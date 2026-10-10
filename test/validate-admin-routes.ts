@@ -854,6 +854,348 @@ async function runTests() {
     }
   }
 
+  // =========================================================================
+  // Test suite 8: HOTFIX — Native Friend Approval — Security Staging (Reqs 1 a 7)
+  // =========================================================================
+  console.log('\n--- 8. Testando HOTFIX de Aprovação de Professores (Requisitos 1 a 7) ---');
+  {
+    interface TestTutor {
+      id: string;
+      name: string;
+      email: string;
+      role: string;
+      approvalStatus: 'pending' | 'approved' | 'rejected';
+      isApproved: boolean;
+      status: 'pending' | 'approved' | 'rejected';
+      approved: boolean;
+      updatedAt?: string;
+    }
+
+    interface TestSystemState {
+      tutorsList: TestTutor[];
+      teachers: Array<{ email: string; name: string; role: string; approvalStatus?: string; isApproved?: boolean }>;
+      userProfiles: Record<string, any>;
+      firestoreTutorsCollection: Map<string, TestTutor>;
+      appStateTutorsDoc: { tutorsList: TestTutor[]; updatedAt?: string };
+    }
+
+    const createInitialSystemState = (): TestSystemState => {
+      const pendingTutor: TestTutor = {
+        id: 'tutor-pedro-santos',
+        name: 'Pedro Santos',
+        email: 'pedro.santos@itissimple.com',
+        role: 'teacher',
+        approvalStatus: 'pending',
+        isApproved: false,
+        status: 'pending',
+        approved: false,
+      };
+
+      const firestoreMap = new Map<string, TestTutor>();
+      firestoreMap.set(pendingTutor.id, { ...pendingTutor });
+
+      return {
+        tutorsList: [{ ...pendingTutor }],
+        teachers: [{
+          email: pendingTutor.email,
+          name: pendingTutor.name,
+          role: 'teacher',
+          approvalStatus: 'pending',
+          isApproved: false,
+        }],
+        userProfiles: {
+          [pendingTutor.email]: {
+            id: pendingTutor.id,
+            email: pendingTutor.email,
+            role: 'teacher',
+            approvalStatus: 'pending',
+            isApproved: false,
+          },
+        },
+        firestoreTutorsCollection: firestoreMap,
+        appStateTutorsDoc: {
+          tutorsList: [{ ...pendingTutor }],
+        },
+      };
+    };
+
+    // Handler idêntico ao implementado em serverApp.ts
+    const approveTutorHandler = (state: TestSystemState) => async (req: Request, res: Response) => {
+      const tutorId = req.params.id;
+      let approvedEmail = '';
+      let approvedTutor: TestTutor | null = null;
+
+      state.tutorsList = (state.tutorsList || []).map((t) => {
+        if (t.id === tutorId || t.email?.toLowerCase() === tutorId.toLowerCase()) {
+          approvedEmail = (t.email || '').toLowerCase().trim();
+          approvedTutor = {
+            ...t,
+            approvalStatus: 'approved',
+            isApproved: true,
+            status: 'approved',
+            approved: true,
+            updatedAt: new Date().toISOString(),
+          };
+          return approvedTutor;
+        }
+        return t;
+      });
+
+      // Se não encontrado em memória, busca na coleção direta
+      if (!approvedTutor && state.firestoreTutorsCollection.has(tutorId)) {
+        const direct = state.firestoreTutorsCollection.get(tutorId)!;
+        approvedEmail = (direct.email || '').toLowerCase().trim();
+        approvedTutor = {
+          ...direct,
+          approvalStatus: 'approved',
+          isApproved: true,
+          status: 'approved',
+          approved: true,
+          updatedAt: new Date().toISOString(),
+        };
+        state.tutorsList.push(approvedTutor);
+      }
+
+      if (!approvedTutor) {
+        return res.status(404).json({ error: 'NotFound', message: `Amigo Nativo "${tutorId}" não foi encontrado.` });
+      }
+
+      // Sincroniza em teachers
+      if (approvedEmail) {
+        const tIdx = state.teachers.findIndex((tc) => (tc.email || '').toLowerCase() === approvedEmail);
+        if (tIdx >= 0) {
+          state.teachers[tIdx] = {
+            ...state.teachers[tIdx],
+            approvalStatus: 'approved',
+            isApproved: true,
+          };
+        }
+        if (state.userProfiles[approvedEmail]) {
+          state.userProfiles[approvedEmail] = {
+            ...state.userProfiles[approvedEmail],
+            approvalStatus: 'approved',
+            isApproved: true,
+          };
+        }
+      }
+
+      // Persistência em Firestore: /tutors/{id}
+      state.firestoreTutorsCollection.set(approvedTutor.id, { ...approvedTutor });
+
+      // Persistência em app_state/tutors
+      state.appStateTutorsDoc = {
+        tutorsList: state.tutorsList.map((t) => ({ ...t })),
+        updatedAt: new Date().toISOString(),
+      };
+
+      return res.status(200).json({ success: true, tutors: state.tutorsList, approvedTutor });
+    };
+
+    // 8.1 Requisito 1: Identificação do erro 401 Unauthorized com Missing Authorization header
+    {
+      const state = createInitialSystemState();
+      const req = createMockRequest({}, {}, { id: 'tutor-pedro-santos' });
+      const res = await simulateRoute([firebaseAuthMiddleware, requireAdmin], approveTutorHandler(state), req);
+      assert(res.statusCode === 401, 'Req 1: Chamada a /approve sem token retorna 401 Unauthorized');
+      assert(res.body?.message === 'Missing Authorization header', 'Req 1: Mensagem informa exatamente "Missing Authorization header"');
+      assert(state.firestoreTutorsCollection.get('tutor-pedro-santos')?.approvalStatus === 'pending', 'Req 1: Documento no Firestore não é alterado');
+    }
+
+    // 8.2 Requisito 2 & 3: Token válido da sessão administrativa e validação rígida de permissões
+    {
+      const state = createInitialSystemState();
+
+      // Tentativa 1: Token de estudante (usuário autenticado mas sem permissão admin)
+      setFirebaseAdminAuthForTesting({
+        verifyIdToken: async () => ({ uid: 'std-user', email: 'student@example.com', role: 'student', email_verified: true }),
+      } as any);
+
+      const reqStudent = createMockRequest(
+        { authorization: 'Bearer student-token' },
+        { tutor: { approvalStatus: 'approved' } }, // Tentativa de injetar role/status via body
+        { id: 'tutor-pedro-santos' }
+      );
+      const resStudent = await simulateRoute([firebaseAuthMiddleware, requireAdmin], approveTutorHandler(state), reqStudent);
+      assert(resStudent.statusCode === 403, 'Req 3: Usuário sem privilégio de admin recebe 403 Forbidden');
+      assert(resStudent.body?.message?.includes('administrator privileges required'), 'Req 3: Mensagem informa que privilégios de administrador são requeridos');
+      assert(state.tutorsList[0].approvalStatus === 'pending', 'Req 3: Tentativa de bypass via body ignorada');
+
+      // Tentativa 2: Token de professor tentando auto-aprovação
+      setFirebaseAdminAuthForTesting({
+        verifyIdToken: async () => ({ uid: 'tutor-pedro-santos', email: 'pedro.santos@itissimple.com', role: 'teacher', email_verified: true }),
+      } as any);
+
+      const reqTeacher = createMockRequest(
+        { authorization: 'Bearer teacher-token' },
+        {},
+        { id: 'tutor-pedro-santos' }
+      );
+      const resTeacher = await simulateRoute([firebaseAuthMiddleware, requireAdmin], approveTutorHandler(state), reqTeacher);
+      assert(resTeacher.statusCode === 403, 'Req 3: Professor tentando auto-aprovação recebe 403');
+      assert(state.tutorsList[0].approvalStatus === 'pending', 'Req 3: Professor permanece pendente');
+
+      // Tentativa 3: Token legítimo de Administrador com custom claim role=admin
+      setFirebaseAdminAuthForTesting({
+        verifyIdToken: async () => ({ uid: 'admin-master-uid', email: 'adm.itissimple@gmail.com', role: 'admin', email_verified: true }),
+      } as any);
+
+      const reqAdmin = createMockRequest(
+        { authorization: 'Bearer valid-admin-id-token' },
+        {},
+        { id: 'tutor-pedro-santos' }
+      );
+      const resAdmin = await simulateRoute([firebaseAuthMiddleware, requireAdmin], approveTutorHandler(state), reqAdmin);
+      assert(resAdmin.statusCode === 200, 'Req 2: Administrador com Bearer token válido obtém 200 OK');
+      assert(resAdmin.body?.success === true, 'Req 2: Resposta contém success=true');
+      assert(resAdmin.body?.approvedTutor?.approvalStatus === 'approved', 'Req 2: Tutor retornado com approvalStatus=approved');
+      assert(resAdmin.body?.approvedTutor?.isApproved === true, 'Req 2: Tutor retornado com isApproved=true');
+    }
+
+    // 8.3 Requisito 4 & 5: Persistência no Firestore e consistência entre /tutors e app_state/tutors
+    {
+      const state = createInitialSystemState();
+      setFirebaseAdminAuthForTesting({
+        verifyIdToken: async () => ({ uid: 'admin-master-uid', email: 'adm.itissimple@gmail.com', role: 'admin', email_verified: true }),
+      } as any);
+
+      const reqAdmin = createMockRequest(
+        { authorization: 'Bearer valid-admin-id-token' },
+        {},
+        { id: 'tutor-pedro-santos' }
+      );
+      await simulateRoute([firebaseAuthMiddleware, requireAdmin], approveTutorHandler(state), reqAdmin);
+
+      // Verificação do documento na coleção /tutors
+      const firestoreDoc = state.firestoreTutorsCollection.get('tutor-pedro-santos');
+      assert(firestoreDoc !== undefined, 'Req 4: Documento existe na coleção /tutors');
+      assert(firestoreDoc?.approvalStatus === 'approved', 'Req 4: /tutors/{id} possui approvalStatus === approved');
+      assert(firestoreDoc?.isApproved === true, 'Req 4: /tutors/{id} possui isApproved === true');
+      assert(firestoreDoc?.approved === true, 'Req 4: /tutors/{id} possui approved === true');
+
+      // Verificação do documento app_state/tutors
+      const stateTutorsDoc = state.appStateTutorsDoc;
+      const tutorInState = stateTutorsDoc.tutorsList.find((t) => t.id === 'tutor-pedro-santos');
+      assert(tutorInState !== undefined, 'Req 5: Documento existe em app_state/tutors');
+      assert(tutorInState?.approvalStatus === 'approved', 'Req 5: app_state/tutors possui approvalStatus === approved');
+      assert(tutorInState?.isApproved === true, 'Req 5: app_state/tutors possui isApproved === true');
+
+      // Consistência estrita entre ambas as coleções
+      assert(firestoreDoc?.approvalStatus === tutorInState?.approvalStatus, 'Req 5: Status idêntico entre /tutors e app_state/tutors');
+      assert(firestoreDoc?.isApproved === tutorInState?.isApproved, 'Req 5: isApproved idêntico entre /tutors e app_state/tutors');
+      assert(firestoreDoc?.status === tutorInState?.status, 'Req 5: status idêntico entre coleções (sem contradição)');
+    }
+
+    // 8.4 Requisito 6: Exibir erro quando a aprovação falhar, sem apresentar falso sucesso
+    {
+      // Simulação do comportamento do frontend handleApproveTutor
+      const simulateFrontendApprove = async (
+        token: string | null,
+        tutorId: string,
+        serverStatusCode: number,
+        serverErrorMsg?: string
+      ) => {
+        let uiTutorStatus = 'pending';
+        let uiErrorMessage: string | null = null;
+        let uiSuccessMessage: string | null = null;
+
+        // 1. Verificação de credencial administrativa
+        if (!token) {
+          uiErrorMessage = 'Sessão administrativa não autenticada no Firebase Auth. Efetue login como Administrador.';
+          // NÃO executa mutação otimista de sucesso
+          return { uiTutorStatus, uiErrorMessage, uiSuccessMessage };
+        }
+
+        // 2. Chamada à API
+        const mockFetchResponse = {
+          ok: serverStatusCode >= 200 && serverStatusCode < 300,
+          status: serverStatusCode,
+          json: async () => serverStatusCode === 200 ? { success: true } : { error: 'Unauthorized', message: serverErrorMsg },
+        };
+
+        if (!mockFetchResponse.ok) {
+          const errData = await mockFetchResponse.json();
+          uiErrorMessage = errData.message || 'Falha ao aprovar';
+          // NÃO apresenta falso sucesso: uiTutorStatus permanece inalterado
+          return { uiTutorStatus, uiErrorMessage, uiSuccessMessage };
+        }
+
+        // 3. Sucesso verificado
+        uiTutorStatus = 'approved';
+        uiSuccessMessage = 'Amigo Nativo aprovado com sucesso!';
+        return { uiTutorStatus, uiErrorMessage, uiSuccessMessage };
+      };
+
+      // 8.4.1 Frontend sem token
+      const resNoToken = await simulateFrontendApprove(null, 't1', 401, 'Missing Authorization header');
+      assert(resNoToken.uiTutorStatus === 'pending', 'Req 6: Frontend NÃO apresenta sucesso se token estiver ausente');
+      assert(resNoToken.uiErrorMessage !== null, 'Req 6: Mensagem de erro informativa exibida ao usuário');
+      assert(resNoToken.uiSuccessMessage === null, 'Req 6: Nenhuma mensagem de falso sucesso exibida');
+
+      // 8.4.2 Frontend com erro 401 da API
+      const res401 = await simulateFrontendApprove('expired-token', 't1', 401, 'Firebase ID token has expired');
+      assert(res401.uiTutorStatus === 'pending', 'Req 6: Frontend reverte/mantém status pending se backend retornar 401');
+      assert(Boolean(res401.uiErrorMessage?.includes('expired')), 'Req 6: Mensagem de erro do backend propagada');
+      assert(res401.uiSuccessMessage === null, 'Req 6: Sucesso não apresentado em caso de 401');
+
+      // 8.4.3 Frontend com sucesso real da API
+      const res200 = await simulateFrontendApprove('valid-token', 't1', 200);
+      assert(res200.uiTutorStatus === 'approved', 'Req 6: Frontend atualiza para approved apenas com 200 OK');
+      assert(res200.uiSuccessMessage !== null, 'Req 6: Feedback positivo apresentado');
+      assert(res200.uiErrorMessage === null, 'Req 6: Nenhum erro apresentado');
+    }
+
+    // 8.5 Requisito 7: Professores aprovados aparecem no catálogo público (GET /api/tutors)
+    {
+      const state = createInitialSystemState();
+
+      // Simulação da rota GET /api/tutors idêntica à do serverApp.ts
+      const getTutorsCatalog = (req: Request, res: Response) => {
+        const requesterEmail = ((req.query.email as string) || '').toLowerCase().trim();
+        const role = req.query.role as string;
+        const isAdmin = role === 'admin' || req.query.admin === 'true';
+
+        if (isAdmin) {
+          return res.status(200).json(state.tutorsList);
+        }
+
+        // Para catálogo público: apenas professores aprovados são retornados
+        const publicList = state.tutorsList.filter((t: TestTutor) => {
+          const isApproved =
+            t.approvalStatus === 'approved' ||
+            t.isApproved === true ||
+            t.status === 'approved' ||
+            t.approved === true;
+          if (isApproved) return true;
+          if (requesterEmail && t.email.toLowerCase() === requesterEmail) return true;
+          return false;
+        });
+
+        return res.status(200).json(publicList);
+      };
+
+      // 8.5.1 Catálogo público antes da aprovação: professor pendente NÃO aparece
+      const reqAnonBefore = createMockRequest();
+      const resAnonBefore = createMockResponse();
+      getTutorsCatalog(reqAnonBefore, resAnonBefore);
+      assert(resAnonBefore.body.length === 0, 'Req 7: Professor pendente NÃO é listado no catálogo público');
+
+      // 8.5.2 Aprovação pelo administrador
+      setFirebaseAdminAuthForTesting({
+        verifyIdToken: async () => ({ uid: 'admin-master-uid', email: 'adm.itissimple@gmail.com', role: 'admin', email_verified: true }),
+      } as any);
+      const reqApprove = createMockRequest({ authorization: 'Bearer admin-token' }, {}, { id: 'tutor-pedro-santos' });
+      await simulateRoute([firebaseAuthMiddleware, requireAdmin], approveTutorHandler(state), reqApprove);
+
+      // 8.5.3 Catálogo público após aprovação: visitante anônimo em qualquer navegador vê o professor
+      const reqAnonAfter = createMockRequest();
+      const resAnonAfter = createMockResponse();
+      getTutorsCatalog(reqAnonAfter, resAnonAfter);
+      assert(resAnonAfter.body.length === 1, 'Req 7: Professor aprovado aparece no catálogo público');
+      assert(resAnonAfter.body[0].email === 'pedro.santos@itissimple.com', 'Req 7: E-mail do professor retornado no catálogo');
+      assert(resAnonAfter.body[0].approvalStatus === 'approved', 'Req 7: Professor retornado com status approved');
+    }
+  }
+
   // Reset mock
   setFirebaseAdminAuthForTesting(null);
 

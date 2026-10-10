@@ -22,9 +22,9 @@ interface AdminApprovalsModalProps {
   isOpen: boolean;
   onClose: () => void;
   tutors: NativeFriendTutor[];
-  onApproveTutor: (tutorId: string, tutor?: NativeFriendTutor) => void;
-  onRejectTutor: (tutorId: string, tutor?: NativeFriendTutor) => void;
-  onDeleteTutor?: (tutorId: string, tutorEmail?: string) => Promise<void> | void;
+  onApproveTutor: (tutorId: string, tutor?: NativeFriendTutor) => Promise<{ success: boolean; error?: string } | void> | void;
+  onRejectTutor: (tutorId: string, tutor?: NativeFriendTutor) => Promise<{ success: boolean; error?: string } | void> | void;
+  onDeleteTutor?: (tutorId: string, tutorEmail?: string) => Promise<{ success: boolean; error?: string } | void> | void;
   onRefresh?: () => void;
   isRefreshing?: boolean;
   currentLanguage: Language;
@@ -58,7 +58,9 @@ export const AdminApprovalsModal: React.FC<AdminApprovalsModalProps> = ({
   const [filter, setFilter] = useState<'pending' | 'approved' | 'rejected' | 'all'>('all');
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [processingId, setProcessingId] = useState<string | null>(null);
   const [actionNotification, setActionNotification] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   // When modal opens, default to pending if any are waiting for review, otherwise show all
   useEffect(() => {
@@ -192,6 +194,23 @@ export const AdminApprovalsModal: React.FC<AdminApprovalsModalProps> = ({
               type="button"
               onClick={() => setActionNotification(null)}
               className="text-emerald-700 hover:text-emerald-900 font-black cursor-pointer px-1"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
+        {/* Action error alert */}
+        {actionError && (
+          <div className="mx-6 mt-3 p-3 bg-rose-50 border border-rose-300 text-rose-800 rounded-xl text-xs font-bold flex items-center justify-between animate-fadeIn" role="alert">
+            <div className="flex items-center gap-2">
+              <XCircle className="w-4 h-4 text-rose-600 shrink-0" />
+              <span>{actionError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setActionError(null)}
+              className="text-rose-700 hover:text-rose-900 font-black cursor-pointer px-1"
             >
               ✕
             </button>
@@ -367,22 +386,66 @@ export const AdminApprovalsModal: React.FC<AdminApprovalsModalProps> = ({
                     {status !== 'approved' && (
                       <button
                         type="button"
-                        onClick={() => onApproveTutor(tutor.id, tutor)}
-                        className="flex-1 sm:flex-initial px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-black transition flex items-center justify-center gap-1.5 cursor-pointer shadow-sm"
+                        disabled={processingId === tutor.id}
+                        onClick={async () => {
+                          setActionError(null);
+                          setActionNotification(null);
+                          setProcessingId(tutor.id);
+                          try {
+                            const res = await onApproveTutor(tutor.id, tutor);
+                            if (res && res.success === false) {
+                              setActionError(res.error || (isEn ? 'Failed to approve native friend' : 'Falha ao aprovar Amigo Nativo'));
+                            } else {
+                              setActionNotification(
+                                isEn
+                                  ? `Native Friend "${tutor.name}" approved successfully and published!`
+                                  : `Amigo Nativo "${tutor.name}" aprovado com sucesso e publicado!`
+                              );
+                              setTimeout(() => setActionNotification(null), 5000);
+                            }
+                          } catch (err: any) {
+                            setActionError(err?.message || (isEn ? 'Failed to approve native friend' : 'Falha ao aprovar Amigo Nativo'));
+                          } finally {
+                            setProcessingId(null);
+                          }
+                        }}
+                        className="flex-1 sm:flex-initial px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-xl text-xs font-black transition flex items-center justify-center gap-1.5 cursor-pointer shadow-sm"
                       >
-                        <CheckCircle className="w-4 h-4" />
-                        <span>{isEn ? 'Approve' : 'Aprovar'}</span>
+                        <CheckCircle className={`w-4 h-4 ${processingId === tutor.id ? 'animate-spin' : ''}`} />
+                        <span>{processingId === tutor.id ? (isEn ? 'Approving...' : 'Aprovando...') : (isEn ? 'Approve' : 'Aprovar')}</span>
                       </button>
                     )}
 
                     {status !== 'rejected' && (
                       <button
                         type="button"
-                        onClick={() => onRejectTutor(tutor.id, tutor)}
-                        className="flex-1 sm:flex-initial px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-black transition flex items-center justify-center gap-1.5 cursor-pointer shadow-sm"
+                        disabled={processingId === tutor.id}
+                        onClick={async () => {
+                          setActionError(null);
+                          setActionNotification(null);
+                          setProcessingId(tutor.id);
+                          try {
+                            const res = await onRejectTutor(tutor.id, tutor);
+                            if (res && res.success === false) {
+                              setActionError(res.error || (isEn ? 'Failed to reject native friend' : 'Falha ao recusar Amigo Nativo'));
+                            } else {
+                              setActionNotification(
+                                isEn
+                                  ? `Native Friend "${tutor.name}" rejected.`
+                                  : `Cadastro de "${tutor.name}" recusado.`
+                              );
+                              setTimeout(() => setActionNotification(null), 5000);
+                            }
+                          } catch (err: any) {
+                            setActionError(err?.message || (isEn ? 'Failed to reject native friend' : 'Falha ao recusar Amigo Nativo'));
+                          } finally {
+                            setProcessingId(null);
+                          }
+                        }}
+                        className="flex-1 sm:flex-initial px-4 py-2 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white rounded-xl text-xs font-black transition flex items-center justify-center gap-1.5 cursor-pointer shadow-sm"
                       >
-                        <XCircle className="w-4 h-4" />
-                        <span>{isEn ? 'Reject' : 'Recusar'}</span>
+                        <XCircle className={`w-4 h-4 ${processingId === tutor.id ? 'animate-spin' : ''}`} />
+                        <span>{processingId === tutor.id ? (isEn ? 'Rejecting...' : 'Recusando...') : (isEn ? 'Reject' : 'Recusar')}</span>
                       </button>
                     )}
 

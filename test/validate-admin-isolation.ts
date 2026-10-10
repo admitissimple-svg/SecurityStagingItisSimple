@@ -185,7 +185,7 @@ async function runTests() {
     {
       // 5.1 Instância em cache pertencente ao projeto antigo itissimple-8663d
       resetFirebaseAdminForTesting();
-      process.env.FIREBASE_PROJECT_ID = 'itissimple-8663d';
+      process.env.FIREBASE_PROJECT_ID = 'itissimple-security-staging';
 
       const mockLegacyApp: App = {
         name: '[DEFAULT]',

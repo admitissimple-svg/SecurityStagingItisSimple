@@ -45,7 +45,7 @@ import { recordConsumedVideo, recordConsumedTrack } from './hooks/useStudentHist
 import { extractYouTubeVideoId, getYouTubeWatchUrl } from './utils/youtube';
 import { getInstantOrCachedWord } from './utils/dictionaryService';
 import { auth, getDb, getAllFirestoreDbs } from './firebase';
-import { getAccessToken } from './utils/auth';
+import { getAccessToken, getAdminAccessToken } from './utils/auth';
 import { useNativeFriends, isTutorApproved, isTeacherRole } from './hooks/useNativeFriends';
 import { onAuthStateChanged, signOut as firebaseSignOutAuth } from 'firebase/auth';
 import { doc, getDoc, collection, getDocs, onSnapshot, setDoc, deleteDoc, query, where } from 'firebase/firestore';
@@ -4444,16 +4444,89 @@ export default function App() {
   }, [isAdminApprovalsOpen]);
 
   // Handler: Admin Approve Tutor
-  const handleApproveTutor = async (tutorId: string, tutorObj?: NativeFriendTutor) => {
+  const handleApproveTutor = async (tutorId: string, tutorObj?: NativeFriendTutor): Promise<{ success: boolean; error?: string }> => {
     const existing = tutors.find(
       (t) => t.id === tutorId || t.email?.toLowerCase() === tutorId.toLowerCase()
     );
     const tutorToApprove = tutorObj || existing;
     const cleanEmail = (tutorToApprove?.email || (tutorId.includes('@') ? tutorId : '')).toLowerCase().trim();
 
-    // Optimistic UI state update
-    setTutors((prev) =>
-      prev.map((t) =>
+    // 1. Verify administrative privileges from currentAccount
+    const isLocalAdmin = currentAccount?.role === 'admin' || currentAccount?.email === 'adm.itissimple@gmail.com';
+    if (!isLocalAdmin) {
+      return {
+        success: false,
+        error: isTeacher ? 'Only administrators can approve Native Friends.' : 'Apenas administradores podem aprovar Amigos Nativos.',
+      };
+    }
+
+    // 2. Obtain valid Firebase Auth ID Token for admin session
+    let token = await getAdminAccessToken().catch(() => null);
+    if (!token) {
+      token = await getAccessToken(true).catch(() => null);
+    }
+
+    if (!token) {
+      return {
+        success: false,
+        error: isTeacher
+          ? 'Missing administrative credentials in Firebase Auth session. Please log in as Administrator.'
+          : 'Sessão administrativa não autenticada no Firebase Auth. Efetue login como Administrador para autorizar Amigos Nativos.',
+      };
+    }
+
+    // 3. Make authorized request to backend
+    let res: Response;
+    try {
+      res = await fetch(`/api/tutors/${encodeURIComponent(tutorId)}/approve`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ tutor: tutorToApprove }),
+      });
+    } catch (networkErr: any) {
+      return {
+        success: false,
+        error: networkErr?.message || 'Falha de comunicação com o servidor ao aprovar Amigo Nativo.',
+      };
+    }
+
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      const errorMsg =
+        errData.message ||
+        errData.error ||
+        (res.status === 401
+          ? 'Não autorizado: token de autenticação inválido ou ausente.'
+          : res.status === 403
+          ? 'Acesso negado: privilégios de administrador necessários.'
+          : `Erro ao aprovar Amigo Nativo (HTTP ${res.status}).`);
+      return { success: false, error: errorMsg };
+    }
+
+    const data = await res.json();
+
+    // 4. Update UI state only upon verified server success
+    setTutors((prev) => {
+      const serverTutors = Array.isArray(data.tutors) ? data.tutors : null;
+      if (serverTutors) {
+        const map = new Map<string, NativeFriendTutor>();
+        prev.forEach((t) => map.set((t.email || t.id).toLowerCase().trim(), t));
+        serverTutors.forEach((t: NativeFriendTutor) => {
+          const k = (t.email || t.id).toLowerCase().trim();
+          map.set(k, {
+            ...(map.get(k) || {}),
+            ...t,
+            approvalStatus: t.id === tutorId || (cleanEmail && t.email?.toLowerCase() === cleanEmail) ? 'approved' : t.approvalStatus,
+            isApproved: t.id === tutorId || (cleanEmail && t.email?.toLowerCase() === cleanEmail) ? true : t.isApproved,
+          });
+        });
+        return Array.from(map.values());
+      }
+
+      return prev.map((t) =>
         t.id === tutorId || (cleanEmail && t.email?.toLowerCase() === cleanEmail)
           ? {
               ...t,
@@ -4461,12 +4534,13 @@ export default function App() {
               isApproved: true,
               status: 'approved',
               approved: true,
+              updatedAt: new Date().toISOString(),
             }
           : t
-      )
-    );
+      );
+    });
 
-    // Direct Cloud Firestore write with { merge: true } across collections and databases
+    // 5. Direct Firestore synchronization if available
     try {
       const dbs = getAllFirestoreDbs();
       const cleanTutorId = tutorToApprove?.id || tutorId;
@@ -4492,68 +4566,94 @@ export default function App() {
           firestorePromises.push(setDoc(doc(dbInstance, 'tutors', cleanEmailDocId), approvalPayload, { merge: true }).catch(() => null));
         }
       }
-
       await Promise.all(firestorePromises);
-      console.log('[NativeFriend Approval] Successfully persisted approved tutor across databases:', cleanTutorId, cleanEmail);
     } catch (fsErr) {
       console.warn('[NativeFriend Approval] Firestore direct setDoc error:', fsErr);
     }
 
-    // Server API persistence
-    try {
-      const res = await fetch(`/api/tutors/${encodeURIComponent(tutorId)}/approve`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tutor: tutorToApprove }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (Array.isArray(data.tutors)) {
-          setTutors((prev) => {
-            const map = new Map<string, NativeFriendTutor>();
-            prev.forEach((t) => map.set((t.email || t.id).toLowerCase().trim(), t));
-            data.tutors.forEach((t: NativeFriendTutor) => {
-              const k = (t.email || t.id).toLowerCase().trim();
-              const existing = map.get(k);
-              // preserve approved state
-              if (existing?.approvalStatus === 'approved' || existing?.isApproved) {
-                map.set(k, { ...t, ...existing, approvalStatus: 'approved', isApproved: true });
-              } else {
-                map.set(k, t);
-              }
-            });
-            return Array.from(map.values());
-          });
-        }
-      }
-    } catch {
-      // local fallback
-    }
+    return { success: true };
   };
 
   // Handler: Admin Reject Tutor
-  const handleRejectTutor = async (tutorId: string, tutorObj?: NativeFriendTutor) => {
+  const handleRejectTutor = async (tutorId: string, tutorObj?: NativeFriendTutor): Promise<{ success: boolean; error?: string }> => {
     const existing = tutors.find(
       (t) => t.id === tutorId || t.email?.toLowerCase() === tutorId.toLowerCase()
     );
     const tutorToReject = tutorObj || existing;
     const cleanEmail = (tutorToReject?.email || (tutorId.includes('@') ? tutorId : '')).toLowerCase().trim();
 
-    setTutors((prev) =>
-      prev.map((t) =>
-        t.id === tutorId || (cleanEmail && t.email?.toLowerCase() === cleanEmail)
-          ? {
-              ...t,
-              approvalStatus: 'rejected',
-              isApproved: false,
-              status: 'rejected',
-              approved: false,
-            }
-          : t
-      )
-    );
+    const isLocalAdmin = currentAccount?.role === 'admin' || currentAccount?.email === 'adm.itissimple@gmail.com';
+    if (!isLocalAdmin) {
+      return {
+        success: false,
+        error: isTeacher ? 'Only administrators can reject Native Friends.' : 'Apenas administradores podem recusar Amigos Nativos.',
+      };
+    }
 
-    // Direct Cloud Firestore write with { merge: true }
+    let token = await getAdminAccessToken().catch(() => null);
+    if (!token) {
+      token = await getAccessToken(true).catch(() => null);
+    }
+
+    if (!token) {
+      return {
+        success: false,
+        error: isTeacher
+          ? 'Missing administrative credentials in Firebase Auth session. Please log in as Administrator.'
+          : 'Sessão administrativa não autenticada no Firebase Auth. Efetue login como Administrador.',
+      };
+    }
+
+    let res: Response;
+    try {
+      res = await fetch(`/api/tutors/${encodeURIComponent(tutorId)}/reject`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+      });
+    } catch (networkErr: any) {
+      return {
+        success: false,
+        error: networkErr?.message || 'Falha de comunicação com o servidor ao recusar Amigo Nativo.',
+      };
+    }
+
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      const errorMsg =
+        errData.message ||
+        errData.error ||
+        (res.status === 401
+          ? 'Não autorizado: token de autenticação inválido ou ausente.'
+          : res.status === 403
+          ? 'Acesso negado: privilégios de administrador necessários.'
+          : `Erro ao recusar Amigo Nativo (HTTP ${res.status}).`);
+      return { success: false, error: errorMsg };
+    }
+
+    const data = await res.json();
+    if (Array.isArray(data.tutors)) {
+      setTutors(data.tutors);
+    } else {
+      setTutors((prev) =>
+        prev.map((t) =>
+          t.id === tutorId || (cleanEmail && t.email?.toLowerCase() === cleanEmail)
+            ? {
+                ...t,
+                approvalStatus: 'rejected',
+                isApproved: false,
+                status: 'rejected',
+                approved: false,
+                updatedAt: new Date().toISOString(),
+              }
+            : t
+        )
+      );
+    }
+
+    // Direct Cloud Firestore write
     try {
       const db = getDb();
       const cleanTutorId = tutorToReject?.id || tutorId;
@@ -4569,48 +4669,89 @@ export default function App() {
         approved: false,
         updatedAt: new Date().toISOString(),
       };
-
       const firestorePromises = [
         setDoc(doc(db, 'users', cleanTutorId), rejectionPayload, { merge: true }).catch(() => null),
         setDoc(doc(db, 'tutors', cleanTutorId), rejectionPayload, { merge: true }).catch(() => null),
       ];
-
       if (cleanEmailDocId && cleanEmailDocId !== cleanTutorId) {
         firestorePromises.push(
           setDoc(doc(db, 'users', cleanEmailDocId), rejectionPayload, { merge: true }).catch(() => null),
           setDoc(doc(db, 'tutors', cleanEmailDocId), rejectionPayload, { merge: true }).catch(() => null)
         );
       }
-
       await Promise.all(firestorePromises);
     } catch (fsErr) {
       console.warn('[NativeFriend Rejection] Firestore direct setDoc error:', fsErr);
     }
 
-    try {
-      const res = await fetch(`/api/tutors/${encodeURIComponent(tutorId)}/reject`, { method: 'POST' });
-      if (res.ok) {
-        const data = await res.json();
-        if (Array.isArray(data.tutors)) {
-          setTutors(data.tutors);
-        }
-      }
-    } catch {
-      // local fallback
-    }
+    return { success: true };
   };
 
   // Handler: Admin Delete Tutor
-  const handleDeleteTutor = async (tutorId: string, tutorEmail?: string) => {
+  const handleDeleteTutor = async (tutorId: string, tutorEmail?: string): Promise<{ success: boolean; error?: string }> => {
+    const isLocalAdmin = currentAccount?.role === 'admin' || currentAccount?.email === 'adm.itissimple@gmail.com';
+    if (!isLocalAdmin) {
+      return {
+        success: false,
+        error: isTeacher ? 'Only administrators can delete Native Friends.' : 'Apenas administradores podem excluir Amigos Nativos.',
+      };
+    }
+
+    let token = await getAdminAccessToken().catch(() => null);
+    if (!token) {
+      token = await getAccessToken(true).catch(() => null);
+    }
+
+    if (!token) {
+      return {
+        success: false,
+        error: isTeacher
+          ? 'Missing administrative credentials in Firebase Auth session. Please log in as Administrator.'
+          : 'Sessão administrativa não autenticada no Firebase Auth. Efetue login como Administrador.',
+      };
+    }
+
     const cleanEmail = tutorEmail?.toLowerCase().trim();
-    setTutors((prev) =>
-      prev.filter((t) => {
-        if (t.id === tutorId) return false;
-        if (t.email?.toLowerCase() === tutorId.toLowerCase()) return false;
-        if (cleanEmail && t.email?.toLowerCase() === cleanEmail) return false;
-        return true;
-      })
-    );
+    const queryParam = cleanEmail ? `?email=${encodeURIComponent(cleanEmail)}` : '';
+
+    let response: Response;
+    try {
+      response = await fetch(`/api/tutors/${encodeURIComponent(tutorId)}${queryParam}`, {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+    } catch (networkErr: any) {
+      return {
+        success: false,
+        error: networkErr?.message || 'Falha de comunicação com o servidor ao excluir Amigo Nativo.',
+      };
+    }
+
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      const errorMsg =
+        errData.message ||
+        errData.error ||
+        `Erro ao excluir Amigo Nativo (HTTP ${response.status}).`;
+      return { success: false, error: errorMsg };
+    }
+
+    const data = await response.json();
+    if (Array.isArray(data.tutors)) {
+      setTutors(data.tutors);
+    } else {
+      setTutors((prev) =>
+        prev.filter((t) => {
+          if (t.id === tutorId) return false;
+          if (t.email?.toLowerCase() === tutorId.toLowerCase()) return false;
+          if (cleanEmail && t.email?.toLowerCase() === cleanEmail) return false;
+          return true;
+        })
+      );
+    }
+
     if (cleanEmail && cleanEmail !== 'adm.itissimple@gmail.com') {
       setAvailableAccounts((prev) => prev.filter((a) => a.email.toLowerCase() !== cleanEmail));
     }
@@ -4629,20 +4770,7 @@ export default function App() {
       console.warn('[NativeFriend Deletion] Firestore delete error:', fsErr);
     }
 
-    try {
-      const queryParam = cleanEmail ? `?email=${encodeURIComponent(cleanEmail)}` : '';
-      const response = await fetch(`/api/tutors/${encodeURIComponent(tutorId)}${queryParam}`, {
-        method: 'DELETE',
-      });
-      if (response.ok) {
-        const data = await response.json();
-        if (Array.isArray(data.tutors)) {
-          setTutors(data.tutors);
-        }
-      }
-    } catch {
-      // local fallback
-    }
+    return { success: true };
   };
 
   // Handler: Save Native Friend Profile (from Teacher Dashboard or Modal)

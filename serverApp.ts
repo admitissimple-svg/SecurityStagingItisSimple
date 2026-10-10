@@ -79,6 +79,7 @@ import {
   requireAdmin,
   isVerifiedAdminRequest,
 } from './src/middleware/firebaseAuth';
+import { getFirebaseAdminAuth } from './src/serverFirebaseAdmin';
 const rawEnvModel = (process.env.GEMINI_MODEL || '').trim();
 const isInvalidEnvModel = !rawEnvModel || rawEnvModel.includes('1.5') || rawEnvModel.includes('2.0') || rawEnvModel.startsWith('emini');
 const GEMINI_TEXT_MODEL = isInvalidEnvModel ? 'gemini-3.6-flash' : rawEnvModel;
@@ -951,6 +952,25 @@ async function initCloudPersistence() {
     console.warn('Cloud persistence init notice:', err);
     isCloudHydrated = true;
   }
+
+  // Pre-synchronize role=admin custom claim on staging admin users in Firebase Auth
+  try {
+    const adminAuth = getFirebaseAdminAuth();
+    const adminEmailsToSync = ['adm.itissimple@gmail.com', 'admin@itissimple.com'];
+    for (const adminEmail of adminEmailsToSync) {
+      try {
+        const userRec = await adminAuth.getUserByEmail(adminEmail);
+        if (userRec && userRec.customClaims?.role !== 'admin') {
+          await adminAuth.setCustomUserClaims(userRec.uid, { role: 'admin' });
+          console.log(`[FirebaseAdmin] Pre-assigned role=admin custom claim to ${adminEmail} (UID: ${userRec.uid})`);
+        }
+      } catch {
+        // User not yet registered in Auth; claim will sync upon login/registration
+      }
+    }
+  } catch (adminErr) {
+    console.warn('[FirebaseAdmin] Admin claims pre-sync notice:', adminErr);
+  }
 }
 
 // 1. Health Endpoint
@@ -970,6 +990,44 @@ app.get('/api/auth/verify-session', firebaseAuthMiddleware, (req, res) => {
     emailVerified: req.user.email_verified,
     role: req.user.role,
   });
+});
+
+app.post('/api/auth/sync-admin-claims', firebaseAuthMiddleware, async (req, res) => {
+  const caller = req.user;
+  if (!caller || !caller.uid) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required: verified user token missing' });
+  }
+
+  const cleanEmail = (caller.email || '').toLowerCase().trim();
+  const db = readDb();
+
+  const isMasterAdminEmail = cleanEmail === 'adm.itissimple@gmail.com' || cleanEmail === 'admin@itissimple.com';
+  const isTeacherAdmin = (db.teachers || []).some(
+    (t: any) => t.role === 'admin' && (t.email || '').toLowerCase().trim() === cleanEmail
+  );
+  const isAuthUserAdmin =
+    db.authUsers &&
+    Object.values(db.authUsers).some(
+      (u: any) => u.role === 'admin' && (u.email || '').toLowerCase().trim() === cleanEmail
+    );
+
+  const isLegitimateAdmin = caller.email_verified && (isMasterAdminEmail || isTeacherAdmin || isAuthUserAdmin);
+
+  if (!isLegitimateAdmin) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Access denied: caller is not an authorized administrator',
+    });
+  }
+
+  try {
+    const adminAuth = getFirebaseAdminAuth();
+    await adminAuth.setCustomUserClaims(caller.uid, { role: 'admin' });
+    return res.json({ success: true, role: 'admin', uid: caller.uid });
+  } catch (err: any) {
+    console.error('Error assigning custom admin claims:', err);
+    return res.status(500).json({ error: 'Internal server error assigning admin claim' });
+  }
 });
 
 // 1.1 Auth Endpoints (Preply-style Login & Registration)
@@ -1308,6 +1366,13 @@ app.post('/api/auth/login', async (req, res) => {
   if (isMasterAdmin) {
     role = 'admin';
     name = authRecord?.name || 'Admin It\'s Simple';
+    const targetAdminUid = uid || authRecord?.uid;
+    if (targetAdminUid) {
+      try {
+        const adminAuth = getFirebaseAdminAuth();
+        adminAuth.setCustomUserClaims(targetAdminUid, { role: 'admin' }).catch(() => {});
+      } catch {}
+    }
   } else if (isRegisteredStudent) {
     // STRICT RBAC: A registered student is locked exclusively to 'student'
     role = 'student';
@@ -2266,6 +2331,13 @@ app.post('/api/auth/google', async (req, res) => {
     if (!name || name === cleanEmail.split('@')[0]) {
       displayName = "Admin It's Simple";
     }
+    const targetAdminUid = uid || authRecord?.uid;
+    if (targetAdminUid) {
+      try {
+        const adminAuth = getFirebaseAdminAuth();
+        adminAuth.setCustomUserClaims(targetAdminUid, { role: 'admin' }).catch(() => {});
+      } catch {}
+    }
   } else if (isRegisteredStudent) {
     // STRICT RBAC: If registered as a student, session is strictly locked to student space
     role = 'student';
@@ -3033,6 +3105,27 @@ app.post('/api/tutors/:id/approve', firebaseAuthMiddleware, requireAdmin, async 
     }
   }
 
+  // If still not found, check direct Firestore collection
+  if (!approvedTutor) {
+    try {
+      const directTutor = await fetchTutorDocumentFromFirestore(tutorId).catch(() => null);
+      if (directTutor) {
+        approvedEmail = (directTutor.email || '').toLowerCase().trim();
+        approvedTutor = {
+          ...directTutor,
+          id: directTutor.id || tutorId,
+          approvalStatus: 'approved',
+          isApproved: true,
+          status: 'approved',
+          approved: true,
+          updatedAt: new Date().toISOString(),
+        };
+        db.tutorsList = db.tutorsList || [];
+        db.tutorsList.push(approvedTutor);
+      }
+    } catch {}
+  }
+
   if (approvedEmail) {
     const tIdx = (db.teachers || []).findIndex((tc: any) => (tc.email || '').toLowerCase() === approvedEmail);
     if (tIdx >= 0) {
@@ -3044,14 +3137,25 @@ app.post('/api/tutors/:id/approve', firebaseAuthMiddleware, requireAdmin, async 
         approved: true,
       };
     }
+    if (db.userProfiles && db.userProfiles[approvedEmail]) {
+      db.userProfiles[approvedEmail] = {
+        ...db.userProfiles[approvedEmail],
+        approvalStatus: 'approved',
+        isApproved: true,
+        status: 'approved',
+        approved: true,
+      };
+    }
   }
 
   if (approvedTutor) {
+    // 1. Direct persistence in Firestore /tutors/{tutorId} and /users/{tutorId}
     await saveTutorToFirestore(approvedTutor).catch((err) => {
       console.warn('Error saving approved tutor to Firestore:', err);
     });
   }
 
+  // 2. Synchronize app_state/tutors and in-memory DB ensuring full consistency
   await writeDbSync(db);
   res.json({ success: true, tutors: db.tutorsList, approvedTutor });
 });
@@ -3077,10 +3181,42 @@ app.post('/api/tutors/:id/reject', firebaseAuthMiddleware, requireAdmin, async (
     return t;
   });
 
-  if (rejectedTutor) {
-    await saveTutorToFirestore(rejectedTutor).catch((err) => {
-      console.warn('Error saving rejected tutor to Firestore:', err);
-    });
+  if (!rejectedTutor) {
+    const passedTutor = req.body.tutor;
+    if (passedTutor) {
+      rejectedEmail = (passedTutor.email || '').toLowerCase().trim();
+      rejectedTutor = {
+        ...passedTutor,
+        id: tutorId,
+        approvalStatus: 'rejected',
+        isApproved: false,
+        status: 'rejected',
+        approved: false,
+        updatedAt: new Date().toISOString(),
+      };
+      db.tutorsList = db.tutorsList || [];
+      db.tutorsList.push(rejectedTutor);
+    }
+  }
+
+  if (!rejectedTutor) {
+    try {
+      const directTutor = await fetchTutorDocumentFromFirestore(tutorId).catch(() => null);
+      if (directTutor) {
+        rejectedEmail = (directTutor.email || '').toLowerCase().trim();
+        rejectedTutor = {
+          ...directTutor,
+          id: directTutor.id || tutorId,
+          approvalStatus: 'rejected',
+          isApproved: false,
+          status: 'rejected',
+          approved: false,
+          updatedAt: new Date().toISOString(),
+        };
+        db.tutorsList = db.tutorsList || [];
+        db.tutorsList.push(rejectedTutor);
+      }
+    } catch {}
   }
 
   if (rejectedEmail) {
@@ -3094,6 +3230,21 @@ app.post('/api/tutors/:id/reject', firebaseAuthMiddleware, requireAdmin, async (
         approved: false,
       };
     }
+    if (db.userProfiles && db.userProfiles[rejectedEmail]) {
+      db.userProfiles[rejectedEmail] = {
+        ...db.userProfiles[rejectedEmail],
+        approvalStatus: 'rejected',
+        isApproved: false,
+        status: 'rejected',
+        approved: false,
+      };
+    }
+  }
+
+  if (rejectedTutor) {
+    await saveTutorToFirestore(rejectedTutor).catch((err) => {
+      console.warn('Error saving rejected tutor to Firestore:', err);
+    });
   }
 
   await writeDbSync(db);
