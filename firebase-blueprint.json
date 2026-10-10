@@ -1,0 +1,390 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile with isolation by UID",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "The user auth UID" },
+        "name": { "type": "string", "description": "Full name" },
+        "email": { "type": "string", "format": "email", "description": "User email address" },
+        "role": { "type": "string", "enum": ["student", "teacher", "admin"], "description": "User role" },
+        "level": { "type": "string", "description": "English level" },
+        "picture": { "type": "string", "description": "Avatar photo URL" },
+        "assignedNativeFriendUID": { "type": "string", "description": "Strictly assigned Native Friend tutor UID" },
+        "nativeFriendUID": { "type": "string", "description": "Strictly assigned Native Friend tutor UID" },
+        "watchedVideosHistory": { "type": "array", "description": "Global history of unique watched YouTube video IDs" },
+        "listenedTracksHistory": { "type": "array", "description": "Global history of unique listened Spotify tracks" },
+        "studentJournal": { "type": "array", "description": "Unified student activity log & journal (video, audio, memorization, lesson) for cross-device S-Path sync" },
+        "vocabulary": { "type": "array", "description": "Accumulated personal dictionary vocabulary words" },
+        "scheduledLessons": { "type": "array", "description": "Scheduled live lessons list" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp" }
+      },
+      "required": ["uid", "email", "role"]
+    },
+    "StudentDailyRoutine": {
+      "title": "StudentDailyRoutine",
+      "description": "Student daily routine video and topic selection",
+      "type": "object",
+      "properties": {
+        "videoId": { "type": "string", "description": "YouTube video ID" },
+        "videoTitle": { "type": "string", "description": "Video title" },
+        "title": { "type": "string", "description": "Video title" },
+        "url": { "type": "string", "description": "YouTube video URL" },
+        "playlistId": { "type": "string", "description": "Selected playlist ID" },
+        "playlistTitle": { "type": "string", "description": "Selected playlist title" },
+        "dayOfWeek": { "type": "string", "description": "Day of week" },
+        "activityId": { "type": "string", "description": "Activity identifier" },
+        "isRepeatVideo": { "type": "boolean", "description": "Whether this video is repeating previous day" },
+        "teacherOverrideTrack": {
+          "type": "object",
+          "description": "Teacher Spotify override track recommendation for student routine",
+          "properties": {
+            "url": { "type": "string" },
+            "title": { "type": "string" },
+            "artist": { "type": "string" },
+            "artistOrHost": { "type": "string" },
+            "coverUrl": { "type": "string" },
+            "embedUrl": { "type": "string" },
+            "instructions": { "type": "string" },
+            "assignedBy": { "type": "string" },
+            "assignedByName": { "type": "string" },
+            "assignedAt": { "type": "string" }
+          }
+        },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "Tutor": {
+      "title": "Tutor",
+      "description": "Native Friend tutor profile",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Tutor identifier" },
+        "uid": { "type": "string", "description": "Tutor user auth UID" },
+        "name": { "type": "string", "description": "Tutor display name" },
+        "email": { "type": "string", "format": "email", "description": "Tutor email" },
+        "avatar": { "type": "string", "description": "Avatar photo URL" },
+        "country": { "type": "string", "description": "Country of origin" },
+        "approvalStatus": { "type": "string", "enum": ["pending", "approved", "rejected"], "description": "Admin review status" }
+      },
+      "required": ["name", "email"]
+    },
+    "LiveLesson": {
+      "title": "LiveLesson",
+      "description": "Live conversation lesson booking",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Lesson ID" },
+        "studentUid": { "type": "string", "description": "Student UID" },
+        "studentEmail": { "type": "string", "format": "email", "description": "Student email" },
+        "studentName": { "type": "string", "description": "Student display name" },
+        "teacherUid": { "type": "string", "description": "Teacher UID" },
+        "teacherEmail": { "type": "string", "format": "email", "description": "Teacher email" },
+        "teacherName": { "type": "string", "description": "Teacher display name" },
+        "title": { "type": "string", "description": "Lesson title" },
+        "description": { "type": "string", "description": "Lesson notes and topic description" },
+        "meetLink": { "type": "string", "description": "Google Meet meeting URL" },
+        "startDateTime": { "type": "string", "format": "date-time", "description": "Start time" },
+        "endDateTime": { "type": "string", "format": "date-time", "description": "End time" },
+        "status": { "type": "string", "enum": ["scheduled", "completed", "not_completed", "cancelled"], "description": "Lesson status" },
+        "cancelledAt": { "type": "string", "format": "date-time", "description": "Cancellation timestamp" },
+        "cancelledBy": { "type": "string", "description": "Responsible party for cancellation" },
+        "cancellationReason": { "type": "string", "description": "Motive for lesson cancellation" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Last update timestamp" }
+      },
+      "required": ["studentEmail", "teacherEmail", "startDateTime", "endDateTime", "status"]
+    },
+    "StudentMediaAssignments": {
+      "title": "StudentMediaAssignments",
+      "description": "Student weekly YouTube and Spotify media assignments partitioned by UID",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Student UID" },
+        "email": { "type": "string", "format": "email", "description": "Student email" },
+        "level": { "type": "string", "description": "English level" },
+        "videoAssignments": { "type": "array", "description": "7-day unique YouTube assignments" },
+        "spotifyAssignments": { "type": "array", "description": "7-day unique Spotify assignments" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Last update timestamp" }
+      },
+      "required": ["uid"]
+    },
+    "TeacherAvailability": {
+      "title": "TeacherAvailability",
+      "description": "Teacher granular 30-minute availability schedule structured per day of week linked to UID",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Teacher user auth UID" },
+        "teacherEmail": { "type": "string", "format": "email", "description": "Teacher email address" },
+        "meetLink": { "type": "string", "description": "Default Google Meet room URL" },
+        "timezone": { "type": "string", "description": "Teacher timezone" },
+        "availableDays": { "type": "array", "description": "Active teaching days" },
+        "availability": { "type": "object", "description": "Granular 30-min slots map by day of week" },
+        "availableHoursByDay": { "type": "object", "description": "Granular 30-min slots map by day of week" },
+        "availableHours": { "type": "array", "description": "Fallback list of slots" },
+        "workingHoursStart": { "type": "string", "description": "Earliest starting slot" },
+        "workingHoursEnd": { "type": "string", "description": "Latest ending slot" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Last update timestamp" }
+      },
+      "required": ["teacherEmail"]
+    },
+    "StudentCurrentRoutine": {
+      "title": "StudentCurrentRoutine",
+      "description": "Weekly routine tracking document containing the daily Spotify track and teacher comments/recommendations",
+      "type": "object",
+      "properties": {
+        "studentUid": { "type": "string", "description": "Student UID" },
+        "studentEmail": { "type": "string", "format": "email", "description": "Student email" },
+        "nativeFriendUid": { "type": "string", "description": "Assigned Native Friend / Teacher UID" },
+        "nativeFriendEmail": { "type": "string", "format": "email", "description": "Assigned Native Friend email" },
+        "weekId": { "type": "string", "description": "Week identifier, e.g. week-1" },
+        "currentSpotifyTrack": {
+          "type": "object",
+          "description": "Daily Spotify track synchronized in real time",
+          "properties": {
+            "id": { "type": "string" },
+            "title": { "type": "string" },
+            "artist": { "type": "string" },
+            "coverUrl": { "type": "string" },
+            "dayOfWeek": { "type": "string" }
+          },
+          "required": ["id", "title", "artist", "dayOfWeek"]
+        },
+        "teacherFeedback": {
+          "type": "object",
+          "description": "Native Friend comments and recommendations connected to the track and day"
+        },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["studentUid", "weekId"]
+    },
+    "AppState": {
+      "title": "AppState",
+      "description": "Server synchronization state document across application instances",
+      "type": "object",
+      "properties": {
+        "teachers": { "type": "array", "description": "Teacher accounts" },
+        "students": { "type": "array", "description": "Student accounts" },
+        "tutorsList": { "type": "array", "description": "Tutors listing" },
+        "liveLessons": { "type": "array", "description": "Scheduled live lessons" },
+        "routinesByDay": { "type": "object", "description": "Weekly routines by day" },
+        "userProfiles": { "type": "object", "description": "Saved user profiles" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Last synchronization timestamp" }
+      }
+    },
+    "DirectMessage": {
+      "title": "DirectMessage",
+      "description": "Asynchronous direct messages and notices exclusive to student and active native friend pair",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Message unique identifier" },
+        "studentUid": { "type": "string", "description": "Student user UID" },
+        "studentEmail": { "type": "string", "format": "email", "description": "Student email" },
+        "studentName": { "type": "string", "description": "Student display name" },
+        "nativeFriendUid": { "type": "string", "description": "Active Native Friend tutor UID" },
+        "nativeFriendEmail": { "type": "string", "format": "email", "description": "Active Native Friend email" },
+        "nativeFriendName": { "type": "string", "description": "Active Native Friend display name" },
+        "nativeFriendAvatar": { "type": "string", "description": "Active Native Friend avatar" },
+        "senderUid": { "type": "string", "description": "UID of the user who sent the message" },
+        "senderEmail": { "type": "string", "format": "email", "description": "Email of the sender" },
+        "senderName": { "type": "string", "description": "Display name of sender" },
+        "senderRole": { "type": "string", "enum": ["student", "teacher", "admin", "system"], "description": "Role of sender" },
+        "recipientUid": { "type": "string", "description": "UID of recipient" },
+        "recipientEmail": { "type": "string", "format": "email", "description": "Email of recipient" },
+        "recipientName": { "type": "string", "description": "Name of recipient" },
+        "text": { "type": "string", "maxLength": 2000, "description": "Message content" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Timestamp of creation" },
+        "read": { "type": "boolean", "description": "Whether message has been read by recipient" },
+        "lessonRefId": { "type": "string", "description": "Optional lesson reference ID" },
+        "isNotice": { "type": "boolean", "description": "Whether message is an administrative notice" }
+      },
+      "required": ["studentUid", "nativeFriendUid", "senderUid", "text"]
+    },
+    "WeeklyHistory": {
+      "title": "WeeklyHistory",
+      "description": "Consolidated weekly history of consumed videos, Spotify tracks, and weekly vocabulary partitioned by student UID and weekId",
+      "type": "object",
+      "properties": {
+        "studentUid": { "type": "string", "description": "Student user auth UID" },
+        "studentEmail": { "type": "string", "format": "email", "description": "Student email" },
+        "assignedNativeFriendUID": { "type": "string", "description": "Assigned Native Friend tutor UID" },
+        "nativeFriendUID": { "type": "string", "description": "Assigned Native Friend tutor UID" },
+        "weekId": { "type": "string", "description": "Week identifier, e.g. week-1, week-5" },
+        "weeklyCycle": { "type": "number", "description": "Cycle number" },
+        "consumedVideoIds": {
+          "type": "array",
+          "description": "List of videos watched during this cycle with IDs and titles"
+        },
+        "consumedTrackIds": {
+          "type": "array",
+          "description": "List of Spotify tracks listened to during this cycle with IDs, titles, and artists"
+        },
+        "weeklyVocabulary": {
+          "type": "array",
+          "description": "List of vocabulary words saved or practiced during this week"
+        },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["studentUid", "weekId"]
+    },
+    "StudentDictionaryEntry": {
+      "title": "StudentDictionaryEntry",
+      "description": "Student vocabulary word entry in personal dictionary",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Entry ID" },
+        "word": { "type": "string", "description": "The English word" },
+        "partOfSpeech": { "type": "string", "description": "Part of speech classification" },
+        "cefrLevel": { "type": "string", "description": "CEFR proficiency level (A1, A2, B1, B2, C1, C2)" },
+        "phonetic": { "type": "string", "description": "Phonetic pronunciation" },
+        "translationPt": { "type": "string", "description": "Portuguese translation" },
+        "translation": { "type": "string", "description": "Portuguese translation" },
+        "definitionEn": { "type": "string", "description": "Standard English definition" },
+        "exampleSentenceEn": { "type": "string", "description": "Real authentic example sentence" },
+        "source": { "type": "string", "description": "Source of the word (video, audio, live lesson, native friend)" },
+        "sourceContext": { "type": "string", "description": "Context sentence where word was heard" },
+        "exampleSentence": { "type": "string", "description": "Example usage sentence" },
+        "learnedAt": { "type": "string", "format": "date-time", "description": "When word was saved" },
+        "addedAt": { "type": "string", "format": "date-time", "description": "When word was saved" },
+        "studentEmail": { "type": "string", "format": "email" },
+        "studentUid": { "type": "string" },
+        "practiceCount": { "type": "number", "description": "Number of times practiced in daily memorization activity" },
+        "lastPracticedAt": { "type": "string", "format": "date-time", "description": "Timestamp when last practiced in daily memorization activity" }      },
+       "required": ["word"]
+    },
+    "StudentJournalEntry": {
+      "title": "StudentJournalEntry",
+      "description": "Student saved sentence and AI pedagogical feedback/corrections in daily journal",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Journal entry ID" },
+        "date": { "type": "string", "description": "Date of entry (YYYY-MM-DD)" },
+        "sentence": { "type": "string", "description": "Student original written sentence" },
+        "wordsUsed": { "type": "array", "description": "Words from routine included in sentence" },
+        "correctedSentence": { "type": "string", "description": "Pedagogical AI corrected sentence" },
+        "explanation": { "type": "string", "description": "Grammatical explanation or suggestion" },
+        "hasErrors": { "type": "boolean", "description": "Whether grammatical errors were found" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "studentUid": { "type": "string" },
+        "studentEmail": { "type": "string", "format": "email" }
+      },
+      "required": ["sentence", "date"]
+    },
+    "StudentHomeworkProgress": {
+      "title": "StudentHomeworkProgress",
+      "description": "Student weekly homework activity progress including matching, fill-in-the-blanks, sentence writing, reading comprehension quiz, and AI evaluation",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Homework or week identifier" },
+        "studentUid": { "type": "string" },
+        "studentEmail": { "type": "string", "format": "email" },
+        "studentName": { "type": "string" },
+        "studentLevel": { "type": "string" },
+        "isCompleted": { "type": "boolean" },
+        "score": { "type": "number" },
+        "submittedAt": { "type": "string", "format": "date-time" },
+        "completedPartsByDay": { "type": "object" },
+        "studentAnswers": {
+          "type": "object",
+          "properties": {
+            "matching": { "type": "object" },
+            "fillInBlanks": { "type": "object" },
+            "sentences": { "type": "object" },
+            "quizAnswers": { "type": "object" }
+          }
+        },
+        "aiEvaluation": { "type": "object" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["studentUid"]
+    },
+    "SessionNotes": {
+      "title": "SessionNotes",
+      "description": "Native Friend in-session notes and recommendations document keyed by session date or ID",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Session note ID or date key" },
+        "sessionDate": { "type": "string", "description": "Session date (YYYY-MM-DD)" },
+        "lessonId": { "type": "string", "description": "Associated lesson identifier" },
+        "studentEmail": { "type": "string", "format": "email", "description": "Student email" },
+        "studentUid": { "type": "string", "description": "Student UID" },
+        "teacherEmail": { "type": "string", "format": "email", "description": "Teacher email" },
+        "teacherName": { "type": "string", "description": "Teacher name" },
+        "topic": { "type": "string", "description": "Session topic" },
+        "content": { "type": "string", "description": "Free-form notes, vocabulary, pronunciation, and recommendations" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["sessionDate", "studentEmail", "content"]
+    }
+  },
+  "firestore": {
+    "/session_notes/{noteId}": {
+      "schema": "SessionNotes",
+      "description": "Native Friend in-session notes and recommendations keyed by session date or ID"
+    },
+    "/users/{userId}/session_notes/{noteId}": {
+      "schema": "SessionNotes",
+      "description": "In-session notes documents stored under student user record"
+    },
+    "/direct_messages/{messageId}": {
+      "schema": "DirectMessage",
+      "description": "Direct asynchronous messages strictly partitioned between student and active native friend"
+    },
+    "/app_state/{docId}": {
+      "schema": "AppState",
+      "description": "Application state document for server synchronization"
+    },
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profiles partitioned by user UID"
+    },
+    "/users/{userId}/vocabulary/{wordId}": {
+      "schema": "StudentDictionaryEntry",
+      "description": "Personal dictionary words saved by student or teacher"
+    },
+    "/users/{userId}/journal/{entryId}": {
+      "schema": "StudentJournalEntry",
+      "description": "Daily journal entries and AI corrected sentences saved by student"
+    },
+    "/users/{userId}/homework/{homeworkId}": {
+      "schema": "StudentHomeworkProgress",
+      "description": "Weekly homework activity progress subcollection"
+    },
+    "/student_homework/{userId}": {
+      "schema": "StudentHomeworkProgress",
+      "description": "Student weekly homework progress partitioned by student UID or email"
+    },
+    "/users/{userId}/lessons/{lessonId}": {
+      "schema": "LiveLesson",
+      "description": "Live and trial lessons scheduled for the student"
+    },
+    "/users/{userId}/weeklyHistory/{weekId}": {
+      "schema": "WeeklyHistory",
+      "description": "Consolidated weekly history of consumed videos, Spotify tracks, and weekly vocabulary"
+    },
+    "/users/{userId}/currentRoutine/{weekId}": {
+      "schema": "StudentCurrentRoutine",
+      "description": "Weekly routine tracking with real-time Spotify track and teacher recommendations"
+    },
+    "/users/{userId}/routines/{dayOfWeek}": {
+      "schema": "StudentDailyRoutine",
+      "description": "Student daily routine video and topic selection persisted by day of week"
+    },
+    "/tutors/{tutorId}": {
+      "schema": "Tutor",
+      "description": "Native Friend profiles"
+    },
+    "/lessons/{lessonId}": {
+      "schema": "LiveLesson",
+      "description": "Live scheduled lessons"
+    },
+    "/student_assignments/{userId}": {
+      "schema": "StudentMediaAssignments",
+      "description": "Student media assignments partitioned by user UID"
+    },
+    "/teacher_availability/{userId}": {
+      "schema": "TeacherAvailability",
+      "description": "Teacher availability schedule partitioned by teacher UID or ID"
+    }
+  }
+}
