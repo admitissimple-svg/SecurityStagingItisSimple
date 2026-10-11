@@ -8,7 +8,7 @@ if (!process.env.FIREBASE_PROJECT_ID) {
   process.env.FIREBASE_PROJECT_ID = 'itissimple-security-staging';
 }
 if (!process.env.FIREBASE_DATABASE_ID) {
-  process.env.FIREBASE_DATABASE_ID = '(defaut)';
+  process.env.FIREBASE_DATABASE_ID = '(default)';
 }
 
 // Check if running within tsx or already bootstrapped

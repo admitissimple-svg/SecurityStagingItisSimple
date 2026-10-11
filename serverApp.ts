@@ -9,7 +9,7 @@ if (!process.env.FIREBASE_PROJECT_ID) {
   process.env.FIREBASE_PROJECT_ID = 'itissimple-security-staging';
 }
 if (!process.env.FIREBASE_DATABASE_ID) {
-  process.env.FIREBASE_DATABASE_ID = '(defaut)';
+  process.env.FIREBASE_DATABASE_ID = '(default)';
 }
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
@@ -44,6 +44,7 @@ import {
   saveWeeklyChecksToFirestore,
   fetchHomeworkFromFirestore,
   saveHomeworkToFirestore,
+  isPermissionError,
 } from './src/serverFirestore';
 import { DEFAULT_CURATED_PLAYLISTS } from './src/utils/youtubeService';
 import {
@@ -574,7 +575,9 @@ function writeDb(db: AppDb) {
   if (syncTimeout) clearTimeout(syncTimeout);
   syncTimeout = setTimeout(() => {
     saveAppStateToFirestore(db).catch((err) => {
-      console.warn('Background Firestore sync error:', err);
+      if (!isPermissionError(err)) {
+        console.warn('Background Firestore sync error:', err);
+      }
     });
   }, 300);
 }
@@ -588,7 +591,9 @@ async function writeDbSync(db: AppDb): Promise<void> {
   }
   // Run Firestore sync in background without blocking the HTTP response
   saveAppStateToFirestore(db).catch((err) => {
-    console.warn('Background Firestore sync error:', err);
+    if (!isPermissionError(err)) {
+      console.warn('Background Firestore sync error:', err);
+    }
   });
 }
 
@@ -9005,7 +9010,9 @@ async function syncYouTubePlaylistsFromApi(force = false, oauthToken?: string): 
       writeDb(db);
       lastYouTubeSyncTime = Date.now();
       saveYouTubePlaylistsToFirestore(channelPlaylists).catch((err) => {
-        console.warn('Firestore saveYouTubePlaylists error:', err);
+        if (!isPermissionError(err)) {
+          console.warn('Firestore saveYouTubePlaylists error:', err);
+        }
       });
       return channelPlaylists;
     }
@@ -9160,7 +9167,9 @@ app.post('/api/youtube-playlists/save', async (req, res) => {
   writeDb(db);
   lastYouTubeSyncTime = Date.now();
   saveYouTubePlaylistsToFirestore(playlists).catch((err) => {
-    console.warn('saveYouTubePlaylistsToFirestore notice:', err);
+    if (!isPermissionError(err)) {
+      console.warn('saveYouTubePlaylistsToFirestore notice:', err);
+    }
   });
   res.json({ success: true, count: playlists.length, playlists });
 });
