@@ -1260,3 +1260,13 @@ export async function saveHomeworkToFirestore(
     return false;
   }
 }
+
+export function isPermissionError(err: any): boolean {
+  if (!err) return false;
+  return (
+    err?.code === 7 ||
+    err?.code === 'permission-denied' ||
+    String(err?.message || '').includes('PERMISSION_DENIED') ||
+    String(err?.message || '').includes('Missing or insufficient permissions')
+  );
+}
