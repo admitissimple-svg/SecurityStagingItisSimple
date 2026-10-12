@@ -68,13 +68,8 @@ export const ACTIVE_OAUTH_CLIENT_ID = resolveClientEnv(
   'oAuthClientId'
 );
 
-// Utilização do banco Firestore configurado com fallback seguro
-export const ACTIVE_FIREBASE_DATABASE_ID =
-  resolveClientEnv(
-    typeof import.meta !== 'undefined' ? (import.meta as any).env?.VITE_FIREBASE_DATABASE_ID : undefined,
-    'VITE_FIREBASE_DATABASE_ID',
-    'firestoreDatabaseId'
-  ) || (appletConfig as any)?.firestoreDatabaseId || '(default)';
+// Utilização exclusiva do banco Firestore (default)
+export const ACTIVE_FIREBASE_DATABASE_ID = '(default)';
 export const ACTIVE_FIRESTORE_DATABASE_ID = ACTIVE_FIREBASE_DATABASE_ID;
 
 // Validação estrita das configurações obrigatórias na inicialização
@@ -168,8 +163,8 @@ export const app = !getApps().length ? initializeApp(firebaseAppConfig) : getApp
 
 export const auth = getAuth(app);
 
-// Utiliza a instância do Firestore vinculada ao banco configurado
-export const db = getFirestore(app, ACTIVE_FIREBASE_DATABASE_ID);
+// Utiliza estritamente a instância (default) do Firestore
+export const db = getFirestore(app);
 
 // Google Auth Provider
 export const googleAuthProvider = new GoogleAuthProvider();
