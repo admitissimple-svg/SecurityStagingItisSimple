@@ -11,10 +11,10 @@ FROM node:22-alpine AS builder
 WORKDIR /app
 
 # Copy dependency manifests
-COPY package.json bun.lock* ./
+COPY package.json package-lock.json ./
 
-# Install all dependencies (including devDependencies required for Vite and Tailwind build)
-RUN npm install --legacy-peer-deps
+# Install all dependencies strictly via npm ci (no fallback to npm install)
+RUN npm ci --legacy-peer-deps
 
 # Copy frontend source files and configuration
 COPY vite.config.ts tsconfig.json index.html ./
@@ -26,7 +26,6 @@ COPY firebase-applet-config.json ./
 RUN rm -f src/data/app_db.json
 
 # Build production bundle into /app/dist
-COPY firebase-applet-config.json ./
 RUN npm run build
 
 # Stage 2: Runtime image for Node.js, Express, TypeScript (tsx)
@@ -42,10 +41,10 @@ ENV FIREBASE_DATABASE_ID=(default)
 # Cloud Run injects PORT dynamically at runtime (defaults to 8080)
 ENV PORT=8080
 
-# Install production dependencies and TypeScript execution engine (tsx)
-# --include=dev explicitly guarantees tsx and typescript are installed even with devDependencies classification
-COPY package.json bun.lock* ./
-RUN npm install --omit=dev --legacy-peer-deps && npm install --include=dev tsx typescript --legacy-peer-deps
+# Install production dependencies strictly via npm ci (no fallback to npm install)
+# tsx is declared in dependencies and executed directly with node --import tsx
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --legacy-peer-deps
 
 # Set production environment for runtime
 ENV NODE_ENV=production
@@ -59,7 +58,6 @@ COPY serverApp.ts ./
 COPY firebase-applet-config.json ./
 COPY src/ ./src/
 COPY public/ ./public/
-COPY firebase-applet-config.json ./
 COPY privacy.html ./
 
 # Guarantee that local app_db.json and local backups are strictly absent from runner image

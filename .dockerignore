@@ -1,17 +1,65 @@
+# ==============================================================================
+# .dockerignore — SecurityStagingItisSimple
+# Bloqueio rigoroso de credenciais, arquivos de ambiente, bancos locais e backups
+# Preservando todos os arquivos legítimos de build e configuração da aplicação
+# ==============================================================================
+
+# 1. Dependências locais e caches de compilação
 node_modules
-.git
-.gitignore
-.dockerignore
-Dockerfile.txt
 dist
-test
-docs
-.env*
-*.md
 .aistudio
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# 2. Versionamento e metadados de repositório
+.git
+.gitignore
+.dockerignore
+Dockerfile.txt
 .DS_Store
+
+# 3. Documentação e suítes de teste
+docs
+test
+*.md
+
+# 4. Arquivos de ambiente e segredos locais
+.env
+.env.*
+.env*
+*.env
+
+# 5. Credenciais, certificados e chaves privadas
+*.pem
+*.key
+*.p12
+*.pfx
+*serviceAccountKey*.json
+*service-account*.json
+*credential*.json
+*credentials*.json
+id_rsa*
+id_ecdsa*
+id_ed25519*
+.gcloud*
+*.credentials
+private_key*
+*secret*
+
+# 6. Bancos de dados locais e arquivos de estado legados
 src/data/app_db.json
+src/data/app_db*.json
+*.db
+*.sqlite
+*.sqlite3
+*.sql
+
+# 7. Arquivos de backup, dumps e versões obsoletas
 src/data/*.backup.json
+*backup*.json
+*.bak
+*.backup
+*.old
+*.orig
+*dump*

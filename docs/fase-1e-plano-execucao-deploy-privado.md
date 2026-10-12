@@ -2,7 +2,7 @@
 
 **Projeto exclusivo:** `itissimple-security-staging`  
 **Escopo:** Procedimento Operacional Definitivo, Playbook de Comandos `gcloud`, Checklist de Validação Pré e Pós-Deploy do Backend Diagnóstico no Google Cloud Run  
-**Status Atual:** **PRONTO PARA REVISÃO — DEPLOY NÃO EXECUTADO** (Aguardando autorização explícita do operador).
+**Status Atual:** **PRONTO PARA REVISÃO — DEPLOY NÃO EXECUTADO** (Autenticação Interna do Diagnóstico: **PENDENTE DE HOMOLOGAÇÃO** — aguardando autorização explícita do operador).
 
 ---
 
@@ -16,6 +16,7 @@
 | **1.4** | **Garantia de `DIAGNOSTIC_ONLY=true` Ativo** | **CONFIRMADO** | Definido expressamente no `Dockerfile` (`ENV DIAGNOSTIC_ONLY=true`) e reforçado no comando de deploy (`--set-env-vars DIAGNOSTIC_ONLY=true`). O bootloader `server.ts` carrega apenas `diagnosticApp.ts`; o módulo de negócio `serverApp.ts` não é importado em memória. |
 | **1.5** | **Serviço 100% Privado com Exigência de `roles/run.invoker`** | **CONFIRMADO** | Implantação configurada com `--no-allow-unauthenticated`. Toda requisição anônima ou sem permissão IAM é barrada no Google Front End (GFE) antes de atingir o container. Camada de defesa em profundidade no middleware da aplicação revalida o token e a allowlist. |
 | **1.6** | **Indisponibilidade Total de Rotas de Negócio** | **CONFIRMADO** | No `diagnosticApp.ts`, apenas `/health` e `/api/diagnostic/firestore` estão registrados. Chamadas para `/api/tutors`, `/api/students`, `/api/auth/*` ou qualquer outra rota de negócio retornam invariavelmente `HTTP 404 Not Found` (`diagnosticMode: true`). |
+| **1.7** | **Autenticação Interna do Diagnóstico Cloud Run** | **PENDENTE DE HOMOLOGAÇÃO** | A homologação fim-a-fim da autenticação do diagnóstico com tokens OIDC gerados na nuvem permanece estritamente como **PENDENTE DE HOMOLOGAÇÃO** até a efetivação do primeiro deploy privado autorizado pelo operador. A suíte local de testes valida e garante a conformidade de todos os fluxos defensivos. |
 
 ---
 

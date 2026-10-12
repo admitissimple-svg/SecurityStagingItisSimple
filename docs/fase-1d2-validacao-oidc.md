@@ -2,7 +2,7 @@
 
 **Projeto Exclusivo:** `itissimple-security-staging`  
 **Escopo:** Validação criptográfica de Audience, Eliminação Total de Curingas, Allowlist Explícita de Identidades, Anti-Confusão com Firebase Auth e Testes Negativos  
-**Status:** Validação e baterias de testes 100% concluídas. **Nenhum deploy realizado, nenhuma infraestrutura ou permissão IAM concedida.**
+**Status:** Validação e baterias de testes 100% concluídas. Autenticação Interna do Diagnóstico Cloud Run: **PENDENTE DE HOMOLOGAÇÃO**. **Nenhum deploy realizado, nenhuma infraestrutura ou permissão IAM concedida.**
 
 ---
 
