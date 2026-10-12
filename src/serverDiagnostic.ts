@@ -6,6 +6,15 @@ import { resolveProjectId, ALLOWED_STAGING_PROJECT_ID } from './serverFirebaseAd
 
 const googleAuthClient = new OAuth2Client();
 
+let firestoreDbResolver: () => any = getFirestoreDb;
+
+export function setFirestoreDbResolverForTesting(resolver: (() => any) | null): void {
+  if (process.env.NODE_ENV !== 'test') {
+    throw new Error('SECURITY VIOLATION: Test resolver only available in test mode.');
+  }
+  firestoreDbResolver = resolver || getFirestoreDb;
+}
+
 /**
  * Project and database constraints strictly locked to staging.
  * Legacy project IDs (e.g. itissimple-8663d) are explicitly forbidden.
@@ -13,6 +22,8 @@ const googleAuthClient = new OAuth2Client();
 export const DIAGNOSTIC_PROJECT_ID = 'itissimple-security-staging';
 export const DIAGNOSTIC_DATABASE_ID = '(default)';
 export const DIAGNOSTIC_COLLECTION = '_diagnostic_probes';
+export const DIAGNOSTIC_DOCUMENT_ID = 'connectivity_check';
+export const DIAGNOSTIC_DOCUMENT_PATH = `${DIAGNOSTIC_COLLECTION}/${DIAGNOSTIC_DOCUMENT_ID}`;
 
 /**
  * Checks if the server is running in DIAGNOSTIC_ONLY mode.
@@ -175,64 +186,73 @@ export interface DiagnosticOperationTiming {
 
 export interface FirestoreProbeResult {
   success: boolean;
+  status: 'connected' | 'error';
   diagnosticMode: boolean;
   projectId: string;
   databaseId: string;
   serviceAccount: string;
   serviceAccountSource: string;
   collection: string;
-  probeId: string;
-  operations: {
-    write: DiagnosticOperationTiming;
+  documentId: string;
+  documentPath: string;
+  documentExists: boolean;
+  probeType: 'single_document_read';
+  operation: {
+    type: 'get';
+    status: 'confirmed' | 'failed';
+    durationMs: number;
+    error?: string;
+  };
+  operations?: {
     read: DiagnosticOperationTiming;
-    delete: DiagnosticOperationTiming;
   };
   totalDurationMs: number;
   timestamp: string;
   error?: string;
-  failedStep?: 'initialization' | 'project_validation' | 'write' | 'read' | 'delete';
+  failedStep?: 'initialization' | 'project_validation' | 'read';
   code?: string | number;
 }
 
 /**
- * Executes a REAL, synchronous probe against Cloud Firestore in project `itissimple-security-staging`.
+ * Executes a REAL, read-only diagnostic probe against Cloud Firestore in project `itissimple-security-staging`.
  *
- * Guarantees:
+ * Invariants (Fase 1A):
  * 1. Strictly bound to `itissimple-security-staging` and database `(default)`.
- * 2. Uses exclusively the temporary `_diagnostic_probes` collection.
+ * 2. Never accesses or modifies `itissimple-8663d`.
  * 3. Never writes to `app_db.json`.
- * 4. Never uses `isCloudWriteDisabled` or local memory fallbacks.
- * 5. Awaits confirmation for write, read, and delete sequentially.
- * 6. Returns explicit error if Firestore is unavailable or permissions are denied.
- * 7. Never exposes tokens, secrets, or private keys.
+ * 4. Never creates, modifies, or deletes any documents (Zero set(), Zero add(), Zero delete()).
+ * 5. Executes a single `get()` operation on `_diagnostic_probes/connectivity_check`.
+ * 6. Validates project ID and database ID explicitly prior to the read operation.
+ * 7. Returns structured connectivity results without exposing credentials or document content.
+ * 8. Never uses mocks as proof of real cloud connectivity.
  */
 export async function executeFirestoreDiagnosticProbe(): Promise<FirestoreProbeResult> {
   const t0 = Date.now();
   const timestamp = new Date().toISOString();
-  const probeId = `probe_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 
   // 1. Service Account verification
   const saInfo = await getExecutionServiceAccount();
 
-  // 2. Project ID validation
+  // 2. Project ID validation (strictly itissimple-security-staging)
   let configuredProjectId = '';
   try {
     configuredProjectId = resolveProjectId();
   } catch (err: any) {
     return {
       success: false,
+      status: 'error',
       diagnosticMode: isDiagnosticMode(),
       projectId: process.env.FIREBASE_PROJECT_ID || 'undefined',
       databaseId: DIAGNOSTIC_DATABASE_ID,
       serviceAccount: saInfo.serviceAccount,
       serviceAccountSource: saInfo.source,
       collection: DIAGNOSTIC_COLLECTION,
-      probeId,
-      operations: {
-        write: { status: 'failed', durationMs: 0 },
-        read: { status: 'failed', durationMs: 0 },
-        delete: { status: 'failed', durationMs: 0 },
-      },
+      documentId: DIAGNOSTIC_DOCUMENT_ID,
+      documentPath: DIAGNOSTIC_DOCUMENT_PATH,
+      documentExists: false,
+      probeType: 'single_document_read',
+      operation: { type: 'get', status: 'failed', durationMs: 0, error: err.message },
+      operations: { read: { status: 'failed', durationMs: 0, error: err.message } },
       totalDurationMs: Date.now() - t0,
       timestamp,
       failedStep: 'project_validation',
@@ -244,17 +264,29 @@ export async function executeFirestoreDiagnosticProbe(): Promise<FirestoreProbeR
   if (configuredProjectId !== DIAGNOSTIC_PROJECT_ID) {
     return {
       success: false,
+      status: 'error',
       diagnosticMode: isDiagnosticMode(),
       projectId: configuredProjectId,
       databaseId: DIAGNOSTIC_DATABASE_ID,
       serviceAccount: saInfo.serviceAccount,
       serviceAccountSource: saInfo.source,
       collection: DIAGNOSTIC_COLLECTION,
-      probeId,
+      documentId: DIAGNOSTIC_DOCUMENT_ID,
+      documentPath: DIAGNOSTIC_DOCUMENT_PATH,
+      documentExists: false,
+      probeType: 'single_document_read',
+      operation: {
+        type: 'get',
+        status: 'failed',
+        durationMs: 0,
+        error: `Refusing diagnostic probe on unauthorized project '${configuredProjectId}'. Strictly required: '${DIAGNOSTIC_PROJECT_ID}'.`,
+      },
       operations: {
-        write: { status: 'failed', durationMs: 0 },
-        read: { status: 'failed', durationMs: 0 },
-        delete: { status: 'failed', durationMs: 0 },
+        read: {
+          status: 'failed',
+          durationMs: 0,
+          error: `Refusing diagnostic probe on unauthorized project '${configuredProjectId}'. Strictly required: '${DIAGNOSTIC_PROJECT_ID}'.`,
+        },
       },
       totalDurationMs: Date.now() - t0,
       timestamp,
@@ -264,22 +296,34 @@ export async function executeFirestoreDiagnosticProbe(): Promise<FirestoreProbeR
     };
   }
 
-  // 3. Database ID validation
+  // 3. Database ID validation (strictly (default))
   const targetDatabaseId = (process.env.FIREBASE_DATABASE_ID || DIAGNOSTIC_DATABASE_ID).trim();
   if (targetDatabaseId !== DIAGNOSTIC_DATABASE_ID) {
     return {
       success: false,
+      status: 'error',
       diagnosticMode: isDiagnosticMode(),
       projectId: configuredProjectId,
       databaseId: targetDatabaseId,
       serviceAccount: saInfo.serviceAccount,
       serviceAccountSource: saInfo.source,
       collection: DIAGNOSTIC_COLLECTION,
-      probeId,
+      documentId: DIAGNOSTIC_DOCUMENT_ID,
+      documentPath: DIAGNOSTIC_DOCUMENT_PATH,
+      documentExists: false,
+      probeType: 'single_document_read',
+      operation: {
+        type: 'get',
+        status: 'failed',
+        durationMs: 0,
+        error: `Refusing diagnostic probe on unauthorized database '${targetDatabaseId}'. Strictly required: '${DIAGNOSTIC_DATABASE_ID}'.`,
+      },
       operations: {
-        write: { status: 'failed', durationMs: 0 },
-        read: { status: 'failed', durationMs: 0 },
-        delete: { status: 'failed', durationMs: 0 },
+        read: {
+          status: 'failed',
+          durationMs: 0,
+          error: `Refusing diagnostic probe on unauthorized database '${targetDatabaseId}'. Strictly required: '${DIAGNOSTIC_DATABASE_ID}'.`,
+        },
       },
       totalDurationMs: Date.now() - t0,
       timestamp,
@@ -290,21 +334,33 @@ export async function executeFirestoreDiagnosticProbe(): Promise<FirestoreProbeR
   }
 
   // 4. Client initialization
-  const db = getFirestoreDb();
+  const db = firestoreDbResolver();
   if (!db) {
     return {
       success: false,
+      status: 'error',
       diagnosticMode: isDiagnosticMode(),
       projectId: configuredProjectId,
       databaseId: targetDatabaseId,
       serviceAccount: saInfo.serviceAccount,
       serviceAccountSource: saInfo.source,
       collection: DIAGNOSTIC_COLLECTION,
-      probeId,
+      documentId: DIAGNOSTIC_DOCUMENT_ID,
+      documentPath: DIAGNOSTIC_DOCUMENT_PATH,
+      documentExists: false,
+      probeType: 'single_document_read',
+      operation: {
+        type: 'get',
+        status: 'failed',
+        durationMs: 0,
+        error: 'Firestore client is unavailable or failed to initialize Firebase Admin SDK with Application Default Credentials.',
+      },
       operations: {
-        write: { status: 'failed', durationMs: 0 },
-        read: { status: 'failed', durationMs: 0 },
-        delete: { status: 'failed', durationMs: 0 },
+        read: {
+          status: 'failed',
+          durationMs: 0,
+          error: 'Firestore client is unavailable or failed to initialize Firebase Admin SDK with Application Default Credentials.',
+        },
       },
       totalDurationMs: Date.now() - t0,
       timestamp,
@@ -314,189 +370,83 @@ export async function executeFirestoreDiagnosticProbe(): Promise<FirestoreProbeR
     };
   }
 
-  const docRef = db.collection(DIAGNOSTIC_COLLECTION).doc(probeId);
-  const probePayload = {
-    probeId,
-    targetProject: DIAGNOSTIC_PROJECT_ID,
-    databaseId: DIAGNOSTIC_DATABASE_ID,
-    serviceAccount: saInfo.serviceAccount,
-    createdAt: timestamp,
-    purpose: 'staging_backend_diagnostic_probe',
-    testEpochMs: Date.now(),
-  };
-
-  const operations: FirestoreProbeResult['operations'] = {
-    write: { status: 'failed', durationMs: 0 },
-    read: { status: 'failed', durationMs: 0 },
-    delete: { status: 'failed', durationMs: 0 },
-  };
-
-  // Step A: Write operation (await confirmation)
-  const writeStart = Date.now();
-  try {
-    await docRef.set(probePayload);
-    operations.write = {
-      status: 'confirmed',
-      durationMs: Date.now() - writeStart,
-    };
-  } catch (err: any) {
-    operations.write = {
-      status: 'failed',
-      durationMs: Date.now() - writeStart,
-      error: err.message,
-    };
-    return {
-      success: false,
-      diagnosticMode: isDiagnosticMode(),
-      projectId: configuredProjectId,
-      databaseId: targetDatabaseId,
-      serviceAccount: saInfo.serviceAccount,
-      serviceAccountSource: saInfo.source,
-      collection: DIAGNOSTIC_COLLECTION,
-      probeId,
-      operations,
-      totalDurationMs: Date.now() - t0,
-      timestamp,
-      failedStep: 'write',
-      error: `Firestore WRITE failed: ${err.message}`,
-      code: err.code || 'WRITE_FAILED',
-    };
-  }
-
-  // Step B: Read operation (await confirmation & payload integrity)
+  // 5. Single Read Operation (get() on _diagnostic_probes/connectivity_check)
+  // CRITICAL SECURITY INVARIANTS:
+  // - Zero write operations (no set(), no add(), no update()).
+  // - Zero delete operations (no delete()).
+  // - Document contents/data are NEVER returned or exposed.
+  // - Credentials/secrets are NEVER exposed.
+  const docRef = db.collection(DIAGNOSTIC_COLLECTION).doc(DIAGNOSTIC_DOCUMENT_ID);
   const readStart = Date.now();
+
   try {
     const snap = await docRef.get();
     const readDuration = Date.now() - readStart;
-    if (!snap.exists) {
-      operations.read = {
-        status: 'failed',
-        durationMs: readDuration,
-        error: 'Document written was not found upon immediate read',
-      };
-      // Try to clean up probe document
-      await docRef.delete().catch(() => {});
-      return {
-        success: false,
-        diagnosticMode: isDiagnosticMode(),
-        projectId: configuredProjectId,
-        databaseId: targetDatabaseId,
-        serviceAccount: saInfo.serviceAccount,
-        serviceAccountSource: saInfo.source,
-        collection: DIAGNOSTIC_COLLECTION,
-        probeId,
-        operations,
-        totalDurationMs: Date.now() - t0,
-        timestamp,
-        failedStep: 'read',
-        error: 'Firestore READ verification failed: probe document not found after write.',
-        code: 'READ_NOT_FOUND',
-      };
-    }
 
-    const data = snap.data();
-    if (data?.probeId !== probeId) {
-      operations.read = {
-        status: 'failed',
-        durationMs: readDuration,
-        error: 'Probe document payload mismatch',
-      };
-      await docRef.delete().catch(() => {});
-      return {
-        success: false,
-        diagnosticMode: isDiagnosticMode(),
-        projectId: configuredProjectId,
-        databaseId: targetDatabaseId,
-        serviceAccount: saInfo.serviceAccount,
-        serviceAccountSource: saInfo.source,
-        collection: DIAGNOSTIC_COLLECTION,
-        probeId,
-        operations,
-        totalDurationMs: Date.now() - t0,
-        timestamp,
-        failedStep: 'read',
-        error: 'Firestore READ verification failed: payload mismatch.',
-        code: 'PAYLOAD_MISMATCH',
-      };
-    }
-
-    operations.read = {
-      status: 'confirmed',
-      durationMs: readDuration,
-      verified: true,
-    };
-  } catch (err: any) {
-    operations.read = {
-      status: 'failed',
-      durationMs: Date.now() - readStart,
-      error: err.message,
-    };
-    await docRef.delete().catch(() => {});
     return {
-      success: false,
+      success: true,
+      status: 'connected',
       diagnosticMode: isDiagnosticMode(),
       projectId: configuredProjectId,
       databaseId: targetDatabaseId,
       serviceAccount: saInfo.serviceAccount,
       serviceAccountSource: saInfo.source,
       collection: DIAGNOSTIC_COLLECTION,
-      probeId,
-      operations,
+      documentId: DIAGNOSTIC_DOCUMENT_ID,
+      documentPath: DIAGNOSTIC_DOCUMENT_PATH,
+      documentExists: Boolean(snap.exists),
+      probeType: 'single_document_read',
+      operation: {
+        type: 'get',
+        status: 'confirmed',
+        durationMs: readDuration,
+      },
+      operations: {
+        read: {
+          status: 'confirmed',
+          durationMs: readDuration,
+          verified: true,
+        },
+      },
+      totalDurationMs: Date.now() - t0,
+      timestamp,
+    };
+  } catch (err: any) {
+    const readDuration = Date.now() - readStart;
+    const errCode = err.code || 'FIRESTORE_CONNECTIVITY_ERROR';
+    return {
+      success: false,
+      status: 'error',
+      diagnosticMode: isDiagnosticMode(),
+      projectId: configuredProjectId,
+      databaseId: targetDatabaseId,
+      serviceAccount: saInfo.serviceAccount,
+      serviceAccountSource: saInfo.source,
+      collection: DIAGNOSTIC_COLLECTION,
+      documentId: DIAGNOSTIC_DOCUMENT_ID,
+      documentPath: DIAGNOSTIC_DOCUMENT_PATH,
+      documentExists: false,
+      probeType: 'single_document_read',
+      operation: {
+        type: 'get',
+        status: 'failed',
+        durationMs: readDuration,
+        error: err.message,
+      },
+      operations: {
+        read: {
+          status: 'failed',
+          durationMs: readDuration,
+          error: err.message,
+        },
+      },
       totalDurationMs: Date.now() - t0,
       timestamp,
       failedStep: 'read',
-      error: `Firestore READ failed: ${err.message}`,
-      code: err.code || 'READ_FAILED',
+      error: `Firestore connectivity check failed on read: ${err.message}`,
+      code: errCode,
     };
   }
-
-  // Step C: Delete operation (await confirmation)
-  const deleteStart = Date.now();
-  try {
-    await docRef.delete();
-    const deleteDuration = Date.now() - deleteStart;
-    operations.delete = {
-      status: 'confirmed',
-      durationMs: deleteDuration,
-    };
-  } catch (err: any) {
-    operations.delete = {
-      status: 'failed',
-      durationMs: Date.now() - deleteStart,
-      error: err.message,
-    };
-    return {
-      success: false,
-      diagnosticMode: isDiagnosticMode(),
-      projectId: configuredProjectId,
-      databaseId: targetDatabaseId,
-      serviceAccount: saInfo.serviceAccount,
-      serviceAccountSource: saInfo.source,
-      collection: DIAGNOSTIC_COLLECTION,
-      probeId,
-      operations,
-      totalDurationMs: Date.now() - t0,
-      timestamp,
-      failedStep: 'delete',
-      error: `Firestore DELETE failed: ${err.message}`,
-      code: err.code || 'DELETE_FAILED',
-    };
-  }
-
-  // All 3 operations confirmed successfully
-  return {
-    success: true,
-    diagnosticMode: isDiagnosticMode(),
-    projectId: configuredProjectId,
-    databaseId: targetDatabaseId,
-    serviceAccount: saInfo.serviceAccount,
-    serviceAccountSource: saInfo.source,
-    collection: DIAGNOSTIC_COLLECTION,
-    probeId,
-    operations,
-    totalDurationMs: Date.now() - t0,
-    timestamp,
-  };
 }
 
 export interface IamVerificationResult {
@@ -743,7 +693,21 @@ export async function verifyGoogleCloudIamToken(rawToken: string): Promise<IamVe
 
   const token = rawToken.trim();
 
-  // 1. Guard against Firebase Auth frontend tokens (Anti-credential-confusion)
+  // 1. Guard against tokens with signatures stripped by Cloud Run (SIGNATURE_REMOVED_BY_GOOGLE)
+  if (
+    token.endsWith('.SIGNATURE_REMOVED_BY_GOOGLE') ||
+    token.includes('SIGNATURE_REMOVED_BY_GOOGLE') ||
+    token === 'mock-iam-stripped-signature'
+  ) {
+    return {
+      valid: false,
+      code: 'IAM_SIGNATURE_STRIPPED',
+      error:
+        'Token signature was removed by Google Cloud Run (SIGNATURE_REMOVED_BY_GOOGLE). Cryptographic verification in Express requires the unaltered Google OIDC ID token in the Authorization header.',
+    };
+  }
+
+  // 2. Guard against Firebase Auth frontend tokens (Anti-credential-confusion)
   if (isFirebaseIdToken(token) || token === 'mock-iam-firebase-token') {
     return {
       valid: false,
@@ -929,25 +893,107 @@ export async function verifyGoogleCloudIamToken(rawToken: string): Promise<IamVe
  * 7. Defense-in-depth: guarantees /api/diagnostic/firestore cannot be accessed even if
  *    Cloud Run service is accidentally configured with --allow-unauthenticated.
  */
+export interface ExtractedIamToken {
+  token: string | null;
+  source: 'authorization' | 'x-serverless-authorization' | null;
+  signatureRemovedByGoogle: boolean;
+}
+
+/**
+ * Extracts and classifies an incoming IAM Bearer token from HTTP headers,
+ * respecting Google Cloud Run documented behavior.
+ *
+ * Cloud Run Documented Behavior:
+ * 1. Standard callers supply `Authorization: Bearer <ID_TOKEN>`.
+ *    Cloud Run passes this header completely unaltered to the container,
+ *    retaining full cryptographic signature for in-app verification.
+ * 2. If a caller or IAP supplies `X-Serverless-Authorization: Bearer <ID_TOKEN>`,
+ *    Cloud Run replaces the JWT signature with `SIGNATURE_REMOVED_BY_GOOGLE`
+ *    before passing it to the container.
+ * 3. In-app cryptographic verification (defense-in-depth) cannot verify a token
+ *    whose signature was stripped. To prevent trusting unverified decoded claims,
+ *    tokens with stripped signatures are explicitly flagged and rejected.
+ */
+export function extractIamTokenFromHeaders(headers: Record<string, any>): ExtractedIamToken {
+  const authHeader = typeof headers['authorization'] === 'string' ? headers['authorization'].trim() : null;
+  const serverlessHeader =
+    typeof headers['x-serverless-authorization'] === 'string' ? headers['x-serverless-authorization'].trim() : null;
+
+  const extractBearer = (headerVal: string | null): string | null => {
+    if (!headerVal) return null;
+    const match = headerVal.match(/^Bearer\s+(\S+)$/i);
+    return match ? match[1].trim() : null;
+  };
+
+  const authToken = extractBearer(authHeader);
+  const serverlessToken = extractBearer(serverlessHeader);
+
+  const isSignatureRemoved = (tok: string | null): boolean => {
+    if (!tok) return false;
+    const parts = tok.split('.');
+    return (parts.length === 3 && parts[2] === 'SIGNATURE_REMOVED_BY_GOOGLE') || tok === 'mock-iam-stripped-signature';
+  };
+
+  // 1. Authorization header carries unaltered JWT with signature intact (preferred standard)
+  if (authToken) {
+    return {
+      token: authToken,
+      source: 'authorization',
+      signatureRemovedByGoogle: isSignatureRemoved(authToken),
+    };
+  }
+
+  // 2. X-Serverless-Authorization header
+  if (serverlessToken) {
+    return {
+      token: serverlessToken,
+      source: 'x-serverless-authorization',
+      signatureRemovedByGoogle: isSignatureRemoved(serverlessToken),
+    };
+  }
+
+  return { token: null, source: null, signatureRemovedByGoogle: false };
+}
+
+/**
+ * Authentication middleware protecting the diagnostic probe endpoint against public access.
+ *
+ * Strict Security Rules:
+ * 1. Anonymous access is strictly forbidden (returns 401 Unauthorized).
+ * 2. Does NOT rely on CORS as an authentication mechanism.
+ * 3. NO static secrets: DIAGNOSTIC_AUTH_TOKEN and ADMIN_BEARER_TOKEN dependencies are completely removed.
+ * 4. Enforces Google Cloud native IAM authentication (Bearer Google OIDC ID token).
+ * 5. Verifies cryptographic signature against Google certificates via OAuth2Client.
+ * 6. Never trusts claims simply decoded without signature verification.
+ * 7. Verifies caller email matches authorized staging service accounts or admins.
+ * 8. Defense-in-depth: guarantees /api/diagnostic/firestore cannot be accessed even if
+ *    Cloud Run service is accidentally configured with --allow-unauthenticated.
+ */
 export const diagnosticAuthMiddleware: RequestHandler = async (req: Request, res: Response, next: NextFunction) => {
-  const authHeader = req.headers.authorization;
-  const serverlessHeader = req.headers['x-serverless-authorization'];
+  const { token, source, signatureRemovedByGoogle } = extractIamTokenFromHeaders(req.headers);
 
-  const rawToken =
-    (typeof authHeader === 'string' && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null) ||
-    (typeof serverlessHeader === 'string' && serverlessHeader.startsWith('Bearer ')
-      ? serverlessHeader.slice(7).trim()
-      : null);
-
-  if (!rawToken) {
+  // 1. Rejection of anonymous requests
+  if (!token) {
     return res.status(401).json({
       error: 'Unauthorized',
-      message: 'Access denied: Diagnostic endpoint requires Google Cloud IAM authentication. Anonymous access is strictly forbidden.',
+      message:
+        'Access denied: Diagnostic endpoint requires Google Cloud IAM authentication. Anonymous access is strictly forbidden.',
       code: 'MISSING_IAM_CREDENTIALS',
     });
   }
 
-  const verification = await verifyGoogleCloudIamToken(rawToken);
+  // 2. Cloud Run documented behavior: reject signature removed by Google
+  if (signatureRemovedByGoogle) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message:
+        'Access denied: The token signature was removed by Cloud Run (SIGNATURE_REMOVED_BY_GOOGLE). In-app cryptographic verification requires the unaltered Google OIDC ID token in the Authorization header.',
+      code: 'IAM_SIGNATURE_STRIPPED',
+    });
+  }
+
+  // 3. Cryptographic token verification in Express (never trusts unverified claims)
+  const verification = await verifyGoogleCloudIamToken(token);
 
   if (!verification.valid) {
     return res.status(403).json({
@@ -962,6 +1008,7 @@ export const diagnosticAuthMiddleware: RequestHandler = async (req: Request, res
     email: verification.email,
     sub: verification.sub,
     issuer: verification.issuer,
+    authSource: source,
   };
 
   next();

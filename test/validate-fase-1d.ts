@@ -572,40 +572,40 @@ async function runTests() {
   process.env.FIREBASE_PROJECT_ID = DIAGNOSTIC_PROJECT_ID;
 
   // --------------------------------------------------------------------------
-  console.log('\n--- 6. Diagnóstico Real do Firestore: Leitura, Escrita e Exclusão Seguras ---');
+  console.log('\n--- 6. Diagnóstico Real do Firestore: Sonda de Leitura Única (get()) Segura ---');
   // --------------------------------------------------------------------------
-  // Mock controlado de Firestore para testar probe completo em ambiente local
-  const memoryStore = new Map<string, any>();
+  // Mock controlado de Firestore para testar probe de leitura única em ambiente local
   let writeCalled = false;
   let readCalled = false;
   let deleteCalled = false;
   let targetCollectionUsed = '';
+  let targetDocIdUsed = '';
 
   const mockDiagnosticFirestore: any = {
     projectId: DIAGNOSTIC_PROJECT_ID,
     collection: (colName: string) => {
       targetCollectionUsed = colName;
       return {
-        doc: (docId: string) => ({
-          set: async (data: any) => {
-            writeCalled = true;
-            memoryStore.set(docId, data);
-            return { writeTime: new Date() };
-          },
-          get: async () => {
-            readCalled = true;
-            const exists = memoryStore.has(docId);
-            return {
-              exists,
-              data: () => memoryStore.get(docId),
-            };
-          },
-          delete: async () => {
-            deleteCalled = true;
-            memoryStore.delete(docId);
-            return { writeTime: new Date() };
-          },
-        }),
+        doc: (docId: string) => {
+          targetDocIdUsed = docId;
+          return {
+            set: async () => {
+              writeCalled = true;
+              return { writeTime: new Date() };
+            },
+            get: async () => {
+              readCalled = true;
+              return {
+                exists: true,
+                data: () => ({ dummySecret: 'NEVER_EXPOSE_THIS' }),
+              };
+            },
+            delete: async () => {
+              deleteCalled = true;
+              return { writeTime: new Date() };
+            },
+          };
+        },
       };
     },
   };
@@ -615,31 +615,29 @@ async function runTests() {
   const successfulProbe = await executeFirestoreDiagnosticProbe();
   assert(successfulProbe.success, 'Diagnostic probe executado com sucesso completo no projeto staging');
   assert(targetCollectionUsed === '_diagnostic_probes', 'Operações restritas estritamente à coleção temporária _diagnostic_probes');
-  assert(writeCalled, 'Operação WRITE no Firestore executada e confirmada');
-  assert(readCalled, 'Operação READ no Firestore executada e confirmada');
-  assert(deleteCalled, 'Operação DELETE no Firestore executada e confirmada');
-  assert(successfulProbe.operations.write.status === 'confirmed', 'Status de WRITE registrado como confirmed');
-  assert(successfulProbe.operations.read.status === 'confirmed', 'Status de READ registrado como confirmed');
-  assert(successfulProbe.operations.read.verified === true, 'Leitura confirmou integridade do payload escrito');
-  assert(successfulProbe.operations.delete.status === 'confirmed', 'Status de DELETE registrado como confirmed');
-  assert(memoryStore.size === 0, 'Documento de probe temporário foi completamente excluído ao final do teste');
+  assert(targetDocIdUsed === 'connectivity_check', 'Operação restrita estritamente ao documento connectivity_check');
+  assert(readCalled, 'Operação READ (get()) no Firestore executada e confirmada');
+  assert(!writeCalled, 'ZERO operações de escrita (set()) executadas (Invariante FASE 1A)');
+  assert(!deleteCalled, 'ZERO operações de exclusão (delete()) executadas (Invariante FASE 1A)');
+  assert(successfulProbe.operation.type === 'get', 'Tipo da operação confirmado como "get"');
+  assert(successfulProbe.operation.status === 'confirmed', 'Status da operação confirmado como confirmed');
+  assert(successfulProbe.documentExists === true, 'documentExists identificado como true');
+  assert((successfulProbe as any).dummySecret === undefined, 'Conteúdo do documento Firestore NÃO é exposto no resultado (Zero vazamento)');
   assert(successfulProbe.databaseId === '(default)', 'Banco de dados confirmado exclusivamente como (default)');
 
   // --------------------------------------------------------------------------
   console.log('\n--- 7. Falhas IAM Retornam Erro Explícito (Zero Fallback Local) ---');
   // --------------------------------------------------------------------------
-  // Simula erro de permissão IAM no Firestore (PERMISSION_DENIED, código 7)
+  // Simula erro de permissão IAM no Firestore (PERMISSION_DENIED, código 7) durante get()
   const mockPermissionDeniedFirestore: any = {
     projectId: DIAGNOSTIC_PROJECT_ID,
     collection: () => ({
       doc: () => ({
-        set: async () => {
+        get: async () => {
           const err: any = new Error('7 PERMISSION_DENIED: Missing or insufficient permissions on _diagnostic_probes');
           err.code = 7;
           throw err;
         },
-        get: async () => ({ exists: false }),
-        delete: async () => {},
       }),
     }),
   };
@@ -648,11 +646,11 @@ async function runTests() {
 
   const deniedProbe = await executeFirestoreDiagnosticProbe();
   assert(!deniedProbe.success, 'Falha IAM no Firestore resulta em erro (success: false)');
-  assert(deniedProbe.failedStep === 'write', 'Passo da falha explicitado como "write"');
+  assert(deniedProbe.failedStep === 'read', 'Passo da falha explicitado como "read"');
   assert(deniedProbe.code === 7 || String(deniedProbe.code).includes('PERMISSION_DENIED'), 'Código de erro IAM preservado e explícito');
-  assert(deniedProbe.operations.write.status === 'failed', 'Operação de escrita marcada como failed');
+  assert(deniedProbe.operation.status === 'failed', 'Operação de leitura marcada como failed');
   assert(
-    Boolean(deniedProbe.operations.write.error?.includes('PERMISSION_DENIED')),
+    Boolean(deniedProbe.operation.error?.includes('PERMISSION_DENIED')),
     'Mensagem detalhada da falha retornada sem mascaramento'
   );
 
