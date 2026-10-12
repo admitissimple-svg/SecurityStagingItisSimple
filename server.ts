@@ -57,6 +57,12 @@ if (!isTsx) {
     process.exit(code ?? 0);
   });
 } else {
-  // Running under tsx loader: start full application server
-  await import('./serverApp.ts');
+  // Running under tsx loader: start application server based on execution mode
+  if (process.env.DIAGNOSTIC_ONLY === 'true') {
+    const { startDiagnosticServer } = await import('./src/diagnosticApp.ts');
+    await startDiagnosticServer();
+  } else {
+    await import('./serverApp.ts');
+  }
 }
+

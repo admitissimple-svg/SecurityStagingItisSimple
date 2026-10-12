@@ -5,11 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
+    "dev:diagnostic": "DIAGNOSTIC_ONLY=true tsx server.ts",
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "start": "node server.ts"
+    "test": "tsx test/validate-fase-1d.ts && tsx test/validate-zero-firestore-etapa-a.ts",
+    "start": "node server.ts",
+    "start:diagnostic": "DIAGNOSTIC_ONLY=true node server.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

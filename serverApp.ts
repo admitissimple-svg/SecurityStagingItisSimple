@@ -90,6 +90,11 @@ import {
   getVerifiedUserFromRequest,
 } from './src/middleware/firebaseAuth';
 import { getFirebaseAdminAuth } from './src/serverFirebaseAdmin';
+import {
+  isDiagnosticMode,
+  isAuthorizedOriginStrict,
+  registerDiagnosticRoutes,
+} from './src/serverDiagnostic';
 const rawEnvModel = (process.env.GEMINI_MODEL || '').trim();
 const isInvalidEnvModel = !rawEnvModel || rawEnvModel.includes('1.5') || rawEnvModel.includes('2.0') || rawEnvModel.startsWith('emini');
 const GEMINI_TEXT_MODEL = isInvalidEnvModel ? 'gemini-3.6-flash' : rawEnvModel;
@@ -97,20 +102,39 @@ const ACTIVE_FIREBASE_PROJECT_ID = 'itissimple-security-staging';
 const GEMINI_PROJECT_ID = ACTIVE_FIREBASE_PROJECT_ID;
 
 const app = express();
-const PORT = process.env.APP_PORT ? parseInt(process.env.APP_PORT, 10) : 3000;
+export const PORT = process.env.PORT
+  ? parseInt(process.env.PORT, 10)
+  : (process.env.APP_PORT ? parseInt(process.env.APP_PORT, 10) : 3000);
 
-// Universal CORS & embedding middleware for published app previews, Cloud Run, and cross-account requests
+export { isDiagnosticMode };
+
+/**
+ * Audits and validates incoming origin against strictly authorized exact staging allowlist.
+ * Generic wildcards (*.run.app, *.google.com, *.web.app, *.firebaseapp.com) are completely forbidden.
+ */
+export function isAuthorizedOrigin(origin?: string): boolean {
+  return isAuthorizedOriginStrict(origin);
+}
+
+// Audited CORS & embedding middleware for staging, Cloud Run, and authorized previews
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (origin) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-  } else {
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    if (isAuthorizedOrigin(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      // Strictly set credentials only for verified authorized origins
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+    } else {
+      if (req.method === 'OPTIONS') {
+        return res.status(403).json({ error: 'Forbidden', message: 'CORS policy: origin unauthorized', origin });
+      }
+    }
   }
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
+
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD');
-  res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Range');
+  res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Range, X-Google-Access-Token, X-Serverless-Authorization');
   res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range');
+
 
   // Prevent frame blocking when published or embedded in preview containers
   res.removeHeader('X-Frame-Options');
@@ -118,8 +142,8 @@ app.use((req, res, next) => {
   // Support Firebase Auth Popup & Cross-Account window communication
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
 
-  // Allow iframe embedding across Google AI Studio, Cloud Run, and published previews
-  res.setHeader('Content-Security-Policy', "frame-ancestors 'self' https://*.google.com https://*.run.app https://*.aistudio.google.com https://*.googleusercontent.com *;");
+  // Allow iframe embedding across Google AI Studio, Cloud Run, and authorized previews
+  res.setHeader('Content-Security-Policy', "frame-ancestors 'self' https://*.google.com https://*.run.app https://*.aistudio.google.com https://*.googleusercontent.com;");
 
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
@@ -537,23 +561,25 @@ function loadFromDisk(): AppDb | null {
   return null;
 }
 
-// Hydrate in-memory DB immediately from disk if available
-const initialDiskDb = loadFromDisk();
-if (initialDiskDb) {
-  inMemoryDb = {
-    ...DEFAULT_DB,
-    ...initialDiskDb,
-    authUsers: { ...DEFAULT_DB.authUsers, ...(initialDiskDb.authUsers || {}) },
-    userProfiles: { ...DEFAULT_DB.userProfiles, ...(initialDiskDb.userProfiles || {}) },
-    students: [
-      ...DEFAULT_DB.students.filter(
-        (defS) => !(initialDiskDb.students || []).some((s: any) => (s.email || '').toLowerCase() === (defS.email || '').toLowerCase())
-      ),
-      ...(initialDiskDb.students || []),
-    ],
-  };
-} else {
-  saveToDiskSync(inMemoryDb);
+// Hydrate in-memory DB immediately from disk if available (strictly skipped in DIAGNOSTIC_ONLY mode)
+if (!isDiagnosticMode()) {
+  const initialDiskDb = loadFromDisk();
+  if (initialDiskDb) {
+    inMemoryDb = {
+      ...DEFAULT_DB,
+      ...initialDiskDb,
+      authUsers: { ...DEFAULT_DB.authUsers, ...(initialDiskDb.authUsers || {}) },
+      userProfiles: { ...DEFAULT_DB.userProfiles, ...(initialDiskDb.userProfiles || {}) },
+      students: [
+        ...DEFAULT_DB.students.filter(
+          (defS) => !(initialDiskDb.students || []).some((s: any) => (s.email || '').toLowerCase() === (defS.email || '').toLowerCase())
+        ),
+        ...(initialDiskDb.students || []),
+      ],
+    };
+  } else {
+    saveToDiskSync(inMemoryDb);
+  }
 }
 
 function readDb(): AppDb {
@@ -564,6 +590,9 @@ let syncTimeout: any = null;
 let isCloudHydrated = false;
 
 function writeDb(db: AppDb) {
+  if (isDiagnosticMode()) {
+    return; // Strictly no disk writes or cloud syncing in diagnostic mode
+  }
   inMemoryDb = db;
   saveToDiskSync(db);
 
@@ -584,6 +613,9 @@ function writeDb(db: AppDb) {
 
 // Immediate synchronous memory update + background Cloud Firestore sync
 async function writeDbSync(db: AppDb): Promise<void> {
+  if (isDiagnosticMode()) {
+    return; // Strictly no disk writes or cloud syncing in diagnostic mode
+  }
   inMemoryDb = db;
   saveToDiskSync(db);
   if (!isCloudHydrated) {
@@ -599,6 +631,9 @@ async function writeDbSync(db: AppDb): Promise<void> {
 
 // Initial hydration from Firestore on server startup
 async function initCloudPersistence() {
+  if (isDiagnosticMode()) {
+    return; // Strictly disabled in DIAGNOSTIC_ONLY mode
+  }
   try {
     // Fetch latest state directly from Cloud Firestore
     const cloudState = await fetchAppStateFromFirestore();
@@ -987,9 +1022,30 @@ async function initCloudPersistence() {
   }
 }
 
-// 1. Health Endpoint
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+// Register isolated diagnostic routes (/api/health, /api/diagnostic/health, /api/diagnostic/firestore)
+registerDiagnosticRoutes(app);
+
+// Enforce DIAGNOSTIC_ONLY isolation on business routes:
+// If DIAGNOSTIC_ONLY is active, business routes are strictly unreachable and return 404
+app.use((req, res, next) => {
+  if (isDiagnosticMode()) {
+    const isHealthOrDiagnostic =
+      req.path === '/api/health' ||
+      req.path === '/api/diagnostic/health' ||
+      req.path === '/api/diagnostic/firestore' ||
+      req.path === '/' ||
+      req.path.startsWith('/api/diagnostic');
+
+    if (!isHealthOrDiagnostic) {
+      return res.status(404).json({
+        error: 'Not Found',
+        message: 'Backend is operating in DIAGNOSTIC_ONLY mode. Business routes, authentication, student/tutor management, and payments are strictly not registered.',
+        requestedPath: req.originalUrl,
+        diagnosticMode: true,
+      });
+    }
+  }
+  next();
 });
 
 // Phase 1C-A: backend Firebase ID token verification and trusted role inspection
@@ -12844,7 +12900,22 @@ app.get(['/terms.html', '/terms'], (_req, res) => {
   res.status(404).send('Terms of service not found');
 });
 
-async function startServer() {
+export async function startServer() {
+  if (isDiagnosticMode()) {
+    console.log('[Diagnostic] Backend starting in DIAGNOSTIC_ONLY mode (Project: itissimple-security-staging)');
+    const server = app.listen(PORT, '0.0.0.0', () => {
+      console.log(`[Diagnostic] Dedicated Diagnostic Backend running on http://0.0.0.0:${PORT} (PORT=${PORT})`);
+    });
+    server.on('error', (err: any) => {
+      if (err.code === 'EADDRINUSE') {
+        console.warn(`Port ${PORT} is already in use, listening skipped.`);
+      } else {
+        console.error('Server error event:', err);
+      }
+    });
+    return server;
+  }
+
   // Preload local database into memory immediately
   readDb();
 
@@ -12858,7 +12929,22 @@ async function startServer() {
     isCloudHydrated = true;
   });
 
-  if (process.env.NODE_ENV !== 'production') {
+  const isStandalone = process.env.STANDALONE_BACKEND === 'true' || process.env.BACKEND_ONLY === 'true';
+
+  if (isStandalone) {
+    // Dedicated standalone Express backend mode: zero Vite or React frontend dependencies
+    console.log(`[Backend] Dedicated Cloud Run Express backend running in standalone mode on port ${PORT}`);
+    app.get('/', (_req, res) => {
+      res.json({
+        service: "It's Simple Dedicated Backend API",
+        status: 'online',
+        projectId: process.env.FIREBASE_PROJECT_ID || 'itissimple-security-staging',
+        environment: process.env.NODE_ENV || 'production',
+        port: PORT,
+        timestamp: new Date().toISOString(),
+      });
+    });
+  } else if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
@@ -12869,14 +12955,26 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
+    if (fs.existsSync(distPath)) {
+      app.use(express.static(distPath));
+      app.get('*', (req, res) => {
+        res.sendFile(path.join(distPath, 'index.html'));
+      });
+    } else {
+      app.get('/', (_req, res) => {
+        res.json({
+          service: "It's Simple Dedicated Backend API",
+          status: 'online',
+          projectId: process.env.FIREBASE_PROJECT_ID || 'itissimple-security-staging',
+          port: PORT,
+          timestamp: new Date().toISOString(),
+        });
+      });
+    }
   }
 
   const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`It's Simple Server running on http://localhost:${PORT}`);
+    console.log(`It's Simple Server running on http://0.0.0.0:${PORT} (PORT=${PORT})`);
   });
 
   server.on('error', (err: any) => {
@@ -12886,6 +12984,13 @@ async function startServer() {
       console.error('Server error event:', err);
     }
   });
+
+  return server;
 }
 
-startServer();
+export { app };
+
+// Auto-start server unless disabled for testing
+if (process.env.NODE_ENV !== 'test') {
+  startServer();
+}
