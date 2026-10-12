@@ -34,8 +34,7 @@ FROM node:22-alpine AS runner
 
 WORKDIR /app
 
-# Set production environment and staging target configuration
-ENV NODE_ENV=production
+# Set staging target configuration
 ENV DIAGNOSTIC_ONLY=true
 ENV FIREBASE_PROJECT_ID=itissimple-security-staging
 ENV FIREBASE_DATABASE_ID=(default)
@@ -44,8 +43,12 @@ ENV FIREBASE_DATABASE_ID=(default)
 ENV PORT=8080
 
 # Install production dependencies and TypeScript execution engine (tsx)
+# --include=dev explicitly guarantees tsx and typescript are installed even with devDependencies classification
 COPY package.json bun.lock* ./
-RUN npm install --omit=dev --legacy-peer-deps && npm install tsx typescript --legacy-peer-deps
+RUN npm install --omit=dev --legacy-peer-deps && npm install --include=dev tsx typescript --legacy-peer-deps
+
+# Set production environment for runtime
+ENV NODE_ENV=production
 
 # Copy built frontend assets from builder stage
 COPY --from=builder /app/dist ./dist
