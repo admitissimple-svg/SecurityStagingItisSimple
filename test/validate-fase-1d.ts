@@ -42,6 +42,7 @@ import {
   EXPLICIT_AUTHORIZED_IAM_IDENTITIES,
   isFirebaseIdToken,
   setTestPublicKeyForVerification,
+  extractIamTokenFromHeaders,
   DIAGNOSTIC_PROJECT_ID,
   DIAGNOSTIC_DATABASE_ID,
 } from '../src/serverDiagnostic';
@@ -141,8 +142,23 @@ async function runTests() {
   console.log('--- AVISO CRÍTICO DE ESCOPO:');
   console.log('--- Os testes executados abaixo são estritamente LOCAIS (mocks em memória).');
   console.log('--- Eles NÃO comprovam ainda conectividade real com a rede do Google Cloud Firestore.');
-  console.log('--- A conectividade real será comprovada na nuvem após autorização explícita.');
   console.log('=========================================================================\n');
+
+  let defaultMockReadCalled = false;
+  const initialMockFirestore: any = {
+    projectId: DIAGNOSTIC_PROJECT_ID,
+    collection: (colName: string) => ({
+      doc: (docId: string) => ({
+        set: async () => ({ writeTime: new Date() }),
+        get: async () => {
+          defaultMockReadCalled = true;
+          return { exists: true, data: () => ({ dummySecret: 'NEVER_EXPOSE_THIS' }) };
+        },
+        delete: async () => ({ writeTime: new Date() }),
+      }),
+    }),
+  };
+  setFirebaseAdminFirestoreForTesting(initialMockFirestore);
 
   // --------------------------------------------------------------------------
   console.log('--- 1. Ativação Exclusiva por Configuração de Servidor (Anti-Bypass) ---');
@@ -296,6 +312,100 @@ async function runTests() {
     passedServerlessHeader = true;
   });
   assert(passedServerlessHeader, 'Cabeçalho nativo X-Serverless-Authorization é validado com sucesso');
+
+  // Credencial de aplicação independente via X-Diagnostic-Authorization
+  let passedDiagHeader = false;
+  let attachedDiagInfo: any = null;
+  const mockDiagReq: any = {
+    headers: { 'x-diagnostic-authorization': 'Bearer mock-iam-oidc-token' },
+  };
+  const mockDiagRes: any = {};
+  await diagnosticAuthMiddleware(mockDiagReq, mockDiagRes, () => {
+    passedDiagHeader = true;
+    attachedDiagInfo = mockDiagReq.iamCaller;
+  });
+  assert(passedDiagHeader, 'Middleware autoriza credencial independente em X-Diagnostic-Authorization');
+  assert(attachedDiagInfo?.authSource === 'x-diagnostic-authorization', 'Identifica authSource como x-diagnostic-authorization');
+
+  // Credencial de aplicação via X-App-Authorization
+  let passedAppHeader = false;
+  let attachedAppInfo: any = null;
+  const mockAppReq: any = {
+    headers: { 'x-app-authorization': 'Bearer mock-iam-admin-user' },
+  };
+  const mockAppRes: any = {};
+  await diagnosticAuthMiddleware(mockAppReq, mockAppRes, () => {
+    passedAppHeader = true;
+    attachedAppInfo = mockAppReq.iamCaller;
+  });
+  assert(passedAppHeader, 'Middleware autoriza credencial em X-App-Authorization');
+  assert(attachedAppInfo?.authSource === 'x-app-authorization', 'Identifica authSource como x-app-authorization');
+
+  // Invocação Dual-Header (Cenário Real Cloud Run):
+  // Authorization tem assinatura removida pelo Cloud Run (SIGNATURE_REMOVED_BY_GOOGLE),
+  // porém X-Diagnostic-Authorization fornece a credencial de aplicação independente intacta.
+  const dualHeaderRes = await simulateRequest(diagnosticApp, 'GET', '/api/diagnostic/firestore', {
+    Authorization: 'Bearer mock-iam-stripped-signature',
+    'X-Diagnostic-Authorization': 'Bearer mock-iam-oidc-token',
+  });
+  assert(
+    dualHeaderRes.status === 200,
+    'Invocação dual-header: Authorization stripped + X-Diagnostic-Authorization intacto autoriza com sucesso (200 OK)'
+  );
+  assert(
+    dualHeaderRes.body?.status === 'connected',
+    'Invocação dual-header executa o probe real com sucesso'
+  );
+
+  // Invocação com X-Serverless-Authorization stripped + Authorization intacto
+  const serverlessDualRes = await simulateRequest(diagnosticApp, 'GET', '/api/diagnostic/firestore', {
+    'X-Serverless-Authorization': 'Bearer mock-iam-stripped-signature',
+    Authorization: 'Bearer mock-iam-oidc-token',
+  });
+  assert(
+    serverlessDualRes.status === 200,
+    'Invocação com X-Serverless-Authorization stripped + Authorization intacto autoriza com sucesso (200 OK)'
+  );
+
+  // Rejeição quando APENAS a assinatura removida pelo Cloud Run está presente (sem credencial de aplicação intacta)
+  const onlyStrippedRes = await simulateRequest(diagnosticApp, 'GET', '/api/diagnostic/firestore', {
+    Authorization: 'Bearer mock-iam-stripped-signature',
+  });
+  assert(
+    onlyStrippedRes.status === 403,
+    'Rejeita com 403 Forbidden quando apenas a assinatura stripped pelo Cloud Run está presente'
+  );
+  assert(
+    onlyStrippedRes.body?.code === 'IAM_SIGNATURE_STRIPPED',
+    'Código de erro explícito IAM_SIGNATURE_STRIPPED retornado'
+  );
+  assert(
+    Boolean(onlyStrippedRes.body?.message?.includes('X-Diagnostic-Authorization')),
+    'Mensagem orienta o operador a fornecer a credencial independente via X-Diagnostic-Authorization'
+  );
+
+  // Validação da função extractIamTokenFromHeaders para priorização correta
+  const extractedDual = extractIamTokenFromHeaders({
+    authorization: 'Bearer mock-iam-stripped-signature',
+    'x-diagnostic-authorization': 'Bearer valid-intact-token',
+  });
+  assert(
+    extractedDual.source === 'x-diagnostic-authorization' &&
+      extractedDual.token === 'valid-intact-token' &&
+      !extractedDual.signatureRemovedByGoogle,
+    'extractIamTokenFromHeaders prioriza X-Diagnostic-Authorization intacto sobre Authorization stripped'
+  );
+
+  const extractedServerlessDual = extractIamTokenFromHeaders({
+    'x-serverless-authorization': 'Bearer mock-iam-stripped-signature',
+    authorization: 'Bearer valid-intact-token',
+  });
+  assert(
+    extractedServerlessDual.source === 'authorization' &&
+      extractedServerlessDual.token === 'valid-intact-token' &&
+      !extractedServerlessDual.signatureRemovedByGoogle,
+    'extractIamTokenFromHeaders prioriza Authorization intacto quando X-Serverless-Authorization é stripped'
+  );
 
   // --------------------------------------------------------------------------
   console.log('\n--- 4.1. Validação Final de Identidade OIDC — Testes Negativos & Integridade (Fase 1D.2) ---');
@@ -534,6 +644,83 @@ async function runTests() {
   assert(!cryptoFirebaseRes.valid, 'JWT do Firebase Auth assinado é REJEITADO como credencial IAM');
   assert(cryptoFirebaseRes.code === 'FIREBASE_AUTH_TOKEN_REJECTED', 'Retorna FIREBASE_AUTH_TOKEN_REJECTED impedindo confusão com credenciais do frontend');
 
+  // 11. JWT Criptográfico Real em X-Diagnostic-Authorization com Authorization Stripped
+  // Simula com precisão cirúrgica a requisição HTTP completa no Cloud Run
+  const cryptoDualReq = await simulateRequest(diagnosticApp, 'GET', '/api/diagnostic/firestore', {
+    Authorization: 'Bearer mock-iam-stripped-signature',
+    'X-Diagnostic-Authorization': `Bearer ${validJwt}`,
+  });
+  assert(
+    cryptoDualReq.status === 200,
+    'HTTP com Authorization stripped + X-Diagnostic-Authorization com JWT RSA real autoriza com 200 OK'
+  );
+
+  // 12. JWT Criptográfico Forjado em X-Diagnostic-Authorization é REJEITADO
+  const cryptoForgedDiagReq = await simulateRequest(diagnosticApp, 'GET', '/api/diagnostic/firestore', {
+    Authorization: 'Bearer mock-iam-stripped-signature',
+    'X-Diagnostic-Authorization': `Bearer ${forgedJwt}`,
+  });
+  assert(
+    cryptoForgedDiagReq.status === 403,
+    'JWT forjado em X-Diagnostic-Authorization é REJEITADO com 403 Forbidden'
+  );
+  assert(
+    cryptoForgedDiagReq.body?.code === 'INVALID_IAM_CREDENTIALS',
+    'Retorna INVALID_IAM_CREDENTIALS para assinatura forjada em X-Diagnostic-Authorization'
+  );
+
+  // 13. JWT Criptográfico Expirado em X-Diagnostic-Authorization é REJEITADO
+  const cryptoExpiredDiagReq = await simulateRequest(diagnosticApp, 'GET', '/api/diagnostic/firestore', {
+    Authorization: 'Bearer mock-iam-stripped-signature',
+    'X-Diagnostic-Authorization': `Bearer ${cryptoExpiredJwt}`,
+  });
+  assert(
+    cryptoExpiredDiagReq.status === 403,
+    'JWT expirado em X-Diagnostic-Authorization é REJEITADO com 403 Forbidden'
+  );
+  assert(
+    cryptoExpiredDiagReq.body?.code === 'TOKEN_EXPIRED',
+    'Retorna TOKEN_EXPIRED para token expirado em X-Diagnostic-Authorization'
+  );
+
+  // 14. JWT Criptográfico com Audience Incorreta em X-Diagnostic-Authorization é REJEITADO
+  const cryptoWrongAudDiagReq = await simulateRequest(diagnosticApp, 'GET', '/api/diagnostic/firestore', {
+    Authorization: 'Bearer mock-iam-stripped-signature',
+    'X-Diagnostic-Authorization': `Bearer ${cryptoWrongAudJwt}`,
+  });
+  assert(
+    cryptoWrongAudDiagReq.status === 403,
+    'JWT com audience incorreta em X-Diagnostic-Authorization é REJEITADO com 403 Forbidden'
+  );
+  assert(
+    cryptoWrongAudDiagReq.body?.code === 'INVALID_IAM_AUDIENCE',
+    'Retorna INVALID_IAM_AUDIENCE para token com audience incorreta em X-Diagnostic-Authorization'
+  );
+
+  // 15. JWT Criptográfico com Identidade Não Autorizada em X-Diagnostic-Authorization é REJEITADO
+  const cryptoUnauthDiagReq = await simulateRequest(diagnosticApp, 'GET', '/api/diagnostic/firestore', {
+    Authorization: 'Bearer mock-iam-stripped-signature',
+    'X-Diagnostic-Authorization': `Bearer ${cryptoUnauthorizedJwt}`,
+  });
+  assert(
+    cryptoUnauthDiagReq.status === 403,
+    'JWT com identidade não autorizada em X-Diagnostic-Authorization é REJEITADO com 403 Forbidden'
+  );
+  assert(
+    cryptoUnauthDiagReq.body?.code === 'UNAUTHORIZED_IAM_IDENTITY',
+    'Retorna UNAUTHORIZED_IAM_IDENTITY para identidade não autorizada em X-Diagnostic-Authorization'
+  );
+
+  // 16. Isolamento Rigoroso de Mocks Fora de Ambiente de Teste (Requisito 2)
+  // Fora de NODE_ENV === 'test', tokens simulados são rejeitados categoricamente
+  process.env.NODE_ENV = 'production';
+  const mockTokenInProd = await verifyGoogleCloudIamToken('mock-iam-oidc-token');
+  assert(
+    !mockTokenInProd.valid,
+    'Tokens simulados são categoricamente REJEITADOS fora de NODE_ENV="test" (Requisito 2)'
+  );
+  process.env.NODE_ENV = 'test';
+
   // Desativa chave de teste
   setTestPublicKeyForVerification(null);
   delete process.env.EXPECTED_AUDIENCE;
@@ -742,6 +929,11 @@ async function runTests() {
   assert(
     corsAllowedOptions.status === 200,
     'Preflight OPTIONS para origem autorizada retorna 200 OK'
+  );
+  assert(
+    corsAllowedOptions.headers?.['access-control-allow-headers']?.includes('X-Diagnostic-Authorization') &&
+      corsAllowedOptions.headers?.['access-control-allow-headers']?.includes('X-App-Authorization'),
+    'Preflight OPTIONS expõe X-Diagnostic-Authorization e X-App-Authorization em Access-Control-Allow-Headers'
   );
 
   // --------------------------------------------------------------------------

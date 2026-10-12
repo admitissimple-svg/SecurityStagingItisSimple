@@ -224,21 +224,43 @@ Após a conclusão das etapas de implantação autorizada, o operador deve execu
 
 ### Teste Real 3: Confirmação de Identidade e Projeto Firebase via Chamada Autorizada
 
-- **Comando:**
+> **Separação Arquitetural de Autenticação (Plataforma vs. Aplicação):**  
+> O Google Cloud Run consome o token IAM de invocação e substitui sua assinatura criptográfica por `SIGNATURE_REMOVED_BY_GOOGLE` ao repassá-lo ao container. Para manter a defesa em profundidade sem confiar em cabeçalhos não verificados criptograficamente, o backend diagnóstico aceita a credencial de aplicação independente via `X-Diagnostic-Authorization` (ou aceita `X-Serverless-Authorization` na plataforma e `Authorization` na aplicação).
+
+- **Comando — Método A (Recomendado: Credencial Independente em `X-Diagnostic-Authorization`):**
   ```bash
   # Obter token de identidade OIDC oficial com audience da URL canônica
   export CALLER_TOKEN=$(gcloud auth print-identity-token --audiences="${SERVICE_URL}")
 
-  # Invocar o endpoint de diagnóstico
+  # Invocar o endpoint fornecendo autenticação de plataforma (Authorization) e credencial intacta de aplicação (X-Diagnostic-Authorization)
   curl -s -X GET "${SERVICE_URL}/api/diagnostic/firestore" \
+    -H "Authorization: Bearer ${CALLER_TOKEN}" \
+    -H "X-Diagnostic-Authorization: Bearer ${CALLER_TOKEN}" | jq .
+  ```
+
+- **Comando — Método B (Alternativo: Invocação de Plataforma via `X-Serverless-Authorization`):**
+  ```bash
+  # Cloud Run consome X-Serverless-Authorization e repassa Authorization intacto ao container
+  curl -s -X GET "${SERVICE_URL}/api/diagnostic/firestore" \
+    -H "X-Serverless-Authorization: Bearer ${CALLER_TOKEN}" \
     -H "Authorization: Bearer ${CALLER_TOKEN}" | jq .
   ```
-- **Resultado Esperado:**
+
+- **Resultado Esperado (HTTP 200 OK):**
   - `success: true`
+  - `status: "connected"`
   - `projectId: "itissimple-security-staging"`
   - `databaseId: "(default)"`
   - `serviceAccount: "sa-diagnostic-backend@itissimple-security-staging.iam.gserviceaccount.com"`
   - `serviceAccountSource: "gcp-metadata"`
+
+- **Verificação Negativa de Assinatura Stripped (Defesa em Profundidade):**
+  ```bash
+  # Chamada com apenas Authorization (sem credencial intacta de aplicação)
+  curl -i -X GET "${SERVICE_URL}/api/diagnostic/firestore" \
+    -H "Authorization: Bearer ${CALLER_TOKEN}"
+  ```
+  - **Resultado Esperado:** `HTTP 403 Forbidden` com `code: "IAM_SIGNATURE_STRIPPED"`, comprovando que o container não confia cegamente em tokens com assinaturas removidas.
 
 ### Teste Real 4: Ciclo Completo de Probe no Firestore (`_diagnostic_probes`)
 

@@ -893,31 +893,55 @@ export async function verifyGoogleCloudIamToken(rawToken: string): Promise<IamVe
  * 7. Defense-in-depth: guarantees /api/diagnostic/firestore cannot be accessed even if
  *    Cloud Run service is accidentally configured with --allow-unauthenticated.
  */
+export type IamAuthHeaderSource =
+  | 'x-diagnostic-authorization'
+  | 'x-app-authorization'
+  | 'authorization'
+  | 'x-serverless-authorization';
+
 export interface ExtractedIamToken {
   token: string | null;
-  source: 'authorization' | 'x-serverless-authorization' | null;
+  source: IamAuthHeaderSource | null;
   signatureRemovedByGoogle: boolean;
 }
 
 /**
  * Extracts and classifies an incoming IAM Bearer token from HTTP headers,
- * respecting Google Cloud Run documented behavior.
+ * respecting Google Cloud Run documented behavior and separating platform from application authentication.
  *
- * Cloud Run Documented Behavior:
- * 1. Standard callers supply `Authorization: Bearer <ID_TOKEN>`.
- *    Cloud Run passes this header completely unaltered to the container,
- *    retaining full cryptographic signature for in-app verification.
- * 2. If a caller or IAP supplies `X-Serverless-Authorization: Bearer <ID_TOKEN>`,
- *    Cloud Run replaces the JWT signature with `SIGNATURE_REMOVED_BY_GOOGLE`
- *    before passing it to the container.
- * 3. In-app cryptographic verification (defense-in-depth) cannot verify a token
- *    whose signature was stripped. To prevent trusting unverified decoded claims,
- *    tokens with stripped signatures are explicitly flagged and rejected.
+ * Cloud Run & Application Authentication Separation:
+ * 1. Platform Invocations:
+ *    When a client invokes private Cloud Run using `Authorization: Bearer <ID_TOKEN>`,
+ *    Cloud Run consumes it for IAM platform authorization (`roles/run.invoker`) and strips
+ *    its signature (`.SIGNATURE_REMOVED_BY_GOOGLE`) before forwarding to the container.
+ * 2. Independent Application Authentication:
+ *    To satisfy in-app defense-in-depth without trusting unverified/stripped headers,
+ *    callers provide an independent verifiable Google OIDC ID token in `X-Diagnostic-Authorization: Bearer <ID_TOKEN>`
+ *    (or `X-App-Authorization: Bearer <ID_TOKEN>`). Cloud Run passes custom headers completely unaltered,
+ *    retaining the full cryptographic RSA signature for verification in Express.
+ * 3. Dual-Header Invocations:
+ *    Alternatively, callers may supply the platform token in `X-Serverless-Authorization: Bearer <ID_TOKEN>`
+ *    (consumed by Cloud Run) and the application token in `Authorization: Bearer <ID_TOKEN>`
+ *    (passed unaltered to the container).
+ * 4. Tokens with stripped signatures (SIGNATURE_REMOVED_BY_GOOGLE) are NEVER cryptographically trusted.
  */
 export function extractIamTokenFromHeaders(headers: Record<string, any>): ExtractedIamToken {
-  const authHeader = typeof headers['authorization'] === 'string' ? headers['authorization'].trim() : null;
+  const diagHeader =
+    typeof headers['x-diagnostic-authorization'] === 'string'
+      ? headers['x-diagnostic-authorization'].trim()
+      : null;
+  const appHeader =
+    typeof headers['x-app-authorization'] === 'string'
+      ? headers['x-app-authorization'].trim()
+      : null;
+  const authHeader =
+    typeof headers['authorization'] === 'string'
+      ? headers['authorization'].trim()
+      : null;
   const serverlessHeader =
-    typeof headers['x-serverless-authorization'] === 'string' ? headers['x-serverless-authorization'].trim() : null;
+    typeof headers['x-serverless-authorization'] === 'string'
+      ? headers['x-serverless-authorization'].trim()
+      : null;
 
   const extractBearer = (headerVal: string | null): string | null => {
     if (!headerVal) return null;
@@ -925,6 +949,8 @@ export function extractIamTokenFromHeaders(headers: Record<string, any>): Extrac
     return match ? match[1].trim() : null;
   };
 
+  const diagToken = extractBearer(diagHeader);
+  const appToken = extractBearer(appHeader);
   const authToken = extractBearer(authHeader);
   const serverlessToken = extractBearer(serverlessHeader);
 
@@ -934,21 +960,73 @@ export function extractIamTokenFromHeaders(headers: Record<string, any>): Extrac
     return (parts.length === 3 && parts[2] === 'SIGNATURE_REMOVED_BY_GOOGLE') || tok === 'mock-iam-stripped-signature';
   };
 
-  // 1. Authorization header carries unaltered JWT with signature intact (preferred standard)
-  if (authToken) {
+  // 1. Independent application credentials: prioritize explicit, unaltered headers (never stripped by Cloud Run)
+  if (diagToken && !isSignatureRemoved(diagToken)) {
     return {
-      token: authToken,
-      source: 'authorization',
-      signatureRemovedByGoogle: isSignatureRemoved(authToken),
+      token: diagToken,
+      source: 'x-diagnostic-authorization',
+      signatureRemovedByGoogle: false,
     };
   }
 
-  // 2. X-Serverless-Authorization header
-  if (serverlessToken) {
+  if (appToken && !isSignatureRemoved(appToken)) {
+    return {
+      token: appToken,
+      source: 'x-app-authorization',
+      signatureRemovedByGoogle: false,
+    };
+  }
+
+  // 2. Standard Authorization header if signature is intact (e.g. when platform auth used X-Serverless-Authorization, or in local/test/proxy environments)
+  if (authToken && !isSignatureRemoved(authToken)) {
+    return {
+      token: authToken,
+      source: 'authorization',
+      signatureRemovedByGoogle: false,
+    };
+  }
+
+  // 3. X-Serverless-Authorization header if signature is intact
+  if (serverlessToken && !isSignatureRemoved(serverlessToken)) {
     return {
       token: serverlessToken,
       source: 'x-serverless-authorization',
-      signatureRemovedByGoogle: isSignatureRemoved(serverlessToken),
+      signatureRemovedByGoogle: false,
+    };
+  }
+
+  // 4. Fallback detection for signature-stripped headers:
+  // If headers were provided but all had signatures removed by Cloud Run (and no intact application credential was provided),
+  // return the stripped token flagged so diagnosticAuthMiddleware can return a descriptive 403 error.
+  if (authToken && isSignatureRemoved(authToken)) {
+    return {
+      token: authToken,
+      source: 'authorization',
+      signatureRemovedByGoogle: true,
+    };
+  }
+
+  if (diagToken && isSignatureRemoved(diagToken)) {
+    return {
+      token: diagToken,
+      source: 'x-diagnostic-authorization',
+      signatureRemovedByGoogle: true,
+    };
+  }
+
+  if (appToken && isSignatureRemoved(appToken)) {
+    return {
+      token: appToken,
+      source: 'x-app-authorization',
+      signatureRemovedByGoogle: true,
+    };
+  }
+
+  if (serverlessToken && isSignatureRemoved(serverlessToken)) {
+    return {
+      token: serverlessToken,
+      source: 'x-serverless-authorization',
+      signatureRemovedByGoogle: true,
     };
   }
 
@@ -987,7 +1065,7 @@ export const diagnosticAuthMiddleware: RequestHandler = async (req: Request, res
     return res.status(403).json({
       error: 'Forbidden',
       message:
-        'Access denied: The token signature was removed by Cloud Run (SIGNATURE_REMOVED_BY_GOOGLE). In-app cryptographic verification requires the unaltered Google OIDC ID token in the Authorization header.',
+        'Access denied: The invocation token signature was removed by Google Cloud Run (SIGNATURE_REMOVED_BY_GOOGLE). Under defense-in-depth separation of platform and application authentication, Express requires an independent, verifiable Google OIDC ID token. Please provide an independent application credential via the \'X-Diagnostic-Authorization\' header (e.g. -H "X-Diagnostic-Authorization: Bearer <TOKEN>") or supply the platform token via \'X-Serverless-Authorization\' and the application token via \'Authorization\'.',
       code: 'IAM_SIGNATURE_STRIPPED',
     });
   }
