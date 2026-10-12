@@ -3,6 +3,14 @@ import path from 'path';
 import fs from 'fs';
 import dotenv from 'dotenv';
 dotenv.config();
+
+// Ensure required Firebase environment variables are loaded for staging
+if (!process.env.FIREBASE_PROJECT_ID) {
+  process.env.FIREBASE_PROJECT_ID = 'itissimple-security-staging';
+}
+if (!process.env.FIREBASE_DATABASE_ID) {
+  process.env.FIREBASE_DATABASE_ID = '(default)';
+}
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import {
@@ -36,6 +44,7 @@ import {
   saveWeeklyChecksToFirestore,
   fetchHomeworkFromFirestore,
   saveHomeworkToFirestore,
+  isPermissionError,
 } from './src/serverFirestore';
 import { DEFAULT_CURATED_PLAYLISTS } from './src/utils/youtubeService';
 import {
@@ -78,8 +87,14 @@ import {
   firebaseAuthMiddleware,
   requireAdmin,
   isVerifiedAdminRequest,
+  getVerifiedUserFromRequest,
 } from './src/middleware/firebaseAuth';
 import { getFirebaseAdminAuth } from './src/serverFirebaseAdmin';
+import {
+  isDiagnosticMode,
+  isAuthorizedOriginStrict,
+  registerDiagnosticRoutes,
+} from './src/serverDiagnostic';
 const rawEnvModel = (process.env.GEMINI_MODEL || '').trim();
 const isInvalidEnvModel = !rawEnvModel || rawEnvModel.includes('1.5') || rawEnvModel.includes('2.0') || rawEnvModel.startsWith('emini');
 const GEMINI_TEXT_MODEL = isInvalidEnvModel ? 'gemini-3.6-flash' : rawEnvModel;
@@ -87,20 +102,39 @@ const ACTIVE_FIREBASE_PROJECT_ID = 'itissimple-security-staging';
 const GEMINI_PROJECT_ID = ACTIVE_FIREBASE_PROJECT_ID;
 
 const app = express();
-const PORT = process.env.APP_PORT ? parseInt(process.env.APP_PORT, 10) : 3000;
+export const PORT = process.env.PORT
+  ? parseInt(process.env.PORT, 10)
+  : (process.env.APP_PORT ? parseInt(process.env.APP_PORT, 10) : 3000);
 
-// Universal CORS & embedding middleware for published app previews, Cloud Run, and cross-account requests
+export { isDiagnosticMode };
+
+/**
+ * Audits and validates incoming origin against strictly authorized exact staging allowlist.
+ * Generic wildcards (*.run.app, *.google.com, *.web.app, *.firebaseapp.com) are completely forbidden.
+ */
+export function isAuthorizedOrigin(origin?: string): boolean {
+  return isAuthorizedOriginStrict(origin);
+}
+
+// Audited CORS & embedding middleware for staging, Cloud Run, and authorized previews
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (origin) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-  } else {
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    if (isAuthorizedOrigin(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      // Strictly set credentials only for verified authorized origins
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+    } else {
+      if (req.method === 'OPTIONS') {
+        return res.status(403).json({ error: 'Forbidden', message: 'CORS policy: origin unauthorized', origin });
+      }
+    }
   }
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
+
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD');
-  res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Range');
+  res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Range, X-Google-Access-Token, X-Serverless-Authorization');
   res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range');
+
 
   // Prevent frame blocking when published or embedded in preview containers
   res.removeHeader('X-Frame-Options');
@@ -108,8 +142,8 @@ app.use((req, res, next) => {
   // Support Firebase Auth Popup & Cross-Account window communication
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
 
-  // Allow iframe embedding across Google AI Studio, Cloud Run, and published previews
-  res.setHeader('Content-Security-Policy', "frame-ancestors 'self' https://*.google.com https://*.run.app https://*.aistudio.google.com https://*.googleusercontent.com *;");
+  // Allow iframe embedding across Google AI Studio, Cloud Run, and authorized previews
+  res.setHeader('Content-Security-Policy', "frame-ancestors 'self' https://*.google.com https://*.run.app https://*.aistudio.google.com https://*.googleusercontent.com;");
 
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
@@ -527,23 +561,25 @@ function loadFromDisk(): AppDb | null {
   return null;
 }
 
-// Hydrate in-memory DB immediately from disk if available
-const initialDiskDb = loadFromDisk();
-if (initialDiskDb) {
-  inMemoryDb = {
-    ...DEFAULT_DB,
-    ...initialDiskDb,
-    authUsers: { ...DEFAULT_DB.authUsers, ...(initialDiskDb.authUsers || {}) },
-    userProfiles: { ...DEFAULT_DB.userProfiles, ...(initialDiskDb.userProfiles || {}) },
-    students: [
-      ...DEFAULT_DB.students.filter(
-        (defS) => !(initialDiskDb.students || []).some((s: any) => (s.email || '').toLowerCase() === (defS.email || '').toLowerCase())
-      ),
-      ...(initialDiskDb.students || []),
-    ],
-  };
-} else {
-  saveToDiskSync(inMemoryDb);
+// Hydrate in-memory DB immediately from disk if available (strictly skipped in DIAGNOSTIC_ONLY mode)
+if (!isDiagnosticMode()) {
+  const initialDiskDb = loadFromDisk();
+  if (initialDiskDb) {
+    inMemoryDb = {
+      ...DEFAULT_DB,
+      ...initialDiskDb,
+      authUsers: { ...DEFAULT_DB.authUsers, ...(initialDiskDb.authUsers || {}) },
+      userProfiles: { ...DEFAULT_DB.userProfiles, ...(initialDiskDb.userProfiles || {}) },
+      students: [
+        ...DEFAULT_DB.students.filter(
+          (defS) => !(initialDiskDb.students || []).some((s: any) => (s.email || '').toLowerCase() === (defS.email || '').toLowerCase())
+        ),
+        ...(initialDiskDb.students || []),
+      ],
+    };
+  } else {
+    saveToDiskSync(inMemoryDb);
+  }
 }
 
 function readDb(): AppDb {
@@ -554,6 +590,9 @@ let syncTimeout: any = null;
 let isCloudHydrated = false;
 
 function writeDb(db: AppDb) {
+  if (isDiagnosticMode()) {
+    return; // Strictly no disk writes or cloud syncing in diagnostic mode
+  }
   inMemoryDb = db;
   saveToDiskSync(db);
 
@@ -565,13 +604,18 @@ function writeDb(db: AppDb) {
   if (syncTimeout) clearTimeout(syncTimeout);
   syncTimeout = setTimeout(() => {
     saveAppStateToFirestore(db).catch((err) => {
-      console.warn('Background Firestore sync error:', err);
+      if (!isPermissionError(err)) {
+        console.warn('Background Firestore sync error:', err);
+      }
     });
   }, 300);
 }
 
 // Immediate synchronous memory update + background Cloud Firestore sync
 async function writeDbSync(db: AppDb): Promise<void> {
+  if (isDiagnosticMode()) {
+    return; // Strictly no disk writes or cloud syncing in diagnostic mode
+  }
   inMemoryDb = db;
   saveToDiskSync(db);
   if (!isCloudHydrated) {
@@ -579,12 +623,17 @@ async function writeDbSync(db: AppDb): Promise<void> {
   }
   // Run Firestore sync in background without blocking the HTTP response
   saveAppStateToFirestore(db).catch((err) => {
-    console.warn('Background Firestore sync error:', err);
+    if (!isPermissionError(err)) {
+      console.warn('Background Firestore sync error:', err);
+    }
   });
 }
 
 // Initial hydration from Firestore on server startup
 async function initCloudPersistence() {
+  if (isDiagnosticMode()) {
+    return; // Strictly disabled in DIAGNOSTIC_ONLY mode
+  }
   try {
     // Fetch latest state directly from Cloud Firestore
     const cloudState = await fetchAppStateFromFirestore();
@@ -973,9 +1022,30 @@ async function initCloudPersistence() {
   }
 }
 
-// 1. Health Endpoint
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+// Register isolated diagnostic routes (/api/health, /api/diagnostic/health, /api/diagnostic/firestore)
+registerDiagnosticRoutes(app);
+
+// Enforce DIAGNOSTIC_ONLY isolation on business routes:
+// If DIAGNOSTIC_ONLY is active, business routes are strictly unreachable and return 404
+app.use((req, res, next) => {
+  if (isDiagnosticMode()) {
+    const isHealthOrDiagnostic =
+      req.path === '/api/health' ||
+      req.path === '/api/diagnostic/health' ||
+      req.path === '/api/diagnostic/firestore' ||
+      req.path === '/' ||
+      req.path.startsWith('/api/diagnostic');
+
+    if (!isHealthOrDiagnostic) {
+      return res.status(404).json({
+        error: 'Not Found',
+        message: 'Backend is operating in DIAGNOSTIC_ONLY mode. Business routes, authentication, student/tutor management, and payments are strictly not registered.',
+        requestedPath: req.originalUrl,
+        diagnosticMode: true,
+      });
+    }
+  }
+  next();
 });
 
 // Phase 1C-A: backend Firebase ID token verification and trusted role inspection
@@ -992,6 +1062,11 @@ app.get('/api/auth/verify-session', firebaseAuthMiddleware, (req, res) => {
   });
 });
 
+export const TRUSTED_ADMIN_EMAILS = new Set<string>([
+  'adm.itissimple@gmail.com',
+  'admin@itissimple.com',
+]);
+
 app.post('/api/auth/sync-admin-claims', firebaseAuthMiddleware, async (req, res) => {
   const caller = req.user;
   if (!caller || !caller.uid) {
@@ -999,9 +1074,24 @@ app.post('/api/auth/sync-admin-claims', firebaseAuthMiddleware, async (req, res)
   }
 
   const cleanEmail = (caller.email || '').toLowerCase().trim();
-  const db = readDb();
 
-  const isMasterAdminEmail = cleanEmail === 'adm.itissimple@gmail.com' || cleanEmail === 'admin@itissimple.com';
+  // Rule 1: Caller email must be verified by Firebase Auth
+  if (!caller.email_verified) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Access denied: caller email must be verified to synchronize administrative claims',
+    });
+  }
+
+  // Rule 2: Caller email MUST belong to authoritative administrator email allowlist
+  if (!TRUSTED_ADMIN_EMAILS.has(cleanEmail)) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Access denied: caller is not an authorized administrator',
+    });
+  }
+
+  const db = readDb();
   const isTeacherAdmin = (db.teachers || []).some(
     (t: any) => t.role === 'admin' && (t.email || '').toLowerCase().trim() === cleanEmail
   );
@@ -1011,12 +1101,11 @@ app.post('/api/auth/sync-admin-claims', firebaseAuthMiddleware, async (req, res)
       (u: any) => u.role === 'admin' && (u.email || '').toLowerCase().trim() === cleanEmail
     );
 
-  const isLegitimateAdmin = caller.email_verified && (isMasterAdminEmail || isTeacherAdmin || isAuthUserAdmin);
-
-  if (!isLegitimateAdmin) {
+  const isConfirmedAdmin = isTeacherAdmin || isAuthUserAdmin || cleanEmail === 'adm.itissimple@gmail.com';
+  if (!isConfirmedAdmin) {
     return res.status(403).json({
       error: 'Forbidden',
-      message: 'Access denied: caller is not an authorized administrator',
+      message: 'Access denied: administrator account is not active or recognized in system records',
     });
   }
 
@@ -1713,6 +1802,14 @@ const handleRegistration = async (req: any, res: any) => {
   // 1. ADMIN REGISTRATION (Strictly only 1 admin allowed)
   // ----------------------------------------------------
   if (requestedRole === 'admin') {
+    // Only pre-authorized administrative emails can ever be registered as admin
+    if (!TRUSTED_ADMIN_EMAILS.has(cleanEmail)) {
+      return res.status(403).json({
+        error: 'Forbidden: não é permitido registrar contas de administrador para este endereço de e-mail.',
+        hasAdminRegistered: true,
+      });
+    }
+
     // Check if an admin already exists in authUsers or teachers
     const existingAdminInAuth = Object.values(db.authUsers || {}).find(
       (u: any) => u.role === 'admin' && u.email !== cleanEmail
@@ -2470,10 +2567,84 @@ app.post('/api/landing-content', (req, res) => {
 });
 
 // 2. Teachers / Native Friends Endpoints
-app.get('/api/teachers', (req, res) => {
+app.get('/api/teachers', firebaseAuthMiddleware, requireAdmin, (req, res) => {
   const db = readDb();
   res.json({ teachers: db.teachers || [] });
 });
+
+/**
+ * Strict public DTO allowlist projection for Native Friends catalog.
+ * Guarantees that no private data (email, uid, meetUrl, meetLink, credentials,
+ * tokens, administrative fields, or unknown properties) is ever returned in public catalog.
+ * Preserves ratings, reviews, and teaching counts ONLY when genuinely recorded as numbers (no fake values added).
+ */
+function toPublicTutorDto(t: any): Record<string, any> {
+  const dto: Record<string, any> = {
+    id: String(t.id || ''),
+    name: String(t.name || ''),
+    avatar: String(t.avatar || t.photoUrl || t.picture || ''),
+    photoUrl: String(t.avatar || t.photoUrl || t.picture || ''),
+    country: String(t.country || ''),
+    countryCode: String(t.countryCode || ''),
+    flag: String(t.flag || ''),
+    accent: String(t.accent || ''),
+    headline: String(t.headline || ''),
+    bio: String(t.bio || ''),
+    specialties: Array.isArray(t.specialties) ? t.specialties.filter((s: unknown) => typeof s === 'string') : [],
+    videoIntroUrl: String(t.videoIntroUrl || t.youtubeUrl || t.videoUrl || t.introVideoUrl || ''),
+    youtubeUrl: String(t.youtubeUrl || t.videoIntroUrl || ''),
+    videoUrl: String(t.videoUrl || t.videoIntroUrl || ''),
+    introVideoUrl: String(t.introVideoUrl || t.videoIntroUrl || ''),
+    youtubeEmbedId: String(t.youtubeEmbedId || ''),
+    availableDays: Array.isArray(t.availableDays) ? t.availableDays : [],
+    availableHours: Array.isArray(t.availableHours) ? t.availableHours : [],
+    availableHoursByDay: t.availableHoursByDay && typeof t.availableHoursByDay === 'object' ? t.availableHoursByDay : {},
+    availability: t.availability && typeof t.availability === 'object' ? t.availability : {},
+    isSuperTutor: Boolean(t.isSuperTutor),
+    languagesSpoken: Array.isArray(t.languagesSpoken) ? t.languagesSpoken : [],
+    timezone: String(t.timezone || ''),
+    approvalStatus: 'approved',
+    isApproved: true,
+    status: 'approved',
+    approved: true,
+    role: 'teacher',
+  };
+
+  if (typeof t.pricePerSessionUsd === 'number') {
+    dto.pricePerSessionUsd = t.pricePerSessionUsd;
+  }
+  if (typeof t.pricePerSessionBrl === 'number') {
+    dto.pricePerSessionBrl = t.pricePerSessionBrl;
+  }
+  // Genuine stats only, never fabricate fake metrics:
+  if (typeof t.rating === 'number' && !isNaN(t.rating)) {
+    dto.rating = t.rating;
+  }
+  if (typeof t.reviewsCount === 'number' && !isNaN(t.reviewsCount)) {
+    dto.reviewsCount = t.reviewsCount;
+  }
+  if (typeof t.activeStudents === 'number' && !isNaN(t.activeStudents)) {
+    dto.activeStudents = t.activeStudents;
+  }
+  if (typeof t.lessonsTaught === 'number' && !isNaN(t.lessonsTaught)) {
+    dto.lessonsTaught = t.lessonsTaught;
+  }
+
+  return dto;
+}
+
+/**
+ * Sanitizes administrative / teacher tutor record for authorized viewers,
+ * ensuring no credentials or password fields are ever exposed.
+ */
+function sanitizePrivateTutorRecord(t: any): Record<string, any> {
+  const sanitized = { ...t };
+  delete sanitized.password;
+  delete sanitized.token;
+  delete sanitized.secret;
+  delete sanitized.apiKey;
+  return sanitized;
+}
 
 app.get('/api/tutors', async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
@@ -2516,54 +2687,111 @@ app.get('/api/tutors', async (req, res) => {
     console.warn('Error fetching tutors from Firestore in GET /api/tutors:', err);
   }
 
-  const requesterEmail = ((req.query.email as string) || '').toLowerCase().trim();
-  const role = req.query.role as string;
-  const uid = (req.query.uid as string) || '';
+  // SECURITY HOTFIX — Native Friends Public API Authorization
+  // 1. Authenticate caller strictly via server-verified Firebase ID token.
+  // 2. Reject ANY privilege derivation from query parameters (?admin=true, ?includePending=true, ?role=admin, ?email=..., ?uid=...).
+  const verifiedUser = await getVerifiedUserFromRequest(req);
 
-  const isAdmin =
-    role === 'admin' ||
-    req.query.admin === 'true' ||
-    req.query.includePending === 'true' ||
-    requesterEmail === 'adm.itissimple@gmail.com' ||
-    Boolean(db.authUsers?.[requesterEmail]?.role === 'admin');
+  const isServerVerifiedAdmin = verifiedUser?.role === 'admin';
+  const verifiedCallerUid = verifiedUser?.uid || '';
+  const verifiedCallerEmail = (verifiedUser?.email || '').toLowerCase().trim();
 
-  if (isAdmin) {
-    return res.json(db.tutorsList || []);
+  // Helper to determine if a tutor record is approved
+  const isApprovedTutor = (t: any) => {
+    return Boolean(
+      t.approvalStatus === 'approved' ||
+      t.isApproved === true ||
+      t.status === 'approved' ||
+      t.approved === true
+    );
+  };
+
+  // If server-verified admin: return full listing of tutors for moderation (excluding explicitly deleted ones, credentials stripped)
+  if (isServerVerifiedAdmin) {
+    const adminList = (db.tutorsList || []).filter((t: any) => {
+      const tEmail = (t.email || '').toLowerCase().trim();
+      const tId = (t.id || '').toLowerCase().trim();
+      return !db.deletedTutorEmails?.includes(tEmail) && !db.deletedTutorIds?.includes(tId);
+    });
+    return res.json(adminList.map(sanitizePrivateTutorRecord));
   }
 
-  // Approved tutors are public; pending tutors are visible ONLY to the tutor themselves
-  const list = (db.tutorsList || []).filter((t: any) => {
+  // Non-admin / unauthenticated caller:
+  // - Public catalog accessible without login: returns only approved tutors.
+  // - Authenticated tutor: can additionally consult their OWN pending/unapproved registration,
+  //   without exposing registrations or private fields of any third parties.
+  const filteredList = (db.tutorsList || []).filter((t: any) => {
     const tEmail = (t.email || '').toLowerCase().trim();
     const tId = (t.id || '').toLowerCase().trim();
     if (db.deletedTutorEmails?.includes(tEmail) || db.deletedTutorIds?.includes(tId)) {
       return false;
     }
-    const isApproved =
-      t.approvalStatus === 'approved' ||
-      t.isApproved === true ||
-      t.status === 'approved' ||
-      t.approved === true;
-    if (isApproved) return true;
-    if (requesterEmail && tEmail === requesterEmail) return true;
-    if (uid && t.uid === uid) return true;
+
+    // 1. Approved tutors are public
+    if (isApprovedTutor(t)) {
+      return true;
+    }
+
+    // 2. If caller is an authenticated user (e.g. teacher), only include their OWN record
+    if (verifiedUser && verifiedCallerUid) {
+      const isOwnByUid = Boolean(t.uid && t.uid === verifiedCallerUid);
+      const isOwnById = Boolean(t.id && t.id === verifiedCallerUid);
+      const isOwnByEmail = Boolean(verifiedCallerEmail && tEmail && tEmail === verifiedCallerEmail);
+      if (isOwnByUid || isOwnById || isOwnByEmail) {
+        return true;
+      }
+    }
+
     return false;
   });
-  res.json(list);
+
+  // Projection layer:
+  // - An authenticated teacher consulting their OWN record receives their full profile (with their private fields).
+  // - All third parties and unauthenticated visitors receive strictly the public DTO projection (no email, uid, meetUrl, meetLink).
+  const projectedList = filteredList.map((t: any) => {
+    const tEmail = (t.email || '').toLowerCase().trim();
+    const isOwnRecord = Boolean(
+      verifiedUser &&
+      verifiedCallerUid &&
+      (
+        (t.uid && t.uid === verifiedCallerUid) ||
+        (t.id && t.id === verifiedCallerUid) ||
+        (verifiedCallerEmail && tEmail && tEmail === verifiedCallerEmail)
+      )
+    );
+
+    if (isOwnRecord) {
+      return sanitizePrivateTutorRecord(t);
+    }
+
+    return toPublicTutorDto(t);
+  });
+
+  return res.json(projectedList);
 });
 
 app.post('/api/tutors', async (req, res) => {
   const db = readDb();
-  const newTutor = req.body.tutor || req.body;
-  if (!newTutor || !newTutor.email) {
-    return res.status(400).json({ error: 'Invalid tutor data' });
+  const rawTutor = req.body?.tutor || req.body;
+  if (!rawTutor || !rawTutor.email || typeof rawTutor.email !== 'string') {
+    return res.status(400).json({ error: 'Invalid tutor data: email is required' });
   }
-  const cleanEmail = newTutor.email.toLowerCase().trim();
-  const cleanName = (newTutor.name || '').trim();
+  const cleanEmail = rawTutor.email.toLowerCase().trim();
+  if (!cleanEmail || !cleanEmail.includes('@')) {
+    return res.status(400).json({ error: 'Invalid tutor email' });
+  }
+  const cleanName = (rawTutor.name || '').trim();
+  if (!cleanName) {
+    return res.status(400).json({ error: 'Invalid tutor name' });
+  }
   const cleanNameLower = cleanName.toLowerCase();
-  const tutorId = newTutor.id || `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
+  const tutorId = (rawTutor.id && typeof rawTutor.id === 'string' && rawTutor.id.trim())
+    ? rawTutor.id.trim()
+    : `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
 
   // Audit protection: Check if caller is verified admin
-  const isAdminCaller = await isVerifiedAdminRequest(req);
+  const verifiedCaller = await getVerifiedUserFromRequest(req);
+  const isAdminCaller = verifiedCaller?.role === 'admin';
 
   // Prevent hijacking or overwriting administrator accounts
   const isTargetAdmin =
@@ -2577,19 +2805,22 @@ app.post('/api/tutors', async (req, res) => {
   }
 
   // Reject attempts to update or overwrite existing tutors by email, UID or ID
-  const incomingUid = (newTutor.uid || '').trim();
-  const incomingId = (newTutor.id || '').trim();
+  const incomingUid = (rawTutor.uid && typeof rawTutor.uid === 'string') ? rawTutor.uid.trim() : '';
+  const incomingId = (rawTutor.id && typeof rawTutor.id === 'string') ? rawTutor.id.trim() : '';
+  const verifiedUidForMatch = verifiedCaller?.uid || '';
 
   const existingEmailIdx = (db.tutorsList || []).findIndex(
     (t: any) =>
       (t.email && t.email.toLowerCase() === cleanEmail) ||
       (incomingId && t.id && t.id === incomingId) ||
+      (verifiedUidForMatch && ((t.uid && t.uid === verifiedUidForMatch) || (t.id && t.id === verifiedUidForMatch))) ||
       (incomingUid && ((t.uid && t.uid === incomingUid) || (t.id && t.id === incomingUid)))
   );
 
   const existingTeacherIdx = (db.teachers || []).findIndex(
     (t: any) =>
       (t.email && t.email.toLowerCase() === cleanEmail) ||
+      (verifiedUidForMatch && t.uid && t.uid === verifiedUidForMatch) ||
       (incomingUid && t.uid && t.uid === incomingUid)
   );
 
@@ -2613,42 +2844,101 @@ app.post('/api/tutors', async (req, res) => {
       isExistingUser: true,
     });
   }
-  
-  const rawVideoLink = (newTutor.videoIntroUrl || newTutor.youtubeUrl || newTutor.videoUrl || newTutor.introVideoUrl || '').trim();
-  const extractedVideoId = newTutor.youtubeEmbedId || extractYouTubeVideoId(rawVideoLink) || '';
+
+  // Strict allowlist: Only explicit accepted properties are persisted.
+  // Unknown properties, credentials, passwords, and client-supplied administrative privileges are discarded.
+  const rawVideoLink = String(rawTutor.videoIntroUrl || rawTutor.youtubeUrl || rawTutor.videoUrl || rawTutor.introVideoUrl || '').trim();
+  const extractedVideoId = rawTutor.youtubeEmbedId || extractYouTubeVideoId(rawVideoLink) || '';
 
   // Privilege audit: Non-admin callers CANNOT self-approve or assign approvalStatus
   const resolvedApprovalStatus = isAdminCaller
-    ? (newTutor.approvalStatus || (newTutor.registeredByAdmin ? 'approved' : 'pending'))
+    ? (rawTutor.approvalStatus || (rawTutor.registeredByAdmin ? 'approved' : 'pending'))
     : 'pending';
-  const resolvedIsApproved = isAdminCaller && (resolvedApprovalStatus === 'approved' || newTutor.isApproved === true);
+  const resolvedIsApproved = isAdminCaller && (resolvedApprovalStatus === 'approved' || rawTutor.isApproved === true);
 
-  const tutorEntry = {
-    ...newTutor,
-    name: cleanName,
+  // Identity audit: Do NOT accept arbitrary UID from client as proof of identity; only verified token UID is trusted
+  const resolvedUid = isAdminCaller
+    ? (incomingUid || verifiedCaller?.uid || undefined)
+    : (verifiedCaller?.uid || undefined);
+
+  const tutorEntry: Record<string, any> = {
     id: tutorId,
+    name: cleanName,
     email: cleanEmail,
-    role: 'teacher', // strictly enforce teacher role
-    videoIntroUrl: rawVideoLink,
-    youtubeUrl: rawVideoLink,
-    videoUrl: rawVideoLink,
-    introVideoUrl: rawVideoLink,
-    youtubeEmbedId: extractedVideoId,
+    role: 'teacher', // strictly enforced
     approvalStatus: resolvedApprovalStatus,
     isApproved: resolvedIsApproved,
     status: resolvedApprovalStatus,
     approved: resolvedIsApproved,
-    registeredByAdmin: isAdminCaller && Boolean(newTutor.registeredByAdmin),
-    appliedAt: newTutor.appliedAt || new Date().toISOString(),
+    registeredByAdmin: isAdminCaller && Boolean(rawTutor.registeredByAdmin),
+    appliedAt: rawTutor.appliedAt || new Date().toISOString(),
   };
 
-  // Strip non-permitted privileged/administrative keys
+  if (resolvedUid) {
+    tutorEntry.uid = resolvedUid;
+  }
+
+  // Allowlist of accepted profile properties
+  if (rawTutor.avatar && typeof rawTutor.avatar === 'string') tutorEntry.avatar = rawTutor.avatar.trim();
+  if (rawTutor.photoUrl && typeof rawTutor.photoUrl === 'string') tutorEntry.photoUrl = rawTutor.photoUrl.trim();
+  if (rawTutor.country && typeof rawTutor.country === 'string') tutorEntry.country = rawTutor.country.trim();
+  if (rawTutor.countryCode && typeof rawTutor.countryCode === 'string') tutorEntry.countryCode = rawTutor.countryCode.trim();
+  if (rawTutor.flag && typeof rawTutor.flag === 'string') tutorEntry.flag = rawTutor.flag.trim();
+  if (rawTutor.accent && typeof rawTutor.accent === 'string') tutorEntry.accent = rawTutor.accent.trim();
+  if (rawTutor.headline && typeof rawTutor.headline === 'string') tutorEntry.headline = rawTutor.headline.trim();
+  if (rawTutor.bio && typeof rawTutor.bio === 'string') tutorEntry.bio = rawTutor.bio.trim();
+  if (Array.isArray(rawTutor.specialties)) {
+    tutorEntry.specialties = rawTutor.specialties.filter((s: unknown) => typeof s === 'string');
+  }
+  if (rawVideoLink) {
+    tutorEntry.videoIntroUrl = rawVideoLink;
+    tutorEntry.youtubeUrl = rawVideoLink;
+    tutorEntry.videoUrl = rawVideoLink;
+    tutorEntry.introVideoUrl = rawVideoLink;
+  }
+  if (extractedVideoId) {
+    tutorEntry.youtubeEmbedId = extractedVideoId;
+  }
+
+  const rawUsd = Number(rawTutor.pricePerSessionUsd);
+  if (!isNaN(rawUsd) && rawUsd >= 0) {
+    tutorEntry.pricePerSessionUsd = rawUsd;
+  }
+  const rawBrl = Number(rawTutor.pricePerSessionBrl);
+  if (!isNaN(rawBrl) && rawBrl >= 0) {
+    tutorEntry.pricePerSessionBrl = rawBrl;
+  }
+  if (Array.isArray(rawTutor.availableDays)) tutorEntry.availableDays = rawTutor.availableDays;
+  if (Array.isArray(rawTutor.availableHours)) tutorEntry.availableHours = rawTutor.availableHours;
+  if (rawTutor.availableHoursByDay && typeof rawTutor.availableHoursByDay === 'object') {
+    tutorEntry.availableHoursByDay = rawTutor.availableHoursByDay;
+  }
+  if (rawTutor.availability && typeof rawTutor.availability === 'object') {
+    tutorEntry.availability = rawTutor.availability;
+  }
+  if (Array.isArray(rawTutor.languagesSpoken)) tutorEntry.languagesSpoken = rawTutor.languagesSpoken;
+  if (rawTutor.timezone && typeof rawTutor.timezone === 'string') tutorEntry.timezone = rawTutor.timezone.trim();
+  if (rawTutor.meetUrl && typeof rawTutor.meetUrl === 'string') tutorEntry.meetUrl = rawTutor.meetUrl.trim();
+  if (rawTutor.meetLink && typeof rawTutor.meetLink === 'string') tutorEntry.meetLink = rawTutor.meetLink.trim();
+
+  // Admin-only fields (moderators may set stats/superTutor on creation if needed)
+  if (isAdminCaller) {
+    if (typeof rawTutor.isSuperTutor === 'boolean') tutorEntry.isSuperTutor = rawTutor.isSuperTutor;
+    if (typeof rawTutor.rating === 'number') tutorEntry.rating = rawTutor.rating;
+    if (typeof rawTutor.reviewsCount === 'number') tutorEntry.reviewsCount = rawTutor.reviewsCount;
+    if (typeof rawTutor.activeStudents === 'number') tutorEntry.activeStudents = rawTutor.activeStudents;
+    if (typeof rawTutor.lessonsTaught === 'number') tutorEntry.lessonsTaught = rawTutor.lessonsTaught;
+  }
+
+  // Strip any accidental non-permitted keys
   delete (tutorEntry as any).isAdmin;
   delete (tutorEntry as any).permissions;
   delete (tutorEntry as any).credits;
   delete (tutorEntry as any).isUpdate;
   delete (tutorEntry as any).adminSettings;
   delete (tutorEntry as any).assignedStudents;
+  delete (tutorEntry as any).password;
+  delete (tutorEntry as any).token;
 
   db.tutorsList = db.tutorsList || [];
   db.tutorsList.push(tutorEntry);
@@ -2657,7 +2947,7 @@ app.post('/api/tutors', async (req, res) => {
   db.teachers = db.teachers || [];
   db.teachers.push({
     email: cleanEmail,
-    name: newTutor.name || cleanName,
+    name: cleanName,
     role: 'teacher',
     approvalStatus: resolvedApprovalStatus,
     isApproved: resolvedIsApproved,
@@ -2665,19 +2955,19 @@ app.post('/api/tutors', async (req, res) => {
     approved: resolvedIsApproved,
   });
 
-  // Ensure auth record exists with role 'teacher'
+  // Ensure auth record exists with role 'teacher' - credentials stored separately from tutor public documents
   if (!db.authUsers) db.authUsers = {};
   db.authUsers[cleanEmail] = {
     email: cleanEmail,
-    name: newTutor.name || cleanName,
-    password: newTutor.password || db.authUsers[cleanEmail]?.password || '',
+    name: cleanName,
+    password: rawTutor.password || db.authUsers[cleanEmail]?.password || '',
     role: 'teacher',
     createdAt: db.authUsers[cleanEmail]?.createdAt || new Date().toISOString(),
   };
 
   // Unmark from deleted lists if newly registered or re-registering
   if (db.deletedTutorIds) {
-    db.deletedTutorIds = db.deletedTutorIds.filter((id) => id !== newTutor.id?.toLowerCase() && id !== tutorId.toLowerCase());
+    db.deletedTutorIds = db.deletedTutorIds.filter((id) => id !== rawTutor.id?.toLowerCase() && id !== tutorId.toLowerCase());
   }
   if (db.deletedTutorEmails) {
     db.deletedTutorEmails = db.deletedTutorEmails.filter((em) => em !== cleanEmail);
@@ -2709,7 +2999,7 @@ app.post('/api/tutors', async (req, res) => {
 
   writeDb(db);
 
-  res.json({ success: true, tutor: tutorEntry, tutors: db.tutorsList });
+  res.status(200).json({ success: true, tutor: tutorEntry, tutors: db.tutorsList });
 });
 
 app.put('/api/tutors/:id', firebaseAuthMiddleware, async (req, res) => {
@@ -8776,7 +9066,9 @@ async function syncYouTubePlaylistsFromApi(force = false, oauthToken?: string): 
       writeDb(db);
       lastYouTubeSyncTime = Date.now();
       saveYouTubePlaylistsToFirestore(channelPlaylists).catch((err) => {
-        console.warn('Firestore saveYouTubePlaylists error:', err);
+        if (!isPermissionError(err)) {
+          console.warn('Firestore saveYouTubePlaylists error:', err);
+        }
       });
       return channelPlaylists;
     }
@@ -8931,7 +9223,9 @@ app.post('/api/youtube-playlists/save', async (req, res) => {
   writeDb(db);
   lastYouTubeSyncTime = Date.now();
   saveYouTubePlaylistsToFirestore(playlists).catch((err) => {
-    console.warn('saveYouTubePlaylistsToFirestore notice:', err);
+    if (!isPermissionError(err)) {
+      console.warn('saveYouTubePlaylistsToFirestore notice:', err);
+    }
   });
   res.json({ success: true, count: playlists.length, playlists });
 });
@@ -12606,7 +12900,22 @@ app.get(['/terms.html', '/terms'], (_req, res) => {
   res.status(404).send('Terms of service not found');
 });
 
-async function startServer() {
+export async function startServer() {
+  if (isDiagnosticMode()) {
+    console.log('[Diagnostic] Backend starting in DIAGNOSTIC_ONLY mode (Project: itissimple-security-staging)');
+    const server = app.listen(PORT, '0.0.0.0', () => {
+      console.log(`[Diagnostic] Dedicated Diagnostic Backend running on http://0.0.0.0:${PORT} (PORT=${PORT})`);
+    });
+    server.on('error', (err: any) => {
+      if (err.code === 'EADDRINUSE') {
+        console.warn(`Port ${PORT} is already in use, listening skipped.`);
+      } else {
+        console.error('Server error event:', err);
+      }
+    });
+    return server;
+  }
+
   // Preload local database into memory immediately
   readDb();
 
@@ -12620,7 +12929,22 @@ async function startServer() {
     isCloudHydrated = true;
   });
 
-  if (process.env.NODE_ENV !== 'production') {
+  const isStandalone = process.env.STANDALONE_BACKEND === 'true' || process.env.BACKEND_ONLY === 'true';
+
+  if (isStandalone) {
+    // Dedicated standalone Express backend mode: zero Vite or React frontend dependencies
+    console.log(`[Backend] Dedicated Cloud Run Express backend running in standalone mode on port ${PORT}`);
+    app.get('/', (_req, res) => {
+      res.json({
+        service: "It's Simple Dedicated Backend API",
+        status: 'online',
+        projectId: process.env.FIREBASE_PROJECT_ID || 'itissimple-security-staging',
+        environment: process.env.NODE_ENV || 'production',
+        port: PORT,
+        timestamp: new Date().toISOString(),
+      });
+    });
+  } else if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
@@ -12631,14 +12955,26 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
+    if (fs.existsSync(distPath)) {
+      app.use(express.static(distPath));
+      app.get('*', (req, res) => {
+        res.sendFile(path.join(distPath, 'index.html'));
+      });
+    } else {
+      app.get('/', (_req, res) => {
+        res.json({
+          service: "It's Simple Dedicated Backend API",
+          status: 'online',
+          projectId: process.env.FIREBASE_PROJECT_ID || 'itissimple-security-staging',
+          port: PORT,
+          timestamp: new Date().toISOString(),
+        });
+      });
+    }
   }
 
   const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`It's Simple Server running on http://localhost:${PORT}`);
+    console.log(`It's Simple Server running on http://0.0.0.0:${PORT} (PORT=${PORT})`);
   });
 
   server.on('error', (err: any) => {
@@ -12648,6 +12984,13 @@ async function startServer() {
       console.error('Server error event:', err);
     }
   });
+
+  return server;
 }
 
-startServer();
+export { app };
+
+// Auto-start server unless disabled for testing
+if (process.env.NODE_ENV !== 'test') {
+  startServer();
+}

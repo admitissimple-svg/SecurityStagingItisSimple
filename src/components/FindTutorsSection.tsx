@@ -209,7 +209,12 @@ export const FindTutorsSection: React.FC<FindTutorsSectionProps> = ({
             </div>
           ) : (
             filteredTutors.map((tutor) => {
-              const isSelectedMentor = selectedMentorEmail === tutor.email;
+              const isSelectedMentor = Boolean(
+                selectedMentorEmail && (
+                  (tutor.email && selectedMentorEmail.toLowerCase() === tutor.email.toLowerCase()) ||
+                  (tutor.id && selectedMentorEmail.toLowerCase() === tutor.id.toLowerCase())
+                )
+              );
 
               return (
                 <div

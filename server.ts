@@ -3,6 +3,14 @@ import { spawn } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+// Ensure required Firebase environment variables are loaded for staging
+if (!process.env.FIREBASE_PROJECT_ID) {
+  process.env.FIREBASE_PROJECT_ID = 'itissimple-security-staging';
+}
+if (!process.env.FIREBASE_DATABASE_ID) {
+  process.env.FIREBASE_DATABASE_ID = '(default)';
+}
+
 // Check if running within tsx or already bootstrapped
 const isTsx =
   process.execArgv.some((arg) => arg.includes('tsx')) ||
@@ -49,6 +57,12 @@ if (!isTsx) {
     process.exit(code ?? 0);
   });
 } else {
-  // Running under tsx loader: start full application server
-  await import('./serverApp.ts');
+  // Running under tsx loader: start application server based on execution mode
+  if (process.env.DIAGNOSTIC_ONLY === 'true') {
+    const { startDiagnosticServer } = await import('./src/diagnosticApp.ts');
+    await startDiagnosticServer();
+  } else {
+    await import('./serverApp.ts');
+  }
 }
+
