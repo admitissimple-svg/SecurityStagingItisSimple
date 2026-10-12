@@ -6,7 +6,7 @@
 # ==============================================================================
 
 # Stage 1: Build the Vite frontend application
-FROM node:22-alpine AS builder
+FROM node:24.12-alpine AS builder
 
 WORKDIR /app
 
@@ -30,7 +30,7 @@ COPY firebase-applet-config.json ./
 RUN npm run build
 
 # Stage 2: Runtime image for Node.js, Express, TypeScript (tsx)
-FROM node:22-alpine AS runner
+FROM node:24.12-alpine AS runner
 
 WORKDIR /app
 
