@@ -20,11 +20,13 @@ RUN npm install --legacy-peer-deps
 COPY vite.config.ts tsconfig.json index.html ./
 COPY src/ ./src/
 COPY public/ ./public/
+COPY firebase-applet-config.json ./
 
 # Ensure local database file is never embedded into build assets
 RUN rm -f src/data/app_db.json
 
 # Build production bundle into /app/dist
+COPY firebase-applet-config.json ./
 RUN npm run build
 
 # Stage 2: Runtime image for Node.js, Express, TypeScript (tsx)
@@ -54,6 +56,7 @@ COPY serverApp.ts ./
 COPY firebase-applet-config.json ./
 COPY src/ ./src/
 COPY public/ ./public/
+COPY firebase-applet-config.json ./
 COPY privacy.html ./
 
 # Guarantee that local app_db.json and local backups are strictly absent from runner image
