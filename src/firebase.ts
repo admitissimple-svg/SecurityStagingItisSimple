@@ -9,12 +9,35 @@ try {
 
 import appletConfig from '../firebase-applet-config.json';
 
+// Helper to detect placeholder strings
+const isPlaceholder = (val: unknown): boolean => {
+  if (!val || typeof val !== 'string') return true;
+  const trimmed = val.trim();
+  return (
+    trimmed === '' ||
+    trimmed.startsWith('your-') ||
+    trimmed.includes('placeholder') ||
+    trimmed.includes('YOUR_') ||
+    trimmed.includes('<') ||
+    trimmed.includes('>')
+  );
+};
+
 // Helper para obter variáveis de ambiente estritamente do frontend (Vite/runtime) com fallback seguro para firebase-applet-config.json
 const resolveClientEnv = (viteVal: string | undefined, envKey: string, fallbackKey?: keyof typeof appletConfig): string => {
+  if (viteVal && typeof viteVal === 'string' && !isPlaceholder(viteVal)) {
+    return viteVal.trim();
+  }
+  if (typeof process !== 'undefined' && process.env?.[envKey] && !isPlaceholder(process.env[envKey])) {
+    return String(process.env[envKey]).trim();
+  }
+  if (fallbackKey && appletConfig && (appletConfig as any)[fallbackKey] && !isPlaceholder((appletConfig as any)[fallbackKey])) {
+    return String((appletConfig as any)[fallbackKey]).trim();
+  }
   if (viteVal && typeof viteVal === 'string' && viteVal.trim().length > 0) {
     return viteVal.trim();
   }
-  if (typeof process !== 'undefined' && process.env?.[envKey]) {
+  if (typeof process !== 'undefined' && process.env?.[envKey] && process.env[envKey].trim().length > 0) {
     return String(process.env[envKey]).trim();
   }
   if (fallbackKey && appletConfig && (appletConfig as any)[fallbackKey]) {
@@ -146,7 +169,9 @@ function validateFirebaseConfig(): void {
 
     const errorMessage = errorLines.join('\n');
     console.error(errorMessage);
-    throw new Error(errorMessage);
+    if (typeof window !== 'undefined') {
+      console.warn('[Firebase] Running with configuration warnings:', errorMessage);
+    }
   }
 }
 

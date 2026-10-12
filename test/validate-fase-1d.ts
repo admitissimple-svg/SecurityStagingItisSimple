@@ -769,12 +769,71 @@ async function runTests() {
   const dockerfilePath = path.join(process.cwd(), 'Dockerfile');
   const dockerfileContent = fs.readFileSync(dockerfilePath, 'utf8');
   assert(
+    dockerfileContent.includes('CMD ["node", "--import", "tsx", "server.ts"]') ||
     dockerfileContent.includes('CMD ["node", "server.ts"]'),
-    'Dockerfile define CMD ["node", "server.ts"] para inicialização do container'
+    'Dockerfile define comando de inicialização com suporte a tsx direto (node --import tsx server.ts)'
   );
   assert(
     dockerfileContent.includes('ENV DIAGNOSTIC_ONLY=true'),
     'Dockerfile define expressamente ENV DIAGNOSTIC_ONLY=true para execução no Cloud Run'
+  );
+  assert(
+    dockerfileContent.includes('node:22-alpine'),
+    'Dockerfile utiliza Node.js 22 LTS (Alpine Linux)'
+  );
+  assert(
+    dockerfileContent.includes('ENV FIREBASE_PROJECT_ID=itissimple-security-staging'),
+    'Dockerfile define FIREBASE_PROJECT_ID=itissimple-security-staging como padrão seguro'
+  );
+  assert(
+    dockerfileContent.includes('ENV FIREBASE_DATABASE_ID=(default)'),
+    'Dockerfile define FIREBASE_DATABASE_ID=(default)'
+  );
+  assert(
+    dockerfileContent.includes('ENV PORT=8080') && dockerfileContent.includes('EXPOSE 8080'),
+    'Dockerfile compatível com porta dinâmica 8080 do Google Cloud Run'
+  );
+  assert(
+    !dockerfileContent.includes('serviceAccountKey') &&
+    !dockerfileContent.includes('private_key') &&
+    !dockerfileContent.includes('FIREBASE_TOKEN'),
+    'Dockerfile não incorpora segredos estáticos, tokens ou chaves privadas'
+  );
+
+  // Verificação de .dockerignore para exclusão de app_db.json
+  const dockerignorePath = path.join(process.cwd(), '.dockerignore');
+  const dockerignoreContent = fs.readFileSync(dockerignorePath, 'utf8');
+  assert(
+    dockerignoreContent.includes('src/data/app_db.json'),
+    '.dockerignore impede que src/data/app_db.json seja incorporado à imagem Docker'
+  );
+
+  // Verificação da resolução de porta (suporte a PORT=8080 e validação de portas inválidas)
+  const { parsePort, resolvePort } = await import('../src/diagnosticApp');
+  assert(parsePort('8080') === 8080, 'parsePort resolve 8080 com precisão (Cloud Run standard)');
+  assert(parsePort('3000') === 3000, 'parsePort resolve 3000 com precisão');
+  assert(parsePort(8080) === 8080, 'parsePort suporta número 8080');
+  assert(parsePort('invalid') === null, 'parsePort rejeita valor não numérico "invalid"');
+  assert(parsePort('-1') === null, 'parsePort rejeita porta negativa "-1"');
+  assert(parsePort('0') === null, 'parsePort rejeita porta "0"');
+  assert(parsePort('70000') === null, 'parsePort rejeita porta fora da faixa TCP "70000"');
+  assert(parsePort('') === null, 'parsePort rejeita string vazia');
+  assert(parsePort(undefined) === null, 'parsePort trata undefined com segurança');
+
+  assert(resolvePort('8080', undefined, 3000) === 8080, 'resolvePort prioriza PORT=8080');
+  assert(resolvePort(undefined, '8080', 3000) === 8080, 'resolvePort respeita APP_PORT=8080 quando PORT não existe');
+  assert(resolvePort('invalid', undefined, 3000) === 3000, 'resolvePort faz fallback seguro para 3000 quando PORT é inválido');
+  assert(resolvePort('-5', 'invalid', 3000) === 3000, 'resolvePort faz fallback seguro quando ambas são inválidas');
+
+  // Verificação de inicialização direta tsx (server.ts)
+  const { isTsxEnvironment } = await import('../server');
+  assert(
+    typeof isTsxEnvironment === 'function',
+    'server.ts exporta função helper isTsxEnvironment para inspeção de runtime'
+  );
+  assert(
+    isTsxEnvironment(),
+    'isTsxEnvironment identifica execução atual sob tsx/loader sem processo filho redundante'
   );
 
   resetFirebaseAdminFirestoreForTesting();

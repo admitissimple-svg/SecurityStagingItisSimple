@@ -4,12 +4,68 @@ import fs from 'fs';
 import dotenv from 'dotenv';
 dotenv.config();
 
+import appletConfig from './firebase-applet-config.json';
+
+const isPlaceholder = (val: string | undefined): boolean => {
+  if (!val) return true;
+  const trimmed = val.trim();
+  return (
+    trimmed === '' ||
+    trimmed.startsWith('your-') ||
+    trimmed.includes('placeholder') ||
+    trimmed.includes('YOUR_') ||
+    trimmed.includes('<') ||
+    trimmed.includes('>')
+  );
+};
+
+// Clean non-existent or placeholder credentials file to allow fallback to ADC
+if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+  try {
+    if (!fs.existsSync(process.env.GOOGLE_APPLICATION_CREDENTIALS) || isPlaceholder(process.env.GOOGLE_APPLICATION_CREDENTIALS)) {
+      delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
+    }
+  } catch {
+    delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  }
+}
+
 // Ensure required Firebase environment variables are loaded for staging
+if (isPlaceholder(process.env.FIREBASE_PROJECT_ID) && appletConfig?.projectId) {
+  process.env.FIREBASE_PROJECT_ID = appletConfig.projectId;
+}
 if (!process.env.FIREBASE_PROJECT_ID) {
   process.env.FIREBASE_PROJECT_ID = 'itissimple-security-staging';
 }
+if (isPlaceholder(process.env.FIREBASE_DATABASE_ID) && appletConfig?.firestoreDatabaseId) {
+  process.env.FIREBASE_DATABASE_ID = appletConfig.firestoreDatabaseId;
+}
 if (!process.env.FIREBASE_DATABASE_ID) {
   process.env.FIREBASE_DATABASE_ID = '(default)';
+}
+
+if (appletConfig) {
+  if (isPlaceholder(process.env.VITE_FIREBASE_PROJECT_ID) && appletConfig.projectId) {
+    process.env.VITE_FIREBASE_PROJECT_ID = appletConfig.projectId;
+  }
+  if (isPlaceholder(process.env.VITE_FIREBASE_API_KEY) && appletConfig.apiKey) {
+    process.env.VITE_FIREBASE_API_KEY = appletConfig.apiKey;
+  }
+  if (isPlaceholder(process.env.VITE_FIREBASE_AUTH_DOMAIN) && appletConfig.authDomain) {
+    process.env.VITE_FIREBASE_AUTH_DOMAIN = appletConfig.authDomain;
+  }
+  if (isPlaceholder(process.env.VITE_FIREBASE_STORAGE_BUCKET) && appletConfig.storageBucket) {
+    process.env.VITE_FIREBASE_STORAGE_BUCKET = appletConfig.storageBucket;
+  }
+  if (isPlaceholder(process.env.VITE_FIREBASE_MESSAGING_SENDER_ID) && appletConfig.messagingSenderId) {
+    process.env.VITE_FIREBASE_MESSAGING_SENDER_ID = appletConfig.messagingSenderId;
+  }
+  if (isPlaceholder(process.env.VITE_FIREBASE_APP_ID) && appletConfig.appId) {
+    process.env.VITE_FIREBASE_APP_ID = appletConfig.appId;
+  }
+  if (isPlaceholder(process.env.VITE_FIREBASE_DATABASE_ID) && appletConfig.firestoreDatabaseId) {
+    process.env.VITE_FIREBASE_DATABASE_ID = appletConfig.firestoreDatabaseId;
+  }
 }
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
@@ -102,9 +158,27 @@ const ACTIVE_FIREBASE_PROJECT_ID = 'itissimple-security-staging';
 const GEMINI_PROJECT_ID = ACTIVE_FIREBASE_PROJECT_ID;
 
 const app = express();
-export const PORT = process.env.PORT
-  ? parseInt(process.env.PORT, 10)
-  : (process.env.APP_PORT ? parseInt(process.env.APP_PORT, 10) : 3000);
+/**
+ * Resolves and validates a numeric server port from environment variables.
+ * Enforces valid TCP port range (1-65535). Fallbacks safely to defaultPort (3000).
+ * Accurately supports Cloud Run dynamic port 8080 and any custom valid port.
+ */
+export function parsePort(val?: string | number): number | null {
+  if (val === undefined || val === null) return null;
+  const str = String(val).trim();
+  if (!/^\d+$/.test(str)) return null;
+  const parsed = parseInt(str, 10);
+  if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535) {
+    return parsed;
+  }
+  return null;
+}
+
+export function resolvePort(portEnv?: string | number, appPortEnv?: string | number, defaultPort = 3000): number {
+  return parsePort(portEnv) ?? parsePort(appPortEnv) ?? defaultPort;
+}
+
+export const PORT = resolvePort(process.env.PORT, process.env.APP_PORT, 3000);
 
 export { isDiagnosticMode };
 

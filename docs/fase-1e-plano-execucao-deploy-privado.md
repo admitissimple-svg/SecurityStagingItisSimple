@@ -88,6 +88,9 @@ export RUNTIME_SA="sa-diagnostic-backend@${PROJECT_ID}.iam.gserviceaccount.com"
 export CALLER_SA="sa-diagnostic-caller@${PROJECT_ID}.iam.gserviceaccount.com"
 export ADMIN_EMAIL="adm.itissimple@gmail.com"
 
+# Tag imutável única para garantir paridade exata e rastreabilidade entre Build e Deploy
+export IMAGE_TAG="gcr.io/${PROJECT_ID}/${SERVICE_NAME}:1e-diagnostic-$(date +%Y%m%d%H%M%S)"
+
 # Travar gcloud no projeto de segurança staging (proibição absoluta de itissimple-8663d)
 gcloud config set project "${PROJECT_ID}"
 ```
@@ -124,22 +127,24 @@ gcloud iam service-accounts create sa-diagnostic-caller \
 ### Etapa 4: Construção do Container com Tag Imutável via Cloud Build
 
 ```bash
-# Compilar a imagem Docker do repositório no Cloud Build do projeto staging
+# Compilar a imagem Docker do repositório no Cloud Build do projeto staging usando a tag imutável
 gcloud builds submit \
   --project="${PROJECT_ID}" \
-  --tag="gcr.io/${PROJECT_ID}/${SERVICE_NAME}:1e-diagnostic-$(date +%Y%m%d%H%M%S)"
+  --tag="${IMAGE_TAG}"
 ```
 
-### Etapa 5: Deploy do Serviço Cloud Run 100% Privado
+### Etapa 5: Deploy do Serviço Cloud Run 100% Privado (Desde a Criação)
 
 ```bash
-# Implantação inicial com --no-allow-unauthenticated e variáveis de segurança travadas
+# Implantação inicial com --no-allow-unauthenticated (privado desde o primeiro milissegundo),
+# utilizando exatamente a mesma tag de imagem compilada (${IMAGE_TAG}) e porta 8080.
 gcloud run deploy "${SERVICE_NAME}" \
   --project="${PROJECT_ID}" \
   --region="${REGION}" \
-  --image="gcr.io/${PROJECT_ID}/${SERVICE_NAME}:latest" \
+  --image="${IMAGE_TAG}" \
   --service-account="${RUNTIME_SA}" \
   --no-allow-unauthenticated \
+  --port=8080 \
   --min-instances=0 \
   --max-instances=1 \
   --memory=512Mi \
@@ -148,7 +153,13 @@ gcloud run deploy "${SERVICE_NAME}" \
   --set-env-vars="NODE_ENV=production,DIAGNOSTIC_ONLY=true,FIREBASE_PROJECT_ID=${PROJECT_ID},FIREBASE_DATABASE_ID=(default)"
 ```
 
-### Etapa 6: Captura da URL Canônica e Injeção de `CLOUD_RUN_SERVICE_URL`
+### Etapa 6: Resolução Segura da Audiência OIDC Inicial e Injeção de `CLOUD_RUN_SERVICE_URL`
+
+> **Mecanismo de Segurança Fail-Closed na Criação:**  
+> Como a URL canônica do Cloud Run (`https://...run.app`) é alocada dinamicamente pelo Google na criação do serviço, a estratégia de duas etapas garante segurança total:
+> 1. Na Etapa 5, o serviço nasce 100% privado (`--no-allow-unauthenticated`). O Google Front End (GFE) bloqueia qualquer requisição anônima ou sem IAM.
+> 2. Se qualquer chamada autorizada por IAM atingir o container antes da configuração da URL, o middleware da aplicação falha fechado (`MISSING_EXPECTED_AUDIENCE_CONFIG`).
+> 3. Imediatamente a seguir, capturamos a URL canônica gerada e atualizamos as variáveis de ambiente do serviço:
 
 ```bash
 # 6.1 Obter a URL canônica gerada pelo Cloud Run
@@ -159,7 +170,7 @@ export SERVICE_URL=$(gcloud run services describe "${SERVICE_NAME}" \
 
 echo "URL canônica do Cloud Run gerada: ${SERVICE_URL}"
 
-# 6.2 Atualizar o serviço com a audience esperada
+# 6.2 Atualizar o serviço com a audience esperada correspondente à URL canônica
 gcloud run services update "${SERVICE_NAME}" \
   --project="${PROJECT_ID}" \
   --region="${REGION}" \
@@ -169,14 +180,14 @@ gcloud run services update "${SERVICE_NAME}" \
 ### Etapa 7: Concessão Estrita de `roles/run.invoker` (Nível de Recurso)
 
 ```bash
-# Conceder permissão de invocação para a SA Invocadora
+# Conceder permissão de invocação para a SA Invocadora exclusivamente no serviço específico
 gcloud run services add-iam-policy-binding "${SERVICE_NAME}" \
   --project="${PROJECT_ID}" \
   --region="${REGION}" \
   --member="serviceAccount:${CALLER_SA}" \
   --role="roles/run.invoker"
 
-# Conceder permissão de invocação para o Administrador Humano
+# Conceder permissão de invocação para o Administrador Humano exclusivamente no serviço específico
 gcloud run services add-iam-policy-binding "${SERVICE_NAME}" \
   --project="${PROJECT_ID}" \
   --region="${REGION}" \

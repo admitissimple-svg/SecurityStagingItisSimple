@@ -19,9 +19,27 @@ if (!process.env.FIREBASE_DATABASE_ID) {
 }
 
 const app = express();
-export const PORT = process.env.PORT
-  ? parseInt(process.env.PORT, 10)
-  : (process.env.APP_PORT ? parseInt(process.env.APP_PORT, 10) : 8080);
+/**
+ * Resolves and validates a numeric server port from environment variables.
+ * Enforces valid TCP port range (1-65535). Fallbacks safely to defaultPort (3000).
+ * Accurately supports Cloud Run dynamic port 8080 and any custom valid port.
+ */
+export function parsePort(val?: string | number): number | null {
+  if (val === undefined || val === null) return null;
+  const str = String(val).trim();
+  if (!/^\d+$/.test(str)) return null;
+  const parsed = parseInt(str, 10);
+  if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535) {
+    return parsed;
+  }
+  return null;
+}
+
+export function resolvePort(portEnv?: string | number, appPortEnv?: string | number, defaultPort = 3000): number {
+  return parsePort(portEnv) ?? parsePort(appPortEnv) ?? defaultPort;
+}
+
+export const PORT = resolvePort(process.env.PORT, process.env.APP_PORT, 3000);
 
 // Strict CORS middleware for diagnostic staging backend
 app.use((req, res, next) => {

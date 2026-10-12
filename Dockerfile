@@ -1,7 +1,8 @@
 # ==============================================================================
-# Dockerfile: Full-Stack Express + Vite Application for Render
+# Dockerfile: Dedicated Isolated Diagnostic Backend for Google Cloud Run
 # Project: itissimple-security-staging (Firestore database: (default))
 # Runtime: Node.js 22 LTS (Alpine Linux)
+# Security Mode: DIAGNOSTIC_ONLY=true (Fail-safe default)
 # ==============================================================================
 
 # Stage 1: Build the Vite frontend application
@@ -20,21 +21,25 @@ COPY vite.config.ts tsconfig.json index.html ./
 COPY src/ ./src/
 COPY public/ ./public/
 
+# Ensure local database file is never embedded into build assets
+RUN rm -f src/data/app_db.json
+
 # Build production bundle into /app/dist
 RUN npm run build
 
-# Stage 2: Runtime image for Node.js, Express, TypeScript (tsx) and static hosting
+# Stage 2: Runtime image for Node.js, Express, TypeScript (tsx)
 FROM node:22-alpine AS runner
 
 WORKDIR /app
 
 # Set production environment and staging target configuration
 ENV NODE_ENV=production
+ENV DIAGNOSTIC_ONLY=true
 ENV FIREBASE_PROJECT_ID=itissimple-security-staging
 ENV FIREBASE_DATABASE_ID=(default)
 
-# Render provides the PORT environment variable dynamically (defaults to 10000 on Render)
-ENV PORT=10000
+# Cloud Run injects PORT dynamically at runtime (defaults to 8080)
+ENV PORT=8080
 
 # Install production dependencies and TypeScript execution engine (tsx)
 COPY package.json bun.lock* ./
@@ -51,17 +56,20 @@ COPY src/ ./src/
 COPY public/ ./public/
 COPY privacy.html ./
 
+# Guarantee that local app_db.json and local backups are strictly absent from runner image
+RUN rm -f /app/src/data/app_db.json /app/dist/src/data/app_db.json
+
 # Configure non-root node user permissions
 RUN chown -R node:node /app
 
 USER node
 
-# Expose Render standard port
-EXPOSE 10000
+# Expose standard Cloud Run port
+EXPOSE 8080
 
 # Health check against API health check endpoint using dynamic PORT
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD wget --no-verbose --tries=1 --spider http://localhost:${PORT}/api/health || exit 1
 
-# Start full-stack server using the configured start script
-CMD ["node", "server.ts"]
+# Direct execution with --import tsx to avoid redundant child process
+CMD ["node", "--import", "tsx", "server.ts"]
