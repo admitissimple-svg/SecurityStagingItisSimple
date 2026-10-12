@@ -1,0 +1,10 @@
+{
+  "name": "Remix Itissimple",
+  "description": "Learn English by living your daily routine with personalized YouTube videos, practical vocabulary, and live Meet lessons with native friends.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

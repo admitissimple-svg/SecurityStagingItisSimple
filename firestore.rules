@@ -1,0 +1,154 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && (
+        request.auth.token.email == 'estilobeeforkids@gmail.com' ||
+        request.auth.token.email == 'estilobeeadm@gmail.com' ||
+        request.auth.token.email == 'adm.itissimple@gmail.com' ||
+        request.auth.token.email == 'admin@itissimple.com'
+      );
+    }
+
+    function isOwner(userId) {
+      return (isAuthenticated() && request.auth.uid == userId) ||
+             (isAuthenticated() && request.auth.token.email != null && (
+               userId == request.auth.uid ||
+               userId == request.auth.token.email ||
+               userId.matches('.*' + request.auth.uid + '.*')
+             )) ||
+             isAdmin();
+    }
+
+    // Test docs for validating Firestore connection on startup
+    match /test/{docId} {
+      allow read, write: if true;
+    }
+    match /_connection_test/{docId} {
+      allow read, write: if true;
+    }
+
+    // User profiles collection - partitioned by UID or email with fallback for seamless multi-account sync
+    match /users/{userId} {
+      allow read: if true;
+      allow write: if isOwner(userId) || isAdmin() || isAuthenticated() || request.auth == null;
+
+      // Vocabulary words subcollection
+      match /vocabulary/{wordId} {
+        allow read: if true;
+        allow write: if isOwner(userId) || isAdmin() || isAuthenticated() || request.auth == null;
+      }
+
+      // Student daily journal & saved sentences subcollection
+      match /journal/{entryId} {
+        allow read: if true;
+        allow write: if isOwner(userId) || isAdmin() || isAuthenticated() || request.auth == null;
+      }
+
+      // Student live & trial lessons subcollection
+      match /lessons/{lessonId} {
+        allow read: if true;
+        allow write: if isOwner(userId) || isAdmin() || isAuthenticated() || request.auth == null;
+      }
+
+      // Student current routine subcollection for real-time Spotify daily track & teacher feedback
+      match /currentRoutine/{weekId} {
+        allow read: if true;
+        allow write: if isOwner(userId) || isAdmin() || isAuthenticated() || request.auth == null;
+      }
+
+      // Consolidated weekly history subcollection (consumedVideoIds, consumedTrackIds, weeklyVocabulary)
+      match /weeklyHistory/{weekId} {
+        allow read: if true;
+        allow write: if isOwner(userId) || isAdmin() || isAuthenticated() || request.auth == null;
+      }
+
+      // Student daily routine subcollection for video, topic selection, and teacher Spotify override track
+      match /routines/{dayOfWeek} {
+        allow read: if true;
+        allow write: if isOwner(userId) || isAdmin() || isAuthenticated() || request.auth == null;
+      }
+
+      // Global accumulated watched videos history subcollection
+      match /watchedVideosHistory/{videoId} {
+        allow read: if true;
+        allow write: if isOwner(userId) || isAdmin() || isAuthenticated() || request.auth == null;
+      }
+
+      // Student activity log & journal subcollection (video, audio, memorization, lesson)
+      match /studentJournal/{entryId} {
+        allow read: if true;
+        allow write: if isOwner(userId) || isAdmin() || isAuthenticated() || request.auth == null;
+      }
+
+      // Student homework & activity progress subcollection (matching, fill-in-blanks, sentence writing, quiz)
+      match /homework/{homeworkId} {
+        allow read: if true;
+        allow write: if isOwner(userId) || isAdmin() || isAuthenticated() || request.auth == null;
+      }
+
+      // Student memorization activity completion per day subcollection
+      match /memorization/{day} {
+        allow read: if true;
+        allow write: if isOwner(userId) || isAdmin() || isAuthenticated() || request.auth == null;
+      }
+
+      // Native Friend in-session notes & recommendations documents keyed by session date or ID
+      match /session_notes/{noteId} {
+        allow read: if true;
+        allow write: if isOwner(userId) || isAdmin() || isAuthenticated() || request.auth == null;
+      }
+    }
+
+    // Top-level student homework collection by student UID / cleanEmail
+    match /student_homework/{userId} {
+      allow read, write: if true;
+    }
+
+    // Native Friend in-session notes & recommendations documents keyed by session date/ID
+    match /session_notes/{noteId} {
+      allow read, write: if true;
+    }
+
+    // App state synchronization document for persistent backend storage across restarts
+    match /app_state/{docId} {
+      allow read, write: if true;
+    }
+
+    // Native Friend / Tutor profiles
+    match /tutors/{tutorId} {
+      allow read, write: if true;
+    }
+
+    // Live lessons - accessible for scheduling, trials, and multi-profile lesson sync
+    match /lessons/{lessonId} {
+      allow read, write: if true;
+    }
+
+    // Routines per user
+    match /routines/{userId} {
+      allow read, write: if isOwner(userId) || isAdmin() || isAuthenticated() || request.auth == null;
+    }
+
+    // Student Media Assignments per UID / cleanEmail
+    match /student_assignments/{userId} {
+      allow read, write: if isOwner(userId) || isAdmin() || isAuthenticated() || request.auth == null;
+    }
+
+    // Teacher availability schedule per UID / cleanEmail
+    match /teacher_availability/{userId} {
+      allow read: if true;
+      allow write: if isOwner(userId) || isAdmin() || isAuthenticated() || request.auth == null;
+    }
+
+    // Direct Messages & Notices
+    match /direct_messages/{messageId} {
+      allow read, write: if true;
+    }
+  }
+}
