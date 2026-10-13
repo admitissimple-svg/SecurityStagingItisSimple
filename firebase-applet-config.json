@@ -1,12 +1,12 @@
 {
   "projectId": "itissimple-security-staging",
-  "appId": "1:334384661166:web:7ec1d19b240c43c726233f",
+  "appId": "1:334384661166:web:7c6a93d815b2608926233f",
   "apiKey": "AIzaSyAIlasw7SKY8ukVaC3SzujlRchSP5Aep4Y",
   "authDomain": "itissimple-security-staging.firebaseapp.com",
   "firestoreDatabaseId": "(default)",
   "storageBucket": "itissimple-security-staging.firebasestorage.app",
   "messagingSenderId": "334384661166",
   "measurementId": "",
-  "oAuthClientId": "",
+  "oAuthClientId": "334384661166-0rjqd47igq993rfhcda2a7qqhiu88tun.apps.googleusercontent.com",
   "recaptchaSiteKey": ""
 }

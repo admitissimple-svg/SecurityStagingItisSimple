@@ -4374,13 +4374,13 @@ export default function App() {
             data.forEach((t: NativeFriendTutor) => {
               const k = (t.email || t.id).toLowerCase().trim();
               const existing = map.get(k);
-              const approved = isTutorApproved(t) || (existing && isTutorApproved(existing));
+              const approved = isTutorApproved(t);
               map.set(k, {
                 ...existing,
                 ...t,
                 isApproved: approved,
-                approvalStatus: approved ? 'approved' : t.approvalStatus,
-                status: approved ? 'approved' : t.status,
+                approvalStatus: approved ? 'approved' : ((t.approvalStatus || t.status || 'pending') as 'approved' | 'pending' | 'rejected'),
+                status: approved ? 'approved' : (t.status || t.approvalStatus || 'pending'),
               });
             });
             return Array.from(map.values());

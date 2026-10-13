@@ -36,7 +36,8 @@ export function getFirestoreDb(): Firestore | null {
         `[serverFirestore Security] Firebase Admin App is bound to unauthorized project '${appProjectId}'. Refusing to create Firestore client.`
       );
     }
-    const targetDatabaseId = process.env.FIREBASE_DATABASE_ID?.trim() || '(default)';
+    const rawTargetDatabaseId = process.env.FIREBASE_DATABASE_ID?.trim() || '(default)';
+    const targetDatabaseId = rawTargetDatabaseId.startsWith('ai-studio-') ? '(default)' : (rawTargetDatabaseId || '(default)');
     adminFirestoreInstance = getFirestore(app, targetDatabaseId);
     return adminFirestoreInstance;
   } catch (err) {

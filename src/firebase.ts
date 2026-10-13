@@ -91,13 +91,14 @@ export const ACTIVE_OAUTH_CLIENT_ID = resolveClientEnv(
   'oAuthClientId'
 );
 
-// Utilização do banco Firestore configurado com fallback seguro
-export const ACTIVE_FIREBASE_DATABASE_ID =
+// Utilização estrita do banco Firestore (default) como fonte única de verdade
+const resolvedDbId =
   resolveClientEnv(
     typeof import.meta !== 'undefined' ? (import.meta as any).env?.VITE_FIREBASE_DATABASE_ID : undefined,
     'VITE_FIREBASE_DATABASE_ID',
     'firestoreDatabaseId'
   ) || (appletConfig as any)?.firestoreDatabaseId || '(default)';
+export const ACTIVE_FIREBASE_DATABASE_ID = resolvedDbId.startsWith('ai-studio-') ? '(default)' : (resolvedDbId || '(default)');
 export const ACTIVE_FIRESTORE_DATABASE_ID = ACTIVE_FIREBASE_DATABASE_ID;
 
 // Validação estrita das configurações obrigatórias na inicialização

@@ -4,6 +4,7 @@ import { onAuthStateChanged } from 'firebase/auth';
 import { getAllFirestoreDbs, getDb, auth } from '../firebase';
 import { NativeFriendTutor } from '../types';
 import { INITIAL_NATIVE_FRIENDS } from '../data/tutors';
+import { getAdminAccessToken } from '../utils/auth';
 
 export enum OperationType {
   CREATE = 'create',
@@ -159,7 +160,10 @@ export async function fetchPublicNativeFriendsFromFirestore(): Promise<{
   try {
     const headers: Record<string, string> = {};
     if (auth.currentUser) {
-      const token = await auth.currentUser.getIdToken().catch(() => null);
+      let token = await getAdminAccessToken().catch(() => null);
+      if (!token) {
+        token = await auth.currentUser.getIdToken().catch(() => null);
+      }
       if (token) headers['Authorization'] = `Bearer ${token}`;
     }
     const res = await fetch('/api/tutors', { headers });
@@ -205,11 +209,14 @@ export async function fetchPublicNativeFriendsFromFirestore(): Promise<{
             if (tutor) {
               const key = (tutor.email || tutor.id).toLowerCase().trim();
               const existing = tutorMap.get(key);
-              if (!existing || (!isTutorApproved(existing) && isTutorApproved(tutor))) {
-                tutorMap.set(key, tutor);
-              } else {
-                tutorMap.set(key, { ...existing, ...tutor, isApproved: existing.isApproved || tutor.isApproved });
-              }
+              const approved = isTutorApproved(tutor);
+              tutorMap.set(key, {
+                ...(existing || {}),
+                ...tutor,
+                isApproved: approved,
+                approvalStatus: approved ? 'approved' : (tutor.approvalStatus || 'pending'),
+                status: approved ? 'approved' : (tutor.status || 'pending'),
+              });
             }
           });
         }
@@ -226,11 +233,14 @@ export async function fetchPublicNativeFriendsFromFirestore(): Promise<{
             if (tutor) {
               const key = (tutor.email || tutor.id).toLowerCase().trim();
               const existing = tutorMap.get(key);
-              if (!existing || (!isTutorApproved(existing) && isTutorApproved(tutor))) {
-                tutorMap.set(key, tutor);
-              } else {
-                tutorMap.set(key, { ...existing, ...tutor, isApproved: existing.isApproved || tutor.isApproved });
-              }
+              const approved = isTutorApproved(tutor);
+              tutorMap.set(key, {
+                ...(existing || {}),
+                ...tutor,
+                isApproved: approved,
+                approvalStatus: approved ? 'approved' : (tutor.approvalStatus || 'pending'),
+                status: approved ? 'approved' : (tutor.status || 'pending'),
+              });
             }
           });
         }
@@ -291,13 +301,13 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
           allTutors.forEach((t) => {
             const k = (t.email || t.id).toLowerCase().trim();
             const existing = map.get(k);
-            const approved = isTutorApproved(t) || (existing && isTutorApproved(existing));
+            const approved = isTutorApproved(t);
             map.set(k, {
               ...existing,
               ...t,
               isApproved: approved,
-              approvalStatus: approved ? 'approved' : t.approvalStatus,
-              status: approved ? 'approved' : t.status,
+              approvalStatus: approved ? 'approved' : ((t.approvalStatus || t.status || 'pending') as 'approved' | 'pending' | 'rejected'),
+              status: approved ? 'approved' : (t.status || t.approvalStatus || 'pending'),
             });
           });
           return Array.from(map.values());
@@ -326,13 +336,13 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
             allTutors.forEach((t) => {
               const k = (t.email || t.id).toLowerCase().trim();
               const existing = map.get(k);
-              const approved = isTutorApproved(t) || (existing && isTutorApproved(existing));
+              const approved = isTutorApproved(t);
               map.set(k, {
                 ...existing,
                 ...t,
                 isApproved: approved,
-                approvalStatus: approved ? 'approved' : t.approvalStatus,
-                status: approved ? 'approved' : t.status,
+                approvalStatus: approved ? 'approved' : ((t.approvalStatus || t.status || 'pending') as 'approved' | 'pending' | 'rejected'),
+                status: approved ? 'approved' : (t.status || t.approvalStatus || 'pending'),
               });
             });
             return Array.from(map.values());
@@ -382,13 +392,13 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
                   liveList.forEach((t) => {
                     const k = (t.email || t.id).toLowerCase().trim();
                     const existing = map.get(k);
-                    const approved = isTutorApproved(t) || (existing && isTutorApproved(existing));
+                    const approved = isTutorApproved(t);
                     map.set(k, {
                       ...existing,
                       ...t,
                       isApproved: approved,
-                      approvalStatus: approved ? 'approved' : t.approvalStatus,
-                      status: approved ? 'approved' : t.status,
+                      approvalStatus: approved ? 'approved' : ((t.approvalStatus || t.status || 'pending') as 'approved' | 'pending' | 'rejected'),
+                      status: approved ? 'approved' : (t.status || t.approvalStatus || 'pending'),
                     });
                   });
                   return Array.from(map.values());
@@ -421,13 +431,13 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
                   liveList.forEach((t) => {
                     const k = (t.email || t.id).toLowerCase().trim();
                     const existing = map.get(k);
-                    const approved = isTutorApproved(t) || (existing && isTutorApproved(existing));
+                    const approved = isTutorApproved(t);
                     map.set(k, {
                       ...existing,
                       ...t,
                       isApproved: approved,
-                      approvalStatus: approved ? 'approved' : t.approvalStatus,
-                      status: approved ? 'approved' : t.status,
+                      approvalStatus: approved ? 'approved' : ((t.approvalStatus || t.status || 'pending') as 'approved' | 'pending' | 'rejected'),
+                      status: approved ? 'approved' : (t.status || t.approvalStatus || 'pending'),
                     });
                   });
                   return Array.from(map.values());
@@ -456,13 +466,13 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
             allTutors.forEach((t) => {
               const k = (t.email || t.id).toLowerCase().trim();
               const existing = map.get(k);
-              const approved = isTutorApproved(t) || (existing && isTutorApproved(existing));
+              const approved = isTutorApproved(t);
               map.set(k, {
                 ...existing,
                 ...t,
                 isApproved: approved,
-                approvalStatus: approved ? 'approved' : t.approvalStatus,
-                status: approved ? 'approved' : t.status,
+                approvalStatus: approved ? 'approved' : ((t.approvalStatus || t.status || 'pending') as 'approved' | 'pending' | 'rejected'),
+                status: approved ? 'approved' : (t.status || t.approvalStatus || 'pending'),
               });
             });
             return Array.from(map.values());
