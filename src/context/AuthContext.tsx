@@ -375,6 +375,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         verifiedRole = account.role || 'student';
       }
 
+      if (verifiedRole === 'admin' && (!authUid || !auth.currentUser)) {
+        const adminErrMsg = 'Sessão de administrador requer autenticação válida no Firebase Auth. Não é permitido simular autenticação.';
+        setError(adminErrMsg);
+        return { success: false, error: adminErrMsg };
+      }
+
       account.role = verifiedRole;
       setCurrentAccount(account);
 

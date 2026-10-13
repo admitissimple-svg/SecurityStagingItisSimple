@@ -85,7 +85,7 @@ export async function requestGoogleDriveAuth(hintEmail?: string): Promise<string
  * Resolves the authenticated Firebase User once auth state has completed initialization.
  * Returns null for unauthenticated visitors without hanging indefinitely.
  */
-export async function waitForAuthUser(): Promise<User | null> {
+export async function waitForAuthUser(timeoutMs = 2500): Promise<User | null> {
   if (auth.currentUser) {
     return auth.currentUser;
   }
@@ -104,7 +104,7 @@ export async function waitForAuthUser(): Promise<User | null> {
     const timer = setTimeout(() => {
       if (unsub) unsub();
       resolve(auth.currentUser || null);
-    }, 1200);
+    }, timeoutMs);
 
     unsub = onAuthStateChanged(auth, (user) => {
       clearTimeout(timer);
@@ -167,7 +167,7 @@ export async function getAdminAccessToken(): Promise<string | null> {
   let token = await user.getIdToken();
   const claims = parseJwtClaims(token);
 
-  if (claims?.role !== 'admin') {
+  if (claims?.role !== 'admin' && claims?.admin !== true) {
     try {
       const res = await fetch('/api/auth/sync-admin-claims', {
         method: 'POST',

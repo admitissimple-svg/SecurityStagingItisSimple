@@ -26,7 +26,7 @@ import {
 import { BrandLogo } from './BrandLogo';
 import { GoogleSignInModal } from './GoogleSignInModal';
 import { firebaseSignInWithEmail } from '../utils/auth';
-import { getDb } from '../firebase';
+import { getDb, auth } from '../firebase';
 
 export interface LoginModalProps {
   isOpen: boolean;
@@ -236,6 +236,23 @@ export const LoginModal: React.FC<LoginModalProps> = ({
 
       // 4. Synchronize role selection tab state with the authenticated user role
       setSelectedRole(verifiedRole);
+
+      // Strict validation: Visual admin login must correspond to a valid Firebase Auth session
+      if (verifiedRole === 'admin' && (firebaseAuthFailed || !firebaseUid || !auth.currentUser)) {
+        const adminAuthError = isEn
+          ? 'Administrator session requires a valid Firebase Authentication login. Simulated authentication is not permitted.'
+          : 'A sessão de administrador requer autenticação válida no Firebase Auth. Não é permitido simular autenticação.';
+        setErrorMsg(adminAuthError);
+        if (onShowToast) {
+          onShowToast(
+            isEn ? 'Authentication Failed' : 'Falha na Autenticação',
+            adminAuthError,
+            'warning'
+          );
+        }
+        setIsLoading(false);
+        return;
+      }
 
       // 5. Sync with backend API
       const controller = new AbortController();

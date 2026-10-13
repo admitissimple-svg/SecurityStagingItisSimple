@@ -4,7 +4,7 @@ import { onAuthStateChanged } from 'firebase/auth';
 import { getAllFirestoreDbs, getDb, auth } from '../firebase';
 import { NativeFriendTutor } from '../types';
 import { INITIAL_NATIVE_FRIENDS } from '../data/tutors';
-import { getAdminAccessToken } from '../utils/auth';
+import { getAdminAccessToken, waitForAuthUser } from '../utils/auth';
 
 export enum OperationType {
   CREATE = 'create',
@@ -151,21 +151,29 @@ function normalizeTutorDoc(docId: string, data: any): NativeFriendTutor | null {
  * Direct fetch from unified Firestore collections across production and preview databases.
  * Guarantees no external/remote records (e.g. Charles) are filtered out.
  */
-export async function fetchPublicNativeFriendsFromFirestore(): Promise<{
+export async function fetchPublicNativeFriendsFromFirestore(options?: {
+  requireAdminToken?: boolean;
+}): Promise<{
   allTutors: NativeFriendTutor[];
   publicTutors: NativeFriendTutor[];
 }> {
   const tutorMap = new Map<string, NativeFriendTutor>();
 
   try {
+    // 1. Await Firebase Auth state initialization so valid sessions are recognized and token attached
+    const user = await waitForAuthUser().catch(() => null);
+
     const headers: Record<string, string> = {};
-    if (auth.currentUser) {
+    if (user) {
       let token = await getAdminAccessToken().catch(() => null);
       if (!token) {
-        token = await auth.currentUser.getIdToken().catch(() => null);
+        token = await user.getIdToken().catch(() => null);
       }
       if (token) headers['Authorization'] = `Bearer ${token}`;
+    } else if (options?.requireAdminToken) {
+      throw new Error('Sessão de autenticação Firebase não encontrada para o administrador.');
     }
+
     const res = await fetch('/api/tutors', { headers });
     if (res.ok) {
       const data = await res.json();
@@ -182,16 +190,13 @@ export async function fetchPublicNativeFriendsFromFirestore(): Promise<{
     }
   } catch (err) {
     console.warn('[useNativeFriends] Backend /api/tutors fetch notice:', err);
+    if (options?.requireAdminToken) {
+      throw err;
+    }
   }
 
   // 2. Direct Firestore synchronization ONLY when authenticated.
   // For unauthenticated visitors, utilize exclusively authorized server REST API (/api/tutors) above.
-  if (!auth.currentUser && typeof (auth as any)?.authStateReady === 'function') {
-    try {
-      await (auth as any).authStateReady();
-    } catch {}
-  }
-
   if (auth.currentUser) {
     const dbs = getAllFirestoreDbs();
     for (const dbInstance of dbs) {
@@ -293,7 +298,9 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
     setIsLoading(true);
     setError(null);
     try {
-      const { allTutors } = await fetchPublicNativeFriendsFromFirestore();
+      const { allTutors } = await fetchPublicNativeFriendsFromFirestore({
+        requireAdminToken: isAdmin,
+      });
       if (allTutors.length > 0) {
         setTutors((prev) => {
           const map = new Map<string, NativeFriendTutor>();
@@ -319,7 +326,7 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [isAdmin]);
 
   // 1. Initial hydration and real-time Firestore synchronization
   useEffect(() => {

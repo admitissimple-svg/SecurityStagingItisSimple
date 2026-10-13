@@ -28,6 +28,7 @@ interface AdminApprovalsModalProps {
   onRefresh?: () => void;
   isRefreshing?: boolean;
   currentLanguage: Language;
+  authError?: string | null;
 }
 
 export const AdminApprovalsModal: React.FC<AdminApprovalsModalProps> = ({
@@ -40,6 +41,7 @@ export const AdminApprovalsModal: React.FC<AdminApprovalsModalProps> = ({
   onRefresh,
   isRefreshing = false,
   currentLanguage,
+  authError,
 }) => {
   const isTutorApproved = (t: NativeFriendTutor) =>
     t.approvalStatus === 'approved' ||
@@ -200,20 +202,22 @@ export const AdminApprovalsModal: React.FC<AdminApprovalsModalProps> = ({
           </div>
         )}
 
-        {/* Action error alert */}
-        {actionError && (
+        {/* Action error or Auth error alert */}
+        {(actionError || authError) && (
           <div className="mx-6 mt-3 p-3 bg-rose-50 border border-rose-300 text-rose-800 rounded-xl text-xs font-bold flex items-center justify-between animate-fadeIn" role="alert">
             <div className="flex items-center gap-2">
               <XCircle className="w-4 h-4 text-rose-600 shrink-0" />
-              <span>{actionError}</span>
+              <span>{authError || actionError}</span>
             </div>
-            <button
-              type="button"
-              onClick={() => setActionError(null)}
-              className="text-rose-700 hover:text-rose-900 font-black cursor-pointer px-1"
-            >
-              ✕
-            </button>
+            {actionError && !authError && (
+              <button
+                type="button"
+                onClick={() => setActionError(null)}
+                className="text-rose-700 hover:text-rose-900 font-black cursor-pointer px-1"
+              >
+                ✕
+              </button>
+            )}
           </div>
         )}
 

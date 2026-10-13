@@ -32,7 +32,7 @@ import { GoogleSignInModal } from './GoogleSignInModal';
 import { ImageUploadInput } from './ImageUploadInput';
 import { firebaseSignInWithEmail, firebaseSignUpWithEmail } from '../utils/auth';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
-import { getDb } from '../firebase';
+import { getDb, auth } from '../firebase';
 
 const TIME_OPTIONS = [
   { value: '06:00', label: '06:00 AM' },
@@ -675,6 +675,17 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
         // 4. Synchronize role selection tab state with the authenticated user role
         setRole(verifiedRole);
+
+        // Strict validation: Visual admin login must correspond to a valid Firebase Auth session
+        if (verifiedRole === 'admin' && (!firebaseUid || !auth.currentUser)) {
+          setErrorMsg(
+            isEn
+              ? 'Administrator session requires a valid Firebase Authentication login. Simulated authentication is not permitted.'
+              : 'A sessão de administrador requer autenticação válida no Firebase Auth. Não é permitido simular autenticação.'
+          );
+          setIsLoading(false);
+          return;
+        }
 
         // 5. Sync with backend API
         const controller = new AbortController();

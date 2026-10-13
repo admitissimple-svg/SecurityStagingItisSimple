@@ -45,7 +45,7 @@ import { recordConsumedVideo, recordConsumedTrack } from './hooks/useStudentHist
 import { extractYouTubeVideoId, getYouTubeWatchUrl } from './utils/youtube';
 import { getInstantOrCachedWord } from './utils/dictionaryService';
 import { auth, getDb, getAllFirestoreDbs } from './firebase';
-import { getAccessToken, getAdminAccessToken } from './utils/auth';
+import { getAccessToken, getAdminAccessToken, waitForAuthUser } from './utils/auth';
 import { useNativeFriends, isTutorApproved, isTeacherRole } from './hooks/useNativeFriends';
 import { onAuthStateChanged, signOut as firebaseSignOutAuth } from 'firebase/auth';
 import { doc, getDoc, collection, getDocs, onSnapshot, setDoc, deleteDoc, query, where } from 'firebase/firestore';
@@ -569,12 +569,25 @@ export default function App() {
   useEffect(() => {
     async function loadInitialData() {
       try {
+        const authUser = await waitForAuthUser().catch(() => null);
+        let tutorToken: string | null = null;
+        if (authUser) {
+          tutorToken = await getAdminAccessToken().catch(() => null);
+          if (!tutorToken) {
+            tutorToken = await authUser.getIdToken().catch(() => null);
+          }
+        }
+        const tutorHeaders: Record<string, string> = {};
+        if (tutorToken) {
+          tutorHeaders['Authorization'] = `Bearer ${tutorToken}`;
+        }
+
         const [routinesRes, studentsRes, settingsRes, landingRes, tutorsRes] = await Promise.all([
           fetch('/api/routines').catch(() => null),
           fetch('/api/students').catch(() => null),
           fetch('/api/teacher-settings').catch(() => null),
           fetch('/api/landing-content').catch(() => null),
-          fetch('/api/tutors').catch(() => null),
+          fetch('/api/tutors', { headers: tutorHeaders }).catch(() => null),
         ]);
 
         if (routinesRes && routinesRes.ok) {
@@ -4346,24 +4359,63 @@ export default function App() {
     }
   };
 
+  const [adminAuthError, setAdminAuthError] = useState<string | null>(null);
   const [isRefreshingTutors, setIsRefreshingTutors] = useState(false);
 
   const fetchLatestTutors = async () => {
     setIsRefreshingTutors(true);
+    setAdminAuthError(null);
+    const isAdminUser = currentAccount?.role === 'admin' || currentAccount?.email?.toLowerCase() === 'adm.itissimple@gmail.com' || isAdminApprovalsOpen;
     try {
-      await refreshNativeFriends().catch(() => null);
-      let token: string | null = null;
-      const isAdminUser = currentAccount?.role === 'admin' || currentAccount?.email?.toLowerCase() === 'adm.itissimple@gmail.com' || isAdminApprovalsOpen;
-      if (isAdminUser) {
-        token = await getAdminAccessToken().catch(() => null);
+      // 1. Await Firebase Auth state initialization
+      const authUser = await waitForAuthUser();
+
+      // 2. Strict validation: If user is visually acting as administrator, they MUST possess an authentic Firebase session
+      if (isAdminUser && !authUser) {
+        const errorMsg = currentLanguage === 'en'
+          ? 'Administrator session not found in Firebase Auth. Please sign in with an authorized administrator account to review pending applications.'
+          : 'Sessão de autenticação Firebase não encontrada para o administrador. Faça login com uma conta de administrador autorizada para revisar cadastros pendentes.';
+        setAdminAuthError(errorMsg);
+        setNotifications((prev) => [
+          {
+            id: `admin-auth-error-${Date.now()}`,
+            title: currentLanguage === 'en' ? 'Authentication Required' : 'Autenticação Necessária',
+            message: errorMsg,
+            type: 'warning',
+            timestamp: new Date().toISOString(),
+            read: false,
+          },
+          ...prev,
+        ]);
+        return;
       }
-      if (!token) {
+
+      // 3. Acquire valid token
+      let token: string | null = null;
+      if (isAdminUser && authUser) {
+        token = await getAdminAccessToken().catch(() => null);
+        if (!token) {
+          token = await authUser.getIdToken().catch(() => null);
+        }
+        if (!token) {
+          const errorMsg = currentLanguage === 'en'
+            ? 'Failed to obtain Firebase ID Token for administrator. Please re-authenticate.'
+            : 'Falha ao obter o Firebase ID Token para o administrador. Por favor, autentique-se novamente.';
+          setAdminAuthError(errorMsg);
+          return;
+        }
+      } else if (authUser) {
         token = await getAccessToken().catch(() => null);
       }
+
+      // Ensure hook is refreshed with authorization
+      await refreshNativeFriends().catch(() => null);
+
       const headers: Record<string, string> = {};
       if (token) {
         headers['Authorization'] = `Bearer ${token}`;
       }
+
       const res = await fetch(`/api/tutors?_t=${Date.now()}`, { headers, cache: 'no-store' });
       if (res.ok) {
         const data = await res.json();
@@ -4386,9 +4438,18 @@ export default function App() {
             return Array.from(map.values());
           });
         }
+      } else if (res.status === 401 || res.status === 403) {
+        if (isAdminUser) {
+          const errorMsg = currentLanguage === 'en'
+            ? 'Administrative access denied: your Firebase account lacks required administrator claims.'
+            : 'Acesso administrativo negado: sua conta Firebase não possui a permissão administrativa necessária.';
+          setAdminAuthError(errorMsg);
+        }
       }
-    } catch {
-      // ignore
+    } catch (err: any) {
+      if (isAdminUser) {
+        setAdminAuthError(err?.message || 'Error fetching tutors for administrator');
+      }
     } finally {
       setIsRefreshingTutors(false);
     }
@@ -6489,6 +6550,7 @@ export default function App() {
         onRefresh={fetchLatestTutors}
         isRefreshing={isRefreshingTutors}
         currentLanguage={isTeacher ? 'en' : currentLanguage}
+        authError={adminAuthError}
       />
 
       {/* Native Friend Edit Profile Modal */}
