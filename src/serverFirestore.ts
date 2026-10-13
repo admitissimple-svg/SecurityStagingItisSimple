@@ -110,13 +110,13 @@ function withTimeout<T>(promise: Promise<T>, ms: number = 1500): Promise<T | nul
 /**
  * Direct persistence for individual Native Friend / Tutor profiles in /tutors/{tutorId} and /users/{tutorId}
  */
-export async function saveTutorToFirestore(tutor: any): Promise<boolean> {
+export async function saveTutorToFirestore(tutor: any, routeDocId?: string): Promise<boolean> {
   if (isCloudWriteDisabled) return false;
   const db = getFirestoreDb();
   if (!db || !tutor) return false;
   try {
     const cleanEmail = (tutor.email || '').toLowerCase().trim();
-    const tutorId = tutor.id || `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
+    const tutorId = tutor.id || (routeDocId ? routeDocId : `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`);
     const approvalStatus = tutor.approvalStatus || (tutor.isApproved ? 'approved' : 'pending');
     const isApproved = approvalStatus === 'approved' || tutor.isApproved === true || tutor.status === 'approved' || tutor.approved === true;
 
@@ -138,7 +138,12 @@ export async function saveTutorToFirestore(tutor: any): Promise<boolean> {
       db.collection('tutors').doc(tutorId).set(sanitized, { merge: true }),
     ];
 
-    if (cleanEmailDocId && cleanEmailDocId !== tutorId) {
+    if (routeDocId && routeDocId !== tutorId) {
+      writePromises.push(db.collection('users').doc(routeDocId).set(sanitized, { merge: true }));
+      writePromises.push(db.collection('tutors').doc(routeDocId).set(sanitized, { merge: true }));
+    }
+
+    if (cleanEmailDocId && cleanEmailDocId !== tutorId && cleanEmailDocId !== routeDocId) {
       writePromises.push(db.collection('users').doc(cleanEmailDocId).set(sanitized, { merge: true }));
       writePromises.push(db.collection('tutors').doc(cleanEmailDocId).set(sanitized, { merge: true }));
     }
@@ -748,12 +753,71 @@ export async function fetchUserDocumentFromFirestore(docId: string, timeoutMs: n
 /**
  * Fast direct fetch of tutor document by docId (UID or tutor ID)
  */
-export async function fetchTutorDocumentFromFirestore(docId: string, timeoutMs: number = 500): Promise<any | null> {
+export async function fetchTutorDocumentFromFirestore(docId: string, timeoutMs: number = 3500): Promise<any | null> {
   const db = getFirestoreDb();
   if (!db || !docId) return null;
   try {
+    // 1. Direct lookup in /tutors/{docId}
     const snap = await withTimeout(db.collection('tutors').doc(docId).get(), timeoutMs);
-    return snap && snap.exists ? snap.data() : null;
+    if (snap && snap.exists) {
+      return { id: docId, ...snap.data() };
+    }
+
+    // 2. Direct lookup in /users/{docId}
+    const userSnap = await withTimeout(db.collection('users').doc(docId).get(), timeoutMs);
+    if (userSnap && userSnap.exists) {
+      const uData = userSnap.data();
+      if (uData && (uData.role === 'teacher' || uData.role === 'tutor' || uData.role === 'native_friend' || uData.approvalStatus)) {
+        return { id: docId, ...uData };
+      }
+    }
+
+    // 3. Sanitized email doc ID
+    const cleanDocId = docId.toLowerCase().trim().replace(/[^a-zA-Z0-9]/g, '-');
+    if (cleanDocId && cleanDocId !== docId) {
+      const cleanTutorSnap = await withTimeout(db.collection('tutors').doc(cleanDocId).get(), timeoutMs);
+      if (cleanTutorSnap && cleanTutorSnap.exists) {
+        return { id: cleanDocId, ...cleanTutorSnap.data() };
+      }
+      const cleanUserSnap = await withTimeout(db.collection('users').doc(cleanDocId).get(), timeoutMs);
+      if (cleanUserSnap && cleanUserSnap.exists) {
+        return { id: cleanDocId, ...cleanUserSnap.data() };
+      }
+    }
+
+    // 4. Query by id, email, or uid in tutors and users
+    const queryPromises: Promise<any>[] = [
+      db.collection('tutors').where('id', '==', docId).limit(1).get().catch(() => null),
+      db.collection('users').where('id', '==', docId).limit(1).get().catch(() => null),
+    ];
+    if (docId.includes('@')) {
+      const lowerEmail = docId.toLowerCase().trim();
+      queryPromises.push(db.collection('tutors').where('email', '==', lowerEmail).limit(1).get().catch(() => null));
+      queryPromises.push(db.collection('users').where('email', '==', lowerEmail).limit(1).get().catch(() => null));
+    }
+    const querySnaps = await withTimeout(Promise.all(queryPromises), timeoutMs);
+    if (querySnaps) {
+      for (const qSnap of querySnaps) {
+        if (qSnap && !qSnap.empty && qSnap.docs[0]?.exists) {
+          const matchedDoc = qSnap.docs[0];
+          return { id: matchedDoc.id, ...matchedDoc.data() };
+        }
+      }
+    }
+
+    // 5. Check app_state/tutors
+    const appStateSnap = await withTimeout(db.collection('app_state').doc('tutors').get(), timeoutMs);
+    if (appStateSnap && appStateSnap.exists) {
+      const stateData = appStateSnap.data();
+      if (stateData && Array.isArray(stateData.tutorsList)) {
+        const found = stateData.tutorsList.find(
+          (t: any) => t.id === docId || (t.email && t.email.toLowerCase() === docId.toLowerCase())
+        );
+        if (found) return found;
+      }
+    }
+
+    return null;
   } catch {
     return null;
   }

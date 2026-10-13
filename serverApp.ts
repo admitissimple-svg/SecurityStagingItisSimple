@@ -3436,6 +3436,7 @@ app.post('/api/tutors/:id/approve', firebaseAuthMiddleware, requireAdmin, async 
   let approvedEmail = '';
   let approvedTutor: any = null;
 
+  // 1. Search in local db.tutorsList
   db.tutorsList = (db.tutorsList || []).map((t) => {
     if (t.id === tutorId || t.email?.toLowerCase() === tutorId.toLowerCase()) {
       approvedEmail = (t.email || '').toLowerCase().trim();
@@ -3452,14 +3453,16 @@ app.post('/api/tutors/:id/approve', firebaseAuthMiddleware, requireAdmin, async 
     return t;
   });
 
-  // If tutor wasn't in db.tutorsList but was passed in body or found in teachers
+  // 2. If not found in db.tutorsList, check db.teachers
   if (!approvedTutor) {
-    const passedTutor = req.body.tutor;
-    if (passedTutor) {
-      approvedEmail = (passedTutor.email || '').toLowerCase().trim();
+    const teacher = (db.teachers || []).find(
+      (tc: any) => tc.id === tutorId || (tc.email && tc.email.toLowerCase() === tutorId.toLowerCase())
+    );
+    if (teacher) {
+      approvedEmail = (teacher.email || '').toLowerCase().trim();
       approvedTutor = {
-        ...passedTutor,
-        id: tutorId,
+        ...teacher,
+        id: teacher.id || tutorId,
         approvalStatus: 'approved',
         isApproved: true,
         status: 'approved',
@@ -3471,7 +3474,7 @@ app.post('/api/tutors/:id/approve', firebaseAuthMiddleware, requireAdmin, async 
     }
   }
 
-  // If still not found, check direct Firestore collection
+  // 3. Locate the tutor directly in Firestore (default) by route ID
   if (!approvedTutor) {
     try {
       const directTutor = await fetchTutorDocumentFromFirestore(tutorId).catch(() => null);
@@ -3489,7 +3492,35 @@ app.post('/api/tutors/:id/approve', firebaseAuthMiddleware, requireAdmin, async 
         db.tutorsList = db.tutorsList || [];
         db.tutorsList.push(approvedTutor);
       }
-    } catch {}
+    } catch (fsErr) {
+      console.warn('Error fetching tutor document from Firestore in POST /api/tutors/:id/approve:', fsErr);
+    }
+  }
+
+  // 4. Fallback if tutor was passed in body (e.g. legacy clients)
+  if (!approvedTutor) {
+    const passedTutor = req.body?.tutor;
+    if (passedTutor) {
+      approvedEmail = (passedTutor.email || '').toLowerCase().trim();
+      approvedTutor = {
+        ...passedTutor,
+        id: tutorId,
+        approvalStatus: 'approved',
+        isApproved: true,
+        status: 'approved',
+        approved: true,
+        updatedAt: new Date().toISOString(),
+      };
+      db.tutorsList = db.tutorsList || [];
+      db.tutorsList.push(approvedTutor);
+    }
+  }
+
+  if (!approvedTutor) {
+    return res.status(404).json({
+      error: 'NotFound',
+      message: `Amigo Nativo "${tutorId}" não foi encontrado para aprovação.`,
+    });
   }
 
   if (approvedEmail) {
@@ -3502,6 +3533,18 @@ app.post('/api/tutors/:id/approve', firebaseAuthMiddleware, requireAdmin, async 
         status: 'approved',
         approved: true,
       };
+    } else {
+      db.teachers = db.teachers || [];
+      db.teachers.push({
+        id: approvedTutor.id || tutorId,
+        email: approvedEmail,
+        name: approvedTutor.name || approvedEmail.split('@')[0],
+        role: 'teacher',
+        approvalStatus: 'approved',
+        isApproved: true,
+        status: 'approved',
+        approved: true,
+      });
     }
     if (db.userProfiles && db.userProfiles[approvedEmail]) {
       db.userProfiles[approvedEmail] = {
@@ -3514,12 +3557,10 @@ app.post('/api/tutors/:id/approve', firebaseAuthMiddleware, requireAdmin, async 
     }
   }
 
-  if (approvedTutor) {
-    // 1. Direct persistence in Firestore /tutors/{tutorId} and /users/{tutorId}
-    await saveTutorToFirestore(approvedTutor).catch((err) => {
-      console.warn('Error saving approved tutor to Firestore:', err);
-    });
-  }
+  // 1. Direct persistence in Firestore (default) across /tutors/{tutorId} and /users/{tutorId}
+  await saveTutorToFirestore(approvedTutor, tutorId).catch((err) => {
+    console.warn('Error saving approved tutor to Firestore:', err);
+  });
 
   // 2. Synchronize app_state/tutors and in-memory DB ensuring full consistency
   await writeDbSync(db);

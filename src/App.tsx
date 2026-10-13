@@ -4505,7 +4505,7 @@ export default function App() {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ tutor: tutorToApprove }),
+        body: JSON.stringify({}),
       });
     } catch (networkErr: any) {
       return {
