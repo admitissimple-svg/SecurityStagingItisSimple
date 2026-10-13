@@ -31,6 +31,7 @@ import {
   DEFAULT_TEACHER_TIMEZONE,
 } from '../utils/timezone';
 import { isValidCanonicalUid } from '../utils/studentPersistence';
+import { auth } from '../firebase';
 
 interface LiveLessonScheduleModalProps {
   isOpen: boolean;
@@ -329,17 +330,37 @@ export const LiveLessonScheduleModal: React.FC<LiveLessonScheduleModalProps> = (
 
   const effectiveStudentUid = useMemo(() => {
     if (initialStudentUid && isValidCanonicalUid(initialStudentUid)) return initialStudentUid.trim();
+    if (
+      auth?.currentUser &&
+      (auth.currentUser.email || '').toLowerCase().trim() === effectiveStudentEmail &&
+      isValidCanonicalUid(auth.currentUser.uid)
+    ) {
+      return auth.currentUser.uid;
+    }
     if (userProfile?.email && userProfile.email.toLowerCase().trim() === effectiveStudentEmail) {
       if (userProfile.id && isValidCanonicalUid(userProfile.id)) return userProfile.id;
       if ((userProfile as any).uid && isValidCanonicalUid((userProfile as any).uid)) return (userProfile as any).uid;
     }
-    if (currentAccount?.role === 'student' && currentAccount?.uid && isValidCanonicalUid(currentAccount.uid)) {
+    if (
+      currentAccount?.role === 'student' &&
+      (currentAccount?.email || '').toLowerCase().trim() === effectiveStudentEmail &&
+      currentAccount?.uid &&
+      isValidCanonicalUid(currentAccount.uid)
+    ) {
       return currentAccount.uid;
     }
-    if ((matchedStudent as any)?.uid && isValidCanonicalUid((matchedStudent as any).uid)) {
+    if (
+      (matchedStudent as any)?.uid &&
+      isValidCanonicalUid((matchedStudent as any).uid) &&
+      (matchedStudent?.email || '').toLowerCase().trim() === effectiveStudentEmail
+    ) {
       return (matchedStudent as any).uid;
     }
-    if (matchedStudent?.id && isValidCanonicalUid(matchedStudent.id)) {
+    if (
+      matchedStudent?.id &&
+      isValidCanonicalUid(matchedStudent.id) &&
+      (matchedStudent?.email || '').toLowerCase().trim() === effectiveStudentEmail
+    ) {
       return matchedStudent.id;
     }
     return '';

@@ -2190,9 +2190,11 @@ const handleRegistration = async (req: any, res: any) => {
 
   if (existingIdx >= 0) {
     const existing = db.students[existingIdx];
+    const resolvedCanonicalUid = (req.body.uid && !req.body.uid.startsWith('usr-') && !req.body.uid.startsWith('st-')) ? req.body.uid : (existing.uid || existing.id || userUid);
     db.students[existingIdx] = {
       ...existing,
-      id: existing.id || userUid,
+      id: resolvedCanonicalUid,
+      uid: resolvedCanonicalUid,
       name: cleanName,
       studentName: cleanName,
       email: cleanEmail,
@@ -2206,8 +2208,11 @@ const handleRegistration = async (req: any, res: any) => {
       dailyPhraseTime: req.body.dailyPhraseTime || existing.dailyPhraseTime || dailyPhraseTime,
       contractedLessons: existing.contractedLessons ?? db.contractedLessons?.[cleanEmail] ?? 0,
       completedLessonsCount: existing.completedLessonsCount ?? 0,
-      teacherEmail: existing.teacherEmail || null,
-      teacherName: existing.teacherName || null,
+      teacherEmail: req.body.teacherEmail || existing.teacherEmail || null,
+      teacherName: req.body.teacherName || existing.teacherName || null,
+      teacherUid: req.body.teacherUid || existing.teacherUid || null,
+      assignedNativeFriendUID: req.body.teacherUid || existing.assignedNativeFriendUID || null,
+      nativeFriendUID: req.body.teacherUid || existing.nativeFriendUID || null,
       status: existing.status || 'active',
       activeSince: existing.activeSince || new Date().toISOString().split('T')[0],
       createdAt: existing.createdAt || new Date().toISOString(),
@@ -2225,6 +2230,7 @@ const handleRegistration = async (req: any, res: any) => {
 
     const studentData = {
       id: userUid,
+      uid: userUid,
       name: cleanName,
       studentName: cleanName,
       email: cleanEmail,
@@ -2237,6 +2243,9 @@ const handleRegistration = async (req: any, res: any) => {
       completedLessonsCount: 0,
       teacherEmail: initialTeacherEmail,
       teacherName: initialTeacherName,
+      teacherUid: req.body.teacherUid || null,
+      assignedNativeFriendUID: req.body.teacherUid || null,
+      nativeFriendUID: req.body.teacherUid || null,
       routineVideoTime,
       routineAudioTime,
       dailyPhraseTime,
@@ -2268,11 +2277,15 @@ const handleRegistration = async (req: any, res: any) => {
   if (!db.userProfiles[cleanEmail]) {
     db.userProfiles[cleanEmail] = {
       id: userUid,
+      uid: userUid,
       name: cleanName,
       email: cleanEmail,
       level,
       teacherEmail: initialTeacherEmail,
       teacherName: initialTeacherName,
+      teacherUid: req.body.teacherUid || null,
+      assignedNativeFriendUID: req.body.teacherUid || null,
+      nativeFriendUID: req.body.teacherUid || null,
       routineVideoTime,
       routineAudioTime,
       dailyPhraseTime,
@@ -2294,17 +2307,22 @@ const handleRegistration = async (req: any, res: any) => {
     };
   } else {
     const p = db.userProfiles[cleanEmail];
+    const resolvedCanonicalUid = (req.body.uid && !req.body.uid.startsWith('usr-') && !req.body.uid.startsWith('st-')) ? req.body.uid : (p.uid || p.id || userUid);
     db.userProfiles[cleanEmail] = {
       ...p,
-      id: p.id || userUid,
+      id: resolvedCanonicalUid,
+      uid: resolvedCanonicalUid,
       name: cleanName,
       level: level || p.level,
       learningGoal: goal || p.learningGoal,
       routineVideoTime: req.body.routineVideoTime || p.routineVideoTime || routineVideoTime,
       routineAudioTime: req.body.routineAudioTime || p.routineAudioTime || routineAudioTime,
       dailyPhraseTime: req.body.dailyPhraseTime || p.dailyPhraseTime || dailyPhraseTime,
-      teacherEmail: p.teacherEmail || null,
-      teacherName: p.teacherName || null,
+      teacherEmail: req.body.teacherEmail || p.teacherEmail || null,
+      teacherName: req.body.teacherName || p.teacherName || null,
+      teacherUid: req.body.teacherUid || p.teacherUid || null,
+      assignedNativeFriendUID: req.body.teacherUid || p.assignedNativeFriendUID || null,
+      nativeFriendUID: req.body.teacherUid || p.nativeFriendUID || null,
       contractedLessons: p.contractedLessons ?? db.contractedLessons?.[cleanEmail] ?? 0,
       completedLessonsCount: p.completedLessonsCount ?? 0,
       picture: userAvatar,
@@ -2350,6 +2368,9 @@ const handleRegistration = async (req: any, res: any) => {
     weeklyStudyDays: db.userProfiles[cleanEmail].weeklyStudyDays,
     teacherEmail: initialTeacherEmail,
     teacherName: initialTeacherName,
+    teacherUid: req.body.teacherUid || null,
+    assignedNativeFriendUID: req.body.teacherUid || null,
+    nativeFriendUID: req.body.teacherUid || null,
     contractedLessons: initialContracted,
     createdAt: new Date().toISOString(),
   };
@@ -2548,9 +2569,10 @@ app.post('/api/auth/google', async (req, res) => {
       (s) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail
     );
     if (!existing) {
+      const canonicalStudentId = uid || db.authUsers[cleanEmail]?.uid || `st-${Date.now()}`;
       db.students.push({
-        id: `st-${Date.now()}`,
-        uid: uid || db.authUsers[cleanEmail]?.uid,
+        id: canonicalStudentId,
+        uid: uid || db.authUsers[cleanEmail]?.uid || canonicalStudentId,
         name: displayName,
         studentName: displayName,
         email: cleanEmail,
@@ -2578,8 +2600,8 @@ app.post('/api/auth/google', async (req, res) => {
       if (!db.userProfiles) db.userProfiles = {};
       if (!db.userProfiles[cleanEmail]) {
         db.userProfiles[cleanEmail] = {
-          id: `usr-${Date.now()}`,
-          uid: uid || db.authUsers[cleanEmail]?.uid,
+          id: canonicalStudentId,
+          uid: uid || db.authUsers[cleanEmail]?.uid || canonicalStudentId,
           name: displayName,
           email: cleanEmail,
           picture: picture || '',
@@ -2598,6 +2620,14 @@ app.post('/api/auth/google', async (req, res) => {
           contractedLessons: 0,
           completedLessonsCount: 0,
         };
+      }
+      writeDb(db);
+    } else if (uid) {
+      existing.id = uid;
+      existing.uid = uid;
+      if (db.userProfiles?.[cleanEmail]) {
+        db.userProfiles[cleanEmail].id = uid;
+        db.userProfiles[cleanEmail].uid = uid;
       }
       writeDb(db);
     }
@@ -4792,9 +4822,12 @@ app.get('/api/user-profile', (req, res) => {
   if (profile && student) {
     const fallbackTeacherEmail = isDisallowedAdminTeacher(student.teacherEmail, student.teacherName) ? null : student.teacherEmail;
     const fallbackTeacherName = isDisallowedAdminTeacher(student.teacherEmail, student.teacherName) ? null : student.teacherName;
+    const canonicalResolvedUid = (uid && !uid.startsWith('usr-') && !uid.startsWith('st-')) ? uid : (profile.uid || (profile.id && !profile.id.startsWith('usr-') && !profile.id.startsWith('st-') ? profile.id : null) || student.uid || student.id || profile.id);
     // Fill in any missing fields from student without overwriting existing profile data
     profile = {
       ...profile,
+      id: canonicalResolvedUid,
+      uid: canonicalResolvedUid,
       name: profile.name || student.name || student.studentName,
       level: profile.level || student.level || student.studentLevel,
       learningGoal: profile.learningGoal || student.goal || student.learningGoal,
@@ -4811,8 +4844,10 @@ app.get('/api/user-profile', (req, res) => {
   } else if (!profile && student) {
     const fallbackTeacherEmail = isDisallowedAdminTeacher(student.teacherEmail, student.teacherName) ? null : student.teacherEmail;
     const fallbackTeacherName = isDisallowedAdminTeacher(student.teacherEmail, student.teacherName) ? null : student.teacherName;
+    const canonicalResolvedUid = (uid && !uid.startsWith('usr-') && !uid.startsWith('st-')) ? uid : (student.uid || student.id || `usr-${Date.now()}`);
     profile = {
-      id: student.id || `usr-${Date.now()}`,
+      id: canonicalResolvedUid,
+      uid: canonicalResolvedUid,
       name: student.name || student.studentName,
       email,
       level: student.level || student.studentLevel || 'iniciante',

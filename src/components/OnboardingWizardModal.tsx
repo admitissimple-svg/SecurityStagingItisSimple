@@ -39,6 +39,9 @@ import {
   GoogleAccount,
   EnglishLevel,
 } from '../types';
+import { firebaseSignUpWithEmail, firebaseSignInWithEmail, googleSignIn } from '../utils/auth';
+import { auth } from '../firebase';
+import { isValidCanonicalUid } from '../utils/studentPersistence';
 
 export interface OnboardingResultData {
   learningGoal: string;
@@ -55,6 +58,7 @@ export interface OnboardingResultData {
     name: string;
     email: string;
     password?: string;
+    uid?: string;
   };
 }
 
@@ -68,7 +72,7 @@ export interface OnboardingWizardModalProps {
   initialEmail?: string;
   onEmailAlreadyExists?: (email: string) => void;
   onCompleteOnboarding: (onboardingData: OnboardingResultData) => void | Promise<void>;
-  onOpenScheduleTrialLesson?: (tutor: NativeFriendTutor, studentInfo?: { name: string; email: string; uid?: string }) => void;
+  onOpenScheduleTrialLesson?: (tutor: NativeFriendTutor, studentInfo?: { name: string; email: string; uid?: string; isTrialLesson?: boolean }) => void;
   onOpenStartNewWeek?: () => void;
 }
 
@@ -333,6 +337,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
   );
   const [studentPassword, setStudentPassword] = useState<string>('');
   const [showPassword, setShowPassword] = useState<boolean>(false);
+  const [authenticatedStudentUid, setAuthenticatedStudentUid] = useState<string>('');
   const [isSavedSuccessfully, setIsSavedSuccessfully] = useState<boolean>(false);
 
   // Reset or initialize on open ONLY when transitioning from closed to open
@@ -448,12 +453,44 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
     return isEn ? found?.titleEn || '' : found?.titlePt || '';
   };
 
-  // Step 5 Save / Submit Action
+  // Google Sign-In helper for seamless 1-click onboarding authentication
+  const handleGoogleSignInOnboarding = async () => {
+    setErrorMessage(null);
+    setIsSubmitting(true);
+    try {
+      const { user } = await googleSignIn();
+      if (!user.email) {
+        throw new Error(isEn ? 'No verified email returned from Google.' : 'Nenhum e-mail retornado pelo Google.');
+      }
+      const gEmail = user.email.toLowerCase().trim();
+      const gName = (user.displayName || gEmail.split('@')[0]).trim();
+      setStudentEmail(gEmail);
+      setStudentName(gName);
+      if (user.uid && isValidCanonicalUid(user.uid)) {
+        setAuthenticatedStudentUid(user.uid);
+      }
+    } catch (err: any) {
+      if (err?.code !== 'auth/popup-closed-by-user') {
+        console.warn('Google sign-in notice in onboarding:', err);
+        setErrorMessage(err?.message || (isEn ? 'Google authentication failed.' : 'Falha na autenticação com Google.'));
+      }
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  // Step 5 Save / Submit Action: Guarantees authenticated Firebase identity and canonical UID before completing
   const handleSaveAndAdvance = async () => {
     setErrorMessage(null);
 
+    const cleanEmail = (studentEmail.trim() || currentAccount?.email || auth?.currentUser?.email || '').toLowerCase().trim();
+    const isGoogleAuthUser = Boolean(
+      (authenticatedStudentUid && isValidCanonicalUid(authenticatedStudentUid)) ||
+      (auth?.currentUser && (auth.currentUser.email || '').toLowerCase().trim() === cleanEmail && isValidCanonicalUid(auth.currentUser.uid))
+    );
+
     // Validation for guest
-    if (!currentAccount) {
+    if (!currentAccount && !isGoogleAuthUser) {
       if (!studentName.trim()) {
         setErrorMessage(isEn ? 'Please enter your name.' : 'Por favor, informe seu nome completo.');
         return;
@@ -466,6 +503,9 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
         setErrorMessage(isEn ? 'Password must be at least 6 characters.' : 'A senha deve conter no mínimo 6 caracteres.');
         return;
       }
+    } else if (!studentEmail.trim() || !studentEmail.includes('@')) {
+      setErrorMessage(isEn ? 'Please enter a valid email address.' : 'Por favor, informe um email válido.');
+      return;
     }
 
     if (!selectedTutor) {
@@ -473,35 +513,71 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
       return;
     }
 
-    const cleanEmail = (studentEmail.trim() || currentAccount?.email || '').toLowerCase();
     const isNewRegistration = !currentAccount || currentAccount.role !== 'student' || cleanEmail !== (currentAccount.email || '').toLowerCase();
 
-    // Check if email already exists in Firebase Auth or Firestore
-    if (isNewRegistration && cleanEmail) {
-      setIsSubmitting(true);
-      try {
-        const checkRes = await fetch(`/api/auth/check-user?email=${encodeURIComponent(cleanEmail)}`);
-        if (checkRes.ok) {
-          const checkData = await checkRes.json();
-          if (checkData.emailExists) {
-            setIsSubmitting(false);
-            if (onEmailAlreadyExists) {
-              onEmailAlreadyExists(cleanEmail);
-            } else {
-              setErrorMessage(isEn ? 'This email is already registered.' : 'Este e-mail já possui uma conta cadastrada.');
-            }
-            return;
-          }
-        }
-      } catch (err) {
-        console.warn('Check email error in onboarding:', err);
-      }
-    }
-
-    // Passa estado local de carregamento
     setIsSubmitting(true);
 
     try {
+      // 1. Resolve canonical Firebase Auth UID strictly from verified authenticated identity
+      let canonicalStudentUid = '';
+
+      if (authenticatedStudentUid && isValidCanonicalUid(authenticatedStudentUid)) {
+        canonicalStudentUid = authenticatedStudentUid;
+      } else if (auth?.currentUser && (auth.currentUser.email || '').toLowerCase().trim() === cleanEmail && isValidCanonicalUid(auth.currentUser.uid)) {
+        canonicalStudentUid = auth.currentUser.uid;
+      } else if (currentAccount?.role === 'student' && (currentAccount.email || '').toLowerCase() === cleanEmail && isValidCanonicalUid(currentAccount.uid)) {
+        canonicalStudentUid = currentAccount.uid || '';
+      } else if (isNewRegistration && studentPassword) {
+        if (authMode === 'signup') {
+          try {
+            const authRes = await firebaseSignUpWithEmail(cleanEmail, studentPassword);
+            canonicalStudentUid = authRes.user.uid;
+            setAuthenticatedStudentUid(authRes.user.uid);
+          } catch (signupErr: any) {
+            if (signupErr?.code === 'auth/email-already-in-use') {
+              try {
+                const loginRes = await firebaseSignInWithEmail(cleanEmail, studentPassword);
+                canonicalStudentUid = loginRes.user.uid;
+                setAuthenticatedStudentUid(loginRes.user.uid);
+              } catch (loginErr: any) {
+                setIsSubmitting(false);
+                setErrorMessage(
+                  isEn
+                    ? 'This email is already registered. Please check your password or choose Login.'
+                    : 'Este e-mail já possui uma conta cadastrada. Por favor, verifique sua senha ou escolha Entrar.'
+                );
+                return;
+              }
+            } else {
+              setIsSubmitting(false);
+              setErrorMessage(signupErr?.message || (isEn ? 'Failed to create student account.' : 'Falha ao criar conta de aluno.'));
+              return;
+            }
+          }
+        } else {
+          // Login mode
+          try {
+            const loginRes = await firebaseSignInWithEmail(cleanEmail, studentPassword);
+            canonicalStudentUid = loginRes.user.uid;
+            setAuthenticatedStudentUid(loginRes.user.uid);
+          } catch (loginErr: any) {
+            setIsSubmitting(false);
+            setErrorMessage(loginErr?.message || (isEn ? 'Invalid email or password.' : 'E-mail ou senha inválidos.'));
+            return;
+          }
+        }
+      }
+
+      if (!canonicalStudentUid || !isValidCanonicalUid(canonicalStudentUid)) {
+        setIsSubmitting(false);
+        setErrorMessage(
+          isEn
+            ? 'Canonical Student UID missing. Please authenticate with Firebase before continuing.'
+            : 'UID canônico do Aluno ausente. Por favor, autentique-se com o Firebase para continuar.'
+        );
+        return;
+      }
+
       await onCompleteOnboarding({
         learningGoal: getFinalLearningGoal(),
         level: studentLevel,
@@ -513,19 +589,16 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
         routineAudioTime,
         dailyPhraseTime,
         selectedTutor,
-        studentAccount: (!currentAccount || currentAccount.role !== 'student' || cleanEmail !== (currentAccount.email || '').toLowerCase())
-          ? {
-              name: studentName.trim() || currentAccount?.name || '',
-              email: cleanEmail,
-              password: studentPassword,
-            }
-          : {
-              name: currentAccount.name,
-              email: currentAccount.email,
-            },
+        studentAccount: {
+          name: studentName.trim() || currentAccount?.name || '',
+          email: cleanEmail,
+          password: studentPassword,
+          uid: canonicalStudentUid,
+        },
       });
 
       setIsSavedSuccessfully(true);
+      setCurrentStep(6);
     } catch (err: any) {
       console.warn('Failed to save onboarding configuration:', err);
       setErrorMessage(err?.message || (isEn ? 'Failed to save configuration.' : 'Erro ao salvar configuração do perfil.'));
@@ -535,14 +608,30 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
   };
 
   const handleBookTrialLesson = () => {
-    const activeStudentEmail = (studentEmail.trim() || currentUserProfile?.email || currentAccount?.email || '').toLowerCase();
-    const activeStudentName = studentName.trim() || currentUserProfile?.name || currentAccount?.name || activeStudentEmail.split('@')[0] || 'Aluno';
-    const activeStudentUid = currentUserProfile?.id || (currentAccount as any)?.uid || (activeStudentEmail ? `usr-${activeStudentEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : undefined);
+    const activeStudentEmail = (studentEmail.trim() || currentUserProfile?.email || currentAccount?.email || auth?.currentUser?.email || '').toLowerCase().trim();
+    const activeStudentName = studentName.trim() || currentUserProfile?.name || currentAccount?.name || auth?.currentUser?.displayName || activeStudentEmail.split('@')[0] || 'Aluno';
+    const activeStudentUid =
+      (authenticatedStudentUid && isValidCanonicalUid(authenticatedStudentUid) ? authenticatedStudentUid : null) ||
+      (auth?.currentUser && (auth.currentUser.email || '').toLowerCase().trim() === activeStudentEmail && isValidCanonicalUid(auth.currentUser.uid) ? auth.currentUser.uid : null) ||
+      (currentAccount?.email?.toLowerCase().trim() === activeStudentEmail && isValidCanonicalUid(currentAccount?.uid) ? currentAccount?.uid : null) ||
+      (currentUserProfile?.email?.toLowerCase().trim() === activeStudentEmail && isValidCanonicalUid(currentUserProfile?.id) ? currentUserProfile?.id : null) ||
+      (currentUserProfile?.email?.toLowerCase().trim() === activeStudentEmail && isValidCanonicalUid((currentUserProfile as any)?.uid) ? (currentUserProfile as any)?.uid : null);
+
+    if (!activeStudentUid) {
+      setErrorMessage(
+        isEn
+          ? 'Canonical Student UID missing. Please sign in to schedule your trial lesson.'
+          : 'UID canônico do Aluno ausente. Por favor, conecte-se para agendar sua aula teste.'
+      );
+      return;
+    }
+
     if (selectedTutor && onOpenScheduleTrialLesson) {
       onOpenScheduleTrialLesson(selectedTutor, {
         name: activeStudentName,
         email: activeStudentEmail,
         uid: activeStudentUid,
+        isTrialLesson: true,
       });
     }
     onClose();
@@ -1475,6 +1564,28 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                   </div>
 
                   <div className="space-y-3">
+                    <button
+                      type="button"
+                      id="onboarding-google-signin-btn"
+                      onClick={handleGoogleSignInOnboarding}
+                      disabled={isSubmitting}
+                      className="w-full flex items-center justify-center gap-2.5 px-4 py-2.5 rounded-xl bg-white hover:bg-slate-100 text-slate-800 text-xs font-bold transition shadow-xs cursor-pointer border border-slate-200"
+                    >
+                      <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24">
+                        <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
+                        <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+                        <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z" />
+                        <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z" />
+                      </svg>
+                      <span>{isEn ? 'Continue with Google' : 'Continuar com o Google'}</span>
+                    </button>
+
+                    <div className="flex items-center gap-2 my-1 text-[11px] text-slate-400">
+                      <div className="h-px bg-white/15 flex-1" />
+                      <span>{isEn ? 'or with email' : 'ou com e-mail'}</span>
+                      <div className="h-px bg-white/15 flex-1" />
+                    </div>
+
                     {authMode === 'signup' && (
                       <div>
                         <label htmlFor="student-name-input" className="block text-xs font-bold text-slate-300 mb-1">

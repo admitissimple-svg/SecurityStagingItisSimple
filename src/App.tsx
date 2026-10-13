@@ -45,7 +45,7 @@ import { recordConsumedVideo, recordConsumedTrack } from './hooks/useStudentHist
 import { extractYouTubeVideoId, getYouTubeWatchUrl } from './utils/youtube';
 import { getInstantOrCachedWord } from './utils/dictionaryService';
 import { auth, getDb, getAllFirestoreDbs } from './firebase';
-import { getAccessToken, getAdminAccessToken, waitForAuthUser } from './utils/auth';
+import { getAccessToken, getAdminAccessToken, waitForAuthUser, firebaseSignUpWithEmail, firebaseSignInWithEmail } from './utils/auth';
 import { useNativeFriends, isTutorApproved, isTeacherRole } from './hooks/useNativeFriends';
 import { onAuthStateChanged, signOut as firebaseSignOutAuth } from 'firebase/auth';
 import { doc, getDoc, collection, getDocs, onSnapshot, setDoc, deleteDoc, query, where } from 'firebase/firestore';
@@ -131,6 +131,7 @@ import {
   purchasePackageWithTransaction,
   cancelLessonWithTransaction,
   isValidCanonicalUid,
+  normalizeUid,
   normalizeWeekId,
   parseWeekCycleNumber,
 } from './utils/studentPersistence';
@@ -427,6 +428,46 @@ export default function App() {
               };
               setDoc(doc(db, 'users', fbUser.uid), studentPayload, { merge: true }).catch(() => null);
             }
+
+            const teacherUid = (firestoreDoc?.teacherUid && isValidCanonicalUid(firestoreDoc.teacherUid))
+              ? firestoreDoc.teacherUid
+              : (firestoreDoc?.assignedNativeFriendUID && isValidCanonicalUid(firestoreDoc.assignedNativeFriendUID))
+                ? firestoreDoc.assignedNativeFriendUID
+                : (firestoreDoc?.nativeFriendUID && isValidCanonicalUid(firestoreDoc.nativeFriendUID))
+                  ? firestoreDoc.nativeFriendUID
+                  : undefined;
+
+            const restoredProfile: UserProfile = {
+              ...createDefaultStudentProfile(account),
+              id: fbUser.uid,
+              uid: fbUser.uid,
+              email: cleanEmail,
+              name: account.name,
+              picture: account.picture,
+              avatar: account.picture,
+              level: (firestoreDoc?.level || firestoreDoc?.englishLevel || EnglishLevel.BEGINNER) as EnglishLevel,
+              englishLevel: (firestoreDoc?.level || firestoreDoc?.englishLevel || EnglishLevel.BEGINNER) as EnglishLevel,
+              userLevel: (firestoreDoc?.level || firestoreDoc?.englishLevel || EnglishLevel.BEGINNER) as EnglishLevel,
+              learningGoal: firestoreDoc?.learningGoal || '',
+              weeklyStudyDaysTarget: typeof firestoreDoc?.weeklyStudyDaysTarget === 'number' ? firestoreDoc.weeklyStudyDaysTarget : 4,
+              weeklyStudyDays: firestoreDoc?.weeklyStudyDays || ['monday', 'tuesday', 'wednesday', 'thursday'],
+              routineVideoTime: firestoreDoc?.routineVideoTime || '09:00',
+              routineAudioTime: firestoreDoc?.routineAudioTime || '14:00',
+              dailyPhraseTime: firestoreDoc?.dailyPhraseTime || '20:00',
+              teacherEmail: firestoreDoc?.teacherEmail || '',
+              teacherName: firestoreDoc?.teacherName || '',
+              teacherMeetUrl: firestoreDoc?.teacherMeetUrl || '',
+              teacherUid: teacherUid,
+              assignedNativeFriendUID: teacherUid,
+              nativeFriendUID: teacherUid,
+              contractedLessons: typeof firestoreDoc?.contractedLessons === 'number' ? firestoreDoc.contractedLessons : 1,
+              completedLessonsCount: typeof firestoreDoc?.completedLessonsCount === 'number' ? firestoreDoc.completedLessonsCount : 0,
+              hasCompletedTrialLesson: Boolean(firestoreDoc?.hasCompletedTrialLesson),
+              onboardingCompleted: firestoreDoc?.onboardingCompleted ?? true,
+              subscriptionType: firestoreDoc?.subscriptionType || 'trial',
+              enrollmentStatus: firestoreDoc?.enrollmentStatus || (teacherUid ? 'active' : 'not_enrolled'),
+            };
+            setUserProfile(restoredProfile);
           }
 
           setCurrentAccount(account);
@@ -539,7 +580,7 @@ export default function App() {
 
   const [activeLessonForAction, setActiveLessonForAction] = useState<LiveLesson | null>(null);
   const [teacherEmailForConfig, setTeacherEmailForConfig] = useState<string>('itissimple.school@gmail.com');
-  const [scheduleStudentInfo, setScheduleStudentInfo] = useState<{ email: string; name: string; uid?: string } | null>(null);
+  const [scheduleStudentInfo, setScheduleStudentInfo] = useState<{ email: string; name: string; uid?: string; isTrialLesson?: boolean } | null>(null);
 
   // Teacher Filter & Minimalist Activity Toggle
   const [selectedStudentFilter, setSelectedStudentFilter] = useState<string>('all');
@@ -1947,6 +1988,7 @@ export default function App() {
 
   // Handler: Complete Onboarding Wizard (Multi-step Assistant)
   const handleCompleteOnboarding = async (data: OnboardingResultData) => {
+    setIsOnboardingCompleting(true);
     try {
       // 1. Student identity resolution
       const isRegisteringStudent = Boolean(data.studentAccount?.email && data.studentAccount.email.trim() !== '');
@@ -1956,11 +1998,60 @@ export default function App() {
       const effectiveName = isRegisteringStudent
         ? (data.studentAccount!.name || data.studentAccount!.email.split('@')[0]).trim()
         : (currentAccount?.role === 'student' && currentAccount.name ? currentAccount.name.trim() : (userProfile.name || currentAccount?.name || 'Aluno'));
-      const studentUid = auth.currentUser?.uid
-        || (currentAccount?.role === 'student' && currentAccount.email?.toLowerCase() === cleanEmail && currentAccount.uid ? currentAccount.uid : '')
-        || (userProfile.email?.toLowerCase() === cleanEmail && userProfile.id && !userProfile.id.includes('@') && !userProfile.id.startsWith('usr-') ? userProfile.id : (auth.currentUser?.uid || ''));
+
+      // Resolve canonical Student UID directly from verified Firebase identity
+      let studentUid =
+        (data.studentAccount?.uid && isValidCanonicalUid(data.studentAccount.uid) ? data.studentAccount.uid.trim() : '') ||
+        (auth.currentUser && (auth.currentUser.email || '').toLowerCase().trim() === cleanEmail && isValidCanonicalUid(auth.currentUser.uid) ? auth.currentUser.uid : '') ||
+        (currentAccount?.role === 'student' && (currentAccount.email || '').toLowerCase().trim() === cleanEmail && isValidCanonicalUid(currentAccount.uid) ? currentAccount.uid : '');
+
+      // If still missing and registration credentials provided, authenticate with Firebase Auth immediately
+      if (!studentUid && isRegisteringStudent && data.studentAccount?.password) {
+        try {
+          const authRes = await firebaseSignUpWithEmail(cleanEmail, data.studentAccount.password);
+          studentUid = authRes.user.uid;
+        } catch (signupErr: any) {
+          if (signupErr?.code === 'auth/email-already-in-use') {
+            try {
+              const loginRes = await firebaseSignInWithEmail(cleanEmail, data.studentAccount.password);
+              studentUid = loginRes.user.uid;
+            } catch (loginErr) {
+              console.warn('Firebase login attempt failed during onboarding reconciliation:', loginErr);
+            }
+          }
+        }
+      }
+
+      if (!studentUid || !isValidCanonicalUid(studentUid)) {
+        throw new Error(
+          currentLanguage === 'en'
+            ? 'Canonical Student UID missing. Please authenticate with Firebase before completing onboarding.'
+            : 'UID canônico do Aluno ausente. Por favor, autentique-se com o Firebase antes de concluir o onboarding.'
+        );
+      }
 
       const selectedLevel = (data.englishLevel || data.userLevel || data.level || EnglishLevel.BEGINNER) as EnglishLevel;
+
+      // 2. Resolve canonical Native Friend UID
+      const cleanTeacherEmail = (data.selectedTutor?.email || '').toLowerCase().trim();
+      const matchedTutor = tutors.find((t) =>
+        (data.selectedTutor?.uid && (t.uid === data.selectedTutor.uid || t.id === data.selectedTutor.uid)) ||
+        (data.selectedTutor?.id && (t.uid === data.selectedTutor.id || t.id === data.selectedTutor.id)) ||
+        (cleanTeacherEmail && (t.email || '').toLowerCase().trim() === cleanTeacherEmail)
+      );
+      const canonicalTutorUid =
+        (data.selectedTutor?.uid && isValidCanonicalUid(data.selectedTutor.uid) ? data.selectedTutor.uid : '') ||
+        (data.selectedTutor?.id && isValidCanonicalUid(data.selectedTutor.id) ? data.selectedTutor.id : '') ||
+        (matchedTutor?.uid && isValidCanonicalUid(matchedTutor.uid) ? matchedTutor.uid : '') ||
+        (matchedTutor?.id && isValidCanonicalUid(matchedTutor.id) ? matchedTutor.id : '');
+
+      if (!canonicalTutorUid) {
+        throw new Error(
+          currentLanguage === 'en'
+            ? 'Canonical Native Friend UID missing for selected teacher.'
+            : 'UID canônico do Amigo Nativo ausente para o mentor selecionado.'
+        );
+      }
 
       const newStudentAccount: GoogleAccount = {
         uid: studentUid,
@@ -1968,14 +2059,15 @@ export default function App() {
         name: effectiveName,
         email: cleanEmail,
         role: 'student',
-        picture: '',
-        avatar: '',
+        picture: auth.currentUser?.photoURL || '',
+        avatar: auth.currentUser?.photoURL || '',
       };
 
-      // 2. Prepare user profile data with assigned Native Friend and trial lesson balance
+      // 3. Prepare user profile data with assigned Native Friend and trial lesson balance
       const updatedProfile: UserProfile = {
         ...createDefaultStudentProfile(newStudentAccount),
         id: studentUid,
+        uid: studentUid,
         name: effectiveName,
         email: cleanEmail,
         level: selectedLevel,
@@ -1991,14 +2083,105 @@ export default function App() {
         teacherEmail: data.selectedTutor?.email || userProfile.teacherEmail || '',
         teacherName: data.selectedTutor?.name || userProfile.teacherName || '',
         teacherMeetUrl: data.selectedTutor?.meetUrl || (data.selectedTutor as any)?.meetLink || userProfile.teacherMeetUrl || '',
+        teacherUid: canonicalTutorUid,
+        assignedNativeFriendUID: canonicalTutorUid,
+        nativeFriendUID: canonicalTutorUid,
         enrollmentStatus: 'active',
         contractedLessons: Math.max(userProfile.contractedLessons || 0, 1),
         hasCompletedTrialLesson: false,
         subscriptionType: 'trial',
       };
 
-      // 3. INSTANT SYNCHRONOUS STATE BATCHING:
-      // Eliminate any delay between onboarding completion and student dashboard access
+      // 4. ESSENTIAL ASYNC PERSISTENCE (AWAITED BEFORE RELEASING SCHEDULING):
+      // A. Save profile in users/{studentUid}
+      let profileSaved = await saveStudentProfileToFirestore(studentUid, updatedProfile, cleanEmail);
+      if (!profileSaved) {
+        console.warn('[Onboarding] Direct Firestore profile write returned false; attempting retry...');
+        profileSaved = await saveStudentProfileToFirestore(studentUid, updatedProfile, cleanEmail);
+        if (!profileSaved) {
+          throw new Error(
+            currentLanguage === 'en'
+              ? 'Failed to persist student profile to database. Please try again.'
+              : 'Falha ao salvar perfil do estudante no banco de dados. Por favor, tente novamente.'
+          );
+        }
+      }
+
+      // B. Save student-teacher link in users/{studentUid}
+      if (data.selectedTutor?.email && canonicalTutorUid) {
+        let linkSaved = await saveStudentNativeFriendToFirestore(studentUid, cleanEmail, {
+          teacherEmail: data.selectedTutor.email,
+          teacherName: data.selectedTutor.name,
+          teacherUid: canonicalTutorUid,
+          assignedNativeFriendUID: canonicalTutorUid,
+          nativeFriendUID: canonicalTutorUid,
+          enrollmentStatus: 'active',
+        });
+        if (!linkSaved) {
+          console.warn('[Onboarding] Direct Firestore teacher link write returned false; attempting retry...');
+          linkSaved = await saveStudentNativeFriendToFirestore(studentUid, cleanEmail, {
+            teacherEmail: data.selectedTutor.email,
+            teacherName: data.selectedTutor.name,
+            teacherUid: canonicalTutorUid,
+            assignedNativeFriendUID: canonicalTutorUid,
+            nativeFriendUID: canonicalTutorUid,
+            enrollmentStatus: 'active',
+          });
+          if (!linkSaved) {
+            throw new Error(
+              currentLanguage === 'en'
+                ? 'Failed to bind Native Friend to student profile. Please try again.'
+                : 'Falha ao vincular o Amigo Nativo ao perfil do estudante. Por favor, tente novamente.'
+            );
+          }
+        }
+      }
+
+      // C. Initialize clean routines in Firestore
+      await initializeCleanStudentRoutinesInFirestore(studentUid).catch(() => {});
+
+      // D. Sync with backend API (creates/updates record with canonical UID)
+      if (isRegisteringStudent) {
+        await fetch('/api/auth/signup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            uid: studentUid,
+            name: effectiveName,
+            email: cleanEmail,
+            password: data.studentAccount?.password || '123456',
+            role: 'student',
+            isUpdate: true,
+            level: selectedLevel,
+            englishLevel: selectedLevel,
+            userLevel: selectedLevel,
+            learningGoal: data.learningGoal,
+            weeklyPracticeDays: data.weeklyStudyDaysTarget,
+            routineActivities: data.weeklyStudyDays,
+            routineVideoTime: data.routineVideoTime,
+            routineAudioTime: data.routineAudioTime,
+            dailyPhraseTime: data.dailyPhraseTime,
+            selectedTutorEmail: data.selectedTutor?.email,
+            selectedTutorName: data.selectedTutor?.name,
+            teacherEmail: data.selectedTutor?.email,
+            teacherName: data.selectedTutor?.name,
+            teacherUid: canonicalTutorUid,
+            contractedLessons: 1,
+          }),
+        }).catch((err) => console.warn('Backend signup sync error:', err));
+      }
+
+      await fetch('/api/user-profile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          uid: studentUid,
+          email: cleanEmail,
+          profile: updatedProfile,
+        }),
+      }).catch((err) => console.warn('Backend user profile sync error:', err));
+
+      // 5. UPDATE REACT STATE AFTER SUCCESSFUL PERSISTENCE:
       const cleanInitialRoutines = createCleanStudentRoutines(data.routineVideoTime);
       setIsOnboardingCompleting(false);
       setIsOnboardingModalOpen(false);
@@ -2024,8 +2207,11 @@ export default function App() {
               (st.email || st.studentEmail || '').toLowerCase().trim() === cleanEmail
                 ? {
                     ...st,
+                    id: studentUid,
+                    uid: studentUid,
                     teacherEmail: data.selectedTutor?.email || st.teacherEmail,
                     teacherName: data.selectedTutor?.name || st.teacherName,
+                    teacherUid: canonicalTutorUid || (st as any).teacherUid,
                     contractedLessons: Math.max(st.contractedLessons || 0, 1),
                     level: selectedLevel,
                   }
@@ -2035,13 +2221,15 @@ export default function App() {
           return [
             ...prev,
             {
-              id: `st-${Date.now()}`,
+              id: studentUid,
+              uid: studentUid,
               name: effectiveName || cleanEmail.split('@')[0],
               studentName: effectiveName || cleanEmail.split('@')[0],
               email: cleanEmail,
               studentEmail: cleanEmail,
               teacherEmail: data.selectedTutor?.email || '',
               teacherName: data.selectedTutor?.name || '',
+              teacherUid: canonicalTutorUid,
               status: 'active',
               level: selectedLevel,
               contractedLessons: 1,
@@ -2071,96 +2259,22 @@ export default function App() {
         ...prev,
       ]);
 
-      // Auto-open lesson schedule modal for this tutor with student info ready (smooth transition)
+      // Auto-open lesson schedule modal for this tutor with verified student UID ready
       if (data.selectedTutor?.email) {
         setTeacherEmailForConfig(data.selectedTutor.email);
         setScheduleStudentInfo({
           name: effectiveName,
           email: cleanEmail,
           uid: studentUid,
+          isTrialLesson: true,
         });
         setTimeout(() => {
           setIsScheduleModalOpen(true);
         }, 350);
       }
-
-      // 4. NON-BLOCKING BACKGROUND ASYNC PERSISTENCE:
-      // Persist credentials & full student profile to backend & Firestore asynchronously
-      (async () => {
-        try {
-          if (studentUid) {
-            initializeCleanStudentRoutinesInFirestore(studentUid).catch(() => {});
-          }
-
-          if (isRegisteringStudent) {
-            await fetch('/api/auth/signup', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                name: effectiveName,
-                email: cleanEmail,
-                password: data.studentAccount?.password || '123456',
-                role: 'student',
-                level: selectedLevel,
-                englishLevel: selectedLevel,
-                userLevel: selectedLevel,
-                learningGoal: data.learningGoal,
-                weeklyPracticeDays: data.weeklyStudyDaysTarget,
-                routineActivities: data.weeklyStudyDays,
-                routineVideoTime: data.routineVideoTime,
-                routineAudioTime: data.routineAudioTime,
-                dailyPhraseTime: data.dailyPhraseTime,
-                selectedTutorEmail: data.selectedTutor?.email,
-                selectedTutorName: data.selectedTutor?.name,
-                teacherEmail: data.selectedTutor?.email,
-                teacherName: data.selectedTutor?.name,
-                contractedLessons: 1,
-              }),
-            });
-          }
-
-          if (cleanEmail) {
-            if (studentUid) {
-              const canonicalTutorUid =
-                (data.selectedTutor?.uid && isValidCanonicalUid(data.selectedTutor.uid) ? data.selectedTutor.uid : '') ||
-                (data.selectedTutor?.id && isValidCanonicalUid(data.selectedTutor.id) ? data.selectedTutor.id : '');
-              const profileWithCanonicalTutor: UserProfile = {
-                ...updatedProfile,
-                ...(canonicalTutorUid
-                  ? {
-                      teacherUid: canonicalTutorUid,
-                      assignedNativeFriendUID: canonicalTutorUid,
-                      nativeFriendUID: canonicalTutorUid,
-                    }
-                  : {}),
-              };
-              saveStudentProfileToFirestore(studentUid, profileWithCanonicalTutor, cleanEmail).catch(() => {});
-              if (data.selectedTutor?.email && canonicalTutorUid) {
-                saveStudentNativeFriendToFirestore(studentUid, cleanEmail, {
-                  teacherEmail: data.selectedTutor.email,
-                  teacherName: data.selectedTutor.name,
-                  teacherUid: canonicalTutorUid,
-                  assignedNativeFriendUID: canonicalTutorUid,
-                  nativeFriendUID: canonicalTutorUid,
-                  enrollmentStatus: 'active',
-                }).catch(() => {});
-              }
-            }
-            await fetch('/api/user-profile', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                email: cleanEmail,
-                profile: updatedProfile,
-              }),
-            });
-          }
-        } catch (err) {
-          console.warn('Background persistence notice:', err);
-        }
-      })();
-    } catch (err) {
+    } catch (err: any) {
       console.warn('Onboarding completion error:', err);
+      alert(err?.message || (currentLanguage === 'en' ? 'Failed to complete onboarding.' : 'Erro ao concluir o onboarding.'));
       setIsOnboardingModalOpen(false);
       if (!currentAccount) {
         setViewMode('landing');
@@ -3465,13 +3579,53 @@ export default function App() {
       ? lessonData.studentName.trim()
       : (scheduleStudentInfo?.name ? scheduleStudentInfo.name.trim() : (currentAccount?.role === 'student' && currentAccount.name ? currentAccount.name.trim() : (userProfile?.name || 'Aluno')));
 
-    const finalStudentUid = (
-      (lessonData.studentUid && isValidCanonicalUid(lessonData.studentUid) ? lessonData.studentUid : '') ||
-      (scheduleStudentInfo?.uid && isValidCanonicalUid(scheduleStudentInfo.uid) ? scheduleStudentInfo.uid : '') ||
-      (currentAccount?.role === 'student' && currentAccount.uid && isValidCanonicalUid(currentAccount.uid) ? currentAccount.uid : '') ||
-      (auth.currentUser?.uid && (!finalStudentEmail || (auth.currentUser.email || '').toLowerCase().trim() === finalStudentEmail) ? auth.currentUser.uid : '') ||
-      (userProfile?.email?.toLowerCase() === finalStudentEmail && userProfile.id && isValidCanonicalUid(userProfile.id) ? userProfile.id : '')
-    );
+    // Resolve student canonical UID strictly matching finalStudentEmail
+    let resolvedStudentUid = '';
+    if (lessonData.studentUid && isValidCanonicalUid(lessonData.studentUid)) {
+      resolvedStudentUid = lessonData.studentUid.trim();
+    } else if (
+      scheduleStudentInfo?.uid &&
+      isValidCanonicalUid(scheduleStudentInfo.uid) &&
+      (!scheduleStudentInfo.email || scheduleStudentInfo.email.toLowerCase().trim() === finalStudentEmail)
+    ) {
+      resolvedStudentUid = scheduleStudentInfo.uid.trim();
+    } else if (
+      currentAccount?.role === 'student' &&
+      currentAccount.uid &&
+      isValidCanonicalUid(currentAccount.uid) &&
+      (currentAccount.email || '').toLowerCase().trim() === finalStudentEmail
+    ) {
+      resolvedStudentUid = currentAccount.uid.trim();
+    } else if (
+      auth.currentUser &&
+      (auth.currentUser.email || '').toLowerCase().trim() === finalStudentEmail &&
+      isValidCanonicalUid(auth.currentUser.uid)
+    ) {
+      resolvedStudentUid = auth.currentUser.uid;
+    } else if (
+      userProfile?.email?.toLowerCase().trim() === finalStudentEmail &&
+      userProfile.id &&
+      isValidCanonicalUid(userProfile.id)
+    ) {
+      resolvedStudentUid = userProfile.id;
+    } else if (
+      userProfile?.email?.toLowerCase().trim() === finalStudentEmail &&
+      (userProfile as any)?.uid &&
+      isValidCanonicalUid((userProfile as any).uid)
+    ) {
+      resolvedStudentUid = (userProfile as any).uid;
+    } else {
+      const matchingStudent = students.find(
+        (s) => (s.email || s.studentEmail || '').toLowerCase().trim() === finalStudentEmail
+      );
+      if (matchingStudent?.uid && isValidCanonicalUid(matchingStudent.uid)) {
+        resolvedStudentUid = matchingStudent.uid.trim();
+      } else if (matchingStudent?.id && isValidCanonicalUid(matchingStudent.id)) {
+        resolvedStudentUid = matchingStudent.id.trim();
+      }
+    }
+
+    const finalStudentUid = normalizeUid(resolvedStudentUid, finalStudentEmail);
 
     const cleanTeacherEmail = (lessonData.teacherEmail || '').toLowerCase().trim();
     const matchedTutor = tutors.find((t) =>
@@ -3483,11 +3637,29 @@ export default function App() {
       (matchedTutor?.uid && isValidCanonicalUid(matchedTutor.uid) ? matchedTutor.uid : '') ||
       (matchedTutor?.id && isValidCanonicalUid(matchedTutor.id) ? matchedTutor.id : '');
 
-    if (!finalStudentUid) {
+    if (!finalStudentUid || !isValidCanonicalUid(finalStudentUid)) {
       alert(
         currentLanguage === 'en'
           ? 'Canonical Student UID missing. Please make sure you are signed in.'
           : 'UID canônico do Aluno ausente. Por favor, verifique se está conectado.'
+      );
+      return;
+    }
+
+    if (!finalTeacherUid || !isValidCanonicalUid(finalTeacherUid)) {
+      alert(
+        currentLanguage === 'en'
+          ? 'Canonical Native Friend UID missing. Cannot schedule lesson without a valid Native Friend.'
+          : 'UID canônico do Amigo Nativo ausente. Não é possível agendar aula sem um Amigo Nativo válido.'
+      );
+      return;
+    }
+
+    if (finalStudentUid === finalTeacherUid) {
+      alert(
+        currentLanguage === 'en'
+          ? 'Security violation: Student and Native Friend cannot have identical identities.'
+          : 'Violação de segurança: Aluno e Amigo Nativo não podem ter identidades idênticas.'
       );
       return;
     }
