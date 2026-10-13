@@ -112,7 +112,7 @@ export function isValidCanonicalUid(uid?: string | null): boolean {
   if (!clean) return false;
   if (clean.includes('@')) return false;
   if (clean.startsWith('usr-')) return false;
-  if (clean.startsWith('teacher-') || clean.startsWith('st-') || clean.startsWith('lesson-')) return false;
+  if (clean.startsWith('teacher-') || clean.startsWith('tutor-') || clean.startsWith('st-') || clean.startsWith('lesson-')) return false;
   if (clean === 'user-default' || clean === 'anonymous_student' || clean === 'undefined' || clean === 'null') return false;
   return true;
 }
@@ -130,6 +130,7 @@ export function normalizeUid(rawId?: string | null, email?: string | null): stri
     cleanRawId &&
     !rawIsEmail &&
     !cleanRawId.startsWith('usr-') &&
+    !cleanRawId.startsWith('tutor-') &&
     cleanRawId !== 'user-default' &&
     cleanRawId !== 'anonymous_student' &&
     cleanRawId !== 'undefined' &&
@@ -1026,9 +1027,11 @@ export async function scheduleLessonWithTransaction(params: ScheduleLessonTransa
     return { success: false, error: 'Student UID missing' };
   }
 
-  // Canonical Native Friend UID resolution: MUST be explicit canonical UID, NEVER derived from email or auth.currentUser
+  // Canonical Native Friend UID / persisted identifier resolution:
   const teacherUid =
-    lesson.teacherUid && isValidCanonicalUid(lesson.teacherUid) ? lesson.teacherUid.trim() : '';
+    lesson.teacherUid && isValidCanonicalUid(lesson.teacherUid)
+      ? lesson.teacherUid.trim()
+      : (lesson.teacherUid && typeof lesson.teacherUid === 'string' && lesson.teacherUid.trim() ? lesson.teacherUid.trim() : '');
 
   if (!teacherUid) {
     return { success: false, error: 'Canonical Native Friend UID missing' };
@@ -1043,6 +1046,10 @@ export async function scheduleLessonWithTransaction(params: ScheduleLessonTransa
   const lessonRef = doc(db, 'lessons', lesson.id);
   const studentRef = doc(db, 'users', studentUid);
   const teacherRef = doc(db, 'users', teacherUid);
+  const tutorRef = doc(db, 'tutors', teacherUid);
+  const teacherEmailDocId = cleanTeacherEmail ? cleanTeacherEmail.replace(/[^a-zA-Z0-9]/g, '-') : '';
+  const teacherEmailRef = teacherEmailDocId && teacherEmailDocId !== teacherUid ? doc(db, 'users', teacherEmailDocId) : null;
+  const tutorEmailRef = teacherEmailDocId && teacherEmailDocId !== teacherUid ? doc(db, 'tutors', teacherEmailDocId) : null;
   const studentSubLessonRef = doc(db, 'users', studentUid, 'lessons', lesson.id);
 
   try {
@@ -1050,14 +1057,27 @@ export async function scheduleLessonWithTransaction(params: ScheduleLessonTransa
       // 1. All transaction reads first
       const studentSnap = await transaction.get(studentRef);
       const teacherSnap = await transaction.get(teacherRef);
+      const tutorSnap = await transaction.get(tutorRef);
+      const teacherEmailSnap = teacherEmailRef ? await transaction.get(teacherEmailRef) : null;
+      const tutorEmailSnap = tutorEmailRef ? await transaction.get(tutorEmailRef) : null;
       const lessonSnap = await transaction.get(lessonRef);
 
-      // Validate teacher account existence in users/{teacherUid}
-      if (!teacherSnap.exists()) {
+      // Validate teacher account existence in users/{teacherUid} or tutors/{teacherUid}
+      let teacherData = (
+        teacherSnap.exists()
+          ? teacherSnap.data()
+          : (tutorSnap.exists()
+              ? tutorSnap.data()
+              : (teacherEmailSnap?.exists()
+                  ? teacherEmailSnap.data()
+                  : (tutorEmailSnap?.exists()
+                      ? tutorEmailSnap.data()
+                      : null)))
+      ) as Record<string, any> | null;
+
+      if (!teacherData) {
         throw new Error('Native Friend UID does not resolve to an existing user');
       }
-
-      const teacherData = (teacherSnap.data() || {}) as Record<string, any>;
 
       // Validate teacher role convention
       const isTeacherRole =
@@ -1143,7 +1163,24 @@ export async function scheduleLessonWithTransaction(params: ScheduleLessonTransa
       // Teacher user doc update
       const teacherSubLessonRef = doc(db, 'users', teacherUid, 'lessons', lesson.id);
       transaction.set(teacherSubLessonRef, sanitizedLesson, { merge: true });
-      transaction.set(teacherRef, { updatedAt: nowIso }, { merge: true });
+      if (teacherSnap.exists()) {
+        transaction.set(teacherRef, { updatedAt: nowIso }, { merge: true });
+      }
+      if (tutorSnap.exists()) {
+        transaction.set(tutorRef, { updatedAt: nowIso }, { merge: true });
+        const tutorSubLessonRef = doc(db, 'tutors', teacherUid, 'lessons', lesson.id);
+        transaction.set(tutorSubLessonRef, sanitizedLesson, { merge: true });
+      }
+      if (teacherEmailSnap && teacherEmailSnap.exists() && teacherEmailRef) {
+        transaction.set(teacherEmailRef, { updatedAt: nowIso }, { merge: true });
+        const teacherEmailSubLessonRef = doc(db, 'users', teacherEmailDocId, 'lessons', lesson.id);
+        transaction.set(teacherEmailSubLessonRef, sanitizedLesson, { merge: true });
+      }
+      if (tutorEmailSnap && tutorEmailSnap.exists() && tutorEmailRef) {
+        transaction.set(tutorEmailRef, { updatedAt: nowIso }, { merge: true });
+        const tutorEmailSubLessonRef = doc(db, 'tutors', teacherEmailDocId, 'lessons', lesson.id);
+        transaction.set(tutorEmailSubLessonRef, sanitizedLesson, { merge: true });
+      }
 
       return {
         lesson: sanitizedLesson,

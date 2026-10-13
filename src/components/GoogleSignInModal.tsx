@@ -186,6 +186,30 @@ export const GoogleSignInModal: React.FC<GoogleSignInModalProps> = ({
         }
       }
 
+      // Guarantee teacher/Native Friend profile is linked under doc(db, 'users', user.uid) & doc(db, 'tutors', user.uid)
+      if (verifiedRole === 'teacher' && user.uid) {
+        const db = getDb();
+        if (db) {
+          const teacherProfilePayload = {
+            id: user.uid,
+            uid: user.uid,
+            email: cleanEmail,
+            name: account.name || user.displayName || cleanEmail.split('@')[0],
+            role: 'teacher',
+            picture: account.picture || user.photoURL || '',
+            avatar: account.picture || user.photoURL || '',
+            ...(firestoreUserDoc || {}),
+            ...(data?.tutor || {}),
+            updatedAt: new Date().toISOString(),
+          };
+          setDoc(doc(db, 'users', user.uid), teacherProfilePayload, { merge: true }).catch(() => null);
+          setDoc(doc(db, 'tutors', user.uid), teacherProfilePayload, { merge: true }).catch(() => null);
+          const legacyTutorDocId = `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
+          setDoc(doc(db, 'tutors', legacyTutorDocId), { uid: user.uid }, { merge: true }).catch(() => null);
+          setDoc(doc(db, 'users', legacyTutorDocId), { uid: user.uid }, { merge: true }).catch(() => null);
+        }
+      }
+
       // 3. Redirection
       if (verifiedRole === 'student') {
         if (typeof window !== 'undefined') {

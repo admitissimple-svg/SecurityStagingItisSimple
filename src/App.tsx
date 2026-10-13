@@ -2043,7 +2043,12 @@ export default function App() {
         (data.selectedTutor?.uid && isValidCanonicalUid(data.selectedTutor.uid) ? data.selectedTutor.uid : '') ||
         (data.selectedTutor?.id && isValidCanonicalUid(data.selectedTutor.id) ? data.selectedTutor.id : '') ||
         (matchedTutor?.uid && isValidCanonicalUid(matchedTutor.uid) ? matchedTutor.uid : '') ||
-        (matchedTutor?.id && isValidCanonicalUid(matchedTutor.id) ? matchedTutor.id : '');
+        (matchedTutor?.id && isValidCanonicalUid(matchedTutor.id) ? matchedTutor.id : '') ||
+        (data.selectedTutor?.uid && !data.selectedTutor.uid.includes('@') && !data.selectedTutor.uid.startsWith('st-') && !data.selectedTutor.uid.startsWith('usr-') ? data.selectedTutor.uid.trim() : '') ||
+        (data.selectedTutor?.id && !data.selectedTutor.id.includes('@') && !data.selectedTutor.id.startsWith('st-') && !data.selectedTutor.id.startsWith('usr-') ? data.selectedTutor.id.trim() : '') ||
+        (matchedTutor?.uid && !matchedTutor.uid.includes('@') && !matchedTutor.uid.startsWith('st-') && !matchedTutor.uid.startsWith('usr-') ? matchedTutor.uid.trim() : '') ||
+        (matchedTutor?.id && !matchedTutor.id.includes('@') && !matchedTutor.id.startsWith('st-') && !matchedTutor.id.startsWith('usr-') ? matchedTutor.id.trim() : '') ||
+        '';
 
       if (!canonicalTutorUid) {
         throw new Error(
@@ -3635,7 +3640,11 @@ export default function App() {
     const finalTeacherUid =
       (lessonData.teacherUid && isValidCanonicalUid(lessonData.teacherUid) ? lessonData.teacherUid : '') ||
       (matchedTutor?.uid && isValidCanonicalUid(matchedTutor.uid) ? matchedTutor.uid : '') ||
-      (matchedTutor?.id && isValidCanonicalUid(matchedTutor.id) ? matchedTutor.id : '');
+      (matchedTutor?.id && isValidCanonicalUid(matchedTutor.id) ? matchedTutor.id : '') ||
+      (lessonData.teacherUid && !lessonData.teacherUid.includes('@') && !lessonData.teacherUid.startsWith('st-') && !lessonData.teacherUid.startsWith('usr-') ? lessonData.teacherUid.trim() : '') ||
+      (matchedTutor?.uid && !matchedTutor.uid.includes('@') && !matchedTutor.uid.startsWith('st-') && !matchedTutor.uid.startsWith('usr-') ? matchedTutor.uid.trim() : '') ||
+      (matchedTutor?.id && !matchedTutor.id.includes('@') && !matchedTutor.id.startsWith('st-') && !matchedTutor.id.startsWith('usr-') ? matchedTutor.id.trim() : '') ||
+      '';
 
     if (!finalStudentUid || !isValidCanonicalUid(finalStudentUid)) {
       alert(
@@ -3646,7 +3655,7 @@ export default function App() {
       return;
     }
 
-    if (!finalTeacherUid || !isValidCanonicalUid(finalTeacherUid)) {
+    if (!finalTeacherUid) {
       alert(
         currentLanguage === 'en'
           ? 'Canonical Native Friend UID missing. Cannot schedule lesson without a valid Native Friend.'
@@ -6365,6 +6374,13 @@ export default function App() {
     isOpen={isBecomeTutorModalOpen}
     onClose={() => setIsBecomeTutorModalOpen(false)}
     currentLanguage={currentLanguage}
+    onSwitchToLogin={(email) => {
+      setIsBecomeTutorModalOpen(false);
+      setAuthModalRole('teacher');
+      setAuthModalMode('login');
+      setAuthInitialEmail(email || '');
+      setIsAuthModalOpen(true);
+    }}
     onRegisteredSuccess={(tutor) => {
       const tutorAccount: GoogleAccount = {
         email: tutor.email,

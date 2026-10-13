@@ -145,6 +145,7 @@ import {
   isVerifiedAdminRequest,
   getVerifiedUserFromRequest,
 } from './src/middleware/firebaseAuth';
+import { isValidCanonicalUid } from './src/utils/studentPersistence';
 import { getFirebaseAdminAuth } from './src/serverFirebaseAdmin';
 import {
   isDiagnosticMode,
@@ -1563,6 +1564,27 @@ app.post('/api/auth/login', async (req, res) => {
       console.warn(`[RBAC] Blocked teacher ${cleanEmail} from accessing admin panel.`);
     }
 
+    // Link real Firebase Auth UID to tutor record without resetting approval or profile
+    // Preserving public tutor ID in tutors list and linking users/{uid}
+    if (uid && isValidCanonicalUid(uid)) {
+      const publicTutorId = tutorObj?.id || teacherObj?.id || `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
+      if (tutorObj) {
+        tutorObj.uid = uid;
+        tutorObj.id = publicTutorId;
+      }
+      if (teacherObj) {
+        teacherObj.uid = uid;
+      }
+      if (authRecord) {
+        authRecord.uid = uid;
+      }
+      writeDb(db);
+      if (tutorObj) {
+        saveTutorToFirestore({ ...tutorObj, id: publicTutorId, uid, role: 'teacher' }).catch(() => {});
+        saveUserToFirestore({ ...tutorObj, id: uid, uid, tutorId: publicTutorId, role: 'teacher' }).catch(() => {});
+      }
+    }
+
     // Purge any accidental student profile entry for this teacher
     if (db.userProfiles && db.userProfiles[cleanEmail]) {
       delete db.userProfiles[cleanEmail];
@@ -1578,8 +1600,15 @@ app.post('/api/auth/login', async (req, res) => {
 
   const tutorObj = (db.tutorsList || []).find((t: any) => (t.email || '').toLowerCase() === cleanEmail);
 
+  const effectiveAccountUid =
+    (uid && isValidCanonicalUid(uid) ? uid : null) ||
+    authRecord?.uid ||
+    (tutorObj as any)?.uid ||
+    (cleanEmail === 'adm.itissimple@gmail.com' ? 'admin-master-uid' : `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`);
+
   const account = {
-    uid: authRecord?.uid || (tutorObj as any)?.uid || (cleanEmail === 'adm.itissimple@gmail.com' ? 'admin-master-uid' : `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`),
+    uid: effectiveAccountUid,
+    id: effectiveAccountUid,
     email: cleanEmail,
     name: name.charAt(0).toUpperCase() + name.slice(1),
     role,
@@ -1593,6 +1622,27 @@ app.post('/api/auth/login', async (req, res) => {
     studentObj = (db.students || []).find(
       (s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail
     );
+
+    // Link real Firebase Auth UID to student record preserving trial lesson and tutor links
+    if (uid && isValidCanonicalUid(uid)) {
+      if (studentObj) {
+        studentObj.uid = uid;
+        studentObj.id = uid;
+        studentObj.studentUid = uid;
+      }
+      if (db.userProfiles?.[cleanEmail]) {
+        db.userProfiles[cleanEmail].uid = uid;
+        db.userProfiles[cleanEmail].id = uid;
+      }
+      if (authRecord) {
+        authRecord.uid = uid;
+      }
+      writeDb(db);
+      const studentToPersist = db.userProfiles?.[cleanEmail] || studentObj;
+      if (studentToPersist) {
+        saveUserToFirestore({ ...studentToPersist, id: uid, uid, role: 'student' }).catch(() => {});
+      }
+    }
 
     studentProfile = db.userProfiles?.[cleanEmail] || null;
 
@@ -1964,7 +2014,10 @@ const handleRegistration = async (req: any, res: any) => {
       (db.teachers || []).some((t: any) => t.email?.toLowerCase() === cleanEmail && t.role !== 'admin') ||
       Boolean(db.authUsers?.[cleanEmail]);
 
-    if (isExistingTutorEmail && !req.body.isUpdate) {
+    const verifiedCaller = await getVerifiedUserFromRequest(req);
+    const isVerifiedCallerOwner = verifiedCaller && (verifiedCaller.email || '').toLowerCase().trim() === cleanEmail;
+
+    if (isExistingTutorEmail && !req.body.isUpdate && !isVerifiedCallerOwner) {
       return res.status(409).json({
         error: 'Este e-mail já está cadastrado no sistema. Por favor, faça login com sua conta ou utilize outro e-mail.',
         duplicateField: 'email',
@@ -2631,12 +2684,27 @@ app.post('/api/auth/google', async (req, res) => {
       }
       writeDb(db);
     }
+  } else if (role === 'teacher' && uid) {
+    const tutorEntry = (db.tutorsList || []).find((t: any) => (t.email || '').toLowerCase() === cleanEmail);
+    if (tutorEntry) {
+      const publicTutorId = tutorEntry.id || `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
+      tutorEntry.uid = uid;
+      tutorEntry.id = publicTutorId;
+      saveTutorToFirestore({ ...tutorEntry, id: publicTutorId, uid, role: 'teacher' }).catch(() => {});
+      saveUserToFirestore({ ...tutorEntry, id: uid, uid, tutorId: publicTutorId, role: 'teacher' }).catch(() => {});
+    }
+    const teacherEntry = (db.teachers || []).find((t: any) => (t.email || '').toLowerCase() === cleanEmail);
+    if (teacherEntry) {
+      teacherEntry.uid = uid;
+    }
+    writeDb(db);
   }
 
   const effectiveUid = uid || db.authUsers?.[cleanEmail]?.uid || (cleanEmail === 'adm.itissimple@gmail.com' ? 'admin-master-uid' : `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`);
 
   const account = {
     uid: effectiveUid,
+    id: effectiveUid,
     email: cleanEmail,
     name: displayName,
     role,
@@ -2967,8 +3035,10 @@ app.post('/api/tutors', async (req, res) => {
     ? (incomingUid || verifiedCaller?.uid || undefined)
     : (verifiedCaller?.uid || undefined);
 
+  const publicTutorId = tutorId;
+
   const tutorEntry: Record<string, any> = {
-    id: tutorId,
+    id: publicTutorId,
     name: cleanName,
     email: cleanEmail,
     role: 'teacher', // strictly enforced
@@ -3052,6 +3122,8 @@ app.post('/api/tutors', async (req, res) => {
   // Also maintain teachers list for auth
   db.teachers = db.teachers || [];
   db.teachers.push({
+    id: tutorEntry.id,
+    uid: tutorEntry.uid || tutorEntry.id,
     email: cleanEmail,
     name: cleanName,
     role: 'teacher',
@@ -3064,6 +3136,7 @@ app.post('/api/tutors', async (req, res) => {
   // Ensure auth record exists with role 'teacher' - credentials stored separately from tutor public documents
   if (!db.authUsers) db.authUsers = {};
   db.authUsers[cleanEmail] = {
+    uid: tutorEntry.uid || tutorEntry.id,
     email: cleanEmail,
     name: cleanName,
     password: rawTutor.password || db.authUsers[cleanEmail]?.password || '',

@@ -11,13 +11,19 @@ import {
   Mail,
   Send,
   Heart,
+  Lock,
+  Eye,
+  EyeOff,
+  LogIn,
 } from 'lucide-react';
 import { Language, DayOfWeek } from '../types';
 import { ImageUploadInput } from './ImageUploadInput';
 import { TIMEZONE_OPTIONS, getDefaultTimezoneForCountry } from '../utils/timezone';
 import { extractYouTubeVideoId } from '../utils/youtube';
+import { getDb, auth } from '../firebase';
 import { doc, setDoc } from 'firebase/firestore';
-import { getDb } from '../firebase';
+import { googleSignIn, firebaseSignUpWithEmail, firebaseSignInWithEmail, getAccessToken } from '../utils/auth';
+import { isValidCanonicalUid } from '../utils/studentPersistence';
 
 interface BecomeTutorModalProps {
   isOpen: boolean;
@@ -25,6 +31,7 @@ interface BecomeTutorModalProps {
   currentLanguage?: Language;
   onRegisteredSuccess?: (tutorData: any) => void;
   onRegisterSuccess?: (tutorData: any) => void;
+  onSwitchToLogin?: (email?: string) => void;
 }
 
 export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
@@ -32,6 +39,7 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
   onClose,
   onRegisteredSuccess,
   onRegisterSuccess,
+  onSwitchToLogin,
 }) => {
   const [step, setStep] = useState<1 | 2 | 3>(1);
   const [formData, setFormData] = useState({
@@ -49,6 +57,12 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
     timezone: 'America/Toronto',
     availableDays: [] as DayOfWeek[],
   });
+  const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+  const [authMode, setAuthMode] = useState<'signup' | 'login'>('signup');
+  const [authenticatedUid, setAuthenticatedUid] = useState<string | null>(auth?.currentUser?.uid || null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isSubmitted, setIsSubmitted] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -81,7 +95,7 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
       if (res.ok) {
         const data = await res.json();
         if (data.emailExists) {
-          setEmailWarning(`This email is already registered (${clean}). Please log in or use another email.`);
+          setEmailWarning(`Este e-mail já está cadastrado (${clean}). Para professores já cadastrados, faça login para vincular seu perfil com segurança.`);
         } else {
           setEmailWarning(null);
         }
@@ -118,17 +132,63 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
       setErrorMessage(emailWarning || nameWarning);
       return;
     }
+
+    if (!password || password.length < 6) {
+      setErrorMessage('A senha deve conter no mínimo 6 caracteres.');
+      return;
+    }
+    if (password !== confirmPassword) {
+      setErrorMessage('A confirmação de senha não coincide com a senha digitada.');
+      return;
+    }
+    const cleanEmail = formData.email.toLowerCase().trim();
+    if (!cleanEmail || !cleanEmail.includes('@')) {
+      setErrorMessage('Por favor, informe um endereço de e-mail válido.');
+      return;
+    }
+    if (!formData.name.trim()) {
+      setErrorMessage('Por favor, informe seu nome completo.');
+      return;
+    }
+
     setIsSubmitting(true);
     setErrorMessage(null);
+
+    // 1. Create Firebase Authentication Identity
+    let firebaseUid: string;
+    let idToken: string | null = null;
+    try {
+      const authResult = await firebaseSignUpWithEmail(cleanEmail, password);
+      firebaseUid = authResult.user.uid;
+      idToken = authResult.accessToken;
+      setAuthenticatedUid(firebaseUid);
+    } catch (authErr: any) {
+      setIsSubmitting(false);
+      const code = authErr?.code;
+      if (code === 'auth/email-already-in-use') {
+        setErrorMessage('Este e-mail já está cadastrado no Firebase Authentication. Faça login para acessar ou vincular sua conta.');
+      } else if (code === 'auth/weak-password') {
+        setErrorMessage('A senha é muito fraca. Utilize pelo menos 6 caracteres.');
+      } else if (code === 'auth/invalid-email') {
+        setErrorMessage('Formato de e-mail inválido.');
+      } else {
+        setErrorMessage(authErr?.message || 'Falha ao criar credenciais no Firebase Authentication.');
+      }
+      return;
+    }
 
     try {
       const cleanVideoLink = (formData.videoUrl || '').trim();
       const extractedEmbedId = extractYouTubeVideoId(cleanVideoLink);
+      const publicTutorId = `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
 
-      // Register with backend
+      // 2. Register with backend (/api/tutors)
+      // Password is NEVER sent in payload, saved in tutor doc or logged
       const tutorPayload = {
+        id: publicTutorId,
+        uid: firebaseUid,
         name: formData.name.trim(),
-        email: formData.email.toLowerCase().trim(),
+        email: cleanEmail,
         avatar: formData.avatar || '',
         role: 'teacher',
         country: formData.country,
@@ -153,50 +213,94 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
 
       const res = await fetch('/api/tutors', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+        },
         body: JSON.stringify({ tutor: tutorPayload }),
       });
 
       const resData = await res.json().catch(() => ({}));
 
       if (!res.ok) {
+        setIsSubmitting(false);
         setErrorMessage(resData.error || 'Erro ao realizar cadastro de Amigo Nativo.');
         return;
       }
 
       const createdTutor = resData.tutor || tutorPayload;
+      const cleanTutorId = createdTutor.id || publicTutorId;
 
-      // Direct Cloud Firestore persistence for /tutors/{tutorId}, /users/{cleanDocId}, and /teacher_availability/
+      // 3. Direct Cloud Firestore persistence linking users/{uid} to tutors/{cleanTutorId}
       try {
         const firestore = getDb();
-        const cleanTutorId = createdTutor.id || `tutor-${tutorPayload.email.replace(/[^a-zA-Z0-9]/g, '-')}`;
-        const cleanDocEmail = tutorPayload.email.replace(/[^a-zA-Z0-9]/g, '-');
-        await Promise.all([
-          setDoc(doc(firestore, 'users', cleanTutorId), {
-            ...createdTutor,
-            id: cleanTutorId,
-            email: tutorPayload.email,
+        const cleanDocEmail = cleanEmail.replace(/[^a-zA-Z0-9]/g, '-');
+
+        const writes = [
+          // Profile in users/{firebaseUid}
+          setDoc(doc(firestore, 'users', firebaseUid), {
+            id: firebaseUid,
+            uid: firebaseUid,
+            tutorId: cleanTutorId,
+            name: tutorPayload.name,
+            email: cleanEmail,
             role: 'teacher',
+            country: tutorPayload.country,
+            accent: tutorPayload.accent,
+            timezone: tutorPayload.timezone,
+            avatar: tutorPayload.avatar,
+            headline: tutorPayload.headline,
+            bio: tutorPayload.bio,
+            pricePerSessionUsd: tutorPayload.pricePerSessionUsd,
+            pricePerSessionBrl: tutorPayload.pricePerSessionBrl,
+            availableDays: tutorPayload.availableDays,
+            approvalStatus: 'pending',
+            isApproved: false,
+            status: 'pending',
+            approved: false,
+            registeredByAdmin: false,
             updatedAt: new Date().toISOString(),
+            createdAt: new Date().toISOString(),
           }, { merge: true }),
+
+          // Tutor registration in tutors/{cleanTutorId} with preserved public ID
           setDoc(doc(firestore, 'tutors', cleanTutorId), {
             ...createdTutor,
             id: cleanTutorId,
-            email: tutorPayload.email,
+            uid: firebaseUid,
+            email: cleanEmail,
+            name: tutorPayload.name,
             role: 'teacher',
+            approvalStatus: 'pending',
+            isApproved: false,
+            status: 'pending',
+            approved: false,
+            registeredByAdmin: false,
             updatedAt: new Date().toISOString(),
           }, { merge: true }),
+
+          // Lookup document by sanitized email
           setDoc(doc(firestore, 'users', cleanDocEmail), {
-            email: tutorPayload.email,
+            id: cleanDocEmail,
+            uid: firebaseUid,
+            tutorId: cleanTutorId,
+            email: cleanEmail,
             name: tutorPayload.name,
             role: 'teacher',
             country: tutorPayload.country,
             timezone: tutorPayload.timezone,
             avatar: tutorPayload.avatar,
+            approvalStatus: 'pending',
+            isApproved: false,
+            status: 'pending',
+            approved: false,
             updatedAt: new Date().toISOString(),
           }, { merge: true }),
+
+          // Teacher availability
           setDoc(doc(firestore, 'teacher_availability', cleanDocEmail), {
-            teacherEmail: tutorPayload.email,
+            teacherEmail: cleanEmail,
+            teacherUid: firebaseUid,
             meetLink: formData.meetUrl,
             workingHoursStart: '08:00',
             workingHoursEnd: '18:00',
@@ -205,7 +309,9 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
             timezone: formData.timezone || 'America/Toronto',
             updatedAt: new Date().toISOString(),
           }, { merge: true }),
-        ]);
+        ];
+
+        await Promise.all(writes);
       } catch (fsErr) {
         console.warn('Direct Firestore registration sync notice:', fsErr);
       }
@@ -213,9 +319,12 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
       // Save meet settings
       await fetch('/api/meet-settings', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+        },
         body: JSON.stringify({
-          teacherEmail: formData.email.toLowerCase().trim(),
+          teacherEmail: cleanEmail,
           settings: {
             meetLink: formData.meetUrl,
             workingHoursStart: '08:00',
@@ -225,7 +334,7 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
             timezone: formData.timezone || 'America/Toronto',
           },
         }),
-      });
+      }).catch(() => {});
 
       setIsSubmitted(true);
       setLastCreatedTutor(createdTutor);
@@ -234,7 +343,7 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
         callback(createdTutor);
       }
     } catch (err: any) {
-      console.error('Error registering tutor:', err);
+      console.error('Error completing tutor registration:', err);
       setErrorMessage('Falha ao conectar com o servidor. Tente novamente.');
     } finally {
       setIsSubmitting(false);
@@ -438,10 +547,106 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
                       }`}
                     />
                     {emailWarning && (
-                      <p className="mt-1 text-xs text-rose-700 font-semibold bg-rose-50 p-2 rounded-lg border border-rose-200">
-                        ⚠️ {emailWarning}
-                      </p>
+                      <div className="mt-1 text-xs text-rose-700 font-semibold bg-rose-50 p-2.5 rounded-lg border border-rose-200 flex flex-col gap-1.5">
+                        <p>⚠️ {emailWarning}</p>
+                        {onSwitchToLogin && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              onSwitchToLogin(formData.email.trim());
+                              onClose();
+                            }}
+                            className="self-start text-[11px] font-black text-[#1C4C96] hover:underline flex items-center gap-1 cursor-pointer"
+                          >
+                            <LogIn className="w-3.5 h-3.5" />
+                            <span>Clique aqui para fazer login como Amigo Nativo</span>
+                          </button>
+                        )}
+                      </div>
                     )}
+                  </div>
+
+                  {/* Password & Confirm Password for Firebase Authentication */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">
+                        Password (Senha de Acesso) *
+                      </label>
+                      <div className="relative">
+                        <Lock className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                        <input
+                          type={showPassword ? 'text' : 'password'}
+                          required
+                          value={password}
+                          onChange={(e) => setPassword(e.target.value)}
+                          placeholder="Mínimo 6 caracteres"
+                          minLength={6}
+                          className={`w-full pl-9 pr-9 py-2 bg-slate-50 border rounded-xl text-sm text-[#000035] focus:bg-white focus:outline-hidden focus:ring-2 ${
+                            password && password.length < 6
+                              ? 'border-amber-400 ring-2 ring-amber-400/20'
+                              : 'border-[#607EC9]/30 focus:ring-[#1C4C96]'
+                          }`}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowPassword(!showPassword)}
+                          className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 cursor-pointer p-0.5"
+                          tabIndex={-1}
+                          title={showPassword ? 'Ocultar senha' : 'Ver senha'}
+                        >
+                          {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                        </button>
+                      </div>
+                      {password && password.length < 6 && (
+                        <p className="mt-1 text-[11px] text-amber-600 font-medium">
+                          A senha deve conter no mínimo 6 caracteres.
+                        </p>
+                      )}
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">
+                        Confirm Password (Confirmar Senha) *
+                      </label>
+                      <div className="relative">
+                        <Lock className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                        <input
+                          type={showConfirmPassword ? 'text' : 'password'}
+                          required
+                          value={confirmPassword}
+                          onChange={(e) => setConfirmPassword(e.target.value)}
+                          placeholder="Repita sua senha"
+                          minLength={6}
+                          className={`w-full pl-9 pr-9 py-2 bg-slate-50 border rounded-xl text-sm text-[#000035] focus:bg-white focus:outline-hidden focus:ring-2 ${
+                            confirmPassword && confirmPassword !== password
+                              ? 'border-rose-400 ring-2 ring-rose-400/20'
+                              : confirmPassword && confirmPassword === password && password.length >= 6
+                              ? 'border-emerald-400 ring-2 ring-emerald-400/20'
+                              : 'border-[#607EC9]/30 focus:ring-[#1C4C96]'
+                          }`}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowConfirmPassword(!showConfirmPassword)}
+                          className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 cursor-pointer p-0.5"
+                          tabIndex={-1}
+                          title={showConfirmPassword ? 'Ocultar senha' : 'Ver senha'}
+                        >
+                          {showConfirmPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                        </button>
+                      </div>
+                      {confirmPassword && confirmPassword !== password && (
+                        <p className="mt-1 text-[11px] text-rose-600 font-medium">
+                          As senhas não coincidem.
+                        </p>
+                      )}
+                      {confirmPassword && confirmPassword === password && password.length >= 6 && (
+                        <p className="mt-1 text-[11px] text-emerald-600 font-medium flex items-center gap-1">
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          <span>Senhas conferem</span>
+                        </p>
+                      )}
+                    </div>
                   </div>
 
                   <div className="grid grid-cols-2 gap-3">
@@ -486,8 +691,27 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
                   <div className="pt-3 flex justify-end">
                     <button
                       type="button"
-                      onClick={() => setStep(2)}
-                      disabled={!formData.name || !formData.email || Boolean(emailWarning) || Boolean(nameWarning)}
+                      onClick={() => {
+                        if (!password || password.length < 6) {
+                          setErrorMessage('A senha deve conter no mínimo 6 caracteres.');
+                          return;
+                        }
+                        if (password !== confirmPassword) {
+                          setErrorMessage('A senha e a confirmação de senha não coincidem.');
+                          return;
+                        }
+                        setStep(2);
+                      }}
+                      disabled={
+                        !formData.name ||
+                        !formData.email ||
+                        !password ||
+                        !confirmPassword ||
+                        password.length < 6 ||
+                        password !== confirmPassword ||
+                        Boolean(emailWarning) ||
+                        Boolean(nameWarning)
+                      }
                       className="px-5 py-2.5 rounded-xl bg-[#062863] text-white hover:bg-[#000035] font-bold text-xs sm:text-sm disabled:opacity-50 cursor-pointer transition"
                     >
                       Next: Bio & Video Intro →

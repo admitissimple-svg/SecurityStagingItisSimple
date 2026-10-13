@@ -25,7 +25,7 @@ import {
 } from '../types';
 import { BrandLogo } from './BrandLogo';
 import { GoogleSignInModal } from './GoogleSignInModal';
-import { firebaseSignInWithEmail } from '../utils/auth';
+import { firebaseSignInWithEmail, firebaseSignUpWithEmail } from '../utils/auth';
 import { getDb, auth } from '../firebase';
 
 export interface LoginModalProps {
@@ -165,6 +165,21 @@ export const LoginModal: React.FC<LoginModalProps> = ({
       } catch (authErr: any) {
         console.warn('Firebase Auth sign-in notice (will fallback to backend DB check):', authErr?.code || authErr?.message);
         firebaseAuthFailed = true;
+
+        // If user is a registered teacher (e.g. Queen Bee) doing first login without prior Firebase Auth account,
+        // create their Firebase Auth identity to link securely
+        if (
+          password.length >= 6 &&
+          (authErr?.code === 'auth/user-not-found' || authErr?.code === 'auth/invalid-credential')
+        ) {
+          try {
+            const signUpResult = await firebaseSignUpWithEmail(cleanEmail, password);
+            firebaseUid = signUpResult?.user?.uid;
+            firebaseAuthFailed = false;
+          } catch (signUpErr: any) {
+            console.warn('Firebase Auth first-login linking notice:', signUpErr?.code || signUpErr?.message);
+          }
+        }
       }
 
       // 2. Query user document in 'users' collection in Firestore using the authenticated UID
@@ -321,6 +336,34 @@ export const LoginModal: React.FC<LoginModalProps> = ({
         account.id = effectiveAuthUid;
       }
       account.role = verifiedRole;
+
+      if (verifiedRole === 'teacher' && firebaseUid) {
+        try {
+          const publicTutorId =
+            data?.tutor?.id ||
+            firestoreUserDoc?.tutorId ||
+            firestoreUserDoc?.id ||
+            `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
+
+          const teacherProfilePayload = {
+            id: firebaseUid,
+            uid: firebaseUid,
+            tutorId: publicTutorId,
+            email: cleanEmail,
+            name: account.name || cleanEmail.split('@')[0],
+            role: 'teacher',
+            approvalStatus: firestoreUserDoc?.approvalStatus || data?.tutor?.approvalStatus || 'pending',
+            isApproved: Boolean(firestoreUserDoc?.isApproved || data?.tutor?.isApproved),
+            status: firestoreUserDoc?.status || data?.tutor?.status || 'pending',
+            approved: Boolean(firestoreUserDoc?.approved || data?.tutor?.approved),
+            ...(firestoreUserDoc || {}),
+            ...(data?.tutor || {}),
+            updatedAt: new Date().toISOString(),
+          };
+          setDoc(doc(db, 'users', firebaseUid), teacherProfilePayload, { merge: true }).catch(() => null);
+          setDoc(doc(db, 'tutors', publicTutorId), { uid: firebaseUid, id: publicTutorId }, { merge: true }).catch(() => null);
+        } catch {}
+      }
 
       // 6. Conditional redirection strictly based on verifiedRole:
       // - Teacher / Native Friend -> /teacher (Native Friend / Teacher Panel)

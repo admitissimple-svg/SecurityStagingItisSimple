@@ -298,6 +298,22 @@ export const LiveLessonScheduleModal: React.FC<LiveLessonScheduleModalProps> = (
     if ((selectedTeacherObj as any)?.id && isValidCanonicalUid((selectedTeacherObj as any).id)) return (selectedTeacherObj as any).id;
     if (matchedTutor?.uid && isValidCanonicalUid(matchedTutor.uid)) return matchedTutor.uid;
     if (matchedTutor?.id && isValidCanonicalUid(matchedTutor.id)) return matchedTutor.id;
+    const rawSelectedUid = (selectedTeacherObj as any)?.uid;
+    if (rawSelectedUid && typeof rawSelectedUid === 'string' && !rawSelectedUid.includes('@') && !rawSelectedUid.startsWith('st-') && !rawSelectedUid.startsWith('usr-')) {
+      return rawSelectedUid.trim();
+    }
+    const rawSelectedId = (selectedTeacherObj as any)?.id;
+    if (rawSelectedId && typeof rawSelectedId === 'string' && !rawSelectedId.includes('@') && !rawSelectedId.startsWith('st-') && !rawSelectedId.startsWith('usr-')) {
+      return rawSelectedId.trim();
+    }
+    const rawMatchedUid = matchedTutor?.uid;
+    if (rawMatchedUid && typeof rawMatchedUid === 'string' && !rawMatchedUid.includes('@') && !rawMatchedUid.startsWith('st-') && !rawMatchedUid.startsWith('usr-')) {
+      return rawMatchedUid.trim();
+    }
+    const rawMatchedId = matchedTutor?.id;
+    if (rawMatchedId && typeof rawMatchedId === 'string' && !rawMatchedId.includes('@') && !rawMatchedId.startsWith('st-') && !rawMatchedId.startsWith('usr-')) {
+      return rawMatchedId.trim();
+    }
     return '';
   }, [selectedTeacherObj, matchedTutor]);
 
