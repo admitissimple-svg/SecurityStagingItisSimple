@@ -41,7 +41,7 @@ export interface FetchPlaylistsResult {
   source: 'api' | 'server' | 'cache' | 'fallback';
 }
 
-import rawChannelPlaylists from '../data/channelPlaylists.json';
+import rawChannelPlaylists from '../data/channelPlaylists.json' with { type: 'json' };
 
 /**
  * Baseline fallback playlists reflecting the entire official channel (@admitissimple).

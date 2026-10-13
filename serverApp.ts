@@ -4,7 +4,7 @@ import fs from 'fs';
 import dotenv from 'dotenv';
 dotenv.config();
 
-import appletConfig from './firebase-applet-config.json';
+import appletConfig from './firebase-applet-config.json' with { type: 'json' };
 
 const isPlaceholder = (val: string | undefined): boolean => {
   if (!val) return true;

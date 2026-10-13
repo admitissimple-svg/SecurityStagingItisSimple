@@ -4,7 +4,7 @@ import { spawn } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-import appletConfig from './firebase-applet-config.json';
+import appletConfig from './firebase-applet-config.json' with { type: 'json' };
 
 const isPlaceholder = (val: string | undefined): boolean => {
   if (!val) return true;

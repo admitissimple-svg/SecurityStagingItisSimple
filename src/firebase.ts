@@ -7,7 +7,7 @@ try {
   setLogLevel('silent');
 } catch {}
 
-import appletConfig from '../firebase-applet-config.json';
+import appletConfig from '../firebase-applet-config.json' with { type: 'json' };
 
 // Helper to detect placeholder strings
 const isPlaceholder = (val: unknown): boolean => {
