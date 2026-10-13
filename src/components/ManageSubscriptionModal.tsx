@@ -270,7 +270,7 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
 
   // Find matching tutor info if available
   const currentTutor = tutorsList.find(
-    (t) => t.email.toLowerCase() === currentTeacherEmail
+   (t) => !!currentTeacherEmail && (t?.email || '').toLowerCase().trim() === currentTeacherEmail
   ) || (currentTeacherEmail ? {
     id: `tutor-${currentTeacherEmail}`,
     name: currentTeacherName || currentTeacherEmail.split('@')[0],
