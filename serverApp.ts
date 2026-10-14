@@ -214,7 +214,9 @@ app.use((req, res, next) => {
 
 
   // Prevent frame blocking when published or embedded in preview containers
-  res.removeHeader('X-Frame-Options');
+  try {
+    res.removeHeader('X-Frame-Options');
+  } catch {}
 
   // Support Firebase Auth Popup & Cross-Account window communication
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
@@ -6370,70 +6372,543 @@ app.post('/api/routines/current-routine/feedback', (req, res) => {
 });
 
 // 5. Live Lessons Endpoints
-app.get(['/api/lessons', '/api/live-lessons'], (req, res) => {
-  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
 
-  const db = readDb();
-  const requesterEmail = (
-    (req.query.email as string) ||
-    (req.query.userEmail as string) ||
-    (req.query.studentEmail as string) ||
-    (req.query.teacherEmail as string) ||
-    ''
-  ).toLowerCase().trim();
-  const role = req.query.role as string;
-  const uid = (req.query.uid as string) || '';
-
-  if (role === 'admin' || requesterEmail === 'adm.itissimple@gmail.com') {
-    return res.json(db.liveLessons || []);
+/**
+ * Authoritatively verifies if an authenticated user is an approved Native Friend (Teacher).
+ * Checks the trusted teacher records in Firestore (tutors and users collections) linked to the Firebase Auth UID.
+ * Does NOT trust URL query params, body parameters, or self-asserted roles.
+ * Does NOT grant admin privileges.
+ * Validates that the tutor is explicitly approved (isApproved: true or approvalStatus: 'approved').
+ */
+async function verifyTeacherIdentityInFirestore(
+  firestore: any,
+  uid: string,
+  email?: string,
+  emailVerified?: boolean
+): Promise<{
+  isTeacher: boolean;
+  publicTutorId?: string;
+  authUid?: string;
+  email?: string;
+  name?: string;
+}> {
+  if (!firestore || !uid) {
+    return { isTeacher: false };
   }
 
-  if (role === 'teacher' || req.query.teacherEmail) {
-    const list = (db.liveLessons || []).filter((l: any) =>
-      (l.teacherEmail || '').toLowerCase() === requesterEmail ||
-      (l.tutorEmail || '').toLowerCase() === requesterEmail ||
-      (l.teacherUid && l.teacherUid === uid) ||
-      (l.tutorUid && l.tutorUid === uid)
-    );
-    return res.json(list);
+  const cleanUid = uid.trim();
+  const cleanEmail = (email || '').trim().toLowerCase();
+
+  const isApprovedTutorData = (data: any): boolean => {
+    if (!data) return false;
+    const role = (data.role || '').toLowerCase().trim();
+    const isTeacherRole =
+      role === 'teacher' ||
+      role === 'tutor' ||
+      role === 'native_friend' ||
+      data.isTeacher === true;
+    const isApproved =
+      data.approvalStatus === 'approved' ||
+      data.isApproved === true ||
+      data.approved === true ||
+      data.status === 'approved';
+    return Boolean(isTeacherRole && isApproved);
+  };
+
+  try {
+    // 1. Check /users/{cleanUid}
+    const userDoc = await firestore.collection('users').doc(cleanUid).get().catch(() => null);
+    if (userDoc && userDoc.exists) {
+      const uData = userDoc.data();
+      if (isApprovedTutorData(uData)) {
+        return {
+          isTeacher: true,
+          publicTutorId: uData.publicTutorId || uData.tutorId || uData.id || cleanUid,
+          authUid: cleanUid,
+          email: uData.email || cleanEmail,
+          name: uData.name,
+        };
+      }
+    }
+
+    // 2. Check /tutors/{cleanUid}
+    const tutorDoc = await firestore.collection('tutors').doc(cleanUid).get().catch(() => null);
+    if (tutorDoc && tutorDoc.exists) {
+      const tData = tutorDoc.data();
+      if (isApprovedTutorData(tData)) {
+        return {
+          isTeacher: true,
+          publicTutorId: tData.publicTutorId || tutorDoc.id,
+          authUid: tData.authUid || tData.uid || cleanUid,
+          email: tData.email || cleanEmail,
+          name: tData.name,
+        };
+      }
+    }
+
+    // 3. Query /tutors where authUid == cleanUid
+    const qAuthUid = await firestore.collection('tutors').where('authUid', '==', cleanUid).limit(1).get().catch(() => null);
+    if (qAuthUid && !qAuthUid.empty) {
+      const doc = qAuthUid.docs[0];
+      const tData = doc.data();
+      if (isApprovedTutorData(tData)) {
+        return {
+          isTeacher: true,
+          publicTutorId: tData.publicTutorId || doc.id,
+          authUid: cleanUid,
+          email: tData.email || cleanEmail,
+          name: tData.name,
+        };
+      }
+    }
+
+    // 4. Query /tutors where uid == cleanUid
+    const qUid = await firestore.collection('tutors').where('uid', '==', cleanUid).limit(1).get().catch(() => null);
+    if (qUid && !qUid.empty) {
+      const doc = qUid.docs[0];
+      const tData = doc.data();
+      if (isApprovedTutorData(tData)) {
+        return {
+          isTeacher: true,
+          publicTutorId: tData.publicTutorId || doc.id,
+          authUid: cleanUid,
+          email: tData.email || cleanEmail,
+          name: tData.name,
+        };
+      }
+    }
+
+    // 5. If verified email, query /tutors where email == cleanEmail
+    if (cleanEmail && emailVerified) {
+      const qEmail = await firestore.collection('tutors').where('email', '==', cleanEmail).limit(1).get().catch(() => null);
+      if (qEmail && !qEmail.empty) {
+        const doc = qEmail.docs[0];
+        const tData = doc.data();
+        if (isApprovedTutorData(tData)) {
+          return {
+            isTeacher: true,
+            publicTutorId: tData.publicTutorId || doc.id,
+            authUid: tData.authUid || cleanUid,
+            email: cleanEmail,
+            name: tData.name,
+          };
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[verifyTeacherIdentityInFirestore] Error querying teacher identity:', err);
   }
 
-  if (role === 'student' || req.query.studentEmail) {
-    const list = (db.liveLessons || []).filter((l: any) => {
-      const lEmail = (l.studentEmail || '').toLowerCase().trim();
-      const lName = (l.studentName || '').toLowerCase().trim();
-      return (
-        lEmail === requesterEmail ||
-        (l.studentUid && l.studentUid === uid) ||
-        (!lEmail && requesterEmail.includes('vinicius') && lName.includes('vinicius')) ||
-        (!lEmail && requesterEmail.includes('regina') && lName.includes('regina'))
+  return { isTeacher: false };
+}
+
+app.get(
+  ['/api/lessons', '/api/live-lessons'],
+  firebaseAuthMiddleware,
+  async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
+    try {
+      const user = req.user;
+
+      if (!user?.uid) {
+        return res.status(401).json({
+          error: 'Authentication required',
+        });
+      }
+
+      const firestore = getFirestoreDb();
+
+      if (!firestore) {
+        return res.status(503).json({
+          error: 'Firestore unavailable',
+        });
+      }
+
+      const uid = user.uid.trim();
+      const email = (user.email || '').trim().toLowerCase();
+      const emailVerified = Boolean(user.email_verified);
+
+      // Verify server-side administrative authority strictly
+      const AUTHORITATIVE_ADMIN_EMAILS = new Set([
+        'adm.itissimple@gmail.com',
+        'estilobeeforkids@gmail.com',
+        'adm.itssimple@gmail.com',
+        'estilobeeadm@gmail.com',
+        'admin@itissimple.com',
+      ]);
+
+      const isAdmin =
+        user.role === 'admin' ||
+        (emailVerified && Boolean(email) && AUTHORITATIVE_ADMIN_EMAILS.has(email));
+
+      let teacherInfo: {
+        isTeacher: boolean;
+        publicTutorId?: string;
+        authUid?: string;
+        email?: string;
+        name?: string;
+      } = { isTeacher: false };
+
+      if (!isAdmin) {
+        teacherInfo = await verifyTeacherIdentityInFirestore(
+          firestore,
+          uid,
+          email,
+          emailVerified
+        );
+      }
+
+      const isTeacher = teacherInfo.isTeacher;
+      const lessonsById = new Map<string, any>();
+
+      if (isAdmin) {
+        // Authoritative admin: can query all canonical lessons
+        const snapshot = await firestore.collection('lessons').get();
+        for (const doc of snapshot.docs) {
+          lessonsById.set(doc.id, {
+            ...doc.data(),
+            id: doc.id,
+          });
+        }
+
+        const legacyLessons = readDb().liveLessons || [];
+        for (const lesson of legacyLessons) {
+          if (lesson?.id && !lessonsById.has(lesson.id)) {
+            lessonsById.set(lesson.id, lesson);
+          }
+        }
+      } else if (isTeacher) {
+        // Teacher (Native Friend): execute strictly filtered queries to avoid unrestricted scan
+        const publicTutorId = teacherInfo.publicTutorId;
+        const teacherEmail = (teacherInfo.email || email).toLowerCase().trim();
+
+        const queryPromises: Promise<any>[] = [];
+
+        if (publicTutorId) {
+          queryPromises.push(
+            firestore.collection('lessons').where('teacherUid', '==', publicTutorId).get().catch(() => ({ docs: [] })),
+            firestore.collection('lessons').where('tutorUid', '==', publicTutorId).get().catch(() => ({ docs: [] })),
+            firestore.collection('tutors').doc(publicTutorId).collection('lessons').get().catch(() => ({ docs: [] }))
+          );
+        }
+
+        if (uid && uid !== publicTutorId) {
+          queryPromises.push(
+            firestore.collection('lessons').where('teacherUid', '==', uid).get().catch(() => ({ docs: [] })),
+            firestore.collection('lessons').where('tutorUid', '==', uid).get().catch(() => ({ docs: [] })),
+            firestore.collection('users').doc(uid).collection('lessons').get().catch(() => ({ docs: [] }))
+          );
+        }
+
+        if (teacherEmail) {
+          queryPromises.push(
+            firestore.collection('lessons').where('teacherEmail', '==', teacherEmail).get().catch(() => ({ docs: [] })),
+            firestore.collection('lessons').where('tutorEmail', '==', teacherEmail).get().catch(() => ({ docs: [] }))
+          );
+        }
+
+        const snapshots = await Promise.all(queryPromises);
+        for (const snap of snapshots) {
+          if (snap && snap.docs) {
+            for (const doc of snap.docs) {
+              lessonsById.set(doc.id, {
+                ...doc.data(),
+                id: doc.id,
+              });
+            }
+          }
+        }
+
+        // Legacy lessons compatibility: check if matching teacher
+        const legacyLessons = readDb().liveLessons || [];
+        for (const lesson of legacyLessons) {
+          if (!lesson?.id || lessonsById.has(lesson.id)) continue;
+          const lTeacherUid = (lesson.teacherUid || lesson.tutorUid || '').trim();
+          const lTeacherEmail = (lesson.teacherEmail || lesson.tutorEmail || '').toLowerCase().trim();
+
+          const matches =
+            (publicTutorId && lTeacherUid === publicTutorId) ||
+            (uid && lTeacherUid === uid) ||
+            (teacherEmail && lTeacherEmail === teacherEmail);
+
+          if (matches) {
+            lessonsById.set(lesson.id, lesson);
+          }
+        }
+      } else {
+        // Student: execute strictly filtered queries to avoid unrestricted scan
+        const queryPromises: Promise<any>[] = [
+          firestore.collection('lessons').where('studentUid', '==', uid).get().catch(() => ({ docs: [] })),
+          firestore.collection('users').doc(uid).collection('lessons').get().catch(() => ({ docs: [] })),
+        ];
+
+        if (email) {
+          queryPromises.push(
+            firestore.collection('lessons').where('studentEmail', '==', email).get().catch(() => ({ docs: [] }))
+          );
+        }
+
+        const snapshots = await Promise.all(queryPromises);
+        for (const snap of snapshots) {
+          if (snap && snap.docs) {
+            for (const doc of snap.docs) {
+              lessonsById.set(doc.id, {
+                ...doc.data(),
+                id: doc.id,
+              });
+            }
+          }
+        }
+
+        // Legacy lessons compatibility: check if matching student
+        const legacyLessons = readDb().liveLessons || [];
+        for (const lesson of legacyLessons) {
+          if (!lesson?.id || lessonsById.has(lesson.id)) continue;
+          const lStudentUid = (lesson.studentUid || '').trim();
+          const lStudentEmail = (lesson.studentEmail || '').toLowerCase().trim();
+
+          const matches =
+            lStudentUid === uid ||
+            (Boolean(email) && lStudentEmail === email);
+
+          if (matches) {
+            lessonsById.set(lesson.id, lesson);
+          }
+        }
+      }
+
+      return res.json(
+        Array.from(lessonsById.values())
       );
-    });
-    return res.json(list);
-  }
-
-  if (requesterEmail || uid) {
-    const list = (db.liveLessons || []).filter((l: any) => {
-      const lEmail = (l.studentEmail || '').toLowerCase().trim();
-      const lTeacher = (l.teacherEmail || l.tutorEmail || '').toLowerCase().trim();
-      const lName = (l.studentName || '').toLowerCase().trim();
-      return (
-        lEmail === requesterEmail ||
-        lTeacher === requesterEmail ||
-        (l.studentUid && l.studentUid === uid) ||
-        (l.teacherUid && l.teacherUid === uid) ||
-        (!lEmail && requesterEmail.includes('vinicius') && lName.includes('vinicius')) ||
-        (!lEmail && requesterEmail.includes('regina') && lName.includes('regina'))
+    } catch (error) {
+      console.error(
+        '[GET /api/lessons] Failed to load lessons',
+        error
       );
-    });
-    return res.json(list);
-  }
 
-  // Anonymous / unauthenticated: return empty list to protect privacy
-  res.json([]);
-});
+      return res.status(500).json({
+        error: 'Unable to load lessons',
+      });
+    }
+  }
+);
+
+/**
+ * Safe, PII-isolated availability endpoint for checking teacher occupied intervals.
+ * Returns exclusively busy time intervals: { startDateTime: string, endDateTime: string }[].
+ * Strips out 100% of student names, emails, UIDs, Meet URLs, and any other student PII.
+ */
+app.get(
+  [
+    '/api/teachers/:teacherId/busy-slots',
+    '/api/tutors/:tutorId/busy-slots',
+    '/api/lessons/busy-slots',
+    '/api/lessons/busy',
+  ],
+  async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
+    try {
+      const firestore = getFirestoreDb();
+      const rawTarget = (
+        req.params.teacherId ||
+        req.params.tutorId ||
+        (req.query.teacherId as string) ||
+        (req.query.teacherUid as string) ||
+        (req.query.tutorId as string) ||
+        (req.query.teacherEmail as string) ||
+        (req.query.email as string) ||
+        ''
+      ).trim();
+
+      const queryEmail = (
+        (req.query.teacherEmail as string) ||
+        (req.query.email as string) ||
+        ''
+      ).trim().toLowerCase();
+
+      const queryUid = (
+        (req.query.teacherUid as string) ||
+        (req.query.tutorUid as string) ||
+        (req.query.uid as string) ||
+        ''
+      ).trim();
+
+      if (!rawTarget && !queryEmail && !queryUid) {
+        return res.status(400).json({
+          error: 'Identificador do professor obrigatório (teacherId, teacherEmail ou teacherUid).',
+        });
+      }
+
+      const candidateTargets = new Set<string>();
+      if (rawTarget) candidateTargets.add(rawTarget);
+      if (queryEmail) candidateTargets.add(queryEmail);
+      if (queryUid) candidateTargets.add(queryUid);
+
+      let publicTutorId = '';
+      let teacherAuthUid = '';
+      let teacherEmail = queryEmail;
+
+      if (firestore) {
+        // Attempt to resolve tutor profile from Firestore
+        for (const target of candidateTargets) {
+          try {
+            // Direct doc lookup in tutors
+            const tutorDoc = await firestore.collection('tutors').doc(target).get().catch(() => null);
+            if (tutorDoc && tutorDoc.exists) {
+              const tData = tutorDoc.data();
+              if (tData) {
+                publicTutorId = tData.publicTutorId || tutorDoc.id;
+                teacherAuthUid = tData.authUid || tData.uid || '';
+                if (!teacherEmail && tData.email) teacherEmail = tData.email.toLowerCase().trim();
+                break;
+              }
+            }
+
+            // By publicTutorId
+            const qPub = await firestore.collection('tutors').where('publicTutorId', '==', target).limit(1).get().catch(() => null);
+            if (qPub && !qPub.empty) {
+              const tData = qPub.docs[0].data();
+              if (tData) {
+                publicTutorId = tData.publicTutorId || qPub.docs[0].id;
+                teacherAuthUid = tData.authUid || tData.uid || '';
+                if (!teacherEmail && tData.email) teacherEmail = tData.email.toLowerCase().trim();
+                break;
+              }
+            }
+
+            // By email
+            if (target.includes('@')) {
+              const qEm = await firestore.collection('tutors').where('email', '==', target.toLowerCase().trim()).limit(1).get().catch(() => null);
+              if (qEm && !qEm.empty) {
+                const tData = qEm.docs[0].data();
+                if (tData) {
+                  publicTutorId = tData.publicTutorId || qEm.docs[0].id;
+                  teacherAuthUid = tData.authUid || tData.uid || '';
+                  teacherEmail = tData.email.toLowerCase().trim();
+                  break;
+                }
+              }
+            }
+          } catch {}
+        }
+      }
+
+      // If not resolved from Firestore tutors, check dbState
+      const db = readDb();
+      if (!publicTutorId && db.tutorsList) {
+        const found = db.tutorsList.find((t: any) => {
+          const tEmail = (t.email || '').toLowerCase().trim();
+          const tId = (t.publicTutorId || t.id || '').trim();
+          return (
+            (rawTarget && (tId === rawTarget || tEmail === rawTarget.toLowerCase())) ||
+            (queryEmail && tEmail === queryEmail) ||
+            (queryUid && (t.uid === queryUid || t.authUid === queryUid))
+          );
+        });
+        if (found) {
+          publicTutorId = found.publicTutorId || found.id || '';
+          teacherAuthUid = found.authUid || found.uid || '';
+          if (!teacherEmail && found.email) teacherEmail = found.email.toLowerCase().trim();
+        }
+      }
+
+      if (!publicTutorId && !rawTarget.includes('@') && rawTarget) {
+        publicTutorId = rawTarget;
+      }
+
+      const activeLessonsMap = new Map<string, any>();
+
+      // Fetch active scheduled lessons for this teacher from Firestore
+      if (firestore) {
+        const queryPromises: Promise<any>[] = [];
+        if (publicTutorId) {
+          queryPromises.push(
+            firestore.collection('lessons').where('teacherUid', '==', publicTutorId).get().catch(() => ({ docs: [] })),
+            firestore.collection('lessons').where('tutorUid', '==', publicTutorId).get().catch(() => ({ docs: [] })),
+            firestore.collection('tutors').doc(publicTutorId).collection('lessons').get().catch(() => ({ docs: [] }))
+          );
+        }
+        if (teacherAuthUid && teacherAuthUid !== publicTutorId) {
+          queryPromises.push(
+            firestore.collection('lessons').where('teacherUid', '==', teacherAuthUid).get().catch(() => ({ docs: [] })),
+            firestore.collection('lessons').where('tutorUid', '==', teacherAuthUid).get().catch(() => ({ docs: [] })),
+            firestore.collection('users').doc(teacherAuthUid).collection('lessons').get().catch(() => ({ docs: [] }))
+          );
+        }
+        if (teacherEmail) {
+          queryPromises.push(
+            firestore.collection('lessons').where('teacherEmail', '==', teacherEmail).get().catch(() => ({ docs: [] })),
+            firestore.collection('lessons').where('tutorEmail', '==', teacherEmail).get().catch(() => ({ docs: [] }))
+          );
+        }
+
+        const snapshots = await Promise.all(queryPromises);
+        for (const snap of snapshots) {
+          if (snap && snap.docs) {
+            for (const doc of snap.docs) {
+              activeLessonsMap.set(doc.id, doc.data());
+            }
+          }
+        }
+      }
+
+      // Check legacy liveLessons
+      const legacyLessons = db.liveLessons || [];
+      for (const lesson of legacyLessons) {
+        if (!lesson?.id || activeLessonsMap.has(lesson.id)) continue;
+        const lTeacherUid = (lesson.teacherUid || lesson.tutorUid || '').trim();
+        const lTeacherEmail = (lesson.teacherEmail || lesson.tutorEmail || '').toLowerCase().trim();
+        const matches =
+          (publicTutorId && lTeacherUid === publicTutorId) ||
+          (teacherAuthUid && lTeacherUid === teacherAuthUid) ||
+          (teacherEmail && lTeacherEmail === teacherEmail);
+        if (matches) {
+          activeLessonsMap.set(lesson.id, lesson);
+        }
+      }
+
+      // Filter only active scheduled lessons and extract strictly startDateTime and endDateTime
+      const busySlots = Array.from(activeLessonsMap.values())
+        .filter((l) => {
+          const isCancelled =
+            l.status === 'cancelled' ||
+            l.status === 'canceled' ||
+            Boolean(l.cancelledAt);
+          return (
+            !isCancelled &&
+            l.status === 'scheduled' &&
+            Boolean(l.startDateTime) &&
+            Boolean(l.endDateTime)
+          );
+        })
+        .map((l) => ({
+          startDateTime: l.startDateTime,
+          endDateTime: l.endDateTime,
+        }));
+
+      // Deduplicate identical intervals
+      const uniqueIntervals: { startDateTime: string; endDateTime: string }[] = [];
+      const seenKey = new Set<string>();
+      for (const slot of busySlots) {
+        const key = `${slot.startDateTime}__${slot.endDateTime}`;
+        if (!seenKey.has(key)) {
+          seenKey.add(key);
+          uniqueIntervals.push(slot);
+        }
+      }
+
+      return res.json(uniqueIntervals);
+    } catch (err: any) {
+      console.error('[GET /api/teachers/:teacherId/busy-slots] Error retrieving busy slots:', err);
+      return res.status(500).json({
+        error: 'Erro ao consultar horários ocupados do professor.',
+      });
+    }
+  }
+);
+
 
 /**
  * Dedicated secure backend endpoint for scheduling live and trial lessons.

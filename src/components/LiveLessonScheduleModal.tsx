@@ -32,6 +32,7 @@ import {
 } from '../utils/timezone';
 import { isValidCanonicalUid } from '../utils/studentPersistence';
 import { auth } from '../firebase';
+import { apiClient } from '../utils/apiClient';
 
 interface LiveLessonScheduleModalProps {
   isOpen: boolean;
@@ -471,17 +472,43 @@ export const LiveLessonScheduleModal: React.FC<LiveLessonScheduleModalProps> = (
   const [teacherLessons, setTeacherLessons] = useState<LiveLesson[]>([]);
 
   React.useEffect(() => {
-    if (!isOpen || !selectedTeacherObj.email) return;
-    const cleanTeacherEmail = selectedTeacherObj.email.toLowerCase().trim();
-    fetch(`/api/lessons?teacherEmail=${encodeURIComponent(cleanTeacherEmail)}&role=teacher`)
-      .then((r) => (r.ok ? r.json() : []))
-      .then((data) => {
-        if (Array.isArray(data)) {
-          setTeacherLessons(data);
+    if (!isOpen || (!selectedTeacherObj.email && !effectiveTeacherUid)) return;
+    const cleanTeacherEmail = (selectedTeacherObj.email || '').toLowerCase().trim();
+    const targetIdentifier = effectiveTeacherUid || cleanTeacherEmail;
+
+    apiClient
+      .get<{ startDateTime: string; endDateTime: string }[]>(
+        `/api/teachers/${encodeURIComponent(targetIdentifier)}/busy-slots`,
+        {
+          params: {
+            teacherEmail: cleanTeacherEmail,
+            teacherUid: effectiveTeacherUid,
+          },
+        }
+      )
+      .then((slots) => {
+        if (Array.isArray(slots)) {
+          // Convert busy intervals to slot blockers without exposing any student PII
+          const pseudoLessons: LiveLesson[] = slots.map((s, idx) => ({
+            id: `busy-slot-${idx}-${s.startDateTime}`,
+            title: 'Busy Slot',
+            startDateTime: s.startDateTime,
+            endDateTime: s.endDateTime,
+            status: 'scheduled',
+            teacherEmail: cleanTeacherEmail,
+            teacherName: selectedTeacherObj.name || 'Native Friend',
+            teacherUid: effectiveTeacherUid || cleanTeacherEmail,
+            studentEmail: '',
+            studentName: '',
+            meetLink: '',
+          }));
+          setTeacherLessons(pseudoLessons);
         }
       })
-      .catch(() => {});
-  }, [isOpen, selectedTeacherObj.email]);
+      .catch((err) => {
+        console.warn('Notice loading teacher busy intervals:', err);
+      });
+  }, [isOpen, selectedTeacherObj.email, effectiveTeacherUid]);
 
   // Combine parent lessons with freshly fetched teacher lessons (deduplicating by id)
   const combinedLessons = useMemo(() => {

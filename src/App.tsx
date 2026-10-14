@@ -49,6 +49,7 @@ import { getAccessToken, getAdminAccessToken, waitForAuthUser, firebaseSignUpWit
 import { useNativeFriends, isTutorApproved, isTeacherRole } from './hooks/useNativeFriends';
 import { onAuthStateChanged, signOut as firebaseSignOutAuth } from 'firebase/auth';
 import { doc, getDoc, collection, getDocs, onSnapshot, setDoc, deleteDoc, query, where } from 'firebase/firestore';
+import { apiClient, ApiError } from './utils/apiClient';
 
 // Components
 import { Navbar } from './components/Navbar';
@@ -1050,35 +1051,88 @@ export default function App() {
     // 1. Fetch user-isolated lessons directly from Firestore + API atomically (Firestore is authoritative)
     Promise.all([
       fetchStudentLessonsFromFirestore(uid, email, isTeacherRole).catch(() => []),
-      fetch(`/api/lessons?${queryParams}`).then((r) => (r.ok ? r.json() : [])).catch(() => []),
-    ]).then(([fsLessons, apiLessons]) => {
-      const map = new Map<string, LiveLesson>();
-      // Put API data first
-      (Array.isArray(apiLessons) ? apiLessons : []).forEach((l: LiveLesson) => {
-        if (l?.id) map.set(l.id, l);
-      });
-      // Put fsLessons over API data (Firestore takes absolute priority!)
-      (Array.isArray(fsLessons) ? fsLessons : []).forEach((l: LiveLesson) => {
-        if (!l?.id) return;
-        const existing = map.get(l.id);
-        if (existing && (existing.status === 'cancelled' || existing.cancelledAt) && l.status !== 'cancelled' && !l.cancelledAt) {
-          // Keep cancelled
-        } else {
-          map.set(l.id, { ...existing, ...l });
+      apiClient.get<LiveLesson[]>('/api/lessons'),
+    ])
+      .then(([fsLessons, apiLessons]) => {
+        if (isCancelled) return;
+        const map = new Map<string, LiveLesson>();
+        // Put API data first
+        (Array.isArray(apiLessons) ? apiLessons : []).forEach((l: LiveLesson) => {
+          if (l?.id) map.set(l.id, l);
+        });
+        // Put fsLessons over API data (Firestore takes absolute priority!)
+        (Array.isArray(fsLessons) ? fsLessons : []).forEach((l: LiveLesson) => {
+          if (!l?.id) return;
+          const existing = map.get(l.id);
+          if (existing && (existing.status === 'cancelled' || existing.cancelledAt) && l.status !== 'cancelled' && !l.cancelledAt) {
+            // Keep cancelled
+          } else {
+            map.set(l.id, { ...existing, ...l });
+          }
+        });
+        // Strict invariant: any cancelled lesson is permanently marked cancelled
+        map.forEach((l, id) => {
+          if (l.status === 'cancelled' || l.cancelledAt) {
+            map.set(id, {
+              ...l,
+              status: 'cancelled',
+              cancelledAt: l.cancelledAt || new Date().toISOString(),
+            });
+          }
+        });
+        setLessons(Array.from(map.values()));
+      })
+      .catch((apiErr: any) => {
+        if (isCancelled) return;
+        console.error('[App] Erro ao carregar aulas da API /api/lessons:', apiErr);
+        // Do NOT convert 401/403/500 silently into []
+        const status = apiErr?.status;
+        if (status === 401 || apiErr?.isUnauthorized) {
+          setNotifications((prev) => [
+            {
+              id: `api-err-401-${Date.now()}`,
+              title: currentLanguage === 'en' ? 'Session Required' : 'Autenticação Necessária',
+              message: currentLanguage === 'en' ? 'Your session expired. Please sign in again.' : 'Sessão expirada ou não autenticada. Por favor, faça login novamente.',
+              type: 'warning',
+              timestamp: new Date().toISOString(),
+              read: false,
+            },
+            ...prev,
+          ]);
+        } else if (status === 403 || apiErr?.isForbidden) {
+          setNotifications((prev) => [
+            {
+              id: `api-err-403-${Date.now()}`,
+              title: currentLanguage === 'en' ? 'Access Denied' : 'Acesso Negado',
+              message: currentLanguage === 'en' ? 'Access forbidden to these lesson records.' : 'Acesso negado: sem autorização para consultar esses registros de aula.',
+              type: 'warning',
+              timestamp: new Date().toISOString(),
+              read: false,
+            },
+            ...prev,
+          ]);
+        } else if (status === 500 || apiErr?.isServerError) {
+          setNotifications((prev) => [
+            {
+              id: `api-err-500-${Date.now()}`,
+              title: currentLanguage === 'en' ? 'Server Error' : 'Erro no Servidor',
+              message: currentLanguage === 'en' ? 'Backend error while retrieving lessons.' : 'Erro interno do servidor ao recuperar aulas.',
+              type: 'warning',
+              timestamp: new Date().toISOString(),
+              read: false,
+            },
+            ...prev,
+          ]);
         }
+        // Fallback to direct Firestore lessons so UI remains functional
+        fetchStudentLessonsFromFirestore(uid, email, isTeacherRole)
+          .then((fsLessons) => {
+            if (!isCancelled && Array.isArray(fsLessons) && fsLessons.length > 0) {
+              setLessons(fsLessons);
+            }
+          })
+          .catch(() => {});
       });
-      // Strict invariant: any cancelled lesson is permanently marked cancelled
-      map.forEach((l, id) => {
-        if (l.status === 'cancelled' || l.cancelledAt) {
-          map.set(id, {
-            ...l,
-            status: 'cancelled',
-            cancelledAt: l.cancelledAt || new Date().toISOString(),
-          });
-        }
-      });
-      setLessons(Array.from(map.values()));
-    });
 
     // Real-time synchronization for lessons from Firestore
     const unsubLessons = subscribeToStudentLessons(uid, email, isTeacherRole, (realtimeLessons) => {
