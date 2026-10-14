@@ -1,6 +1,7 @@
 import { EnglishLevel, LiveLesson } from '../types';
 import { NATIVE_FRIENDS_DICTIONARY_DATABASE } from '../data/dictionaryDatabase';
 import { parseNotesHtml, ParsedNotesResult } from './notesHtmlParser';
+import { auth } from '../firebase';
 
 export interface PedagogicalMistakeAnalysis {
   id: string;
@@ -55,6 +56,8 @@ export interface PedagogicalReviewSummary {
   rememberThis: string;
 }
 
+export const PEDAGOGICAL_PROMPT_VERSION = 'v2.1-pedagogical-gemini';
+
 export interface PedagogicalLessonTransformation {
   lessonId?: string;
   sessionKey: string;
@@ -67,6 +70,22 @@ export interface PedagogicalLessonTransformation {
   studentLevel: string;
   cefrLevel: string;
   contentHash?: string;
+  language?: string;
+  promptVersion?: string;
+  isAiGenerated?: boolean;
+  isFallback?: boolean;
+  isProvisional?: boolean;
+  needsAiGeneration?: boolean;
+  authError?: {
+    status: number;
+    message: string;
+    requiresLogin?: boolean;
+  };
+  fallbackReason?: 'QUOTA_EXCEEDED' | 'AUTH_ERROR' | 'MODEL_UNAVAILABLE' | 'TIMEOUT' | 'INVALID_RESPONSE' | 'NO_API_KEY' | 'AI_UNAVAILABLE' | string;
+  aiNotice?: string;
+  source?: 'gemini' | 'fallback';
+  modelUsed?: string;
+  cooldownSecondsRemaining?: number;
   // Rigorously specified sections:
   // 1. Analyze Mistakes (mapped from Alt+N)
   // 2. Grammar Points (systemic grammar rules from Alt+N & session topic)
@@ -97,6 +116,109 @@ export function computeNotesHash(str: string): string {
     hash |= 0;
   }
   return Math.abs(hash).toString(16);
+}
+
+/**
+ * Constructs a distinct cache key partitioned by session, content hash, language, CEFR, and prompt version.
+ */
+export function buildPedagogicalCacheKey(params: {
+  canonicalSessionKey: string;
+  contentHash: string;
+  language?: string;
+  cefrLevel?: string;
+  promptVersion?: string;
+}): string {
+  const pv = params.promptVersion || PEDAGOGICAL_PROMPT_VERSION;
+  const lang = (params.language || 'pt').toLowerCase().trim();
+  const cefr = (params.cefrLevel || 'B1').toUpperCase().trim();
+  return `${params.canonicalSessionKey}__hash_${params.contentHash}__lang_${lang}__cefr_${cefr}__pv_${pv}`;
+}
+
+export function getPendingConfirmationText(lang: string = 'pt'): string {
+  switch (lang.toLowerCase()) {
+    case 'en': return 'Pending confirmation with the teacher';
+    case 'es': return 'Pendiente de confirmación con el profesor';
+    case 'fr': return 'En attente de confirmation avec le professeur';
+    case 'de': return 'Ausstehende Bestätigung durch die Lehrkraft';
+    case 'it': return 'In attesa di conferma con l\'insegnante';
+    case 'ja': return '講師への確認待ち';
+    case 'ko': return '교사 확인 대기 중';
+    case 'zh': return '等待老师确认';
+    case 'ru': return 'Ожидает подтверждения преподавателем';
+    case 'ar': return 'في انتظار تأكيد المعلم';
+    case 'tr': return 'Öğretmenle onay bekleniyor';
+    case 'pt':
+    default:
+      return 'Pendente de confirmação com o professor';
+  }
+}
+
+export function getUnconfirmedExplanationText(original: string, lang: string = 'pt'): string {
+  switch (lang.toLowerCase()) {
+    case 'en':
+      return `The corrected form for "${original}" was not specified in the session. Please confirm with your Native Friend in the next session to validate the exact context.`;
+    case 'es':
+      return `La forma corregida para "${original}" no fue informada en la clase. Confirme con su Native Friend en la próxima sesión para validar el contexto exacto.`;
+    case 'fr':
+      return `La forme corrigée pour "${original}" n'a pas été précisée pendant le cours. Confirmez avec votre Native Friend lors de la prochaine session pour valider le contexte exact.`;
+    case 'de':
+      return `Die korrigierte Form für "${original}" wurde in der Stunde nicht angegeben. Bitte bestätigen Sie den genauen Kontext in der nächsten Sitzung mit Ihrem Native Friend.`;
+    case 'it':
+      return `La forma corretta per "${original}" non è stata specificata durante la lezione. Si prega di confermare con il Native Friend nella prossima sessione per convalidare il contesto esatto.`;
+    case 'ja':
+      return `「${original}」の修正形はレッスン中に指定されませんでした。次のセッションでネイティブフレンドに正確な文脈を確認してください。`;
+    case 'ko':
+      return `"${original}"에 대한 수정 형태가 수업 중 지정되지 않았습니다. 다음 세션에서 원어민 친구에게 정확한 문맥을 확인하세요.`;
+    case 'zh':
+      return `课上未提供"${original}"的修改形式。请在下次会话中与您的Native Friend确认具体语境。`;
+    case 'ru':
+      return `Исправленная форма для "${original}" не была указана на уроке. Пожалуйста, уточните точный контекст у Native Friend на следующем занятии.`;
+    case 'ar':
+      return `لم يتم تحديد الصيغة المصححة لـ "${original}" في الجلسة. يُرجى التأكيد مع صديقك المعتمد في الجلسة القادمة للتحقق من السياق الدقيق.`;
+    case 'tr':
+      return `"${original}" için düzeltilmiş biçim derste belirtilmedi. Tam bağlamı doğrulamak için bir sonraki oturumda Native Friend ile onaylayın.`;
+    case 'pt':
+    default:
+      return `A forma corrigida para "${original}" não foi informada na aula. Confirme com seu Native Friend na próxima sessão para validar o contexto exato.`;
+  }
+}
+
+export function getPendingPitfallsText(lang: string = 'pt'): string {
+  switch (lang.toLowerCase()) {
+    case 'en': return 'Awaiting teacher confirmation regarding the specific context of usage.';
+    case 'es': return 'A la espera de confirmación del profesor sobre el contexto específico de uso.';
+    case 'fr': return 'En attente de confirmation de l\'enseignant concernant le contexte d\'utilisation.';
+    case 'de': return 'Warten auf Bestätigung der Lehrkraft zum genauen Verwendungskontext.';
+    case 'it': return 'In attesa di conferma da parte dell\'insegnante sul contesto d\'uso specifico.';
+    case 'ja': return '具体的な使用文脈について講師の確認を待っています。';
+    case 'ko': return '구체적인 사용 맥락에 대해 교사의 확인을 기다리는 중입니다.';
+    case 'zh': return '等待教师确认具体使用语境。';
+    case 'ru': return 'Ожидается подтверждение преподавателя относительно конкретного контекста использования.';
+    case 'ar': return 'في انتظار تأكيد المعلم بشأن سياق الاستخدام المحدد.';
+    case 'tr': return 'Belirli kullanım bağlamı konusunda öğretmen onayı bekleniyor.';
+    case 'pt':
+    default:
+      return 'Aguardando confirmação do professor sobre o contexto específico de uso.';
+  }
+}
+
+export function getAiUnavailableNoticeText(lang: string = 'pt'): string {
+  switch (lang.toLowerCase()) {
+    case 'en': return 'AI pedagogical enrichment is temporarily unavailable. Displaying verified teacher notes and standard markings.';
+    case 'es': return 'El enriquecimiento pedagógico por IA no está disponible temporalmente. Mostrando notas verificadas del profesor y marcas estándar.';
+    case 'fr': return 'L\'enrichissement pédagogique par IA est temporairement indisponible. Affichage des notes vérifiées de l\'enseignant et des annotations standard.';
+    case 'de': return 'Die pädagogische KI-Anreicherung ist vorübergehend nicht verfügbar. Zeigt verifizierte Lehrernotizen und Standardmarkierungen an.';
+    case 'it': return 'L\'arricchimento pedagogico con IA è temporaneamente non disponibile. Vengono mostrate le note verificate dell\'insegnante e le annotazioni standard.';
+    case 'ja': return 'AIによる教育的拡張は現在一時的に利用できません。確認済みの講師メモと標準マーキングを表示しています。';
+    case 'ko': return 'AI 교육적 심화 분석을 일시적으로 사용할 수 없습니다. 확인된 교사 메모와 표준 마킹을 표시합니다.';
+    case 'zh': return 'AI教学丰富功能暂时不可用。正在显示已验证的教师笔记和标准标记。';
+    case 'ru': return 'Педагогическое обогащение с помощью ИИ временно недоступно. Отображаются проверенные заметки преподавателя и стандартная разметка.';
+    case 'ar': return 'التحسين التربوي بالذكاء الاصطناعي غير متاح مؤقتًا. يتم عرض ملاحظات المعلم المعتمدة والعلامات القياسية.';
+    case 'tr': return 'Yapay zeka pedagojik zenginleştirmesi geçici olarak kullanılamıyor. Doğrulanmış öğretmen notları ve standart işaretlemeler gösteriliyor.';
+    case 'pt':
+    default:
+      return 'O enriquecimento pedagógico por IA está temporariamente indisponível. Exibindo as anotações verificadas do professor e marcações padrão.';
+  }
 }
 
 /**
@@ -177,6 +299,7 @@ export function generateLocalPedagogicalTransformation(params: {
   studentEmail?: string;
   lessonId?: string;
   sessionKey?: string;
+  language?: string;
 }): PedagogicalLessonTransformation {
   const {
     rawNotes,
@@ -188,6 +311,7 @@ export function generateLocalPedagogicalTransformation(params: {
     studentEmail,
     lessonId,
     sessionKey: customSessionKey,
+    language = 'pt',
   } = params;
 
   const markings = parseNotesHtml(rawNotes);
@@ -284,15 +408,15 @@ export function generateLocalPedagogicalTransformation(params: {
 
     if (!hasCorrection) {
       // Teacher marked the mistake but did not provide the correction (e.g. "Blate")
-      // Do NOT guess or hallucinate a correction; mark as pending confirmation
+      // Do NOT guess or hallucinate a correction; mark as pending confirmation in student language
       mistakesAnalysis.push({
         id: `mistake-${mistakesAnalysis.length + 1}`,
         original: rawOrig,
-        corrected: 'Pendente de confirmação com o professor',
+        corrected: getPendingConfirmationText(language),
         category: 'vocabulary',
-        explanation: `A forma corrigida para "${rawOrig}" não foi informada na aula. Confirme com seu Native Friend na próxima sessão para validar o contexto exato.`,
+        explanation: getUnconfirmedExplanationText(rawOrig, language),
         twoExamples: [],
-        commonPitfalls: 'Aguardando confirmação do professor sobre o contexto específico de uso.',
+        commonPitfalls: getPendingPitfallsText(language),
         isPendingConfirmation: true,
       });
       continue;
@@ -527,6 +651,8 @@ export function generateLocalPedagogicalTransformation(params: {
     rememberThis,
   };
 
+  const cleanLang = (language || 'pt').toLowerCase().trim();
+
   return {
     lessonId,
     sessionKey,
@@ -539,6 +665,13 @@ export function generateLocalPedagogicalTransformation(params: {
     studentLevel: String(studentLevel),
     cefrLevel: cefrMeta.cefr,
     contentHash,
+    language: cleanLang,
+    promptVersion: PEDAGOGICAL_PROMPT_VERSION,
+    isAiGenerated: false,
+    isFallback: true,
+    fallbackReason: 'AI_UNAVAILABLE',
+    source: 'fallback',
+    aiNotice: getAiUnavailableNoticeText(cleanLang),
     mistakesAnalysis,
     grammarPoints,
     vocabularyAndExpressions,
@@ -567,6 +700,7 @@ export async function fetchPedagogicalTransformation(params: {
   studentEmail?: string;
   lessonId?: string;
   sessionKey?: string;
+  language?: string;
   forceRegenerate?: boolean;
 }): Promise<PedagogicalLessonTransformation> {
   const {
@@ -579,13 +713,96 @@ export async function fetchPedagogicalTransformation(params: {
     studentEmail,
     lessonId,
     sessionKey,
+    language = 'pt',
     forceRegenerate = false,
   } = params;
 
   try {
+    const token = await auth?.currentUser?.getIdToken().catch(() => null);
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const effectiveKey = sessionKey || lessonId || '';
+
+    // Security Hotfix (Etapa 2): If not an explicit regeneration, check server cache first!
+    if (!forceRegenerate && effectiveKey) {
+      try {
+        const cacheUrl = `/api/pedagogical-notes?sessionKey=${encodeURIComponent(effectiveKey)}&language=${encodeURIComponent(language)}${studentUid ? `&studentUid=${encodeURIComponent(studentUid)}` : ''}`;
+        const cacheRes = await fetch(cacheUrl, { headers });
+
+        if (cacheRes.status === 401 || cacheRes.status === 403) {
+          const authMsg = cacheRes.status === 401
+            ? 'Faça login com sua conta de estudante para acessar o relatório pedagógico.'
+            : 'Acesso negado: você não tem permissão para visualizar as anotações desta aula.';
+          return {
+            sessionKey: effectiveKey,
+            sessionDate,
+            topic,
+            studentLevel,
+            cefrLevel: 'B1',
+            mistakesAnalysis: [],
+            grammarPoints: [],
+            vocabularyAndExpressions: [],
+            reviewSummary: {
+              estimatedMinutes: '0 min',
+              keyRules: [],
+              mustKnowVocabulary: [],
+              essentialCorrections: [],
+              rememberThis: authMsg,
+            },
+            correctStampsCount: 0,
+            incorrectStampsCount: 0,
+            generatedAt: new Date().toISOString(),
+            isFallback: true,
+            isProvisional: true,
+            authError: {
+              status: cacheRes.status,
+              message: authMsg,
+              requiresLogin: cacheRes.status === 401,
+            },
+          };
+        }
+
+        if (cacheRes.ok) {
+          const cachedData = await cacheRes.json();
+          if (cachedData && typeof cachedData === 'object' && !Array.isArray(cachedData) && cachedData.sessionKey) {
+            return cachedData;
+          }
+        }
+      } catch (cacheErr) {
+        console.warn('Pedagogical cache lookup notice:', cacheErr);
+      }
+
+      // If no cached entry exists, DO NOT automatically call paid Gemini API.
+      // Return the deterministic local notes flagged as provisional preview with explicit generation invitation.
+      const provisional = generateLocalPedagogicalTransformation({
+        rawNotes,
+        topic,
+        sessionDate,
+        teacherName,
+        studentLevel,
+        studentUid,
+        studentEmail,
+        lessonId,
+        sessionKey,
+        language,
+      });
+      provisional.isFallback = true;
+      provisional.isProvisional = true;
+      provisional.isAiGenerated = false;
+      provisional.needsAiGeneration = true;
+      provisional.aiNotice = language === 'en'
+        ? 'Preliminary teacher-faithful guide. Click "Generate with AI" for synthesized masterclass analysis.'
+        : 'Guia preliminar fiel às anotações do professor. Clique em "Gerar com IA" para sintetizar a análise pedagógica com Gemini.';
+      return provisional;
+    }
+
+    // Explicit generation request (forceRegenerate === true):
     const res = await fetch('/api/pedagogical-notes/transform', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({
         rawNotes,
         topic,
@@ -596,9 +813,43 @@ export async function fetchPedagogicalTransformation(params: {
         studentEmail,
         lessonId,
         sessionKey,
-        forceRegenerate,
+        language,
+        forceRegenerate: true,
       }),
     });
+
+    if (res.status === 401 || res.status === 403) {
+      const authMsg = res.status === 401
+        ? 'Faça login com sua conta de estudante para gerar ou visualizar o relatório pedagógico.'
+        : 'Acesso negado: você não tem permissão para visualizar as anotações desta aula.';
+      return {
+        sessionKey: effectiveKey,
+        sessionDate,
+        topic,
+        studentLevel,
+        cefrLevel: 'B1',
+        mistakesAnalysis: [],
+        grammarPoints: [],
+        vocabularyAndExpressions: [],
+        reviewSummary: {
+          estimatedMinutes: '0 min',
+          keyRules: [],
+          mustKnowVocabulary: [],
+          essentialCorrections: [],
+          rememberThis: authMsg,
+        },
+        correctStampsCount: 0,
+        incorrectStampsCount: 0,
+        generatedAt: new Date().toISOString(),
+        isFallback: true,
+        isProvisional: true,
+        authError: {
+          status: res.status,
+          message: authMsg,
+          requiresLogin: res.status === 401,
+        },
+      };
+    }
 
     if (res.ok) {
       const data = await res.json();
@@ -611,7 +862,7 @@ export async function fetchPedagogicalTransformation(params: {
   }
 
   // Graceful deterministic fallback strictly faithful to raw notes
-  return generateLocalPedagogicalTransformation({
+  const fallback = generateLocalPedagogicalTransformation({
     rawNotes,
     topic,
     sessionDate,
@@ -621,5 +872,10 @@ export async function fetchPedagogicalTransformation(params: {
     studentEmail,
     lessonId,
     sessionKey,
+    language,
   });
+  fallback.isFallback = true;
+  fallback.isProvisional = true;
+  fallback.isAiGenerated = false;
+  return fallback;
 }

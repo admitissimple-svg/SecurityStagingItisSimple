@@ -16,6 +16,7 @@ import {
   synthesizeFillInBlanks,
   profileWord,
 } from './pedagogicalStorySynthesizer';
+import { auth } from '../firebase';
 
 // Rich dictionary knowledge base for routine words
 const ROUTINE_VOCAB_DICT: Record<
@@ -781,9 +782,15 @@ export async function generateWeeklyHomeworkWithAi(params: {
     const controller = new AbortController();
     const abortTimeout = setTimeout(() => controller.abort(), 35000);
 
+    const token = await auth?.currentUser?.getIdToken().catch(() => null);
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
     const response = await fetch('/api/homework/generate-ai', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       signal: controller.signal,
       body: JSON.stringify({
         words: cleanWordList,
@@ -795,6 +802,14 @@ export async function generateWeeklyHomeworkWithAi(params: {
       }),
     });
     clearTimeout(abortTimeout);
+
+    if (response.status === 401 || response.status === 403) {
+      console.warn(`Homework generate-ai rejected (${response.status}): unauthenticated or unauthorized. Falling back to structured baseline.`);
+      return {
+        ...localBaseline,
+        isAiGenerated: false,
+      };
+    }
 
     if (response.ok) {
       const data = await response.json();
@@ -849,9 +864,15 @@ export async function generatePart4StoryWithAi(params: {
     const controller = new AbortController();
     const abortTimeout = setTimeout(() => controller.abort(), 20000);
 
+    const token = await auth?.currentUser?.getIdToken().catch(() => null);
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
     const response = await fetch('/api/homework/generate-part4', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       signal: controller.signal,
       body: JSON.stringify({
         words: cleanWords,
@@ -861,6 +882,11 @@ export async function generatePart4StoryWithAi(params: {
       }),
     });
     clearTimeout(abortTimeout);
+
+    if (response.status === 401 || response.status === 403) {
+      console.warn(`Homework generate-part4 rejected (${response.status}): unauthenticated or unauthorized.`);
+      return null;
+    }
 
     if (response.ok) {
       const data = await response.json();

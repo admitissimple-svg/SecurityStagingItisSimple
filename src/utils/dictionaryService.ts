@@ -1,6 +1,7 @@
 import { StudentDictionaryEntry, EnglishLevel } from '../types';
 import { NATIVE_FRIENDS_DICTIONARY_DATABASE } from '../data/dictionaryDatabase';
 import { resolveCefrLevel } from './pedagogicalTransformer';
+import { auth } from '../firebase';
 
 export interface DictionaryLookupResult {
   word: string;
@@ -254,11 +255,17 @@ async function fetchFromBackendApi(
       signal = AbortSignal.timeout(6000);
     }
 
+    const token = await auth?.currentUser?.getIdToken().catch(() => null);
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
     const res = await fetch('/api/dictionary/define', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers,
       body: JSON.stringify({
         word: cleanWord,
         context,
@@ -267,6 +274,11 @@ async function fetchFromBackendApi(
       }),
       signal,
     });
+
+    if (res.status === 401 || res.status === 403) {
+      console.warn(`Dictionary define rejected (${res.status}): unauthenticated or unauthorized.`);
+      return null;
+    }
 
     if (!res.ok) return null;
 

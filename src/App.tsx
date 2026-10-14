@@ -1005,20 +1005,8 @@ export default function App() {
 
   const lastAttemptedSignatureRef = useRef<string>('');
 
-  // Proactively generate AI content ONCE when student opens modal with vocabulary
-  useEffect(() => {
-    if (!isHomeworkModalOpen) return;
-    if (!weeklyHomework || weeklyHomework.isEmpty || weeklyHomework.totalWordsCollected === 0) return;
-    if (weeklyHomework.isAiGenerated) return;
-
-    const signature = `${homeworkTargetDay}_${weeklyHomework.vocabularyList.map((w) => w.word.toLowerCase()).sort().join('|')}`;
-    if (lastAttemptedSignatureRef.current === signature || isGeneratingAiRef.current) {
-      return;
-    }
-
-    lastAttemptedSignatureRef.current = signature;
-    handleRegenerateHomeworkWithAi();
-  }, [isHomeworkModalOpen, weeklyHomework, homeworkTargetDay, handleRegenerateHomeworkWithAi]);
+  // Security Hotfix (Etapa 2): Automatic paid generation on modal opening removed.
+  // Homework uses cached state or deterministic layout on open; explicit button click required for AI generation.
 
   const handleOpenHomeworkModal = useCallback((targetDay?: DayOfWeek) => {
     const selected = targetDay || getTodayDayOfWeek();

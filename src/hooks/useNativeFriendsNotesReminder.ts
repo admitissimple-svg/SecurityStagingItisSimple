@@ -313,6 +313,7 @@ export function useNativeFriendsNotesReminder({
         studentEmail: resolvedEmail,
         lessonId: latestSession.lessonId,
         sessionKey: latestSession.key,
+        language: currentLanguage,
       })
         .then((trans) => {
           if (!isCancelled) setLatestTransformation(trans);
@@ -326,7 +327,7 @@ export function useNativeFriendsNotesReminder({
     return () => {
       isCancelled = true;
     };
-  }, [latestSession, studentLevel, resolvedUid, resolvedEmail]);
+  }, [latestSession, studentLevel, resolvedUid, resolvedEmail, currentLanguage]);
 
   // 4. Save review progress to Firestore and Server (NO localStorage)
   const persistProgress = useCallback(

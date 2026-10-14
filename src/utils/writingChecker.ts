@@ -1,4 +1,5 @@
 import { EnglishLevel, WritingEvaluationResult, WordFeedback, SentenceFeedback, WeeklyHomeworkData, HomeworkAiEvaluation } from '../types';
+import { auth } from '../firebase';
 
 export const GEMINI_PROJECT_ID = 'itissimple-security-staging';
 
@@ -806,17 +807,34 @@ export async function checkDailySentenceAi(
   const localAnalysis = analyzeSentenceGrammarDeterministic(cleanSentence, cleanDailyWords);
 
   try {
+    const token = await auth?.currentUser?.getIdToken().catch(() => null);
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
     const res = await fetch('/api/check-daily-sentence', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers,
       body: JSON.stringify({
         sentence: cleanSentence,
         dailyWords: cleanDailyWords,
         projectId: GEMINI_PROJECT_ID,
       }),
     });
+
+    if (res.status === 401 || res.status === 403) {
+      console.warn(`Daily sentence check rejected (${res.status}): unauthenticated or unauthorized. Falling back to local analysis.`);
+      const fallbackResult = evaluateLocally({
+        sentence: cleanSentence,
+        dailyWords: cleanDailyWords,
+        words: cleanDailyWords,
+      });
+      dailySentenceClientCache.set(cacheKey, fallbackResult);
+      return fallbackResult;
+    }
 
     if (res.ok) {
       const data = await res.json();
@@ -936,11 +954,22 @@ export async function checkStudentWritingApi(
 ): Promise<WritingEvaluationResult> {
   // 1. Try server API call
   try {
+    const token = await auth?.currentUser?.getIdToken().catch(() => null);
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
     const res = await fetch('/api/check-writing', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(params),
     });
+
+    if (res.status === 401 || res.status === 403) {
+      console.warn(`Backend writing check rejected (${res.status}): unauthenticated or unauthorized. Running local evaluation.`);
+      return evaluateLocally(params);
+    }
 
     if (res.ok) {
       const data = await res.json();
@@ -987,13 +1016,21 @@ export async function evaluateWeeklyHomeworkApi(params: {
   currentLanguage?: string;
 }): Promise<HomeworkAiEvaluation> {
   try {
+    const token = await auth?.currentUser?.getIdToken().catch(() => null);
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
     const res = await fetch('/api/homework/evaluate', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(params),
     });
 
-    if (res.ok) {
+    if (res.status === 401 || res.status === 403) {
+      console.warn(`Homework evaluation rejected (${res.status}): unauthenticated or unauthorized. Falling back to client evaluation.`);
+    } else if (res.ok) {
       const data = await res.json();
       if (data && data.evaluation) {
         return data.evaluation as HomeworkAiEvaluation;

@@ -271,8 +271,8 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
       }
     }
 
-    if (line.includes('->') || line.includes('=>')) {
-      const arrowParts = line.split(/->|=>/);
+    if (line.includes('->') || line.includes('=>') || line.includes('➜') || line.includes('→')) {
+      const arrowParts = line.split(/->|=>|➜|→/);
       if (arrowParts.length >= 2) {
         const cleanOrig = cleanExpressionTerm(arrowParts[0].replace(/\[\[TAG:[^\]]+\]\]/g, ''));
         const cleanCorr = cleanExpressionTerm(arrowParts[1].replace(/\[\[TAG:[^\]]+\]\]/g, ''));

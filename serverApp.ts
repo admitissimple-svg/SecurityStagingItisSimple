@@ -147,10 +147,18 @@ import {
   generateLocalPedagogicalTransformation,
   getCanonicalSessionKey,
   computeNotesHash,
+  buildPedagogicalCacheKey,
+  PEDAGOGICAL_PROMPT_VERSION,
+  getPendingConfirmationText,
+  getUnconfirmedExplanationText,
+  getPendingPitfallsText,
+  getAiUnavailableNoticeText,
+  resolveCefrLevel,
 } from './src/utils/pedagogicalTransformer';
 import {
   firebaseAuthMiddleware,
   requireAdmin,
+  requireTeacher,
   isVerifiedAdminRequest,
   getVerifiedUserFromRequest,
 } from './src/middleware/firebaseAuth';
@@ -161,9 +169,35 @@ import {
   isAuthorizedOriginStrict,
   registerDiagnosticRoutes,
 } from './src/serverDiagnostic';
-const rawEnvModel = (process.env.GEMINI_MODEL || '').trim();
-const isInvalidEnvModel = !rawEnvModel || rawEnvModel.includes('1.5') || rawEnvModel.includes('2.0') || rawEnvModel.startsWith('emini');
-const GEMINI_TEXT_MODEL = isInvalidEnvModel ? 'gemini-3.6-flash' : rawEnvModel;
+import {
+  GEMINI_FIXED_MODEL,
+  checkAndConsumeRateLimit,
+  acquireSingleFlightLock,
+  validatePayloadBounds,
+  executeGeminiSingleAttempt,
+  logGeminiAudited,
+  resetGeminiSecurityStateForTesting,
+  sendGeminiCostControlUnavailable,
+  GeminiFeature,
+} from './src/serverGeminiSecurity';
+
+export const LANGUAGE_NAMES: Record<string, { nameEn: string; nameNative: string }> = {
+  pt: { nameEn: 'Portuguese', nameNative: 'Português' },
+  en: { nameEn: 'English', nameNative: 'English' },
+  es: { nameEn: 'Spanish', nameNative: 'Español' },
+  fr: { nameEn: 'French', nameNative: 'Français' },
+  de: { nameEn: 'German', nameNative: 'Deutsch' },
+  it: { nameEn: 'Italian', nameNative: 'Italiano' },
+  ja: { nameEn: 'Japanese', nameNative: '日本語' },
+  ko: { nameEn: 'Korean', nameNative: '한국어' },
+  zh: { nameEn: 'Simplified Chinese', nameNative: '中文' },
+  ru: { nameEn: 'Russian', nameNative: 'Русский' },
+  ar: { nameEn: 'Arabic', nameNative: 'العربية' },
+  tr: { nameEn: 'Turkish', nameNative: 'Türkçe' },
+};
+
+// Security Hotfix (Etapa 2): Sole model for all generation routes is gemini-2.5-flash
+const GEMINI_TEXT_MODEL = GEMINI_FIXED_MODEL;
 const ACTIVE_FIREBASE_PROJECT_ID = 'itissimple-security-staging';
 const GEMINI_PROJECT_ID = ACTIVE_FIREBASE_PROJECT_ID;
 
@@ -3892,24 +3926,16 @@ const pedagogicalDictCache = new Map<string, any>();
 async function queryAiPedagogicalDefinition(
   cleanWord: string,
   studentLevel: string,
-  cefr: string
+  cefr: string,
+  callerRole: string = 'student'
 ): Promise<any | null> {
   const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || '';
   if (!apiKey || !cleanWord || cleanWord.length < 2) return null;
 
   try {
-    const ai = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    });
-
-    const prompt = `You are the master Native Friend Notes Pedagogical AI Engine for an English immersion app.
-Analyze the word or phrase: "${cleanWord}".
-Student English level: "${studentLevel}" (Target CEFR: ${cefr}).
+    const prompt = `Analyze the word or phrase: "${cleanWord}".
+Target CEFR: ${cefr}.
+Student English Level: "${studentLevel}".
 
 Generate a personalized pedagogical dictionary entry adhering strictly to Native Friend Notes standards:
 1. "word": Exactly "${cleanWord}".
@@ -3935,47 +3961,32 @@ Respond strictly with a JSON object:
   "register": "..."
 }`;
 
-    const candidateModels = [
-      'gemini-2.5-flash',
-      'gemini-3.1-flash-lite',
-      'gemini-3.6-flash',
-    ];
+    // Security Hotfix (Etapa 2): Single attempt with gemini-2.5-flash, zero cascade, exact token bound
+    const singleAttempt = await executeGeminiSingleAttempt({
+      feature: 'dictionary_define',
+      systemInstruction: 'You are the master Native Friend Notes Pedagogical AI Engine. Provide accurate, crystal-clear lexical analyses for ESL learners in strict JSON.',
+      untrustedUserDataPrompt: prompt,
+      callerRole,
+      apiKey,
+      temperature: 0.2,
+    });
 
-    for (const model of candidateModels) {
-      try {
-        const config: any = {
-          responseMimeType: 'application/json',
-          thinkingConfig: { thinkingBudget: 0 },
-        };
-
-        const response = await ai.models.generateContent({
-          model,
-          contents: prompt,
-          config,
-        });
-
-        const text = response.text || '';
-        if (text) {
-          const parsed = JSON.parse(text);
-          if (parsed && parsed.definitionEn && parsed.exampleSentenceEn) {
-            return {
-              word: parsed.word || cleanWord,
-              partOfSpeech: parsed.partOfSpeech || (cleanWord.includes(' ') ? 'Idiomatic Expression' : 'Noun'),
-              cefrLevel: parsed.cefrLevel || cefr,
-              definitionEn: formatPedagogicalSentence(parsed.definitionEn),
-              exampleSentenceEn: formatPedagogicalSentence(parsed.exampleSentenceEn),
-              translationPt: parsed.translationPt || '',
-              collocations: Array.isArray(parsed.collocations) ? parsed.collocations : [],
-              phonetic: parsed.phonetic || '',
-              register: parsed.register || 'neutral',
-              source: 'native_notes_ai_personalized',
-              notFound: false,
-            };
-          }
-        }
-      } catch (err) {
-        continue;
-      }
+    const parsed = singleAttempt?.parsedJson;
+    if (parsed && parsed.definitionEn && parsed.exampleSentenceEn) {
+      return {
+        word: parsed.word || cleanWord,
+        partOfSpeech: parsed.partOfSpeech || (cleanWord.includes(' ') ? 'Idiomatic Expression' : 'Noun'),
+        cefrLevel: parsed.cefrLevel || cefr,
+        definitionEn: formatPedagogicalSentence(parsed.definitionEn),
+        exampleSentenceEn: formatPedagogicalSentence(parsed.exampleSentenceEn),
+        translationPt: parsed.translationPt || '',
+        collocations: Array.isArray(parsed.collocations) ? parsed.collocations : [],
+        phonetic: parsed.phonetic || '',
+        register: parsed.register || 'neutral',
+        source: 'native_notes_ai_personalized',
+        isAiGenerated: true,
+        notFound: false,
+      };
     }
   } catch (err) {
     console.warn('Notice querying AI pedagogical dictionary:', err);
@@ -3984,15 +3995,38 @@ Respond strictly with a JSON object:
 }
 
 // 2.2 Dictionary Lookup Endpoint (Native Friend Notes Unified Standard)
-app.all('/api/dictionary/define', async (req, res) => {
+app.all('/api/dictionary/define', firebaseAuthMiddleware, async (req, res) => {
   const rawWord = (req.body?.word || req.query?.word || '') as string;
   if (!rawWord || typeof rawWord !== 'string') {
     return res.status(400).json({ error: 'Word is required' });
   }
 
   const cleanWord = rawWord.trim();
+  if (cleanWord.length > 100) {
+    return res.status(400).json({
+      error: 'Payload bounds exceeded',
+      message: 'Word parameter exceeds the maximum permitted length of 100 characters.',
+    });
+  }
+
+  const caller = req.user!;
   const lowerWord = cleanWord.toLowerCase();
-  const studentLevel = (req.body?.studentLevel || req.body?.level || req.query?.level || 'intermediate') as string;
+  let studentLevel = (req.body?.studentLevel || req.body?.level || req.query?.level || 'intermediate') as string;
+
+  // Authoritative CEFR level for authenticated student
+  if (caller.role === 'student') {
+    const db = readDb();
+    const callerEmail = (caller.email || '').toLowerCase().trim();
+    const registeredStudent = (db.students || []).find((s: any) =>
+      (s.uid === caller.uid || s.id === caller.uid) ||
+      (callerEmail && (s.email || '').toLowerCase().trim() === callerEmail)
+    );
+    const profile = db.userProfiles?.[caller.uid] || (callerEmail && db.userProfiles?.[callerEmail]);
+    if (profile?.level || profile?.englishLevel || registeredStudent?.level || registeredStudent?.englishLevel) {
+      studentLevel = profile?.level || profile?.englishLevel || registeredStudent?.level || registeredStudent?.englishLevel;
+    }
+  }
+
   const cefr = resolveNativeNotesCefr(studentLevel);
   const cacheKey = `${lowerWord}_${cefr}`;
 
@@ -4024,8 +4058,52 @@ app.all('/api/dictionary/define', async (req, res) => {
     return res.json(curatedResult);
   }
 
-  // 2. Query Gemini AI for personalized pedagogical entry with thinkingBudget: 0 (Fast ~400ms)
-  const aiResult = await queryAiPedagogicalDefinition(cleanWord, studentLevel, cefr);
+  // Security Hotfix (Etapa 2 & Residuals): Rate limiting per UID and single-flight lock before AI invocation
+  const rateLimitCheck = await checkAndConsumeRateLimit(caller.uid, 'dictionary_define');
+  if (!rateLimitCheck.allowed) {
+    if (rateLimitCheck.unavailable) {
+      return sendGeminiCostControlUnavailable(res, 5);
+    }
+    logGeminiAudited({
+      feature: 'dictionary_define',
+      status: 'RATE_LIMITED',
+      callerRole: caller.role,
+      detail: `Rate limit hit, retry after ${rateLimitCheck.retryAfterSeconds}s`,
+    });
+    // Deterministic fallback immediately
+    const offlineEntry = getDictionaryDefinition(cleanWord);
+    if (offlineEntry && offlineEntry.definitionEn) {
+      const offlineResult = {
+        word: offlineEntry.word || cleanWord,
+        partOfSpeech: offlineEntry.partOfSpeech || (cleanWord.includes(' ') ? 'Idiomatic Expression' : 'Noun'),
+        cefrLevel: (offlineEntry as any).cefrLevel || cefr,
+        definitionEn: offlineEntry.definitionEn,
+        exampleSentenceEn: formatPedagogicalSentence(offlineEntry.exampleSentenceEn || generateNativeNotesExample(cleanWord, offlineEntry.partOfSpeech || '')),
+        translationPt: offlineEntry.translationPt || '',
+        phonetic: (offlineEntry as any).phonetic,
+        source: 'native_notes_standard',
+        isFallback: true,
+        rateLimited: true,
+        notFound: false,
+      };
+      return res.json(offlineResult);
+    }
+  }
+
+  // 2. Query Gemini AI for personalized pedagogical entry with single-flight protection
+  const flightLock = await acquireSingleFlightLock(`dictionary_define:${cacheKey}`);
+  if (!flightLock.acquired && flightLock.unavailable) {
+    return sendGeminiCostControlUnavailable(res, 5);
+  }
+  let aiResult: any = null;
+  if (flightLock.acquired) {
+    try {
+      aiResult = await queryAiPedagogicalDefinition(cleanWord, studentLevel, cefr, caller.role);
+    } finally {
+      await flightLock.release();
+    }
+  }
+
   if (aiResult) {
     pedagogicalDictCache.set(cacheKey, aiResult);
     pedagogicalDictCache.set(lowerWord, aiResult);
@@ -7274,6 +7352,39 @@ app.post('/api/lessons/:id/cancel', async (req, res) => {
   res.json({ success: true, liveLessons: db.liveLessons });
 });
 
+/**
+ * Invalidates all cached pedagogical transformations (all languages, hashes, CEFR levels)
+ * for a modified session, preserving historical session documents.
+ */
+export function invalidatePedagogicalCache(
+  db: any,
+  identifiers: {
+    canonicalSessionKey?: string;
+    sessionKey?: string;
+    lessonId?: string;
+    id?: string;
+  }
+) {
+  if (!db || !db.pedagogicalTransformationsMap) return;
+  const prefixes = [
+    identifiers.canonicalSessionKey,
+    identifiers.sessionKey,
+    identifiers.id,
+    identifiers.lessonId,
+    identifiers.lessonId ? `lesson_${identifiers.lessonId.replace(/^lesson_/, '')}` : undefined,
+  ].filter(Boolean) as string[];
+
+  const allKeys = Object.keys(db.pedagogicalTransformationsMap);
+  allKeys.forEach((key) => {
+    for (const prefix of prefixes) {
+      if (key === prefix || key.startsWith(`${prefix}__`) || key.startsWith(`${prefix}_`)) {
+        delete db.pedagogicalTransformationsMap[key];
+        break;
+      }
+    }
+  });
+}
+
 // Save live lesson notes & automatically migrate vocabulary to student's personal dictionary
 app.post('/api/lessons/:id/notes', async (req, res) => {
   const db = readDb();
@@ -7388,6 +7499,14 @@ app.post('/api/lessons/:id/notes', async (req, res) => {
     });
   }
 
+  // Invalidate all versions (languages, CEFR levels, hashes) of cached pedagogical transformation for this session
+  invalidatePedagogicalCache(db, {
+    canonicalSessionKey: sessionKey,
+    sessionKey,
+    lessonId: id,
+    id,
+  });
+
   await writeDbSync(db);
   res.json({ success: true, liveLessons: db.liveLessons });
 });
@@ -7475,15 +7594,13 @@ app.post('/api/session-notes', async (req, res) => {
     sessionDate: cleanDate,
   });
 
-  if (db.pedagogicalTransformationsMap) {
-    delete db.pedagogicalTransformationsMap[canonicalSessionKey];
-    if (sessionKey) delete db.pedagogicalTransformationsMap[sessionKey];
-    if (id) delete db.pedagogicalTransformationsMap[id];
-    if (lessonId) {
-      delete db.pedagogicalTransformationsMap[lessonId];
-      delete db.pedagogicalTransformationsMap[`lesson_${lessonId.replace(/^lesson_/, '')}`];
-    }
-  }
+  // Invalidate all versions (languages, CEFR levels, hashes) of cached pedagogical transformation for this session
+  invalidatePedagogicalCache(db, {
+    canonicalSessionKey,
+    sessionKey,
+    lessonId,
+    id,
+  });
 
   await writeDbSync(db);
 
@@ -7574,6 +7691,13 @@ app.post('/api/drive/sync-session-notes', async (req, res) => {
         return l;
       });
     }
+
+    // Invalidate cached pedagogical transformation for this session
+    invalidatePedagogicalCache(db, {
+      canonicalSessionKey: effectiveKey,
+      sessionKey: effectiveKey,
+      lessonId: lessonId || undefined,
+    });
 
     await writeDbSync(db);
     saveSessionNotesToFirestoreServer(effectiveKey, db.sessionNotesMap[effectiveKey]).catch(() => null);
@@ -7848,6 +7972,56 @@ app.post('/api/session-notes/progress', async (req, res) => {
   return res.json({ success: true, progress: db.sessionNotesProgressMap[key] });
 });
 
+// Controlled cooldown tracker for Gemini quota exhaustion to prevent repeated 429 floods
+let geminiQuotaCooldownUntil = 0;
+const GEMINI_QUOTA_COOLDOWN_MS = 60_000;
+
+export type GeminiFailureCategory =
+  | 'AUTH_ERROR'
+  | 'QUOTA_EXCEEDED'
+  | 'MODEL_UNAVAILABLE'
+  | 'TIMEOUT'
+  | 'INVALID_RESPONSE';
+
+export function categorizeGeminiError(err: any): { category: GeminiFailureCategory; safeReason: string } {
+  const msg = String(err?.message || err?.statusText || err || '').toLowerCase();
+  const status = Number(err?.status || err?.statusCode || err?.code || 0);
+
+  if (msg.includes('timeout') || status === 408 || msg.includes('deadline_exceeded')) {
+    return { category: 'TIMEOUT', safeReason: 'Request timed out waiting for model response.' };
+  }
+  if (
+    status === 429 ||
+    msg.includes('resource_exhausted') ||
+    msg.includes('quota') ||
+    msg.includes('rate limit') ||
+    msg.includes('too many requests')
+  ) {
+    return { category: 'QUOTA_EXCEEDED', safeReason: 'Gemini quota or rate limit exceeded.' };
+  }
+  if (
+    status === 401 ||
+    status === 403 ||
+    msg.includes('api_key') ||
+    msg.includes('unauthenticated') ||
+    msg.includes('permission_denied')
+  ) {
+    return { category: 'AUTH_ERROR', safeReason: 'Gemini authentication failed or invalid credentials.' };
+  }
+  if (status === 404 || msg.includes('not found') || msg.includes('is not supported')) {
+    return { category: 'MODEL_UNAVAILABLE', safeReason: 'Requested model is unavailable or unsupported.' };
+  }
+  return { category: 'INVALID_RESPONSE', safeReason: 'Model response was empty or malformed.' };
+}
+
+export function logSafeGeminiDiagnostic(category: string, model: string, details?: string) {
+  const sanitized = (details || '')
+    .replace(/AIza[0-9A-Za-z-_]{30,45}/g, '[REDACTED_API_KEY]')
+    .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '[REDACTED_EMAIL]')
+    .replace(/Bearer\s+[a-zA-Z0-9._-]+/gi, '[REDACTED_TOKEN]');
+  console.warn(`[GEMINI_DIAGNOSTIC] Category: ${category} | Model: ${model} | Info: ${sanitized.slice(0, 150)}`);
+}
+
 // Helper for pedagogical transformation fallback
 function generateServerPedagogicalFallback(params: {
   rawNotes: string;
@@ -7859,6 +8033,7 @@ function generateServerPedagogicalFallback(params: {
   studentEmail?: string;
   lessonId?: string;
   sessionKey?: string;
+  language?: string;
 }) {
   return generateLocalPedagogicalTransformation(params as any);
 }
@@ -7924,7 +8099,7 @@ function syncTransformationVocabToDictionary(
 }
 
 // Generate or retrieve Pedagogical Transformation using Gemini AI with fallback
-app.post('/api/pedagogical-notes/transform', async (req, res) => {
+app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req, res) => {
   const db = readDb();
   if (!db.pedagogicalTransformationsMap) {
     db.pedagogicalTransformationsMap = {};
@@ -7941,7 +8116,18 @@ app.post('/api/pedagogical-notes/transform', async (req, res) => {
     lessonId = '',
     sessionKey: customSessionKey = '',
     forceRegenerate = false,
+    language: rawLang = '',
+    currentLanguage: altLang = '',
   } = req.body || {};
+
+  // Security Hotfix (Etapa 2): Payload bounds validation before any processing
+  const bounds = validatePayloadBounds('pedagogical_transform', { text: rawNotes });
+  if (!bounds.valid) {
+    return res.status(400).json({
+      error: 'Payload bounds exceeded',
+      message: bounds.error,
+    });
+  }
 
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
   const canonicalSessionKey = getCanonicalSessionKey({
@@ -7952,56 +8138,204 @@ app.post('/api/pedagogical-notes/transform', async (req, res) => {
     sessionDate,
   });
   const contentHash = computeNotesHash(rawNotes);
+  const language = (rawLang || altLang || 'pt').toLowerCase().trim();
 
-  // Check cache first if not explicitly regenerating: verify canonical key and content hash
+  // 1. SECURITY & AUTHORIZATION:
+  // Strictly verify caller permissions (mandatory Firebase ID token)
+  const caller = req.user!;
+  const callerUid = caller.uid;
+  const callerEmail = (caller.email || '').toLowerCase().trim();
+  let cleanUid = callerUid;
+  let effectiveEmail = callerEmail;
+
+  if (caller.role === 'student') {
+    // Verify student ownership of requested student identifiers
+    if (studentUid && studentUid !== callerUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Unauthorized access: student UID does not match authenticated user.',
+      });
+    }
+    if (cleanEmail && cleanEmail !== callerEmail) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Unauthorized access: student email does not match authenticated user.',
+      });
+    }
+
+    // Verify student ownership of lesson via canonical Firestore database first, then fallback
+    if (lessonId) {
+      let lesson: any = null;
+      const firestore = getFirestoreDb();
+      if (firestore) {
+        try {
+          const lSnap1 = await firestore.collection('liveLessons').doc(lessonId).get();
+          if (lSnap1.exists) {
+            lesson = lSnap1.data();
+          } else {
+            const lSnap2 = await firestore.collection('lessons').doc(lessonId).get();
+            if (lSnap2.exists) {
+              lesson = lSnap2.data();
+            }
+          }
+        } catch {}
+      }
+
+      if (!lesson && Array.isArray(db.liveLessons)) {
+        lesson = db.liveLessons.find((l: any) => l.id === lessonId);
+      }
+
+      if (lesson) {
+        const lEmail = (lesson.studentEmail || '').toLowerCase().trim();
+        const lUid = lesson.studentUid || '';
+        if ((lUid && lUid !== callerUid) || (lEmail && lEmail !== callerEmail)) {
+          return res.status(403).json({
+            error: 'Forbidden',
+            message: 'Unauthorized access: you may only transform pedagogical notes for your own lessons.',
+          });
+        }
+      }
+    }
+
+    cleanUid = callerUid;
+    effectiveEmail = callerEmail;
+  } else {
+    // Teachers and Admins can act on behalf of the student
+    cleanUid = studentUid || callerUid;
+    effectiveEmail = cleanEmail || callerEmail;
+  }
+
+  // Authoritative student CEFR level from registered user document (prevents client spoofing)
+  const registeredStudent = (db.students || []).find((s: any) =>
+    (cleanUid && (s.uid === cleanUid || s.id === cleanUid)) ||
+    (effectiveEmail && (s.email || '').toLowerCase().trim() === effectiveEmail)
+  );
+  const profile = (cleanUid && db.userProfiles?.[cleanUid]) || (effectiveEmail && db.userProfiles?.[effectiveEmail]);
+  const authoritativeLevel = profile?.level || profile?.englishLevel || registeredStudent?.level || registeredStudent?.englishLevel || studentLevel;
+  const cefrMeta = resolveCefrLevel(authoritativeLevel);
+  const cefr = cefrMeta.cefr;
+
+  // 2. CACHE LOOKUP:
+  // Build composite cache key partitioned by session, content hash, language, CEFR, and prompt version
+  const compositeCacheKey = buildPedagogicalCacheKey({
+    canonicalSessionKey,
+    contentHash,
+    language,
+    cefrLevel: cefr,
+  });
+
   const cached =
-    db.pedagogicalTransformationsMap[canonicalSessionKey] ||
-    (customSessionKey ? db.pedagogicalTransformationsMap[customSessionKey] : undefined) ||
-    (lessonId ? db.pedagogicalTransformationsMap[lessonId] : undefined);
+    db.pedagogicalTransformationsMap[compositeCacheKey] ||
+    (language === 'pt' ? db.pedagogicalTransformationsMap[canonicalSessionKey] : undefined);
 
-  if (!forceRegenerate && cached && cached.contentHash && cached.contentHash === contentHash) {
+  if (!forceRegenerate) {
+    if (cached && cached.contentHash === contentHash) {
+      return res.json({
+        success: true,
+        cached: true,
+        transformation: cached,
+      });
+    }
+
+    // Security Hotfix (Etapa 2): Require explicit user action (forceRegenerate === true) to invoke Gemini.
+    // Opening a modal or changing the language returns existing cache or deterministic provisional preview.
+    const provisional = generateServerPedagogicalFallback({
+      rawNotes,
+      topic,
+      sessionDate,
+      teacherName,
+      studentLevel: authoritativeLevel,
+      studentUid,
+      studentEmail: cleanEmail,
+      lessonId,
+      sessionKey: canonicalSessionKey,
+      language,
+    });
+    provisional.isAiGenerated = false;
+    provisional.isFallback = true;
+    provisional.isProvisional = true;
+    provisional.needsAiGeneration = true;
+    provisional.aiNotice = language === 'en'
+      ? 'Preliminary teacher-faithful guide. Click "Generate with Gemini" for synthesized masterclass analysis.'
+      : 'Guia preliminar fiel às notas do professor. Clique em "Gerar com Gemini" para sintetizar sua análise com IA.';
+
     return res.json({
       success: true,
-      cached: true,
-      transformation: cached,
+      cached: false,
+      transformation: provisional,
     });
   }
 
-  const lvl = String(studentLevel).toLowerCase();
-  const cefr = lvl.includes('avancado') || lvl.includes('c1') || lvl.includes('c2')
-    ? 'C1'
-    : lvl.includes('iniciante') || lvl.includes('a1') || lvl.includes('a2')
-    ? 'A2'
-    : 'B1';
+  // Security Hotfix (Etapa 2 & Residuals): Rate limiting check per authenticated UID
+  const rateLimitCheck = await checkAndConsumeRateLimit(callerUid, 'pedagogical_transform');
+  if (!rateLimitCheck.allowed) {
+    if (rateLimitCheck.unavailable) {
+      return sendGeminiCostControlUnavailable(res, 5);
+    }
+    logGeminiAudited({
+      feature: 'pedagogical_transform',
+      status: 'RATE_LIMITED',
+      callerRole: caller.role,
+      detail: `Rate limit hit, retry after ${rateLimitCheck.retryAfterSeconds}s`,
+    });
+    return res.status(429).json({
+      success: false,
+      error: 'Rate limit exceeded',
+      message: 'Limite de solicitações de análise pedagógica atingido para este usuário. Aguarde alguns instantes.',
+      retryAfterSeconds: rateLimitCheck.retryAfterSeconds,
+    });
+  }
 
-  // Parse notes using robust notesHtmlParser
-  const markings = parseNotesHtml(rawNotes);
-  const correctCount = markings.correctCount;
-  const incorrectCount = markings.incorrectCount;
-  const newWordCount = markings.newWordCount;
-  const pronounceCount = markings.pronounceCount;
+  // Security Hotfix (Etapa 2 & Residuals): Multi-instance Single-Flight Lock
+  const flightLock = await acquireSingleFlightLock(`pedagogical_transform:${compositeCacheKey}`);
+  if (!flightLock.acquired) {
+    if (flightLock.unavailable) {
+      return sendGeminiCostControlUnavailable(res, 5);
+    }
+    logGeminiAudited({
+      feature: 'pedagogical_transform',
+      status: 'INFLIGHT_LOCKED',
+      callerRole: caller.role,
+      detail: 'Concurrent generation already in progress for this session',
+    });
+    return res.status(429).json({
+      success: false,
+      error: 'Concurrent generation in progress',
+      message: 'Uma análise pedagógica para esta sessão já está em andamento. Aguarde alguns instantes.',
+      retryAfterSeconds: 4,
+    });
+  }
 
-  const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || '';
+  try {
+    // Parse notes using robust notesHtmlParser
+    const markings = parseNotesHtml(rawNotes);
+    const correctCount = markings.correctCount;
+    const incorrectCount = markings.incorrectCount;
+    const newWordCount = markings.newWordCount;
+    const pronounceCount = markings.pronounceCount;
 
-  if (apiKey && rawNotes.trim().length > 15) {
-    try {
-      const ai = new GoogleGenAI({
-        apiKey,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build',
-          },
-        },
-      });
+    const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || '';
+    const isCooldownActive = Date.now() < geminiQuotaCooldownUntil;
+    let lastFailureCategory: GeminiFailureCategory | null = isCooldownActive ? 'QUOTA_EXCEEDED' : null;
+
+    if (apiKey && rawNotes.trim().length > 15 && !isCooldownActive) {
+      const targetLang = LANGUAGE_NAMES[language] || { nameEn: 'Portuguese', nameNative: 'Português' };
+      const pendingText = getPendingConfirmationText(language);
 
       const systemInstruction = `You are an elite, Cambridge/CELTA-certified Pedagogical English Language Synthesizer and Master Native Friend Teacher.
 Your mission is to transform raw in-session teacher notes into an ultra-structured, masterclass pedagogical report for the student.
 The student MUST NEVER see raw, fragmented notes. Instead, they receive a polished, elegant learning guide calibrated to their CEFR level (${cefr}).
 
+LANGUAGE REQUIREMENT (CRITICAL):
+- The student's chosen study and native interface language is ${targetLang.nameEn} (${targetLang.nameNative}, code: "${language}").
+- All pedagogical explanations, grammar rules, vocabulary definitions, common pitfalls, comparisons, CEFR adaptation advice, rememberThis takeaway, and review summaries MUST be written in ${targetLang.nameEn} (${targetLang.nameNative}).
+- The target English words, phrasal verbs, collocations, and didactic examples themselves MUST remain in natural, authentic English.
+- Didactic Examples: Any examples created by the AI must be clearly didactic learning examples (e.g. "Didactic Example: ..."), NEVER presented as real student utterances or claimed to be spoken by the student.
+
 CRITICAL FIDELITY MANDATE (ZERO HALLUCINATION / ZERO INVENTED EXAMPLES):
 1. Analyze Mistakes (mistakesAnalysis):
    - ONLY include real mistakes marked by the teacher in the notes.
-   - If the teacher did not inform the correction (e.g., student said a word/phrase marked with incorrect, but no correction was provided), DO NOT invent or guess the correction. Set "corrected": "Pendente de confirmação com o professor" and set "isPendingConfirmation": true.
+   - If the teacher did not inform the correction (e.g., student said a word/phrase marked with incorrect, but no correction was provided), DO NOT invent or guess the correction. Set "corrected": "${pendingText}", set "isPendingConfirmation": true, and set "twoExamples": [].
    - NEVER insert mocked or unrelated examples (such as "I have 28 years old" or "It depends of the weather") when they do not appear in the teacher notes.
    - If no mistakes were marked in the notes, return an empty array [] for mistakesAnalysis.
 2. Grammar Points (grammarPoints):
@@ -8011,7 +8345,7 @@ CRITICAL FIDELITY MANDATE (ZERO HALLUCINATION / ZERO INVENTED EXAMPLES):
    - Work EXCLUSIVELY with terms marked by the teacher as Alt+W (new-word) or Alt+P (pronounce).
    - If no terms were stamped with new-word or pronounce, return an empty array [] for vocabularyAndExpressions. NEVER insert mocked words like "catch up" or "workload".
 4. Quick Review (reviewSummary):
-   - Accurately summarize ONLY the real information from the other categories.
+   - Accurately summarize ONLY the real information from the other categories in ${targetLang.nameEn}.
 
 You MUST produce a JSON object strictly conforming to this schema:
 {
@@ -8019,24 +8353,24 @@ You MUST produce a JSON object strictly conforming to this schema:
     {
       "id": "mistake-1",
       "original": "Student's original faulty utterance",
-      "corrected": "Polished correction or 'Pendente de confirmação com o professor'",
+      "corrected": "Polished correction or '${pendingText}'",
       "category": "grammar" | "vocabulary" | "collocation" | "preposition" | "pronunciation" | "phrasing",
-      "explanation": "Clear explanation calibrated to CEFR ${cefr}",
-      "twoExamples": ["Example 1", "Example 2"],
-      "commonPitfalls": "Common mistake learners make with this structure",
+      "explanation": "Clear explanation in ${targetLang.nameEn} calibrated to CEFR ${cefr}",
+      "twoExamples": ["Didactic example 1", "Didactic example 2"],
+      "commonPitfalls": "Common mistake learners make with this structure in ${targetLang.nameEn}",
       "isPendingConfirmation": false
     }
   ],
   "grammarPoints": [
     {
       "id": "grammar-1",
-      "topic": "Grammar topic name",
-      "rule": "Detailed rule explanation adapted to CEFR ${cefr}",
+      "topic": "Grammar topic name in ${targetLang.nameEn}",
+      "rule": "Detailed rule explanation in ${targetLang.nameEn} adapted to CEFR ${cefr}",
       "form": "Formula / Syntax breakdown",
-      "usage": "When and why native speakers use this",
-      "examples": ["Example 1", "Example 2"],
-      "commonMistakes": "Mistake to avoid",
-      "comparisons": "Contrast with other structures"
+      "usage": "When and why native speakers use this in ${targetLang.nameEn}",
+      "examples": ["Didactic example 1", "Didactic example 2"],
+      "commonMistakes": "Mistake to avoid in ${targetLang.nameEn}",
+      "comparisons": "Contrast with other structures in ${targetLang.nameEn}"
     }
   ],
   "vocabularyAndExpressions": [
@@ -8044,9 +8378,9 @@ You MUST produce a JSON object strictly conforming to this schema:
       "id": "vocab-1",
       "term": "Word, phrasal verb, or pronunciation term",
       "partOfSpeech": "Part of speech (e.g. Phrasal Verb, Noun, Pronunciation Focus)",
-      "simpleDefinition": "Clear, accessible definition adapted to CEFR ${cefr}",
+      "simpleDefinition": "Clear, accessible definition in ${targetLang.nameEn} adapted to CEFR ${cefr}",
       "collocations": ["Collocation 1", "Collocation 2"],
-      "realExamples": ["Real-world sentence 1", "Real-world sentence 2"],
+      "realExamples": ["Real-world didactic sentence 1", "Real-world didactic sentence 2"],
       "synonyms": ["Synonym 1", "Synonym 2"],
       "register": "informal" | "neutral" | "formal" | "idiomatic",
       "category": "Thematic category or 'Pronunciation & Phonetics (Alt+P)' / 'New Words & Expressions (Alt+W)'",
@@ -8056,260 +8390,338 @@ You MUST produce a JSON object strictly conforming to this schema:
   ],
   "reviewSummary": {
     "estimatedMinutes": "5–10 minutes",
-    "keyRules": ["Key grammar rules covered"],
-    "mustKnowVocabulary": ["Vocabulary and pronunciation items with definitions"],
+    "keyRules": ["Key grammar rules covered in ${targetLang.nameEn}"],
+    "mustKnowVocabulary": ["Vocabulary and pronunciation items with definitions in ${targetLang.nameEn}"],
     "essentialCorrections": [{"original": "...", "corrected": "..."}],
-    "rememberThis": "Memorable takeaway focused on the session items"
+    "rememberThis": "Memorable takeaway focused on the session items in ${targetLang.nameEn}"
   }
 }
 
 Return JSON only without Markdown backticks.`;
 
-      const prompt = `Student Information:
-- Student UID: ${studentUid || 'student'}
+      // Security Hotfix (Etapa 2): Privacy enforcement — studentUid and email REMOVED from prompt.
+      // Untrusted raw notes are cleanly delimited and passed.
+      const prompt = `Pedagogical Parameters:
 - CEFR Level: ${cefr}
 - Lesson Date: ${sessionDate}
 - Session Topic: ${topic}
-- Native Friend: ${teacherName}
+- Native Friend Teacher: ${teacherName}
+- Target Language: ${targetLang.nameEn} (${targetLang.nameNative})
 
 Raw In-Session Notes to transform:
 """
 ${rawNotes}
 """
 
-Please synthesize and transform these notes strictly adhering to the real markings without inventing errors or vocabulary.`;
+Please synthesize and transform these notes strictly adhering to the real markings without inventing errors or vocabulary, writing explanations in ${targetLang.nameEn}.`;
 
-      const candidateModels = ['gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
+      // Security Hotfix (Etapa 2): Single attempt with gemini-2.5-flash, zero cascade, exact token bounds
+      const singleAttempt = await executeGeminiSingleAttempt({
+        feature: 'pedagogical_transform',
+        systemInstruction,
+        untrustedUserDataPrompt: prompt,
+        callerRole: caller.role,
+        apiKey,
+        temperature: 0.35,
+      });
 
-      for (const model of candidateModels) {
-        try {
-          const response = await Promise.race([
-            ai.models.generateContent({
-              model,
-              contents: prompt,
-              config: {
-                systemInstruction,
-                responseMimeType: 'application/json',
-                temperature: 0.4,
-              },
-            }),
-            new Promise<never>((_, reject) =>
-              setTimeout(() => reject(new Error('TIMEOUT')), 16000)
-            ),
+      if (singleAttempt?.parsedJson) {
+        const parsed = singleAttempt.parsedJson;
+
+        if (parsed && Array.isArray(parsed.mistakesAnalysis)) {
+          // Strict validation against markings
+          const rawErrMap = new Map<string, typeof markings.errors[0]>();
+          markings.errors.forEach((e) => rawErrMap.set(e.original.toLowerCase().trim(), e));
+
+          const validatedMistakes: any[] = [];
+          (parsed.mistakesAnalysis || []).forEach((m: any) => {
+            const origKey = String(m?.original || '').toLowerCase().trim();
+            const rawErr = rawErrMap.get(origKey);
+            if (rawErr) {
+              const isUnconfirmed = rawErr.isPendingConfirmation || !rawErr.corrected;
+              validatedMistakes.push({
+                id: `mistake-${validatedMistakes.length + 1}`,
+                original: rawErr.original,
+                corrected: isUnconfirmed ? pendingText : (rawErr.corrected || m.corrected),
+                category: m.category || 'grammar',
+                explanation: isUnconfirmed
+                  ? getUnconfirmedExplanationText(rawErr.original, language)
+                  : (m.explanation || `In natural spoken English, phrasing this structure as "${m.corrected || rawErr.corrected}" is the native formulation.`),
+                twoExamples: isUnconfirmed ? [] : (Array.isArray(m.twoExamples) ? m.twoExamples : []),
+                commonPitfalls: isUnconfirmed ? getPendingPitfallsText(language) : (m.commonPitfalls || ''),
+                isPendingConfirmation: isUnconfirmed,
+              });
+              rawErrMap.delete(origKey);
+            }
+          });
+
+          // Any raw error that the model missed
+          rawErrMap.forEach((rawErr) => {
+            const isUnconfirmed = rawErr.isPendingConfirmation || !rawErr.corrected;
+            validatedMistakes.push({
+              id: `mistake-${validatedMistakes.length + 1}`,
+              original: rawErr.original,
+              corrected: isUnconfirmed ? pendingText : rawErr.corrected,
+              category: 'vocabulary',
+              explanation: isUnconfirmed
+                ? getUnconfirmedExplanationText(rawErr.original, language)
+                : `In natural spoken English, phrasing this structure as "${rawErr.corrected}" is the native formulation.`,
+              twoExamples: isUnconfirmed ? [] : [`Didactic Example: "${rawErr.corrected}".`],
+              commonPitfalls: isUnconfirmed ? getPendingPitfallsText(language) : '',
+              isPendingConfirmation: isUnconfirmed,
+            });
+          });
+
+          // Strict validation of vocabulary: terms MUST be in markings.newWords or markings.pronounceItems
+          const validTermsSet = new Set<string>([
+            ...markings.newWords.map((w) => w.toLowerCase().trim()),
+            ...markings.pronounceItems.map((p) => p.toLowerCase().trim()),
           ]);
 
-          if (response && response.text) {
-            const cleanText = response.text.trim().replace(/^```json/i, '').replace(/```$/i, '').trim();
-            const parsed = JSON.parse(cleanText);
-
-            if (parsed && Array.isArray(parsed.mistakesAnalysis)) {
-              // Strict validation against markings
-              const rawErrMap = new Map<string, typeof markings.errors[0]>();
-              markings.errors.forEach((e) => rawErrMap.set(e.original.toLowerCase().trim(), e));
-
-              const validatedMistakes: any[] = [];
-              (parsed.mistakesAnalysis || []).forEach((m: any) => {
-                const origKey = String(m?.original || '').toLowerCase().trim();
-                const rawErr = rawErrMap.get(origKey);
-                if (rawErr) {
-                  const isUnconfirmed = rawErr.isPendingConfirmation || !rawErr.corrected;
-                  validatedMistakes.push({
-                    id: `mistake-${validatedMistakes.length + 1}`,
-                    original: rawErr.original,
-                    corrected: isUnconfirmed ? 'Pendente de confirmação com o professor' : (rawErr.corrected || m.corrected),
-                    category: m.category || 'grammar',
-                    explanation: isUnconfirmed
-                      ? `A forma corrigida para "${rawErr.original}" não foi informada na aula. Confirme com seu Native Friend na próxima sessão para validar o contexto exato.`
-                      : (m.explanation || `In natural spoken English, phrasing this structure as "${m.corrected || rawErr.corrected}" is the native formulation.`),
-                    twoExamples: isUnconfirmed ? [] : (Array.isArray(m.twoExamples) ? m.twoExamples : []),
-                    commonPitfalls: isUnconfirmed ? 'Aguardando confirmação do professor sobre o contexto específico de uso.' : (m.commonPitfalls || ''),
-                    isPendingConfirmation: isUnconfirmed,
-                  });
-                  rawErrMap.delete(origKey);
-                }
+          const validatedVocab: any[] = [];
+          (parsed.vocabularyAndExpressions || []).forEach((v: any) => {
+            const termKey = String(v?.term || '').toLowerCase().trim();
+            if (validTermsSet.has(termKey)) {
+              const isPronounce = markings.pronounceItems.some((p) => p.toLowerCase().trim() === termKey);
+              validatedVocab.push({
+                ...v,
+                id: `vocab-${validatedVocab.length + 1}`,
+                isPronunciationFocus: isPronounce,
               });
+              validTermsSet.delete(termKey);
+            }
+          });
 
-              // Any raw error that the model missed
-              rawErrMap.forEach((rawErr) => {
-                const isUnconfirmed = rawErr.isPendingConfirmation || !rawErr.corrected;
-                validatedMistakes.push({
-                  id: `mistake-${validatedMistakes.length + 1}`,
-                  original: rawErr.original,
-                  corrected: isUnconfirmed ? 'Pendente de confirmação com o professor' : rawErr.corrected,
-                  category: 'vocabulary',
-                  explanation: isUnconfirmed
-                    ? `A forma corrigida para "${rawErr.original}" não foi informada na aula. Confirme com seu Native Friend na próxima sessão para validar o contexto exato.`
-                    : `In natural spoken English, phrasing this structure as "${rawErr.corrected}" is the native formulation.`,
-                  twoExamples: isUnconfirmed ? [] : [`In everyday conversation: "${rawErr.corrected}".`],
-                  commonPitfalls: isUnconfirmed ? 'Aguardando confirmação do professor sobre o contexto específico de uso.' : '',
-                  isPendingConfirmation: isUnconfirmed,
-                });
-              });
+          validTermsSet.forEach((missedKey) => {
+            const isPronounce = markings.pronounceItems.some((p) => p.toLowerCase().trim() === missedKey);
+            const originalTerm =
+              markings.pronounceItems.find((p) => p.toLowerCase().trim() === missedKey) ||
+              markings.newWords.find((w) => w.toLowerCase().trim() === missedKey) ||
+              missedKey;
+            validatedVocab.push({
+              id: `vocab-${validatedVocab.length + 1}`,
+              term: originalTerm,
+              partOfSpeech: isPronounce ? 'Pronunciation Focus' : 'Vocabulary Item',
+              simpleDefinition: isPronounce
+                ? `Pronunciation focus: Pay careful attention to syllable stress on "${originalTerm}".`
+                : `Key communicative expression (${cefr}): used in conversation to communicate "${originalTerm}" clearly and naturally.`,
+              collocations: [`use "${originalTerm}" naturally`],
+              realExamples: [`Didactic Example: "Practicing with '${originalTerm}' builds speaking confidence."`],
+              synonyms: ['target phrase'],
+              register: 'neutral',
+              category: isPronounce ? 'Pronunciation & Phonetics (Alt+P)' : 'New Words & Expressions (Alt+W)',
+              phoneticGuide: isPronounce ? `🎯 Pronunciation focus: practice clean syllable stress on "${originalTerm}".` : undefined,
+              isPronunciationFocus: isPronounce,
+            });
+          });
 
-              // Strict validation of vocabulary: terms MUST be in markings.newWords or markings.pronounceItems
-              const validTermsSet = new Set<string>([
-                ...markings.newWords.map((w) => w.toLowerCase().trim()),
-                ...markings.pronounceItems.map((p) => p.toLowerCase().trim()),
-              ]);
+          // Strict validation of grammar: if no mistakes, grammar must be empty []
+          let validatedGrammar: any[] = [];
+          if (validatedMistakes.length > 0) {
+            validatedGrammar = Array.isArray(parsed.grammarPoints) ? parsed.grammarPoints : [];
+          }
 
-              const validatedVocab: any[] = [];
-              (parsed.vocabularyAndExpressions || []).forEach((v: any) => {
-                const termKey = String(v?.term || '').toLowerCase().trim();
-                if (validTermsSet.has(termKey)) {
-                  const isPronounce = markings.pronounceItems.some((p) => p.toLowerCase().trim() === termKey);
-                  validatedVocab.push({
-                    ...v,
-                    id: `vocab-${validatedVocab.length + 1}`,
-                    isPronunciationFocus: isPronounce,
-                  });
-                  validTermsSet.delete(termKey);
-                }
-              });
+          const allCorrections = validatedMistakes.map((m: any) => ({
+            original: m.original,
+            corrected: m.corrected,
+            explanation: m.explanation,
+          }));
 
-              validTermsSet.forEach((missedKey) => {
-                const isPronounce = markings.pronounceItems.some((p) => p.toLowerCase().trim() === missedKey);
-                const originalTerm =
-                  markings.pronounceItems.find((p) => p.toLowerCase().trim() === missedKey) ||
-                  markings.newWords.find((w) => w.toLowerCase().trim() === missedKey) ||
-                  missedKey;
-                validatedVocab.push({
-                  id: `vocab-${validatedVocab.length + 1}`,
-                  term: originalTerm,
-                  partOfSpeech: isPronounce ? 'Pronunciation Focus' : 'Vocabulary Item',
-                  simpleDefinition: isPronounce
-                    ? `Pronunciation focus: Pay careful attention to syllable stress, vowel reduction, and clear articulation of "${originalTerm}".`
-                    : `Key communicative expression (${cefr}): used in conversation to communicate "${originalTerm}" clearly and naturally.`,
-                  collocations: [`use "${originalTerm}" naturally`],
-                  realExamples: [`In conversation: "I practiced using '${originalTerm}' today."`],
-                  synonyms: ['target phrase'],
-                  register: 'neutral',
-                  category: isPronounce ? 'Pronunciation & Phonetics (Alt+P)' : 'New Words & Expressions (Alt+W)',
-                  phoneticGuide: isPronounce ? `🎯 Pronunciation focus: practice clean syllable stress on "${originalTerm}".` : undefined,
-                  isPronunciationFocus: isPronounce,
-                });
-              });
+          const allVocab = validatedVocab.map((v: any) => {
+            const tag = v.isPronunciationFocus ? '🎯 [Pronounce]' : '✨';
+            return `${tag} ${v.term} (${v.partOfSpeech || 'Vocab'}) — ${v.simpleDefinition || ''}`;
+          });
 
-              // Strict validation of grammar: if no mistakes, grammar must be empty []
-              let validatedGrammar: any[] = [];
-              if (validatedMistakes.length > 0) {
-                validatedGrammar = Array.isArray(parsed.grammarPoints) ? parsed.grammarPoints : [];
-              }
+          const allRules = validatedGrammar.map((g: any) => `${g.topic}: ${g.rule}`);
 
-              const allCorrections = validatedMistakes.map((m: any) => ({
-                original: m.original,
-                corrected: m.corrected,
-                explanation: m.explanation,
-              }));
+          let rememberThis =
+            typeof parsed?.reviewSummary?.rememberThis === 'string' && parsed.reviewSummary.rememberThis.trim().length > 10
+              ? parsed.reviewSummary.rememberThis.trim()
+              : '';
 
-              const allVocab = validatedVocab.map((v: any) => {
-                const tag = v.isPronunciationFocus ? '🎯 [Pronounce]' : '✨';
-                return `${tag} ${v.term} (${v.partOfSpeech || 'Vocab'}) — ${v.simpleDefinition || ''}`;
-              });
-
-              const allRules = validatedGrammar.map((g: any) => `${g.topic}: ${g.rule}`);
-
-              let rememberThis = 'Remember this: Fluency is not about never making mistakes; it is about recognizing patterns quickly and adopting natural native phraseology!';
-              if (validatedMistakes.length > 0) {
-                rememberThis = validatedMistakes[0].isPendingConfirmation
-                  ? `Lembre-se disto: Revise a expressão "${validatedMistakes[0].original}" com seu Native Friend para confirmar a formulação exata!`
-                  : `Remember this: Instead of saying "${validatedMistakes[0].original}", always say "${validatedMistakes[0].corrected}"! Consistent small shifts in your active vocabulary build unstoppable speaking confidence.`;
-              } else if (validatedVocab.length > 0) {
-                rememberThis = `Remember this: Active practice with your new expressions (${validatedVocab.map((v: any) => v.term).slice(0, 3).join(', ')}) turns passive recognition into spontaneous conversational confidence!`;
-              }
-
-              const transformation = {
-                lessonId: lessonId || undefined,
-                sessionKey: canonicalSessionKey,
-                sessionDate,
-                topic,
-                teacherName,
-                studentUid,
-                studentEmail: cleanEmail,
-                studentLevel: String(studentLevel),
-                cefrLevel: cefr,
-                contentHash,
-                mistakesAnalysis: validatedMistakes,
-                grammarPoints: validatedGrammar,
-                vocabularyAndExpressions: validatedVocab,
-                levelAdaptation: parsed.levelAdaptation || {
-                  cefrLevel: cefr,
-                  levelLabel: cefr === 'C1' ? 'Advanced' : cefr === 'B1' ? 'Intermediate' : 'Elementary',
-                  nativeInterferenceNotes: 'Focus on native collocations and avoiding Portuguese literal calques.',
-                  complexityAdjustmentAdvice: 'Review key corrections out loud before each session.',
-                  targetedPracticePrompt: `Practice summarizing your views on "${topic}".`,
-                },
-                reviewSummary: {
-                  estimatedMinutes: '5–10 minutes',
-                  keyRules: allRules,
-                  mustKnowVocabulary: allVocab,
-                  essentialCorrections: allCorrections,
-                  rememberThis,
-                },
-                rawNotesSnippet: markings.cleanText.slice(0, 300),
-                correctStampsCount: correctCount,
-                incorrectStampsCount: incorrectCount,
-                newWordStampsCount: newWordCount,
-                pronounceStampsCount: pronounceCount,
-                generatedAt: new Date().toISOString(),
-              };
-
-              db.pedagogicalTransformationsMap[canonicalSessionKey] = transformation;
-              syncTransformationVocabToDictionary(transformation, studentUid, cleanEmail);
-              await writeDbSync(db);
-
-              return res.json({
-                success: true,
-                cached: false,
-                transformation,
-              });
+          if (!rememberThis) {
+            if (validatedMistakes.length > 0) {
+              rememberThis = validatedMistakes[0].isPendingConfirmation
+                ? (language === 'pt'
+                    ? `Lembre-se disto: Revise a expressão "${validatedMistakes[0].original}" com seu Native Friend para confirmar a formulação exata!`
+                    : `Remember this: Review "${validatedMistakes[0].original}" with your Native Friend to confirm the exact formulation!`)
+                : (language === 'pt'
+                    ? `Lembre-se disto: Em vez de dizer "${validatedMistakes[0].original}", use "${validatedMistakes[0].corrected}"!`
+                    : `Remember this: Instead of saying "${validatedMistakes[0].original}", say "${validatedMistakes[0].corrected}"!`);
+            } else if (validatedVocab.length > 0) {
+              const termNames = validatedVocab.map((v: any) => v.term).slice(0, 3).join(', ');
+              rememberThis =
+                language === 'pt'
+                  ? `Lembre-se disto: A prática ativa das novas expressões (${termNames}) transforma o reconhecimento passivo em confiança espontânea!`
+                  : `Remember this: Active practice with your new expressions (${termNames}) turns passive recognition into spontaneous conversational confidence!`;
+            } else {
+              rememberThis =
+                language === 'pt'
+                  ? 'Lembre-se: Fluência não significa nunca errar, mas reconhecer padrões rapidamente e adotar a fraseologia nativa!'
+                  : 'Remember: Fluency is not about never making mistakes; it is about recognizing patterns quickly and adopting natural native phraseology!';
             }
           }
-        } catch (mErr: any) {
-          console.warn('Pedagogical Gemini model notice: [AI_UNAVAILABLE] ' + (mErr?.name || 'MODEL_FAILURE'));
+
+          const transformation = {
+            lessonId: lessonId || undefined,
+            sessionKey: canonicalSessionKey,
+            sessionDate,
+            topic,
+            teacherName,
+            studentUid,
+            studentEmail: cleanEmail,
+            studentLevel: String(authoritativeLevel),
+            cefrLevel: cefr,
+            contentHash,
+            language,
+            promptVersion: PEDAGOGICAL_PROMPT_VERSION,
+            isAiGenerated: true,
+            isFallback: false,
+            isProvisional: false,
+            source: 'gemini' as const,
+            modelUsed: GEMINI_FIXED_MODEL,
+            mistakesAnalysis: validatedMistakes,
+            grammarPoints: validatedGrammar,
+            vocabularyAndExpressions: validatedVocab,
+            levelAdaptation: parsed.levelAdaptation || {
+              cefrLevel: cefr,
+              levelLabel: cefrMeta.labelEn,
+              nativeInterferenceNotes: 'Focus on native collocations and avoiding literal calques.',
+              complexityAdjustmentAdvice: 'Review key corrections out loud before each session.',
+              targetedPracticePrompt: `Practice summarizing your views on "${topic}".`,
+            },
+            reviewSummary: {
+              estimatedMinutes: '5–10 minutes',
+              keyRules: allRules,
+              mustKnowVocabulary: allVocab,
+              essentialCorrections: allCorrections,
+              rememberThis,
+            },
+            rawNotesSnippet: markings.cleanText.slice(0, 300),
+            correctStampsCount: correctCount,
+            incorrectStampsCount: incorrectCount,
+            newWordStampsCount: newWordCount,
+            pronounceStampsCount: pronounceCount,
+            generatedAt: new Date().toISOString(),
+          };
+
+          db.pedagogicalTransformationsMap[compositeCacheKey] = transformation;
+          if (language === 'pt') {
+            db.pedagogicalTransformationsMap[canonicalSessionKey] = transformation;
+          }
+          syncTransformationVocabToDictionary(transformation, studentUid, cleanEmail);
+          await writeDbSync(db);
+
+          return res.json({
+            success: true,
+            cached: false,
+            transformation,
+          });
         }
       }
-    } catch (apiErr: any) {
-      console.warn('Gemini API call notice: [AI_UNAVAILABLE] ' + (apiErr?.name || 'API_FAILURE'));
     }
+
+    // Graceful deterministic fallback strictly faithful to notes — clearly identified as provisional
+    const fallbackTransformation = generateServerPedagogicalFallback({
+      rawNotes,
+      topic,
+      sessionDate,
+      teacherName,
+      studentLevel: authoritativeLevel,
+      studentUid,
+      studentEmail: cleanEmail,
+      lessonId,
+      sessionKey: canonicalSessionKey,
+      language,
+    });
+
+    fallbackTransformation.isAiGenerated = false;
+    fallbackTransformation.isFallback = true;
+    fallbackTransformation.isProvisional = true;
+    fallbackTransformation.source = 'fallback';
+    fallbackTransformation.fallbackReason = lastFailureCategory || (isCooldownActive ? 'QUOTA_EXCEEDED' : 'AI_UNAVAILABLE');
+    fallbackTransformation.aiNotice = getAiUnavailableNoticeText(language);
+    if (isCooldownActive || lastFailureCategory === 'QUOTA_EXCEEDED') {
+      fallbackTransformation.cooldownSecondsRemaining = Math.max(1, Math.ceil((geminiQuotaCooldownUntil - Date.now()) / 1000));
+    }
+
+    // Store provisional fallback under composite key
+    db.pedagogicalTransformationsMap[compositeCacheKey] = fallbackTransformation;
+    if (language === 'pt') {
+      db.pedagogicalTransformationsMap[canonicalSessionKey] = fallbackTransformation;
+    }
+    syncTransformationVocabToDictionary(fallbackTransformation, studentUid, cleanEmail);
+    await writeDbSync(db);
+
+    res.json({
+      success: true,
+      cached: false,
+      transformation: fallbackTransformation,
+    });
+  } finally {
+    await flightLock.release();
   }
-
-  // Graceful deterministic fallback strictly faithful to notes
-  const transformation = generateServerPedagogicalFallback({
-    rawNotes,
-    topic,
-    sessionDate,
-    teacherName,
-    studentLevel,
-    studentUid,
-    studentEmail: cleanEmail,
-    lessonId,
-    sessionKey: canonicalSessionKey,
-  });
-
-  db.pedagogicalTransformationsMap[canonicalSessionKey] = transformation;
-  syncTransformationVocabToDictionary(transformation, studentUid, cleanEmail);
-  await writeDbSync(db);
-
-  res.json({
-    success: true,
-    cached: false,
-    transformation,
-  });
 });
 
 // Retrieve cached pedagogical transformation
-app.get('/api/pedagogical-notes', async (req, res) => {
+app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
   const db = readDb();
   const sessionKey = (req.query.sessionKey as string) || (req.query.id as string) || '';
   const studentUid = (req.query.studentUid as string) || '';
+  const language = ((req.query.language as string) || (req.query.lang as string) || '').toLowerCase().trim();
 
-  if (sessionKey && db.pedagogicalTransformationsMap?.[sessionKey]) {
-    return res.json(db.pedagogicalTransformationsMap[sessionKey]);
+  const caller = req.user!;
+  if (caller.role === 'student') {
+    if (studentUid && caller.uid !== studentUid) {
+      return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to student notes.' });
+    }
+  }
+
+  if (sessionKey) {
+    let transformation: any = null;
+    if (language) {
+      const match = Object.entries(db.pedagogicalTransformationsMap || {}).find(([k, v]: [string, any]) => {
+        return (k === sessionKey || k.startsWith(`${sessionKey}__`)) && v.language === language;
+      });
+      if (match) transformation = match[1];
+    }
+    if (!transformation && db.pedagogicalTransformationsMap?.[sessionKey]) {
+      transformation = db.pedagogicalTransformationsMap[sessionKey];
+    }
+    if (!transformation) {
+      const found = Object.entries(db.pedagogicalTransformationsMap || {}).find(([k]: [string, any]) =>
+        k === sessionKey || k.startsWith(`${sessionKey}__`)
+      );
+      if (found) transformation = found[1];
+    }
+
+    if (transformation) {
+      if (caller.role === 'student') {
+        const callerEmail = (caller.email || '').toLowerCase().trim();
+        const tEmail = (transformation.studentEmail || '').toLowerCase().trim();
+        const tUid = transformation.studentUid || '';
+        if ((tUid && tUid !== caller.uid) || (tEmail && tEmail !== callerEmail)) {
+          return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to student notes.' });
+        }
+      }
+      return res.json(transformation);
+    }
+  }
+
+  if (caller.role === 'student') {
+    const callerEmail = (caller.email || '').toLowerCase().trim();
+    const list = Object.values(db.pedagogicalTransformationsMap || {}).filter(
+      (t: any) =>
+        ((t.studentUid && t.studentUid === caller.uid) ||
+         (t.studentEmail && (t.studentEmail || '').toLowerCase().trim() === callerEmail)) &&
+        (!language || t.language === language)
+    );
+    return res.json(list);
   }
 
   if (studentUid) {
     const list = Object.values(db.pedagogicalTransformationsMap || {}).filter(
-      (t: any) => t.studentUid === studentUid
+      (t: any) => t.studentUid === studentUid && (!language || t.language === language)
     );
     return res.json(list);
   }
@@ -11735,66 +12147,20 @@ app.post(['/api/homework', '/api/homework/submit'], firebaseAuthMiddleware, asyn
   });
 });
 
-// Safe Gemini generation runner with timeout and multi-model fallback (no uncaught errors or stderr stack traces)
-async function callGeminiSafeJson(prompt: string, timeoutMs: number = 5000): Promise<any | null> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return null;
-
-  const candidateModels = [
-    'gemini-3.6-flash',
-    'gemini-3.1-flash-lite',
-    'gemini-3.5-flash-lite',
-    GEMINI_TEXT_MODEL,
-  ];
-  const modelsToTry = Array.from(new Set(candidateModels.filter(Boolean)));
-
-  const ai = new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
+// Safe Gemini generation runner strictly using gemini-2.5-flash with single attempt and zero cascade
+async function callGeminiSafeJson(
+  prompt: string,
+  timeoutMs: number = 6000,
+  feature: GeminiFeature = 'check_writing',
+  callerRole: string = 'student'
+): Promise<any | null> {
+  const result = await executeGeminiSingleAttempt({
+    feature,
+    systemInstruction: 'You are an expert English language evaluation engine. Provide rigorous, helpful, and accurate feedback strictly in valid JSON format.',
+    untrustedUserDataPrompt: prompt,
+    callerRole,
   });
-
-  for (const model of modelsToTry) {
-    let timerId: any = null;
-    try {
-      const config: any = {
-        responseMimeType: 'application/json',
-      };
-      if (model.includes('gemini-3.6') || model.includes('gemini-3.1')) {
-        config.thinkingConfig = { thinkingBudget: 0 };
-      }
-
-      const generatePromise = ai.models.generateContent({
-        model,
-        contents: prompt,
-        config,
-      });
-
-      const timeoutPromise = new Promise((_, reject) => {
-        timerId = setTimeout(() => reject(new Error(`Timeout after ${timeoutMs}ms on ${model}`)), timeoutMs);
-      });
-
-      const response: any = await Promise.race([generatePromise, timeoutPromise]);
-      if (timerId) {
-        clearTimeout(timerId);
-        timerId = null;
-      }
-
-      if (response && response.text) {
-        const parsed = extractCleanJson(response.text);
-        if (parsed && typeof parsed === 'object') return parsed;
-      }
-    } catch {
-      // If a candidate model times out or encounters a 503 spike, immediately advance to the next candidate
-    } finally {
-      if (timerId) clearTimeout(timerId);
-    }
-  }
-
-  return null;
+  return result?.parsedJson || null;
 }
 
 // Helper to normalize and calibrate English proficiency levels
@@ -11982,7 +12348,7 @@ Output format must be a strict JSON object:
 }`;
 
   const userPrompt = `Generate a 100% INÉDITA mini-story and 2-3 coherent comprehension questions for:
-Student: "${protagonist}"
+Protagonist: "Alex"
 Proficiency Level: ${levelMeta.labelEn} (${levelMeta.labelPt} - CEFR ${levelMeta.cefr})
 Target Words of the Day to weave in organically with **word**:
 ${words.map((w, i) => `${i + 1}. "${w}"`).join('\n')}
@@ -11993,70 +12359,44 @@ MANDATORY RULES:
 3. All questions must test factual events, decisions, and turning points in this narrative.
 Return strict JSON only.`;
 
-  const ai = new GoogleGenAI({
+  // Security Hotfix (Etapa 2): Single attempt with gemini-2.5-flash, exact token bounds, zero cascades
+  const singleAttempt = await executeGeminiSingleAttempt({
+    feature: 'homework_part4',
+    systemInstruction,
+    untrustedUserDataPrompt: userPrompt,
+    callerRole: 'student',
     apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
+    temperature: 0.7,
   });
 
-  const candidateModels = [
-    'gemini-3.8-flash',
-    'gemini-3.1-flash-lite',
-    'gemini-flash-latest',
-  ];
-
-  for (const model of candidateModels) {
-    try {
-      const response = await Promise.race([
-        ai.models.generateContent({
-          model,
-          contents: userPrompt,
-          config: {
-            systemInstruction,
-            responseMimeType: 'application/json',
-            temperature: 0.85,
-          },
-        }),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(`Timeout model ${model}`)), 18000)
-        ),
-      ]);
-
-      if (response && response.text) {
-        const parsed = extractCleanJson(response.text);
-        if (
-          parsed &&
-          parsed.title &&
-          parsed.text &&
-          !isBadStoryText(parsed.text) &&
-          Array.isArray(parsed.questions) &&
-          parsed.questions.length > 0
-        ) {
-          parsed.questions = parsed.questions.map((q: any, idx: number) => {
-            let corrIdx = 0;
-            if (typeof q.correctAnswer === 'number' && q.correctAnswer >= 0 && q.correctAnswer < 4) {
-              corrIdx = q.correctAnswer;
-            } else if (typeof q.correctAnswer === 'string' && Array.isArray(q.options)) {
-              const foundIdx = q.options.findIndex(
-                (opt: string) => opt.toLowerCase().trim() === q.correctAnswer.toLowerCase().trim()
-              );
-              corrIdx = foundIdx >= 0 ? foundIdx : 0;
-            }
-            return {
-              ...q,
-              id: q.id || `q-${idx + 1}`,
-              correctAnswer: corrIdx,
-            };
-          });
-
-          return parsed;
+  if (singleAttempt?.parsedJson) {
+    const parsed = singleAttempt.parsedJson;
+    if (
+      parsed &&
+      parsed.title &&
+      parsed.text &&
+      !isBadStoryText(parsed.text) &&
+      Array.isArray(parsed.questions) &&
+      parsed.questions.length > 0
+    ) {
+      parsed.questions = parsed.questions.map((q: any, idx: number) => {
+        let corrIdx = 0;
+        if (typeof q.correctAnswer === 'number' && q.correctAnswer >= 0 && q.correctAnswer < 4) {
+          corrIdx = q.correctAnswer;
+        } else if (typeof q.correctAnswer === 'string' && Array.isArray(q.options)) {
+          const foundIdx = q.options.findIndex(
+            (opt: string) => opt.toLowerCase().trim() === q.correctAnswer.toLowerCase().trim()
+          );
+          corrIdx = foundIdx >= 0 ? foundIdx : 0;
         }
-      }
-    } catch {
-      // Continue to next candidate model
+        return {
+          ...q,
+          id: q.id || `q-${idx + 1}`,
+          correctAnswer: corrIdx,
+        };
+      });
+
+      return parsed;
     }
   }
 
@@ -12083,7 +12423,6 @@ async function generateDirectMemorizationAi(
   }
 
   const levelMeta = normalizeStudentLevel(studentLevel);
-  const protagonist = (studentName && studentName !== 'Student' ? studentName.split(' ')[0] : 'Regina').trim();
 
   const systemInstruction = `You are a world-class English Language Teaching (ELT) Instructional Designer and Expert Native English Teacher for "It's Simple - Learn English by Living Your Life".
 Your mission is to generate 100% authentic, personalized, native, and engaging educational content for the 4-part "Weekly Memorization Activity", strictly and exclusively utilizing the student's active target vocabulary words assigned for today's session:
@@ -12117,19 +12456,19 @@ STRICT SYSTEM PROMPT CONSTRAINTS & RULES (ENFORCED 100%):
      * Provide an insightful clue in English ("hintEn") and Portuguese ("hintPt") highlighting the context clue.
      * Provide an explanation in English ("explanationEn") and Portuguese ("explanationPt") explaining why that word is the correct choice.
    - Part 3 (Sentence Writing):
-     * Provide a personalized, engaging prompt that challenges ${protagonist} to apply each target word to their personal goals, career, or daily routine.
+     * Provide an engaging prompt challenging the learner to apply each target word to their personal goals, career, or daily routine.
      * Calibrate the prompt to ${levelMeta.labelEn} level.
      * Include practical challenge guidance in English ("hint" and "hintEn"), in Portuguese ("hintPt"), and a clear level grammar instruction ("levelInstruction").
    - Part 4 (Mini-Story & Comprehension Questions):
-     * Compose a cohesive, lively, and 100% original short story (like a project launch, collaborative task, or real-life event) featuring ${protagonist} that seamlessly and organically embeds ALL target words in context, highlighted with **word**.
+     * Compose a cohesive, lively, and 100% original short story featuring a relatable protagonist navigating a concrete situation that seamlessly and organically embeds ALL target words in context, highlighted with **word**.
      * Accompany with 2 to 3 multiple-choice reading comprehension questions that strictly test concrete plot events, decisions, and outcomes in this narrative. ZERO generic questions about English study methods.
      * Each question has 4 options, a "correctAnswer" index (0, 1, 2, or 3), and an "explanation" citing the story.
 
 You MUST respond with a strict, valid JSON object matching the requested schema.`;
 
+  // Security Hotfix (Etapa 2): Privacy enforcement — student personal name removed from prompts
   const userPrompt = `Generate the complete, customized 4-part Memorization Activity:
-- Student Name: "${protagonist}"
-- Proficiency Level: ${levelMeta.labelEn} (${levelMeta.labelPt} - CEFR ${levelMeta.cefr})
+- Target Learner Level: ${levelMeta.labelEn} (${levelMeta.labelPt} - CEFR ${levelMeta.cefr})
 - Pedagogical Grammar Focus: ${levelMeta.grammarFocusEn}
 
 TARGET VOCABULARY WORDS FOR TODAY (MUST GENERATE COMPLETE CUSTOM CONTENT FOR EACH ONE):
@@ -12168,7 +12507,7 @@ Required JSON Structure:
   ],
   "readingPassage": {
     "title": "Story Title",
-    "text": "Coherent short story featuring ${protagonist} that organically embeds ALL target words highlighted with **word**.",
+    "text": "Coherent short story that organically embeds ALL target words highlighted with **word**.",
     "questions": [
       {
         "id": "q-1",
@@ -12181,92 +12520,64 @@ Required JSON Structure:
   }
 }`;
 
-  const ai = new GoogleGenAI({
+  // Security Hotfix (Etapa 2): Single attempt with gemini-2.5-flash, exact token bounds, zero cascade
+  const singleAttempt = await executeGeminiSingleAttempt({
+    feature: 'homework_generate',
+    systemInstruction,
+    untrustedUserDataPrompt: userPrompt,
+    callerRole: 'student',
     apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
+    temperature: 0.65,
   });
 
-  const candidateModels = [
-    'gemini-3.8-flash',
-    'gemini-3.1-flash-lite',
-    'gemini-flash-latest',
-  ];
-
-  for (const model of candidateModels) {
-    try {
-      const response = await Promise.race([
-        ai.models.generateContent({
-          model,
-          contents: userPrompt,
-          config: {
-            systemInstruction,
-            responseMimeType: 'application/json',
-            temperature: 0.75,
-          },
-        }),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(`Timeout model ${model}`)), 24000)
-        ),
-      ]);
-
-      if (response && response.text) {
-        const parsed = extractCleanJson(response.text);
-        if (
-          parsed &&
-          Array.isArray(parsed.matchingPairs) &&
-          parsed.matchingPairs.length > 0 &&
-          Array.isArray(parsed.fillInBlanks) &&
-          parsed.fillInBlanks.length > 0 &&
-          Array.isArray(parsed.sentenceWritingPrompts) &&
-          parsed.sentenceWritingPrompts.length > 0
-        ) {
-          // Verify that zero generic boilerplate exists in generated items
-          if (hasGenericBoilerplate(parsed)) {
-            continue;
-          }
-
-          // If story was missing or formulaic, generate it via dedicated Part 4 generator
-          if (!parsed.readingPassage?.text || isBadStoryText(parsed.readingPassage.text)) {
-            const dedicatedStory = await generatePart4StoryWithGemini(words, studentLevel, studentName);
-            if (dedicatedStory && !isBadStoryText(dedicatedStory.text)) {
-              parsed.readingPassage = dedicatedStory;
-            }
-          }
-
-          // Normalize questions
-          if (Array.isArray(parsed.readingPassage?.questions)) {
-            parsed.readingPassage.questions = parsed.readingPassage.questions.map((q: any, qIdx: number) => {
-              let corrIdx = 0;
-              if (typeof q.correctAnswer === 'number' && q.correctAnswer >= 0 && q.correctAnswer < 4) {
-                corrIdx = q.correctAnswer;
-              } else if (typeof q.correctAnswer === 'string' && Array.isArray(q.options)) {
-                const foundIdx = q.options.findIndex(
-                  (opt: string) => opt.toLowerCase().trim() === q.correctAnswer.toLowerCase().trim()
-                );
-                corrIdx = foundIdx >= 0 ? foundIdx : 0;
-              }
-              return {
-                ...q,
-                id: q.id || `q-${qIdx + 1}`,
-                correctAnswer: corrIdx,
-              };
-            });
-          }
-
-          // Cache successful AI response for 2 hours
-          aiMemorizationCache.set(cacheKey, {
-            data: parsed,
-            expiry: Date.now() + 2 * 60 * 60 * 1000,
+  if (singleAttempt?.parsedJson) {
+    const parsed = singleAttempt.parsedJson;
+    if (
+      parsed &&
+      Array.isArray(parsed.matchingPairs) &&
+      parsed.matchingPairs.length > 0 &&
+      Array.isArray(parsed.fillInBlanks) &&
+      parsed.fillInBlanks.length > 0 &&
+      Array.isArray(parsed.sentenceWritingPrompts) &&
+      parsed.sentenceWritingPrompts.length > 0
+    ) {
+      if (!hasGenericBoilerplate(parsed)) {
+        // If story was missing or formulaic, synthesize cohesive story deterministically (zero secondary cascade)
+        if (!parsed.readingPassage?.text || isBadStoryText(parsed.readingPassage.text)) {
+          parsed.readingPassage = synthesizeCohesiveStoryAndQuestions({
+            words,
+            studentLevel,
+            studentName: 'Student',
           });
-          return parsed;
         }
+
+        // Normalize questions
+        if (Array.isArray(parsed.readingPassage?.questions)) {
+          parsed.readingPassage.questions = parsed.readingPassage.questions.map((q: any, qIdx: number) => {
+            let corrIdx = 0;
+            if (typeof q.correctAnswer === 'number' && q.correctAnswer >= 0 && q.correctAnswer < 4) {
+              corrIdx = q.correctAnswer;
+            } else if (typeof q.correctAnswer === 'string' && Array.isArray(q.options)) {
+              const foundIdx = q.options.findIndex(
+                (opt: string) => opt.toLowerCase().trim() === q.correctAnswer.toLowerCase().trim()
+              );
+              corrIdx = foundIdx >= 0 ? foundIdx : 0;
+            }
+            return {
+              ...q,
+              id: q.id || `q-${qIdx + 1}`,
+              correctAnswer: corrIdx,
+            };
+          });
+        }
+
+        // Cache successful AI response for 2 hours
+        aiMemorizationCache.set(cacheKey, {
+          data: parsed,
+          expiry: Date.now() + 2 * 60 * 60 * 1000,
+        });
+        return parsed;
       }
-    } catch (err: any) {
-      console.warn(`[Direct Memorization AI] Attempt failed with model ${model}:`, err?.message || err);
     }
   }
 
@@ -12274,18 +12585,51 @@ Required JSON Structure:
 }
 
 // AI-Powered 4-Stage Weekly Memorization Activity Generator
-app.post('/api/homework/generate-ai', async (req, res) => {
+app.post('/api/homework/generate-ai', firebaseAuthMiddleware, async (req, res) => {
   try {
+    const caller = req.user!;
+    const callerUid = caller.uid;
+    const callerEmail = (caller.email || '').toLowerCase().trim();
     const {
       words = [],
       wordDetails = [],
       studentName = 'Student',
       studentLevel = 'Intermediate',
       studentEmail = '',
+      studentUid = '',
       weekLabel = '',
-    } = req.body;
+    } = req.body || {};
 
-    const levelMeta = normalizeStudentLevel(studentLevel);
+    let effectiveLevel = studentLevel;
+    let effectiveName = studentName;
+    let effectiveEmail = studentEmail || callerEmail;
+
+    if (caller.role === 'student') {
+      if (studentUid && studentUid !== callerUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Unauthorized access: cannot generate homework for another student.',
+        });
+      }
+      if (studentEmail && studentEmail.toLowerCase().trim() !== callerEmail) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Unauthorized access: cannot generate homework for another student.',
+        });
+      }
+
+      effectiveEmail = callerEmail;
+      const db = readDb();
+      const registeredStudent = (db.students || []).find((s: any) =>
+        (s.uid === callerUid || s.id === callerUid) ||
+        (callerEmail && (s.email || '').toLowerCase().trim() === callerEmail)
+      );
+      const profile = db.userProfiles?.[callerUid] || (callerEmail && db.userProfiles?.[callerEmail]);
+      effectiveLevel = profile?.level || profile?.englishLevel || registeredStudent?.level || registeredStudent?.englishLevel || studentLevel;
+      effectiveName = profile?.name || registeredStudent?.name || studentName || 'Student';
+    }
+
+    const levelMeta = normalizeStudentLevel(effectiveLevel);
 
     // 1. Simple direct input: clean array of unique words
     const rawList = Array.isArray(words) ? words : [];
@@ -12295,7 +12639,13 @@ app.post('/api/homework/generate-ai', async (req, res) => {
           .map((item: any) => (typeof item === 'string' ? item : item?.word || '').trim())
           .filter((w: string) => Boolean(w))
       )
-    ).slice(0, 5);
+    ).slice(0, 15);
+
+    // Security Hotfix (Etapa 2): Payload bounds validation
+    const bounds = validatePayloadBounds('homework_generate', { words: cleanWords });
+    if (!bounds.valid) {
+      return res.status(400).json({ error: 'Payload bounds exceeded', message: bounds.error });
+    }
 
     // Anti-generic rule: if no words provided, return clean empty notice immediately
     if (cleanWords.length === 0) {
@@ -12329,8 +12679,55 @@ app.post('/api/homework/generate-ai', async (req, res) => {
       aiMemorizationCache.delete(cacheKey);
     }
 
-    // 2. Direct Gemini AI generation with Specialized Native Teacher & Instructional Designer System Prompt
-    const aiResult = await generateDirectMemorizationAi(cleanWords, studentLevel, studentName);
+    // Security Hotfix (Etapa 2 & Residuals): Rate limiting per UID
+    const rateCheck = await checkAndConsumeRateLimit(callerUid, 'homework_generate');
+    if (!rateCheck.allowed) {
+      if (rateCheck.unavailable) {
+        return sendGeminiCostControlUnavailable(res, 5);
+      }
+      logGeminiAudited({
+        feature: 'homework_generate',
+        status: 'RATE_LIMITED',
+        callerRole: caller.role,
+        detail: `Rate limit hit, retry after ${rateCheck.retryAfterSeconds}s`,
+      });
+      return res.status(429).json({
+        success: false,
+        error: 'Rate limit exceeded',
+        message: 'Muitas gerações de atividade solicitadas recentemente. Aguarde alguns instantes.',
+        retryAfterSeconds: rateCheck.retryAfterSeconds,
+      });
+    }
+
+    // Security Hotfix (Etapa 2 & Residuals): Single-flight lock
+    const flightLock = await acquireSingleFlightLock(`homework_generate:${cacheKey}`);
+    if (!flightLock.acquired) {
+      if (flightLock.unavailable) {
+        return sendGeminiCostControlUnavailable(res, 5);
+      }
+      logGeminiAudited({
+        feature: 'homework_generate',
+        status: 'INFLIGHT_LOCKED',
+        callerRole: caller.role,
+        detail: 'Concurrent homework generation in progress',
+      });
+      return res.status(429).json({
+        success: false,
+        error: 'Concurrent generation in progress',
+        message: 'Uma geração de atividade idêntica já está em processamento.',
+        retryAfterSeconds: 4,
+      });
+    }
+
+    let aiResult: any = null;
+    try {
+      // 2. Direct Gemini AI generation with Specialized Native Teacher & Instructional Designer System Prompt
+      aiResult = await generateDirectMemorizationAi(cleanWords, studentLevel, studentName);
+    } finally {
+      await flightLock.release();
+    }
+
+    const wasAiGenerated = Boolean(aiResult && !hasGenericBoilerplate(aiResult));
 
     // Assemble the 4 parts
     let matchingPairs: any[] = [];
@@ -12353,7 +12750,12 @@ app.post('/api/homework/generate-ai', async (req, res) => {
       if (aiResult.readingPassage?.text && !isBadStoryText(aiResult.readingPassage.text)) {
         readingPassage = aiResult.readingPassage;
       } else {
-        readingPassage = await generatePart4StoryWithGemini(cleanWords, studentLevel, studentName);
+        readingPassage = synthesizeCohesiveStoryAndQuestions({
+          words: cleanWords,
+          studentLevel,
+          studentName: 'Alex',
+          wordDetails,
+        });
       }
     }
 
@@ -12405,9 +12807,6 @@ app.post('/api/homework/generate-ai', async (req, res) => {
       });
     }
 
-    if (!readingPassage || isBadStoryText(readingPassage.text)) {
-      readingPassage = await generatePart4StoryWithGemini(cleanWords, studentLevel, studentName);
-    }
 
     if (!readingPassage || isBadStoryText(readingPassage.text)) {
       readingPassage = synthesizeCohesiveStoryAndQuestions({
@@ -12448,13 +12847,14 @@ app.post('/api/homework/generate-ai', async (req, res) => {
       sentenceWritingPrompts,
       readingPassage,
       isEmpty: false,
-      isAiGenerated: true,
+      isAiGenerated: wasAiGenerated,
+      isFallback: !wasAiGenerated,
       isCompleted: false,
       score: 0,
     };
 
     const payload = { success: true, homework: finalHomeworkData };
-    if (!hasGenericBoilerplate(finalHomeworkData)) {
+    if (!hasGenericBoilerplate(finalHomeworkData) && wasAiGenerated) {
       aiMemorizationCache.set(cacheKey, { data: payload, expiry: Date.now() + 60 * 60 * 1000 });
     }
     res.json(payload);
@@ -12466,14 +12866,46 @@ app.post('/api/homework/generate-ai', async (req, res) => {
 
 // Dedicated Endpoint for Part 4 (Mini-Story / Routine Reading & Interpretation)
 // Delivers 100% original story narratives and dynamic comprehension questions using Gemini API
-app.post(['/api/homework/generate-part4', '/api/homework/generate-story'], async (req, res) => {
+app.post(['/api/homework/generate-part4', '/api/homework/generate-story'], firebaseAuthMiddleware, async (req, res) => {
   try {
+    const caller = req.user!;
+    const callerUid = caller.uid;
+    const callerEmail = (caller.email || '').toLowerCase().trim();
     const {
       words = [],
       studentLevel = 'Intermediate',
       studentName = 'Student',
+      studentUid = '',
+      studentEmail = '',
       wordDetails = [],
-    } = req.body;
+    } = req.body || {};
+
+    let effectiveLevel = studentLevel;
+    let effectiveName = studentName;
+
+    if (caller.role === 'student') {
+      if (studentUid && studentUid !== callerUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Unauthorized access: cannot generate story for another student.',
+        });
+      }
+      if (studentEmail && studentEmail.toLowerCase().trim() !== callerEmail) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Unauthorized access: cannot generate story for another student.',
+        });
+      }
+
+      const db = readDb();
+      const registeredStudent = (db.students || []).find((s: any) =>
+        (s.uid === callerUid || s.id === callerUid) ||
+        (callerEmail && (s.email || '').toLowerCase().trim() === callerEmail)
+      );
+      const profile = db.userProfiles?.[callerUid] || (callerEmail && db.userProfiles?.[callerEmail]);
+      effectiveLevel = profile?.level || profile?.englishLevel || registeredStudent?.level || registeredStudent?.englishLevel || studentLevel;
+      effectiveName = profile?.name || registeredStudent?.name || studentName || 'Student';
+    }
 
     const rawList = Array.isArray(words) ? words : [];
     const cleanWords = Array.from(
@@ -12482,16 +12914,69 @@ app.post(['/api/homework/generate-part4', '/api/homework/generate-story'], async
           .map((item: any) => (typeof item === 'string' ? item : item?.word || '').trim())
           .filter((w: string) => Boolean(w))
       )
-    );
+    ).slice(0, 15);
 
     if (cleanWords.length === 0) {
       return res.status(400).json({ error: 'No words provided for Part 4 generation' });
     }
 
-    // Direct generation via dedicated Gemini Prompt Architecture
-    const aiStory = await generatePart4StoryWithGemini(cleanWords, studentLevel, studentName);
+    // Security Hotfix (Etapa 2): Payload bounds validation
+    const bounds = validatePayloadBounds('homework_part4', { words: cleanWords });
+    if (!bounds.valid) {
+      return res.status(400).json({ error: 'Payload bounds exceeded', message: bounds.error });
+    }
+
+    // Security Hotfix (Etapa 2 & Residuals): Rate limiting per UID
+    const rateCheck = await checkAndConsumeRateLimit(callerUid, 'homework_part4');
+    if (!rateCheck.allowed) {
+      if (rateCheck.unavailable) {
+        return sendGeminiCostControlUnavailable(res, 5);
+      }
+      logGeminiAudited({
+        feature: 'homework_part4',
+        status: 'RATE_LIMITED',
+        callerRole: caller.role,
+        detail: `Rate limit hit, retry after ${rateCheck.retryAfterSeconds}s`,
+      });
+      return res.status(429).json({
+        success: false,
+        error: 'Rate limit exceeded',
+        message: 'Limite de solicitações para Part 4 atingido. Tente novamente mais tarde.',
+        retryAfterSeconds: rateCheck.retryAfterSeconds,
+      });
+    }
+
+    // Security Hotfix (Etapa 2 & Residuals): Single-flight lock
+    const part4LockKey = `homework_part4:${cleanWords.sort().join('|')}_${effectiveLevel}`;
+    const flightLock = await acquireSingleFlightLock(part4LockKey);
+    if (!flightLock.acquired) {
+      if (flightLock.unavailable) {
+        return sendGeminiCostControlUnavailable(res, 5);
+      }
+      logGeminiAudited({
+        feature: 'homework_part4',
+        status: 'INFLIGHT_LOCKED',
+        callerRole: caller.role,
+        detail: 'Concurrent story generation in progress',
+      });
+      return res.status(429).json({
+        success: false,
+        error: 'Concurrent generation in progress',
+        message: 'Uma história idêntica já está sendo gerada. Aguarde alguns instantes.',
+        retryAfterSeconds: 4,
+      });
+    }
+
+    let aiStory: any = null;
+    try {
+      // Direct generation via dedicated Gemini Prompt Architecture
+      aiStory = await generatePart4StoryWithGemini(cleanWords, effectiveLevel, effectiveName);
+    } finally {
+      await flightLock.release();
+    }
+
     if (aiStory && !isBadStoryText(aiStory.text)) {
-      return res.json({ success: true, readingPassage: aiStory, isAiGenerated: true });
+      return res.json({ success: true, readingPassage: aiStory, isAiGenerated: true, isFallback: false });
     }
 
     // Dynamic fallback ensuring zero template-reuse
@@ -12501,7 +12986,7 @@ app.post(['/api/homework/generate-part4', '/api/homework/generate-story'], async
       studentName,
       wordDetails,
     });
-    return res.json({ success: true, readingPassage: fallbackStory, isAiGenerated: false });
+    return res.json({ success: true, readingPassage: fallbackStory, isAiGenerated: false, isFallback: true });
   } catch (error: any) {
     console.error('Error in /api/homework/generate-part4:', error);
     res.status(500).json({ error: error.message || 'Failed to generate Part 4 story' });
@@ -12575,16 +13060,7 @@ async function evaluateDailySentenceIsolated(
   // 2. Concise, token-optimized Gemini API call strictly for Sentence of the Day
   const apiKey = process.env.GEMINI_API_KEY;
   if (apiKey && rawClean.length >= 3) {
-    const ai = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    });
-
-    const concisePrompt = `You are a strict English grammar checker for "Sentence of the Day" (project: ${GEMINI_PROJECT_ID}).
+    const concisePrompt = `You are a strict English grammar checker for "Sentence of the Day".
 Evaluate the student's sentence with zero-tolerance for errors:
 1. Capitalization: Standalone pronoun "i" MUST be "I" (e.g. "because i pass" -> "because I passed", "now i will" -> "now I will"). First word of sentence must be capitalized.
 2. Verb Tense & Agreement: Check tense consistency across clauses (e.g. if the sentence starts in past tense like "Today was a perfect day", causal/subordinate clauses like "because i pass the test" MUST use past tense "because I passed the test"). Check 3rd-person singular, modals, and auxiliaries.
@@ -12597,150 +13073,130 @@ Daily Words: ${JSON.stringify(cleanDailyWords)}
 Return strict JSON:
 {"hasAnyError":boolean,"isCorrect":boolean,"usedWords":[string],"missingWords":[string],"correctedSentence":string,"explanationPt":string,"explanationEn":string,"wordFeedbacks":[{"original":string,"hasError":boolean,"corrected":string,"explanationPt":string,"explanationEn":string}]}`;
 
-    const modelsToTry = ['gemini-3.6-flash', 'gemini-3.1-flash-lite', 'gemini-3.5-flash-lite'];
-    for (const model of modelsToTry) {
-      let timerId: any = null;
-      try {
-        const config: any = {
-          responseMimeType: 'application/json',
-          temperature: 0.1,
-        };
-        if (model.includes('gemini-3.6') || model.includes('gemini-3.1')) {
-          config.thinkingConfig = { thinkingBudget: 0 };
-        }
+    // Security Hotfix (Etapa 2): Single attempt with gemini-2.5-flash, exact token bounds, zero cascade
+    const singleAttempt = await executeGeminiSingleAttempt({
+      feature: 'check_daily_sentence',
+      systemInstruction: 'You are an ultra-rigorous English grammar checker for Sentence of the Day. Respond strictly in valid JSON.',
+      untrustedUserDataPrompt: concisePrompt,
+      callerRole: 'student',
+      apiKey,
+      temperature: 0.1,
+    });
 
-        const generatePromise = ai.models.generateContent({
-          model,
-          contents: concisePrompt,
-          config,
-        });
+    const parsed = singleAttempt?.parsedJson;
+    if (parsed && typeof parsed === 'object') {
+      // Ensure Gemini's correctedSentence also passes deterministic capitalization/tense rules
+      const rawAiCorrected =
+        parsed.correctedSentence && parsed.correctedSentence.trim()
+          ? parsed.correctedSentence.trim()
+          : programmaticFixed;
+      const postChecked = analyzeSentenceGrammarDeterministic(rawAiCorrected, cleanDailyWords);
+      const finalCorrected =
+        rawAiCorrected !== rawClean
+          ? postChecked.fixedSentence
+          : programmaticFixed;
 
-        const timeoutPromise = new Promise((_, reject) => {
-          timerId = setTimeout(() => reject(new Error('Daily sentence check timeout')), 5500);
-        });
+      const normalizedOriginal = rawClean.replace(/[.!?\s]+$/, '');
+      const normalizedCorrected = finalCorrected.replace(/[.!?\s]+$/, '');
+      const hasDiff = Boolean(normalizedCorrected && normalizedCorrected !== normalizedOriginal);
 
-        const response: any = await Promise.race([generatePromise, timeoutPromise]);
-        if (timerId) clearTimeout(timerId);
+      const finalUsedWords =
+        Array.isArray(parsed.usedWords) && parsed.usedWords.length > 0
+          ? parsed.usedWords
+          : usedWords;
+      const finalMissingWords =
+        Array.isArray(parsed.missingWords) && parsed.missingWords.length > 0
+          ? parsed.missingWords
+          : missingWords;
 
-        const parsed = response?.text ? extractCleanJson(response.text) : null;
-        if (parsed && typeof parsed === 'object') {
-          // Ensure Gemini's correctedSentence also passes deterministic capitalization/tense rules
-          const rawAiCorrected =
-            parsed.correctedSentence && parsed.correctedSentence.trim()
-              ? parsed.correctedSentence.trim()
-              : programmaticFixed;
-          const postChecked = analyzeSentenceGrammarDeterministic(rawAiCorrected, cleanDailyWords);
-          const finalCorrected =
-            rawAiCorrected !== rawClean
-              ? postChecked.fixedSentence
-              : programmaticFixed;
+      const finalHasError = Boolean(
+        hasProgrammaticError ||
+          hasDiff ||
+          parsed.hasAnyError === true ||
+          parsed.isCorrect === false ||
+          !usedTargetWord
+      );
 
-          const normalizedOriginal = rawClean.replace(/[.!?\s]+$/, '');
-          const normalizedCorrected = finalCorrected.replace(/[.!?\s]+$/, '');
-          const hasDiff = Boolean(normalizedCorrected && normalizedCorrected !== normalizedOriginal);
+      const aiExplPt = parsed.explanationPt || parsed.explanation || '';
+      const aiExplEn = parsed.explanationEn || parsed.explanation || '';
 
-          const finalUsedWords =
-            Array.isArray(parsed.usedWords) && parsed.usedWords.length > 0
-              ? parsed.usedWords
-              : usedWords;
-          const finalMissingWords =
-            Array.isArray(parsed.missingWords) && parsed.missingWords.length > 0
-              ? parsed.missingWords
-              : missingWords;
+      const combinedExplPt =
+        Array.from(new Set([...programmaticErrorsPt, aiExplPt].filter(Boolean)))
+          .join(' ')
+          .trim() ||
+        (finalHasError
+          ? 'Ajustes gramaticais sugeridos para tornar sua frase correta e natural.'
+          : 'Sua frase está gramaticalmente correta e natural.');
 
-          const finalHasError = Boolean(
-            hasProgrammaticError ||
-              hasDiff ||
-              parsed.hasAnyError === true ||
-              parsed.isCorrect === false ||
-              !usedTargetWord
-          );
+      const combinedExplEn =
+        Array.from(new Set([...programmaticErrorsEn, aiExplEn].filter(Boolean)))
+          .join(' ')
+          .trim() ||
+        (finalHasError
+          ? 'Suggested grammar adjustments to make your sentence accurate and natural.'
+          : 'Your sentence is grammatically accurate and natural.');
 
-          const aiExplPt = parsed.explanationPt || parsed.explanation || '';
-          const aiExplEn = parsed.explanationEn || parsed.explanation || '';
-
-          const combinedExplPt =
-            Array.from(new Set([...programmaticErrorsPt, aiExplPt].filter(Boolean)))
-              .join(' ')
-              .trim() ||
-            (finalHasError
-              ? 'Ajustes gramaticais sugeridos para tornar sua frase correta e natural.'
-              : 'Sua frase está gramaticalmente correta e natural.');
-
-          const combinedExplEn =
-            Array.from(new Set([...programmaticErrorsEn, aiExplEn].filter(Boolean)))
-              .join(' ')
-              .trim() ||
-            (finalHasError
-              ? 'Suggested grammar adjustments to make your sentence accurate and natural.'
-              : 'Your sentence is grammatically accurate and natural.');
-
-          // Merge wordFeedbacks from deterministic check and Gemini
-          const combinedWordFeedbacks = [...wordFeedbacks];
-          if (Array.isArray(parsed.wordFeedbacks)) {
-            parsed.wordFeedbacks.forEach((wf: any) => {
-              if (
-                wf &&
-                wf.hasError &&
-                wf.original &&
-                wf.corrected &&
-                !combinedWordFeedbacks.some(
-                  (existing) =>
-                    existing.original.toLowerCase() === String(wf.original).toLowerCase()
-                )
-              ) {
-                combinedWordFeedbacks.push(wf);
-              }
-            });
+      // Merge wordFeedbacks from deterministic check and Gemini
+      const combinedWordFeedbacks = [...wordFeedbacks];
+      if (Array.isArray(parsed.wordFeedbacks)) {
+        parsed.wordFeedbacks.forEach((wf: any) => {
+          if (
+            wf &&
+            wf.hasError &&
+            wf.original &&
+            wf.corrected &&
+            !combinedWordFeedbacks.some(
+              (existing) =>
+                existing.original.toLowerCase() === String(wf.original).toLowerCase()
+            )
+          ) {
+            combinedWordFeedbacks.push(wf);
           }
-
-          const targetWordFeedback = hasWordConstraint
-            ? usedTargetWord
-              ? finalMissingWords.length > 0
-                ? `Palavras utilizadas (${finalUsedWords.length}/${cleanDailyWords.length}): ${finalUsedWords.join(', ')}. Não incluída(s): ${finalMissingWords.join(', ')}.`
-                : `Palavras da rotina utilizadas (${finalUsedWords.length}/${cleanDailyWords.length}): ${finalUsedWords.join(', ')}.`
-              : `Inclua pelo menos uma palavra da sua rotina na frase (${cleanDailyWords.slice(0, 5).join(', ')}).`
-            : '';
-
-          const resultPayload = {
-            hasAnyError: finalHasError,
-            isCorrect: !finalHasError,
-            usedTargetWord,
-            usedWords: finalUsedWords,
-            missingWords: finalMissingWords,
-            targetWordFeedback,
-            wordFeedbacks: combinedWordFeedbacks,
-            sentenceFeedback: {
-              original: rawClean,
-              hasError: finalHasError,
-              corrected: finalCorrected,
-              explanationPt: combinedExplPt,
-              explanationEn: combinedExplEn,
-            },
-            correctedSentence: finalCorrected,
-            explanation: combinedExplPt,
-            overallSummaryPt: finalHasError
-              ? combinedExplPt
-              : `Excelente! Frase natural com o vocabulário da sua rotina (${finalUsedWords.join(', ') || 'palavras de hoje'}).`,
-            overallSummaryEn: finalHasError
-              ? combinedExplEn
-              : `Outstanding! Natural sentence using your daily vocabulary (${finalUsedWords.join(', ') || 'today’s words'}).`,
-          };
-
-          if (dailySentenceEvaluationCache.size > 200) {
-            const firstKey = dailySentenceEvaluationCache.keys().next().value;
-            if (firstKey) dailySentenceEvaluationCache.delete(firstKey);
-          }
-          dailySentenceEvaluationCache.set(cacheKey, {
-            data: resultPayload,
-            expiry: Date.now() + 30 * 60 * 1000,
-          });
-          return resultPayload;
-        }
-      } catch {
-        if (timerId) clearTimeout(timerId);
-        // Try next candidate model or fall back to deterministic result
+        });
       }
+
+      const targetWordFeedback = hasWordConstraint
+        ? usedTargetWord
+          ? finalMissingWords.length > 0
+            ? `Palavras utilizadas (${finalUsedWords.length}/${cleanDailyWords.length}): ${finalUsedWords.join(', ')}. Não incluída(s): ${finalMissingWords.join(', ')}.`
+            : `Palavras da rotina utilizadas (${finalUsedWords.length}/${cleanDailyWords.length}): ${finalUsedWords.join(', ')}.`
+          : `Inclua pelo menos uma palavra da sua rotina na frase (${cleanDailyWords.slice(0, 5).join(', ')}).`
+        : '';
+
+      const resultPayload = {
+        hasAnyError: finalHasError,
+        isCorrect: !finalHasError,
+        usedTargetWord,
+        usedWords: finalUsedWords,
+        missingWords: finalMissingWords,
+        targetWordFeedback,
+        wordFeedbacks: combinedWordFeedbacks,
+        sentenceFeedback: {
+          original: rawClean,
+          hasError: finalHasError,
+          corrected: finalCorrected,
+          explanationPt: combinedExplPt,
+          explanationEn: combinedExplEn,
+        },
+        correctedSentence: finalCorrected,
+        explanation: combinedExplPt,
+        overallSummaryPt: finalHasError
+          ? combinedExplPt
+          : `Excelente! Frase natural com o vocabulário da sua rotina (${finalUsedWords.join(', ') || 'palavras de hoje'}).`,
+        overallSummaryEn: finalHasError
+          ? combinedExplEn
+          : `Outstanding! Natural sentence using your daily vocabulary (${finalUsedWords.join(', ') || 'today’s words'}).`,
+      };
+
+      if (dailySentenceEvaluationCache.size > 200) {
+        const firstKey = dailySentenceEvaluationCache.keys().next().value;
+        if (firstKey) dailySentenceEvaluationCache.delete(firstKey);
+      }
+      dailySentenceEvaluationCache.set(cacheKey, {
+        data: resultPayload,
+        expiry: Date.now() + 30 * 60 * 1000,
+      });
+      return resultPayload;
     }
   }
 
@@ -12787,10 +13243,81 @@ Return strict JSON:
   return fallbackPayload;
 }
 
-app.post('/api/check-daily-sentence', async (req, res) => {
+app.post('/api/check-daily-sentence', firebaseAuthMiddleware, async (req, res) => {
   try {
-    const { sentence = '', dailyWords = [] } = req.body || {};
-    const result = await evaluateDailySentenceIsolated(sentence, dailyWords);
+    const caller = req.user!;
+    const callerUid = caller.uid;
+    const callerEmail = (caller.email || '').toLowerCase().trim();
+    const { sentence = '', dailyWords = [], studentUid = '', studentEmail = '' } = req.body || {};
+
+    if (caller.role === 'student') {
+      if (studentUid && studentUid !== callerUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Unauthorized access: student UID does not match authenticated user.',
+        });
+      }
+      if (studentEmail && studentEmail.toLowerCase().trim() !== callerEmail) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Unauthorized access: student email does not match authenticated user.',
+        });
+      }
+    }
+
+    // Security Hotfix (Etapa 2): Payload bounds validation
+    const bounds = validatePayloadBounds('check_daily_sentence', { sentence, words: dailyWords });
+    if (!bounds.valid) {
+      return res.status(400).json({ error: 'Payload bounds exceeded', message: bounds.error });
+    }
+
+    // Security Hotfix (Etapa 2 & Residuals): Rate limiting per UID
+    const rateCheck = await checkAndConsumeRateLimit(callerUid, 'check_daily_sentence');
+    if (!rateCheck.allowed) {
+      if (rateCheck.unavailable) {
+        return sendGeminiCostControlUnavailable(res, 5);
+      }
+      logGeminiAudited({
+        feature: 'check_daily_sentence',
+        status: 'RATE_LIMITED',
+        callerRole: caller.role,
+        detail: `Rate limit hit, retry after ${rateCheck.retryAfterSeconds}s`,
+      });
+      return res.status(429).json({
+        success: false,
+        error: 'Rate limit exceeded',
+        message: 'Muitas verificações de frase solicitadas recentemente. Aguarde alguns instantes.',
+        retryAfterSeconds: rateCheck.retryAfterSeconds,
+      });
+    }
+
+    // Security Hotfix (Etapa 2 & Residuals): Single-flight lock
+    const flightKey = `check_daily_sentence:${callerUid}:${sentence.trim().toLowerCase()}`;
+    const flightLock = await acquireSingleFlightLock(flightKey);
+    if (!flightLock.acquired) {
+      if (flightLock.unavailable) {
+        return sendGeminiCostControlUnavailable(res, 5);
+      }
+      logGeminiAudited({
+        feature: 'check_daily_sentence',
+        status: 'INFLIGHT_LOCKED',
+        callerRole: caller.role,
+        detail: 'Concurrent sentence verification in progress',
+      });
+      return res.status(429).json({
+        success: false,
+        error: 'Concurrent verification in progress',
+        message: 'Esta frase já está sendo verificada.',
+        retryAfterSeconds: 3,
+      });
+    }
+
+    let result: any = null;
+    try {
+      result = await evaluateDailySentenceIsolated(sentence, dailyWords);
+    } finally {
+      await flightLock.release();
+    }
     return res.json(result);
   } catch (err: any) {
     return res.status(200).json({
@@ -12801,12 +13328,16 @@ app.post('/api/check-daily-sentence', async (req, res) => {
       missingWords: [],
       correctedSentence: req.body?.sentence || '',
       explanation: 'Frase verificada com sucesso.',
+      isFallback: true,
     });
   }
 });
 
 // 12. Writing / Grammar Evaluation via Gemini API with Absolute Rigor & Subtle Error Detection
-app.post('/api/check-writing', async (req, res) => {
+app.post('/api/check-writing', firebaseAuthMiddleware, async (req, res) => {
+  const caller = req.user!;
+  const callerUid = caller.uid;
+  const callerEmail = (caller.email || '').toLowerCase().trim();
   const {
     words = [],
     dailyWords = [],
@@ -12817,12 +13348,65 @@ app.post('/api/check-writing', async (req, res) => {
     instruction = '',
     levelInstruction = '',
     language = 'pt',
-  } = req.body;
-  const levelMeta = normalizeStudentLevel(level);
+    studentUid = '',
+    studentEmail = '',
+  } = req.body || {};
+
+  let effectiveLevel = level;
+  if (caller.role === 'student') {
+    if (studentUid && studentUid !== callerUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Unauthorized access: student UID does not match authenticated user.',
+      });
+    }
+    if (studentEmail && studentEmail.toLowerCase().trim() !== callerEmail) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Unauthorized access: student email does not match authenticated user.',
+      });
+    }
+
+    const db = readDb();
+    const registeredStudent = (db.students || []).find((s: any) =>
+      (s.uid === callerUid || s.id === callerUid) ||
+      (callerEmail && (s.email || '').toLowerCase().trim() === callerEmail)
+    );
+    const profile = db.userProfiles?.[callerUid] || (callerEmail && db.userProfiles?.[callerEmail]);
+    effectiveLevel = profile?.level || profile?.englishLevel || registeredStudent?.level || registeredStudent?.englishLevel || level;
+  }
+
+  const levelMeta = normalizeStudentLevel(effectiveLevel);
 
   const rawWordsList = Array.isArray(dailyWords) && dailyWords.length > 0
     ? dailyWords
     : Array.isArray(words) ? words : [];
+
+  // Security Hotfix (Etapa 2): Payload bounds validation
+  const bounds = validatePayloadBounds('check_writing', { sentence, words: rawWordsList });
+  if (!bounds.valid) {
+    return res.status(400).json({ error: 'Payload bounds exceeded', message: bounds.error });
+  }
+
+  // Security Hotfix (Etapa 2 & Residuals): Rate limiting per UID
+  const rateCheck = await checkAndConsumeRateLimit(callerUid, 'check_writing');
+  if (!rateCheck.allowed) {
+    if (rateCheck.unavailable) {
+      return sendGeminiCostControlUnavailable(res, 5);
+    }
+    logGeminiAudited({
+      feature: 'check_writing',
+      status: 'RATE_LIMITED',
+      callerRole: caller.role,
+      detail: `Rate limit hit, retry after ${rateCheck.retryAfterSeconds}s`,
+    });
+    return res.status(429).json({
+      success: false,
+      error: 'Rate limit exceeded',
+      message: 'Muitas análises de escrita solicitadas recentemente. Aguarde alguns instantes.',
+      retryAfterSeconds: rateCheck.retryAfterSeconds,
+    });
+  }
 
   const allTargetWords = targetWord
     ? Array.from(new Set([targetWord, ...rawWordsList]))
@@ -12830,6 +13414,28 @@ app.post('/api/check-writing', async (req, res) => {
   const mainTarget = targetWord || allTargetWords[0] || '';
 
   const rawClean = (sentence || '').trim();
+
+  // Security Hotfix (Etapa 2 & Residuals): Single flight lock
+  const flightKey = `check_writing:${callerUid}:${rawClean.toLowerCase()}`;
+  const flightLock = await acquireSingleFlightLock(flightKey);
+  if (!flightLock.acquired) {
+    if (flightLock.unavailable) {
+      return sendGeminiCostControlUnavailable(res, 5);
+    }
+    logGeminiAudited({
+      feature: 'check_writing',
+      status: 'INFLIGHT_LOCKED',
+      callerRole: caller.role,
+      detail: 'Concurrent writing check in progress',
+    });
+    return res.status(429).json({
+      success: false,
+      error: 'Concurrent evaluation in progress',
+      message: 'Esta frase já está sendo analisada. Aguarde alguns instantes.',
+      retryAfterSeconds: 3,
+    });
+  }
+
   const lowerSentence = rawClean.toLowerCase();
   const programmaticErrorsPt: string[] = [];
   const programmaticErrorsEn: string[] = [];
@@ -13058,7 +13664,12 @@ OUTPUT STRICT JSON matching this schema:
   "levelTipsEn": "string"
 }`;
 
-    const parsed = await callGeminiSafeJson(prompt, 6000);
+    let parsed: any = null;
+    try {
+      parsed = await callGeminiSafeJson(prompt, 6000, 'check_writing', caller.role);
+    } finally {
+      await flightLock.release();
+    }
     if (parsed && typeof parsed === 'object') {
       const normalizedOriginal = rawClean.trim().replace(/[.!?\s]+$/, '').toLowerCase();
       const normalizedCorrected = (parsed.correctedSentence || '').trim().replace(/[.!?\s]+$/, '').toLowerCase();
@@ -13246,23 +13857,134 @@ OUTPUT STRICT JSON matching this schema:
   });
 });
 
+// In-memory cache for evaluated homework to prevent redundant evaluations and duplicate cost
+const homeworkEvalCache = new Map<string, { data: any; expiry: number }>();
+
+// In-memory cache for live lesson generated vocabulary to prevent duplicate generation
+const lessonVocabCache = new Map<string, any[]>();
+
+export function resetResidualCachesForTesting(): void {
+  homeworkEvalCache.clear();
+  lessonVocabCache.clear();
+}
+
 // 13. Comprehensive AI Homework Evaluator (All 4 Interactive Stages)
-app.post('/api/homework/evaluate', async (req, res) => {
+app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
   try {
+    const caller = req.user!;
+    const callerUid = caller.uid;
+    const callerEmail = (caller.email || '').toLowerCase().trim();
     const {
       homework,
       studentAnswers = {},
       studentLevel = 'iniciante',
       studentName = 'Student',
+      studentUid = '',
+      studentEmail = '',
       currentLanguage = 'pt',
-    } = req.body;
+    } = req.body || {};
 
     if (!homework) {
       return res.status(400).json({ error: 'homework data is required' });
     }
 
-    const levelMeta = normalizeStudentLevel(studentLevel || homework.studentLevel);
+    let effectiveLevel = studentLevel || homework.studentLevel;
+    let effectiveName = studentName || homework.studentName;
+
+    if (caller.role === 'student') {
+      if (studentUid && studentUid !== callerUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Unauthorized access: cannot evaluate homework for another student.',
+        });
+      }
+      if (studentEmail && studentEmail.toLowerCase().trim() !== callerEmail) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Unauthorized access: cannot evaluate homework for another student.',
+        });
+      }
+      if (homework.studentUid && homework.studentUid !== callerUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Unauthorized access: cannot evaluate homework for another student.',
+        });
+      }
+      if (homework.studentEmail && homework.studentEmail.toLowerCase().trim() !== callerEmail) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Unauthorized access: cannot evaluate homework for another student.',
+        });
+      }
+
+      const db = readDb();
+      const registeredStudent = (db.students || []).find((s: any) =>
+        (s.uid === callerUid || s.id === callerUid) ||
+        (callerEmail && (s.email || '').toLowerCase().trim() === callerEmail)
+      );
+      const profile = db.userProfiles?.[callerUid] || (callerEmail && db.userProfiles?.[callerEmail]);
+      effectiveLevel = profile?.level || profile?.englishLevel || registeredStudent?.level || registeredStudent?.englishLevel || effectiveLevel;
+      effectiveName = profile?.name || registeredStudent?.name || effectiveName;
+    }
+
+    const levelMeta = normalizeStudentLevel(effectiveLevel);
     const { matching = {}, fillInBlanks = {}, sentences = {}, quizAnswers = {} } = studentAnswers;
+
+    // Check in-memory cache to preserve previously evaluated content and prevent duplicate costs
+    const sentencesContent = JSON.stringify(sentences || {});
+    const contentHash = crypto.createHash('sha256').update(sentencesContent).digest('hex').slice(0, 16);
+    const evalCacheKey = `${callerUid}_${homework.id || 'hw'}_${contentHash}`;
+    const cachedEval = homeworkEvalCache.get(evalCacheKey);
+    if (cachedEval && Date.now() < cachedEval.expiry) {
+      return res.json({ success: true, evaluation: cachedEval.data, cached: true });
+    }
+
+    // Security Hotfix (Etapa 2 & Residuals): Payload bounds validation
+    const bounds = validatePayloadBounds('homework_evaluate', { text: sentencesContent });
+    if (!bounds.valid) {
+      return res.status(400).json({ error: 'Payload bounds exceeded', message: bounds.error });
+    }
+
+    // Security Hotfix (Etapa 2 & Residuals): Rate limiting check per authenticated UID
+    const rateCheck = await checkAndConsumeRateLimit(callerUid, 'homework_evaluate');
+    if (!rateCheck.allowed) {
+      if (rateCheck.unavailable) {
+        return sendGeminiCostControlUnavailable(res, 5);
+      }
+      logGeminiAudited({
+        feature: 'homework_evaluate',
+        status: 'RATE_LIMITED',
+        callerRole: caller.role,
+        detail: `Rate limit hit, retry after ${rateCheck.retryAfterSeconds}s`,
+      });
+      return res.status(429).json({
+        success: false,
+        error: 'Rate limit exceeded',
+        message: 'Limite de solicitações de avaliação de homework atingido para este usuário. Aguarde alguns instantes.',
+        retryAfterSeconds: rateCheck.retryAfterSeconds,
+      });
+    }
+
+    // Security Hotfix (Etapa 2 & Residuals): Multi-instance Single-Flight Lock with key bound to user and content
+    const flightKey = `homework_evaluate:${callerUid}:${homework.id || 'hw'}:${contentHash}`;
+    const flightLock = await acquireSingleFlightLock(flightKey);
+    if (!flightLock.acquired) {
+      if (flightLock.unavailable) {
+        return sendGeminiCostControlUnavailable(res, 5);
+      }
+      logGeminiAudited({
+        feature: 'homework_evaluate',
+        status: 'INFLIGHT_LOCKED',
+        callerRole: caller.role,
+        detail: 'Concurrent homework evaluation in progress',
+      });
+      return res.status(429).json({
+        success: false,
+        error: 'Concurrent evaluation in progress',
+        message: 'Uma avaliação deste exercício já está em processamento.',
+        retryAfterSeconds: 4,
+      });
+    }
 
     // Calculate baseline scores
     let matchingCorrect = 0;
@@ -13330,7 +14052,7 @@ app.post('/api/homework/evaluate', async (req, res) => {
     const fillScore = (fillCorrect / totalFill) * 30;
     const quizScore = (quizCorrect / totalQuiz) * 20;
 
-    // AI evaluation of sentences with Gemini
+    // AI evaluation of sentences with Gemini (single attempt with explicit homework_evaluate policy)
     const apiKey = process.env.GEMINI_API_KEY;
     let sentenceEvaluationResults: any[] = [];
     let tutorSummaryPt = '';
@@ -13340,8 +14062,9 @@ app.post('/api/homework/evaluate', async (req, res) => {
     let levelNextStepsPt = '';
     let levelNextStepsEn = '';
 
-    if (apiKey) {
-      const prompt = `You are a warm, inspiring Native English teacher at "It's Simple".
+    try {
+      if (apiKey) {
+        const prompt = `You are a warm, inspiring Native English teacher at "It's Simple".
 Evaluate this student's completed Weekly Memorization Activity.
 
 STUDENT PROFILE:
@@ -13399,16 +14122,20 @@ Output STRICT JSON matching this schema:
   "levelNextStepsEn": "string"
 }`;
 
-      const aiRes = await callGeminiSafeJson(prompt, 15000);
-      if (aiRes && Array.isArray(aiRes.sentenceFeedback)) {
-        sentenceEvaluationResults = aiRes.sentenceFeedback;
-        tutorSummaryPt = aiRes.tutorFeedbackSummaryPt || '';
-        tutorSummaryEn = aiRes.tutorFeedbackSummaryEn || '';
-        levelStrengthsPt = aiRes.levelStrengthsPt || '';
-        levelStrengthsEn = aiRes.levelStrengthsEn || '';
-        levelNextStepsPt = aiRes.levelNextStepsPt || '';
-        levelNextStepsEn = aiRes.levelNextStepsEn || '';
+        // Explicitly apply homework_evaluate policy! Single bounded attempt, zero cascade
+        const aiRes = await callGeminiSafeJson(prompt, 15000, 'homework_evaluate', caller.role);
+        if (aiRes && Array.isArray(aiRes.sentenceFeedback)) {
+          sentenceEvaluationResults = aiRes.sentenceFeedback;
+          tutorSummaryPt = aiRes.tutorFeedbackSummaryPt || '';
+          tutorSummaryEn = aiRes.tutorFeedbackSummaryEn || '';
+          levelStrengthsPt = aiRes.levelStrengthsPt || '';
+          levelStrengthsEn = aiRes.levelStrengthsEn || '';
+          levelNextStepsPt = aiRes.levelNextStepsPt || '';
+          levelNextStepsEn = aiRes.levelNextStepsEn || '';
+        }
       }
+    } finally {
+      await flightLock.release();
     }
 
     // Fallback sentence evaluation if AI was offline
@@ -13476,6 +14203,9 @@ Output STRICT JSON matching this schema:
       readingFeedback,
     };
 
+    // Cache evaluated result
+    homeworkEvalCache.set(evalCacheKey, { data: evaluationResponse, expiry: Date.now() + 600000 });
+
     res.json({ success: true, evaluation: evaluationResponse });
   } catch (error: any) {
     console.error('Error evaluating homework:', error);
@@ -13483,9 +14213,11 @@ Output STRICT JSON matching this schema:
   }
 });
 
-// AI Live Lesson Vocabulary Generator
-app.post('/api/lesson/vocab-generate', async (req, res) => {
-  const { words, topic, notes } = req.body;
+// AI Live Lesson Vocabulary Generator (Restricted strictly to Teachers and Admins)
+app.post('/api/lesson/vocab-generate', firebaseAuthMiddleware, requireTeacher, async (req, res) => {
+  const caller = req.user!;
+  const callerUid = caller.uid;
+  const { words, topic, notes } = req.body || {};
   if (!words || !Array.isArray(words) || words.length === 0) {
     return res.status(400).json({ error: 'words array is required' });
   }
@@ -13495,8 +14227,65 @@ app.post('/api/lesson/vocab-generate', async (req, res) => {
     return res.json({ success: true, entries: [] });
   }
 
-  if (process.env.GEMINI_API_KEY) {
-    const prompt = `You are a native English language teacher creating personalized vocabulary study notes for a live conversation lesson.
+  // 1. Check in-memory cache to prevent duplicate generation and unnecessary cost
+  const vocabCacheKey = `${cleanWords.map((w: string) => w.toLowerCase().trim()).sort().join('|')}__${(topic || '').trim().toLowerCase()}`;
+  if (lessonVocabCache.has(vocabCacheKey)) {
+    return res.json({ success: true, entries: lessonVocabCache.get(vocabCacheKey), cached: true });
+  }
+
+  // Security Hotfix (Etapa 2 & Residuals): Payload bounds validation
+  const bounds = validatePayloadBounds('vocab_generate', {
+    words: cleanWords,
+    text: `${topic || ''} ${notes || ''}`,
+  });
+  if (!bounds.valid) {
+    return res.status(400).json({ error: 'Payload bounds exceeded', message: bounds.error });
+  }
+
+  // Security Hotfix (Etapa 2 & Residuals): Rate limiting check per authenticated teacher UID
+  const rateCheck = await checkAndConsumeRateLimit(callerUid, 'vocab_generate');
+  if (!rateCheck.allowed) {
+    if (rateCheck.unavailable) {
+      return sendGeminiCostControlUnavailable(res, 5);
+    }
+    logGeminiAudited({
+      feature: 'vocab_generate',
+      status: 'RATE_LIMITED',
+      callerRole: caller.role,
+      detail: `Rate limit hit, retry after ${rateCheck.retryAfterSeconds}s`,
+    });
+    return res.status(429).json({
+      success: false,
+      error: 'Rate limit exceeded',
+      message: 'Limite de solicitações de geração de vocabulário atingido. Aguarde alguns instantes.',
+      retryAfterSeconds: rateCheck.retryAfterSeconds,
+    });
+  }
+
+  // Security Hotfix (Etapa 2 & Residuals): Multi-instance Single-Flight Lock
+  const flightLock = await acquireSingleFlightLock(`vocab_generate:${vocabCacheKey}`);
+  if (!flightLock.acquired) {
+    if (flightLock.unavailable) {
+      return sendGeminiCostControlUnavailable(res, 5);
+    }
+    logGeminiAudited({
+      feature: 'vocab_generate',
+      status: 'INFLIGHT_LOCKED',
+      callerRole: caller.role,
+      detail: 'Concurrent vocab generation in progress',
+    });
+    return res.status(429).json({
+      success: false,
+      error: 'Concurrent generation in progress',
+      message: 'Uma geração de vocabulário idêntica já está em processamento.',
+      retryAfterSeconds: 4,
+    });
+  }
+
+  let generatedEntries: any[] | null = null;
+  try {
+    if (process.env.GEMINI_API_KEY) {
+      const prompt = `You are a native English language teacher creating personalized vocabulary study notes for a live conversation lesson.
 Lesson Topic: "${topic || 'Everyday conversation and practical routines'}"
 Teacher's Live Lesson Notes/Context: "${notes || 'Real-life speaking practice'}"
 Vocabulary items typed by the teacher during class: ${JSON.stringify(cleanWords)}
@@ -13517,14 +14306,23 @@ Return a JSON array of objects with the exact schema:
   }
 ]`;
 
-    const parsed = await callGeminiSafeJson(prompt, 6000);
-    if (Array.isArray(parsed) && parsed.length > 0) {
-      return res.json({ success: true, entries: parsed });
+      // Explicitly apply vocab_generate policy! Single bounded attempt, zero cascade
+      const parsed = await callGeminiSafeJson(prompt, 8000, 'vocab_generate', caller.role);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        generatedEntries = parsed;
+      }
     }
+  } finally {
+    await flightLock.release();
+  }
+
+  if (generatedEntries && generatedEntries.length > 0) {
+    lessonVocabCache.set(vocabCacheKey, generatedEntries);
+    return res.json({ success: true, entries: generatedEntries });
   }
 
   // Fallback linguistic generator for each word
-  const entries = cleanWords.map((word) => {
+  const fallbackEntries = cleanWords.map((word) => {
     return {
       word,
       definitionEn: `A practical English term denoting "${word}", used naturally when communicating about ${topic || 'daily life'}.`,
@@ -13533,7 +14331,8 @@ Return a JSON array of objects with the exact schema:
     };
   });
 
-  res.json({ success: true, entries });
+  lessonVocabCache.set(vocabCacheKey, fallbackEntries);
+  res.json({ success: true, entries: fallbackEntries, isFallback: true });
 });
 
 // Explicit route for Privacy Policy (Google verification & direct access)

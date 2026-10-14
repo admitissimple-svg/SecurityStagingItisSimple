@@ -24,6 +24,7 @@ import {
   Filter,
   ShieldCheck,
   FileText,
+  Info,
 } from 'lucide-react';
 import { GoogleAccount, LiveLesson, StudentProfile, UserProfile, EnglishLevel } from '../types';
 import { formatDateInTimeZone } from '../utils/timezone';
@@ -341,6 +342,7 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
           studentEmail: resolvedEmail,
           lessonId: activeSession.lessonId,
           sessionKey: activeSession.key,
+          language: currentLanguage,
           forceRegenerate,
         });
 
@@ -365,14 +367,14 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
         setIsLoadingTransformation(false);
       }
     },
-    [activeSession, studentLevel, resolvedUid, resolvedEmail]
+    [activeSession, studentLevel, resolvedUid, resolvedEmail, currentLanguage]
   );
 
   useEffect(() => {
     if (isOpen && activeSession) {
       loadPedagogicalNotes(false);
     }
-  }, [isOpen, activeSession, loadPedagogicalNotes]);
+  }, [isOpen, activeSession, loadPedagogicalNotes, currentLanguage]);
 
   // Copy 5-10 minute review summary to clipboard
   const handleCopySummary = () => {
@@ -430,6 +432,17 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                 <span className="px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[11px] font-black border border-emerald-400/40">
                   {cefrMeta.cefr} • {cefrMeta.labelEn}
                 </span>
+                {transformation?.isAiGenerated ? (
+                  <span className="px-2 py-0.5 rounded-full bg-blue-500/20 text-[#9AB4FF] text-[11px] font-black border border-blue-400/40 flex items-center gap-1">
+                    <Sparkles className="w-3 h-3 text-[#9AB4FF]" />
+                    {transformation.modelUsed || 'Gemini'}
+                  </span>
+                ) : transformation?.isFallback ? (
+                  <span className="px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 text-[11px] font-semibold border border-amber-400/40 flex items-center gap-1">
+                    <AlertTriangle className="w-3 h-3 text-amber-300" />
+                    {isEn ? 'Direct Notes (AI Offline)' : 'Notas Diretas (IA Offline)'}
+                  </span>
+                ) : null}
               </div>
               <p className="text-xs text-[#9AB4FF] mt-0.5">
                 {isEn
@@ -649,8 +662,83 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                   : 'Seu Amigo Nativo gravará anotações e marcará correções durante suas sessões 1-a-1. Elas serão transformadas neste guia pedagógico automaticamente!'}
               </p>
             </div>
+          ) : transformation.authError ? (
+            <div className="py-14 px-6 rounded-3xl bg-rose-50/80 border border-rose-200/90 shadow-sm flex flex-col items-center justify-center text-center space-y-3">
+              <div className="w-12 h-12 rounded-2xl bg-rose-100 text-rose-700 flex items-center justify-center font-bold text-xl">
+                🔒
+              </div>
+              <h3 className="font-black text-base text-rose-950">
+                {transformation.authError.status === 401
+                  ? (isEn ? 'Authentication Required' : 'Autenticação Necessária')
+                  : (isEn ? 'Access Restricted' : 'Acesso Não Autorizado')}
+              </h3>
+              <p className="text-xs text-rose-800 max-w-md">
+                {transformation.authError.message}
+              </p>
+            </div>
           ) : (
             <>
+              {/* Optional Prompt to Generate with AI (Zero automatic billing on open/language change) */}
+              {transformation.needsAiGeneration && (
+                <div className="p-3.5 rounded-2xl bg-indigo-50/90 border border-indigo-200/90 shadow-2xs flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-indigo-950">
+                  <div className="flex items-start gap-2.5">
+                    <Sparkles className="w-4 h-4 text-indigo-600 mt-0.5 shrink-0" />
+                    <div>
+                      <div className="font-bold flex items-center gap-2">
+                        <span>{isEn ? 'Masterclass AI Analysis Ready' : 'Análise Pedagógica Masterclass Disponível'}</span>
+                      </div>
+                      <p className="text-indigo-800 text-[11px] mt-0.5">
+                        {isEn
+                          ? 'Viewing preliminary teacher notes. Generate full masterclass report calibrated to your CEFR level.'
+                          : 'Exibindo notas preliminares do professor. Gere o guia pedagógico inteligente com o Gemini.'}
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => loadPedagogicalNotes(true)}
+                    disabled={isLoadingTransformation}
+                    className="px-3.5 py-1.5 rounded-xl bg-[#1C4C96] hover:bg-[#000035] text-white font-bold text-xs shrink-0 transition cursor-pointer shadow-sm disabled:opacity-50 flex items-center gap-1.5"
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    {isEn ? 'Generate with Gemini' : 'Gerar com Gemini'}
+                  </button>
+                </div>
+              )}
+
+              {/* AI Fallback Notice Banner (when Gemini was offline or quota reached during explicit request) */}
+              {transformation.isFallback && !transformation.needsAiGeneration && (
+                <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200/90 shadow-2xs flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-amber-900">
+                  <div className="flex items-start gap-2.5">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
+                    <div>
+                      <div className="font-bold text-amber-950 flex items-center gap-2 flex-wrap">
+                        <span>{isEn ? 'AI Pedagogical Enrichment Temporarily Unavailable' : 'Enriquecimento por IA Temporariamente Indisponível'}</span>
+                        {transformation.cooldownSecondsRemaining ? (
+                          <span className="text-[10px] px-2 py-0.5 rounded-md bg-amber-200/70 text-amber-900 font-bold">
+                            {isEn ? `Cooldown: ${transformation.cooldownSecondsRemaining}s` : `Aguarde: ${transformation.cooldownSecondsRemaining}s`}
+                          </span>
+                        ) : null}
+                      </div>
+                      <p className="text-amber-800 text-[11px] mt-0.5">
+                        {transformation.aiNotice ||
+                          (isEn
+                            ? 'Displaying direct notes faithful to teacher markings. Detailed explanations and exercises are paused.'
+                            : 'Exibindo notas diretas fiéis às marcações do professor. Explicações detalhadas e exercícios pausados.')}
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => loadPedagogicalNotes(true)}
+                    disabled={isLoadingTransformation}
+                    className="px-3 py-1.5 rounded-xl bg-white border border-amber-300 hover:bg-amber-100/60 text-amber-950 font-bold text-xs shrink-0 transition cursor-pointer shadow-2xs disabled:opacity-50"
+                  >
+                    {isEn ? 'Retry with Gemini' : 'Tentar com Gemini'}
+                  </button>
+                </div>
+              )}
+
               {/* Minimalist Top Context Strip */}
               {activeTab !== 'all' ? (
                 <div className="px-4 py-2 rounded-xl bg-white border border-slate-200/80 shadow-2xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs text-slate-600">
