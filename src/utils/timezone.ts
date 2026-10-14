@@ -54,16 +54,35 @@ export function formatDateInTimeZone(
   timeZone: string = DEFAULT_STUDENT_TIMEZONE,
   lang: 'pt' | 'en' = 'pt'
 ): string {
+  if (!isoDateString) return '';
+  const trimmed = isoDateString.trim();
+
+  // Pure calendar date in YYYY-MM-DD format (no time or timezone offset)
+  // Must be formatted as a calendar date without UTC offset shifting the day
+  const isPureCalendarDate = /^\d{4}-\d{2}-\d{2}$/.test(trimmed);
+  if (isPureCalendarDate) {
+    const [y, m, d] = trimmed.split('-').map(Number);
+    // Construct UTC date at 12:00 UTC to prevent boundary shifts across any calendar
+    const dateObj = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+    return dateObj.toLocaleDateString(lang === 'en' ? 'en-US' : 'pt-BR', {
+      timeZone: 'UTC',
+      weekday: 'short',
+      day: 'numeric',
+      month: 'short',
+    });
+  }
+
+  // Real timestamps with time component / timezone offset
   try {
-    const d = new Date(isoDateString);
+    const d = new Date(trimmed);
     return d.toLocaleDateString(lang === 'en' ? 'en-US' : 'pt-BR', {
-      timeZone,
+      timeZone: sanitizeTimeZone(timeZone),
       weekday: 'short',
       day: 'numeric',
       month: 'short',
     });
   } catch {
-    return new Date(isoDateString).toLocaleDateString(lang === 'en' ? 'en-US' : 'pt-BR', {
+    return new Date(trimmed).toLocaleDateString(lang === 'en' ? 'en-US' : 'pt-BR', {
       weekday: 'short',
       day: 'numeric',
       month: 'short',

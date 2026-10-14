@@ -141,6 +141,13 @@ import {
   profileWord,
 } from './src/utils/pedagogicalStorySynthesizer';
 import { analyzeSentenceGrammarDeterministic } from './src/utils/writingChecker';
+import crypto from 'crypto';
+import { parseNotesHtml } from './src/utils/notesHtmlParser';
+import {
+  generateLocalPedagogicalTransformation,
+  getCanonicalSessionKey,
+  computeNotesHash,
+} from './src/utils/pedagogicalTransformer';
 import {
   firebaseAuthMiddleware,
   requireAdmin,
@@ -7458,6 +7465,26 @@ app.post('/api/session-notes', async (req, res) => {
     });
   }
 
+  // Invalidate cached pedagogical transformation for this session to ensure next fetch re-analyzes fresh notes
+  const canonicalSessionKey = getCanonicalSessionKey({
+    lessonId,
+    sessionKey,
+    id,
+    studentUid,
+    studentEmail: cleanEmail,
+    sessionDate: cleanDate,
+  });
+
+  if (db.pedagogicalTransformationsMap) {
+    delete db.pedagogicalTransformationsMap[canonicalSessionKey];
+    if (sessionKey) delete db.pedagogicalTransformationsMap[sessionKey];
+    if (id) delete db.pedagogicalTransformationsMap[id];
+    if (lessonId) {
+      delete db.pedagogicalTransformationsMap[lessonId];
+      delete db.pedagogicalTransformationsMap[`lesson_${lessonId.replace(/^lesson_/, '')}`];
+    }
+  }
+
   await writeDbSync(db);
 
   // Asynchronously persist to Cloud Firestore under /session_notes/{sessionKey} and /users/{studentId}/session_notes
@@ -7668,12 +7695,53 @@ app.get('/api/drive/files/:fileId/download', (req, res) => {
 app.get('/api/session-notes', async (req, res) => {
   const db = readDb();
   const id = (req.query.id as string) || '';
+  const lessonId = (req.query.lessonId as string) || '';
   const studentEmail = ((req.query.studentEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
   const studentUid = ((req.query.studentUid as string) || (req.query.uid as string) || '').trim();
   const sessionDate = (req.query.sessionDate as string) || '';
 
-  if (id && db.sessionNotesMap?.[id]) {
-    return res.json(db.sessionNotesMap[id]);
+  // Direct lookup by id, lessonId, or canonical key
+  if (id || lessonId) {
+    const targetKey = id || lessonId;
+    const cleanId = targetKey.replace(/^lesson_/, '');
+    if (db.sessionNotesMap?.[targetKey]) {
+      return res.json(db.sessionNotesMap[targetKey]);
+    }
+    if (db.sessionNotesMap?.[`lesson_${cleanId}`]) {
+      return res.json(db.sessionNotesMap[`lesson_${cleanId}`]);
+    }
+    if (db.sessionNotesMap?.[cleanId]) {
+      return res.json(db.sessionNotesMap[cleanId]);
+    }
+    const foundDoc = Object.values(db.sessionNotesMap || {}).find(
+      (n: any) => n.id === targetKey || n.lessonId === targetKey || n.lessonId === cleanId || n.id === `lesson_${cleanId}`
+    );
+    if (foundDoc) {
+      return res.json(foundDoc);
+    }
+    // Also check liveLessons
+    if (Array.isArray(db.liveLessons)) {
+      const matchLesson = db.liveLessons.find((l: any) => l.id === targetKey || l.id === cleanId);
+      if (matchLesson && (matchLesson.sessionNotesDocument || matchLesson.liveNotes || matchLesson.recommendations)) {
+        const lDate = matchLesson.sessionDate || (matchLesson.startDateTime ? matchLesson.startDateTime.split('T')[0] : '');
+        return res.json({
+          id: matchLesson.id,
+          sessionDate: lDate,
+          lessonId: matchLesson.id,
+          studentEmail: matchLesson.studentEmail,
+          studentUid: matchLesson.studentUid,
+          teacherEmail: matchLesson.teacherEmail || matchLesson.tutorEmail || 'adm.itissimple@gmail.com',
+          teacherName: matchLesson.teacherName || matchLesson.tutorName || 'Native Friend',
+          topic: matchLesson.title || 'Conversation & Fluency',
+          content: matchLesson.sessionNotesDocument || matchLesson.liveNotes || matchLesson.recommendations || '',
+          driveFileId: matchLesson.driveFileId,
+          driveFileUrl: matchLesson.driveFileUrl,
+          driveFolderName: matchLesson.driveFolderName,
+          driveLastSyncedAt: matchLesson.driveLastSyncedAt,
+          updatedAt: matchLesson.updatedAt || matchLesson.notesLastSavedAt || new Date().toISOString(),
+        });
+      }
+    }
   }
 
   if (studentUid || studentEmail) {
@@ -7792,263 +7860,7 @@ function generateServerPedagogicalFallback(params: {
   lessonId?: string;
   sessionKey?: string;
 }) {
-  const {
-    rawNotes,
-    topic = 'Conversation & Fluency',
-    sessionDate = new Date().toISOString().split('T')[0],
-    teacherName = 'Native Friend',
-    studentLevel = 'intermediario',
-    studentUid,
-    studentEmail,
-    lessonId,
-    sessionKey = lessonId || `session_${sessionDate}`,
-  } = params;
-
-  const lvl = String(studentLevel).toLowerCase();
-  const cefr = lvl.includes('avancado') || lvl.includes('c1') || lvl.includes('c2')
-    ? 'C1'
-    : lvl.includes('iniciante') || lvl.includes('a1') || lvl.includes('a2')
-    ? 'A2'
-    : 'B1';
-
-  // Extract markings for Alt+N, Alt+W, Alt+P, Alt+Y
-  const tagCorrect = (rawNotes.match(/data-tag-type=["']correct["']/g) || []).length;
-  const tagIncorrect = (rawNotes.match(/data-tag-type=["']incorrect["']/g) || []).length;
-  const tagNewWord = (rawNotes.match(/data-tag-type=["']new-word["']/g) || []).length;
-  const tagPronounce = (rawNotes.match(/data-tag-type=["']pronounce["']/g) || []).length;
-
-  const plainCorrect = (rawNotes.replace(/<span[^>]*data-tag-type=["']correct["'][^>]*>[\s\S]*?<\/span>/gi, '').match(/✓|✔/g) || []).length;
-  const plainIncorrect = (rawNotes.replace(/<span[^>]*data-tag-type=["']incorrect["'][^>]*>[\s\S]*?<\/span>/gi, '').match(/✗|✖/g) || []).length;
-  const plainNewWord = (rawNotes.replace(/<span[^>]*data-tag-type=["']new-word["'][^>]*>[\s\S]*?<\/span>/gi, '').match(/\[New Word\]/gi) || []).length;
-  const plainPronounce = (rawNotes.replace(/<span[^>]*data-tag-type=["']pronounce["'][^>]*>[\s\S]*?<\/span>/gi, '').match(/\[Pronounce\]/gi) || []).length;
-
-  const correctCount = tagCorrect + plainCorrect;
-  const incorrectCount = tagIncorrect + plainIncorrect;
-  const newWordCount = tagNewWord + plainNewWord;
-  const pronounceCount = tagPronounce + plainPronounce;
-
-  const cleanText = rawNotes.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-
-  // Extract Alt+W and Alt+P terms from rawNotes
-  const extractedNewWords: string[] = [];
-  const extractedPronounce: string[] = [];
-
-  const rawLines = rawNotes.split(/<br\s*[\/]?>|\n|<\/div>|<\/p>/gi).map((l) => l.trim()).filter(Boolean);
-  rawLines.forEach((line) => {
-    if (/data-tag-type=["']new-word["']|\[New Word\]/i.test(line)) {
-      const term = line
-        .replace(/<[^>]+>/g, '')
-        .replace(/\[New Word\]/gi, '')
-        .replace(/✦/g, '')
-        .trim();
-      if (term && term.length > 1 && !term.toLowerCase().includes('in-session notes')) {
-        extractedNewWords.push(term);
-      }
-    } else if (/data-tag-type=["']pronounce["']|\[Pronounce\]/i.test(line)) {
-      const term = line
-        .replace(/<[^>]+>/g, '')
-        .replace(/\[Pronounce\]/gi, '')
-        .replace(/🎯/g, '')
-        .trim();
-      if (term && term.length > 1 && !term.toLowerCase().includes('in-session notes')) {
-        extractedPronounce.push(term);
-      }
-    }
-  });
-
-  const mistakesAnalysis = [
-    {
-      id: 'mistake-1',
-      original: rawNotes.includes('agree') ? "I'm agree with you" : 'I have 28 years old',
-      corrected: rawNotes.includes('agree') ? 'I agree with you' : 'I am 28 years old',
-      category: 'grammar',
-      explanation: rawNotes.includes('agree')
-        ? '"Agree" is an active verb in English, not an adjective. Do not put the auxiliary "am" before it in present simple.'
-        : 'In English, age is expressed using the verb "to be", reflecting an ongoing physical state, not "have".',
-      twoExamples: [
-        rawNotes.includes('agree') ? 'I agree with your suggestion.' : 'She is 30 years old.',
-        rawNotes.includes('agree') ? 'Do you agree with the manager?' : 'When I was 20, I lived abroad.',
-      ],
-      commonPitfalls: rawNotes.includes('agree')
-        ? 'Saying "I am agree" because of Portuguese "Estou de acordo".'
-        : 'Translating Portuguese "Eu tenho ... anos" directly as "I have ... years".',
-    },
-    {
-      id: 'mistake-2',
-      original: rawNotes.includes('depend') ? 'It depends of the weather' : 'Can I make a question?',
-      corrected: rawNotes.includes('depend') ? 'It depends on the weather' : 'Can I ask a question?',
-      category: rawNotes.includes('depend') ? 'preposition' : 'collocation',
-      explanation: rawNotes.includes('depend')
-        ? 'The verb "depend" strictly collocates with the preposition "on", never "of".'
-        : 'In natural English, questions are asked ("ask a question"), never "made".',
-      twoExamples: [
-        rawNotes.includes('depend') ? 'Our trip depends on the budget.' : 'May I ask a quick question?',
-        rawNotes.includes('depend') ? 'Success depends on consistency.' : 'He asked me about our project.',
-      ],
-      commonPitfalls: rawNotes.includes('depend')
-        ? 'Using "depend of" due to Portuguese "depende de".'
-        : 'Translating "fazer uma pergunta" as "make a question".',
-    },
-  ];
-
-  const grammarPoints = [
-    {
-      id: 'grammar-1',
-      topic: 'Stative & Opinion Verbs: Agree, Believe, Need',
-      rule: 'Verbs that describe mental states or opinions do not combine with the verb "to be" in simple affirmative statements.',
-      form: 'Subject + Verb (e.g., I agree) | Subject + don\'t/doesn\'t + Verb (e.g., I don\'t agree)',
-      usage: 'Used to communicate personal perspectives, consensus, or agreements clearly in daily talks.',
-      examples: [
-        'I completely agree with your proposal.',
-        'We don\'t agree on every detail, but we respect each other\'s view.',
-      ],
-      commonMistakes: 'Saying "I am agree" or "Are you agree?".',
-      comparisons: 'I agree (Verb) vs I am in agreement (Formal idiom).',
-    },
-    {
-      id: 'grammar-2',
-      topic: 'Dependent Prepositions with Common Verbs (Depend on, Wait for, Listen to)',
-      rule: 'Certain English verbs take fixed prepositions before their object. These must be acquired as fixed units.',
-      form: 'Verb + Fixed Preposition + Object',
-      usage: 'Expressing relationships, dependencies, and focus.',
-      examples: [
-        'My weekend plans depend on my energy levels.',
-        'I am listening to the morning news podcast.',
-      ],
-      commonMistakes: 'Saying "depend of" or "listen music" without "to".',
-      comparisons: 'Depend ON vs Wait FOR vs Listen TO.',
-    },
-  ];
-
-  const vocabularyAndExpressions: any[] = [];
-
-  // Add words stamped with Alt+W (New Word)
-  extractedNewWords.forEach((word, idx) => {
-    vocabularyAndExpressions.push({
-      id: `vocab-nw-${idx + 1}`,
-      term: word,
-      partOfSpeech: 'New Expression',
-      simpleDefinition: `A high-impact term stamped during session to enrich your vocabulary about ${topic}.`,
-      collocations: [`use "${word}" in context`, `actively practicing "${word}"`],
-      realExamples: [`In conversation: "${word}" makes your speech sound authentic and natural.`],
-      synonyms: ['expressive phrasing'],
-      register: 'neutral',
-      category: 'New Words & Expressions (Alt+W)',
-    });
-  });
-
-  // Add words stamped with Alt+P (Pronounce)
-  extractedPronounce.forEach((word, idx) => {
-    vocabularyAndExpressions.push({
-      id: `vocab-pr-${idx + 1}`,
-      term: word,
-      partOfSpeech: 'Pronunciation Focus',
-      simpleDefinition: `Pronunciation focus: ensure accurate syllable stress and clear vowel articulation without final epenthetic vowel.`,
-      collocations: [`pronounce "${word}" cleanly`, `stress pattern of "${word}"`],
-      realExamples: [`Speak aloud: practice "${word}" 3 times smoothly.`],
-      synonyms: ['phonetic clarity'],
-      register: 'neutral',
-      category: 'Pronunciation & Phonetics (Alt+P)',
-      phoneticGuide: `🎯 Pronunciation focus: practice clean stress and clear ending consonant on "${word}".`,
-      isPronunciationFocus: true,
-    });
-  });
-
-  // Default vocabulary if none stamped
-  if (vocabularyAndExpressions.length === 0) {
-    vocabularyAndExpressions.push(
-      {
-        id: 'vocab-1',
-        term: 'catch up',
-        partOfSpeech: 'Phrasal Verb',
-        simpleDefinition: 'To speak with someone you haven’t seen recently to share updates and news.',
-        collocations: ['catch up with a friend', 'catch up on work', 'play catch-up'],
-        realExamples: [
-          'Let’s grab coffee tomorrow to catch up.',
-          'I spent the morning catching up on emails.',
-        ],
-        synonyms: ['reconnect', 'update', 'chat'],
-        register: 'informal',
-        category: 'Phrasal Verbs & Social Life',
-      },
-      {
-        id: 'vocab-2',
-        term: 'streamline',
-        partOfSpeech: 'Verb',
-        simpleDefinition: 'To make a system, workflow, or process more efficient and simpler.',
-        collocations: ['streamline the process', 'streamline operations', 'streamline workflow'],
-        realExamples: [
-          'We implemented a new tool to streamline weekly reporting.',
-          'Streamlining your daily routine frees up valuable time.',
-        ],
-        synonyms: ['optimize', 'simplify', 'improve'],
-        register: 'formal',
-        category: 'Work & Productivity',
-      },
-      {
-        id: 'vocab-3',
-        term: 'make sense',
-        partOfSpeech: 'Idiomatic Phrase',
-        simpleDefinition: 'To be logical, practical, or easy to understand.',
-        collocations: ['that makes a lot of sense', 'make sense to do something', 'doesn’t make sense'],
-        realExamples: [
-          'Does that explanation make sense to you?',
-          'It makes total sense to practice speaking 15 minutes a day.',
-        ],
-        synonyms: ['be logical', 'be reasonable'],
-        register: 'neutral',
-        category: 'Everyday Fluency',
-      }
-    );
-  }
-
-  const levelAdaptation = {
-    cefrLevel: cefr as any,
-    levelLabel: cefr === 'C1' ? 'Advanced (C1-C2)' : cefr === 'B1' ? 'Intermediate (B1-B2)' : 'Elementary (A1-A2)',
-    nativeInterferenceNotes:
-      cefr === 'A2'
-        ? 'At this stage, Portuguese speakers often translate word-for-word ("I have 25 years", "is raining" without "it"). Focus on clear declarative S-V-O patterns and anchor prepositions (in/on/at).'
-        : 'At the intermediate level, Portuguese speakers communicate smoothly but trip over prepositions ("depend on", "interested in") and false friends ("actually" vs "currently", "pretend" vs "intend"). Pay close attention to verbal collocations.',
-    complexityAdjustmentAdvice: 'Keep explanations concise and repeat corrected phrases aloud 3 times before your next session.',
-    targetedPracticePrompt: `Describe your thoughts on "${topic}", making sure to incorporate at least two corrected structures and vocabulary items.`,
-  };
-
-  // Quick Review: MANDATORILY includes ALL corrections, ALL vocabulary, and ALL rules
-  const reviewSummary = {
-    estimatedMinutes: '5–10 minutes',
-    keyRules: grammarPoints.map((g) => `${g.topic}: ${g.rule}`),
-    mustKnowVocabulary: vocabularyAndExpressions.map((v) => {
-      const tag = v.isPronunciationFocus ? '🎯 [Pronounce]' : '✨';
-      return `${tag} ${v.term} (${v.partOfSpeech}) — ${v.simpleDefinition}`;
-    }),
-    essentialCorrections: mistakesAnalysis.map((m) => ({
-      original: m.original,
-      corrected: m.corrected,
-      explanation: m.explanation,
-    })),
-    rememberThis: `Remember this: Instead of saying "${mistakesAnalysis[0]?.original || 'the mistake'}", always say "${mistakesAnalysis[0]?.corrected || 'the correction'}"! Consistent small shifts in your active vocabulary build unstoppable speaking confidence.`,
-  };
-
-  return {
-    lessonId,
-    sessionKey,
-    sessionDate,
-    topic,
-    teacherName,
-    studentLevel: String(studentLevel),
-    cefrLevel: cefr,
-    mistakesAnalysis,
-    grammarPoints,
-    vocabularyAndExpressions,
-    levelAdaptation,
-    reviewSummary,
-    rawNotesSnippet: cleanText.slice(0, 300),
-    correctStampsCount: correctCount,
-    incorrectStampsCount: incorrectCount,
-    newWordStampsCount: newWordCount,
-    pronounceStampsCount: pronounceCount,
-    generatedAt: new Date().toISOString(),
-  };
+  return generateLocalPedagogicalTransformation(params as any);
 }
 
 function syncTransformationVocabToDictionary(
@@ -8132,17 +7944,26 @@ app.post('/api/pedagogical-notes/transform', async (req, res) => {
   } = req.body || {};
 
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
-  const sessionKey =
-    customSessionKey ||
-    lessonId ||
-    `session_${sessionDate}_${(studentUid || cleanEmail).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+  const canonicalSessionKey = getCanonicalSessionKey({
+    lessonId,
+    sessionKey: customSessionKey,
+    studentUid,
+    studentEmail: cleanEmail,
+    sessionDate,
+  });
+  const contentHash = computeNotesHash(rawNotes);
 
-  // Check cache first if not explicitly regenerating
-  if (!forceRegenerate && db.pedagogicalTransformationsMap[sessionKey]) {
+  // Check cache first if not explicitly regenerating: verify canonical key and content hash
+  const cached =
+    db.pedagogicalTransformationsMap[canonicalSessionKey] ||
+    (customSessionKey ? db.pedagogicalTransformationsMap[customSessionKey] : undefined) ||
+    (lessonId ? db.pedagogicalTransformationsMap[lessonId] : undefined);
+
+  if (!forceRegenerate && cached && cached.contentHash && cached.contentHash === contentHash) {
     return res.json({
       success: true,
       cached: true,
-      transformation: db.pedagogicalTransformationsMap[sessionKey],
+      transformation: cached,
     });
   }
 
@@ -8153,21 +7974,12 @@ app.post('/api/pedagogical-notes/transform', async (req, res) => {
     ? 'A2'
     : 'B1';
 
-  // Markings detection for Alt+N, Alt+W, Alt+P, Alt+Y
-  const tagCorrect = (rawNotes.match(/data-tag-type=["']correct["']/g) || []).length;
-  const tagIncorrect = (rawNotes.match(/data-tag-type=["']incorrect["']/g) || []).length;
-  const tagNewWord = (rawNotes.match(/data-tag-type=["']new-word["']/g) || []).length;
-  const tagPronounce = (rawNotes.match(/data-tag-type=["']pronounce["']/g) || []).length;
-
-  const plainCorrect = (rawNotes.replace(/<span[^>]*data-tag-type=["']correct["'][^>]*>[\s\S]*?<\/span>/gi, '').match(/✓|✔/g) || []).length;
-  const plainIncorrect = (rawNotes.replace(/<span[^>]*data-tag-type=["']incorrect["'][^>]*>[\s\S]*?<\/span>/gi, '').match(/✗|✖/g) || []).length;
-  const plainNewWord = (rawNotes.replace(/<span[^>]*data-tag-type=["']new-word["'][^>]*>[\s\S]*?<\/span>/gi, '').match(/\[New Word\]/gi) || []).length;
-  const plainPronounce = (rawNotes.replace(/<span[^>]*data-tag-type=["']pronounce["'][^>]*>[\s\S]*?<\/span>/gi, '').match(/\[Pronounce\]/gi) || []).length;
-
-  const correctCount = tagCorrect + plainCorrect;
-  const incorrectCount = tagIncorrect + plainIncorrect;
-  const newWordCount = tagNewWord + plainNewWord;
-  const pronounceCount = tagPronounce + plainPronounce;
+  // Parse notes using robust notesHtmlParser
+  const markings = parseNotesHtml(rawNotes);
+  const correctCount = markings.correctCount;
+  const incorrectCount = markings.incorrectCount;
+  const newWordCount = markings.newWordCount;
+  const pronounceCount = markings.pronounceCount;
 
   const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || '';
 
@@ -8186,24 +7998,20 @@ app.post('/api/pedagogical-notes/transform', async (req, res) => {
 Your mission is to transform raw in-session teacher notes into an ultra-structured, masterclass pedagogical report for the student.
 The student MUST NEVER see raw, fragmented notes. Instead, they receive a polished, elegant learning guide calibrated to their CEFR level (${cefr}).
 
-CRITICAL INSTRUCTIONS ON TEACHER SHORTCUT MARKINGS & TAB ROUTING:
-1. Alt + N (Error / Incorrect Markings):
-   - Items stamped with 'data-tag-type="incorrect"', '✗', 'Instead of:', or error lines MUST be directed and processed appropriately into:
-     a) "mistakesAnalysis" (Tab 1: Analyze Mistakes): student's original faulty utterance, natural native correction, category, grammatical explanation (addressing Brazilian Portuguese L1 interference), two natural examples, and common pitfalls.
-     b) "grammarPoints" (Tab 2: Grammar Points): whenever an error involves a systemic grammatical rule/structure (e.g. verb tenses, stative verbs, auxiliary verbs, dependent prepositions, conditionals, modals, word order), elaborate the corresponding rule with syntax (FORM), usage, examples, and comparisons.
-2. Alt + W (New Word) & Alt + P (Pronunciation Markings):
-   - Items stamped with 'data-tag-type="new-word"', '[New Word]', 'data-tag-type="pronounce"', '[Pronounce]' MUST be directed and processed into:
-     "vocabularyAndExpressions" (Tab 3: Vocabulary & Expressions).
-   - For Alt+W: provide part of speech, register, simple definition adapted to CEFR ${cefr}, collocations, real examples, and synonyms.
-   - For Alt+P: mark partOfSpeech as "Pronunciation Focus", provide clear syllable stress breakdown, phonetic guide, common Brazilian Portuguese mispronunciations to avoid, and conversational examples.
-3. CEFR LEVEL ADAPTATION:
-   - There is NO separate CEFR tab. Instead, ALL tabs (Complete Report, 1. Analyze Mistakes, 2. Grammar Points, 3. Vocabulary & Expressions, and Quick Review) MUST be intelligently and deeply elaborated respecting and adapting to the student's current CEFR level (${cefr}).
-4. QUICK REVIEW MANDATE:
-   - ALL session notes, corrections, and processed terms MUST compose the Quick Review ("reviewSummary").
-   - "essentialCorrections": MUST contain ALL items from mistakesAnalysis.
-   - "mustKnowVocabulary": MUST contain ALL terms from vocabularyAndExpressions (both Alt+W and Alt+P).
-   - "keyRules": MUST contain ALL grammar rules from grammarPoints.
-   - "rememberThis": High-impact golden takeaway rule for the student.
+CRITICAL FIDELITY MANDATE (ZERO HALLUCINATION / ZERO INVENTED EXAMPLES):
+1. Analyze Mistakes (mistakesAnalysis):
+   - ONLY include real mistakes marked by the teacher in the notes.
+   - If the teacher did not inform the correction (e.g., student said a word/phrase marked with incorrect, but no correction was provided), DO NOT invent or guess the correction. Set "corrected": "Pendente de confirmação com o professor" and set "isPendingConfirmation": true.
+   - NEVER insert mocked or unrelated examples (such as "I have 28 years old" or "It depends of the weather") when they do not appear in the teacher notes.
+   - If no mistakes were marked in the notes, return an empty array [] for mistakesAnalysis.
+2. Grammar Points (grammarPoints):
+   - ONLY explain grammatical rules directly related to the real errors when there is sufficient systemic evidence in the notes.
+   - If there are no systemic grammar errors in the notes, return an empty array [] for grammarPoints. NEVER invent arbitrary grammar rules.
+3. Vocabulary & Expressions (vocabularyAndExpressions):
+   - Work EXCLUSIVELY with terms marked by the teacher as Alt+W (new-word) or Alt+P (pronounce).
+   - If no terms were stamped with new-word or pronounce, return an empty array [] for vocabularyAndExpressions. NEVER insert mocked words like "catch up" or "workload".
+4. Quick Review (reviewSummary):
+   - Accurately summarize ONLY the real information from the other categories.
 
 You MUST produce a JSON object strictly conforming to this schema:
 {
@@ -8211,11 +8019,12 @@ You MUST produce a JSON object strictly conforming to this schema:
     {
       "id": "mistake-1",
       "original": "Student's original faulty utterance",
-      "corrected": "Polished, natural native correction",
+      "corrected": "Polished correction or 'Pendente de confirmação com o professor'",
       "category": "grammar" | "vocabulary" | "collocation" | "preposition" | "pronunciation" | "phrasing",
-      "explanation": "Crystal clear grammatical rule explanation highlighting why the error occurred and how to fix it, calibrated to CEFR ${cefr}",
-      "twoExamples": ["Example 1 in natural context", "Example 2 in natural context"],
-      "commonPitfalls": "Common mistake learners make with this structure (especially Portuguese L1 interference)"
+      "explanation": "Clear explanation calibrated to CEFR ${cefr}",
+      "twoExamples": ["Example 1", "Example 2"],
+      "commonPitfalls": "Common mistake learners make with this structure",
+      "isPendingConfirmation": false
     }
   ],
   "grammarPoints": [
@@ -8227,7 +8036,7 @@ You MUST produce a JSON object strictly conforming to this schema:
       "usage": "When and why native speakers use this",
       "examples": ["Example 1", "Example 2"],
       "commonMistakes": "Mistake to avoid",
-      "comparisons": "Contrast with other structures or Portuguese interference"
+      "comparisons": "Contrast with other structures"
     }
   ],
   "vocabularyAndExpressions": [
@@ -8240,16 +8049,17 @@ You MUST produce a JSON object strictly conforming to this schema:
       "realExamples": ["Real-world sentence 1", "Real-world sentence 2"],
       "synonyms": ["Synonym 1", "Synonym 2"],
       "register": "informal" | "neutral" | "formal" | "idiomatic",
-      "category": "Thematic category or 'Pronunciation & Phonetics (Alt+P)' / 'New Words (Alt+W)'",
-      "phoneticGuide": "Phonetic / stress guide if pronunciation item"
+      "category": "Thematic category or 'Pronunciation & Phonetics (Alt+P)' / 'New Words & Expressions (Alt+W)'",
+      "phoneticGuide": "Phonetic / stress guide if pronunciation item",
+      "isPronunciationFocus": false
     }
   ],
   "reviewSummary": {
     "estimatedMinutes": "5–10 minutes",
-    "keyRules": ["All key grammar rules covered"],
-    "mustKnowVocabulary": ["All vocabulary and pronunciation items with definitions"],
+    "keyRules": ["Key grammar rules covered"],
+    "mustKnowVocabulary": ["Vocabulary and pronunciation items with definitions"],
     "essentialCorrections": [{"original": "...", "corrected": "..."}],
-    "rememberThis": "Single most memorable, high-impact golden takeaway rule for the student"
+    "rememberThis": "Memorable takeaway focused on the session items"
   }
 }
 
@@ -8267,7 +8077,7 @@ Raw In-Session Notes to transform:
 ${rawNotes}
 """
 
-Please synthesize and transform these notes according to the Alt+N, Alt+W, and Alt+P routing rules, adapting deeply to CEFR ${cefr}, and ensuring ALL items are included in the Quick Review.`;
+Please synthesize and transform these notes strictly adhering to the real markings without inventing errors or vocabulary.`;
 
       const candidateModels = ['gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
 
@@ -8280,11 +8090,11 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
               config: {
                 systemInstruction,
                 responseMimeType: 'application/json',
-                temperature: 0.6,
+                temperature: 0.4,
               },
             }),
             new Promise<never>((_, reject) =>
-              setTimeout(() => reject(new Error(`Timeout model ${model}`)), 16000)
+              setTimeout(() => reject(new Error('TIMEOUT')), 16000)
             ),
           ]);
 
@@ -8293,23 +8103,123 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
             const parsed = JSON.parse(cleanText);
 
             if (parsed && Array.isArray(parsed.mistakesAnalysis)) {
-              // Ensure Quick Review contains ALL corrections and vocabulary
-              const allCorrections = parsed.mistakesAnalysis.map((m: any) => ({
+              // Strict validation against markings
+              const rawErrMap = new Map<string, typeof markings.errors[0]>();
+              markings.errors.forEach((e) => rawErrMap.set(e.original.toLowerCase().trim(), e));
+
+              const validatedMistakes: any[] = [];
+              (parsed.mistakesAnalysis || []).forEach((m: any) => {
+                const origKey = String(m?.original || '').toLowerCase().trim();
+                const rawErr = rawErrMap.get(origKey);
+                if (rawErr) {
+                  const isUnconfirmed = rawErr.isPendingConfirmation || !rawErr.corrected;
+                  validatedMistakes.push({
+                    id: `mistake-${validatedMistakes.length + 1}`,
+                    original: rawErr.original,
+                    corrected: isUnconfirmed ? 'Pendente de confirmação com o professor' : (rawErr.corrected || m.corrected),
+                    category: m.category || 'grammar',
+                    explanation: isUnconfirmed
+                      ? `A forma corrigida para "${rawErr.original}" não foi informada na aula. Confirme com seu Native Friend na próxima sessão para validar o contexto exato.`
+                      : (m.explanation || `In natural spoken English, phrasing this structure as "${m.corrected || rawErr.corrected}" is the native formulation.`),
+                    twoExamples: isUnconfirmed ? [] : (Array.isArray(m.twoExamples) ? m.twoExamples : []),
+                    commonPitfalls: isUnconfirmed ? 'Aguardando confirmação do professor sobre o contexto específico de uso.' : (m.commonPitfalls || ''),
+                    isPendingConfirmation: isUnconfirmed,
+                  });
+                  rawErrMap.delete(origKey);
+                }
+              });
+
+              // Any raw error that the model missed
+              rawErrMap.forEach((rawErr) => {
+                const isUnconfirmed = rawErr.isPendingConfirmation || !rawErr.corrected;
+                validatedMistakes.push({
+                  id: `mistake-${validatedMistakes.length + 1}`,
+                  original: rawErr.original,
+                  corrected: isUnconfirmed ? 'Pendente de confirmação com o professor' : rawErr.corrected,
+                  category: 'vocabulary',
+                  explanation: isUnconfirmed
+                    ? `A forma corrigida para "${rawErr.original}" não foi informada na aula. Confirme com seu Native Friend na próxima sessão para validar o contexto exato.`
+                    : `In natural spoken English, phrasing this structure as "${rawErr.corrected}" is the native formulation.`,
+                  twoExamples: isUnconfirmed ? [] : [`In everyday conversation: "${rawErr.corrected}".`],
+                  commonPitfalls: isUnconfirmed ? 'Aguardando confirmação do professor sobre o contexto específico de uso.' : '',
+                  isPendingConfirmation: isUnconfirmed,
+                });
+              });
+
+              // Strict validation of vocabulary: terms MUST be in markings.newWords or markings.pronounceItems
+              const validTermsSet = new Set<string>([
+                ...markings.newWords.map((w) => w.toLowerCase().trim()),
+                ...markings.pronounceItems.map((p) => p.toLowerCase().trim()),
+              ]);
+
+              const validatedVocab: any[] = [];
+              (parsed.vocabularyAndExpressions || []).forEach((v: any) => {
+                const termKey = String(v?.term || '').toLowerCase().trim();
+                if (validTermsSet.has(termKey)) {
+                  const isPronounce = markings.pronounceItems.some((p) => p.toLowerCase().trim() === termKey);
+                  validatedVocab.push({
+                    ...v,
+                    id: `vocab-${validatedVocab.length + 1}`,
+                    isPronunciationFocus: isPronounce,
+                  });
+                  validTermsSet.delete(termKey);
+                }
+              });
+
+              validTermsSet.forEach((missedKey) => {
+                const isPronounce = markings.pronounceItems.some((p) => p.toLowerCase().trim() === missedKey);
+                const originalTerm =
+                  markings.pronounceItems.find((p) => p.toLowerCase().trim() === missedKey) ||
+                  markings.newWords.find((w) => w.toLowerCase().trim() === missedKey) ||
+                  missedKey;
+                validatedVocab.push({
+                  id: `vocab-${validatedVocab.length + 1}`,
+                  term: originalTerm,
+                  partOfSpeech: isPronounce ? 'Pronunciation Focus' : 'Vocabulary Item',
+                  simpleDefinition: isPronounce
+                    ? `Pronunciation focus: Pay careful attention to syllable stress, vowel reduction, and clear articulation of "${originalTerm}".`
+                    : `Key communicative expression (${cefr}): used in conversation to communicate "${originalTerm}" clearly and naturally.`,
+                  collocations: [`use "${originalTerm}" naturally`],
+                  realExamples: [`In conversation: "I practiced using '${originalTerm}' today."`],
+                  synonyms: ['target phrase'],
+                  register: 'neutral',
+                  category: isPronounce ? 'Pronunciation & Phonetics (Alt+P)' : 'New Words & Expressions (Alt+W)',
+                  phoneticGuide: isPronounce ? `🎯 Pronunciation focus: practice clean syllable stress on "${originalTerm}".` : undefined,
+                  isPronunciationFocus: isPronounce,
+                });
+              });
+
+              // Strict validation of grammar: if no mistakes, grammar must be empty []
+              let validatedGrammar: any[] = [];
+              if (validatedMistakes.length > 0) {
+                validatedGrammar = Array.isArray(parsed.grammarPoints) ? parsed.grammarPoints : [];
+              }
+
+              const allCorrections = validatedMistakes.map((m: any) => ({
                 original: m.original,
                 corrected: m.corrected,
                 explanation: m.explanation,
               }));
 
-              const allVocab = (parsed.vocabularyAndExpressions || []).map((v: any) => {
-                const tag = v.partOfSpeech?.includes('Pronounc') || v.category?.includes('Pronounc') ? '🎯 [Pronounce]' : '✨';
+              const allVocab = validatedVocab.map((v: any) => {
+                const tag = v.isPronunciationFocus ? '🎯 [Pronounce]' : '✨';
                 return `${tag} ${v.term} (${v.partOfSpeech || 'Vocab'}) — ${v.simpleDefinition || ''}`;
               });
 
-              const allRules = (parsed.grammarPoints || []).map((g: any) => `${g.topic}: ${g.rule}`);
+              const allRules = validatedGrammar.map((g: any) => `${g.topic}: ${g.rule}`);
+
+              let rememberThis = 'Remember this: Fluency is not about never making mistakes; it is about recognizing patterns quickly and adopting natural native phraseology!';
+              if (validatedMistakes.length > 0) {
+                rememberThis = validatedMistakes[0].isPendingConfirmation
+                  ? `Lembre-se disto: Revise a expressão "${validatedMistakes[0].original}" com seu Native Friend para confirmar a formulação exata!`
+                  : `Remember this: Instead of saying "${validatedMistakes[0].original}", always say "${validatedMistakes[0].corrected}"! Consistent small shifts in your active vocabulary build unstoppable speaking confidence.`;
+              } else if (validatedVocab.length > 0) {
+                rememberThis = `Remember this: Active practice with your new expressions (${validatedVocab.map((v: any) => v.term).slice(0, 3).join(', ')}) turns passive recognition into spontaneous conversational confidence!`;
+              }
 
               const transformation = {
                 lessonId: lessonId || undefined,
-                sessionKey,
+                sessionKey: canonicalSessionKey,
                 sessionDate,
                 topic,
                 teacherName,
@@ -8317,9 +8227,10 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
                 studentEmail: cleanEmail,
                 studentLevel: String(studentLevel),
                 cefrLevel: cefr,
-                mistakesAnalysis: parsed.mistakesAnalysis,
-                grammarPoints: parsed.grammarPoints || [],
-                vocabularyAndExpressions: parsed.vocabularyAndExpressions || [],
+                contentHash,
+                mistakesAnalysis: validatedMistakes,
+                grammarPoints: validatedGrammar,
+                vocabularyAndExpressions: validatedVocab,
                 levelAdaptation: parsed.levelAdaptation || {
                   cefrLevel: cefr,
                   levelLabel: cefr === 'C1' ? 'Advanced' : cefr === 'B1' ? 'Intermediate' : 'Elementary',
@@ -8329,12 +8240,12 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
                 },
                 reviewSummary: {
                   estimatedMinutes: '5–10 minutes',
-                  keyRules: allRules.length > 0 ? allRules : parsed.reviewSummary?.keyRules || [],
-                  mustKnowVocabulary: allVocab.length > 0 ? allVocab : parsed.reviewSummary?.mustKnowVocabulary || [],
-                  essentialCorrections: allCorrections.length > 0 ? allCorrections : parsed.reviewSummary?.essentialCorrections || [],
-                  rememberThis: parsed.reviewSummary?.rememberThis || `Remember this: Instead of saying "${parsed.mistakesAnalysis[0]?.original || 'the mistake'}", always say "${parsed.mistakesAnalysis[0]?.corrected || 'the correction'}"!`,
+                  keyRules: allRules,
+                  mustKnowVocabulary: allVocab,
+                  essentialCorrections: allCorrections,
+                  rememberThis,
                 },
-                rawNotesSnippet: rawNotes.replace(/<[^>]+>/g, ' ').slice(0, 300),
+                rawNotesSnippet: markings.cleanText.slice(0, 300),
                 correctStampsCount: correctCount,
                 incorrectStampsCount: incorrectCount,
                 newWordStampsCount: newWordCount,
@@ -8342,7 +8253,7 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
                 generatedAt: new Date().toISOString(),
               };
 
-              db.pedagogicalTransformationsMap[sessionKey] = transformation;
+              db.pedagogicalTransformationsMap[canonicalSessionKey] = transformation;
               syncTransformationVocabToDictionary(transformation, studentUid, cleanEmail);
               await writeDbSync(db);
 
@@ -8353,16 +8264,16 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
               });
             }
           }
-        } catch (mErr) {
-          console.warn(`Pedagogical Gemini model ${model} error:`, mErr);
+        } catch (mErr: any) {
+          console.warn('Pedagogical Gemini model notice: [AI_UNAVAILABLE] ' + (mErr?.name || 'MODEL_FAILURE'));
         }
       }
-    } catch (apiErr) {
-      console.warn('Gemini API call failed, falling back to local synthesizer:', apiErr);
+    } catch (apiErr: any) {
+      console.warn('Gemini API call notice: [AI_UNAVAILABLE] ' + (apiErr?.name || 'API_FAILURE'));
     }
   }
 
-  // Local fallback
+  // Graceful deterministic fallback strictly faithful to notes
   const transformation = generateServerPedagogicalFallback({
     rawNotes,
     topic,
@@ -8372,10 +8283,10 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
     studentUid,
     studentEmail: cleanEmail,
     lessonId,
-    sessionKey,
+    sessionKey: canonicalSessionKey,
   });
 
-  db.pedagogicalTransformationsMap[sessionKey] = transformation;
+  db.pedagogicalTransformationsMap[canonicalSessionKey] = transformation;
   syncTransformationVocabToDictionary(transformation, studentUid, cleanEmail);
   await writeDbSync(db);
 

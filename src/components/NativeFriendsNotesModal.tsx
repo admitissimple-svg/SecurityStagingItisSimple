@@ -751,29 +751,33 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                               {item.category || 'Correction'}
                             </span>
                           </div>
-                          <button
-                            type="button"
-                            onClick={() => speakEnglish(item.corrected)}
-                            className="px-2.5 py-1 rounded-lg bg-slate-50 hover:bg-slate-100 text-[#1C4C96] text-xs flex items-center gap-1.5 font-bold cursor-pointer transition border border-slate-200"
-                            title={isEn ? 'Listen to natural pronunciation' : 'Ouvir pronúncia natural'}
-                          >
-                            <Volume2 className="w-3.5 h-3.5 text-[#1C4C96]" />
-                            <span className="text-[11px]">{isEn ? 'Listen' : 'Ouvir'}</span>
-                          </button>
+                          {!item.isPendingConfirmation && item.corrected && !item.corrected.includes('Pendente') && (
+                            <button
+                              type="button"
+                              onClick={() => speakEnglish(item.corrected)}
+                              className="px-2.5 py-1 rounded-lg bg-slate-50 hover:bg-slate-100 text-[#1C4C96] text-xs flex items-center gap-1.5 font-bold cursor-pointer transition border border-slate-200"
+                              title={isEn ? 'Listen to natural pronunciation' : 'Ouvir pronúncia natural'}
+                            >
+                              <Volume2 className="w-3.5 h-3.5 text-[#1C4C96]" />
+                              <span className="text-[11px]">{isEn ? 'Listen' : 'Ouvir'}</span>
+                            </button>
+                          )}
                         </div>
 
                         {/* Comparison: Original vs Natural */}
                         <div className="space-y-1.5 p-3 rounded-xl bg-slate-50/70 border border-slate-200/60">
                           <div className="flex items-start gap-2 text-xs">
                             <span className="text-red-500 font-bold shrink-0 mt-0.5">✗</span>
-                            <span className="text-slate-500 line-through italic">
+                            <span className="text-slate-700 italic font-medium">
                               "{item.original}"
                             </span>
                           </div>
                           <div className="flex items-start gap-2 text-sm">
-                            <span className="text-emerald-600 font-bold shrink-0 mt-0.5">✓</span>
-                            <span className="text-slate-900 font-bold leading-snug">
-                              "{item.corrected}"
+                            <span className={item.isPendingConfirmation ? "text-amber-600 font-bold shrink-0 mt-0.5 text-xs" : "text-emerald-600 font-bold shrink-0 mt-0.5"}>
+                              {item.isPendingConfirmation ? "⏳" : "✓"}
+                            </span>
+                            <span className={item.isPendingConfirmation ? "text-amber-800 italic font-semibold text-xs leading-snug" : "text-slate-900 font-bold leading-snug"}>
+                              {item.isPendingConfirmation ? item.corrected : `"${item.corrected}"`}
                             </span>
                           </div>
                         </div>
@@ -1207,26 +1211,38 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                           </span>
                         </div>
                         <div className="space-y-1.5 text-xs max-h-72 overflow-y-auto pr-1">
-                          {transformation.reviewSummary.essentialCorrections.map((c, i) => (
-                            <div
-                              key={i}
-                              className="p-2 rounded-lg bg-white border border-slate-200 flex items-center justify-between gap-2"
-                            >
-                              <div className="flex items-center gap-1.5 flex-1 min-w-0">
-                                <span className="text-red-500 line-through truncate">✗ {c.original}</span>
-                                <ArrowRight className="w-3 h-3 text-slate-300 shrink-0" />
-                                <span className="text-emerald-700 font-bold truncate">✓ {c.corrected}</span>
-                              </div>
-                              <button
-                                type="button"
-                                onClick={() => speakEnglish(c.corrected)}
-                                className="p-1 rounded bg-slate-50 hover:bg-slate-100 text-slate-600 cursor-pointer border border-slate-200 shrink-0 transition"
-                                title="Listen"
+                          {transformation.reviewSummary.essentialCorrections.map((c, i) => {
+                            const isPending = (c as any).isPendingConfirmation || c.corrected?.includes('Pendente');
+                            return (
+                              <div
+                                key={i}
+                                className="p-2 rounded-lg bg-white border border-slate-200 flex items-center justify-between gap-2"
                               >
-                                <Volume2 className="w-3 h-3" />
-                              </button>
+                                <div className="flex items-center gap-1.5 flex-1 min-w-0">
+                                  <span className="text-red-500 line-through truncate">✗ {c.original}</span>
+                                  <ArrowRight className="w-3 h-3 text-slate-300 shrink-0" />
+                                  <span className={isPending ? "text-amber-700 italic text-[11px] truncate font-medium" : "text-emerald-700 font-bold truncate"}>
+                                    {isPending ? c.corrected : `✓ ${c.corrected}`}
+                                  </span>
+                                </div>
+                                {!isPending && (
+                                  <button
+                                    type="button"
+                                    onClick={() => speakEnglish(c.corrected)}
+                                    className="p-1 rounded bg-slate-50 hover:bg-slate-100 text-slate-600 cursor-pointer border border-slate-200 shrink-0 transition"
+                                    title="Listen"
+                                  >
+                                    <Volume2 className="w-3 h-3" />
+                                  </button>
+                                )}
+                              </div>
+                            );
+                          })}
+                          {transformation.reviewSummary.essentialCorrections.length === 0 && (
+                            <div className="p-3 rounded-lg bg-white border border-slate-200 text-center text-xs text-slate-400">
+                              {isEn ? 'No corrections recorded in this session.' : 'Nenhuma correção registrada nesta sessão.'}
                             </div>
-                          ))}
+                          )}
                         </div>
                       </div>
 
@@ -1245,17 +1261,22 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                           {transformation.reviewSummary.keyRules.map((r, i) => (
                             <li key={i} className="leading-snug">{r}</li>
                           ))}
+                          {transformation.reviewSummary.keyRules.length === 0 && (
+                            <li className="list-none -ml-4 text-center text-slate-400">
+                              {isEn ? 'No formal grammar points required for this session.' : 'Nenhum ponto gramatical formal necessário nesta sessão.'}
+                            </li>
+                          )}
                         </ul>
                       </div>
                     </div>
 
                     {/* Must-Know Vocabulary Checklist */}
-                    {Array.isArray(transformation.reviewSummary.mustKnowVocabulary) &&
-                      transformation.reviewSummary.mustKnowVocabulary.length > 0 && (
-                        <div className="space-y-1.5 pt-1 border-t border-slate-100">
-                          <h4 className="font-bold text-xs text-slate-700 uppercase tracking-wide">
-                            {isEn ? 'Key Vocabulary:' : 'Vocabulário Essencial:'}
-                          </h4>
+                    {Array.isArray(transformation.reviewSummary.mustKnowVocabulary) && (
+                      <div className="space-y-1.5 pt-1 border-t border-slate-100">
+                        <h4 className="font-bold text-xs text-slate-700 uppercase tracking-wide">
+                          {isEn ? 'Key Vocabulary:' : 'Vocabulário Essencial:'}
+                        </h4>
+                        {transformation.reviewSummary.mustKnowVocabulary.length > 0 ? (
                           <div className="flex flex-wrap gap-1.5">
                             {transformation.reviewSummary.mustKnowVocabulary.map((v, i) => (
                               <span
@@ -1266,8 +1287,13 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                               </span>
                             ))}
                           </div>
-                        </div>
-                      )}
+                        ) : (
+                          <p className="text-xs text-slate-400 italic">
+                            {isEn ? 'No new vocabulary terms recorded in this session.' : 'Nenhum novo termo registrado nesta sessão.'}
+                          </p>
+                        )}
+                      </div>
+                    )}
                   </div>
 
                   {/* Minimalist Bottom Tab Navigation */}

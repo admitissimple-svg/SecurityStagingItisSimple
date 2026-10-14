@@ -580,11 +580,58 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       focusEditorAtEnd(editor);
     }
 
+    // Asynchronously verify with /api/session-notes to guarantee the full HTML is retrieved
+    let cancelled = false;
+    const fetchSavedNotes = async () => {
+      try {
+        const queryParams = new URLSearchParams();
+        if (selectedLessonId) queryParams.set('lessonId', selectedLessonId);
+        if (currentSessionKey) queryParams.set('id', currentSessionKey);
+        if (selectedStudentEmail) queryParams.set('studentEmail', selectedStudentEmail);
+        if (sessionDate) queryParams.set('sessionDate', sessionDate);
+
+        const res = await fetch(`/api/session-notes?${queryParams.toString()}`);
+        if (res.ok && !cancelled) {
+          const data = await res.json();
+          const savedNote = Array.isArray(data) ? data[0] : data;
+          if (savedNote && savedNote.content && savedNote.content.trim() && !isOnlyOldTemplate(savedNote.content)) {
+            const serverContent = savedNote.content;
+            setNotesContent(serverContent);
+            if (savedNote.topic) setTopic(savedNote.topic);
+            if (savedNote.updatedAt) setLastSavedTimestamp(savedNote.updatedAt);
+            if (savedNote.driveFileId) {
+              setDriveFileId(savedNote.driveFileId);
+              setDriveFileUrl(savedNote.driveFileUrl || null);
+              setDriveLastSyncedAt(savedNote.driveLastSyncedAt || null);
+              setDriveSyncStatus('synced');
+            }
+            lastSavedContentRef.current = {
+              content: serverContent,
+              topic: savedNote.topic || initialTopic,
+              sessionKey: currentSessionKey,
+            };
+            const f = formatContentForEditor(serverContent);
+            const ed = getActiveEditor();
+            if (ed && ed.innerHTML !== f) {
+              ed.innerHTML = f;
+              lastInternalHtmlRef.current = f;
+            }
+          }
+        }
+      } catch {
+        // silent fallback to initialContent
+      }
+    };
+    fetchSavedNotes();
+
     const timer = setTimeout(() => {
       isInitialLoadRef.current = false;
     }, 100);
 
-    return () => clearTimeout(timer);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, [currentSessionKey]);
 
   const updateDocumentHeader = useCallback(
