@@ -330,7 +330,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
         // Find matching lessons for this student
         const studentLessons = teacherLessons.filter(
-          (l) => l?.studentEmail && l.studentEmail.toLowerCase().trim() === filterStr
+          (l) => l?.studentEmail && (l.studentEmail || '').toLowerCase().trim() === filterStr
         );
 
         // Check if there is an active lesson scheduled specifically for TODAY
@@ -506,7 +506,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       } else if (selectedStudentEmail) {
         const studentEmailLower = selectedStudentEmail.toLowerCase().trim();
         const studentLessons = teacherLessons.filter(
-          (l) => l?.studentEmail && l.studentEmail.toLowerCase().trim() === studentEmailLower
+          (l) => l?.studentEmail && (l.studentEmail || '').toLowerCase().trim() === studentEmailLower
         );
         // Check if there is a lesson on this exact sessionDate with notes
         const lessonOnDate = studentLessons.find(
@@ -1983,9 +1983,9 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                     (l) =>
                       !selectedStudentEmail ||
                       (l?.studentEmail &&
-                        l.studentEmail.toLowerCase().trim() ===
-                          selectedStudentEmail.toLowerCase().trim()) ||
-                      l.id === selectedLessonId
+                        (l.studentEmail || '').toLowerCase().trim() ===
+                          (selectedStudentEmail || '').toLowerCase().trim()) ||
+                      l?.id === selectedLessonId
                   )
                   .sort((a, b) => {
                     const timeA = a.startDateTime ? new Date(a.startDateTime).getTime() : 0;

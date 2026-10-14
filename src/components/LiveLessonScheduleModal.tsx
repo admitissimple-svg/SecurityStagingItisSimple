@@ -126,8 +126,9 @@ export const LiveLessonScheduleModal: React.FC<LiveLessonScheduleModalProps> = (
     if (activeStudentTeacherEmail) {
       const matched = teachers.filter(
         (tc) =>
-          (tc.email || '').toLowerCase().trim() === activeStudentTeacherEmail ||
-          (tc.id || '').toLowerCase().trim() === activeStudentTeacherEmail
+          Boolean(tc) &&
+          ((tc.email || '').toLowerCase().trim() === activeStudentTeacherEmail ||
+            (tc.id || '').toLowerCase().trim() === activeStudentTeacherEmail)
       );
       if (matched.length > 0) {
         return matched;
@@ -146,7 +147,7 @@ export const LiveLessonScheduleModal: React.FC<LiveLessonScheduleModalProps> = (
   }, [isTeacher, activeStudentTeacherEmail, teachers, userProfile?.teacherName]);
 
   const defaultTeacherEmail = isTeacher && currentAccount
-    ? currentAccount.email
+    ? (currentAccount.email || 'itissimple.school@gmail.com')
     : activeStudentTeacherEmail || initialTeacherEmail || teachers[0]?.email || 'itissimple.school@gmail.com';
 
   const [selectedTeacherEmail, setSelectedTeacherEmail] = useState<string>(defaultTeacherEmail);
@@ -158,10 +159,10 @@ export const LiveLessonScheduleModal: React.FC<LiveLessonScheduleModalProps> = (
       setSelectedTeacherEmail(initialTeacherEmail);
     } else if (isTeacher && currentAccount?.email) {
       setSelectedTeacherEmail(currentAccount.email);
-    } else if (availableTeachers.length > 0 && !availableTeachers.some((tc) => tc.email?.toLowerCase() === selectedTeacherEmail.toLowerCase())) {
-      setSelectedTeacherEmail(availableTeachers[0].email);
+    } else if (availableTeachers.length > 0 && selectedTeacherEmail && !availableTeachers.some((tc) => (tc?.email || '').toLowerCase().trim() === (selectedTeacherEmail || '').toLowerCase().trim())) {
+      setSelectedTeacherEmail(availableTeachers[0]?.email || 'itissimple.school@gmail.com');
     }
-  }, [isOpen, activeStudentTeacherEmail, initialTeacherEmail, isTeacher, currentAccount?.email, availableTeachers]);
+  }, [isOpen, activeStudentTeacherEmail, initialTeacherEmail, isTeacher, currentAccount?.email, availableTeachers, selectedTeacherEmail]);
 
   const defaultStudent =
     (candidateStudentEmail ? { email: candidateStudentEmail, name: initialStudentName || userProfile?.name || currentAccount?.name || '', role: 'student' as const } : null) ||
@@ -217,17 +218,20 @@ export const LiveLessonScheduleModal: React.FC<LiveLessonScheduleModalProps> = (
     return name.replace(/\s*\(Amigo Nativo\)/gi, '').replace(/\s*\(Amiga Nativa\)/gi, '').replace(/\s*\(Native Friend\)/gi, '').trim();
   };
 
+  const cleanSelectedTeacherEmail = (selectedTeacherEmail || '').toLowerCase().trim();
   const selectedTeacherObj = availableTeachers.find((t) =>
-    (t.email && t.email.toLowerCase() === selectedTeacherEmail.toLowerCase()) ||
-    (t.id && t.id.toLowerCase() === selectedTeacherEmail.toLowerCase())
+    Boolean(t) &&
+    ((t.email && t.email.toLowerCase().trim() === cleanSelectedTeacherEmail) ||
+    (t.id && t.id.toLowerCase().trim() === cleanSelectedTeacherEmail))
   )
     || teachers.find((t) =>
-      (t.email && t.email.toLowerCase() === selectedTeacherEmail.toLowerCase()) ||
-      (t.id && t.id.toLowerCase() === selectedTeacherEmail.toLowerCase())
+      Boolean(t) &&
+      ((t.email && t.email.toLowerCase().trim() === cleanSelectedTeacherEmail) ||
+      (t.id && t.id.toLowerCase().trim() === cleanSelectedTeacherEmail))
     )
     || {
       name: userProfile?.teacherName || 'It is Simple Teacher',
-      email: selectedTeacherEmail,
+      email: selectedTeacherEmail || 'itissimple.school@gmail.com',
     };
 
   // Find matching tutor profile from tutors list (or availableTeachers/teachers)
@@ -254,10 +258,11 @@ export const LiveLessonScheduleModal: React.FC<LiveLessonScheduleModalProps> = (
 
     // 3. From teacherMeetSettings (case-insensitive email matching)
     const cleanEmail = (selectedTeacherEmail || '').toLowerCase().trim();
+    const safeSettings = teacherMeetSettings || {};
     const settings =
-      teacherMeetSettings[cleanEmail] ||
-      teacherMeetSettings[selectedTeacherEmail] ||
-      Object.entries(teacherMeetSettings).find(([k]) => k.toLowerCase().trim() === cleanEmail)?.[1];
+      safeSettings[cleanEmail] ||
+      safeSettings[selectedTeacherEmail] ||
+      Object.entries(safeSettings).find(([k]) => k.toLowerCase().trim() === cleanEmail)?.[1];
 
     if (settings?.meetLink && settings.meetLink.trim() && settings.meetLink !== 'https://meet.google.com/gmt-kxnw-zpq') {
       return settings.meetLink.trim();
@@ -278,10 +283,12 @@ export const LiveLessonScheduleModal: React.FC<LiveLessonScheduleModalProps> = (
     return 'https://meet.google.com/new';
   }, [matchedTutor, selectedTeacherObj, teacherMeetSettings, selectedTeacherEmail, userProfile]);
 
+  const safeMeetSettings = teacherMeetSettings || {};
+  const cleanSelectedEmail = (selectedTeacherEmail || '').toLowerCase().trim();
   const rawTeacherSettings: TeacherMeetSettings | undefined =
-    teacherMeetSettings[selectedTeacherEmail] ||
-    teacherMeetSettings[selectedTeacherEmail.toLowerCase().trim()] ||
-    Object.entries(teacherMeetSettings).find(([k]) => k.toLowerCase().trim() === selectedTeacherEmail.toLowerCase().trim())?.[1];
+    (selectedTeacherEmail ? safeMeetSettings[selectedTeacherEmail] : undefined) ||
+    (cleanSelectedEmail ? safeMeetSettings[cleanSelectedEmail] : undefined) ||
+    Object.entries(safeMeetSettings).find(([k]) => k.toLowerCase().trim() === cleanSelectedEmail)?.[1];
 
   const activeTeacherSettings: TeacherMeetSettings = {
     teacherEmail: selectedTeacherEmail,

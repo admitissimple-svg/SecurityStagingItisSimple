@@ -55,7 +55,7 @@ export const DailySentenceModal: React.FC<DailySentenceModalProps> = ({
   });
 
   const matchedWords = allWords.filter((w) =>
-    sentenceInput.toLowerCase().includes(w.toLowerCase())
+    Boolean(w && (sentenceInput || '').toLowerCase().includes(w.toLowerCase()))
   );
 
   const handleManualCheck = async () => {

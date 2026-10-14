@@ -67,7 +67,7 @@ export const LiveMeetLessonsPanel: React.FC<LiveMeetLessonsPanelProps> = ({
   // Filter active scheduled lessons and sort chronologically (earliest first)
   const activeScheduledLessons = lessons
     .filter((l) => {
-      if (l.status !== 'scheduled' || l.cancelledAt) return false;
+      if (!l || l.status !== 'scheduled' || l.cancelledAt) return false;
       if (isTeacher) {
         // In teacher view, show scheduled lessons for this teacher
         if (currentAccount?.email) {

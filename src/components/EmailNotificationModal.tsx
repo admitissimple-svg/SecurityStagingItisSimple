@@ -50,9 +50,10 @@ export const EmailNotificationModal: React.FC<EmailNotificationModalProps> = ({
     userProfile?.teacherEmail ||
     teachers[0]?.email ||
     'itissimple.school@gmail.com';
+  const cleanPrefEmail = (preferredTeacherEmail || '').toLowerCase().trim();
   const preferredTeacherName =
     userProfile?.teacherName ||
-    teachers.find((t) => t.email.toLowerCase() === preferredTeacherEmail.toLowerCase())?.name ||
+    teachers.find((t) => (t?.email || '').toLowerCase().trim() === cleanPrefEmail)?.name ||
     'Amigo Nativo';
 
   const [recipient, setRecipient] = useState<string>(preferredTeacherEmail);
@@ -201,7 +202,7 @@ export const EmailNotificationModal: React.FC<EmailNotificationModalProps> = ({
                 </option>
               )}
               {teachers
-                .filter((tc) => tc.email.toLowerCase() !== userProfile?.teacherEmail?.toLowerCase())
+                .filter((tc) => Boolean(tc?.email) && (tc.email || '').toLowerCase().trim() !== (userProfile?.teacherEmail || '').toLowerCase().trim())
                 .map((tc) => (
                   <option key={tc.email} value={tc.email}>
                     {tc.name} ({tc.email})

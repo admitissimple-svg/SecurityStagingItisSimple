@@ -291,15 +291,20 @@ export function generateGoogleCalendarWebLink(details: {
   teacherName?: string;
   meetLink?: string;
 }): string {
-  const startIso = new Date(details.startDateTime)
+  const startDate = details.startDateTime ? new Date(details.startDateTime) : new Date();
+  const validStartDate = isNaN(startDate.getTime()) ? new Date() : startDate;
+  const endDate = details.endDateTime ? new Date(details.endDateTime) : new Date(validStartDate.getTime() + 30 * 60000);
+  const validEndDate = isNaN(endDate.getTime()) ? new Date(validStartDate.getTime() + 30 * 60000) : endDate;
+
+  const startIso = validStartDate
     .toISOString()
     .replace(/-|:|\.\d+/g, '');
-  const endIso = new Date(details.endDateTime)
+  const endIso = validEndDate
     .toISOString()
     .replace(/-|:|\.\d+/g, '');
 
   const effectiveMeet = details.meetLink || 'https://meet.google.com/new';
-  const text = encodeURIComponent(details.title);
+  const text = encodeURIComponent(details.title || 'It\'s Simple English Session');
   const desc = encodeURIComponent(
     `${details.description || ''}\n\nGoogle Meet: ${effectiveMeet}\nStudent: ${details.studentName || ''} (${details.studentEmail || ''})\nTeacher / Native Friend: ${details.teacherName || ''} (${details.teacherEmail || ''})`
   );

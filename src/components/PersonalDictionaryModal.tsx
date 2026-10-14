@@ -168,6 +168,7 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
     if (!term) return nativeFriendEntries;
 
     return nativeFriendEntries.filter((item) => {
+      if (!item) return false;
       const w = (item.word || '').toLowerCase();
       const d = (item.definitionEn || '').toLowerCase();
       const e = (item.exampleSentenceEn || '').toLowerCase();
@@ -181,6 +182,7 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
     if (!term) return myWordsEntries;
 
     return myWordsEntries.filter((item) => {
+      if (!item) return false;
       const w = (item.word || '').toLowerCase();
       const d = (item.definitionEn || '').toLowerCase();
       const e = (item.exampleSentenceEn || '').toLowerCase();

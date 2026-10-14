@@ -87,12 +87,15 @@ export const FindTutorsSection: React.FC<FindTutorsSectionProps> = ({
   }, [tutors]);
 
   const filteredTutors = useMemo(() => {
+    const q = (searchQuery || '').toLowerCase().trim();
     return (tutors || []).filter((tutor) => {
-      const matchesSearch =
-        (tutor.name || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
-        (tutor.headline || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
-        (tutor.bio || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
-        (tutor.accent || '').toLowerCase().includes(searchQuery.toLowerCase());
+      if (!tutor) return false;
+      const matchesSearch = !q || (
+        (tutor.name || '').toLowerCase().includes(q) ||
+        (tutor.headline || '').toLowerCase().includes(q) ||
+        (tutor.bio || '').toLowerCase().includes(q) ||
+        (tutor.accent || '').toLowerCase().includes(q)
+      );
 
       const matchesCountry = selectedCountry === 'all' || tutor.country === selectedCountry;
       const matchesSpecialty =
@@ -209,10 +212,11 @@ export const FindTutorsSection: React.FC<FindTutorsSectionProps> = ({
             </div>
           ) : (
             filteredTutors.map((tutor) => {
+              const selEmail = (selectedMentorEmail || '').toLowerCase().trim();
               const isSelectedMentor = Boolean(
-                selectedMentorEmail && (
-                  (tutor.email && selectedMentorEmail.toLowerCase() === tutor.email.toLowerCase()) ||
-                  (tutor.id && selectedMentorEmail.toLowerCase() === tutor.id.toLowerCase())
+                selEmail && (
+                  (tutor.email && selEmail === tutor.email.toLowerCase().trim()) ||
+                  (tutor.id && selEmail === tutor.id.toLowerCase().trim())
                 )
               );
 

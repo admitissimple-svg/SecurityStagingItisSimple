@@ -1434,11 +1434,12 @@ export default function App() {
             const tutorSnap = await getDoc(doc(getDb(), 'tutors', cleanTutorId));
             if (tutorSnap.exists()) {
               const directTutor = { id: tutorSnap.id, ...tutorSnap.data() } as NativeFriendTutor;
+              const directTutorEmail = (directTutor.email || '').toLowerCase().trim();
               setTutors((prev) => {
                 const filtered = prev.filter(
                   (t) =>
-                    t.email.toLowerCase() !== directTutor.email.toLowerCase() &&
-                    t.id !== directTutor.id
+                    (t?.email ? t.email.toLowerCase().trim() !== directTutorEmail : true) &&
+                    t?.id !== directTutor.id
                 );
                 return [...filtered, directTutor];
               });
@@ -1451,11 +1452,12 @@ export default function App() {
           if (res.ok) {
             const data = await res.json();
             if (data.tutor) {
+              const dataTutorEmail = (data.tutor.email || '').toLowerCase().trim();
               setTutors((prev) => {
                 const filtered = prev.filter(
                   (t) =>
-                    t.email.toLowerCase() !== data.tutor.email.toLowerCase() &&
-                    t.id !== data.tutor.id
+                    (t?.email ? t.email.toLowerCase().trim() !== dataTutorEmail : true) &&
+                    t?.id !== data.tutor.id
                 );
                 return [...filtered, data.tutor];
               });
@@ -2541,8 +2543,9 @@ export default function App() {
     }
     if (account.role === 'teacher') {
       if (tutorData) {
+        const tEmailTarget = (tutorData.email || '').toLowerCase().trim();
         setTutors((prev) => {
-          const next = prev.filter((t) => t.email.toLowerCase() !== tutorData.email.toLowerCase());
+          const next = prev.filter((t) => (t?.email ? t.email.toLowerCase().trim() !== tEmailTarget : true));
           return [...next, tutorData];
         });
       }
@@ -2550,8 +2553,9 @@ export default function App() {
         .then((res) => (res.ok ? res.json() : null))
         .then((data) => {
           if (data?.tutor) {
+            const dataTutorEmail = (data.tutor.email || '').toLowerCase().trim();
             setTutors((prev) => {
-              const next = prev.filter((t) => t.email.toLowerCase() !== data.tutor.email.toLowerCase());
+              const next = prev.filter((t) => (t?.email ? t.email.toLowerCase().trim() !== dataTutorEmail : true));
               return [...next, data.tutor];
             });
           }
@@ -4875,7 +4879,7 @@ export default function App() {
     }
 
     if (cleanEmail && cleanEmail !== 'adm.itissimple@gmail.com') {
-      setAvailableAccounts((prev) => prev.filter((a) => a.email.toLowerCase() !== cleanEmail));
+      setAvailableAccounts((prev) => prev.filter((a) => (a?.email ? a.email.toLowerCase().trim() !== cleanEmail : true)));
     }
 
     // Direct Firestore deletion
@@ -5443,6 +5447,7 @@ export default function App() {
 
     // 1. From backend students array
     (students || []).forEach((s) => {
+      if (!s) return;
       const email = (s.email || s.studentEmail || '').toLowerCase().trim();
       const sTeacher = (s.teacherEmail || '').toLowerCase().trim();
       const sTeacherUid = (s.teacherUid || (s as any).assignedTeacherId || '').trim();
@@ -5479,7 +5484,7 @@ export default function App() {
     // 2. From availableAccounts (ONLY when NOT viewing as a teacher)
     if (!isTeacher) {
       availableAccounts.forEach((a) => {
-        if (a.role === 'student') {
+        if (a && a.role === 'student') {
           const email = (a.email || '').toLowerCase().trim();
           if (email) {
             const existing = studentMap.get(email) || ({} as GoogleAccount);
@@ -5502,6 +5507,7 @@ export default function App() {
 
     // 3. From current lessons (ONLY for this teacher if viewing as teacher)
     (lessons || []).forEach((l) => {
+      if (!l) return;
       const email = (l.studentEmail || '').toLowerCase().trim();
       if (!email) return;
 
@@ -5515,7 +5521,7 @@ export default function App() {
 
       // Check if student is explicitly unenrolled or cancelled
       const knownStudent = (students || []).find(
-        (s) => (s.email || s.studentEmail || '').toLowerCase().trim() === email
+        (s) => Boolean(s) && (s.email || s.studentEmail || '').toLowerCase().trim() === email
       );
       if (knownStudent) {
         const kStatus = knownStudent.status || (knownStudent as any).enrollmentStatus;
@@ -5558,6 +5564,7 @@ export default function App() {
     }
 
     return Array.from(studentMap.values()).filter((st) => {
+      if (!st) return false;
       const email = (st.email || (st as any).studentEmail || '').toLowerCase().trim();
       return Boolean(email && email.includes('@') && !email.includes('test-student'));
     });
@@ -6312,12 +6319,13 @@ export default function App() {
         role: 'teacher',
         picture: tutor.avatar,
       };
+      const cleanRegEmail = (tutor.email || '').toLowerCase().trim();
       setTutors((prev) => [
-        ...prev.filter((t) => t.email.toLowerCase() !== tutor.email.toLowerCase()),
+        ...prev.filter((t) => (t?.email ? t.email.toLowerCase().trim() !== cleanRegEmail : true)),
         tutor,
       ]);
       setAvailableAccounts((prev) => [
-        ...prev.filter((a) => a.email.toLowerCase() !== tutor.email.toLowerCase()),
+        ...prev.filter((a) => (a?.email ? a.email.toLowerCase().trim() !== cleanRegEmail : true)),
         tutorAccount,
       ]);
       setCurrentAccount(tutorAccount);

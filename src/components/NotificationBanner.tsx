@@ -28,6 +28,7 @@ export const NotificationBanner: React.FC<NotificationBannerProps> = ({
   onDismiss,
 }) => {
   const filteredNotifications = (notifications || []).filter((n) => {
+    if (!n) return false;
     const id = (n.id || '').toLowerCase();
     const title = (n.title || '').toLowerCase();
     // Exclude login/welcome and logout banners

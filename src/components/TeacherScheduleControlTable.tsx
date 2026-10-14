@@ -141,6 +141,7 @@ export const TeacherScheduleControlTable: React.FC<TeacherScheduleControlTablePr
     };
 
     (students || []).forEach((st) => {
+      if (!st) return;
       const email = (st.email || (st as any).studentEmail || '').toLowerCase().trim();
       const name = st.name || (st as any).studentName || email.split('@')[0];
       const stTeacher = ((st as any).teacherEmail || '').toLowerCase().trim();
@@ -163,6 +164,7 @@ export const TeacherScheduleControlTable: React.FC<TeacherScheduleControlTablePr
 
     // Also include students with active scheduled lessons or trial lessons for this teacher
     (lessons || []).forEach((l) => {
+      if (!l) return;
       const email = (l.studentEmail || '').toLowerCase().trim();
       const name = l.studentName || email.split('@')[0];
       const lTeacherEmail = (l.teacherEmail || (l as any).tutorEmail || '').toLowerCase().trim();
@@ -177,7 +179,7 @@ export const TeacherScheduleControlTable: React.FC<TeacherScheduleControlTablePr
 
       // Check if this student is explicitly unenrolled or cancelled in students array
       const knownStudent = (students || []).find(
-        (s) => (s.email || (s as any).studentEmail || '').toLowerCase().trim() === email
+        (s) => Boolean(s) && ((s.email || (s as any).studentEmail || '')).toLowerCase().trim() === email
       );
       if (knownStudent) {
         const kStatus = (knownStudent as any).status || (knownStudent as any).enrollmentStatus;
@@ -287,7 +289,7 @@ export const TeacherScheduleControlTable: React.FC<TeacherScheduleControlTablePr
     if (selectedTeacherFilter && selectedTeacherFilter !== 'all') {
       const filterTutorEmail = (selectedTeacherFilter || '').toLowerCase().trim();
       const match = teachers.find(
-        (tch) => (tch.email || '').toLowerCase().trim() === filterTutorEmail
+        (tch) => Boolean(tch) && (tch.email || '').toLowerCase().trim() === filterTutorEmail
       );
       if (match) {
         return {
@@ -414,9 +416,9 @@ export const TeacherScheduleControlTable: React.FC<TeacherScheduleControlTablePr
                 className="px-3 py-1.5 bg-white border border-[#607EC9]/40 rounded-xl text-xs font-semibold text-[#000035] focus:outline-hidden focus:ring-2 focus:ring-[#1C4C96]"
               >
                 <option value="all">All Native Friends</option>
-                {teachers.map((tch) => (
-                  <option key={tch.email} value={tch.email}>
-                    {tch.name} ({tch.email})
+                {teachers.filter((tch) => Boolean(tch && (tch.email || tch.id))).map((tch) => (
+                  <option key={tch.email || tch.id} value={tch.email || tch.id}>
+                    {tch.name || tch.email || 'Native Friend'} ({tch.email || tch.id})
                   </option>
                 ))}
               </select>
@@ -559,7 +561,7 @@ export const TeacherScheduleControlTable: React.FC<TeacherScheduleControlTablePr
                 // Look up student photo safely
                 const lessonStudentEmail = (lesson.studentEmail || '').toLowerCase().trim();
                 const studentData = students.find(
-                  (s) => lessonStudentEmail && (s.email || '').toLowerCase().trim() === lessonStudentEmail
+                  (s) => Boolean(s) && lessonStudentEmail && (s.email || '').toLowerCase().trim() === lessonStudentEmail
                 );
                 const studentPhoto =
                   studentData?.picture ||

@@ -387,8 +387,9 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
             setDailyPhraseTime(currentUserProfile.dailyPhraseTime);
           }
           if (currentUserProfile.teacherEmail) {
+            const cleanTarg = currentUserProfile.teacherEmail.toLowerCase().trim();
             const matchTutor = tutorsList.find(
-              (t) => t.email.toLowerCase() === currentUserProfile.teacherEmail?.toLowerCase()
+              (t) => (t?.email || '').toLowerCase().trim() === cleanTarg
             );
             if (matchTutor) {
               setSelectedTutorId(matchTutor.id || matchTutor.email);
