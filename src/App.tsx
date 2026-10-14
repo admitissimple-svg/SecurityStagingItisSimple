@@ -3576,151 +3576,69 @@ export default function App() {
     teacherUid?: string;
     meetLink: string;
   }) => {
+    const currentUser = auth.currentUser;
+    if (!currentUser) {
+      alert(
+        currentLanguage === 'en'
+          ? 'Authentication required. Please sign in to schedule your lesson.'
+          : 'Autenticação necessária. Por favor, conecte-se para agendar sua aula.'
+      );
+      setIsAuthModalOpen(true);
+      return;
+    }
+
     const finalStudentEmail = (lessonData.studentEmail && lessonData.studentEmail.trim() !== '')
       ? lessonData.studentEmail.trim().toLowerCase()
-      : (scheduleStudentInfo?.email ? scheduleStudentInfo.email.trim().toLowerCase() : (currentAccount?.role === 'student' && currentAccount.email ? currentAccount.email.trim().toLowerCase() : (userProfile?.email ? userProfile.email.trim().toLowerCase() : '')));
+      : (currentUser.email ? currentUser.email.toLowerCase().trim() : (userProfile?.email ? userProfile.email.toLowerCase().trim() : ''));
 
     const finalStudentName = (lessonData.studentName && lessonData.studentName.trim() !== '')
       ? lessonData.studentName.trim()
-      : (scheduleStudentInfo?.name ? scheduleStudentInfo.name.trim() : (currentAccount?.role === 'student' && currentAccount.name ? currentAccount.name.trim() : (userProfile?.name || 'Aluno')));
+      : (currentUser.displayName || userProfile?.name || 'Aluno');
 
-    // Resolve student canonical UID strictly matching finalStudentEmail
-    let resolvedStudentUid = '';
-    if (lessonData.studentUid && isValidCanonicalUid(lessonData.studentUid)) {
-      resolvedStudentUid = lessonData.studentUid.trim();
-    } else if (
-      scheduleStudentInfo?.uid &&
-      isValidCanonicalUid(scheduleStudentInfo.uid) &&
-      (!scheduleStudentInfo.email || scheduleStudentInfo.email.toLowerCase().trim() === finalStudentEmail)
-    ) {
-      resolvedStudentUid = scheduleStudentInfo.uid.trim();
-    } else if (
-      currentAccount?.role === 'student' &&
-      currentAccount.uid &&
-      isValidCanonicalUid(currentAccount.uid) &&
-      (currentAccount.email || '').toLowerCase().trim() === finalStudentEmail
-    ) {
-      resolvedStudentUid = currentAccount.uid.trim();
-    } else if (
-      auth.currentUser &&
-      (auth.currentUser.email || '').toLowerCase().trim() === finalStudentEmail &&
-      isValidCanonicalUid(auth.currentUser.uid)
-    ) {
-      resolvedStudentUid = auth.currentUser.uid;
-    } else if (
-      userProfile?.email?.toLowerCase().trim() === finalStudentEmail &&
-      userProfile.id &&
-      isValidCanonicalUid(userProfile.id)
-    ) {
-      resolvedStudentUid = userProfile.id;
-    } else if (
-      userProfile?.email?.toLowerCase().trim() === finalStudentEmail &&
-      (userProfile as any)?.uid &&
-      isValidCanonicalUid((userProfile as any).uid)
-    ) {
-      resolvedStudentUid = (userProfile as any).uid;
-    } else {
-      const matchingStudent = students.find(
-        (s) => (s.email || s.studentEmail || '').toLowerCase().trim() === finalStudentEmail
-      );
-      if (matchingStudent?.uid && isValidCanonicalUid(matchingStudent.uid)) {
-        resolvedStudentUid = matchingStudent.uid.trim();
-      } else if (matchingStudent?.id && isValidCanonicalUid(matchingStudent.id)) {
-        resolvedStudentUid = matchingStudent.id.trim();
-      }
-    }
-
-    const finalStudentUid = normalizeUid(resolvedStudentUid, finalStudentEmail);
+    const finalStudentUid = (currentUser?.uid || lessonData.studentUid || userProfile?.uid || userProfile?.id || '').trim();
 
     const cleanTeacherEmail = (lessonData.teacherEmail || '').toLowerCase().trim();
+    const cleanTeacherUid = (lessonData.teacherUid || '').trim();
     const matchedTutor = tutors.find((t) =>
-      (lessonData.teacherUid && (t.uid === lessonData.teacherUid || t.id === lessonData.teacherUid)) ||
-      (cleanTeacherEmail && (t.email || '').toLowerCase().trim() === cleanTeacherEmail)
+      (cleanTeacherUid && (t.id === cleanTeacherUid || t.uid === cleanTeacherUid || t.publicTutorId === cleanTeacherUid)) ||
+      (cleanTeacherEmail && (t.email || '').toLowerCase().trim() === cleanTeacherEmail) ||
+      (cleanTeacherEmail && t.id === cleanTeacherEmail)
     );
-    const finalTeacherUid =
-      (lessonData.teacherUid && isValidCanonicalUid(lessonData.teacherUid) ? lessonData.teacherUid : '') ||
-      (matchedTutor?.uid && isValidCanonicalUid(matchedTutor.uid) ? matchedTutor.uid : '') ||
-      (matchedTutor?.id && isValidCanonicalUid(matchedTutor.id) ? matchedTutor.id : '') ||
-      (lessonData.teacherUid && !lessonData.teacherUid.includes('@') && !lessonData.teacherUid.startsWith('st-') && !lessonData.teacherUid.startsWith('usr-') ? lessonData.teacherUid.trim() : '') ||
-      (matchedTutor?.uid && !matchedTutor.uid.includes('@') && !matchedTutor.uid.startsWith('st-') && !matchedTutor.uid.startsWith('usr-') ? matchedTutor.uid.trim() : '') ||
-      (matchedTutor?.id && !matchedTutor.id.includes('@') && !matchedTutor.id.startsWith('st-') && !matchedTutor.id.startsWith('usr-') ? matchedTutor.id.trim() : '') ||
-      '';
 
-    if (!finalStudentUid || !isValidCanonicalUid(finalStudentUid)) {
+    const targetTeacherId = cleanTeacherUid || matchedTutor?.publicTutorId || matchedTutor?.id || cleanTeacherEmail || teacherEmailForConfig;
+    const finalTeacherUid = targetTeacherId;
+
+    if (!targetTeacherId) {
       alert(
         currentLanguage === 'en'
-          ? 'Canonical Student UID missing. Please make sure you are signed in.'
-          : 'UID canônico do Aluno ausente. Por favor, verifique se está conectado.'
+          ? 'Please select a valid Native Friend to schedule your lesson.'
+          : 'Por favor, selecione um Amigo Nativo válido para agendar sua aula.'
       );
       return;
     }
 
-    if (!finalTeacherUid) {
-      alert(
-        currentLanguage === 'en'
-          ? 'Canonical Native Friend UID missing. Cannot schedule lesson without a valid Native Friend.'
-          : 'UID canônico do Amigo Nativo ausente. Não é possível agendar aula sem um Amigo Nativo válido.'
-      );
-      return;
-    }
-
-    if (finalStudentUid === finalTeacherUid) {
-      alert(
-        currentLanguage === 'en'
-          ? 'Security violation: Student and Native Friend cannot have identical identities.'
-          : 'Violação de segurança: Aluno e Amigo Nativo não podem ter identidades idênticas.'
-      );
-      return;
-    }
-
-    if (!finalTeacherUid) {
-      alert(
-        currentLanguage === 'en'
-          ? 'Canonical Native Friend UID missing. Cannot schedule lesson without a valid Native Friend.'
-          : 'UID canônico do Amigo Nativo ausente. Não é possível agendar aula sem um Amigo Nativo válido.'
-      );
-      return;
-    }
-
-    // Conflict Check (Strict Anti-Duplicity Rule 2 - Individualized by teacher and student UIDs/emails)
-    const existingConflict = findTeacherLessonConflict(
-      lessonData.teacherEmail,
-      lessonData.startDateTime,
-      lessonData.endDateTime,
-      lessons,
-      undefined,
-      finalTeacherUid,
-      finalStudentEmail,
-      finalStudentUid
-    );
-    if (existingConflict) {
-      alert(
-        isTeacher
-          ? `Conflict Blocked: You or this student already have another lesson scheduled at this time. Overlapping lessons are not allowed.`
-          : `Bloqueio de Conflito: Já existe uma aula agendada neste horário para este Amigo Nativo ou Aluno. Por favor, selecione outro horário disponível.`
-      );
-      return;
-    }
+    const isTrialBooking = Boolean((scheduleStudentInfo as any)?.isTrialLesson || userProfile?.subscriptionType === 'trial');
+    const deterministicId = `lesson-${currentUser.uid}-${new Date(lessonData.startDateTime).getTime()}`;
 
     const newLesson: LiveLesson = {
-      id: `lesson-${Date.now()}`,
-      title: lessonData.title,
-      description: lessonData.description,
+      id: deterministicId,
+      title: lessonData.title || (isTrialBooking ? 'Aula Experimental Ao Vivo' : 'Aula Ao Vivo 1-on-1'),
+      description: lessonData.description || '',
       startDateTime: lessonData.startDateTime,
       endDateTime: lessonData.endDateTime,
       studentEmail: finalStudentEmail,
       studentName: finalStudentName,
-      studentUid: finalStudentUid,
-      teacherEmail: lessonData.teacherEmail,
-      teacherName: lessonData.teacherName,
-      teacherUid: finalTeacherUid,
-      meetLink: lessonData.meetLink,
+      studentUid: currentUser.uid,
+      teacherEmail: cleanTeacherEmail || (matchedTutor?.email || ''),
+      teacherName: lessonData.teacherName || matchedTutor?.name || 'Native Friend',
+      teacherUid: targetTeacherId,
+      meetLink: lessonData.meetLink || matchedTutor?.meetUrl || 'https://meet.google.com/new',
       status: 'scheduled',
+      isTrialLesson: isTrialBooking,
       createdAt: new Date().toISOString(),
     };
 
-    // Direct Firestore atomic transaction: decrements balance and saves lesson atomically across student & teacher
-    const isTrialBooking = Boolean((scheduleStudentInfo as any)?.isTrialLesson || userProfile?.subscriptionType === 'trial');
+    // Direct backend atomic transaction: verified via Firebase Admin SDK
     const txResult = await scheduleLessonWithTransaction({
       lesson: newLesson,
       isTrialLesson: isTrialBooking,
@@ -3737,22 +3655,24 @@ export default function App() {
     }
 
     // Success path: Add confirmed lesson to state and apply balances
-    setLessons((prev) => [newLesson, ...prev]);
+    const confirmedLesson = txResult.lesson || newLesson;
+    setLessons((prev) => {
+      const exists = prev.some((l) => l.id === confirmedLesson.id);
+      return exists ? prev : [confirmedLesson, ...prev];
+    });
+
     if (txResult.remainingLessons !== undefined) {
       setUserProfile((prev) => ({
         ...prev,
         availableLessons: txResult.remainingLessons,
         contractedLessons: txResult.contractedLessons ?? prev.contractedLessons,
+        hasCompletedTrialLesson: isTrialBooking ? true : prev.hasCompletedTrialLesson,
+        teacherUid: confirmedLesson.teacherUid || prev.teacherUid,
+        teacherEmail: confirmedLesson.teacherEmail || prev.teacherEmail,
+        teacherName: confirmedLesson.teacherName || prev.teacherName,
+        teacherMeetUrl: confirmedLesson.meetLink || prev.teacherMeetUrl,
       }));
     }
-
-    fetch('/api/lessons', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(newLesson),
-    }).catch((err) => {
-      console.warn('Background API save notice:', err);
-    });
 
     // Update students state so student appears immediately in teacher's filter and list
     setStudents((prev) => {

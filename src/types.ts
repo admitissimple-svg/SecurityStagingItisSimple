@@ -34,6 +34,7 @@ export type UserRole = 'student' | 'teacher' | 'admin';
 export interface NativeFriendTutor {
   id: string;
   uid?: string;
+  publicTutorId?: string;
   name: string;
   email: string;
   avatar: string;
@@ -464,6 +465,7 @@ export interface LiveLesson {
   calendarEventId?: string;
   calendarHtmlLink?: string;
   status: 'scheduled' | 'completed' | 'not_completed' | 'cancelled';
+  isTrialLesson?: boolean;
   completedAt?: string;
   cancelledAt?: string;
   cancelledBy?: 'student' | 'teacher' | 'admin' | string;

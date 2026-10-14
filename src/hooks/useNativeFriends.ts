@@ -5,6 +5,7 @@ import { getAllFirestoreDbs, getDb, auth } from '../firebase';
 import { NativeFriendTutor } from '../types';
 import { INITIAL_NATIVE_FRIENDS } from '../data/tutors';
 import { getAdminAccessToken, waitForAuthUser } from '../utils/auth';
+import { consolidateTutorsList } from '../utils/tutorConsolidation';
 
 export enum OperationType {
   CREATE = 'create',
@@ -157,7 +158,7 @@ export async function fetchPublicNativeFriendsFromFirestore(options?: {
   allTutors: NativeFriendTutor[];
   publicTutors: NativeFriendTutor[];
 }> {
-  const tutorMap = new Map<string, NativeFriendTutor>();
+  const rawTutors: NativeFriendTutor[] = [];
 
   try {
     // 1. Await Firebase Auth state initialization so valid sessions are recognized and token attached
@@ -182,8 +183,7 @@ export async function fetchPublicNativeFriendsFromFirestore(options?: {
         list.forEach((t: any) => {
           const tutor = normalizeTutorDoc(t.id, t);
           if (tutor) {
-            const key = (tutor.email || tutor.id).toLowerCase().trim();
-            tutorMap.set(key, tutor);
+            rawTutors.push(tutor);
           }
         });
       }
@@ -195,75 +195,13 @@ export async function fetchPublicNativeFriendsFromFirestore(options?: {
     }
   }
 
-  // 2. Direct Firestore synchronization ONLY when authenticated.
-  // For unauthenticated visitors, utilize exclusively authorized server REST API (/api/tutors) above.
-  if (auth.currentUser) {
-    const dbs = getAllFirestoreDbs();
-    for (const dbInstance of dbs) {
-      try {
-        // Primary unified query: /users where role == 'teacher'
-        const teachersQuery = query(collection(dbInstance, 'users'), where('role', '==', 'teacher'));
-        const teachersSnap = await getDocs(teachersQuery).catch((err) => {
-          handleFirestoreError(err, OperationType.GET, 'users');
-          return null;
-        });
-
-        if (teachersSnap) {
-          teachersSnap.forEach((d) => {
-            const tutor = normalizeTutorDoc(d.id, d.data());
-            if (tutor) {
-              const key = (tutor.email || tutor.id).toLowerCase().trim();
-              const existing = tutorMap.get(key);
-              const approved = isTutorApproved(tutor);
-              tutorMap.set(key, {
-                ...(existing || {}),
-                ...tutor,
-                isApproved: approved,
-                approvalStatus: approved ? 'approved' : (tutor.approvalStatus || 'pending'),
-                status: approved ? 'approved' : (tutor.status || 'pending'),
-              });
-            }
-          });
-        }
-
-        // Authoritative fallback collection: /tutors
-        const tutorsSnap = await getDocs(collection(dbInstance, 'tutors')).catch((err) => {
-          handleFirestoreError(err, OperationType.GET, 'tutors');
-          return null;
-        });
-
-        if (tutorsSnap) {
-          tutorsSnap.forEach((d) => {
-            const tutor = normalizeTutorDoc(d.id, d.data());
-            if (tutor) {
-              const key = (tutor.email || tutor.id).toLowerCase().trim();
-              const existing = tutorMap.get(key);
-              const approved = isTutorApproved(tutor);
-              tutorMap.set(key, {
-                ...(existing || {}),
-                ...tutor,
-                isApproved: approved,
-                approvalStatus: approved ? 'approved' : (tutor.approvalStatus || 'pending'),
-                status: approved ? 'approved' : (tutor.status || 'pending'),
-              });
-            }
-          });
-        }
-      } catch (err) {
-        console.warn('[useNativeFriends] Database query notice:', err);
-      }
-    }
+  // 2. Fallback to INITIAL_NATIVE_FRIENDS if empty
+  if (rawTutors.length === 0 && INITIAL_NATIVE_FRIENDS.length > 0) {
+    rawTutors.push(...INITIAL_NATIVE_FRIENDS);
   }
 
-  // 3. Fallback to INITIAL_NATIVE_FRIENDS if empty
-  if (tutorMap.size === 0) {
-    INITIAL_NATIVE_FRIENDS.forEach((t) => {
-      const key = (t.email || t.id).toLowerCase().trim();
-      tutorMap.set(key, t);
-    });
-  }
-
-  const allTutors = Array.from(tutorMap.values());
+  // Canonical deduplication: guarantees every Native Friend appears exactly once
+  const allTutors = consolidateTutorsList(rawTutors) as NativeFriendTutor[];
   const publicTutors = allTutors.filter((t) => isTutorApproved(t) && isTeacherRole(t));
 
   // Required production logging: list retrieved Firestore tutor IDs for verification
@@ -302,23 +240,7 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
         requireAdminToken: isAdmin,
       });
       if (allTutors.length > 0) {
-        setTutors((prev) => {
-          const map = new Map<string, NativeFriendTutor>();
-          prev.forEach((t) => map.set((t.email || t.id).toLowerCase().trim(), t));
-          allTutors.forEach((t) => {
-            const k = (t.email || t.id).toLowerCase().trim();
-            const existing = map.get(k);
-            const approved = isTutorApproved(t);
-            map.set(k, {
-              ...existing,
-              ...t,
-              isApproved: approved,
-              approvalStatus: approved ? 'approved' : ((t.approvalStatus || t.status || 'pending') as 'approved' | 'pending' | 'rejected'),
-              status: approved ? 'approved' : (t.status || t.approvalStatus || 'pending'),
-            });
-          });
-          return Array.from(map.values());
-        });
+        setTutors((prev) => consolidateTutorsList([...prev, ...allTutors]) as NativeFriendTutor[]);
       }
     } catch (err) {
       console.warn('[useNativeFriends] refresh notice:', err);
@@ -337,23 +259,7 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
       .then(({ allTutors }) => {
         if (!isMounted) return;
         if (allTutors.length > 0) {
-          setTutors((prev) => {
-            const map = new Map<string, NativeFriendTutor>();
-            prev.forEach((t) => map.set((t.email || t.id).toLowerCase().trim(), t));
-            allTutors.forEach((t) => {
-              const k = (t.email || t.id).toLowerCase().trim();
-              const existing = map.get(k);
-              const approved = isTutorApproved(t);
-              map.set(k, {
-                ...existing,
-                ...t,
-                isApproved: approved,
-                approvalStatus: approved ? 'approved' : ((t.approvalStatus || t.status || 'pending') as 'approved' | 'pending' | 'rejected'),
-                status: approved ? 'approved' : (t.status || t.approvalStatus || 'pending'),
-              });
-            });
-            return Array.from(map.values());
-          });
+          setTutors((prev) => consolidateTutorsList([...prev, ...allTutors]) as NativeFriendTutor[]);
         }
       })
       .catch((err) => {
@@ -393,27 +299,11 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
                 if (tutor) liveList.push(tutor);
               });
               if (liveList.length > 0) {
-                setTutors((prev) => {
-                  const map = new Map<string, NativeFriendTutor>();
-                  prev.forEach((t) => map.set((t.email || t.id).toLowerCase().trim(), t));
-                  liveList.forEach((t) => {
-                    const k = (t.email || t.id).toLowerCase().trim();
-                    const existing = map.get(k);
-                    const approved = isTutorApproved(t);
-                    map.set(k, {
-                      ...existing,
-                      ...t,
-                      isApproved: approved,
-                      approvalStatus: approved ? 'approved' : ((t.approvalStatus || t.status || 'pending') as 'approved' | 'pending' | 'rejected'),
-                      status: approved ? 'approved' : (t.status || t.approvalStatus || 'pending'),
-                    });
-                  });
-                  return Array.from(map.values());
-                });
+                setTutors((prev) => consolidateTutorsList([...prev, ...liveList]) as NativeFriendTutor[]);
               }
             },
             (err) => {
-              handleFirestoreError(err, OperationType.GET, 'users');
+              // Gracefully ignore permission denied under restrictive Firestore security rules
             }
           );
           realtimeUnsubs.push(unsubUsers);
@@ -432,27 +322,11 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
                 if (tutor) liveList.push(tutor);
               });
               if (liveList.length > 0) {
-                setTutors((prev) => {
-                  const map = new Map<string, NativeFriendTutor>();
-                  prev.forEach((t) => map.set((t.email || t.id).toLowerCase().trim(), t));
-                  liveList.forEach((t) => {
-                    const k = (t.email || t.id).toLowerCase().trim();
-                    const existing = map.get(k);
-                    const approved = isTutorApproved(t);
-                    map.set(k, {
-                      ...existing,
-                      ...t,
-                      isApproved: approved,
-                      approvalStatus: approved ? 'approved' : ((t.approvalStatus || t.status || 'pending') as 'approved' | 'pending' | 'rejected'),
-                      status: approved ? 'approved' : (t.status || t.approvalStatus || 'pending'),
-                    });
-                  });
-                  return Array.from(map.values());
-                });
+                setTutors((prev) => consolidateTutorsList([...prev, ...liveList]) as NativeFriendTutor[]);
               }
             },
             (err) => {
-              handleFirestoreError(err, OperationType.GET, 'tutors');
+              // Gracefully ignore permission denied under restrictive Firestore security rules
             }
           );
           realtimeUnsubs.push(unsubTutors);

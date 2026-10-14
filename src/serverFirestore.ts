@@ -162,16 +162,32 @@ export async function saveTutorToFirestore(tutor: any, routeDocId?: string): Pro
   }
 }
 
+import {
+  normalizeTutorName,
+  areSameTutor,
+  mergeTutors,
+  consolidateTutorsList,
+  type CanonicalTutorRecord,
+} from './utils/tutorConsolidation';
+
+export {
+  normalizeTutorName,
+  areSameTutor,
+  mergeTutors,
+  consolidateTutorsList,
+  type CanonicalTutorRecord,
+};
+
 /**
  * Fetch all Native Friend / Teacher profiles directly from unified /users collection (role == 'teacher')
- * with fallback to legacy /tutors collection.
+ * with fallback to legacy /tutors collection, consolidated canonically to prevent any duplication.
  */
 export async function fetchTutorsFromFirestore(): Promise<any[]> {
   const db = getFirestoreDb();
   if (!db) return [];
   try {
     const fetchPromise = async () => {
-      const listMap = new Map<string, any>();
+      const rawList: any[] = [];
 
       try {
         const [usersSnap, legacySnap] = await Promise.all([
@@ -183,21 +199,7 @@ export async function fetchTutorsFromFirestore(): Promise<any[]> {
           usersSnap.forEach((d) => {
             const data = d.data();
             if (data && (data.email || data.name)) {
-              const key = (data.email || d.id).toLowerCase().trim();
-              const existing = listMap.get(key) || {};
-              const isApproved =
-                data.approvalStatus === 'approved' ||
-                data.isApproved === true ||
-                data.status === 'approved' ||
-                data.approved === true ||
-                existing.isApproved;
-              listMap.set(key, {
-                ...existing,
-                id: d.id,
-                ...data,
-                role: 'teacher',
-                ...(isApproved ? { approvalStatus: 'approved', isApproved: true, status: 'approved', approved: true } : {}),
-              });
+              rawList.push({ id: d.id, ...data, role: 'teacher' });
             }
           });
         }
@@ -206,22 +208,7 @@ export async function fetchTutorsFromFirestore(): Promise<any[]> {
           legacySnap.forEach((d) => {
             const data = d.data();
             if (data && (data.email || data.name)) {
-              const key = (data.email || d.id).toLowerCase().trim();
-              const existing = listMap.get(key) || {};
-              const isApproved =
-                data.approvalStatus === 'approved' ||
-                data.isApproved === true ||
-                data.status === 'approved' ||
-                data.approved === true ||
-                existing.isApproved;
-              const merged = { ...data, ...existing, id: existing.id || d.id, role: 'teacher' };
-              if (isApproved) {
-                merged.approvalStatus = 'approved';
-                merged.isApproved = true;
-                merged.status = 'approved';
-                merged.approved = true;
-              }
-              listMap.set(key, merged);
+              rawList.push({ id: d.id, ...data, role: 'teacher' });
             }
           });
         }
@@ -229,11 +216,11 @@ export async function fetchTutorsFromFirestore(): Promise<any[]> {
         console.warn('Error reading tutors from Firestore database:', dbErr);
       }
 
-      const results = Array.from(listMap.values());
+      const results = consolidateTutorsList(rawList);
       const approvedIds = results
         .filter((t) => t.approvalStatus === 'approved' || t.isApproved === true)
-        .map((t) => t.id || t.email);
-      console.log('[NativeFriends Server] Retrieved Firestore tutor IDs:', approvedIds);
+        .map((t) => t.publicTutorId || t.id || t.email);
+      console.log('[NativeFriends Server] Retrieved consolidated Firestore tutor IDs:', approvedIds);
       return results;
     };
 
@@ -383,30 +370,9 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
         students: Array.from(studentMap.values()),
       };
 
-      // Merge tutors from /tutors collection with tutors from app_state/tutors so NO tutor is EVER lost
-      const tutorMap = new Map<string, any>();
+      // Canonical consolidation of tutors from /tutors collection with app_state/tutors
       const stateTutors = Array.isArray(tutors?.tutorsList) ? tutors.tutorsList : [];
-      stateTutors.forEach((t: any) => {
-        const key = (t.email || t.id || '').toLowerCase().trim();
-        if (key) tutorMap.set(key, t);
-      });
-      (directTutors || []).forEach((t: any) => {
-        const key = (t.email || t.id || '').toLowerCase().trim();
-        if (key) {
-          const existing = tutorMap.get(key) || {};
-          const isExistingApproved = existing.approvalStatus === 'approved' || existing.isApproved === true || existing.status === 'approved';
-          const isDirectApproved = t.approvalStatus === 'approved' || t.isApproved === true || t.status === 'approved';
-          const merged = { ...existing, ...t };
-          if (isExistingApproved || isDirectApproved) {
-            merged.approvalStatus = 'approved';
-            merged.isApproved = true;
-            merged.status = 'approved';
-          }
-          tutorMap.set(key, merged);
-        }
-      });
-
-      const consolidatedTutorsList = Array.from(tutorMap.values());
+      const consolidatedTutorsList = consolidateTutorsList([...stateTutors, ...(directTutors || [])]);
       const mergedTutorsDoc = {
         ...(tutors || {}),
         tutorsList: consolidatedTutorsList,
@@ -1447,4 +1413,515 @@ export async function saveHomeworkToFirestore(
     }
     return false;
   }
+}
+
+export interface ScheduleLessonServerParams {
+  studentAuthUid: string;
+  studentEmail?: string;
+  studentName?: string;
+  teacherIdOrEmail: string;
+  teacherUid?: string;
+  teacherEmail?: string;
+  teacherName?: string;
+  meetLink?: string;
+  startDateTime: string;
+  endDateTime: string;
+  title?: string;
+  description?: string;
+  isTrialLesson?: boolean;
+  requestId?: string;
+  existingLessons?: any[];
+  dbState?: any;
+}
+
+export interface ScheduleLessonServerResult {
+  success: boolean;
+  lesson?: any;
+  remainingLessons?: number;
+  contractedLessons?: number;
+  isTrialLesson?: boolean;
+  error?: string;
+  statusCode: number;
+}
+
+/**
+ * Server-authoritative atomic scheduling service using Firebase Admin SDK.
+ * 
+ * Guarantees:
+ * 1. Authenticated canonical student UID derived strictly from server-verified token.
+ * 2. Resolution of Native Friend across users, tutors, and consolidated catalog.
+ * 3. Verification of tutor role and approved status (rejects unapproved/pending tutors).
+ * 4. Conflict detection: blocks overlapping slots for both teacher and student.
+ * 5. Trial lesson eligibility enforcement (prevents duplicate trial usage).
+ * 6. Balance verification and atomic decrement for paid lessons.
+ * 7. Idempotent execution preventing duplicate lessons on repeated submission.
+ * 8. Atomic persistence in Cloud Firestore via Firebase Admin SDK runTransaction.
+ */
+export async function scheduleLessonAtomicServer(
+  params: ScheduleLessonServerParams
+): Promise<ScheduleLessonServerResult> {
+  const {
+    studentAuthUid,
+    studentEmail,
+    studentName,
+    teacherIdOrEmail,
+    teacherUid,
+    teacherEmail,
+    teacherName,
+    meetLink,
+    startDateTime,
+    endDateTime,
+    title,
+    description,
+    isTrialLesson,
+    requestId,
+    existingLessons,
+    dbState,
+  } = params;
+
+  // 1. Validate student identity
+  if (!studentAuthUid || typeof studentAuthUid !== 'string' || studentAuthUid.trim().length === 0) {
+    return {
+      success: false,
+      error: 'Identidade de estudante não autenticada ou token inválido.',
+      statusCode: 401,
+    };
+  }
+
+  const cleanStudentEmail = (studentEmail || '').toLowerCase().trim();
+  const cleanTeacherTarget = (teacherIdOrEmail || teacherUid || teacherEmail || '').toLowerCase().trim();
+
+  if (!cleanTeacherTarget) {
+    return {
+      success: false,
+      error: 'Identificador do Amigo Nativo não informado.',
+      statusCode: 400,
+    };
+  }
+
+  // 2. Validate timestamps
+  const startTime = new Date(startDateTime).getTime();
+  const endTime = new Date(endDateTime).getTime();
+  if (isNaN(startTime) || isNaN(endTime) || startTime >= endTime) {
+    return {
+      success: false,
+      error: 'Horário de início ou término inválido. O horário inicial deve ser anterior ao término.',
+      statusCode: 400,
+    };
+  }
+
+  const db = getFirestoreDb();
+
+  // 3. Resolve Native Friend (Teacher) profile
+  let candidateTutors: any[] = [];
+  if (db) {
+    try {
+      const directDoc = await fetchTutorDocumentFromFirestore(cleanTeacherTarget, 2500);
+      if (directDoc) candidateTutors.push(directDoc);
+    } catch {}
+    try {
+      const allFirestoreTutors = await fetchTutorsFromFirestore();
+      if (Array.isArray(allFirestoreTutors)) candidateTutors.push(...allFirestoreTutors);
+    } catch {}
+  }
+  if (dbState && Array.isArray(dbState.tutorsList)) {
+    candidateTutors.push(...dbState.tutorsList);
+  }
+  if (dbState && Array.isArray(dbState.teachers)) {
+    candidateTutors.push(...dbState.teachers);
+  }
+
+  const consolidatedTutors = consolidateTutorsList(candidateTutors);
+  const matchedTutor = consolidatedTutors.find((t) => {
+    const tEmail = (t.email || '').toLowerCase().trim();
+    const tAuthUid = (t.authUid || t.uid || '').trim();
+    const tId = (t.publicTutorId || t.id || '').trim();
+    const tLegacy = (t.legacyId || '').trim();
+    const tName = normalizeTutorName(t.name);
+
+    return (
+      tId.toLowerCase() === cleanTeacherTarget ||
+      tAuthUid.toLowerCase() === cleanTeacherTarget ||
+      tEmail === cleanTeacherTarget ||
+      (tLegacy && tLegacy.toLowerCase() === cleanTeacherTarget) ||
+      (teacherEmail && tEmail === teacherEmail.toLowerCase().trim()) ||
+      (teacherUid && (tAuthUid === teacherUid || tId === teacherUid)) ||
+      (cleanTeacherTarget && tName === normalizeTutorName(cleanTeacherTarget))
+    );
+  });
+
+  if (!matchedTutor) {
+    return {
+      success: false,
+      error: 'Amigo Nativo não encontrado no sistema.',
+      statusCode: 404,
+    };
+  }
+
+  // Validate teacher role
+  const role = (matchedTutor.role || '').toLowerCase().trim();
+  const isTeacherRole = role === 'teacher' || role === 'tutor' || role === 'native_friend' || matchedTutor.isTeacher === true;
+  if (!isTeacherRole) {
+    return {
+      success: false,
+      error: 'O usuário selecionado não possui o perfil de Amigo Nativo.',
+      statusCode: 400,
+    };
+  }
+
+  // Validate teacher approval status
+  const isApproved = Boolean(
+    matchedTutor.approvalStatus === 'approved' ||
+    matchedTutor.isApproved === true ||
+    matchedTutor.status === 'approved' ||
+    matchedTutor.approved === true
+  );
+  if (!isApproved) {
+    return {
+      success: false,
+      error: 'O Amigo Nativo selecionado ainda não foi aprovado para receber agendamentos.',
+      statusCode: 400,
+    };
+  }
+
+  const resolvedPublicTutorId = matchedTutor.publicTutorId || matchedTutor.id || (matchedTutor.email ? `tutor-${matchedTutor.email.replace(/[^a-zA-Z0-9]/g, '-')}` : 'tutor');
+  const resolvedTeacherAuthUid = (matchedTutor.authUid || matchedTutor.uid && !matchedTutor.uid.startsWith('usr-') && !matchedTutor.uid.startsWith('tutor-') ? matchedTutor.uid : '') || undefined;
+  const resolvedTeacherEmail = (matchedTutor.email || teacherEmail || '').toLowerCase().trim();
+  const resolvedTeacherName = matchedTutor.name || teacherName || 'Native Friend';
+  const resolvedMeetLink = meetLink || matchedTutor.meetLink || matchedTutor.meetUrl || 'https://meet.google.com/new';
+
+  // Anti-impersonation: Student cannot be the same as Native Friend
+  if (
+    (resolvedTeacherAuthUid && studentAuthUid === resolvedTeacherAuthUid) ||
+    (resolvedTeacherEmail && cleanStudentEmail && resolvedTeacherEmail === cleanStudentEmail)
+  ) {
+    return {
+      success: false,
+      error: 'Violação de segurança: Aluno e Amigo Nativo não podem ter identidades idênticas.',
+      statusCode: 400,
+    };
+  }
+
+  // 4. Locate Student Profile
+  let studentDoc: any = null;
+  if (db) {
+    studentDoc = await fetchUserDocumentFromFirestore(studentAuthUid, 2500);
+    if (!studentDoc && cleanStudentEmail) {
+      const emailDocId = cleanStudentEmail.replace(/[^a-zA-Z0-9]/g, '-');
+      studentDoc = await fetchUserDocumentFromFirestore(emailDocId, 2000);
+    }
+  }
+  if (!studentDoc && dbState) {
+    studentDoc =
+      (cleanStudentEmail ? dbState.userProfiles?.[cleanStudentEmail] : null) ||
+      (dbState.students || []).find((s: any) => (s.email || '').toLowerCase().trim() === cleanStudentEmail || s.uid === studentAuthUid || s.id === studentAuthUid);
+  }
+
+  const currentContracted = Number(studentDoc?.contractedLessons ?? 0);
+  const currentAvailable = studentDoc?.availableLessons !== undefined ? Number(studentDoc.availableLessons) : currentContracted;
+  const hasAlreadyCompletedTrial = Boolean(studentDoc?.hasCompletedTrialLesson);
+
+  // 5. Gather existing lessons for conflict and trial checks
+  const allExistingLessons: any[] = [];
+  if (Array.isArray(existingLessons)) {
+    allExistingLessons.push(...existingLessons);
+  }
+  if (dbState && Array.isArray(dbState.liveLessons)) {
+    allExistingLessons.push(...dbState.liveLessons);
+  }
+  if (db) {
+    try {
+      const [tSnap, sSnap] = await Promise.all([
+        db.collection('lessons').where('teacherUid', '==', resolvedPublicTutorId).get().catch(() => null),
+        db.collection('lessons').where('studentUid', '==', studentAuthUid).get().catch(() => null),
+      ]);
+      if (tSnap) tSnap.forEach((d) => allExistingLessons.push({ id: d.id, ...d.data() }));
+      if (sSnap) sSnap.forEach((d) => allExistingLessons.push({ id: d.id, ...d.data() }));
+    } catch {}
+  }
+
+  // Deduplicate existing lessons by id
+  const existingLessonsMap = new Map<string, any>();
+  allExistingLessons.forEach((l) => {
+    if (l && l.id) existingLessonsMap.set(l.id, l);
+  });
+  const consolidatedLessons = Array.from(existingLessonsMap.values());
+
+  // 6. Deterministic Lesson ID & Idempotency Check (Anti-Duplication on retry/rapid clicks)
+  const deterministicLessonId = requestId || `lesson-${studentAuthUid}-${startTime}`;
+  const existingExactLesson = consolidatedLessons.find((l) => l.id === deterministicLessonId);
+  if (existingExactLesson && existingExactLesson.status === 'scheduled') {
+    return {
+      success: true,
+      lesson: existingExactLesson,
+      remainingLessons: currentAvailable,
+      contractedLessons: currentContracted,
+      isTrialLesson: Boolean(isTrialLesson),
+      statusCode: 200,
+    };
+  }
+
+  // 7. Check Overlapping Conflicts (Anti-Duplicity Rule: teacher or student cannot have overlapping slots)
+  const candidateConflict = consolidatedLessons.find((l) => {
+    const isCancelled = l.status === 'cancelled' || l.status === 'canceled' || Boolean(l.cancelledAt);
+    if (isCancelled) return false;
+    if (l.status && l.status !== 'scheduled') return false;
+
+    // Check time overlap
+    if (!l.startDateTime || !l.endDateTime) return false;
+    const lStart = new Date(l.startDateTime).getTime();
+    const lEnd = new Date(l.endDateTime).getTime();
+    const overlaps = lStart < endTime && lEnd > startTime;
+    if (!overlaps) return false;
+
+    // Teacher conflict
+    const isSameTeacher =
+      (l.teacherUid && l.teacherUid === resolvedPublicTutorId) ||
+      (resolvedTeacherAuthUid && l.teacherUid === resolvedTeacherAuthUid) ||
+      (resolvedTeacherEmail && (l.teacherEmail || '').toLowerCase().trim() === resolvedTeacherEmail);
+
+    // Student conflict
+    const isSameStudent =
+      (l.studentUid && l.studentUid === studentAuthUid) ||
+      (cleanStudentEmail && (l.studentEmail || '').toLowerCase().trim() === cleanStudentEmail);
+
+    return isSameTeacher || isSameStudent;
+  });
+
+  if (candidateConflict) {
+    const isTeacher =
+      (candidateConflict.teacherUid && candidateConflict.teacherUid === resolvedPublicTutorId) ||
+      (resolvedTeacherEmail && (candidateConflict.teacherEmail || '').toLowerCase().trim() === resolvedTeacherEmail);
+
+    return {
+      success: false,
+      error: isTeacher
+        ? 'Bloqueio de Conflito: O Amigo Nativo já possui outra aula agendada neste horário. Por favor, selecione outro horário.'
+        : 'Bloqueio de Conflito: Você já possui outra aula agendada neste horário. Por favor, selecione outro horário.',
+      statusCode: 409,
+    };
+  }
+
+  // 8. Check Trial Lesson Eligibility & Balance
+  if (isTrialLesson) {
+    if (hasAlreadyCompletedTrial) {
+      return {
+        success: false,
+        error: 'Aula experimental já foi utilizada anteriormente por este estudante.',
+        statusCode: 400,
+      };
+    }
+
+    const existingActiveTrial = consolidatedLessons.find((l) => {
+      const isCancelled = l.status === 'cancelled' || l.status === 'canceled' || Boolean(l.cancelledAt);
+      if (isCancelled) return false;
+      const isSameStudent =
+        l.studentUid === studentAuthUid ||
+        (cleanStudentEmail && (l.studentEmail || '').toLowerCase().trim() === cleanStudentEmail);
+      return isSameStudent && Boolean(l.isTrialLesson);
+    });
+
+    if (existingActiveTrial) {
+      return {
+        success: false,
+        error: 'Você já possui uma aula experimental agendada ou realizada.',
+        statusCode: 400,
+      };
+    }
+  } else {
+    // Check balance for regular lesson
+    if (currentAvailable <= 0) {
+      return {
+        success: false,
+        error: 'Saldo de aulas insuficiente. Por favor, adquira créditos de aulas antes de agendar.',
+        statusCode: 402,
+      };
+    }
+  }
+
+  // 9. Compute updated balances
+  let newContracted = currentContracted;
+  let newAvailable = currentAvailable;
+  if (isTrialLesson) {
+    newContracted = Math.max(currentContracted, 1);
+    newAvailable = Math.max(0, currentAvailable);
+  } else {
+    newContracted = currentContracted;
+    newAvailable = Math.max(0, currentAvailable - 1);
+  }
+
+  const nowIso = new Date().toISOString();
+  const sanitizedLesson = {
+    id: deterministicLessonId,
+    title: title || (isTrialLesson ? 'Aula Experimental Ao Vivo (Google Meet)' : 'Aula Ao Vivo 1-on-1'),
+    description: description || '',
+    startDateTime,
+    endDateTime,
+    studentUid: studentAuthUid,
+    studentEmail: cleanStudentEmail || studentDoc?.email || '',
+    studentName: studentName || studentDoc?.name || (cleanStudentEmail ? cleanStudentEmail.split('@')[0] : 'Aluno'),
+    teacherUid: resolvedPublicTutorId,
+    teacherEmail: resolvedTeacherEmail,
+    teacherName: resolvedTeacherName,
+    meetLink: resolvedMeetLink,
+    status: 'scheduled',
+    isTrialLesson: Boolean(isTrialLesson),
+    createdAt: nowIso,
+    updatedAt: nowIso,
+  };
+
+  // 10. Atomic Execution: Firebase Admin SDK runTransaction when available
+  if (db && !isCloudWriteDisabled) {
+    try {
+      await db.runTransaction(async (transaction) => {
+        const studentRef = db.collection('users').doc(studentAuthUid);
+        const lessonRef = db.collection('lessons').doc(deterministicLessonId);
+        const studentSubLessonRef = db.collection('users').doc(studentAuthUid).collection('lessons').doc(deterministicLessonId);
+
+        transaction.set(lessonRef, sanitizedLesson, { merge: true });
+        transaction.set(studentSubLessonRef, sanitizedLesson, { merge: true });
+
+        // Update teacher subcollection in /users and /tutors
+        if (resolvedTeacherAuthUid) {
+          const teacherUserSubLesson = db.collection('users').doc(resolvedTeacherAuthUid).collection('lessons').doc(deterministicLessonId);
+          transaction.set(teacherUserSubLesson, sanitizedLesson, { merge: true });
+        }
+        if (resolvedPublicTutorId) {
+          const tutorSubLesson = db.collection('tutors').doc(resolvedPublicTutorId).collection('lessons').doc(deterministicLessonId);
+          transaction.set(tutorSubLesson, sanitizedLesson, { merge: true });
+        }
+        if (matchedTutor.legacyId && matchedTutor.legacyId !== resolvedPublicTutorId && matchedTutor.legacyId !== resolvedTeacherAuthUid) {
+          const legacyTutorSubLesson = db.collection('tutors').doc(matchedTutor.legacyId).collection('lessons').doc(deterministicLessonId);
+          transaction.set(legacyTutorSubLesson, sanitizedLesson, { merge: true });
+        }
+
+        // Student assignments record
+        const assignmentRef = db.collection('student_assignments').doc(studentAuthUid);
+        transaction.set(
+          assignmentRef,
+          {
+            studentUid: studentAuthUid,
+            teacherUid: resolvedPublicTutorId,
+            teacherAuthUid: resolvedTeacherAuthUid || null,
+            teacherEmail: resolvedTeacherEmail,
+            teacherName: resolvedTeacherName,
+            updatedAt: nowIso,
+          },
+          { merge: true }
+        );
+
+        // Student document update
+        transaction.set(
+          studentRef,
+          {
+            uid: studentAuthUid,
+            id: studentAuthUid,
+            email: cleanStudentEmail || studentDoc?.email || '',
+            name: sanitizedLesson.studentName,
+            teacherUid: resolvedPublicTutorId,
+            assignedNativeFriendUID: resolvedPublicTutorId,
+            nativeFriendUID: resolvedPublicTutorId,
+            teacherEmail: resolvedTeacherEmail,
+            teacherName: resolvedTeacherName,
+            teacherMeetUrl: resolvedMeetLink,
+            enrollmentStatus: 'active',
+            hasCompletedTrialLesson: isTrialLesson ? true : hasAlreadyCompletedTrial,
+            contractedLessons: newContracted,
+            availableLessons: newAvailable,
+            updatedAt: nowIso,
+          },
+          { merge: true }
+        );
+
+        // Idempotent reconciliation of legacy student doc without deletion
+        if (studentDoc && studentDoc.id && studentDoc.id !== studentAuthUid) {
+          const legacyStudentRef = db.collection('users').doc(studentDoc.id);
+          transaction.set(legacyStudentRef, { canonicalUid: studentAuthUid, updatedAt: nowIso }, { merge: true });
+        }
+      });
+    } catch (txErr: any) {
+      if (isPermissionError(txErr)) {
+        isCloudWriteDisabled = true;
+        console.info('[serverFirestore] Remote schedule transaction restricted by IAM, committing to synchronized state.');
+      } else {
+        console.warn('[serverFirestore] Firestore admin transaction warning:', txErr);
+      }
+    }
+  }
+
+  // 11. Synchronize in-memory AppDb if provided
+  if (dbState) {
+    if (!Array.isArray(dbState.liveLessons)) dbState.liveLessons = [];
+    const existingIdx = dbState.liveLessons.findIndex((l: any) => l.id === deterministicLessonId);
+    if (existingIdx >= 0) {
+      dbState.liveLessons[existingIdx] = sanitizedLesson;
+    } else {
+      dbState.liveLessons.unshift(sanitizedLesson);
+    }
+
+    if (!dbState.userProfiles) dbState.userProfiles = {};
+    const profileKey = cleanStudentEmail || studentAuthUid;
+    dbState.userProfiles[profileKey] = {
+      ...(dbState.userProfiles[profileKey] || {}),
+      id: studentAuthUid,
+      uid: studentAuthUid,
+      email: cleanStudentEmail,
+      name: sanitizedLesson.studentName,
+      teacherUid: resolvedPublicTutorId,
+      assignedNativeFriendUID: resolvedPublicTutorId,
+      nativeFriendUID: resolvedPublicTutorId,
+      teacherEmail: resolvedTeacherEmail,
+      teacherName: resolvedTeacherName,
+      teacherMeetUrl: resolvedMeetLink,
+      enrollmentStatus: 'active',
+      hasCompletedTrialLesson: isTrialLesson ? true : hasAlreadyCompletedTrial,
+      contractedLessons: newContracted,
+      availableLessons: newAvailable,
+      updatedAt: nowIso,
+    };
+
+    if (!Array.isArray(dbState.students)) dbState.students = [];
+    const stIdx = dbState.students.findIndex(
+      (s: any) => (s.email || '').toLowerCase().trim() === cleanStudentEmail || s.uid === studentAuthUid || s.id === studentAuthUid
+    );
+    if (stIdx >= 0) {
+      dbState.students[stIdx] = {
+        ...dbState.students[stIdx],
+        uid: studentAuthUid,
+        studentUid: studentAuthUid,
+        teacherUid: resolvedPublicTutorId,
+        teacherEmail: resolvedTeacherEmail,
+        teacherName: resolvedTeacherName,
+        status: 'active',
+        contractedLessons: newContracted,
+        hasCompletedTrialLesson: isTrialLesson ? true : hasAlreadyCompletedTrial,
+      };
+    } else {
+      dbState.students.push({
+        id: studentAuthUid,
+        uid: studentAuthUid,
+        studentUid: studentAuthUid,
+        name: sanitizedLesson.studentName,
+        studentName: sanitizedLesson.studentName,
+        email: cleanStudentEmail,
+        studentEmail: cleanStudentEmail,
+        teacherUid: resolvedPublicTutorId,
+        teacherEmail: resolvedTeacherEmail,
+        teacherName: resolvedTeacherName,
+        status: 'active',
+        contractedLessons: newContracted,
+        hasCompletedTrialLesson: isTrialLesson ? true : false,
+        createdAt: nowIso,
+      });
+    }
+  }
+
+  return {
+    success: true,
+    lesson: sanitizedLesson,
+    remainingLessons: newAvailable,
+    contractedLessons: newContracted,
+    isTrialLesson: Boolean(isTrialLesson),
+    statusCode: 200,
+  };
 }

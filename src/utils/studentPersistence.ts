@@ -1007,207 +1007,77 @@ export async function scheduleLessonWithTransaction(params: ScheduleLessonTransa
   contractedLessons?: number;
   error?: string;
 }> {
-  const db = getDb();
-  if (!db || !params.lesson?.id) {
-    return { success: false, error: 'Database or lesson ID missing' };
-  }
-
   const { lesson, isTrialLesson } = params;
-  const cleanStudentEmail = (lesson.studentEmail || '').toLowerCase().trim();
-  const cleanTeacherEmail = (lesson.teacherEmail || '').toLowerCase().trim();
-
-  // Canonical Student UID resolution (explicit canonical UID, never manufactured from email)
-  const studentUid =
-    (lesson.studentUid && isValidCanonicalUid(lesson.studentUid) ? lesson.studentUid.trim() : '') ||
-    (auth?.currentUser?.uid && (!cleanStudentEmail || (auth.currentUser.email || '').toLowerCase().trim() === cleanStudentEmail)
-      ? auth.currentUser.uid
-      : '');
-
-  if (!studentUid || !isValidCanonicalUid(studentUid)) {
-    return { success: false, error: 'Student UID missing' };
+  if (!lesson || !lesson.startDateTime || !lesson.endDateTime) {
+    return { success: false, error: 'Dados obrigatórios do agendamento ausentes.' };
   }
 
-  // Canonical Native Friend UID / persisted identifier resolution:
-  const teacherUid =
-    lesson.teacherUid && isValidCanonicalUid(lesson.teacherUid)
-      ? lesson.teacherUid.trim()
-      : (lesson.teacherUid && typeof lesson.teacherUid === 'string' && lesson.teacherUid.trim() ? lesson.teacherUid.trim() : '');
-
-  if (!teacherUid) {
-    return { success: false, error: 'Canonical Native Friend UID missing' };
-  }
-
-  // Auth Context Safety: Student and Native Friend cannot have the same UID
-  if (studentUid === teacherUid) {
-    return { success: false, error: 'Student UID and Native Friend UID cannot be identical' };
-  }
-
-  const nowIso = new Date().toISOString();
-  const lessonRef = doc(db, 'lessons', lesson.id);
-  const studentRef = doc(db, 'users', studentUid);
-  const teacherRef = doc(db, 'users', teacherUid);
-  const tutorRef = doc(db, 'tutors', teacherUid);
-  const teacherEmailDocId = cleanTeacherEmail ? cleanTeacherEmail.replace(/[^a-zA-Z0-9]/g, '-') : '';
-  const teacherEmailRef = teacherEmailDocId && teacherEmailDocId !== teacherUid ? doc(db, 'users', teacherEmailDocId) : null;
-  const tutorEmailRef = teacherEmailDocId && teacherEmailDocId !== teacherUid ? doc(db, 'tutors', teacherEmailDocId) : null;
-  const studentSubLessonRef = doc(db, 'users', studentUid, 'lessons', lesson.id);
-
+  // 1. Authoritative Backend Scheduling: Execute privileged operations via Firebase Admin SDK
   try {
-    const result = await runTransaction(db, async (transaction) => {
-      // 1. All transaction reads first
-      const studentSnap = await transaction.get(studentRef);
-      const teacherSnap = await transaction.get(teacherRef);
-      const tutorSnap = await transaction.get(tutorRef);
-      const teacherEmailSnap = teacherEmailRef ? await transaction.get(teacherEmailRef) : null;
-      const tutorEmailSnap = tutorEmailRef ? await transaction.get(tutorEmailRef) : null;
-      const lessonSnap = await transaction.get(lessonRef);
-
-      // Validate teacher account existence in users/{teacherUid} or tutors/{teacherUid}
-      let teacherData = (
-        teacherSnap.exists()
-          ? teacherSnap.data()
-          : (tutorSnap.exists()
-              ? tutorSnap.data()
-              : (teacherEmailSnap?.exists()
-                  ? teacherEmailSnap.data()
-                  : (tutorEmailSnap?.exists()
-                      ? tutorEmailSnap.data()
-                      : null)))
-      ) as Record<string, any> | null;
-
-      if (!teacherData) {
-        throw new Error('Native Friend UID does not resolve to an existing user');
-      }
-
-      // Validate teacher role convention
-      const isTeacherRole =
-        teacherData.role === 'teacher' ||
-        teacherData.role === 'admin' ||
-        teacherData.isTeacher === true;
-
-      if (!isTeacherRole) {
-        throw new Error('User account is not a Native Friend');
-      }
-
-      // Validate teacher approval status
-      const isApproved =
-        teacherData.approvalStatus === 'approved' ||
-        teacherData.isApproved === true ||
-        teacherData.status === 'approved' ||
-        teacherData.approved === true ||
-        (teacherData.approvalStatus === undefined && teacherData.isApproved === undefined && teacherData.status === 'active');
-
-      if (!isApproved || teacherData.approvalStatus === 'rejected' || teacherData.approvalStatus === 'pending') {
-        throw new Error('Native Friend account is not approved');
-      }
-
-      const studentData = studentSnap.exists() ? (studentSnap.data() as Partial<UserProfile>) : {};
-      const currentContracted = Number(studentData.contractedLessons ?? 0);
-      const currentAvailable =
-        studentData.availableLessons !== undefined ? Number(studentData.availableLessons) : currentContracted;
-
-      let newContracted = currentContracted;
-      let newAvailable = currentAvailable;
-
-      if (isTrialLesson) {
-        // Trial lesson grant: ensure at least 1 contracted lesson and mark trial completed/booked
-        newContracted = Math.max(currentContracted, 1);
-        newAvailable = Math.max(0, currentAvailable);
-      } else {
-        // Decrement available lesson balance atomically
-        newContracted = currentContracted;
-        newAvailable = Math.max(0, currentAvailable - 1);
-      }
-
-      // Resolve authoritative teacher details from teacher user document if available
-      const effectiveTeacherName = lesson.teacherName || teacherData.name || studentData.teacherName || null;
-      const effectiveTeacherEmail = cleanTeacherEmail || teacherData.email || studentData.teacherEmail || null;
-      const effectiveTeacherMeet = lesson.meetLink || teacherData.meetUrl || teacherData.meetLink || '';
-
-      const sanitizedLesson: LiveLesson = stampSchemaVersion({
-        ...lesson,
-        id: lesson.id,
-        studentUid,
-        studentEmail: cleanStudentEmail,
-        studentName: lesson.studentName || studentData.name || cleanStudentEmail.split('@')[0],
-        teacherUid,
-        teacherEmail: effectiveTeacherEmail,
-        teacherName: effectiveTeacherName,
-        meetLink: effectiveTeacherMeet || lesson.meetLink || '',
-        status: 'scheduled',
-        isTrialLesson: Boolean(isTrialLesson),
-        createdAt: lesson.createdAt || nowIso,
-        updatedAt: nowIso,
-      });
-
-      // 2. Transaction writes
-      transaction.set(lessonRef, sanitizedLesson, { merge: true });
-      transaction.set(studentSubLessonRef, sanitizedLesson, { merge: true });
-
-      // Student main document update with decremented balance and canonical teacher UID binding
-      const studentUpdate: Record<string, any> = stampSchemaVersion({
-        contractedLessons: newContracted,
-        availableLessons: newAvailable,
-        teacherUid,
-        teacherEmail: effectiveTeacherEmail,
-        teacherName: effectiveTeacherName,
-        teacherMeetUrl: effectiveTeacherMeet,
-        assignedNativeFriendUID: teacherUid,
-        nativeFriendUID: teacherUid,
-        enrollmentStatus: 'active',
-        hasCompletedTrialLesson: isTrialLesson ? true : (studentData.hasCompletedTrialLesson ?? false),
-        updatedAt: nowIso,
-      });
-      transaction.set(studentRef, studentUpdate, { merge: true });
-
-      // Teacher user doc update
-      const teacherSubLessonRef = doc(db, 'users', teacherUid, 'lessons', lesson.id);
-      transaction.set(teacherSubLessonRef, sanitizedLesson, { merge: true });
-      if (teacherSnap.exists()) {
-        transaction.set(teacherRef, { updatedAt: nowIso }, { merge: true });
-      }
-      if (tutorSnap.exists()) {
-        transaction.set(tutorRef, { updatedAt: nowIso }, { merge: true });
-        const tutorSubLessonRef = doc(db, 'tutors', teacherUid, 'lessons', lesson.id);
-        transaction.set(tutorSubLessonRef, sanitizedLesson, { merge: true });
-      }
-      if (teacherEmailSnap && teacherEmailSnap.exists() && teacherEmailRef) {
-        transaction.set(teacherEmailRef, { updatedAt: nowIso }, { merge: true });
-        const teacherEmailSubLessonRef = doc(db, 'users', teacherEmailDocId, 'lessons', lesson.id);
-        transaction.set(teacherEmailSubLessonRef, sanitizedLesson, { merge: true });
-      }
-      if (tutorEmailSnap && tutorEmailSnap.exists() && tutorEmailRef) {
-        transaction.set(tutorEmailRef, { updatedAt: nowIso }, { merge: true });
-        const tutorEmailSubLessonRef = doc(db, 'tutors', teacherEmailDocId, 'lessons', lesson.id);
-        transaction.set(tutorEmailSubLessonRef, sanitizedLesson, { merge: true });
-      }
-
+    const currentUser = auth?.currentUser;
+    if (!currentUser) {
       return {
-        lesson: sanitizedLesson,
-        contractedLessons: newContracted,
-        remainingLessons: newAvailable,
+        success: false,
+        error: 'Sessão não autenticada. Faça login com seu e-mail para agendar a aula.',
       };
+    }
+
+    const idToken = await currentUser.getIdToken();
+    if (!idToken) {
+      return {
+        success: false,
+        error: 'Token de autenticação ausente. Por favor, reconecte-se.',
+      };
+    }
+
+    const payload = {
+      requestId: lesson.id,
+      id: lesson.id,
+      teacherId: lesson.teacherUid || lesson.teacherEmail,
+      teacherUid: lesson.teacherUid,
+      teacherEmail: lesson.teacherEmail,
+      teacherName: lesson.teacherName,
+      meetLink: lesson.meetLink,
+      startDateTime: lesson.startDateTime,
+      endDateTime: lesson.endDateTime,
+      title: lesson.title,
+      description: lesson.description,
+      isTrialLesson: Boolean(isTrialLesson),
+      studentName: lesson.studentName || currentUser.displayName || 'Aluno',
+      studentEmail: currentUser.email || lesson.studentEmail,
+      studentUid: currentUser.uid,
+    };
+
+    const response = await fetch('/api/lessons/schedule', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`,
+      },
+      body: JSON.stringify(payload),
     });
 
+    const data = await response.json().catch(() => ({}));
+
+    if (response.ok && data.success) {
+      return {
+        success: true,
+        lesson: data.lesson,
+        remainingLessons: data.remainingLessons,
+        contractedLessons: data.contractedLessons,
+      };
+    }
+
     return {
-      success: true,
-      lesson: result.lesson,
-      contractedLessons: result.contractedLessons,
-      remainingLessons: result.remainingLessons,
+      success: false,
+      error: data.message || data.error || 'Falha ao agendar aula no servidor.',
     };
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
-    console.error('Error in scheduleLessonWithTransaction:', errorMsg);
-    if (
-      !errorMsg.includes('Native Friend UID does not resolve') &&
-      !errorMsg.includes('Native Friend account is not approved') &&
-      !errorMsg.includes('User account is not a Native Friend')
-    ) {
-      handleFirestoreError(error, OperationType.WRITE, `lessons/${lesson.id}`);
-    }
+    console.error('Error in scheduleLessonWithTransaction (backend dispatch):', errorMsg);
     return {
       success: false,
-      error: errorMsg,
+      error: errorMsg || 'Erro de comunicação com o servidor de agendamento.',
     };
   }
 }

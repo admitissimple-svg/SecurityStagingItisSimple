@@ -314,15 +314,17 @@ export const LiveLessonScheduleModal: React.FC<LiveLessonScheduleModalProps> = (
     if (rawMatchedId && typeof rawMatchedId === 'string' && !rawMatchedId.includes('@') && !rawMatchedId.startsWith('st-') && !rawMatchedId.startsWith('usr-')) {
       return rawMatchedId.trim();
     }
-    return '';
-  }, [selectedTeacherObj, matchedTutor]);
+    return matchedTutor?.id || (matchedTutor as any)?.publicTutorId || (selectedTeacherObj as any)?.id || selectedTeacherEmail || '';
+  }, [selectedTeacherObj, matchedTutor, selectedTeacherEmail]);
 
   const effectiveStudentEmail = (
     (isStudentBookingMode && candidateStudentEmail)
       ? candidateStudentEmail
-      : (!isTeacher && currentAccount?.email)
-        ? currentAccount.email.trim().toLowerCase()
-        : (selectedStudentEmail || (currentAccount?.email ?? '')).trim().toLowerCase()
+      : auth?.currentUser?.email
+        ? auth.currentUser.email.trim().toLowerCase()
+        : (!isTeacher && currentAccount?.email)
+          ? currentAccount.email.trim().toLowerCase()
+          : (selectedStudentEmail || (currentAccount?.email ?? '')).trim().toLowerCase()
   );
 
   const matchedStudent = students.find((s) => (s.email || '').toLowerCase() === effectiveStudentEmail);

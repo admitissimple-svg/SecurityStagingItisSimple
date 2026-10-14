@@ -101,6 +101,8 @@ import {
   fetchHomeworkFromFirestore,
   saveHomeworkToFirestore,
   isPermissionError,
+  consolidateTutorsList,
+  scheduleLessonAtomicServer,
 } from './src/serverFirestore';
 import { DEFAULT_CURATED_PLAYLISTS } from './src/utils/youtubeService';
 import {
@@ -2753,8 +2755,10 @@ app.get('/api/teachers', firebaseAuthMiddleware, requireAdmin, (req, res) => {
  * Preserves ratings, reviews, and teaching counts ONLY when genuinely recorded as numbers (no fake values added).
  */
 function toPublicTutorDto(t: any): Record<string, any> {
+  const publicId = String(t.publicTutorId || t.id || '');
   const dto: Record<string, any> = {
-    id: String(t.id || ''),
+    id: publicId,
+    publicTutorId: publicId,
     name: String(t.name || ''),
     avatar: String(t.avatar || t.photoUrl || t.picture || ''),
     photoUrl: String(t.avatar || t.photoUrl || t.picture || ''),
@@ -2813,6 +2817,9 @@ function toPublicTutorDto(t: any): Record<string, any> {
  */
 function sanitizePrivateTutorRecord(t: any): Record<string, any> {
   const sanitized = { ...t };
+  const publicId = String(t.publicTutorId || t.id || '');
+  sanitized.id = publicId;
+  sanitized.publicTutorId = publicId;
   delete sanitized.password;
   delete sanitized.token;
   delete sanitized.secret;
@@ -2829,36 +2836,11 @@ app.get('/api/tutors', async (req, res) => {
   // Continuously synchronize tutors with Firestore so remotely created profiles (e.g. Charles) appear immediately
   try {
     const directTutors = await fetchTutorsFromFirestore();
-    if (directTutors && directTutors.length > 0) {
-      const map = new Map<string, any>();
-      (db.tutorsList || []).forEach((t: any) => {
-        const k = (t.email || t.id || '').toLowerCase().trim();
-        if (k) map.set(k, t);
-      });
-      directTutors.forEach((t: any) => {
-        const k = (t.email || t.id || '').toLowerCase().trim();
-        if (k) {
-          const existing = map.get(k) || {};
-          const isApproved =
-            t.approvalStatus === 'approved' ||
-            t.isApproved === true ||
-            t.status === 'approved' ||
-            t.approved === true ||
-            existing.isApproved;
-          map.set(k, {
-            ...existing,
-            ...t,
-            role: 'teacher',
-            approvalStatus: isApproved ? 'approved' : t.approvalStatus,
-            isApproved: isApproved,
-            status: isApproved ? 'approved' : t.status,
-          });
-        }
-      });
-      db.tutorsList = Array.from(map.values());
-    }
+    const mergedList = [...(db.tutorsList || []), ...(directTutors || [])];
+    db.tutorsList = consolidateTutorsList(mergedList);
   } catch (err) {
     console.warn('Error fetching tutors from Firestore in GET /api/tutors:', err);
+    db.tutorsList = consolidateTutorsList(db.tutorsList || []);
   }
 
   // SECURITY HOTFIX — Native Friends Public API Authorization
@@ -6451,6 +6433,81 @@ app.get(['/api/lessons', '/api/live-lessons'], (req, res) => {
 
   // Anonymous / unauthenticated: return empty list to protect privacy
   res.json([]);
+});
+
+/**
+ * Dedicated secure backend endpoint for scheduling live and trial lessons.
+ * Strictly authenticated via Firebase Admin SDK verifyIdToken.
+ * Derived canonical student UID is exclusively taken from the verified token.
+ * Prevents scheduling for other users, double-booking, and unauthorized trial lessons.
+ */
+app.post('/api/lessons/schedule', firebaseAuthMiddleware, async (req, res) => {
+  const verifiedUser = req.user;
+  if (!verifiedUser || !verifiedUser.uid) {
+    return res.status(401).json({
+      error: 'Autenticação necessária para agendar aulas.',
+      message: 'Verified Firebase ID token missing',
+    });
+  }
+
+  const studentAuthUid = verifiedUser.uid;
+  const verifiedStudentEmail = (verifiedUser.email || '').toLowerCase().trim();
+
+  // Defense-in-depth: Reject attempt to schedule on behalf of another student
+  if (req.body.studentUid && req.body.studentUid.trim() !== studentAuthUid) {
+    return res.status(403).json({
+      error: 'Proibido: tentativa de agendar aula em nome de outro estudante.',
+      message: 'Student UID does not match authenticated token UID',
+    });
+  }
+  if (
+    req.body.studentEmail &&
+    verifiedStudentEmail &&
+    req.body.studentEmail.toLowerCase().trim() !== verifiedStudentEmail
+  ) {
+    return res.status(403).json({
+      error: 'Proibido: tentativa de agendar aula com e-mail divergente do token autenticado.',
+      message: 'Student email does not match authenticated token email',
+    });
+  }
+
+  const db = readDb();
+  try {
+    const result = await scheduleLessonAtomicServer({
+      studentAuthUid,
+      studentEmail: verifiedStudentEmail,
+      studentName: req.body.studentName,
+      teacherIdOrEmail: req.body.teacherId || req.body.tutorId || req.body.teacherUid || req.body.teacherEmail,
+      teacherUid: req.body.teacherUid,
+      teacherEmail: req.body.teacherEmail,
+      teacherName: req.body.teacherName,
+      meetLink: req.body.meetLink,
+      startDateTime: req.body.startDateTime,
+      endDateTime: req.body.endDateTime,
+      title: req.body.title,
+      description: req.body.description,
+      isTrialLesson: Boolean(req.body.isTrialLesson),
+      requestId: req.body.requestId || req.body.id,
+      existingLessons: db.liveLessons,
+      dbState: db,
+    });
+
+    if (!result.success) {
+      return res.status(result.statusCode || 400).json({
+        error: result.error,
+        message: result.error,
+      });
+    }
+
+    await writeDbSync(db);
+    return res.status(200).json(result);
+  } catch (err: any) {
+    console.error('Error in POST /api/lessons/schedule:', err);
+    return res.status(500).json({
+      error: 'Erro interno ao processar agendamento de aula.',
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
 });
 
 app.post(['/api/lessons', '/api/live-lessons'], async (req, res) => {
