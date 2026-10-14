@@ -385,11 +385,12 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
   // Selected student object (safe memoized lookup)
   const activeStudent = useMemo(() => {
+    const targetEmail = (selectedStudentEmail || '').toLowerCase().trim();
+    if (!targetEmail) return undefined;
     return safeStudents.find(
       (s) =>
-        s?.email &&
-        selectedStudentEmail &&
-        s.email.toLowerCase().trim() === selectedStudentEmail.toLowerCase().trim()
+        Boolean(s) &&
+        (s.email || '').toLowerCase().trim() === targetEmail
     );
   }, [safeStudents, selectedStudentEmail]);
 

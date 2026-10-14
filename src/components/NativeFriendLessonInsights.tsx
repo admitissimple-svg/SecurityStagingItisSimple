@@ -94,11 +94,11 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
     journalEntries.forEach((entry) => {
       if (entry && entry.type === 'video' && entry.id) {
         if (!entry.week || entry.week === weeklyCycle) {
-          const id = entry.id.toLowerCase();
+          const id = String(entry.id).toLowerCase();
           if (!seen.has(id)) {
             seen.add(id);
             list.push({
-              id: entry.id,
+              id: String(entry.id),
               title: entry.title || 'Daily Routine Video',
               dayOfWeek: entry.dayOfWeek,
               watchedAt: entry.timestamp ? new Date(entry.timestamp).toISOString() : entry.date,
@@ -110,11 +110,12 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
 
     // 2. From weeklyHistory
     (weeklyHistory?.consumedVideoIds || []).forEach((v) => {
+      if (!v) return;
       const vid = v.id || v.videoId;
-      if (vid && !seen.has(vid.toLowerCase())) {
-        seen.add(vid.toLowerCase());
+      if (vid && !seen.has(String(vid).toLowerCase())) {
+        seen.add(String(vid).toLowerCase());
         list.push({
-          id: vid,
+          id: String(vid),
           title: v.title || v.videoTitle || 'Daily Routine Video',
           dayOfWeek: v.dayOfWeek,
           watchedAt: v.watchedAt,
@@ -133,11 +134,11 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
     journalEntries.forEach((entry) => {
       if (entry && entry.type === 'audio' && entry.id) {
         if (!entry.week || entry.week === weeklyCycle) {
-          const id = entry.id.toLowerCase();
+          const id = String(entry.id).toLowerCase();
           if (!seen.has(id)) {
             seen.add(id);
             list.push({
-              id: entry.id,
+              id: String(entry.id),
               title: entry.title || 'Daily Spotify Track',
               artist: entry.artist || 'Spotify Artist',
               dayOfWeek: entry.dayOfWeek,
@@ -149,11 +150,12 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
 
     // 2. From weeklyHistory
     (weeklyHistory?.consumedTrackIds || []).forEach((t) => {
+      if (!t) return;
       const trkId = t.id || t.trackId;
-      if (trkId && !seen.has(trkId.toLowerCase())) {
-        seen.add(trkId.toLowerCase());
+      if (trkId && !seen.has(String(trkId).toLowerCase())) {
+        seen.add(String(trkId).toLowerCase());
         list.push({
-          id: trkId,
+          id: String(trkId),
           title: t.title || 'Daily Track',
           artist: t.artist || 'Artist',
           coverUrl: t.coverUrl,

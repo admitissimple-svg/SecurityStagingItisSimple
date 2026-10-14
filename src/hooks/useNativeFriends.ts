@@ -381,12 +381,13 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
   // Filter public tutors for the main landing directory
   const publicTutors = useMemo(() => {
     return tutors.filter((t) => {
+      if (!t) return false;
       const isApproved = isTutorApproved(t);
       const isTeacher = isTeacherRole(t);
       if (isApproved && isTeacher) return true;
 
       // Allow tutor themselves to view their profile even if pending
-      if (cleanUserEmail && t.email?.toLowerCase().trim() === cleanUserEmail) {
+      if (cleanUserEmail && (t.email || '').toLowerCase().trim() === cleanUserEmail) {
         return true;
       }
       if (uid && t.uid === uid) {

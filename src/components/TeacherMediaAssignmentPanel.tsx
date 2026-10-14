@@ -98,8 +98,12 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
   // Find current active student info
   const selectedStudent = (students || []).find(
     (s) =>
-      (selectedStudentUid && (s.uid === selectedStudentUid || s.id === selectedStudentUid)) ||
-      (selectedStudentEmail && (s.email?.toLowerCase() === selectedStudentEmail.toLowerCase() || s.uid === selectedStudentEmail || s.id === selectedStudentEmail))
+      Boolean(s) &&
+      ((selectedStudentUid && (s.uid === selectedStudentUid || s.id === selectedStudentUid)) ||
+        (selectedStudentEmail &&
+          ((s.email || '').toLowerCase().trim() === (selectedStudentEmail || '').toLowerCase().trim() ||
+            s.uid === selectedStudentEmail ||
+            s.id === selectedStudentEmail)))
   );
 
   const activeStudentEmail = selectedStudent?.email || (selectedStudentEmail && selectedStudentEmail !== 'all' && selectedStudentEmail.includes('@') ? selectedStudentEmail : '') || '';
@@ -654,7 +658,11 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
     }
 
     if (itemWithVid?.activityName && playlists.length > 0) {
-      const pl = playlists.find((p) => itemWithVid.activityName.toLowerCase().includes(p.title.toLowerCase()));
+      const pl = playlists.find(
+        (p) =>
+          Boolean(p?.title) &&
+          (itemWithVid.activityName || '').toLowerCase().includes((p.title || '').toLowerCase())
+      );
       if (pl) return pl.id;
     }
 

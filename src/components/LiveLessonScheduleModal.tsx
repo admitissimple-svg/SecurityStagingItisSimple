@@ -184,8 +184,8 @@ export const LiveLessonScheduleModal: React.FC<LiveLessonScheduleModalProps> = (
     } else if (!isTeacher && currentAccount?.email) {
       setSelectedStudentEmail(currentAccount.email);
     } else if (isTeacher && students.length > 0) {
-      if (!selectedStudentEmail || !students.some((s) => s.email === selectedStudentEmail)) {
-        setSelectedStudentEmail(students[0].email);
+      if (!selectedStudentEmail || !students.some((s) => s && s.email === selectedStudentEmail)) {
+        setSelectedStudentEmail(students[0]?.email || '');
       }
     }
   }, [isOpen, candidateStudentEmail, isTeacher, currentAccount?.email, students]);

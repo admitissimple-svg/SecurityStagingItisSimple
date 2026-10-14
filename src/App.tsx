@@ -4317,11 +4317,12 @@ export default function App() {
       (Object.keys(updated) as DayOfWeek[]).forEach((day) => {
         if (Array.isArray(updated[day])) {
           updated[day] = updated[day].map((item) => {
+            if (!item) return item;
             const isTutorOrConversation =
-              item.id.toLowerCase().includes('tutor') ||
-              item.activityName.toLowerCase().includes('conversa') ||
-              item.activityName.toLowerCase().includes('chat') ||
-              item.activityName.toLowerCase().includes('native') ||
+              (item.id || '').toLowerCase().includes('tutor') ||
+              (item.activityName || '').toLowerCase().includes('conversa') ||
+              (item.activityName || '').toLowerCase().includes('chat') ||
+              (item.activityName || '').toLowerCase().includes('native') ||
               item.time === '15:00';
 
             if (isTutorOrConversation) {
@@ -4929,12 +4930,13 @@ export default function App() {
     };
 
     setTutors((prev) => {
+      const targetEmail = (mergedTutor.email || '').toLowerCase().trim();
       const exists = prev.some(
-        (t) => t.id === mergedTutor.id || t.email.toLowerCase() === mergedTutor.email.toLowerCase()
+        (t) => Boolean(t) && (t.id === mergedTutor.id || (targetEmail && (t.email || '').toLowerCase().trim() === targetEmail))
       );
       if (exists) {
         return prev.map((t) =>
-          t.id === mergedTutor.id || t.email.toLowerCase() === mergedTutor.email.toLowerCase()
+          Boolean(t) && (t.id === mergedTutor.id || (targetEmail && (t.email || '').toLowerCase().trim() === targetEmail))
             ? mergedTutor
             : t
         );
@@ -4944,7 +4946,8 @@ export default function App() {
 
     // Update currentAccount if active user is this tutor
     setCurrentAccount((prev) => {
-      if (prev && prev.email.toLowerCase() === mergedTutor.email.toLowerCase()) {
+      const targetEmail = (mergedTutor.email || '').toLowerCase().trim();
+      if (prev && targetEmail && (prev.email || '').toLowerCase().trim() === targetEmail) {
         return {
           ...prev,
           name: mergedTutor.name,
@@ -4955,17 +4958,18 @@ export default function App() {
     });
 
     // Update available accounts list
-    setAvailableAccounts((prev) =>
-      prev.map((acc) =>
-        acc.email.toLowerCase() === mergedTutor.email.toLowerCase()
+    setAvailableAccounts((prev) => {
+      const targetEmail = (mergedTutor.email || '').toLowerCase().trim();
+      return prev.map((acc) =>
+        Boolean(acc) && targetEmail && (acc.email || '').toLowerCase().trim() === targetEmail
           ? {
               ...acc,
               name: mergedTutor.name,
               picture: mergedTutor.avatar || acc.picture,
             }
           : acc
-      )
-    );
+      );
+    });
 
     // Sync timezone to teacherMeetSettings if provided
     if (mergedTutor.timezone) {
@@ -5039,9 +5043,10 @@ export default function App() {
           : null
       );
     }
+    const targetCleanEmail = (cleanProfile.email || '').toLowerCase().trim();
     setAvailableAccounts((prev) =>
       prev.map((acc) =>
-        acc.email.toLowerCase() === (cleanProfile.email || '').toLowerCase()
+        Boolean(acc) && targetCleanEmail && (acc.email || '').toLowerCase().trim() === targetCleanEmail
           ? {
               ...acc,
               name: cleanProfile.name,
@@ -5052,7 +5057,7 @@ export default function App() {
     );
     setStudents((prev) =>
       prev.map((st) =>
-        st.email.toLowerCase() === (cleanProfile.email || '').toLowerCase()
+        Boolean(st) && targetCleanEmail && (st.email || '').toLowerCase().trim() === targetCleanEmail
           ? {
               ...st,
               name: cleanProfile.name,
@@ -5144,7 +5149,7 @@ export default function App() {
         teacherMeetSettings[emailClean] ||
         (currentAccount.uid ? teacherMeetSettings[currentAccount.uid] : undefined);
       const found = tutors.find(
-        (t) => t.email.toLowerCase() === emailClean
+        (t) => Boolean(t) && (t.email || '').toLowerCase().trim() === emailClean
       );
       if (found) {
         return {
@@ -5160,9 +5165,9 @@ export default function App() {
       }
 
       return {
-        id: `tutor-${currentAccount.email.replace(/[^a-zA-Z0-9]/g, '-')}`,
+        id: `tutor-${(currentAccount.email || currentAccount.id || 'current').replace(/[^a-zA-Z0-9]/g, '-')}`,
         name: currentAccount.name,
-        email: currentAccount.email,
+        email: currentAccount.email || '',
         avatar: currentAccount.picture || '',
         country: 'United States',
         countryCode: 'US',
@@ -5372,6 +5377,7 @@ export default function App() {
 
     // 2. From all approved tutors list (coexistence of all Native Friends)
     tutors.forEach((t) => {
+      if (!t) return;
       const isApproved =
         t.approvalStatus === 'approved' ||
         t.isApproved === true ||
@@ -5397,8 +5403,8 @@ export default function App() {
 
     // 3. From current student's assigned teacher if present
     if (userProfile.teacherEmail) {
-      const email = userProfile.teacherEmail.toLowerCase().trim();
-      if (!teacherMap.has(email)) {
+      const email = (userProfile.teacherEmail || '').toLowerCase().trim();
+      if (email && !teacherMap.has(email)) {
         teacherMap.set(email, {
           id: `teacher-${email}`,
           name: userProfile.teacherName || email.split('@')[0],
@@ -5854,9 +5860,10 @@ export default function App() {
                   const filterClean = (selectedStudentFilter || '').toLowerCase().trim();
                   const found = studentsList.find(
                     (s) =>
-                      (s.email && s.email.toLowerCase().trim() === filterClean) ||
-                      s.uid === selectedStudentFilter ||
-                      s.id === selectedStudentFilter
+                      Boolean(s) &&
+                      (((s.email || '').toLowerCase().trim() === filterClean) ||
+                        s.uid === selectedStudentFilter ||
+                        s.id === selectedStudentFilter)
                   );
                   const stUid = found?.uid || found?.id || selectedStudentFilter;
                   const stEmail = found?.email || selectedStudentFilter || '';
