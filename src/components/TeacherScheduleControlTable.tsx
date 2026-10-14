@@ -201,11 +201,14 @@ export const TeacherScheduleControlTable: React.FC<TeacherScheduleControlTablePr
     return Array.from(map.values());
   }, [students, lessons, currentAccount, tutorProfile]);
 
-  const sortedLessons = [...lessons].sort((a, b) => {
-    return new Date(a.startDateTime).getTime() - new Date(b.startDateTime).getTime();
+  const sortedLessons = [...(lessons || [])].filter(Boolean).sort((a, b) => {
+    const timeA = a.startDateTime ? new Date(a.startDateTime).getTime() : 0;
+    const timeB = b.startDateTime ? new Date(b.startDateTime).getTime() : 0;
+    return timeA - timeB;
   });
 
   const filteredLessons = sortedLessons.filter((lesson) => {
+    if (!lesson) return false;
     const isTeacher = currentAccount?.role === 'teacher';
     const teacherEmailClean = (currentAccount?.email || '').toLowerCase().trim();
     const currentTeacherUid = (currentAccount?.id || (currentAccount as any)?.uid || '').trim();
@@ -217,21 +220,21 @@ export const TeacherScheduleControlTable: React.FC<TeacherScheduleControlTablePr
         (currentTeacherUid && lTeacherUid && currentTeacherUid === lTeacherUid) ||
         (teacherEmailClean && lTeacherEmail && teacherEmailClean === lTeacherEmail);
       if (!isMyLesson) return false;
-    } else if (selectedTeacherFilter !== 'all') {
+    } else if (selectedTeacherFilter && selectedTeacherFilter !== 'all') {
       const lTeacherEmail = (lesson.teacherEmail || (lesson as any).tutorEmail || '').toLowerCase().trim();
       const lTeacherUid = (lesson.teacherUid || (lesson as any).tutorUid || '').trim();
-      const filterEmail = selectedTeacherFilter.toLowerCase().trim();
-      if (lTeacherEmail !== filterEmail && lTeacherUid !== filterEmail) return false;
+      const filterEmail = (selectedTeacherFilter || '').toLowerCase().trim();
+      if (filterEmail && lTeacherEmail !== filterEmail && lTeacherUid !== filterEmail) return false;
     }
 
-    if (selectedStudentFilter !== 'all') {
-      const filterEmail = selectedStudentFilter.toLowerCase().trim();
+    if (selectedStudentFilter && selectedStudentFilter !== 'all') {
+      const filterEmail = (selectedStudentFilter || '').toLowerCase().trim();
       const lStudentEmail = (lesson.studentEmail || '').toLowerCase().trim();
-      if (lStudentEmail !== filterEmail) {
+      if (filterEmail && lStudentEmail !== filterEmail) {
         return false;
       }
     }
-    if (selectedStatusFilter !== 'all') {
+    if (selectedStatusFilter && selectedStatusFilter !== 'all') {
       if (selectedStatusFilter === 'active') {
         if (
           lesson.status === 'cancelled' ||
@@ -281,9 +284,10 @@ export const TeacherScheduleControlTable: React.FC<TeacherScheduleControlTablePr
       };
 
   const displayedTutorProfile = React.useMemo(() => {
-    if (selectedTeacherFilter !== 'all') {
+    if (selectedTeacherFilter && selectedTeacherFilter !== 'all') {
+      const filterTutorEmail = (selectedTeacherFilter || '').toLowerCase().trim();
       const match = teachers.find(
-        (tch) => (tch.email || '').toLowerCase().trim() === selectedTeacherFilter.toLowerCase().trim()
+        (tch) => (tch.email || '').toLowerCase().trim() === filterTutorEmail
       );
       if (match) {
         return {
@@ -552,9 +556,10 @@ export const TeacherScheduleControlTable: React.FC<TeacherScheduleControlTablePr
                   !isNotCompleted &&
                   !isTrial;
 
-                // Look up student photo
+                // Look up student photo safely
+                const lessonStudentEmail = (lesson.studentEmail || '').toLowerCase().trim();
                 const studentData = students.find(
-                  (s) => s.email.toLowerCase() === lesson.studentEmail.toLowerCase()
+                  (s) => lessonStudentEmail && (s.email || '').toLowerCase().trim() === lessonStudentEmail
                 );
                 const studentPhoto =
                   studentData?.picture ||

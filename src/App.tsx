@@ -5843,16 +5843,18 @@ export default function App() {
                 />
 
                 {/* Minimalist & Practical Student Workspace: Displayed when a specific student is filtered */}
-                {selectedStudentFilter !== 'all' ? (() => {
+                {selectedStudentFilter && selectedStudentFilter !== 'all' ? (() => {
+                  const filterClean = (selectedStudentFilter || '').toLowerCase().trim();
                   const found = studentsList.find(
                     (s) =>
-                      s.email?.toLowerCase() === selectedStudentFilter.toLowerCase() ||
+                      (s.email && s.email.toLowerCase().trim() === filterClean) ||
                       s.uid === selectedStudentFilter ||
                       s.id === selectedStudentFilter
                   );
                   const stUid = found?.uid || found?.id || selectedStudentFilter;
-                  const stEmail = found?.email || selectedStudentFilter;
-                  const stName = found?.name || (found as any)?.studentName || (found as any)?.fullName || stEmail.split('@')[0];
+                  const stEmail = found?.email || selectedStudentFilter || '';
+                  const stCleanEmail = (stEmail || '').toLowerCase().trim();
+                  const stName = found?.name || (found as any)?.studentName || (found as any)?.fullName || (stEmail ? stEmail.split('@')[0] : 'Student');
                   const stLevel = found?.level || (found as any)?.studentLevel || 'intermediate';
                   const stAvatar = (found as any)?.avatarUrl || (found as any)?.photoUrl || (found as any)?.picture || '';
                   const stWeeklyCycle = (found as any)?.weeklyCycle || userProfile?.weeklyCycle || 1;
@@ -5864,9 +5866,11 @@ export default function App() {
                   const teacherEmailVal = currentAccount?.email || currentTutorProfile?.email;
 
                   // Student's scheduled lessons
-                  const studentLessons = lessons.filter(
-                    (l) => l.studentEmail?.toLowerCase() === stEmail.toLowerCase() && l.status !== 'cancelled'
-                  );
+                  const studentLessons = (lessons || []).filter((l) => {
+                    if (!l || l.status === 'cancelled') return false;
+                    const lEmail = (l.studentEmail || '').toLowerCase().trim();
+                    return Boolean(stCleanEmail && lEmail === stCleanEmail);
+                  });
 
                   return (
                     <div className="space-y-5 animate-in fade-in duration-200" id="filtered-student-workspace">

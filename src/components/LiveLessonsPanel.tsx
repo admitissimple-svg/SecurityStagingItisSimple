@@ -101,7 +101,7 @@ export const LiveLessonsPanel: React.FC<LiveLessonsPanelProps> = ({
 
   const relevantLessons = isTeacher && selectedStudentFilter && selectedStudentFilter !== 'all'
     ? baseRelevantLessons.filter(
-        (l) => (l.studentEmail || '').toLowerCase().trim() === selectedStudentFilter.toLowerCase().trim()
+        (l) => (l.studentEmail || '').toLowerCase().trim() === (selectedStudentFilter || '').toLowerCase().trim()
       )
     : baseRelevantLessons;
 

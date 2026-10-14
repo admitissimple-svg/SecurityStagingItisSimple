@@ -71,14 +71,16 @@ export const LiveMeetLessonsPanel: React.FC<LiveMeetLessonsPanelProps> = ({
       if (isTeacher) {
         // In teacher view, show scheduled lessons for this teacher
         if (currentAccount?.email) {
+          const myTeacherEmail = (currentAccount.email || '').toLowerCase().trim();
           const matchesTeacher =
-            (l.teacherEmail || '').toLowerCase() === currentAccount.email.toLowerCase() ||
+            (l.teacherEmail || '').toLowerCase().trim() === myTeacherEmail ||
             !l.teacherEmail;
           if (!matchesTeacher) return false;
         }
         // If student filter is active
         if (selectedStudentFilter && selectedStudentFilter !== 'all') {
-          return (l.studentEmail || '').toLowerCase() === selectedStudentFilter.toLowerCase();
+          const filterStudent = (selectedStudentFilter || '').toLowerCase().trim();
+          return (l.studentEmail || '').toLowerCase().trim() === filterStudent;
         }
         return true;
       } else {
