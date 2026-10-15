@@ -17,6 +17,10 @@ import {
 import { StudentDictionaryEntry, Language, DayOfWeek } from '../types';
 import { speakText } from '../utils/audio';
 import { lookupWord, getInstantOrCachedWord } from '../utils/dictionaryService';
+import {
+  consolidateDictionaryEntries,
+  normalizeDictionaryWord,
+} from '../utils/studentDictionaryLibrary';
 
 interface PersonalDictionaryModalProps {
   isOpen: boolean;
@@ -86,65 +90,68 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
     });
   }, [isOpen, wordsFromRoutines]);
 
-  // Merge student's saved dictionary entries and routine words (without test words)
-  const allDictionaryEntries: StudentDictionaryEntry[] = useMemo(() => {
-    const map = new Map<string, StudentDictionaryEntry>();
+  // Convert routine words into canonical StudentDictionaryEntry items
+  const routineEntries: StudentDictionaryEntry[] = useMemo(() => {
+    if (!wordsFromRoutines || wordsFromRoutines.length === 0) return [];
 
-    // 1. Add custom saved entries (from live lessons or student inputs)
-    (customSavedEntries || []).forEach((entry) => {
-      const clean = (entry.word || '').trim();
-      if (!clean) return;
-      const lower = clean.toLowerCase();
-      map.set(lower, entry);
-    });
-
-    // 2. Add words actively typed by the student in daily routines
-    (wordsFromRoutines || []).forEach((item) => {
+    return wordsFromRoutines.map((item) => {
       const cleanWord = (item.word || '').trim();
-      if (!cleanWord) return;
+      const norm = normalizeDictionaryWord(cleanWord);
       const lower = cleanWord.toLowerCase();
-      const existing = map.get(lower);
-      const enriched = apiEnrichedEntries[lower];
+      const enriched = apiEnrichedEntries[norm] || apiEnrichedEntries[lower];
+      const cached = getInstantOrCachedWord(cleanWord, item.sourceActivityName);
 
-      if (existing) {
-        map.set(lower, {
-          ...existing,
-          definitionEn: existing.definitionEn || enriched?.definitionEn || '',
-          exampleSentenceEn: existing.exampleSentenceEn || enriched?.exampleSentenceEn || '',
-          partOfSpeech: existing.partOfSpeech || enriched?.partOfSpeech || '',
-          sourceActivityName: existing.sourceActivityName || item.sourceActivityName,
-          sourceDay: existing.sourceDay || item.sourceDay,
-          source: existing.source || (enriched?.source as any) || 'api',
-          notFound: existing.notFound ?? enriched?.notFound ?? false,
-        });
-      } else {
-        const cached = getInstantOrCachedWord(cleanWord, item.sourceActivityName);
-        map.set(lower, {
-          id: `routine_${lower}_${Date.now()}`,
-          word: cleanWord,
-          definitionEn: enriched?.definitionEn || cached.definitionEn || '',
-          partOfSpeech: enriched?.partOfSpeech || cached.partOfSpeech || '',
-          exampleSentenceEn: enriched?.exampleSentenceEn || cached.exampleSentenceEn || '',
-          translationPt: cached.translationPt || '',
-          sourceActivityName: item.sourceActivityName || 'Daily Routine',
-          sourceDay: item.sourceDay,
-          phonetic: enriched?.phonetic,
-          source: (enriched?.source as any) || 'api',
-          notFound: enriched?.notFound || false,
-        });
-      }
+      const isLiveSession =
+        (item.sourceActivityName || '').includes('Live Session') ||
+        (item.sourceActivityName || '').includes('Native Friend') ||
+        (item.sourceActivityName || '').includes('Native Friends Notes');
+
+      const source = isLiveSession ? 'live_lesson' : 'routine';
+      const originSource = isLiveSession ? 'native_notes' : 'routine';
+
+      return {
+        id: `routine_${norm || lower}`,
+        word: cleanWord,
+        originalWord: cleanWord,
+        normalizedWord: norm || lower,
+        definitionEn: enriched?.definitionEn || cached.definitionEn || '',
+        partOfSpeech: enriched?.partOfSpeech || cached.partOfSpeech || '',
+        exampleSentenceEn: enriched?.exampleSentenceEn || cached.exampleSentenceEn || '',
+        translationPt: cached.translationPt || '',
+        phonetic: enriched?.phonetic,
+        source,
+        sourceActivityName: item.sourceActivityName || 'Daily Routine',
+        sourceDay: item.sourceDay,
+        origins: [
+          {
+            source: originSource,
+            activityName: item.sourceActivityName || 'Daily Routine',
+            dayOfWeek: item.sourceDay,
+            date: new Date().toISOString().split('T')[0],
+          },
+        ],
+        practiceCount: 0,
+        notFound: enriched?.notFound || false,
+      };
     });
+  }, [wordsFromRoutines, apiEnrichedEntries]);
 
-    // Strictly sort in ascending alphabetical order
-    return Array.from(map.values()).sort((a, b) =>
-      (a.word || '').localeCompare((b.word || ''), ['en', 'pt'], { sensitivity: 'base' })
-    );
-  }, [wordsFromRoutines, customSavedEntries, apiEnrichedEntries]);
+  // Consolidate student's saved dictionary entries and routine words using canonical consolidation engine
+  const allDictionaryEntries: StudentDictionaryEntry[] = useMemo(() => {
+    return consolidateDictionaryEntries(customSavedEntries || [], routineEntries);
+  }, [customSavedEntries, routineEntries]);
 
-  // Phase 1B: Classify Native Friend vs My Words
-  // Native Friend: source === 'live_lesson' OR sourceActivityName contains 'Native Friends Notes' or 'Live Session'
+  // Phase 1B / 2.2B: Classify Native Friend vs My Words
+  // Native Friend: source === 'live_lesson' OR has origin with source 'live_lesson' or 'native_notes'
+  // OR sourceActivityName contains 'Native Friends Notes' or 'Live Session'
   const isNativeFriend = (entry: StudentDictionaryEntry): boolean => {
     if (entry.source === 'live_lesson') return true;
+    if (
+      Array.isArray(entry.origins) &&
+      entry.origins.some((o) => o.source === 'live_lesson' || o.source === 'native_notes')
+    ) {
+      return true;
+    }
     const act = entry.sourceActivityName || '';
     if (act.includes('Native Friends Notes') || act.includes('Live Session')) {
       return true;
@@ -235,9 +242,13 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
     e.preventDefault();
     if (!newWord.trim() || !newDefinition.trim()) return;
 
+    const cleanWord = newWord.trim();
+    const norm = normalizeDictionaryWord(cleanWord);
     const newEntry: StudentDictionaryEntry = {
       id: `custom_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-      word: newWord.trim(),
+      word: cleanWord,
+      originalWord: cleanWord,
+      normalizedWord: norm,
       partOfSpeech: newPartOfSpeech.trim() || undefined,
       definitionEn: newDefinition.trim(),
       exampleSentenceEn: newExample.trim(),
@@ -245,6 +256,15 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
       learnedAt: new Date().toISOString(),
       source: 'api',
       sourceActivityName: isEn ? 'Personal Addition' : 'Adição Manual',
+      origins: [
+        {
+          source: 'api',
+          activityName: isEn ? 'Personal Addition' : 'Adição Manual',
+          date: new Date().toISOString().split('T')[0],
+        },
+      ],
+      practiceCount: 0,
+      practiceHistory: [],
     };
 
     if (onSaveCustomEntry) {
@@ -583,6 +603,30 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
                                     </span>
                                   )}
                                 </div>
+                                {Array.isArray(entry.origins) && entry.origins.length > 0 && (
+                                  <div className="flex items-center gap-1 flex-wrap mt-0.5">
+                                    {entry.origins.map((orig, origIdx) => {
+                                      const isNative = orig.source === 'live_lesson' || orig.source === 'native_notes';
+                                      const isRoutine = orig.source === 'routine';
+                                      return (
+                                        <span
+                                          key={`orig_nf_${origIdx}_${orig.source}`}
+                                          className={`text-[9px] font-bold px-1.5 py-0.5 rounded-sm border ${
+                                            isNative
+                                              ? 'text-blue-700 bg-blue-50 border-blue-200'
+                                              : isRoutine
+                                              ? 'text-amber-800 bg-amber-50 border-amber-200'
+                                              : 'text-slate-600 bg-slate-50 border-slate-200'
+                                          }`}
+                                          title={orig.activityName || orig.context || orig.source}
+                                        >
+                                          {isNative ? '✦ Native Friends' : isRoutine ? '⚡ Routine' : orig.source}
+                                          {orig.dayOfWeek ? ` (${orig.dayOfWeek})` : ''}
+                                        </span>
+                                      );
+                                    })}
+                                  </div>
+                                )}
                               </div>
                             </td>
 
@@ -731,6 +775,30 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
                                     </span>
                                   )}
                                 </div>
+                                {Array.isArray(entry.origins) && entry.origins.length > 0 && (
+                                  <div className="flex items-center gap-1 flex-wrap mt-0.5">
+                                    {entry.origins.map((orig, origIdx) => {
+                                      const isNative = orig.source === 'live_lesson' || orig.source === 'native_notes';
+                                      const isRoutine = orig.source === 'routine';
+                                      return (
+                                        <span
+                                          key={`orig_my_${origIdx}_${orig.source}`}
+                                          className={`text-[9px] font-bold px-1.5 py-0.5 rounded-sm border ${
+                                            isNative
+                                              ? 'text-blue-700 bg-blue-50 border-blue-200'
+                                              : isRoutine
+                                              ? 'text-amber-800 bg-amber-50 border-amber-200'
+                                              : 'text-slate-600 bg-slate-50 border-slate-200'
+                                          }`}
+                                          title={orig.activityName || orig.context || orig.source}
+                                        >
+                                          {isNative ? '✦ Native Friends' : isRoutine ? '⚡ Routine' : orig.source}
+                                          {orig.dayOfWeek ? ` (${orig.dayOfWeek})` : ''}
+                                        </span>
+                                      );
+                                    })}
+                                  </div>
+                                )}
                               </div>
                             </td>
 

@@ -83,11 +83,28 @@ export function consolidateDictionaryEntries(
     const norm = normalizeDictionaryWord(item.normalizedWord || item.word);
     if (!norm) return;
 
-    // Ensure item has normalizedWord stamped
+    // Ensure item has normalizedWord and origins stamped
+    const initialOrigins: DictionaryEntryOrigin[] = Array.isArray(item.origins) && item.origins.length > 0
+      ? [...item.origins]
+      : item.source
+      ? [
+          {
+            source: item.source,
+            activityName: item.sourceActivityName,
+            dayOfWeek: item.sourceDay,
+            date: item.learnedAt ? item.learnedAt.split('T')[0] : undefined,
+            lessonId: item.lessonRefId,
+            videoId: item.routineRef?.videoId,
+            videoTitle: item.routineRef?.videoTitle,
+          },
+        ]
+      : [];
+
     const normalizedItem: StudentDictionaryEntry = {
       ...item,
       normalizedWord: item.normalizedWord || norm,
       originalWord: item.originalWord || item.word,
+      origins: initialOrigins,
     };
     masterMap.set(norm, normalizedItem);
   });
