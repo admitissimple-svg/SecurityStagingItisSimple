@@ -553,19 +553,33 @@ export function generateWeeklyHomework(
           if (trimmed && !seenCandidates.has(trimmed.toLowerCase())) {
             seenCandidates.add(trimmed.toLowerCase());
             const lower = trimmed.toLowerCase();
+            const customMatch = Array.isArray(customWords)
+              ? customWords.find(
+                  (cw) =>
+                    (cw?.word || '').trim().toLowerCase() === lower &&
+                    Boolean(cw.definitionEn && cw.definitionEn.trim().length > 0)
+                )
+              : undefined;
             const dictMatch = ROUTINE_VOCAB_DICT[lower];
-            const prof = profileWord(trimmed, dictMatch ? {
+            const prof = profileWord(trimmed, customMatch ? {
+              definitionEn: customMatch.definitionEn,
+              translationPt: customMatch.translationPt,
+              exampleSentence: customMatch.exampleSentence,
+            } : (dictMatch ? {
               definitionEn: dictMatch.definitionEn,
               translationPt: dictMatch.translationPt,
               exampleSentence: dictMatch.exampleSentence,
-            } : undefined);
+            } : undefined));
 
             candidateItems.push({
+              id: (customMatch as any)?.id,
               word: trimmed,
               sourceActivityName: item.activityName,
               sourceDay: d,
-              source: 'routine',
-              practiceCount: 0,
+              source: (customMatch as any)?.source || 'routine',
+              practiceCount: typeof (customMatch as any)?.practiceCount === 'number' ? (customMatch as any).practiceCount : 0,
+              lastPracticedAt: (customMatch as any)?.lastPracticedAt,
+              learnedAt: (customMatch as any)?.learnedAt,
               definitionEn: prof.definitionEn,
               translationPt: prof.translationPt,
               exampleSentence: prof.exampleSentenceEn,

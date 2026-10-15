@@ -8,6 +8,7 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { getInstantOrCachedWord, DictionaryLookupResult } from '../utils/dictionaryService';
+import { StudentDictionaryEntry } from '../types';
 
 interface StudentKeyWordsCardProps {
   isEn: boolean;
@@ -18,6 +19,7 @@ interface StudentKeyWordsCardProps {
   handleSaveWords: (e?: React.FormEvent) => void;
   speakText: (text: string) => void;
   studentLevel?: string;
+  dictionaryEntries?: StudentDictionaryEntry[];
 }
 
 export const StudentKeyWordsCard: React.FC<StudentKeyWordsCardProps> = ({
@@ -29,6 +31,7 @@ export const StudentKeyWordsCard: React.FC<StudentKeyWordsCardProps> = ({
   handleSaveWords,
   speakText,
   studentLevel,
+  dictionaryEntries = [],
 }) => {
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
 
@@ -67,7 +70,8 @@ export const StudentKeyWordsCard: React.FC<StudentKeyWordsCardProps> = ({
           {words.map((w, idx) => {
             const cleanWord = w.trim();
             const def = cleanWord
-              ? wordDefinitions[idx] || getInstantOrCachedWord(cleanWord, undefined, studentLevel)
+              ? wordDefinitions[idx] ||
+                getInstantOrCachedWord(cleanWord, undefined, studentLevel, undefined, undefined, dictionaryEntries)
               : null;
 
             const isHovered = hoveredIdx === idx && Boolean(cleanWord && def && def.definitionEn);

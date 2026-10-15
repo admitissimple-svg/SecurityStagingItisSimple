@@ -28,6 +28,7 @@ interface PersonalDictionaryModalProps {
   currentLanguage: Language;
   wordsFromRoutines?: Array<{ word: string; sourceActivityName?: string; sourceDay?: DayOfWeek }>;
   customSavedEntries?: StudentDictionaryEntry[];
+  excludedWords?: string[];
   onSaveCustomEntry?: (entry: StudentDictionaryEntry) => void;
   onDeleteEntry?: (word: string) => void;
   onOpenJournalModal?: () => void;
@@ -39,6 +40,7 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
   currentLanguage,
   wordsFromRoutines = [],
   customSavedEntries = [],
+  excludedWords = [],
   onSaveCustomEntry,
   onDeleteEntry,
   onOpenJournalModal,
@@ -53,8 +55,30 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
   const [isLookingUpApi, setIsLookingUpApi] = useState(false);
   const [lookupError, setLookupError] = useState<string | null>(null);
   const [apiEnrichedEntries, setApiEnrichedEntries] = useState<Record<string, Partial<StudentDictionaryEntry>>>({});
+  const [deletedWordsInSession, setDeletedWordsInSession] = useState<Set<string>>(new Set());
 
   const isEn = currentLanguage === 'en';
+
+  // Compute effective set of excluded/deleted words
+  const effectiveExcludedSet = useMemo(() => {
+    const set = new Set<string>();
+    (excludedWords || []).forEach((w) => {
+      const n = normalizeDictionaryWord(w);
+      if (n) set.add(n);
+    });
+    deletedWordsInSession.forEach((w) => set.add(w));
+    return set;
+  }, [excludedWords, deletedWordsInSession]);
+
+  const handleDeleteWord = (word: string) => {
+    const norm = normalizeDictionaryWord(word);
+    if (norm) {
+      setDeletedWordsInSession((prev) => new Set(prev).add(norm));
+    }
+    if (onDeleteEntry) {
+      onDeleteEntry(word);
+    }
+  };
 
   // Automatically enrich words from routines via Free Dictionary API in background
   useEffect(() => {
@@ -62,14 +86,14 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
 
     const wordsToFetch = wordsFromRoutines
       .map((r) => (r.word || '').trim().toLowerCase())
-      .filter((w) => w && !apiEnrichedEntries[w]);
+      .filter((w) => w && !apiEnrichedEntries[w] && !effectiveExcludedSet.has(normalizeDictionaryWord(w)));
 
     if (wordsToFetch.length === 0) return;
 
     // Fetch definitions for words entered in routine
     wordsToFetch.slice(0, 15).forEach(async (w) => {
       try {
-        const res = await lookupWord(w);
+        const res = await lookupWord(w, undefined, undefined, undefined, undefined, customSavedEntries);
         if (res && res.definitionEn) {
           setApiEnrichedEntries((prev) => ({
             ...prev,
@@ -88,58 +112,69 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
         console.warn('Routine word background lookup error:', err);
       }
     });
-  }, [isOpen, wordsFromRoutines]);
+  }, [isOpen, wordsFromRoutines, effectiveExcludedSet, customSavedEntries]);
 
   // Convert routine words into canonical StudentDictionaryEntry items
+  // Reusing existing My Dictionary definitions (2.2B.2) and omitting excluded words (2.2B.1)
   const routineEntries: StudentDictionaryEntry[] = useMemo(() => {
     if (!wordsFromRoutines || wordsFromRoutines.length === 0) return [];
 
-    return wordsFromRoutines.map((item) => {
-      const cleanWord = (item.word || '').trim();
-      const norm = normalizeDictionaryWord(cleanWord);
-      const lower = cleanWord.toLowerCase();
-      const enriched = apiEnrichedEntries[norm] || apiEnrichedEntries[lower];
-      const cached = getInstantOrCachedWord(cleanWord, item.sourceActivityName);
+    return wordsFromRoutines
+      .filter((item) => {
+        const norm = normalizeDictionaryWord(item.word);
+        return Boolean(norm && !effectiveExcludedSet.has(norm));
+      })
+      .map((item) => {
+        const cleanWord = (item.word || '').trim();
+        const norm = normalizeDictionaryWord(cleanWord);
+        const lower = cleanWord.toLowerCase();
+        
+        // 2.2B.2: Reutilizar definições ricas existentes no My Dictionary
+        const existingInSaved = (customSavedEntries || []).find(
+          (e) => normalizeDictionaryWord(e.normalizedWord || e.word) === norm && Boolean(e.definitionEn)
+        );
+        const enriched = apiEnrichedEntries[norm] || apiEnrichedEntries[lower];
+        const cached = getInstantOrCachedWord(cleanWord, item.sourceActivityName, undefined, undefined, undefined, customSavedEntries);
 
-      const isLiveSession =
-        (item.sourceActivityName || '').includes('Live Session') ||
-        (item.sourceActivityName || '').includes('Native Friend') ||
-        (item.sourceActivityName || '').includes('Native Friends Notes');
+        const isLiveSession =
+          (item.sourceActivityName || '').includes('Live Session') ||
+          (item.sourceActivityName || '').includes('Native Friend') ||
+          (item.sourceActivityName || '').includes('Native Friends Notes');
 
-      const source = isLiveSession ? 'live_lesson' : 'routine';
-      const originSource = isLiveSession ? 'native_notes' : 'routine';
+        const source = isLiveSession ? 'live_lesson' : 'routine';
+        const originSource = isLiveSession ? 'native_notes' : 'routine';
 
-      return {
-        id: `routine_${norm || lower}`,
-        word: cleanWord,
-        originalWord: cleanWord,
-        normalizedWord: norm || lower,
-        definitionEn: enriched?.definitionEn || cached.definitionEn || '',
-        partOfSpeech: enriched?.partOfSpeech || cached.partOfSpeech || '',
-        exampleSentenceEn: enriched?.exampleSentenceEn || cached.exampleSentenceEn || '',
-        translationPt: cached.translationPt || '',
-        phonetic: enriched?.phonetic,
-        source,
-        sourceActivityName: item.sourceActivityName || 'Daily Routine',
-        sourceDay: item.sourceDay,
-        origins: [
-          {
-            source: originSource,
-            activityName: item.sourceActivityName || 'Daily Routine',
-            dayOfWeek: item.sourceDay,
-            date: new Date().toISOString().split('T')[0],
-          },
-        ],
-        practiceCount: 0,
-        notFound: enriched?.notFound || false,
-      };
-    });
-  }, [wordsFromRoutines, apiEnrichedEntries]);
+        return {
+          id: existingInSaved?.id || `routine_${norm || lower}`,
+          word: cleanWord,
+          originalWord: cleanWord,
+          normalizedWord: norm || lower,
+          definitionEn: existingInSaved?.definitionEn || enriched?.definitionEn || cached.definitionEn || '',
+          partOfSpeech: existingInSaved?.partOfSpeech || enriched?.partOfSpeech || cached.partOfSpeech || '',
+          exampleSentenceEn: existingInSaved?.exampleSentenceEn || enriched?.exampleSentenceEn || cached.exampleSentenceEn || '',
+          translationPt: existingInSaved?.translationPt || cached.translationPt || '',
+          phonetic: existingInSaved?.phonetic || enriched?.phonetic,
+          source,
+          sourceActivityName: item.sourceActivityName || 'Daily Routine',
+          sourceDay: item.sourceDay,
+          origins: [
+            {
+              source: originSource,
+              activityName: item.sourceActivityName || 'Daily Routine',
+              dayOfWeek: item.sourceDay,
+              date: new Date().toISOString().split('T')[0],
+            },
+          ],
+          practiceCount: existingInSaved?.practiceCount || 0,
+          notFound: !existingInSaved && (enriched?.notFound || false),
+        };
+      });
+  }, [wordsFromRoutines, apiEnrichedEntries, customSavedEntries, effectiveExcludedSet]);
 
   // Consolidate student's saved dictionary entries and routine words using canonical consolidation engine
   const allDictionaryEntries: StudentDictionaryEntry[] = useMemo(() => {
-    return consolidateDictionaryEntries(customSavedEntries || [], routineEntries);
-  }, [customSavedEntries, routineEntries]);
+    return consolidateDictionaryEntries(customSavedEntries || [], routineEntries, effectiveExcludedSet);
+  }, [customSavedEntries, routineEntries, effectiveExcludedSet]);
 
   // Phase 1B / 2.2B: Classify Native Friend vs My Words
   // Native Friend: source === 'live_lesson' OR has origin with source 'live_lesson' or 'native_notes'
@@ -672,7 +707,7 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
                                 {onDeleteEntry && (
                                   <button
                                     type="button"
-                                    onClick={() => onDeleteEntry(entry.word)}
+                                    onClick={() => handleDeleteWord(entry.word)}
                                     className="p-1.5 rounded-lg text-slate-300 hover:text-red-600 hover:bg-red-50 transition cursor-pointer"
                                     title={isEn ? 'Remove word' : 'Remover palavra'}
                                   >
@@ -844,7 +879,7 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
                                 {onDeleteEntry && (
                                   <button
                                     type="button"
-                                    onClick={() => onDeleteEntry(entry.word)}
+                                    onClick={() => handleDeleteWord(entry.word)}
                                     className="p-1.5 rounded-lg text-slate-300 hover:text-red-600 hover:bg-red-50 transition cursor-pointer"
                                     title={isEn ? 'Remove word' : 'Remover palavra'}
                                   >

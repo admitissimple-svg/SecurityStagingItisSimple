@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   PenTool,
   Sparkles,
@@ -11,8 +11,11 @@ import {
   Volume2,
   CheckCircle2,
   X,
+  BookOpen,
+  ChevronDown,
+  Search,
 } from 'lucide-react';
-import { WritingEvaluationResult } from '../types';
+import { WritingEvaluationResult, StudentDictionaryEntry } from '../types';
 
 interface StudentDailySentenceCardProps {
   isEn: boolean;
@@ -23,6 +26,8 @@ interface StudentDailySentenceCardProps {
   sentenceSavedSuccess: boolean;
   isCheckingSentence: boolean;
   sentenceEvaluation: WritingEvaluationResult | null;
+  dictionaryEntries?: StudentDictionaryEntry[];
+  excludedWords?: string[];
   onOpenJournalModal?: () => void;
   onTest30MinReminder?: () => void;
   setSentenceInput: React.Dispatch<React.SetStateAction<string>>;
@@ -42,6 +47,8 @@ export const StudentDailySentenceCard: React.FC<StudentDailySentenceCardProps> =
   sentenceSavedSuccess,
   isCheckingSentence,
   sentenceEvaluation,
+  dictionaryEntries = [],
+  excludedWords = [],
   onOpenJournalModal,
   onTest30MinReminder,
   setSentenceInput,
@@ -51,6 +58,52 @@ export const StudentDailySentenceCard: React.FC<StudentDailySentenceCardProps> =
   handleSaveSentence,
   speakText,
 }) => {
+  const [isDictConsultOpen, setIsDictConsultOpen] = useState(false);
+  const [dictSearchTerm, setDictSearchTerm] = useState('');
+
+  const excludedSet = useMemo(() => {
+    return new Set((excludedWords || []).map((w) => (w || '').trim().toLowerCase()));
+  }, [excludedWords]);
+
+  // Filter active dictionary entries omitting excluded words
+  const activeDictWords = useMemo(() => {
+    if (!Array.isArray(dictionaryEntries) || dictionaryEntries.length === 0) return [];
+    const map = new Map<string, StudentDictionaryEntry>();
+    dictionaryEntries.forEach((e) => {
+      if (!e || !e.word || !e.word.trim()) return;
+      const clean = e.word.trim();
+      const lower = clean.toLowerCase();
+      if (excludedSet.has(lower)) return;
+      if (!map.has(lower)) {
+        map.set(lower, e);
+      }
+    });
+    return Array.from(map.values()).sort((a, b) =>
+      (a.word || '').localeCompare(b.word || '', ['en', 'pt'], { sensitivity: 'base' })
+    );
+  }, [dictionaryEntries, excludedSet]);
+
+  const filteredDictWords = useMemo(() => {
+    const term = dictSearchTerm.trim().toLowerCase();
+    if (!term) return activeDictWords;
+    return activeDictWords.filter((e) => {
+      return (
+        (e.word || '').toLowerCase().includes(term) ||
+        (e.definitionEn && e.definitionEn.toLowerCase().includes(term)) ||
+        (e.translationPt && e.translationPt.toLowerCase().includes(term))
+      );
+    });
+  }, [activeDictWords, dictSearchTerm]);
+
+  // Track which dictionary words are currently used in sentence
+  const matchedDictWords = useMemo(() => {
+    const inputLower = (sentenceInput || '').toLowerCase();
+    if (!inputLower) return [];
+    return activeDictWords.filter((entry) => {
+      const w = (entry.word || '').toLowerCase();
+      return w.length >= 2 && inputLower.includes(w);
+    });
+  }, [activeDictWords, sentenceInput]);
   return (
     <div className="space-y-3">
       {/* Header */}
@@ -147,6 +200,106 @@ export const StudentDailySentenceCard: React.FC<StudentDailySentenceCardProps> =
             })
           )}
         </div>
+
+        {/* Optional My Dictionary consultation (2.2B.3) */}
+        {activeDictWords.length > 0 && (
+          <div className="pt-2 border-t border-slate-200/70 space-y-2">
+            <div className="flex items-center justify-between">
+              <button
+                type="button"
+                onClick={() => setIsDictConsultOpen((prev) => !prev)}
+                className="text-[10px] font-bold text-[#1C4C96] hover:text-[#000035] flex items-center gap-1.5 transition cursor-pointer select-none"
+              >
+                <BookOpen className="w-3.5 h-3.5 text-[#1C4C96]" />
+                <span>{isEn ? 'Consult My Dictionary' : 'Consultar Meu Dicionário'}</span>
+                <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-[#9AB4FF]/30 text-[#000035] font-black">
+                  {activeDictWords.length}
+                </span>
+                <ChevronDown
+                  className={`w-3 h-3 transition-transform duration-200 ${
+                    isDictConsultOpen ? 'rotate-180' : ''
+                  }`}
+                />
+              </button>
+
+              {matchedDictWords.length > 0 && (
+                <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200 flex items-center gap-1">
+                  <Check className="w-3 h-3 text-emerald-600" />
+                  <span>
+                    {matchedDictWords.length} {isEn ? 'from dictionary used' : 'do dicionário usadas'}
+                  </span>
+                </span>
+              )}
+            </div>
+
+            {/* Expandable consultation drawer */}
+            {isDictConsultOpen && (
+              <div className="p-2.5 bg-white rounded-xl border border-[#9AB4FF]/40 space-y-2 animate-in fade-in zoom-in-95 duration-150">
+                <div className="relative">
+                  <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type="text"
+                    value={dictSearchTerm}
+                    onChange={(e) => setDictSearchTerm(e.target.value)}
+                    placeholder={
+                      isEn
+                        ? 'Search word, definition, or translation...'
+                        : 'Buscar palavra, definição ou tradução...'
+                    }
+                    className="w-full pl-8 pr-3 py-1 bg-slate-50 border border-slate-200 rounded-lg text-[11px] text-[#000035] focus:outline-none focus:ring-1 focus:ring-[#1C4C96] placeholder:text-slate-400"
+                  />
+                </div>
+
+                <div className="flex flex-wrap gap-1 max-h-36 overflow-y-auto p-1">
+                  {filteredDictWords.length === 0 ? (
+                    <span className="text-[10px] text-slate-400 italic">
+                      {isEn ? 'No dictionary words match your search.' : 'Nenhuma palavra encontrada no dicionário.'}
+                    </span>
+                  ) : (
+                    filteredDictWords.map((entry) => {
+                      const isUsed = (sentenceInput || '')
+                        .toLowerCase()
+                        .includes(entry.word.toLowerCase());
+                      return (
+                        <button
+                          key={entry.id || entry.word}
+                          type="button"
+                          onClick={() => {
+                            setSentenceInput((prev) => {
+                              const trimmed = prev.trim();
+                              return trimmed ? `${trimmed} ${entry.word}` : entry.word;
+                            });
+                            if (sentenceEvaluation) setSentenceEvaluation(null);
+                          }}
+                          className={`text-[10px] font-medium px-2 py-0.5 rounded-full border transition cursor-pointer flex items-center gap-1 ${
+                            isUsed
+                              ? 'bg-emerald-100 text-emerald-900 border-emerald-300 font-bold'
+                              : 'bg-slate-50 text-[#000035] border-slate-200 hover:border-[#1C4C96] hover:bg-blue-50'
+                          }`}
+                          title={
+                            entry.definitionEn
+                              ? `${entry.word} (${entry.partOfSpeech || 'Word'}): ${entry.definitionEn}${
+                                  entry.translationPt ? ` — ${entry.translationPt}` : ''
+                                }`
+                              : entry.word
+                          }
+                        >
+                          <span>{entry.word}</span>
+                          {entry.cefrLevel && (
+                            <span className="text-[8px] font-black uppercase px-1 rounded bg-[#000035] text-white">
+                              {entry.cefrLevel}
+                            </span>
+                          )}
+                          {isUsed && <Check className="w-2.5 h-2.5 text-emerald-600" />}
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Sentence Textarea */}

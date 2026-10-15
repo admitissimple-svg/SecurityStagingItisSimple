@@ -115,6 +115,10 @@ import {
   subscribeToStudentDailyJournal,
   subscribeToStudentDailyRoutines,
   deleteStudentVocabularyFromFirestore,
+  fetchExcludedDictionaryWords,
+  addExcludedDictionaryWord,
+  removeExcludedDictionaryWord,
+  getCachedExcludedDictionaryWords,
   deleteStudentJournalEntryFromFirestore,
   recordActivityInStudentJournal,
   removeActivityFromStudentJournal,
@@ -569,6 +573,9 @@ export default function App() {
   const [isPersonalDictionaryOpen, setIsPersonalDictionaryOpen] = useState<boolean>(false);
   const [studentDictionaryEntries, setStudentDictionaryEntries] = useState<StudentDictionaryEntry[]>(() => {
     return getCachedLocalVocabulary(currentAccount?.uid, currentAccount?.email);
+  });
+  const [excludedDictionaryWords, setExcludedDictionaryWords] = useState<string[]>(() => {
+    return getCachedExcludedDictionaryWords(currentAccount?.uid, currentAccount?.email);
   });
   const [dailyJournalEntries, setDailyJournalEntries] = useState<DailyJournalEntry[]>([]);
   const [isJournalModalOpen, setIsJournalModalOpen] = useState<boolean>(false);
@@ -1346,6 +1353,14 @@ export default function App() {
             })
             .catch(() => {});
 
+          fetchExcludedDictionaryWords(uid, email)
+            .then((excluded) => {
+              if (Array.isArray(excluded)) {
+                setExcludedDictionaryWords(excluded);
+              }
+            })
+            .catch(() => {});
+
           // 4. Fetch student homework and activity progress directly from Cloud Firestore (cross-device sync)
           const targetCycleForFetch = loadedCycle !== null ? loadedCycle : 1;
           const targetWeekIdForFetch = normalizeWeekId(targetCycleForFetch) || 'week-1';
@@ -1903,6 +1918,11 @@ export default function App() {
       fetchStudentVocabularyFromFirestore(uid, dictEmail).then((fsEntries) => {
         if (Array.isArray(fsEntries) && fsEntries.length > 0) {
           setStudentDictionaryEntries(fsEntries);
+        }
+      });
+      fetchExcludedDictionaryWords(uid, dictEmail).then((exWords) => {
+        if (Array.isArray(exWords)) {
+          setExcludedDictionaryWords(exWords);
         }
       });
 
@@ -2695,7 +2715,7 @@ export default function App() {
       .map((w) => {
         const cleanW = w.trim();
         const normKey = normalizeDictionaryWord(cleanW);
-        const cached = getInstantOrCachedWord(cleanW, actName, userProfile?.level);
+        const cached = getInstantOrCachedWord(cleanW, actName, userProfile?.level, userProfile?.uid, userProfile?.email, studentDictionaryEntries);
         const actVideoId = (currentAct as any)?.videoId || (currentAct as any)?.videoUrl;
         const actVideoTitle = (currentAct as any)?.title || actName;
         const todayIso = new Date().toISOString();
@@ -4330,12 +4350,21 @@ export default function App() {
 
   // Handler: Save manual entry in Personal Dictionary
   const handleSaveCustomDictionaryEntry = async (entry: StudentDictionaryEntry) => {
+    const norm = normalizeDictionaryWord(entry.normalizedWord || entry.word);
+    if (norm) {
+      setExcludedDictionaryWords((prev) => prev.filter((w) => normalizeDictionaryWord(w) !== norm));
+    }
+
     setStudentDictionaryEntries((prev) => {
       return consolidateDictionaryEntries(prev, [entry]);
     });
 
     const targetUid = currentAccount?.uid || auth.currentUser?.uid || userProfile?.id || (userProfile as any)?.uid || '';
     const targetEmail = currentAccount?.email || auth.currentUser?.email || userProfile?.email || '';
+
+    if (norm && (targetUid || targetEmail)) {
+      await removeExcludedDictionaryWord(targetUid, norm, targetEmail);
+    }
 
     // Direct Firestore persistence - cumulative and permanent!
     if (targetUid || targetEmail) {
@@ -4367,10 +4396,18 @@ export default function App() {
   const handleDeleteCustomDictionaryEntry = async (word: string) => {
     const cleanWord = (word || '').trim().toLowerCase();
     if (!cleanWord) return;
+    const norm = normalizeDictionaryWord(cleanWord);
 
     setStudentDictionaryEntries((prev) =>
-      prev.filter((e) => (e.word || '').trim().toLowerCase() !== cleanWord)
+      prev.filter((e) => normalizeDictionaryWord(e.normalizedWord || e.word) !== norm)
     );
+
+    if (norm) {
+      setExcludedDictionaryWords((prev) => {
+        if (!prev.includes(norm)) return [...prev, norm];
+        return prev;
+      });
+    }
 
     const targetUid = currentAccount?.uid || auth.currentUser?.uid || userProfile?.id || (userProfile as any)?.uid || '';
     const targetEmail = currentAccount?.email || auth.currentUser?.email || userProfile?.email || '';
@@ -5405,6 +5442,16 @@ export default function App() {
           }
         }).catch(() => {});
       }
+
+      if (effectiveWords.length > 0) {
+        markVocabularyWordsPracticedInFirestore(studentUid, effectiveWords, studentEmail)
+          .then((updated) => {
+            if (Array.isArray(updated) && updated.length > 0) {
+              setStudentDictionaryEntries(updated);
+            }
+          })
+          .catch(() => {});
+      }
     }
 
     setNotifications((prev) => [
@@ -6260,6 +6307,8 @@ export default function App() {
                   studentJournal={studentJournal}
                   onUpdateSPathCheck={handleUpdateSPathCheck}
                   onBehavioralComplete={handleBehavioralActivityComplete}
+                  dictionaryEntries={studentDictionaryEntries}
+                  excludedWords={excludedDictionaryWords}
                 />
 
                 {/* Section 3: Weekly Activity (Image 3) */}
@@ -6726,6 +6775,8 @@ export default function App() {
         currentLanguage={currentLanguage}
         onSaveDailySentence={handleSaveDailySentence}
         onOpenJournalModal={() => setIsJournalModalOpen(true)}
+        dictionaryEntries={studentDictionaryEntries}
+        excludedWords={excludedDictionaryWords}
       />
 
       {/* Admin Landing Content Editor Modal */}
@@ -6778,6 +6829,7 @@ export default function App() {
         onClose={() => setIsPersonalDictionaryOpen(false)}
         wordsFromRoutines={wordsFromRoutines}
         customSavedEntries={studentDictionaryEntries}
+        excludedWords={excludedDictionaryWords}
         onSaveCustomEntry={handleSaveCustomDictionaryEntry}
         onDeleteEntry={handleDeleteCustomDictionaryEntry}
         onOpenJournalModal={() => setIsJournalModalOpen(true)}

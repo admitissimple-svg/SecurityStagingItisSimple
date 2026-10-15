@@ -9,6 +9,7 @@ import {
   fetchStudentVocabularyFromFirestore,
   saveStudentVocabularyToFirestore,
   getCachedLocalVocabulary,
+  getCachedExcludedDictionaryWords,
   normalizeUid,
 } from './studentPersistence';
 import { lookupWord } from './dictionaryService';
@@ -73,15 +74,22 @@ export function isDefinitionRicher(existingDef?: string, newDef?: string): boole
  */
 export function consolidateDictionaryEntries(
   existingList: StudentDictionaryEntry[] = [],
-  newEntries: StudentDictionaryEntry[] = []
+  newEntries: StudentDictionaryEntry[] = [],
+  excludedWords?: string[] | Set<string>
 ): StudentDictionaryEntry[] {
   const masterMap = new Map<string, StudentDictionaryEntry>();
+  const excludedSet = excludedWords instanceof Set
+    ? excludedWords
+    : Array.isArray(excludedWords)
+    ? new Set(excludedWords.map((w) => normalizeDictionaryWord(w)).filter(Boolean))
+    : null;
 
   // 1. Index existing entries
   existingList.forEach((item) => {
     if (!item || !item.word || !item.word.trim()) return;
     const norm = normalizeDictionaryWord(item.normalizedWord || item.word);
     if (!norm) return;
+    if (excludedSet && excludedSet.has(norm)) return;
 
     // Ensure item has normalizedWord and origins stamped
     const initialOrigins: DictionaryEntryOrigin[] = Array.isArray(item.origins) && item.origins.length > 0
@@ -115,6 +123,7 @@ export function consolidateDictionaryEntries(
     const cleanWord = incoming.word.trim();
     const norm = normalizeDictionaryWord(incoming.normalizedWord || cleanWord);
     if (!norm) return;
+    if (excludedSet && excludedSet.has(norm)) return;
 
     const existing = masterMap.get(norm);
 
@@ -362,6 +371,12 @@ export async function findDictionaryWord(
 ): Promise<StudentDictionaryEntry | null> {
   const norm = normalizeDictionaryWord(word);
   if (!norm) return null;
+
+  // Check if word has been deleted/excluded from active dictionary
+  const excluded = getCachedExcludedDictionaryWords(studentUid, studentEmail);
+  if (excluded.some((ex) => normalizeDictionaryWord(ex) === norm)) {
+    return null;
+  }
 
   // 1. Check local session cache first
   const cachedList = getCachedLocalVocabulary(studentUid, studentEmail);

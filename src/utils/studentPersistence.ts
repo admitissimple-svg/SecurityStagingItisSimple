@@ -38,6 +38,7 @@ import {
 // ZERO dependency on localStorage: 100% of persistent data is stored in Cloud Firestore
 const inMemoryVocabularyCache = new Map<string, StudentDictionaryEntry[]>();
 const inMemoryWeeklyChecksCache = new Map<string, Record<string, boolean>>();
+const inMemoryExcludedVocabularyWords = new Map<string, Set<string>>();
 
 /**
  * Strict validator for positive integer week cycles.
@@ -387,6 +388,11 @@ export async function saveStudentVocabularyToFirestore(
 
     await withFirestoreTimeout(Promise.all(writePromises), 6000, null);
 
+    // Un-exclude any newly saved entries so they are active again
+    sanitizedEntries.forEach((e) => {
+      if (e?.word) removeExcludedDictionaryWord(cleanUid, e.word, cleanEmail);
+    });
+
     // Mirror to backend server API for disk persistence with verified authorization
     if (cleanEmail || cleanUid) {
       getAccessToken().then((token) => {
@@ -553,9 +559,12 @@ export async function fetchStudentVocabularyFromFirestore(
       }
     }
 
-    const result = Array.from(entryMap.values()).sort((a, b) =>
-      (a.word || '').localeCompare(b.word || '', ['en', 'pt'], { sensitivity: 'base' })
-    );
+    const excluded = new Set(getCachedExcludedDictionaryWords(cleanUid, cleanEmail));
+    const result = Array.from(entryMap.values())
+      .filter((item) => !excluded.has(normalizeDictionaryWord(item.normalizedWord || item.word)))
+      .sort((a, b) =>
+        (a.word || '').localeCompare(b.word || '', ['en', 'pt'], { sensitivity: 'base' })
+      );
 
     // CRITICAL: Only cache if we actually have words - NEVER wipe local cache with empty result!
     if (result.length > 0) {
@@ -642,9 +651,136 @@ export async function deleteStudentVocabularyFromFirestore(
       } catch {}
     }
 
+    // 3. Mark word as excluded so routine consolidation does not resurrect it
+    await addExcludedDictionaryWord(cleanUid, cleanWord, cleanEmail);
+
     return true;
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, `users/${cleanUid}/vocabulary/${wordDocId}`);
+    return false;
+  }
+}
+
+/**
+ * Returns cached excluded dictionary words for the student.
+ */
+export function getCachedExcludedDictionaryWords(studentUid?: string, studentEmail?: string): string[] {
+  const cleanEmail = (studentEmail || '').toLowerCase().trim();
+  const cleanUid = normalizeUid(studentUid, cleanEmail);
+  const set = (cleanUid && inMemoryExcludedVocabularyWords.get(cleanUid)) ||
+    (cleanEmail && inMemoryExcludedVocabularyWords.get(cleanEmail));
+  return set ? Array.from(set) : [];
+}
+
+/**
+ * Caches excluded dictionary words locally.
+ */
+export function cacheExcludedWordsLocally(studentUid: string, studentEmail: string | undefined, words: string[]): void {
+  const cleanEmail = (studentEmail || '').toLowerCase().trim();
+  const cleanUid = normalizeUid(studentUid, cleanEmail);
+  const normalizedWords = new Set(words.map((w) => normalizeDictionaryWord(w)).filter(Boolean));
+  if (cleanUid) inMemoryExcludedVocabularyWords.set(cleanUid, normalizedWords);
+  if (cleanEmail) inMemoryExcludedVocabularyWords.set(cleanEmail, normalizedWords);
+}
+
+/**
+ * Fetches excluded dictionary words from Firestore users/{cleanUid}.
+ */
+export async function fetchExcludedDictionaryWords(
+  studentUid: string,
+  studentEmail?: string
+): Promise<string[]> {
+  const db = getDb();
+  const cleanEmail = (studentEmail || '').toLowerCase().trim();
+  const cleanUid = normalizeUid(studentUid, cleanEmail);
+  if (!db || !cleanUid) {
+    return getCachedExcludedDictionaryWords(cleanUid, cleanEmail);
+  }
+
+  try {
+    const userRef = doc(db, 'users', cleanUid);
+    const snap = await withFirestoreTimeout(getDoc(userRef), 2500, null);
+    if (snap && snap.exists()) {
+      const data = snap.data();
+      if (Array.isArray(data?.excludedDictionaryWords)) {
+        const list: string[] = data.excludedDictionaryWords
+          .map((w: string) => normalizeDictionaryWord(w))
+          .filter(Boolean);
+        cacheExcludedWordsLocally(cleanUid, cleanEmail, list);
+        return list;
+      }
+    }
+  } catch {}
+
+  return getCachedExcludedDictionaryWords(cleanUid, cleanEmail);
+}
+
+/**
+ * Adds a word to the excluded dictionary words list.
+ */
+export async function addExcludedDictionaryWord(
+  studentUid: string,
+  word: string,
+  studentEmail?: string
+): Promise<boolean> {
+  const norm = normalizeDictionaryWord(word);
+  if (!norm) return false;
+  const cleanEmail = (studentEmail || '').toLowerCase().trim();
+  const cleanUid = normalizeUid(studentUid, cleanEmail);
+
+  // Update in-memory
+  const current = new Set(getCachedExcludedDictionaryWords(cleanUid, cleanEmail));
+  current.add(norm);
+  const updatedList = Array.from(current);
+  cacheExcludedWordsLocally(cleanUid, cleanEmail, updatedList);
+
+  const db = getDb();
+  if (!db || !cleanUid) return true;
+
+  try {
+    const userRef = doc(db, 'users', cleanUid);
+    await withFirestoreTimeout(
+      setDoc(userRef, { excludedDictionaryWords: updatedList, updatedAt: new Date().toISOString() }, { merge: true }),
+      3000,
+      null
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Removes a word from the excluded dictionary words list (e.g. when re-added manually).
+ */
+export async function removeExcludedDictionaryWord(
+  studentUid: string,
+  word: string,
+  studentEmail?: string
+): Promise<boolean> {
+  const norm = normalizeDictionaryWord(word);
+  if (!norm) return false;
+  const cleanEmail = (studentEmail || '').toLowerCase().trim();
+  const cleanUid = normalizeUid(studentUid, cleanEmail);
+
+  const current = new Set(getCachedExcludedDictionaryWords(cleanUid, cleanEmail));
+  if (!current.has(norm)) return true;
+  current.delete(norm);
+  const updatedList = Array.from(current);
+  cacheExcludedWordsLocally(cleanUid, cleanEmail, updatedList);
+
+  const db = getDb();
+  if (!db || !cleanUid) return true;
+
+  try {
+    const userRef = doc(db, 'users', cleanUid);
+    await withFirestoreTimeout(
+      setDoc(userRef, { excludedDictionaryWords: updatedList, updatedAt: new Date().toISOString() }, { merge: true }),
+      3000,
+      null
+    );
+    return true;
+  } catch {
     return false;
   }
 }

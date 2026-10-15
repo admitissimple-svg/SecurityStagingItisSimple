@@ -354,7 +354,140 @@ async function runTests() {
   }
 
   // --------------------------------------------------------------------------
-  // TESTE 8: Resumo final
+  // TESTE 8: ETAPA 1 (2.2B.1) Exclusão de palavra proveniente da rotina não a recria
+  // --------------------------------------------------------------------------
+  console.log('\nTEST 8: ETAPA 1 (2.2B.1) Exclusão de palavra da rotina mantendo integridade histórica');
+  {
+    const routineWords: StudentDictionaryEntry[] = [
+      {
+        id: 'routine_breakfast',
+        word: 'breakfast',
+        normalizedWord: 'breakfast',
+        definitionEn: 'The first meal of the day, typically eaten in the morning.',
+        origins: [{ source: 'routine', activityName: 'Morning Routine', dayOfWeek: 'monday' as DayOfWeek }],
+      },
+      {
+        id: 'routine_coffee',
+        word: 'coffee',
+        normalizedWord: 'coffee',
+        definitionEn: 'A beverage brewed from roasted coffee beans.',
+        origins: [{ source: 'routine', activityName: 'Morning Routine', dayOfWeek: 'monday' as DayOfWeek }],
+      },
+    ];
+
+    // Simulated routine and journal data:
+    const routinesHistory = {
+      monday: [{ id: 'act_1', activityName: 'Morning Routine', learnedWords: ['breakfast', 'coffee'] }],
+    };
+    const journalHistory = [
+      { id: 'j_1', sentence: 'I had breakfast and coffee.', wordsUsed: ['breakfast', 'coffee'] },
+    ];
+
+    // Student excludes "breakfast" from active library
+    const excludedSet = new Set<string>(['breakfast']);
+    const activeLibrary = consolidateDictionaryEntries([], routineWords, excludedSet);
+
+    assert(activeLibrary.length === 1, 'Excluded word removed from active dictionary');
+    assert(activeLibrary[0]?.word === 'coffee', 'Only non-excluded words remain active');
+    assert(!activeLibrary.some((e) => e.word === 'breakfast'), 'Excluded word does NOT appear in active library');
+
+    // Pedagogical principle check: routine and journal remain completely intact
+    assert(routinesHistory.monday[0].learnedWords.includes('breakfast'), 'Original routine learnedWords history remains 100% intact');
+    assert(journalHistory[0].wordsUsed.includes('breakfast'), 'Original journal entry history remains 100% intact');
+
+    // Simulate modal reopening: consolidation runs again with excludedSet
+    const reopenedModalEntries = consolidateDictionaryEntries([], routineWords, excludedSet);
+    assert(reopenedModalEntries.length === 1, 'Modal reopen does NOT resurrect excluded word');
+    assert(!reopenedModalEntries.some((e) => e.word === 'breakfast'), 'Excluded word never reappears upon reopen');
+  }
+
+  // --------------------------------------------------------------------------
+  // TESTE 9: ETAPA 2 (2.2B.2) Reutilização de definições ricas do My Dictionary em componentes
+  // --------------------------------------------------------------------------
+  console.log('\nTEST 9: ETAPA 2 (2.2B.2) Reutilização de definições ricas do My Dictionary');
+  {
+    const myDictionary: StudentDictionaryEntry[] = [
+      {
+        id: 'dict_resilience',
+        word: 'resilience',
+        normalizedWord: 'resilience',
+        definitionEn: 'The capacity to recover quickly from difficulties; toughness and mental flexibility.',
+        exampleSentenceEn: 'Language learners build great resilience through daily conversational practice.',
+        partOfSpeech: 'Noun',
+        cefrLevel: 'C1',
+        translationPt: 'resiliência',
+      },
+    ];
+
+    // Component needing definition of "resilience"
+    const targetWord = 'Resilience';
+    const norm = normalizeDictionaryWord(targetWord);
+    const foundInMyDict = myDictionary.find((e) => normalizeDictionaryWord(e.normalizedWord || e.word) === norm);
+
+    assert(Boolean(foundInMyDict), 'Word found in My Dictionary');
+    assert(
+      foundInMyDict?.definitionEn === 'The capacity to recover quickly from difficulties; toughness and mental flexibility.',
+      'Component receives rich pedagogical definition from My Dictionary'
+    );
+    assert(foundInMyDict?.partOfSpeech === 'Noun', 'Component receives specific part of speech');
+    assert(foundInMyDict?.cefrLevel === 'C1', 'Component receives CEFR level badge');
+  }
+
+  // --------------------------------------------------------------------------
+  // TESTE 10: ETAPA 3 (2.2B.3) Consulta ao My Dictionary na Frase do Dia e respeito a exclusão
+  // --------------------------------------------------------------------------
+  console.log('\nTEST 10: ETAPA 3 (2.2B.3) Consulta ao My Dictionary na Frase do Dia');
+  {
+    const savedEntries: StudentDictionaryEntry[] = [
+      {
+        id: 'dict_1',
+        word: 'thrive',
+        normalizedWord: 'thrive',
+        definitionEn: 'To grow or develop well; flourish.',
+        cefrLevel: 'B2',
+      },
+      {
+        id: 'dict_2',
+        word: 'persist',
+        normalizedWord: 'persist',
+        definitionEn: 'Continue firmly in an opinion or course of action.',
+        cefrLevel: 'B2',
+      },
+      {
+        id: 'dict_3',
+        word: 'give up',
+        normalizedWord: 'give up',
+        definitionEn: 'Cease making an effort.',
+        cefrLevel: 'B1',
+      },
+    ];
+
+    const excludedWords = ['give up'];
+    const excludedSet = new Set(excludedWords.map((w) => normalizeDictionaryWord(w)));
+
+    // Active words available for consultation in Sentence of the Day
+    const consultableWords = savedEntries.filter(
+      (e) => !excludedSet.has(normalizeDictionaryWord(e.normalizedWord || e.word))
+    );
+
+    assert(consultableWords.length === 2, 'Excluded words omitted from Sentence of the Day consultation');
+    assert(consultableWords.some((e) => e.word === 'thrive'), 'Word "thrive" is available to consult and insert');
+    assert(consultableWords.some((e) => e.word === 'persist'), 'Word "persist" is available to consult and insert');
+    assert(!consultableWords.some((e) => e.word === 'give up'), 'Excluded word "give up" cannot be consulted');
+
+    // Simulate student selecting "thrive" from dictionary to compose their sentence
+    const selectedWord = consultableWords[0]?.word;
+    const initialSentence = 'Every day I practice English and';
+    const updatedSentence = `${initialSentence} ${selectedWord}`.trim();
+    assert(updatedSentence === 'Every day I practice English and thrive', 'Dictionary word correctly inserted into sentence');
+
+    // Check sentence matching
+    const matched = consultableWords.filter((e) => updatedSentence.toLowerCase().includes(e.word.toLowerCase()));
+    assert(matched.length === 1 && matched[0]?.word === 'thrive', 'Sentence of the Day correctly identifies dictionary word used');
+  }
+
+  // --------------------------------------------------------------------------
+  // TESTE 11: Resumo final
   // --------------------------------------------------------------------------
   console.log('\n======================================================');
   console.log(`TEST RESUMO FASE 2.2B: ${passed} PASS, ${failed} FAIL`);

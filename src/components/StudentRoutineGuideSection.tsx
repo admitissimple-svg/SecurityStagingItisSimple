@@ -43,6 +43,7 @@ import {
   TeacherAssignedVideo,
   TeacherAssignedSpotify,
   StudentJournalEntry,
+  StudentDictionaryEntry,
 } from '../types';
 import { Translations, getActivityDisplayName } from '../utils/i18n';
 import { extractYouTubeVideoId, getYouTubeEmbedUrl, getDailyYouTubeVideoForStudent, getYouTubePlaylistForLevel } from '../utils/youtube';
@@ -132,6 +133,8 @@ interface StudentRoutineGuideSectionProps {
       url?: string;
     };
   }) => void;
+  dictionaryEntries?: StudentDictionaryEntry[];
+  excludedWords?: string[];
 }
 
 export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProps> = ({
@@ -161,6 +164,8 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
   studentJournal,
   onUpdateSPathCheck,
   onBehavioralComplete,
+  dictionaryEntries = [],
+  excludedWords = [],
 }) => {
   const isEn = currentLanguage === 'en';
   const todayDay = getTodayDayOfWeek();
@@ -301,13 +306,43 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
   }, [activeActivity?.id, activeActivity?.learnedWords?.join(',')]);
 
   // Keep English definitions synchronized using Native Friend Notes unified pedagogical standard
+  // Reuses My Dictionary definitions (2.2B.2)
   useEffect(() => {
     const studentLevel = userProfile?.level;
     const initialDefs: Record<number, DictionaryLookupResult> = {};
     words.forEach((w, idx) => {
       const clean = w.trim();
       if (clean) {
-        initialDefs[idx] = getInstantOrCachedWord(clean, undefined, studentLevel);
+        // 2.2B.2: Reutilizar definição do My Dictionary do aluno se já existir
+        const norm = clean.toLowerCase();
+        const existingInMyDict = (dictionaryEntries || []).find(
+          (d) =>
+            (d.word || '').trim().toLowerCase() === norm &&
+            Boolean(d.definitionEn && d.definitionEn.trim().length > 0)
+        );
+        if (existingInMyDict) {
+          initialDefs[idx] = {
+            word: existingInMyDict.word,
+            partOfSpeech: existingInMyDict.partOfSpeech || (clean.includes(' ') ? 'Idiomatic Expression' : 'Noun'),
+            definitionEn: existingInMyDict.definitionEn,
+            exampleSentenceEn: existingInMyDict.exampleSentenceEn || '',
+            translationPt: existingInMyDict.translationPt || '',
+            phonetic: existingInMyDict.phonetic,
+            audio: existingInMyDict.audio || existingInMyDict.audioUrl,
+            cefrLevel: (existingInMyDict.cefrLevel as any) || 'B1',
+            source: 'my_dictionary',
+            notFound: false,
+          };
+        } else {
+          initialDefs[idx] = getInstantOrCachedWord(
+            clean,
+            undefined,
+            studentLevel,
+            userProfile?.uid,
+            userProfile?.email,
+            dictionaryEntries
+          );
+        }
       }
     });
     setWordDefinitions(initialDefs);
@@ -316,13 +351,26 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     const timer = setTimeout(() => {
       const wordsToLookup = words
         .map((w, idx) => ({ word: w.trim(), idx }))
-        .filter(({ word, idx }) => word.length >= 2 && (!initialDefs[idx] || !initialDefs[idx].definitionEn));
+        .filter(
+          ({ word, idx }) =>
+            word.length >= 2 &&
+            (!initialDefs[idx] ||
+              !initialDefs[idx].definitionEn ||
+              initialDefs[idx].source === 'pending')
+        );
 
       if (wordsToLookup.length === 0) return;
 
       wordsToLookup.forEach(async ({ word, idx }) => {
         try {
-          const res = await lookupWord(word, undefined, studentLevel);
+          const res = await lookupWord(
+            word,
+            undefined,
+            studentLevel,
+            userProfile?.uid,
+            userProfile?.email,
+            dictionaryEntries
+          );
           if (res) {
             setWordDefinitions((prev) => {
               if (words[idx]?.trim().toLowerCase() === word.toLowerCase()) {
@@ -338,7 +386,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     }, 200);
 
     return () => clearTimeout(timer);
-  }, [words, userProfile?.level]);
+  }, [words, userProfile?.level, userProfile?.uid, userProfile?.email, dictionaryEntries]);
 
   // Spotify view toggle: App Player or Spotify Web, and Track vs Full Playlist view
   const [spotifyPlayerMode, setSpotifyPlayerMode] = useState<'app' | 'web'>('app');
@@ -548,9 +596,16 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
       };
       setSentenceInput(corrected);
       setSentenceEvaluation(updatedEval);
+      const dictMatchedWords = (dictionaryEntries || [])
+        .filter((e) => {
+          const w = (e.word || '').trim().toLowerCase();
+          return w.length >= 2 && corrected.toLowerCase().includes(w);
+        })
+        .map((e) => e.word.trim());
+      const accumulatedWords = Array.from(new Set([...matchedSentenceWords, ...dictMatchedWords]));
       const finalWordsToSave =
-        matchedSentenceWords.length > 0
-          ? matchedSentenceWords
+        accumulatedWords.length > 0
+          ? accumulatedWords
           : updatedEval.usedWords || displayRoutineWords;
       onSaveDailySentence(corrected, finalWordsToSave, updatedEval);
       setSentenceSavedSuccess(true);
@@ -591,7 +646,14 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
       return;
     }
 
-    const finalWordsToSave = matchedSentenceWords.length > 0 ? matchedSentenceWords : (activeEval?.usedWords || displayRoutineWords);
+    const dictMatchedWords = (dictionaryEntries || [])
+      .filter((e) => {
+        const w = (e.word || '').trim().toLowerCase();
+        return w.length >= 2 && clean.toLowerCase().includes(w);
+      })
+      .map((e) => e.word.trim());
+    const accumulatedWords = Array.from(new Set([...matchedSentenceWords, ...dictMatchedWords]));
+    const finalWordsToSave = accumulatedWords.length > 0 ? accumulatedWords : (activeEval?.usedWords || displayRoutineWords);
     onSaveDailySentence(clean, finalWordsToSave, activeEval);
     setSentenceSavedSuccess(true);
     setTimeout(() => {
@@ -2377,6 +2439,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
             handleSaveWords={handleSaveWords}
             speakText={speakText}
             studentLevel={userProfile?.level}
+            dictionaryEntries={dictionaryEntries}
           />
         </div>
       </div>
@@ -2400,6 +2463,8 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
           handleCheckGrammar={handleCheckGrammar}
           handleSaveSentence={handleSaveSentence}
           speakText={speakText}
+          dictionaryEntries={dictionaryEntries}
+          excludedWords={excludedWords}
         />
 
         <div className="pt-2">

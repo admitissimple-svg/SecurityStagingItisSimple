@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   X,
   Sparkles,
@@ -10,9 +10,11 @@ import {
   AlertTriangle,
   CheckCircle2,
   BookOpen,
+  ChevronDown,
+  Search,
   Loader2,
 } from 'lucide-react';
-import { RoutineItem, UserProfile, WritingEvaluationResult, Language } from '../types';
+import { RoutineItem, UserProfile, WritingEvaluationResult, Language, StudentDictionaryEntry } from '../types';
 import { checkDailySentenceAi } from '../utils/writingChecker';
 import { speakText } from '../utils/audio';
 
@@ -22,6 +24,8 @@ interface DailySentenceModalProps {
   todayRoutines: RoutineItem[];
   userProfile: UserProfile;
   currentLanguage: Language;
+  dictionaryEntries?: StudentDictionaryEntry[];
+  excludedWords?: string[];
   onSaveDailySentence: (sentence: string, wordsUsed: string[], evaluationResult?: WritingEvaluationResult | null) => void;
   onOpenJournalModal?: () => void;
 }
@@ -32,6 +36,8 @@ export const DailySentenceModal: React.FC<DailySentenceModalProps> = ({
   todayRoutines,
   userProfile,
   currentLanguage,
+  dictionaryEntries = [],
+  excludedWords = [],
   onSaveDailySentence,
   onOpenJournalModal,
 }) => {
@@ -40,6 +46,50 @@ export const DailySentenceModal: React.FC<DailySentenceModalProps> = ({
   const [evaluation, setEvaluation] = useState<WritingEvaluationResult | null>(null);
   const [isChecking, setIsChecking] = useState<boolean>(false);
   const [saveSuccess, setSaveSuccess] = useState<boolean>(false);
+  const [isDictConsultOpen, setIsDictConsultOpen] = useState(false);
+  const [dictSearchTerm, setDictSearchTerm] = useState('');
+
+  const excludedSet = useMemo(() => {
+    return new Set((excludedWords || []).map((w) => (w || '').trim().toLowerCase()));
+  }, [excludedWords]);
+
+  const activeDictWords = useMemo(() => {
+    if (!Array.isArray(dictionaryEntries) || dictionaryEntries.length === 0) return [];
+    const map = new Map<string, StudentDictionaryEntry>();
+    dictionaryEntries.forEach((e) => {
+      if (!e || !e.word || !e.word.trim()) return;
+      const clean = e.word.trim();
+      const lower = clean.toLowerCase();
+      if (excludedSet.has(lower)) return;
+      if (!map.has(lower)) {
+        map.set(lower, e);
+      }
+    });
+    return Array.from(map.values()).sort((a, b) =>
+      (a.word || '').localeCompare(b.word || '', ['en', 'pt'], { sensitivity: 'base' })
+    );
+  }, [dictionaryEntries, excludedSet]);
+
+  const filteredDictWords = useMemo(() => {
+    const term = dictSearchTerm.trim().toLowerCase();
+    if (!term) return activeDictWords;
+    return activeDictWords.filter((e) => {
+      return (
+        (e.word || '').toLowerCase().includes(term) ||
+        (e.definitionEn && e.definitionEn.toLowerCase().includes(term)) ||
+        (e.translationPt && e.translationPt.toLowerCase().includes(term))
+      );
+    });
+  }, [activeDictWords, dictSearchTerm]);
+
+  const matchedDictWords = useMemo(() => {
+    const inputLower = (sentenceInput || '').toLowerCase();
+    if (!inputLower) return [];
+    return activeDictWords.filter((entry) => {
+      const w = (entry.word || '').toLowerCase();
+      return w.length >= 2 && inputLower.includes(w);
+    });
+  }, [activeDictWords, sentenceInput]);
 
   // Gather all unique words
   const allWords: string[] = [];
@@ -101,7 +151,11 @@ export const DailySentenceModal: React.FC<DailySentenceModalProps> = ({
       }
     }
 
-    const wordsToRecord = matchedWords.length > 0 ? matchedWords : (activeEval?.usedWords || allWords);
+    const dictMatchedWords = activeDictWords
+      .filter((entry) => clean.toLowerCase().includes(entry.word.toLowerCase()))
+      .map((e) => e.word.trim());
+    const combinedWords = Array.from(new Set([...matchedWords, ...dictMatchedWords]));
+    const wordsToRecord = combinedWords.length > 0 ? combinedWords : (activeEval?.usedWords || allWords);
     onSaveDailySentence(clean, wordsToRecord, activeEval);
     setSaveSuccess(true);
     setTimeout(() => {
@@ -167,7 +221,7 @@ export const DailySentenceModal: React.FC<DailySentenceModalProps> = ({
           )}
 
           {/* Words */}
-          <div className="space-y-1.5">
+          <div className="space-y-2">
             <span className="text-xs font-bold text-[#000035] flex items-center gap-1.5">
               <Sparkles className="w-3.5 h-3.5 text-[#1C4C96]" />
               <span>{isEn ? 'Words Learned Today:' : 'Palavras Praticadas Hoje:'}</span>
@@ -192,6 +246,99 @@ export const DailySentenceModal: React.FC<DailySentenceModalProps> = ({
                 );
               })}
             </div>
+
+            {/* Optional My Dictionary consultation (2.2B.3) */}
+            {activeDictWords.length > 0 && (
+              <div className="pt-2 border-t border-slate-200 space-y-2">
+                <div className="flex items-center justify-between">
+                  <button
+                    type="button"
+                    onClick={() => setIsDictConsultOpen((prev) => !prev)}
+                    className="text-xs font-bold text-[#1C4C96] hover:text-[#000035] flex items-center gap-1.5 transition cursor-pointer select-none"
+                  >
+                    <BookOpen className="w-3.5 h-3.5 text-[#1C4C96]" />
+                    <span>{isEn ? 'Consult My Dictionary' : 'Consultar Meu Dicionário'}</span>
+                    <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-[#9AB4FF]/30 text-[#000035] font-black">
+                      {activeDictWords.length}
+                    </span>
+                    <ChevronDown
+                      className={`w-3.5 h-3.5 transition-transform duration-200 ${
+                        isDictConsultOpen ? 'rotate-180' : ''
+                      }`}
+                    />
+                  </button>
+
+                  {matchedDictWords.length > 0 && (
+                    <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200 flex items-center gap-1">
+                      <Check className="w-3 h-3 text-emerald-600" />
+                      <span>
+                        {matchedDictWords.length} {isEn ? 'from dictionary used' : 'do dicionário usadas'}
+                      </span>
+                    </span>
+                  )}
+                </div>
+
+                {isDictConsultOpen && (
+                  <div className="p-3 bg-slate-50 rounded-2xl border border-[#9AB4FF]/40 space-y-2 animate-in fade-in zoom-in-95 duration-150">
+                    <div className="relative">
+                      <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                      <input
+                        type="text"
+                        value={dictSearchTerm}
+                        onChange={(e) => setDictSearchTerm(e.target.value)}
+                        placeholder={
+                          isEn
+                            ? 'Search word, definition, or translation...'
+                            : 'Buscar palavra, definição ou tradução...'
+                        }
+                        className="w-full pl-8 pr-3 py-1.5 bg-white border border-slate-200 rounded-xl text-xs text-[#000035] focus:outline-none focus:ring-1 focus:ring-[#1C4C96] placeholder:text-slate-400"
+                      />
+                    </div>
+
+                    <div className="flex flex-wrap gap-1.5 max-h-36 overflow-y-auto p-1">
+                      {filteredDictWords.length === 0 ? (
+                        <span className="text-xs text-slate-400 italic">
+                          {isEn ? 'No dictionary words match your search.' : 'Nenhuma palavra encontrada no dicionário.'}
+                        </span>
+                      ) : (
+                        filteredDictWords.map((entry) => {
+                          const isUsed = (sentenceInput || '')
+                            .toLowerCase()
+                            .includes(entry.word.toLowerCase());
+                          return (
+                            <button
+                              key={entry.id || entry.word}
+                              type="button"
+                              onClick={() =>
+                                setSentenceInput((prev) => (prev ? `${prev} ${entry.word}` : entry.word))
+                              }
+                              className={`text-xs px-2.5 py-1 rounded-xl border transition cursor-pointer flex items-center gap-1.5 ${
+                                isUsed
+                                  ? 'bg-[#9AB4FF]/25 text-[#062863] border-[#607EC9] font-bold'
+                                  : 'bg-white text-slate-700 border-slate-200 hover:border-[#1C4C96]'
+                              }`}
+                              title={
+                                entry.definitionEn
+                                  ? `${entry.word}: ${entry.definitionEn}`
+                                  : entry.word
+                              }
+                            >
+                              <span>{entry.word}</span>
+                              {entry.cefrLevel && (
+                                <span className="text-[9px] font-black uppercase px-1 rounded bg-[#000035] text-white">
+                                  {entry.cefrLevel}
+                                </span>
+                              )}
+                              {isUsed && <Check className="w-3 h-3 text-emerald-600" />}
+                            </button>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Textarea */}

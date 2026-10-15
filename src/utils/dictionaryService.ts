@@ -2,6 +2,7 @@ import { StudentDictionaryEntry, EnglishLevel } from '../types';
 import { NATIVE_FRIENDS_DICTIONARY_DATABASE } from '../data/dictionaryDatabase';
 import { resolveCefrLevel } from './pedagogicalTransformer';
 import { auth } from '../firebase';
+import { getCachedLocalVocabulary, normalizeDictionaryWord } from './studentPersistence';
 
 export interface DictionaryLookupResult {
   word: string;
@@ -330,7 +331,10 @@ async function fetchFromBackendApi(
 export async function lookupWord(
   rawWord: string,
   context?: string,
-  studentLevel?: EnglishLevel | string
+  studentLevel?: EnglishLevel | string,
+  studentUid?: string,
+  studentEmail?: string,
+  activeDictionary?: StudentDictionaryEntry[]
 ): Promise<DictionaryLookupResult> {
   const cleanWord = rawWord.trim();
   if (!cleanWord) {
@@ -345,16 +349,70 @@ export async function lookupWord(
     };
   }
 
+  const norm = normalizeDictionaryWord(cleanWord);
   const cacheKey = cleanWord.toLowerCase();
   const cefrMeta = resolveCefrLevel(studentLevel);
 
-  // 1. Check session memory cache first
+  // 1. First priority: Check student's My Dictionary for existing rich pedagogical definition
+  if (Array.isArray(activeDictionary) && activeDictionary.length > 0) {
+    const existing = activeDictionary.find(
+      (e) =>
+        normalizeDictionaryWord(e.normalizedWord || e.word) === norm &&
+        Boolean(e.definitionEn && e.definitionEn.trim().length > 0)
+    );
+    if (existing) {
+      const myDictResult: DictionaryLookupResult = {
+        word: existing.word,
+        partOfSpeech: existing.partOfSpeech || (cleanWord.includes(' ') ? 'Idiomatic Expression' : 'Noun'),
+        definitionEn: existing.definitionEn,
+        exampleSentenceEn: formatExample(existing.exampleSentenceEn || ''),
+        translationPt: existing.translationPt || '',
+        phonetic: existing.phonetic,
+        audio: existing.audio || existing.audioUrl,
+        cefrLevel: (existing.cefrLevel as any) || cefrMeta.cefr,
+        source: 'my_dictionary',
+        notFound: false,
+      };
+      memoryCache.set(cacheKey, myDictResult);
+      return myDictResult;
+    }
+  }
+
+  // Check cached local vocabulary if studentUid/studentEmail or auth is present
+  const uidToCheck = studentUid || auth?.currentUser?.uid;
+  const emailToCheck = studentEmail || auth?.currentUser?.email || undefined;
+  if (uidToCheck || emailToCheck) {
+    const localVocab = getCachedLocalVocabulary(uidToCheck, emailToCheck);
+    const existing = localVocab.find(
+      (e) =>
+        normalizeDictionaryWord(e.normalizedWord || e.word) === norm &&
+        Boolean(e.definitionEn && e.definitionEn.trim().length > 0)
+    );
+    if (existing) {
+      const myDictResult: DictionaryLookupResult = {
+        word: existing.word,
+        partOfSpeech: existing.partOfSpeech || (cleanWord.includes(' ') ? 'Idiomatic Expression' : 'Noun'),
+        definitionEn: existing.definitionEn,
+        exampleSentenceEn: formatExample(existing.exampleSentenceEn || ''),
+        translationPt: existing.translationPt || '',
+        phonetic: existing.phonetic,
+        audio: existing.audio || existing.audioUrl,
+        cefrLevel: (existing.cefrLevel as any) || cefrMeta.cefr,
+        source: 'my_dictionary',
+        notFound: false,
+      };
+      memoryCache.set(cacheKey, myDictResult);
+      return myDictResult;
+    }
+  }
+
+  // 2. Check session memory cache
   const cached = memoryCache.get(cacheKey);
   if (cached && !cached.notFound) {
     return cached;
   }
 
-  // 2. Check Native Friend Notes validated database for instant match
+  // 3. Check Native Friend Notes validated database for instant match
   const lowerKey = cleanWord.toLowerCase();
   const normalizedKey = lowerKey.replace(/[_\-]+/g, ' ');
   const dbEntry = NATIVE_FRIENDS_DICTIONARY_DATABASE[lowerKey] || NATIVE_FRIENDS_DICTIONARY_DATABASE[normalizedKey];
@@ -378,21 +436,21 @@ export async function lookupWord(
     return result;
   }
 
-  // 3. Query backend dictionary endpoint (/api/dictionary/define)
+  // 4. Query backend dictionary endpoint (/api/dictionary/define)
   const backendResult = await fetchFromBackendApi(cleanWord, context, studentLevel);
   if (backendResult && !backendResult.notFound && backendResult.definitionEn) {
     memoryCache.set(cacheKey, backendResult);
     return backendResult;
   }
 
-  // 4. Query Free Dictionary API with Native Friend Notes pedagogical adaptation
+  // 5. Query Free Dictionary API with Native Friend Notes pedagogical adaptation
   const apiResult = await fetchFromFreeDictionaryApi(cleanWord, studentLevel);
   if (apiResult && !apiResult.notFound && apiResult.definitionEn) {
     memoryCache.set(cacheKey, apiResult);
     return apiResult;
   }
 
-  // 5. Native Friend Notes standard pedagogical fallback for words without direct external entry
+  // 6. Native Friend Notes standard pedagogical fallback for words without direct external entry
   const isMultiWord = cleanWord.includes(' ');
   const fallbackPos = isMultiWord ? 'Idiomatic Expression' : 'Vocabulary Item';
   const fallbackDef =
@@ -424,7 +482,10 @@ export async function lookupWord(
 export function getInstantOrCachedWord(
   rawWord: string,
   _context?: string,
-  studentLevel?: EnglishLevel | string
+  studentLevel?: EnglishLevel | string,
+  studentUid?: string,
+  studentEmail?: string,
+  activeDictionary?: StudentDictionaryEntry[]
 ): DictionaryLookupResult {
   const cleanWord = rawWord.trim();
   if (!cleanWord) {
@@ -438,7 +499,58 @@ export function getInstantOrCachedWord(
     };
   }
 
+  const norm = normalizeDictionaryWord(cleanWord);
   const cacheKey = cleanWord.toLowerCase();
+  const cefrMeta = resolveCefrLevel(studentLevel);
+
+  // 1. Check My Dictionary first
+  if (Array.isArray(activeDictionary) && activeDictionary.length > 0) {
+    const existing = activeDictionary.find(
+      (e) =>
+        normalizeDictionaryWord(e.normalizedWord || e.word) === norm &&
+        Boolean(e.definitionEn && e.definitionEn.trim().length > 0)
+    );
+    if (existing) {
+      return {
+        word: existing.word,
+        partOfSpeech: existing.partOfSpeech || (cleanWord.includes(' ') ? 'Idiomatic Expression' : 'Noun'),
+        definitionEn: existing.definitionEn,
+        exampleSentenceEn: formatExample(existing.exampleSentenceEn || ''),
+        translationPt: existing.translationPt || '',
+        phonetic: existing.phonetic,
+        audio: existing.audio || existing.audioUrl,
+        cefrLevel: (existing.cefrLevel as any) || cefrMeta.cefr,
+        source: 'my_dictionary',
+        notFound: false,
+      };
+    }
+  }
+
+  const uidToCheck = studentUid || auth?.currentUser?.uid;
+  const emailToCheck = studentEmail || auth?.currentUser?.email || undefined;
+  if (uidToCheck || emailToCheck) {
+    const localVocab = getCachedLocalVocabulary(uidToCheck, emailToCheck);
+    const existing = localVocab.find(
+      (e) =>
+        normalizeDictionaryWord(e.normalizedWord || e.word) === norm &&
+        Boolean(e.definitionEn && e.definitionEn.trim().length > 0)
+    );
+    if (existing) {
+      return {
+        word: existing.word,
+        partOfSpeech: existing.partOfSpeech || (cleanWord.includes(' ') ? 'Idiomatic Expression' : 'Noun'),
+        definitionEn: existing.definitionEn,
+        exampleSentenceEn: formatExample(existing.exampleSentenceEn || ''),
+        translationPt: existing.translationPt || '',
+        phonetic: existing.phonetic,
+        audio: existing.audio || existing.audioUrl,
+        cefrLevel: (existing.cefrLevel as any) || cefrMeta.cefr,
+        source: 'my_dictionary',
+        notFound: false,
+      };
+    }
+  }
+
   const cached = memoryCache.get(cacheKey);
   if (cached) {
     return cached;
@@ -447,8 +559,6 @@ export function getInstantOrCachedWord(
   const lowerKey = cleanWord.toLowerCase();
   const normalizedKey = lowerKey.replace(/[_\-]+/g, ' ');
   const dbEntry = NATIVE_FRIENDS_DICTIONARY_DATABASE[lowerKey] || NATIVE_FRIENDS_DICTIONARY_DATABASE[normalizedKey];
-
-  const cefrMeta = resolveCefrLevel(studentLevel);
 
   if (dbEntry) {
     return {
