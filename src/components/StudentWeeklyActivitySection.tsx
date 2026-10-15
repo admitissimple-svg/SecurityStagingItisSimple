@@ -47,6 +47,7 @@ import {
   normalizeUid,
   normalizeWeekId,
   parseWeekCycleNumber,
+  normalizeDictionaryWord,
 } from '../utils/studentPersistence';
 
 interface StudentWeeklyActivitySectionProps {
@@ -61,6 +62,7 @@ interface StudentWeeklyActivitySectionProps {
   currentLanguage: Language;
   dictionaryEntries?: StudentDictionaryEntry[];
   wordsFromRoutines?: Array<{ word: string; sourceActivityName?: string; sourceDay?: DayOfWeek }>;
+  excludedWords?: string[];
   onUpdateUserProfile?: (updated: Partial<UserProfile>) => void;
   weeklyChecks?: Record<string, boolean>;
   onToggleWeeklyCheck?: (stepId: string, dayKey: DayOfWeek, newChecked?: boolean) => void;
@@ -127,6 +129,7 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
   currentLanguage,
   dictionaryEntries,
   wordsFromRoutines,
+  excludedWords,
   onUpdateUserProfile,
   weeklyChecks: propWeeklyChecks,
   onToggleWeeklyCheck,
@@ -202,7 +205,7 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
     return list;
   }, [propStudentJournal, localJournal, userProfile?.studentJournal]);
 
-  // Local state for dictionary entries loaded directly from server database
+  // Local state for dictionary entries loaded directly from server database if not passed by parent
   const [loadedDictEntries, setLoadedDictEntries] = useState<StudentDictionaryEntry[]>([]);
 
   // Sync loaded entries whenever dictionaryEntries prop changes
@@ -212,9 +215,9 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
     }
   }, [dictionaryEntries]);
 
-  // Fetch dictionary directly from server database for the active student
+  // Fetch dictionary directly from server database only if dictionaryEntries prop was not provided
   useEffect(() => {
-    if (!studentEmail) return;
+    if (!studentEmail || dictionaryEntries !== undefined) return;
     let isMounted = true;
     getAccessToken().then((token) => {
       const headers: Record<string, string> = {};
@@ -242,51 +245,22 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
     return () => {
       isMounted = false;
     };
-  }, [studentEmail]);
+  }, [studentEmail, dictionaryEntries]);
 
-  // Total learned / practiced words calculation across student personal dictionary (saved by native friend or student), routines, and live sessions
+  // FASE 4B.3: Single authoritative consolidated source for My Dictionary counter and modal
+  // Strictly respects exclusions and avoids duplication by utilizing dictionaryEntries (consolidatedActiveDictionary)
   const totalWords = useMemo(() => {
+    if (Array.isArray(dictionaryEntries)) {
+      return dictionaryEntries.length;
+    }
+    const excludedSet = new Set((excludedWords || []).map((w) => normalizeDictionaryWord(w)).filter(Boolean));
     const uniqueWords = new Set<string>();
-
-    // 1. Personal dictionary words (saved by native friends during live lessons or student)
-    const activeDict = (dictionaryEntries && dictionaryEntries.length > 0)
-      ? dictionaryEntries
-      : loadedDictEntries;
-
-    if (Array.isArray(activeDict)) {
-      activeDict.forEach((entry) => {
-        const clean = (entry?.word || '').trim().toLowerCase();
-        if (clean) uniqueWords.add(clean);
-      });
-    }
-
-    // 2. Words from routines and live lesson notes
-    if (Array.isArray(wordsFromRoutines)) {
-      wordsFromRoutines.forEach((item) => {
-        const clean = (item?.word || '').trim().toLowerCase();
-        if (clean) uniqueWords.add(clean);
-      });
-    }
-
-    // 3. Directly inspect routinesByDay items
-    if (routinesByDay && typeof routinesByDay === 'object') {
-      Object.values(routinesByDay as Record<string, RoutineItem[]>).forEach((dayItems) => {
-        if (Array.isArray(dayItems)) {
-          dayItems.forEach((item) => {
-            if (item?.learnedWords && Array.isArray(item.learnedWords)) {
-              item.learnedWords.forEach((w) => {
-                if (typeof w === 'string' && w.trim().length > 0) {
-                  uniqueWords.add(w.trim().toLowerCase());
-                }
-              });
-            }
-          });
-        }
-      });
-    }
-
+    (loadedDictEntries || []).forEach((entry) => {
+      const clean = normalizeDictionaryWord(entry?.normalizedWord || entry?.word);
+      if (clean && !excludedSet.has(clean)) uniqueWords.add(clean);
+    });
     return uniqueWords.size;
-  }, [dictionaryEntries, loadedDictEntries, wordsFromRoutines, routinesByDay]);
+  }, [dictionaryEntries, loadedDictEntries, excludedWords]);
 
   // Target weekly chat sessions with native friend (default: 1 or from user profile)
   const initialTarget = userProfile?.weeklyNativeLessonsTarget || 1;

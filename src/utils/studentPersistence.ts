@@ -818,15 +818,34 @@ export async function removeExcludedDictionaryWord(
   }
 }
 
+export type StudentVocabularySubscriptionStatus =
+  | 'loading'
+  | 'loaded_with_words'
+  | 'loaded_empty'
+  | 'error';
+
+export interface StudentVocabularySnapshotResult {
+  entries: StudentDictionaryEntry[];
+  status: StudentVocabularySubscriptionStatus;
+  studentUid: string;
+  error?: string | null;
+}
+
 /**
  * Real-time subscription to student vocabulary on Firestore.
  * Immediately notifies when any word is added, updated, or removed by student, teacher, or routine across devices.
  * Firestore is the single authoritative source of truth.
+ *
+ * FASE 4B.3 (Estabilização da Leitura do My Dictionary):
+ * - Differentiates explicitly: 'loading', 'loaded_with_words', 'loaded_empty', 'error'.
+ * - First empty snapshot of subcollection is NEVER interpreted as consolidated empty while main doc read is pending.
+ * - Read failures never display an empty dictionary.
+ * - Strict isolation per canonical UID.
  */
 export function subscribeToStudentVocabulary(
   studentUid: string,
   studentEmail: string | undefined,
-  callback: (entries: StudentDictionaryEntry[]) => void
+  callback: (entries: StudentDictionaryEntry[], snapshotResult?: StudentVocabularySnapshotResult) => void
 ): () => void {
   const db = getDb();
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
@@ -839,34 +858,89 @@ export function subscribeToStudentVocabulary(
   const vocabColRef = collection(db, 'users', cleanUid, 'vocabulary');
   const userDocRef = doc(db, 'users', cleanUid);
 
+  let isUnsubscribed = false;
+  let docReceived = false;
+  let colReceived = false;
+  let docError: any = null;
+  let colError: any = null;
+
   let docVocab: StudentDictionaryEntry[] = [];
   const colMap = new Map<string, StudentDictionaryEntry>();
-  let hasReceivedSnapshot = false;
 
   const notify = () => {
-    const mergedMap = new Map<string, StudentDictionaryEntry>();
+    if (isUnsubscribed) return;
 
-    // Pre-populate with local cache if we haven't received remote data yet
-    if (!hasReceivedSnapshot) {
+    const isDocPending = !docReceived && docError === null;
+    const isColPending = !colReceived && colError === null;
+
+    // Both sources failed with read error:
+    if (docError !== null && colError !== null) {
       const cached = getCachedLocalVocabulary(cleanUid, cleanEmail);
-      cached.forEach((item) => {
-        if (item && item.word) {
-          mergedMap.set(item.word.toLowerCase().trim(), item);
-        }
+      const excluded = new Set(getCachedExcludedDictionaryWords(cleanUid, cleanEmail));
+      const filteredCached = cached.filter((item) => !excluded.has(normalizeDictionaryWord(item.normalizedWord || item.word)));
+      callback(filteredCached, {
+        entries: filteredCached,
+        status: 'error',
+        studentUid: cleanUid,
+        error: docError?.message || colError?.message || 'Failed to read student vocabulary from Firestore',
       });
+      return;
     }
 
-    // Authoritative userDocRef vocabulary array
+    // While main doc is still pending:
+    // If subcollection is empty (colMap.size === 0), DO NOT emit as consolidated empty!
+    // We are still loading!
+    if (isDocPending && colMap.size === 0) {
+      const cached = getCachedLocalVocabulary(cleanUid, cleanEmail);
+      const excluded = new Set(getCachedExcludedDictionaryWords(cleanUid, cleanEmail));
+      const filteredCached = cached.filter((item) => !excluded.has(normalizeDictionaryWord(item.normalizedWord || item.word)));
+      if (filteredCached.length > 0) {
+        callback(filteredCached, {
+          entries: filteredCached,
+          status: 'loading',
+          studentUid: cleanUid,
+        });
+      }
+      return;
+    }
+
+    // While subcollection is pending:
+    // If docVocab is empty, we must also wait for subcollection before concluding empty!
+    if (isColPending && docVocab.length === 0) {
+      const cached = getCachedLocalVocabulary(cleanUid, cleanEmail);
+      const excluded = new Set(getCachedExcludedDictionaryWords(cleanUid, cleanEmail));
+      const filteredCached = cached.filter((item) => !excluded.has(normalizeDictionaryWord(item.normalizedWord || item.word)));
+      if (filteredCached.length > 0) {
+        callback(filteredCached, {
+          entries: filteredCached,
+          status: 'loading',
+          studentUid: cleanUid,
+        });
+      }
+      return;
+    }
+
+    // Authoritative consolidation
+    const mergedMap = new Map<string, StudentDictionaryEntry>();
+
+    // 1. Authoritative userDocRef vocabulary array
     docVocab.forEach((item) => {
-      if (item && item.word) {
-        mergedMap.set(item.word.toLowerCase().trim(), item);
+      if (item && item.word && item.word.trim()) {
+        const norm = normalizeDictionaryWord(item.normalizedWord || item.word);
+        if (norm) mergedMap.set(norm, item);
       }
     });
 
-    // Subcollection items
+    // 2. Subcollection items
     colMap.forEach((item, key) => {
       if (!mergedMap.has(key)) {
         mergedMap.set(key, item);
+      } else {
+        const existing = mergedMap.get(key)!;
+        const consolidated = consolidateDictionaryEntries([existing], [item]);
+        if (consolidated[0]) {
+          mergedMap.set(key, consolidated[0]);
+        }
       }
     });
 
@@ -877,28 +951,53 @@ export function subscribeToStudentVocabulary(
         (a.word || '').localeCompare(b.word || '', ['en', 'pt'], { sensitivity: 'base' })
       );
 
+    const isInitialDone = (!isDocPending) && (!isColPending);
+
+    let status: StudentVocabularySubscriptionStatus = 'loading';
     if (list.length > 0) {
+      status = 'loaded_with_words';
       cacheVocabularyLocally(cleanUid, cleanEmail, list);
+    } else if (isInitialDone) {
+      if (docError !== null || colError !== null) {
+        status = 'error';
+      } else {
+        status = 'loaded_empty';
+      }
     }
-    callback(list);
+
+    callback(list, {
+      entries: list,
+      status,
+      studentUid: cleanUid,
+      error: (docError || colError)?.message || null,
+    });
   };
 
   // Subcollection listener
   const unsubCol = onSnapshot(
     vocabColRef,
     (snapshot) => {
-      hasReceivedSnapshot = true;
+      if (isUnsubscribed) return;
+      colReceived = true;
+      colError = null;
       colMap.clear();
       snapshot.forEach((d) => {
         const item = d.data() as StudentDictionaryEntry;
-        if (item && item.word) {
-          colMap.set(item.word.toLowerCase().trim(), item);
+        if (item && item.word && item.word.trim()) {
+          const norm = normalizeDictionaryWord(item.normalizedWord || item.word);
+          if (norm) {
+            colMap.set(norm, item);
+          }
         }
       });
       notify();
     },
     (err) => {
+      if (isUnsubscribed) return;
+      colReceived = true;
+      colError = err;
       console.warn('Real-time vocabulary subcollection notice:', err);
+      notify();
     }
   );
 
@@ -906,7 +1005,9 @@ export function subscribeToStudentVocabulary(
   const unsubDoc = onSnapshot(
     userDocRef,
     (snap) => {
-      hasReceivedSnapshot = true;
+      if (isUnsubscribed) return;
+      docReceived = true;
+      docError = null;
       if (snap.exists()) {
         const data = snap.data();
         if (Array.isArray(data?.excludedDictionaryWords)) {
@@ -917,16 +1018,25 @@ export function subscribeToStudentVocabulary(
         }
         if (Array.isArray(data?.vocabulary)) {
           docVocab = data.vocabulary;
-          notify();
+        } else {
+          docVocab = [];
         }
+      } else {
+        docVocab = [];
       }
+      notify();
     },
     (err) => {
+      if (isUnsubscribed) return;
+      docReceived = true;
+      docError = err;
       console.warn('Real-time vocabulary user doc notice:', err);
+      notify();
     }
   );
 
   return () => {
+    isUnsubscribed = true;
     unsubCol();
     unsubDoc();
   };

@@ -175,7 +175,7 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
 
   // Consolidate student's saved dictionary entries and routine words using canonical consolidation engine
   const allDictionaryEntries: StudentDictionaryEntry[] = useMemo(() => {
-    if (consolidatedEntries && consolidatedEntries.length > 0) {
+    if (Array.isArray(consolidatedEntries)) {
       return consolidatedEntries.filter((e) => {
         const norm = normalizeDictionaryWord(e.normalizedWord || e.word);
         return Boolean(norm && !effectiveExcludedSet.has(norm));
