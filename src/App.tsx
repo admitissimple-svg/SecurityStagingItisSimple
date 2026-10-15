@@ -141,7 +141,10 @@ import {
   parseWeekCycleNumber,
   consolidateDictionaryEntries,
   normalizeDictionaryWord,
+  clearAllLocalPersistenceCaches,
 } from './utils/studentPersistence';
+import { buildConsolidatedActiveDictionary } from './utils/studentDictionaryLibrary';
+import { clearDictionaryMemoryCache } from './utils/dictionaryService';
 import { FirestoreSchemaAlertBanner } from './components/FirestoreSchemaAlertBanner';
 import { StudentJournalEntry } from './types';
 import { ManageSubscriptionModal } from './components/ManageSubscriptionModal';
@@ -2565,6 +2568,10 @@ export default function App() {
     tutorData?: any
   ) => {
     const effectiveAuthUid = auth.currentUser?.uid || account.uid || account.id || initialProfile?.uid || initialProfile?.id || '';
+    if (currentAccount && currentAccount.email.toLowerCase() !== account.email.toLowerCase()) {
+      clearDictionaryMemoryCache();
+      clearAllLocalPersistenceCaches();
+    }
     const safeAccount: GoogleAccount = {
       ...account,
       uid: effectiveAuthUid || account.uid,
@@ -2664,8 +2671,12 @@ export default function App() {
     try {
       firebaseSignOutAuth(auth).catch(() => {});
     } catch {}
+    clearDictionaryMemoryCache();
+    clearAllLocalPersistenceCaches();
     setCurrentAccount(null);
     setUserProfile(createDefaultStudentProfile(null));
+    setStudentDictionaryEntries([]);
+    setExcludedDictionaryWords([]);
     setLessons([]);
     setStudents([]);
     setNotifications([]);
@@ -5373,6 +5384,20 @@ export default function App() {
     return list;
   }, [routinesByDay, lessons]);
 
+  // Phase 2.2E / Etapa 5: Unified consolidated active dictionary library
+  // Combines previous & current routine words, Native Friends notes, manual additions,
+  // rich definitions, and excludes persistent deletions.
+  const consolidatedActiveDictionary = useMemo(() => {
+    return buildConsolidatedActiveDictionary(
+      studentDictionaryEntries,
+      wordsFromRoutines,
+      excludedDictionaryWords,
+      userProfile?.level,
+      currentAccount?.uid,
+      currentAccount?.email
+    );
+  }, [studentDictionaryEntries, wordsFromRoutines, excludedDictionaryWords, userProfile?.level, currentAccount?.uid, currentAccount?.email]);
+
   // Handler: Save Daily Sentence and persist in Firestore Journal
   const handleSaveDailySentence = async (
     sentence: string,
@@ -5418,40 +5443,12 @@ export default function App() {
       ],
     }));
 
-    const activeCycle = parseWeekCycleNumber(userProfile?.weeklyCycle);
-
+    // Phase 2.2E (Etapas 1 & 2):
+    // 1. Frase do Dia is strictly saved in My Journal via saveStudentJournalEntryToFirestore.
+    // 2. No recordActivityInStudentJournal call (removes S-Path video_day collateral checkmark).
+    // 3. No markVocabularyWordsPracticedInFirestore call (removes practiceCount/history contamination).
     if (studentUid || studentEmail) {
       saveStudentJournalEntryToFirestore(studentUid, newJournalEntry, studentEmail);
-      if (activeCycle !== null) {
-        recordActivityInStudentJournal(
-          studentUid,
-          {
-            id: `sentence_${newJournalEntry.date}_${Date.now()}`,
-            type: 'sentence',
-            date: newJournalEntry.date,
-            dayOfWeek: selectedDay,
-            week: activeCycle,
-            timestamp: Date.now(),
-            title: sentence.length > 50 ? `${sentence.slice(0, 50)}...` : sentence,
-            details: sentence,
-          },
-          studentEmail
-        ).then((res) => {
-          if (res.updatedJournal) {
-            setStudentJournal(res.updatedJournal);
-          }
-        }).catch(() => {});
-      }
-
-      if (effectiveWords.length > 0) {
-        markVocabularyWordsPracticedInFirestore(studentUid, effectiveWords, studentEmail)
-          .then((updated) => {
-            if (Array.isArray(updated) && updated.length > 0) {
-              setStudentDictionaryEntries(updated);
-            }
-          })
-          .catch(() => {});
-      }
     }
 
     setNotifications((prev) => [
@@ -6307,7 +6304,7 @@ export default function App() {
                   studentJournal={studentJournal}
                   onUpdateSPathCheck={handleUpdateSPathCheck}
                   onBehavioralComplete={handleBehavioralActivityComplete}
-                  dictionaryEntries={studentDictionaryEntries}
+                  dictionaryEntries={consolidatedActiveDictionary}
                   excludedWords={excludedDictionaryWords}
                 />
 
@@ -6775,7 +6772,7 @@ export default function App() {
         currentLanguage={currentLanguage}
         onSaveDailySentence={handleSaveDailySentence}
         onOpenJournalModal={() => setIsJournalModalOpen(true)}
-        dictionaryEntries={studentDictionaryEntries}
+        dictionaryEntries={consolidatedActiveDictionary}
         excludedWords={excludedDictionaryWords}
       />
 
@@ -6829,6 +6826,7 @@ export default function App() {
         onClose={() => setIsPersonalDictionaryOpen(false)}
         wordsFromRoutines={wordsFromRoutines}
         customSavedEntries={studentDictionaryEntries}
+        consolidatedEntries={consolidatedActiveDictionary}
         excludedWords={excludedDictionaryWords}
         onSaveCustomEntry={handleSaveCustomDictionaryEntry}
         onDeleteEntry={handleDeleteCustomDictionaryEntry}

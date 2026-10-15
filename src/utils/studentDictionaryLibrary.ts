@@ -12,7 +12,7 @@ import {
   getCachedExcludedDictionaryWords,
   normalizeUid,
 } from './studentPersistence';
-import { lookupWord } from './dictionaryService';
+import { lookupWord, getInstantOrCachedWord } from './dictionaryService';
 
 /**
  * Normalizes a vocabulary word or expression for deterministic indexing and deduplication.
@@ -458,4 +458,86 @@ export async function recordWordPractice(
   }
 
   return updatedEntries;
+}
+
+/**
+ * Phase 2.2E / Etapa 5: Builds the single unified active consolidated dictionary library.
+ * Combines in a single canonical representation:
+ * - Words from past routines and current routine
+ * - Words and expressions from Native Friends live lessons / notes
+ * - Manual student additions in My Dictionary
+ * - Enriched definitions and parts of speech
+ * - Multi-origin accumulation
+ * - Persistent logical exclusions
+ *
+ * Utilized identically across:
+ * - PersonalDictionaryModal
+ * - StudentDailySentenceCard
+ * - DailySentenceModal
+ */
+export function buildConsolidatedActiveDictionary(
+  savedEntries: StudentDictionaryEntry[] = [],
+  wordsFromRoutines: Array<{ word: string; sourceActivityName?: string; sourceDay?: DayOfWeek }> = [],
+  excludedWords?: string[] | Set<string>,
+  studentLevel?: EnglishLevel | string,
+  studentUid?: string,
+  studentEmail?: string
+): StudentDictionaryEntry[] {
+  const excludedSet = excludedWords instanceof Set
+    ? excludedWords
+    : Array.isArray(excludedWords)
+    ? new Set(excludedWords.map((w) => normalizeDictionaryWord(w)).filter(Boolean))
+    : new Set<string>();
+
+  const routineEntries: StudentDictionaryEntry[] = (wordsFromRoutines || [])
+    .filter((item) => {
+      const norm = normalizeDictionaryWord(item.word);
+      return Boolean(norm && !excludedSet.has(norm));
+    })
+    .map((item) => {
+      const cleanWord = (item.word || '').trim();
+      const norm = normalizeDictionaryWord(cleanWord);
+      const lower = cleanWord.toLowerCase();
+
+      // Reutilizar definições ricas existentes no My Dictionary
+      const existingInSaved = (savedEntries || []).find(
+        (e) => normalizeDictionaryWord(e.normalizedWord || e.word) === norm && Boolean(e.definitionEn)
+      );
+      const cached = getInstantOrCachedWord(cleanWord, item.sourceActivityName, studentLevel, studentUid, studentEmail, savedEntries);
+
+      const isLiveSession =
+        (item.sourceActivityName || '').includes('Live Session') ||
+        (item.sourceActivityName || '').includes('Native Friend') ||
+        (item.sourceActivityName || '').includes('Native Friends Notes');
+
+      const source = isLiveSession ? 'live_lesson' : 'routine';
+      const originSource = isLiveSession ? 'native_notes' : 'routine';
+
+      return {
+        id: existingInSaved?.id || `routine_${norm || lower}`,
+        word: cleanWord,
+        originalWord: cleanWord,
+        normalizedWord: norm || lower,
+        definitionEn: existingInSaved?.definitionEn || cached.definitionEn || '',
+        partOfSpeech: existingInSaved?.partOfSpeech || cached.partOfSpeech || '',
+        exampleSentenceEn: existingInSaved?.exampleSentenceEn || cached.exampleSentenceEn || '',
+        translationPt: existingInSaved?.translationPt || cached.translationPt || '',
+        phonetic: existingInSaved?.phonetic || cached.phonetic,
+        source,
+        sourceActivityName: item.sourceActivityName || 'Daily Routine',
+        sourceDay: item.sourceDay,
+        origins: [
+          {
+            source: originSource,
+            activityName: item.sourceActivityName || 'Daily Routine',
+            dayOfWeek: item.sourceDay,
+            date: new Date().toISOString().split('T')[0],
+          },
+        ],
+        practiceCount: existingInSaved?.practiceCount || 0,
+        notFound: !existingInSaved && (cached?.notFound || false),
+      };
+    });
+
+  return consolidateDictionaryEntries(savedEntries || [], routineEntries, excludedSet);
 }

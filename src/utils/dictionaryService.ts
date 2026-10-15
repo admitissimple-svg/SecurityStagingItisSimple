@@ -52,6 +52,14 @@ interface FreeDictionaryItem {
 const memoryCache = new Map<string, DictionaryLookupResult>();
 
 /**
+ * Clears the public in-memory dictionary cache.
+ * Called upon logout or account switch to guarantee clean isolation.
+ */
+export function clearDictionaryMemoryCache(): void {
+  memoryCache.clear();
+}
+
+/**
  * Normalizes example sentence to clean whitespace, capitalized first letter, and clean punctuation.
  */
 function formatExample(ex?: string): string {
@@ -354,6 +362,7 @@ export async function lookupWord(
   const cefrMeta = resolveCefrLevel(studentLevel);
 
   // 1. First priority: Check student's My Dictionary for existing rich pedagogical definition
+  // NOTE: Private student definitions must NEVER be stored in the global shared memoryCache!
   if (Array.isArray(activeDictionary) && activeDictionary.length > 0) {
     const existing = activeDictionary.find(
       (e) =>
@@ -373,7 +382,7 @@ export async function lookupWord(
         source: 'my_dictionary',
         notFound: false,
       };
-      memoryCache.set(cacheKey, myDictResult);
+      // Isolated private data: return directly without writing to shared memoryCache
       return myDictResult;
     }
   }
@@ -401,7 +410,7 @@ export async function lookupWord(
         source: 'my_dictionary',
         notFound: false,
       };
-      memoryCache.set(cacheKey, myDictResult);
+      // Isolated private data: return directly without writing to shared memoryCache
       return myDictResult;
     }
   }

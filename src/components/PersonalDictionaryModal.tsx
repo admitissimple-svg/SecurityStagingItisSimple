@@ -28,6 +28,7 @@ interface PersonalDictionaryModalProps {
   currentLanguage: Language;
   wordsFromRoutines?: Array<{ word: string; sourceActivityName?: string; sourceDay?: DayOfWeek }>;
   customSavedEntries?: StudentDictionaryEntry[];
+  consolidatedEntries?: StudentDictionaryEntry[];
   excludedWords?: string[];
   onSaveCustomEntry?: (entry: StudentDictionaryEntry) => void;
   onDeleteEntry?: (word: string) => void;
@@ -40,6 +41,7 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
   currentLanguage,
   wordsFromRoutines = [],
   customSavedEntries = [],
+  consolidatedEntries,
   excludedWords = [],
   onSaveCustomEntry,
   onDeleteEntry,
@@ -173,8 +175,14 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
 
   // Consolidate student's saved dictionary entries and routine words using canonical consolidation engine
   const allDictionaryEntries: StudentDictionaryEntry[] = useMemo(() => {
+    if (consolidatedEntries && consolidatedEntries.length > 0) {
+      return consolidatedEntries.filter((e) => {
+        const norm = normalizeDictionaryWord(e.normalizedWord || e.word);
+        return Boolean(norm && !effectiveExcludedSet.has(norm));
+      });
+    }
     return consolidateDictionaryEntries(customSavedEntries || [], routineEntries, effectiveExcludedSet);
-  }, [customSavedEntries, routineEntries, effectiveExcludedSet]);
+  }, [consolidatedEntries, customSavedEntries, routineEntries, effectiveExcludedSet]);
 
   // Phase 1B / 2.2B: Classify Native Friend vs My Words
   // Native Friend: source === 'live_lesson' OR has origin with source 'live_lesson' or 'native_notes'

@@ -260,6 +260,16 @@ export function cacheVocabularyLocally(
 }
 
 /**
+ * Clears all local in-memory session persistence caches upon student logout or account switch.
+ * Ensures zero leakage of private student data across account switches.
+ */
+export function clearAllLocalPersistenceCaches(): void {
+  inMemoryVocabularyCache.clear();
+  inMemoryWeeklyChecksCache.clear();
+  inMemoryExcludedVocabularyWords.clear();
+}
+
+/**
  * Persist student vocabulary entries directly and permanently to Cloud Firestore.
  * CUMULATIVE: Loads existing words first and merges, ensuring words accumulate permanently over time
  * and are never overwritten or cleared.
@@ -388,11 +398,6 @@ export async function saveStudentVocabularyToFirestore(
 
     await withFirestoreTimeout(Promise.all(writePromises), 6000, null);
 
-    // Un-exclude any newly saved entries so they are active again
-    sanitizedEntries.forEach((e) => {
-      if (e?.word) removeExcludedDictionaryWord(cleanUid, e.word, cleanEmail);
-    });
-
     // Mirror to backend server API for disk persistence with verified authorization
     if (cleanEmail || cleanUid) {
       getAccessToken().then((token) => {
@@ -510,6 +515,12 @@ export async function fetchStudentVocabularyFromFirestore(
       const userSnap = await withFirestoreTimeout(getDoc(userRef), 4000, null);
       if (userSnap && userSnap.exists()) {
         const data = userSnap.data();
+        if (Array.isArray(data?.excludedDictionaryWords)) {
+          const list: string[] = data.excludedDictionaryWords
+            .map((w: string) => normalizeDictionaryWord(w))
+            .filter(Boolean);
+          cacheExcludedWordsLocally(cleanUid, cleanEmail, list);
+        }
         if (Array.isArray(data?.vocabulary)) {
           data.vocabulary.forEach((item: StudentDictionaryEntry) => {
             if (item?.word) {
@@ -837,9 +848,12 @@ export function subscribeToStudentVocabulary(
       }
     });
 
-    const list = Array.from(mergedMap.values()).sort((a, b) =>
-      (a.word || '').localeCompare(b.word || '', ['en', 'pt'], { sensitivity: 'base' })
-    );
+    const excluded = new Set(getCachedExcludedDictionaryWords(cleanUid, cleanEmail));
+    const list = Array.from(mergedMap.values())
+      .filter((item) => !excluded.has(normalizeDictionaryWord(item.normalizedWord || item.word)))
+      .sort((a, b) =>
+        (a.word || '').localeCompare(b.word || '', ['en', 'pt'], { sensitivity: 'base' })
+      );
 
     if (list.length > 0) {
       cacheVocabularyLocally(cleanUid, cleanEmail, list);
@@ -873,6 +887,12 @@ export function subscribeToStudentVocabulary(
       hasReceivedSnapshot = true;
       if (snap.exists()) {
         const data = snap.data();
+        if (Array.isArray(data?.excludedDictionaryWords)) {
+          const list: string[] = data.excludedDictionaryWords
+            .map((w: string) => normalizeDictionaryWord(w))
+            .filter(Boolean);
+          cacheExcludedWordsLocally(cleanUid, cleanEmail, list);
+        }
         if (Array.isArray(data?.vocabulary)) {
           docVocab = data.vocabulary;
           notify();
