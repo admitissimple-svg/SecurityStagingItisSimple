@@ -19,6 +19,11 @@ const isPlaceholder = (val: string | undefined): boolean => {
   );
 };
 
+// Ensure production mode is set when running in Google Cloud Run or explicit production environments
+if (!process.env.NODE_ENV && (process.env.K_SERVICE || process.env.K_REVISION || process.env.APP_ENV === 'production')) {
+  process.env.NODE_ENV = 'production';
+}
+
 // Clean non-existent or placeholder credentials file to allow fallback to ADC
 if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
   try {
@@ -128,9 +133,17 @@ if (!isTsx) {
   if (process.env.NODE_ENV !== 'test') {
     if (process.env.DIAGNOSTIC_ONLY === 'true') {
       const { startDiagnosticServer } = await import('./src/diagnosticApp.ts');
-      await startDiagnosticServer();
+      await startDiagnosticServer().catch((err: unknown) => {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        console.error(`[Diagnostic] Fatal error starting diagnostic server: ${errorMsg}`);
+        process.exit(1);
+      });
     } else {
-      await import('./serverApp.ts');
+      await import('./serverApp.ts').catch((err: unknown) => {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        console.error(`[Server] Fatal error loading server application: ${errorMsg}`);
+        process.exit(1);
+      });
     }
   }
 }

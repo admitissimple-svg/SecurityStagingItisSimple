@@ -67,7 +67,6 @@ if (appletConfig) {
     process.env.VITE_FIREBASE_DATABASE_ID = appletConfig.firestoreDatabaseId;
   }
 }
-import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import {
   fetchAppStateFromFirestore,
@@ -223,6 +222,41 @@ export function resolvePort(portEnv?: string | number, appPortEnv?: string | num
 }
 
 export const PORT = resolvePort(process.env.PORT, process.env.APP_PORT, 3000);
+
+/**
+ * Single explicit source of truth for runtime execution mode.
+ * Determines whether the application should run in production mode (serving compiled static assets)
+ * or development mode (using Vite development middleware).
+ *
+ * Explicit rules:
+ * 1. NODE_ENV === 'production' explicitly signals production mode.
+ * 2. Cloud Run runtime indicators (K_SERVICE, K_REVISION) unambiguously signal
+ *    execution in Google Cloud Run, where production mode must be used even if
+ *    NODE_ENV was not explicitly passed in the service environment.
+ * 3. Explicit APP_ENV === 'production' signals production mode.
+ * 4. In all other cases (e.g. local development where NODE_ENV is unset or 'development'),
+ *    it safely resolves to false (development mode), preserving Vite dev middleware.
+ */
+export function isProductionMode(): boolean {
+  if (process.env.NODE_ENV === 'test') {
+    return false;
+  }
+  if (process.env.NODE_ENV === 'production') {
+    return true;
+  }
+  if (Boolean(process.env.K_SERVICE || process.env.K_REVISION)) {
+    return true;
+  }
+  if (process.env.APP_ENV === 'production') {
+    return true;
+  }
+  return false;
+}
+
+// Ensure NODE_ENV is normalized to 'production' if runtime indicators detected production mode
+if (process.env.NODE_ENV !== 'test' && isProductionMode() && process.env.NODE_ENV !== 'production') {
+  process.env.NODE_ENV = 'production';
+}
 
 export { isDiagnosticMode };
 
@@ -14552,7 +14586,9 @@ export async function startServer() {
         timestamp: new Date().toISOString(),
       });
     });
-  } else if (process.env.NODE_ENV !== 'production') {
+  } else if (!isProductionMode()) {
+    console.log(`[Server] Running in DEVELOPMENT mode with Vite dev middleware on port ${PORT}`);
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
@@ -14562,13 +14598,18 @@ export async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
+    console.log(`[Server] Running in PRODUCTION mode serving compiled static bundle on port ${PORT}`);
     const distPath = path.join(process.cwd(), 'dist');
     if (fs.existsSync(distPath)) {
       app.use(express.static(distPath));
       app.get('*', (req, res) => {
+        if (req.path.startsWith('/api/')) {
+          return res.status(404).json({ error: 'Not Found', message: `Route ${req.originalUrl} not found` });
+        }
         res.sendFile(path.join(distPath, 'index.html'));
       });
     } else {
+      console.warn('[Server] Production mode active but dist directory was not found. Serving API status fallback.');
       app.get('/', (_req, res) => {
         res.json({
           service: "It's Simple Dedicated Backend API",
@@ -14600,5 +14641,9 @@ export { app };
 
 // Auto-start server unless disabled for testing
 if (process.env.NODE_ENV !== 'test') {
-  startServer();
+  startServer().catch((err: unknown) => {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    console.error(`[Server] Fatal error during startup: ${errorMsg}`);
+    process.exit(1);
+  });
 }
