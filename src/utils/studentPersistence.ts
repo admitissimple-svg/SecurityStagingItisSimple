@@ -25,6 +25,7 @@ import {
 import { handleFirestoreError, OperationType, withFirestoreTimeout } from './routineSync';
 import { DAYS_OF_WEEK, getTodayDayOfWeek } from './notifications';
 import { getAccessToken } from './auth';
+import { normalizeDictionaryWord, consolidateDictionaryEntries } from './studentDictionaryLibrary';
 import {
   assertSafeFirestoreWrite,
   validateFirestoreDocument,
@@ -100,7 +101,7 @@ export function buildWeeklyChecksCacheKey(identifier: string, weekId: string): s
   return `${identifier.trim()}::${weekId}`;
 }
 
-export { migrateLegacyLocalStorageToFirestore };
+export { migrateLegacyLocalStorageToFirestore, normalizeDictionaryWord, consolidateDictionaryEntries };
 
 /**
  * Validates whether an identity represents an explicit canonical Firebase Auth UID.
@@ -343,35 +344,11 @@ export async function saveStudentVocabularyToFirestore(
       } catch {}
     }
 
-    // 4. Merge new entries into masterMap (strictly accumulating, never dropping existing ones)
-    sanitizedEntries.forEach((entry) => {
-      if (!entry || !entry.word || !entry.word.trim()) return;
-      const key = entry.word.toLowerCase().trim();
-      const existing = masterMap.get(key);
-
-      const mergedEntry: StudentDictionaryEntry = {
-        id: entry.id || existing?.id || `dict_${key.replace(/[^a-zA-Z0-9_-]/g, '_')}_${Date.now()}`,
-        word: entry.word.trim(),
-        partOfSpeech: entry.partOfSpeech || existing?.partOfSpeech || '',
-        definitionEn: entry.definitionEn || existing?.definitionEn || '',
-        exampleSentenceEn: entry.exampleSentenceEn || existing?.exampleSentenceEn || '',
-        translationPt: entry.translationPt || existing?.translationPt || '',
-        phonetic: entry.phonetic || existing?.phonetic || '',
-        cefrLevel: entry.cefrLevel || existing?.cefrLevel || '',
-        sourceActivityName: entry.sourceActivityName || existing?.sourceActivityName || 'Personal Dictionary',
-        sourceDay: entry.sourceDay || existing?.sourceDay,
-        source: entry.source || existing?.source || 'api',
-        learnedAt: entry.learnedAt || existing?.learnedAt || new Date().toISOString(),
-        notFound: entry.notFound ?? existing?.notFound ?? false,
-        practiceCount: entry.practiceCount !== undefined ? entry.practiceCount : existing?.practiceCount,
-        lastPracticedAt: entry.lastPracticedAt || existing?.lastPracticedAt,
-      };
-
-      masterMap.set(key, mergedEntry);
-    });
-
-    const accumulatedList = Array.from(masterMap.values()).sort((a, b) =>
-      (a.word || '').localeCompare(b.word || '', ['en', 'pt'], { sensitivity: 'base' })
+    // 4. Merge new entries into masterMap using pedagogical consolidation engine
+    // Guarantees: multi-origin preservation, richer definition protection, non-zeroing practice count
+    const accumulatedList = consolidateDictionaryEntries(
+      Array.from(masterMap.values()),
+      sanitizedEntries
     );
 
     // Cache accumulated list locally immediately
@@ -390,11 +367,10 @@ export async function saveStudentVocabularyToFirestore(
     ];
 
     // Write individual entries to subcollection users/{cleanUid}/vocabulary/{wordDocId}
-    sanitizedEntries.forEach((entry) => {
-      if (!entry || !entry.word || !entry.word.trim()) return;
-      const key = entry.word.toLowerCase().trim();
-      const fullItem = masterMap.get(key);
-      if (!fullItem) return;
+    accumulatedList.forEach((fullItem) => {
+      if (!fullItem || !fullItem.word || !fullItem.word.trim()) return;
+      const key = normalizeDictionaryWord(fullItem.normalizedWord || fullItem.word);
+      if (!key) return;
       const wordDocId = key.replace(/[^a-zA-Z0-9_-]/g, '_');
       const itemRef = doc(db, 'users', cleanUid, 'vocabulary', wordDocId);
       const wordPayload = stampSchemaVersion({
@@ -411,17 +387,31 @@ export async function saveStudentVocabularyToFirestore(
 
     await withFirestoreTimeout(Promise.all(writePromises), 6000, null);
 
-    // Mirror to backend server API for disk persistence
+    // Mirror to backend server API for disk persistence with verified authorization
     if (cleanEmail || cleanUid) {
-      fetch('/api/student-dictionary', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          studentEmail: cleanEmail,
-          studentUid: cleanUid,
-          entries: accumulatedList,
-        }),
-      }).catch(() => {});
+      getAccessToken().then((token) => {
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+        fetch('/api/student-dictionary', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            studentEmail: cleanEmail,
+            studentUid: cleanUid,
+            entries: accumulatedList,
+          }),
+        }).catch(() => {});
+      }).catch(() => {
+        fetch('/api/student-dictionary', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            studentEmail: cleanEmail,
+            studentUid: cleanUid,
+            entries: accumulatedList,
+          }),
+        }).catch(() => {});
+      });
     }
 
     return true;
@@ -449,19 +439,27 @@ export async function markVocabularyWordsPracticedInFirestore(
 
   const currentVocab = await fetchStudentVocabularyFromFirestore(cleanUid, cleanEmail);
   const nowIso = new Date().toISOString();
-  const targetWordsSet = new Set(words.map((w) => (w || '').trim().toLowerCase()).filter(Boolean));
+  const targetWordsSet = new Set(words.map((w) => normalizeDictionaryWord(w)).filter(Boolean));
 
   let modifiedCount = 0;
   const updatedVocab = currentVocab.map((entry) => {
     if (!entry || !entry.word) return entry;
-    const norm = entry.word.trim().toLowerCase();
+    const norm = normalizeDictionaryWord(entry.normalizedWord || entry.word);
     if (targetWordsSet.has(norm)) {
       modifiedCount++;
       const currentCount = typeof entry.practiceCount === 'number' ? entry.practiceCount : 0;
+      const history = Array.isArray(entry.practiceHistory) ? [...entry.practiceHistory] : [];
+      history.push({
+        date: nowIso,
+        activityType: 'memorization',
+        correct: true,
+      });
       return {
         ...entry,
+        normalizedWord: entry.normalizedWord || norm,
         practiceCount: currentCount + 1,
         lastPracticedAt: nowIso,
+        practiceHistory: history,
       };
     }
     return entry;

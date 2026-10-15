@@ -6,6 +6,7 @@ import {
 } from './pedagogicalTransformer';
 import { lookupWord } from './dictionaryService';
 import { saveStudentVocabularyToFirestore } from './studentPersistence';
+import { normalizeDictionaryWord } from './studentDictionaryLibrary';
 
 export interface SyncSessionVocabParams {
   studentUid: string;
@@ -16,6 +17,7 @@ export interface SyncSessionVocabParams {
   sessionDate?: string;
   topic?: string;
   teacherName?: string;
+  lessonId?: string;
 }
 
 /**
@@ -31,16 +33,17 @@ function formatSentence(str?: string): string {
 }
 
 /**
- * Synchronizes all words, expressions, and terms indicated by the Native Friend/Tutor
- * during a session (via Alt + W for New Word and Alt + P for Pronounce) directly into
- * the student's "My Dictionary" in Cloud Firestore.
+ * Synchronizes words and expressions indicated by the Native Friend/Tutor
+ * during a session into the student's "My Dictionary" in Cloud Firestore.
  *
- * Strict Compliance Requirements:
- * 1. Zero localStorage: 100% of data is persisted in Cloud Firestore isolated by student UID.
- * 2. Follows standard app rules for definitions, grammatical classes (part of speech),
- *    CEFR level (A1-C2), and real authentic example sentences.
- * 3. Preserves all existing features (minimalist 4-tab system, sequential reminders,
- *    S-Path unimpacted, shortcut mappings).
+ * Strict Compliance Requirements (Fase 2.1):
+ * 1. ONLY words explicitly marked as New Word (Alt + W) enter My Dictionary.
+ * 2. Items marked exclusively as Pronounce (Alt + P) remain in pedagogical notes
+ *    and do NOT enter the personal dictionary automatically.
+ * 3. If a term has both New Word (Alt+W) and Pronounce (Alt+P), it enters as a New Word
+ *    while retaining its pronunciation focus guidance.
+ * 4. Zero localStorage: 100% of data is persisted in Cloud Firestore isolated by student UID.
+ * 5. Follows standard app rules for definitions, grammatical classes, CEFR levels, and authentic examples.
  */
 export async function syncSessionVocabularyToStudentDictionary(
   params: SyncSessionVocabParams
@@ -54,6 +57,7 @@ export async function syncSessionVocabularyToStudentDictionary(
     sessionDate = new Date().toISOString().split('T')[0],
     topic = 'Conversation & Fluency',
     teacherName = 'Native Friend',
+    lessonId,
   } = params;
 
   const cleanUid = (studentUid || '').trim();
@@ -81,66 +85,73 @@ export async function syncSessionVocabularyToStudentDictionary(
 
   const candidateMap = new Map<string, TermMetadata>();
 
-  // Add terms from raw markings (Alt + W)
+  // Add terms from raw markings (Alt + W: New Word) -> EXCLUSIVE ENTRY PERMITTED
   (markings.newWords || []).forEach((w) => {
     const clean = w.trim();
     if (!clean) return;
-    const key = clean.toLowerCase();
+    const key = normalizeDictionaryWord(clean);
+    if (!key) return;
     if (!candidateMap.has(key)) {
       candidateMap.set(key, {
         term: clean,
         isPronounce: false,
         isNewWord: true,
       });
+    } else {
+      candidateMap.get(key)!.isNewWord = true;
     }
   });
 
-  // Add terms from raw markings (Alt + P)
+  // Check terms from raw markings (Alt + P: Pronounce)
+  // RULE (Etapa B): Items marked EXCLUSIVELY as Pronounce (Alt + P) remain in pedagogical notes
+  // and do NOT automatically enter My Dictionary!
   (markings.pronounceItems || []).forEach((p) => {
     const clean = p.trim();
     if (!clean) return;
-    const key = clean.toLowerCase();
+    const key = normalizeDictionaryWord(clean);
+    if (!key) return;
     const existing = candidateMap.get(key);
     if (existing) {
+      // Word is already marked as Alt+W (New Word), so annotate with pronunciation focus
       existing.isPronounce = true;
-    } else {
-      candidateMap.set(key, {
-        term: clean,
-        isPronounce: true,
-        isNewWord: false,
-      });
     }
+    // If not existing in candidateMap, do NOT add: strictly kept out of My Dictionary
   });
 
   // Merge terms from pedagogical transformation vocabulary (if provided)
+  // Only accept terms that are explicitly New Words (Alt+W)
   (vocabularyAndExpressions || []).forEach((v) => {
     const clean = (v.term || '').trim();
     if (!clean) return;
-    const key = clean.toLowerCase();
+    const key = normalizeDictionaryWord(clean);
+    if (!key) return;
     const existing = candidateMap.get(key);
 
-    const isPronounce =
-      v.isPronunciationFocus ||
-      v.partOfSpeech === 'Pronunciation Focus' ||
-      v.category?.toLowerCase().includes('pronounc') ||
-      Boolean(existing?.isPronounce);
-
-    const isNewWord =
+    const isExplicitNewWord =
+      Boolean(existing?.isNewWord) ||
+      (markings.newWords || []).some((w) => normalizeDictionaryWord(w) === key) ||
       v.category?.toLowerCase().includes('new word') ||
-      v.partOfSpeech?.toLowerCase().includes('new') ||
-      Boolean(existing?.isNewWord);
+      v.partOfSpeech?.toLowerCase().includes('new');
 
-    const candidate: TermMetadata = {
-      term: clean,
-      isPronounce,
-      isNewWord,
-      partOfSpeech: v.partOfSpeech || (isPronounce ? 'Pronunciation Focus' : 'Expression'),
-      definitionEn: v.simpleDefinition,
-      exampleSentenceEn: Array.isArray(v.realExamples) && v.realExamples.length > 0 ? v.realExamples[0] : undefined,
-      phonetic: v.phoneticGuide,
-    };
+    // Only if it is explicitly a New Word (Alt+W)
+    if (isExplicitNewWord) {
+      const isPronounce =
+        Boolean(v.isPronunciationFocus) ||
+        Boolean(existing?.isPronounce) ||
+        (markings.pronounceItems || []).some((p) => normalizeDictionaryWord(p) === key);
 
-    candidateMap.set(key, candidate);
+      const candidate: TermMetadata = {
+        term: clean,
+        isPronounce,
+        isNewWord: true,
+        partOfSpeech: v.partOfSpeech || (isPronounce ? 'Pronunciation Focus' : 'Expression'),
+        definitionEn: v.simpleDefinition || existing?.definitionEn,
+        exampleSentenceEn: Array.isArray(v.realExamples) && v.realExamples.length > 0 ? v.realExamples[0] : existing?.exampleSentenceEn,
+        phonetic: v.phoneticGuide || existing?.phonetic,
+      };
+
+      candidateMap.set(key, candidate);
+    }
   });
 
   if (candidateMap.size === 0) {
@@ -156,7 +167,7 @@ export async function syncSessionVocabularyToStudentDictionary(
     let partOfSpeech = meta.partOfSpeech || '';
     let phonetic = meta.phonetic || '';
 
-    // If definition or example is missing, do a pedagogical dictionary lookup
+    // If definition or example is missing, do a pedagogical dictionary lookup (No Gemini)
     if (!definition || !example || !partOfSpeech) {
       try {
         const lookupRes = await lookupWord(meta.term, undefined, studentLevel);
@@ -195,6 +206,8 @@ export async function syncSessionVocabularyToStudentDictionary(
     dictionaryEntries.push({
       id: docId,
       word: meta.term,
+      originalWord: meta.term,
+      normalizedWord: key,
       definitionEn: definition,
       partOfSpeech,
       exampleSentenceEn: formatSentence(example),
@@ -205,6 +218,17 @@ export async function syncSessionVocabularyToStudentDictionary(
       learnedAt: sessionDate ? `${sessionDate}T12:00:00.000Z` : new Date().toISOString(),
       customNotes: `Introduced by ${teacherName} in live session`,
       notFound: false,
+      origins: [
+        {
+          source: 'native_notes',
+          activityName: `Native Friends Notes (${topic})`,
+          date: sessionDate,
+          lessonId,
+          context: `Introduced by ${teacherName} in live session: "${topic}"`,
+          teacherName,
+        },
+      ],
+      lessonRefId: lessonId,
     });
   }
 

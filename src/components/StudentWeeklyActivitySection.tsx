@@ -216,25 +216,29 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
   useEffect(() => {
     if (!studentEmail) return;
     let isMounted = true;
-    fetch(`/api/student-dictionary?studentEmail=${encodeURIComponent(studentEmail)}`)
-      .then((res) => (res.ok ? res.json() : []))
-      .then((data) => {
-        if (isMounted && Array.isArray(data) && data.length > 0) {
-          setLoadedDictEntries((prev) => {
-            const map = new Map<string, StudentDictionaryEntry>();
-            prev.forEach((e) => {
-              if (e && e.word) map.set(e.word.toLowerCase().trim(), e);
+    getAccessToken().then((token) => {
+      const headers: Record<string, string> = {};
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+      fetch(`/api/student-dictionary?studentEmail=${encodeURIComponent(studentEmail)}`, { headers })
+        .then((res) => (res.ok ? res.json() : []))
+        .then((data) => {
+          if (isMounted && Array.isArray(data) && data.length > 0) {
+            setLoadedDictEntries((prev) => {
+              const map = new Map<string, StudentDictionaryEntry>();
+              prev.forEach((e) => {
+                if (e && e.word) map.set(e.word.toLowerCase().trim(), e);
+              });
+              data.forEach((e: StudentDictionaryEntry) => {
+                if (e && e.word) map.set(e.word.toLowerCase().trim(), e);
+              });
+              return Array.from(map.values());
             });
-            data.forEach((e: StudentDictionaryEntry) => {
-              if (e && e.word) map.set(e.word.toLowerCase().trim(), e);
-            });
-            return Array.from(map.values());
-          });
-        }
-      })
-      .catch((err) => {
-        console.warn('Error loading student dictionary for weekly activity counter:', err);
-      });
+          }
+        })
+        .catch((err) => {
+          console.warn('Error loading student dictionary for weekly activity counter:', err);
+        });
+    });
     return () => {
       isMounted = false;
     };

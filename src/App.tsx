@@ -135,6 +135,8 @@ import {
   normalizeUid,
   normalizeWeekId,
   parseWeekCycleNumber,
+  consolidateDictionaryEntries,
+  normalizeDictionaryWord,
 } from './utils/studentPersistence';
 import { FirestoreSchemaAlertBanner } from './components/FirestoreSchemaAlertBanner';
 import { StudentJournalEntry } from './types';
@@ -1532,15 +1534,18 @@ export default function App() {
       });
 
       // 2. Mirror from backend
-      fetch(`/api/student-dictionary?studentEmail=${encodeURIComponent(dictEmail)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`)
+      auth.currentUser?.getIdToken().then((token) => {
+        const headers: Record<string, string> = {};
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+        return fetch(`/api/student-dictionary?studentEmail=${encodeURIComponent(dictEmail)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`, { headers });
+      }).catch(() => {
+        return fetch(`/api/student-dictionary?studentEmail=${encodeURIComponent(dictEmail)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`);
+      })
         .then((r) => (r.ok ? r.json() : []))
         .then((data) => {
           if (Array.isArray(data) && data.length > 0) {
             setStudentDictionaryEntries((prev) => {
-              const map = new Map<string, StudentDictionaryEntry>();
-              prev.forEach((e) => map.set(e.word.toLowerCase(), e));
-              data.forEach((e: StudentDictionaryEntry) => map.set(e.word.toLowerCase(), e));
-              return Array.from(map.values());
+              return consolidateDictionaryEntries(prev, data);
             });
           }
         })
@@ -1901,15 +1906,18 @@ export default function App() {
         }
       });
 
-      fetch(`/api/student-dictionary?studentEmail=${encodeURIComponent(dictEmail)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`)
+      auth.currentUser?.getIdToken().then((token) => {
+        const headers: Record<string, string> = {};
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+        return fetch(`/api/student-dictionary?studentEmail=${encodeURIComponent(dictEmail)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`, { headers });
+      }).catch(() => {
+        return fetch(`/api/student-dictionary?studentEmail=${encodeURIComponent(dictEmail)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`);
+      })
         .then((r) => (r.ok ? r.json() : []))
         .then((data) => {
           if (Array.isArray(data) && data.length > 0) {
             setStudentDictionaryEntries((prev) => {
-              const map = new Map<string, StudentDictionaryEntry>();
-              prev.forEach((e) => map.set(e.word.toLowerCase(), e));
-              data.forEach((e: StudentDictionaryEntry) => map.set(e.word.toLowerCase(), e));
-              return Array.from(map.values());
+              return consolidateDictionaryEntries(prev, data);
             });
           }
         })
@@ -2686,19 +2694,44 @@ export default function App() {
       .filter((w) => Boolean(w && w.trim()))
       .map((w) => {
         const cleanW = w.trim();
+        const normKey = normalizeDictionaryWord(cleanW);
         const cached = getInstantOrCachedWord(cleanW, actName, userProfile?.level);
+        const actVideoId = (currentAct as any)?.videoId || (currentAct as any)?.videoUrl;
+        const actVideoTitle = (currentAct as any)?.title || actName;
+        const todayIso = new Date().toISOString();
+
         return {
-          id: `routine_${cleanW.toLowerCase().replace(/[^a-zA-Z0-9_-]/g, '_')}_${Date.now()}`,
+          id: `routine_${normKey.replace(/[^a-zA-Z0-9_-]/g, '_')}_${Date.now()}`,
           word: cleanW,
+          originalWord: cleanW,
+          normalizedWord: normKey,
           definitionEn: cached.definitionEn || '',
           exampleSentenceEn: cached.exampleSentenceEn || '',
           partOfSpeech: cached.partOfSpeech || '',
           translationPt: cached.translationPt || '',
           cefrLevel: cached.cefrLevel || 'B1',
-          learnedAt: new Date().toISOString(),
-          source: 'native_notes_standard',
+          learnedAt: todayIso,
+          source: 'routine',
           sourceActivityName: `${actName} (${selectedDay})`,
           sourceDay: selectedDay,
+          origins: [
+            {
+              source: 'routine',
+              activityName: `${actName} (${selectedDay})`,
+              dayOfWeek: selectedDay,
+              videoId: actVideoId,
+              videoTitle: actVideoTitle,
+              date: todayIso.slice(0, 10),
+              context: `5 Words routine activity: "${actName}"`,
+            },
+          ],
+          routineRef: {
+            day: selectedDay,
+            activityName: actName,
+            activityId,
+            videoId: actVideoId,
+            videoTitle: actVideoTitle,
+          },
         };
       });
 
@@ -4264,16 +4297,9 @@ export default function App() {
     );
     const targetUid = (targetStudent as any)?.uid || (targetStudent as any)?.studentUid || targetStudent?.id || currentAccount?.uid || auth.currentUser?.uid || '';
 
-    // Update local studentDictionaryEntries cumulatively
+    // Update local studentDictionaryEntries using pedagogical consolidation engine
     setStudentDictionaryEntries((prev) => {
-      const map = new Map<string, StudentDictionaryEntry>();
-      prev.forEach((e) => {
-        if (e?.word) map.set(e.word.toLowerCase().trim(), e);
-      });
-      entries.forEach((e) => {
-        if (e?.word) map.set(e.word.toLowerCase().trim(), e);
-      });
-      return Array.from(map.values()).sort((a, b) => a.word.localeCompare(b.word));
+      return consolidateDictionaryEntries(prev, entries);
     });
 
     if (targetEmail || targetUid) {
@@ -4281,9 +4307,13 @@ export default function App() {
       await saveStudentVocabularyToFirestore(targetUid, entries, targetEmail);
 
       try {
+        const token = await auth.currentUser?.getIdToken().catch(() => null);
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+
         await fetch('/api/student-dictionary', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
           body: JSON.stringify({
             studentEmail: targetEmail,
             studentUid: targetUid,
@@ -4301,12 +4331,7 @@ export default function App() {
   // Handler: Save manual entry in Personal Dictionary
   const handleSaveCustomDictionaryEntry = async (entry: StudentDictionaryEntry) => {
     setStudentDictionaryEntries((prev) => {
-      const map = new Map<string, StudentDictionaryEntry>();
-      prev.forEach((e) => {
-        if (e?.word) map.set(e.word.toLowerCase().trim(), e);
-      });
-      map.set(entry.word.toLowerCase().trim(), entry);
-      return Array.from(map.values()).sort((a, b) => a.word.localeCompare(b.word));
+      return consolidateDictionaryEntries(prev, [entry]);
     });
 
     const targetUid = currentAccount?.uid || auth.currentUser?.uid || userProfile?.id || (userProfile as any)?.uid || '';
@@ -4317,14 +4342,18 @@ export default function App() {
       await saveStudentVocabularyToFirestore(targetUid, [entry], targetEmail);
     }
 
-    if (currentAccount?.email) {
+    if (currentAccount?.email || targetEmail) {
       try {
+        const token = await auth.currentUser?.getIdToken().catch(() => null);
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+
         await fetch('/api/student-dictionary', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
           body: JSON.stringify({
-            studentEmail: currentAccount.email,
-            studentUid: currentAccount.uid,
+            studentEmail: targetEmail || currentAccount?.email,
+            studentUid: targetUid,
             entry,
           }),
         });

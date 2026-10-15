@@ -98,6 +98,36 @@ export interface AdminLandingContent {
   footerSlogan: string;
 }
 
+export interface DictionaryEntryOrigin {
+  source: 'native_notes' | 'routine' | 'manual' | 'homework' | 'live_lesson' | 'api' | string;
+  activityName?: string;
+  dayOfWeek?: DayOfWeek;
+  date?: string;
+  lessonId?: string;
+  videoId?: string;
+  videoTitle?: string;
+  trackId?: string;
+  noteId?: string;
+  context?: string;
+  teacherName?: string;
+  teacherEmail?: string;
+}
+
+export interface DictionaryPracticeRecord {
+  date: string;
+  activityType?: 'memorization' | 'homework' | 'sentence' | 'routine' | string;
+  dayOfWeek?: DayOfWeek;
+  correct?: boolean;
+}
+
+export interface DictionaryAiMetadata {
+  version?: string;
+  model?: string;
+  enrichedAt?: string;
+  promptVersion?: string;
+  isAiGenerated?: boolean;
+}
+
 export interface StudentDictionaryEntry {
   id: string;
   word: string;
@@ -108,13 +138,36 @@ export interface StudentDictionaryEntry {
   translationPt?: string;
   sourceActivityName?: string;
   sourceDay?: DayOfWeek;
-  source?: 'api' | 'offline_dict' | 'fallback' | 'custom' | 'not_found' | string;
+  source?: 'api' | 'offline_dict' | 'fallback' | 'custom' | 'not_found' | 'routine' | 'live_lesson' | 'native_notes' | string;
   learnedAt?: string;
   customNotes?: string;
   notFound?: boolean;
   cefrLevel?: string;
   practiceCount?: number;
   lastPracticedAt?: string;
+
+  // Fase 2.1 — Pedagogical Library Foundation (Retrocompatible: All Optional)
+  originalWord?: string;
+  normalizedWord?: string;
+  translations?: Record<string, string>;
+  explanations?: Record<string, string>;
+  examples?: Array<{ sentence: string; translation?: string; context?: string; source?: string }>;
+  audio?: string;
+  audioUrl?: string;
+  ipa?: string;
+  origins?: DictionaryEntryOrigin[];
+  lessonRefId?: string;
+  routineRef?: {
+    day?: DayOfWeek;
+    videoId?: string;
+    videoTitle?: string;
+    activityName?: string;
+    activityId?: string;
+  };
+  firstSeenAt?: string;
+  practiceHistory?: DictionaryPracticeRecord[];
+  enrichmentStatus?: 'pending' | 'enriched' | 'failed' | 'manual' | 'standard' | string;
+  aiMetadata?: DictionaryAiMetadata;
 }
 export interface GoogleAccount {
   id?: string;
