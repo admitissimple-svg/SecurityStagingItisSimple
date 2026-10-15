@@ -278,7 +278,8 @@ export function clearAllLocalPersistenceCaches(): void {
 export async function saveStudentVocabularyToFirestore(
   studentUid: string,
   entries: StudentDictionaryEntry[],
-  studentEmail?: string
+  studentEmail?: string,
+  lessonId?: string
 ): Promise<boolean> {
   const db = getDb();
   if (!db) return false;
@@ -398,33 +399,55 @@ export async function saveStudentVocabularyToFirestore(
 
     await withFirestoreTimeout(Promise.all(writePromises), 6000, null);
 
-    // Mirror to backend server API for disk persistence with verified authorization
+    // Authoritative backend persistence with verified authorization & Firebase Admin SDK
     if (cleanEmail || cleanUid) {
-      getAccessToken().then((token) => {
-        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-        if (token) headers['Authorization'] = `Bearer ${token}`;
-        fetch('/api/student-dictionary', {
+      let token: string | null = null;
+      try {
+        token = await getAccessToken();
+      } catch {}
+
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+
+      try {
+        const res = await fetch('/api/student-dictionary', {
           method: 'POST',
           headers,
           body: JSON.stringify({
             studentEmail: cleanEmail,
             studentUid: cleanUid,
+            lessonId,
             entries: accumulatedList,
           }),
-        }).catch(() => {});
-      }).catch(() => {
-        fetch('/api/student-dictionary', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            studentEmail: cleanEmail,
-            studentUid: cleanUid,
-            entries: accumulatedList,
-          }),
-        }).catch(() => {});
-      });
+        });
+
+        if (!res.ok) {
+          const errJson = await res.json().catch(() => ({}));
+          throw new Error(errJson.message || errJson.error || `HTTP ${res.status}: Failed to persist dictionary.`);
+        }
+
+        const resData = await res.json().catch(() => ({}));
+        if (resData?.dictionary && Array.isArray(resData.dictionary)) {
+          cacheVocabularyLocally(resData.studentUid || cleanUid, resData.studentEmail || cleanEmail, resData.dictionary);
+          return true;
+        }
+      } catch (fetchErr: any) {
+        // In Node/test/SSR environment where relative URL cannot be resolved:
+        try {
+          const { getFirestoreDb, saveStudentVocabularyToFirestoreServer } = await import('../serverFirestore');
+          const serverDb = getFirestoreDb();
+          if (serverDb) {
+            await saveStudentVocabularyToFirestoreServer(cleanUid, accumulatedList, cleanEmail);
+            cacheVocabularyLocally(cleanUid, cleanEmail, accumulatedList);
+            return true;
+          }
+        } catch {}
+        throw fetchErr;
+      }
     }
 
+    // Cache accumulated list locally only after confirmed persistence
+    cacheVocabularyLocally(cleanUid, cleanEmail, accumulatedList);
     return true;
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, `users/${cleanUid}/vocabulary`);
@@ -561,8 +584,7 @@ export async function fetchStudentVocabularyFromFirestore(
               altData.vocabulary.forEach((item: StudentDictionaryEntry) => {
                 if (item?.word) entryMap.set(item.word.toLowerCase().trim(), item);
               });
-              // Migrate to cleanUid
-              setDoc(doc(db, 'users', cleanUid), { vocabulary: altData.vocabulary, updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+              // Etapa 4: Strictly read-only recovery - no automatic migration write in this phase
               break;
             }
           }

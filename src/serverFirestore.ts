@@ -1033,8 +1033,479 @@ export async function addWatchedVideoToUserDoc(
   }
 }
 
+export function isValidCanonicalUid(uid?: string | null): boolean {
+  if (!uid || typeof uid !== 'string') return false;
+  const clean = uid.trim();
+  if (!clean) return false;
+  if (clean.includes('@')) return false;
+  if (clean.startsWith('usr-')) return false;
+  if (clean.startsWith('teacher-') || clean.startsWith('tutor-') || clean.startsWith('st-') || clean.startsWith('lesson-')) return false;
+  if (clean === 'user-default' || clean === 'anonymous_student' || clean === 'undefined' || clean === 'null') return false;
+  return true;
+}
+
+export interface ResolveStudentIdentityParams {
+  caller: {
+    uid: string;
+    email?: string;
+    role: 'admin' | 'teacher' | 'student';
+  };
+  studentEmail?: string;
+  studentUid?: string;
+  lessonId?: string;
+}
+
+export interface ResolvedStudentIdentityResult {
+  authorized: boolean;
+  canonicalStudentUid: string;
+  studentEmail: string;
+  error?: string;
+  statusCode?: number;
+}
+
+/**
+ * Resolves the unequivocal canonical Firebase Auth UID of a student on the trusted backend.
+ * Enforces strict authorization:
+ * - Students can only access/modify their own dictionary.
+ * - Teachers must have an existing authorized pedagogical link (verified lesson or assigned student profile).
+ * - Teacher UID can NEVER be substituted as student UID.
+ * - Synthetic IDs (usr-*, st-*) are rejected.
+ * - If canonical UID cannot be unequivocally verified, recording is aborted with an explicit error.
+ */
+export async function resolveCanonicalStudentIdentity(
+  params: ResolveStudentIdentityParams
+): Promise<ResolvedStudentIdentityResult> {
+  const { caller, studentEmail, studentUid, lessonId } = params;
+
+  if (!caller || !caller.uid) {
+    return {
+      authorized: false,
+      canonicalStudentUid: '',
+      studentEmail: '',
+      error: 'Authentication required: verified user token missing.',
+      statusCode: 401,
+    };
+  }
+
+  const cleanReqEmail = (studentEmail || '').toLowerCase().trim();
+  const cleanReqUid = (studentUid || '').trim();
+  const callerEmail = (caller.email || '').toLowerCase().trim();
+
+  // 1. Caller is Student: Strict self-access only
+  if (caller.role === 'student') {
+    if (cleanReqUid && cleanReqUid !== caller.uid) {
+      return {
+        authorized: false,
+        canonicalStudentUid: '',
+        studentEmail: '',
+        error: 'Cross-student access prohibited. Students may only access their own dictionary.',
+        statusCode: 403,
+      };
+    }
+    if (cleanReqEmail && callerEmail && cleanReqEmail !== callerEmail) {
+      return {
+        authorized: false,
+        canonicalStudentUid: '',
+        studentEmail: '',
+        error: 'Cross-student access prohibited. Students may only access their own dictionary.',
+        statusCode: 403,
+      };
+    }
+    return {
+      authorized: true,
+      canonicalStudentUid: caller.uid,
+      studentEmail: callerEmail || cleanReqEmail,
+    };
+  }
+
+  const db = getFirestoreDb();
+  let adminAuth: any = null;
+  try {
+    const { getFirebaseAdminAuth } = await import('./serverFirebaseAdmin');
+    adminAuth = getFirebaseAdminAuth();
+  } catch {}
+
+  // 2. Caller is Teacher: Verify authorized pedagogical link
+  if (caller.role === 'teacher' || (caller.role as string) === 'native_friend') {
+    let hasAuthorizedLink = false;
+    let candidateUid = cleanReqUid;
+    let authorizedEmail = cleanReqEmail;
+
+    // A. Check lesson authorization by lessonId
+    if (lessonId) {
+      try {
+        if (db) {
+          const lessonSnap = await db.collection('lessons').doc(lessonId).get();
+          if (lessonSnap.exists) {
+            const lData = lessonSnap.data();
+            const lTeacherUid = lData?.teacherUid;
+            const lTeacherEmail = (lData?.teacherEmail || '').toLowerCase().trim();
+            const isLessonTeacher =
+              (lTeacherUid && lTeacherUid === caller.uid) ||
+              (lTeacherEmail && lTeacherEmail === callerEmail);
+
+            if (isLessonTeacher) {
+              const lStudentEmail = (lData?.studentEmail || '').toLowerCase().trim();
+              const lStudentUid = (lData?.studentUid || '').trim();
+              if (
+                (!cleanReqEmail || cleanReqEmail === lStudentEmail) &&
+                (!cleanReqUid || cleanReqUid === lStudentUid || cleanReqUid.startsWith('usr-'))
+              ) {
+                hasAuthorizedLink = true;
+                if (!authorizedEmail) authorizedEmail = lStudentEmail;
+                if (!candidateUid || candidateUid.startsWith('usr-')) candidateUid = lStudentUid;
+              }
+            } else {
+              return {
+                authorized: false,
+                canonicalStudentUid: '',
+                studentEmail: '',
+                error: 'Teacher is not authorized for this lesson.',
+                statusCode: 403,
+              };
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Notice checking lesson authorization in Firestore:', err);
+      }
+    }
+
+    // B. Check authorized relationship via lessons collection or student profile
+    if (!hasAuthorizedLink && db && (authorizedEmail || candidateUid)) {
+      try {
+        // Query lessons for authorized link between teacher and student
+        const lessonQuery = authorizedEmail
+          ? db.collection('lessons').where('studentEmail', '==', authorizedEmail)
+          : db.collection('lessons').where('studentUid', '==', candidateUid);
+        const lSnap = await lessonQuery.get();
+        if (!lSnap.empty) {
+          for (const lDoc of lSnap.docs) {
+            const data = lDoc.data();
+            const tUid = data.teacherUid;
+            const tEmail = (data.teacherEmail || '').toLowerCase().trim();
+            if ((tUid && tUid === caller.uid) || (tEmail && tEmail === callerEmail)) {
+              hasAuthorizedLink = true;
+              if (!authorizedEmail && data.studentEmail) authorizedEmail = data.studentEmail.toLowerCase().trim();
+              if ((!candidateUid || candidateUid.startsWith('usr-')) && data.studentUid) candidateUid = data.studentUid;
+              break;
+            }
+          }
+        }
+      } catch {}
+
+      // Query user profile for assigned native friend relationship
+      if (!hasAuthorizedLink) {
+        try {
+          const profileQuery = authorizedEmail
+            ? db.collection('users').where('email', '==', authorizedEmail)
+            : db.collection('users').where('uid', '==', candidateUid);
+          const pSnap = await profileQuery.get();
+          if (!pSnap.empty) {
+            for (const pDoc of pSnap.docs) {
+              const pData = pDoc.data();
+              const assignedUid = pData.assignedNativeFriendUID || pData.teacherUid;
+              const assignedEmail = (pData.teacherEmail || '').toLowerCase().trim();
+              if ((assignedUid && assignedUid === caller.uid) || (assignedEmail && assignedEmail === callerEmail)) {
+                hasAuthorizedLink = true;
+                if (!authorizedEmail && pData.email) authorizedEmail = pData.email.toLowerCase().trim();
+                if ((!candidateUid || candidateUid.startsWith('usr-')) && pData.uid) candidateUid = pData.uid;
+                break;
+              }
+            }
+          }
+        } catch {}
+      }
+    }
+
+    if (!hasAuthorizedLink) {
+      return {
+        authorized: false,
+        canonicalStudentUid: '',
+        studentEmail: '',
+        error: 'Teacher has no authorized pedagogical link with this student.',
+        statusCode: 403,
+      };
+    }
+
+    // Resolve CANONICAL student UID via Firebase Admin Auth
+    // Candidate 1: candidateUid if valid canonical UID
+    if (candidateUid && isValidCanonicalUid(candidateUid)) {
+      if (candidateUid === caller.uid) {
+        return {
+          authorized: false,
+          canonicalStudentUid: '',
+          studentEmail: '',
+          error: 'Teacher UID cannot be used as student UID.',
+          statusCode: 403,
+        };
+      }
+      if (adminAuth) {
+        try {
+          const userRec = await adminAuth.getUser(candidateUid);
+          if (userRec && userRec.uid) {
+            if (userRec.uid === caller.uid) {
+              return {
+                authorized: false,
+                canonicalStudentUid: '',
+                studentEmail: '',
+                error: 'Teacher UID cannot be used as student UID.',
+                statusCode: 403,
+              };
+            }
+            const recEmail = (userRec.email || '').toLowerCase().trim();
+            if (!authorizedEmail || !recEmail || recEmail === authorizedEmail) {
+              return {
+                authorized: true,
+                canonicalStudentUid: userRec.uid,
+                studentEmail: recEmail || authorizedEmail,
+              };
+            }
+          }
+        } catch {}
+      } else {
+        return {
+          authorized: true,
+          canonicalStudentUid: candidateUid,
+          studentEmail: authorizedEmail,
+        };
+      }
+    }
+
+    // Candidate 2: resolve by authorized student email from Firebase Admin Auth
+    if (authorizedEmail) {
+      if (adminAuth) {
+        try {
+          const userRec = await adminAuth.getUserByEmail(authorizedEmail);
+          if (userRec && userRec.uid && isValidCanonicalUid(userRec.uid)) {
+            if (userRec.uid === caller.uid) {
+              return {
+                authorized: false,
+                canonicalStudentUid: '',
+                studentEmail: '',
+                error: 'Teacher UID cannot be used as student UID.',
+                statusCode: 403,
+              };
+            }
+            return {
+              authorized: true,
+              canonicalStudentUid: userRec.uid,
+              studentEmail: userRec.email || authorizedEmail,
+            };
+          }
+        } catch {}
+      }
+
+      // Candidate 3: Search Firestore /users for student document with canonical UID
+      if (db) {
+        try {
+          const uSnap = await db.collection('users').where('email', '==', authorizedEmail).get();
+          for (const uDoc of uSnap.docs) {
+            if (isValidCanonicalUid(uDoc.id) && uDoc.id !== caller.uid) {
+              return {
+                authorized: true,
+                canonicalStudentUid: uDoc.id,
+                studentEmail: authorizedEmail,
+              };
+            }
+          }
+        } catch {}
+      }
+    }
+
+    return {
+      authorized: false,
+      canonicalStudentUid: '',
+      studentEmail: '',
+      error: 'Cannot unequivocally resolve canonical student UID from Firebase Auth. Recording aborted.',
+      statusCode: 422,
+    };
+  }
+
+  // 3. Caller is Admin
+  if (caller.role === 'admin') {
+    let candidateUid = cleanReqUid;
+    let targetEmail = cleanReqEmail;
+
+    if (candidateUid && isValidCanonicalUid(candidateUid)) {
+      if (adminAuth) {
+        try {
+          const userRec = await adminAuth.getUser(candidateUid);
+          if (userRec && userRec.uid) {
+            return {
+              authorized: true,
+              canonicalStudentUid: userRec.uid,
+              studentEmail: (userRec.email || targetEmail).toLowerCase().trim(),
+            };
+          }
+        } catch {}
+      } else {
+        return {
+          authorized: true,
+          canonicalStudentUid: candidateUid,
+          studentEmail: targetEmail,
+        };
+      }
+    }
+
+    if (targetEmail && adminAuth) {
+      try {
+        const userRec = await adminAuth.getUserByEmail(targetEmail);
+        if (userRec && userRec.uid && isValidCanonicalUid(userRec.uid)) {
+          return {
+            authorized: true,
+            canonicalStudentUid: userRec.uid,
+            studentEmail: userRec.email || targetEmail,
+          };
+        }
+      } catch {}
+    }
+
+    if (targetEmail && db) {
+      try {
+        const uSnap = await db.collection('users').where('email', '==', targetEmail).get();
+        for (const uDoc of uSnap.docs) {
+          if (isValidCanonicalUid(uDoc.id)) {
+            return {
+              authorized: true,
+              canonicalStudentUid: uDoc.id,
+              studentEmail: targetEmail,
+            };
+          }
+        }
+      } catch {}
+    }
+
+    return {
+      authorized: false,
+      canonicalStudentUid: '',
+      studentEmail: '',
+      error: 'Cannot unequivocally resolve canonical student UID from Firebase Auth. Recording aborted.',
+      statusCode: 422,
+    };
+  }
+
+  return {
+    authorized: false,
+    canonicalStudentUid: '',
+    studentEmail: '',
+    error: 'Unauthorized identity role.',
+    statusCode: 403,
+  };
+}
+
+/**
+ * Server-side consolidation of student dictionary entries.
+ * Guarantees:
+ * - Richer definitions and authentic examples are preserved.
+ * - Multi-origin history is accumulated.
+ * - practiceCount is never decreased or reset.
+ * - lastPracticedAt is strictly preserved (most recent timestamp kept).
+ * - Deduplicated deterministically by normalized word.
+ */
+function consolidateServerEntries(existingEntries: any[], newEntries: any[]): any[] {
+  const masterMap = new Map<string, any>();
+
+  (existingEntries || []).forEach((e) => {
+    if (!e || !e.word) return;
+    const rawWord = (e.word || '').trim();
+    const key = (e.normalizedWord || rawWord).toLowerCase().trim();
+    if (!key) return;
+    masterMap.set(key, { ...e, word: rawWord, normalizedWord: key });
+  });
+
+  (newEntries || []).forEach((item) => {
+    if (!item || !item.word) return;
+    const rawWord = (item.word || '').trim();
+    const key = (item.normalizedWord || rawWord).toLowerCase().trim();
+    if (!key) return;
+
+    const existing = masterMap.get(key);
+
+    if (!existing) {
+      masterMap.set(key, {
+        ...item,
+        id: item.id || `dict_${key.replace(/[^a-zA-Z0-9_-]/g, '_')}_${Date.now()}`,
+        word: rawWord,
+        originalWord: item.originalWord || rawWord,
+        normalizedWord: key,
+        practiceCount: typeof item.practiceCount === 'number' ? item.practiceCount : 0,
+        origins: Array.isArray(item.origins) ? item.origins : (item.source ? [{ source: item.source, activityName: item.sourceActivityName }] : []),
+      });
+      return;
+    }
+
+    // Richer definition protection
+    const existingDef = (existing.definitionEn || '').trim();
+    const newDef = (item.definitionEn || item.meaningOrTip || '').trim();
+    const genericFallbackRegex = /A (fundamental word|natural conversational expression|practical English term|Key communicative expression)/i;
+    const isNewGeneric = genericFallbackRegex.test(newDef);
+    const isExistingGeneric = genericFallbackRegex.test(existingDef);
+    const keepExistingDef = Boolean(existingDef && (!newDef || (isNewGeneric && !isExistingGeneric) || (existingDef.length > 20 && newDef.length < 15)));
+
+    const resolvedDef = keepExistingDef ? existingDef : (newDef || existingDef || '');
+    const resolvedExample = existing.exampleSentenceEn && (!item.exampleSentenceEn || item.exampleSentenceEn.length < existing.exampleSentenceEn.length)
+      ? existing.exampleSentenceEn
+      : (item.exampleSentenceEn || item.exampleSentence || existing.exampleSentenceEn || '');
+
+    // Accumulate origins without duplication
+    const mergedOrigins = [...(existing.origins || [])];
+    if (Array.isArray(item.origins)) {
+      item.origins.forEach((orig: any) => {
+        const isDup = mergedOrigins.some(
+          (m: any) => m.source === orig.source && m.activityName === orig.activityName && m.date === orig.date
+        );
+        if (!isDup) mergedOrigins.push(orig);
+      });
+    } else if (item.source) {
+      const isDup = mergedOrigins.some((m: any) => m.source === item.source && m.activityName === item.sourceActivityName);
+      if (!isDup) {
+        mergedOrigins.push({
+          source: item.source,
+          activityName: item.sourceActivityName,
+          dayOfWeek: item.sourceDay,
+          date: item.learnedAt ? item.learnedAt.split('T')[0] : new Date().toISOString().split('T')[0],
+          lessonId: item.lessonRefId,
+          videoId: item.routineRef?.videoId,
+          videoTitle: item.routineRef?.videoTitle,
+        });
+      }
+    }
+
+    // Practice count: NEVER decrease or reset
+    const exCount = typeof existing.practiceCount === 'number' ? existing.practiceCount : 0;
+    const inCount = typeof item.practiceCount === 'number' ? item.practiceCount : 0;
+    const mergedPracticeCount = Math.max(exCount, inCount);
+
+    let mergedLastPracticedAt = existing.lastPracticedAt;
+    if (item.lastPracticedAt) {
+      if (!existing.lastPracticedAt || new Date(item.lastPracticedAt) > new Date(existing.lastPracticedAt)) {
+        mergedLastPracticedAt = item.lastPracticedAt;
+      }
+    }
+
+    masterMap.set(key, {
+      ...existing,
+      ...item,
+      id: existing.id || item.id,
+      word: rawWord,
+      originalWord: item.originalWord || existing.originalWord || rawWord,
+      normalizedWord: key,
+      definitionEn: resolvedDef,
+      exampleSentenceEn: resolvedExample,
+      origins: mergedOrigins,
+      practiceCount: mergedPracticeCount,
+      lastPracticedAt: mergedLastPracticedAt,
+    });
+  });
+
+  return Array.from(masterMap.values()).sort((a, b) => (a.word || '').localeCompare(b.word || ''));
+}
+
 /**
  * Server-side persistent storage of student vocabulary in Cloud Firestore.
+ * Strictly requires a canonical student Firebase Auth UID (rejects synthetic usr-* / st-* or teacher UID).
+ * Persists to canonical document users/{canonicalStudentUid} and subcollection users/{canonicalStudentUid}/vocabulary/{wordDocId}.
  */
 export async function saveStudentVocabularyToFirestoreServer(
   studentUid: string,
@@ -1043,51 +1514,71 @@ export async function saveStudentVocabularyToFirestoreServer(
 ): Promise<boolean> {
   if (isCloudWriteDisabled) return false;
   const db = getFirestoreDb();
-  if (!db || (!studentUid && !studentEmail)) return false;
+  if (!db || !studentUid) return false;
+
+  const cleanUid = studentUid.trim();
+  if (!isValidCanonicalUid(cleanUid)) {
+    throw new Error(
+      `[saveStudentVocabularyToFirestoreServer] Rejected non-canonical student UID: "${cleanUid}". Persistence strictly requires a canonical Firebase Auth UID.`
+    );
+  }
   if (!entries || entries.length === 0) return true;
 
   try {
-    const cleanUid = studentUid || (studentEmail ? studentEmail.toLowerCase().trim().replace(/[^a-zA-Z0-9_-]/g, '_') : '');
     const cleanEmail = (studentEmail || '').toLowerCase().trim();
-    const emailDocId = cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : '';
-    const hyphenDocId = cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9]/g, '-') : '';
-
-    const targetDocIds = Array.from(new Set([cleanUid, emailDocId, hyphenDocId].filter(Boolean)));
     const sanitizedEntries = JSON.parse(JSON.stringify(entries || []));
 
-    for (const docId of targetDocIds) {
-      let existingList: any[] = [];
-      try {
-        const userSnap = await db.collection('users').doc(docId).get();
-        if (userSnap.exists && Array.isArray(userSnap.data()?.vocabulary)) {
-          existingList = userSnap.data()?.vocabulary;
-        }
-      } catch {}
+    // 1. Fetch existing entries from canonical user document
+    let existingList: any[] = [];
+    try {
+      const userSnap = await db.collection('users').doc(cleanUid).get();
+      if (userSnap.exists && Array.isArray(userSnap.data()?.vocabulary)) {
+        existingList = userSnap.data()?.vocabulary;
+      }
+    } catch {}
 
-      const map = new Map<string, any>();
-      existingList.forEach((e) => {
-        if (e && e.word) map.set(e.word.toLowerCase().trim(), e);
-      });
-      sanitizedEntries.forEach((e: any) => {
-        if (e && e.word) {
-          const key = e.word.toLowerCase().trim();
-          map.set(key, { ...(map.get(key) || {}), ...e });
-        }
-      });
-      const accumulated = Array.from(map.values()).sort((a, b) => (a.word || '').localeCompare(b.word || ''));
+    // 2. Fetch existing entries from canonical subcollection
+    try {
+      const subSnap = await db.collection('users').doc(cleanUid).collection('vocabulary').get();
+      if (!subSnap.empty) {
+        subSnap.forEach((docItem) => {
+          const item = docItem.data();
+          if (item && item.word) {
+            existingList.push(item);
+          }
+        });
+      }
+    } catch {}
 
-      await db.collection('users').doc(docId).set({ vocabulary: accumulated, updatedAt: new Date().toISOString() }, { merge: true });
+    // 3. Consolidate entries cumulatively
+    const consolidated = consolidateServerEntries(existingList, sanitizedEntries);
 
-      for (const item of sanitizedEntries) {
-        if (item && item.word) {
-          const wordDocId = (item.id || item.word).toLowerCase().trim().replace(/[^a-zA-Z0-9_-]/g, '_');
-          await db.collection('users').doc(docId).collection('vocabulary').doc(wordDocId).set(
-            { ...item, studentUid: cleanUid, studentEmail: cleanEmail, updatedAt: new Date().toISOString() },
-            { merge: true }
-          );
-        }
+    // 4. Save to canonical root document users/{cleanUid}
+    await db.collection('users').doc(cleanUid).set(
+      {
+        vocabulary: consolidated,
+        updatedAt: new Date().toISOString(),
+      },
+      { merge: true }
+    );
+
+    // 5. Save individual entries to subcollection users/{cleanUid}/vocabulary/{wordDocId}
+    for (const item of consolidated) {
+      if (item && item.word) {
+        const rawWord = (item.normalizedWord || item.word).toLowerCase().trim();
+        const wordDocId = rawWord.replace(/[^a-zA-Z0-9_-]/g, '_');
+        await db.collection('users').doc(cleanUid).collection('vocabulary').doc(wordDocId).set(
+          {
+            ...item,
+            studentUid: cleanUid,
+            studentEmail: cleanEmail || item.studentEmail,
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        );
       }
     }
+
     return true;
   } catch (err: any) {
     if (isPermissionError(err)) {
@@ -1095,8 +1586,92 @@ export async function saveStudentVocabularyToFirestoreServer(
       console.info('[serverFirestore] Remote vocabulary save restricted by IAM, continuing with local state.');
     } else {
       console.warn('Firestore server vocabulary save notice:', err);
+      throw err;
     }
     return false;
+  }
+}
+
+/**
+ * Server-side read of student personal dictionary directly from canonical Firestore path.
+ * Implements Etapa 4: Safe, read-only recovery of legacy records when unequivocal identity link is proven.
+ * CRITICAL: Strictly read-only! Never performs automatic migration writes (no setDoc).
+ * CRITICAL: Canonical records are never overwritten by legacy records.
+ */
+export async function fetchStudentVocabularyFromFirestoreServer(
+  canonicalStudentUid: string,
+  studentEmail?: string
+): Promise<any[]> {
+  const db = getFirestoreDb();
+  if (!db || !canonicalStudentUid) return [];
+
+  const entryMap = new Map<string, any>();
+
+  try {
+    // 1. Fetch from canonical document users/{canonicalStudentUid}
+    const userDocRef = db.collection('users').doc(canonicalStudentUid);
+    const userSnap = await userDocRef.get();
+    if (userSnap.exists) {
+      const data = userSnap.data();
+      if (Array.isArray(data?.vocabulary)) {
+        data.vocabulary.forEach((item: any) => {
+          if (item && item.word) {
+            const key = (item.normalizedWord || item.word).toLowerCase().trim();
+            entryMap.set(key, item);
+          }
+        });
+      }
+    }
+
+    // 2. Fetch from canonical subcollection users/{canonicalStudentUid}/vocabulary
+    const subColRef = db.collection('users').doc(canonicalStudentUid).collection('vocabulary');
+    const subSnap = await subColRef.get();
+    if (!subSnap.empty) {
+      subSnap.forEach((docItem) => {
+        const item = docItem.data();
+        if (item && item.word) {
+          const key = (item.normalizedWord || item.word).toLowerCase().trim();
+          entryMap.set(key, { ...(entryMap.get(key) || {}), ...item });
+        }
+      });
+    }
+
+    // 3. Etapa 4: Read-only check of legacy doc IDs if canonical doc has no vocabulary
+    if (studentEmail && entryMap.size === 0) {
+      const cleanEmail = studentEmail.toLowerCase().trim();
+      const legacyDocIds = [
+        `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`,
+        cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_'),
+        cleanEmail,
+      ].filter((id) => id !== canonicalStudentUid);
+
+      for (const legId of legacyDocIds) {
+        try {
+          const legSnap = await db.collection('users').doc(legId).get();
+          if (legSnap.exists) {
+            const legData = legSnap.data();
+            const emailMatches = (legData?.email || '').toLowerCase().trim() === cleanEmail;
+            const uidMatches = !legData?.uid || legData?.uid === canonicalStudentUid || legData?.uid === legId;
+            if (emailMatches && uidMatches && Array.isArray(legData?.vocabulary)) {
+              legData.vocabulary.forEach((item: any) => {
+                if (item && item.word) {
+                  const key = (item.normalizedWord || item.word).toLowerCase().trim();
+                  if (!entryMap.has(key)) {
+                    entryMap.set(key, item);
+                  }
+                }
+              });
+              break; // Only read the first matching legacy document
+            }
+          }
+        } catch {}
+      }
+    }
+
+    return Array.from(entryMap.values()).sort((a, b) => (a.word || '').localeCompare(b.word || ''));
+  } catch (err) {
+    console.warn('fetchStudentVocabularyFromFirestoreServer error:', err);
+    return [];
   }
 }
 

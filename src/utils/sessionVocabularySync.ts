@@ -234,9 +234,10 @@ export async function syncSessionVocabularyToStudentDictionary(
 
   // 4. Save cumulatively and permanently to Cloud Firestore isolated by student UID
   try {
-    await saveStudentVocabularyToFirestore(cleanUid, dictionaryEntries, cleanEmail);
-  } catch (err) {
+    await saveStudentVocabularyToFirestore(cleanUid, dictionaryEntries, cleanEmail, lessonId);
+  } catch (err: any) {
     console.error('syncSessionVocabularyToStudentDictionary Firestore save error:', err);
+    throw new Error(`Falha na persistência canônica do vocabulário: ${err?.message || err}`);
   }
 
   return dictionaryEntries;

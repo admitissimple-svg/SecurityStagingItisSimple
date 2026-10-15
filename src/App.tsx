@@ -1158,6 +1158,7 @@ export default function App() {
       setWeeklyChecks({});
       setStudentJournal([]);
       setWeeklyHomework(null);
+      setStudentDictionaryEntries([]);
       const cachedDict = getCachedLocalVocabulary(uid, email);
       if (cachedDict && cachedDict.length > 0) {
         setStudentDictionaryEntries(cachedDict);
@@ -1350,6 +1351,7 @@ export default function App() {
           // Fetch student personal dictionary directly from Firestore (Permanent Multi-device Sync)
           fetchStudentVocabularyFromFirestore(uid, email)
             .then((vocab) => {
+              if (isCancelled) return;
               if (Array.isArray(vocab)) {
                 setStudentDictionaryEntries(vocab);
               }
@@ -1885,8 +1887,9 @@ export default function App() {
 
   // Real-time synchronization of student vocabulary dictionary across all devices & sessions (Mobile <-> Desktop)
   useEffect(() => {
-    const uid = (currentAccount?.role === 'student' ? (currentAccount?.uid || '') : (selectedStudentFilter !== 'all' ? selectedStudentFilter : '')) || auth.currentUser?.uid || userProfile?.id || (userProfile as any)?.uid || '';
-    const email = (currentAccount?.role === 'student' ? (currentAccount?.email || '') : (selectedStudentFilter !== 'all' ? selectedStudentFilter : '')) || auth.currentUser?.email || userProfile?.email || '';
+    if (currentAccount?.role !== 'student') return;
+    const uid = currentAccount?.uid || '';
+    const email = currentAccount?.email || '';
     if (!uid && !email) return;
 
     const unsub = subscribeToStudentVocabulary(uid, email, (cloudEntries) => {
@@ -1897,12 +1900,13 @@ export default function App() {
     });
 
     return () => unsub();
-  }, [currentAccount?.uid, currentAccount?.email, currentAccount?.role, selectedStudentFilter, userProfile?.id, userProfile?.email]);
+  }, [currentAccount?.uid, currentAccount?.email, currentAccount?.role]);
 
   // Ensure accumulated vocabulary is loaded from Firestore whenever switching lessons or days
   useEffect(() => {
-    const uid = (currentAccount?.role === 'student' ? (currentAccount?.uid || '') : (selectedStudentFilter !== 'all' ? selectedStudentFilter : '')) || auth.currentUser?.uid || userProfile?.id || (userProfile as any)?.uid || '';
-    const email = (currentAccount?.role === 'student' ? (currentAccount?.email || '') : (selectedStudentFilter !== 'all' ? selectedStudentFilter : '')) || auth.currentUser?.email || userProfile?.email || '';
+    if (currentAccount?.role !== 'student') return;
+    const uid = currentAccount?.uid || '';
+    const email = currentAccount?.email || '';
     if (!uid && !email) return;
 
     fetchStudentVocabularyFromFirestore(uid, email).then((fsEntries) => {
@@ -1910,7 +1914,7 @@ export default function App() {
         setStudentDictionaryEntries(fsEntries);
       }
     });
-  }, [selectedDay, selectedActivityId]);
+  }, [selectedDay, selectedActivityId, currentAccount?.role, currentAccount?.uid, currentAccount?.email]);
 
   // Refresh student dictionary whenever the modal is opened
   useEffect(() => {
@@ -4320,43 +4324,83 @@ export default function App() {
   };
 
   // Handler: Add words to Student Personal Dictionary (auto-migrated from lesson notes)
-  const handleAddWordsToDictionary = async (entries: StudentDictionaryEntry[], studentEmail?: string) => {
-    if (!entries || entries.length === 0) return;
-    const targetEmail = (studentEmail || (selectedStudentFilter !== 'all' ? selectedStudentFilter : currentAccount?.email) || '').toLowerCase().trim();
-    const targetStudent = (studentsList || []).find(
-      (s) => (s.email || '').toLowerCase().trim() === targetEmail || (s as any).uid === targetEmail || s.id === targetEmail
-    );
-    const targetUid = (targetStudent as any)?.uid || (targetStudent as any)?.studentUid || targetStudent?.id || currentAccount?.uid || auth.currentUser?.uid || '';
+  const handleAddWordsToDictionary = async (
+    entries: StudentDictionaryEntry[],
+    studentEmail?: string,
+    studentUid?: string,
+    lessonId?: string
+  ) => {
+    if (!entries || entries.length === 0) return { success: false, error: 'No entries to add' };
 
-    // Update local studentDictionaryEntries using pedagogical consolidation engine
-    setStudentDictionaryEntries((prev) => {
-      return consolidateDictionaryEntries(prev, entries);
-    });
+    const isTeacherCaller = currentAccount?.role === 'teacher' || currentAccount?.role === 'admin';
 
-    if (targetEmail || targetUid) {
-      // Direct Firestore persistence - cumulative and permanent!
-      await saveStudentVocabularyToFirestore(targetUid, entries, targetEmail);
+    // Strict identity resolution:
+    // If teacher is caller, target student MUST come from explicitly supplied studentEmail / studentUid,
+    // NEVER from currentAccount (which is the teacher's identity!)
+    let targetEmail = (
+      studentEmail ||
+      (!isTeacherCaller ? currentAccount?.email : '') ||
+      (selectedStudentFilter !== 'all' ? selectedStudentFilter : '') ||
+      ''
+    ).toLowerCase().trim();
 
-      try {
-        const token = await auth.currentUser?.getIdToken().catch(() => null);
-        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-        if (token) headers['Authorization'] = `Bearer ${token}`;
+    let targetUid = (studentUid && isValidCanonicalUid(studentUid) ? studentUid.trim() : '');
 
-        await fetch('/api/student-dictionary', {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({
-            studentEmail: targetEmail,
-            studentUid: targetUid,
-            teacherEmail: currentAccount?.email,
-            teacherName: currentAccount?.name,
-            entries,
-          }),
-        });
-      } catch (err) {
-        console.warn('Failed to sync student dictionary entries:', err);
+    if (!targetUid && targetEmail) {
+      const targetStudent = (studentsList || []).find(
+        (s) => (s.email || '').toLowerCase().trim() === targetEmail
+      );
+      if (targetStudent && (targetStudent as any).uid && isValidCanonicalUid((targetStudent as any).uid)) {
+        targetUid = (targetStudent as any).uid;
       }
     }
+
+    if (!targetEmail && !targetUid) {
+      throw new Error('Identidade do estudante não informada para adição ao My Dictionary.');
+    }
+
+    // Strict invariant: Teacher UID can NEVER be passed as student UID
+    if (isTeacherCaller && targetUid && targetUid === currentAccount?.uid) {
+      targetUid = '';
+    }
+
+    // Call backend API with token and await response
+    const token = await auth.currentUser?.getIdToken().catch(() => null);
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const res = await fetch('/api/student-dictionary', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        studentEmail: targetEmail,
+        studentUid: targetUid,
+        lessonId,
+        teacherEmail: currentAccount?.email,
+        teacherName: currentAccount?.name,
+        entries,
+      }),
+    });
+
+    if (!res.ok) {
+      const errJson = await res.json().catch(() => ({}));
+      const msg = errJson.message || errJson.error || `HTTP ${res.status}: Erro ao persistir dicionário do aluno.`;
+      throw new Error(msg);
+    }
+
+    const resData = await res.json();
+    const updatedDictionary: StudentDictionaryEntry[] = resData.dictionary || [];
+
+    // CRITICAL (Etapa 5 - Isolamento de Sessão):
+    // Only update studentDictionaryEntries React state if the currently logged-in account is the student!
+    // NEVER mutate the teacher's React state!
+    if (currentAccount?.role === 'student' && (!targetEmail || targetEmail === currentAccount?.email?.toLowerCase().trim())) {
+      setStudentDictionaryEntries(
+        updatedDictionary.length > 0 ? updatedDictionary : (prev) => consolidateDictionaryEntries(prev, entries)
+      );
+    }
+
+    return { success: true, count: entries.length };
   };
 
   // Handler: Save manual entry in Personal Dictionary

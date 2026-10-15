@@ -83,6 +83,8 @@ import {
   resetRepeatFlagsSubcollection,
   addWatchedVideoToUserDoc,
   saveStudentVocabularyToFirestoreServer,
+  fetchStudentVocabularyFromFirestoreServer,
+  resolveCanonicalStudentIdentity,
   saveSessionNotesToFirestoreServer,
   fetchSessionNotesFromFirestoreServer,
   saveYouTubePlaylistsToFirestore,
@@ -8805,191 +8807,133 @@ app.get('/api/student-dictionary', async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   const db = readDb();
   const caller = await getVerifiedUserFromRequest(req);
-  const requestedEmail = ((req.query.studentEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
-  const requestedUid = ((req.query.studentUid as string) || (req.query.uid as string) || '').trim();
 
-  // Role validation: Never trust client-supplied role query parameter without token verification
-  if (caller) {
-    if (caller.role === 'student') {
-      const callerEmail = (caller.email || '').toLowerCase().trim();
-      const callerUid = caller.uid || '';
-      // Cross-student access prohibition (Etapa D)
-      if ((requestedUid && requestedUid !== callerUid) || (requestedEmail && requestedEmail !== callerEmail)) {
-        return res.status(403).json({
-          error: 'Forbidden',
-          message: 'Cross-student access prohibited. Students may only access their own dictionary.',
-        });
-      }
-    }
-  } else {
-    // If unauthenticated: Reject if attempting to access administrative dictionary dump
-    const untrustedRole = (req.query.role as string) || '';
-    if (untrustedRole === 'admin') {
-      return res.status(401).json({
-        error: 'Unauthorized',
-        message: 'Administrative privileges require a verified authorization token.',
-      });
-    }
+  if (!caller) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Authentication required: verified user token missing.',
+    });
   }
 
+  const requestedEmail = ((req.query.studentEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
+  const requestedUid = ((req.query.studentUid as string) || (req.query.uid as string) || '').trim();
+  const requestedLessonId = ((req.query.lessonId as string) || '').trim();
+
   // Admin access to all dictionaries (strictly requires verified admin token)
-  if (caller && caller.role === 'admin' && !requestedEmail && !requestedUid) {
+  if (caller.role === 'admin' && !requestedEmail && !requestedUid) {
     return res.json(db.studentDictionaryMap || {});
   }
 
-  const effectiveEmail = caller && caller.role === 'student' ? (caller.email || '').toLowerCase().trim() : requestedEmail;
-  const effectiveUid = caller && caller.role === 'student' ? caller.uid : requestedUid;
+  const identityRes = await resolveCanonicalStudentIdentity({
+    caller,
+    studentEmail: requestedEmail,
+    studentUid: requestedUid,
+    lessonId: requestedLessonId || undefined,
+  });
 
-  if (effectiveEmail || effectiveUid) {
-    const fromEmail: any[] = (effectiveEmail && db.studentDictionaryMap?.[effectiveEmail]) || [];
-    const fromUid: any[] = (effectiveUid && db.studentDictionaryMap?.[effectiveUid]) || [];
-    const map = new Map<string, any>();
-    [...fromEmail, ...fromUid].forEach((entry: any) => {
-      const w = (entry.normalizedWord || entry.word || '').toLowerCase().trim();
-      if (w) map.set(w, entry);
+  if (!identityRes.authorized) {
+    return res.status(identityRes.statusCode || 403).json({
+      error: 'Forbidden',
+      message: identityRes.error || 'Access denied to student dictionary.',
     });
-    const list = Array.from(map.values()).sort((a, b) => (a.word || '').localeCompare(b.word || ''));
-    return res.json(list);
   }
 
-  res.json([]);
+  const canonicalUid = identityRes.canonicalStudentUid;
+  const canonicalEmail = identityRes.studentEmail;
+
+  // Fetch directly from canonical Firestore path
+  const firestoreWords = await fetchStudentVocabularyFromFirestoreServer(canonicalUid, canonicalEmail);
+
+  if (firestoreWords.length > 0) {
+    if (!db.studentDictionaryMap) db.studentDictionaryMap = {};
+    if (canonicalUid) db.studentDictionaryMap[canonicalUid] = firestoreWords;
+    if (canonicalEmail) db.studentDictionaryMap[canonicalEmail] = firestoreWords;
+    return res.json(firestoreWords);
+  }
+
+  // Fallback to in-memory db if Firestore had no words
+  const fromEmail: any[] = (canonicalEmail && db.studentDictionaryMap?.[canonicalEmail]) || [];
+  const fromUid: any[] = (canonicalUid && db.studentDictionaryMap?.[canonicalUid]) || [];
+  const map = new Map<string, any>();
+  [...fromEmail, ...fromUid].forEach((entry: any) => {
+    const w = (entry.normalizedWord || entry.word || '').toLowerCase().trim();
+    if (w) map.set(w, entry);
+  });
+  const list = Array.from(map.values()).sort((a, b) => (a.word || '').localeCompare(b.word || ''));
+  return res.json(list);
 });
 
 app.post('/api/student-dictionary', async (req, res) => {
   const db = readDb();
   const caller = await getVerifiedUserFromRequest(req);
-  let { studentEmail, studentUid, teacherEmail, teacherName, entries, entry } = req.body || {};
-  let cleanEmail = (studentEmail || '').toLowerCase().trim();
-  let targetUid = (studentUid || '').trim();
 
-  // Etapa D: Cross-student write protection
-  if (caller) {
-    if (caller.role === 'student') {
-      const callerEmail = (caller.email || '').toLowerCase().trim();
-      const callerUid = caller.uid || '';
-      if ((targetUid && targetUid !== callerUid) || (cleanEmail && cleanEmail !== callerEmail)) {
-        return res.status(403).json({
-          error: 'Forbidden',
-          message: 'Cross-student modification prohibited. Students may only save to their own dictionary.',
-        });
-      }
-      cleanEmail = callerEmail;
-      targetUid = callerUid;
-    }
+  if (!caller) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Authentication required: verified user token missing.',
+    });
   }
 
-  if (!cleanEmail && !targetUid) {
-    return res.status(400).json({ error: 'studentEmail or studentUid is required' });
-  }
+  const { studentEmail, studentUid, lessonId, teacherEmail, teacherName, entries, entry } = req.body || {};
 
-  if (!db.studentDictionaryMap) db.studentDictionaryMap = {};
-  const currentList: any[] =
-    (cleanEmail && db.studentDictionaryMap[cleanEmail]) ||
-    (targetUid && db.studentDictionaryMap[targetUid]) ||
-    [];
-
-  const dictMap = new Map<string, any>();
-  currentList.forEach((e: any) => {
-    const w = (e.normalizedWord || e.word || '').toLowerCase().trim();
-    if (w) dictMap.set(w, e);
+  // Resolve canonical student identity and verify teacher's authorized pedagogical link
+  const identityRes = await resolveCanonicalStudentIdentity({
+    caller,
+    studentEmail,
+    studentUid,
+    lessonId,
   });
+
+  if (!identityRes.authorized) {
+    return res.status(identityRes.statusCode || 403).json({
+      error: identityRes.statusCode === 422 ? 'Unprocessable Entity' : 'Forbidden',
+      message: identityRes.error || 'Access denied: unauthorized student dictionary persistence.',
+    });
+  }
+
+  const canonicalStudentUid = identityRes.canonicalStudentUid;
+  const verifiedStudentEmail = identityRes.studentEmail;
+
+  // Strict invariant: Teacher UID can NEVER be the student UID
+  if (caller.role === 'teacher' && canonicalStudentUid === caller.uid) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Teacher UID cannot be used as student UID for dictionary persistence.',
+    });
+  }
 
   const itemsToAdd = Array.isArray(entries) ? entries : (entry ? [entry] : []);
   if (itemsToAdd.length === 0) {
-    return res.json({ success: true, dictionary: Array.from(dictMap.values()) });
+    const existing = await fetchStudentVocabularyFromFirestoreServer(canonicalStudentUid, verifiedStudentEmail);
+    return res.json({ success: true, studentUid: canonicalStudentUid, dictionary: existing });
   }
 
-  itemsToAdd.forEach((item: any) => {
-    const rawWord = (item.word || '').trim();
-    if (!rawWord) return;
-    const lower = rawWord.toLowerCase();
-    const existing = dictMap.get(lower);
-
-    // Definition richness check (never replace richer definition with generic fallback)
-    const existingDef = (existing?.definitionEn || '').trim();
-    const newDef = (item.definitionEn || item.meaningOrTip || '').trim();
-    const genericFallbackRegex = /A (fundamental word|natural conversational expression|practical English term|Key communicative expression)/i;
-    const isNewGeneric = genericFallbackRegex.test(newDef);
-    const isExistingGeneric = genericFallbackRegex.test(existingDef);
-    const keepExistingDef = Boolean(existingDef && (!newDef || (isNewGeneric && !isExistingGeneric) || (existingDef.length > 20 && newDef.length < 15)));
-
-    const resolvedDef = keepExistingDef ? existingDef : (newDef || existingDef || '');
-    const resolvedExample = existing?.exampleSentenceEn && (!item.exampleSentenceEn || item.exampleSentenceEn.length < existing.exampleSentenceEn.length)
-      ? existing.exampleSentenceEn
-      : (item.exampleSentenceEn || item.exampleSentence || existing?.exampleSentenceEn || '');
-
-    // Accumulate origins (preserving both routine and native_notes)
-    const mergedOrigins = [...(existing?.origins || [])];
-    if (item.origins && Array.isArray(item.origins)) {
-      item.origins.forEach((orig: any) => {
-        const isDup = mergedOrigins.some(
-          (m: any) => m.source === orig.source && m.activityName === orig.activityName && m.date === orig.date
-        );
-        if (!isDup) mergedOrigins.push(orig);
-      });
-    } else if (item.source) {
-      const isDup = mergedOrigins.some((m: any) => m.source === item.source && m.activityName === item.sourceActivityName);
-      if (!isDup) {
-        mergedOrigins.push({
-          source: item.source,
-          activityName: item.sourceActivityName,
-          dayOfWeek: item.sourceDay,
-          date: item.learnedAt ? item.learnedAt.split('T')[0] : new Date().toISOString().split('T')[0],
-          lessonId: item.lessonRefId,
-          videoId: item.routineRef?.videoId,
-          videoTitle: item.routineRef?.videoTitle,
-        });
-      }
-    }
-
-    // Practice count: Never decrease or reset
-    const exCount = typeof existing?.practiceCount === 'number' ? existing.practiceCount : 0;
-    const inCount = typeof item.practiceCount === 'number' ? item.practiceCount : 0;
-    const mergedPracticeCount = Math.max(exCount, inCount);
-
-    let mergedLastPracticedAt = existing?.lastPracticedAt;
-    if (item.lastPracticedAt) {
-      if (!existing?.lastPracticedAt || new Date(item.lastPracticedAt) > new Date(existing.lastPracticedAt)) {
-        mergedLastPracticedAt = item.lastPracticedAt;
-      }
-    }
-
-    dictMap.set(lower, {
-      ...existing,
-      ...item,
-      id: existing?.id || item.id || `dict_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-      word: rawWord,
-      originalWord: item.originalWord || existing?.originalWord || rawWord,
-      normalizedWord: item.normalizedWord || existing?.normalizedWord || lower,
-      partOfSpeech: item.partOfSpeech || existing?.partOfSpeech || '',
-      definitionEn: resolvedDef,
-      exampleSentenceEn: resolvedExample,
-      phonetic: item.phonetic || existing?.phonetic,
-      audio: item.audio || item.audioUrl || existing?.audio,
-      learnedAt: existing?.learnedAt || item.learnedAt || new Date().toISOString(),
-      source: existing?.source && mergedOrigins.some((o: any) => o.source === 'live_lesson') ? 'live_lesson' : (item.source || existing?.source || 'api'),
-      sourceActivityName: item.sourceActivityName || existing?.sourceActivityName || (teacherName ? `Live Session with ${teacherName}` : 'Personal Dictionary'),
-      teacherEmail: teacherEmail || item.teacherEmail || existing?.teacherEmail,
-      teacherName: teacherName || item.teacherName || existing?.teacherName,
-      studentEmail: cleanEmail,
-      studentUid: targetUid,
-      origins: mergedOrigins,
-      practiceCount: mergedPracticeCount,
-      lastPracticedAt: mergedLastPracticedAt,
+  // Persist directly and permanently to Cloud Firestore using Firebase Admin SDK
+  try {
+    await saveStudentVocabularyToFirestoreServer(canonicalStudentUid, itemsToAdd, verifiedStudentEmail);
+  } catch (saveErr: any) {
+    console.error('Failed to persist student vocabulary in Firestore:', saveErr);
+    return res.status(500).json({
+      error: 'Internal Server Error',
+      message: 'Failed to persist student vocabulary to canonical Cloud Firestore.',
     });
-  });
+  }
 
-  const updated = Array.from(dictMap.values()).sort((a, b) => (a.word || '').localeCompare(b.word || ''));
-  if (cleanEmail) db.studentDictionaryMap[cleanEmail] = updated;
-  if (targetUid) db.studentDictionaryMap[targetUid] = updated;
+  // Retrieve authoritative consolidated list from canonical Firestore path
+  const updatedList = await fetchStudentVocabularyFromFirestoreServer(canonicalStudentUid, verifiedStudentEmail);
 
-  // Immediately persist accumulated vocabulary to Cloud Firestore
-  saveStudentVocabularyToFirestoreServer(targetUid, updated, cleanEmail).catch((err) => {
-    console.warn('Backend Firestore vocabulary save notice:', err);
-  });
-
+  // Sync memory cache
+  if (!db.studentDictionaryMap) db.studentDictionaryMap = {};
+  if (canonicalStudentUid) db.studentDictionaryMap[canonicalStudentUid] = updatedList;
+  if (verifiedStudentEmail) db.studentDictionaryMap[verifiedStudentEmail] = updatedList;
   await writeDbSync(db);
-  res.json({ success: true, dictionary: updated });
+
+  return res.json({
+    success: true,
+    studentUid: canonicalStudentUid,
+    studentEmail: verifiedStudentEmail,
+    dictionary: updatedList,
+  });
 });
 
 // Endpoint: Get student journal entries

@@ -42,6 +42,7 @@ import {
   EnglishLevel,
 } from '../types';
 import { syncSessionVocabularyToStudentDictionary } from '../utils/sessionVocabularySync';
+import { isValidCanonicalUid } from '../utils/studentPersistence';
 import { formatDateInTimeZone, formatTimeInTimeZone } from '../utils/timezone';
 import { doc, setDoc } from 'firebase/firestore';
 import { getDb } from '../firebase';
@@ -78,7 +79,12 @@ interface TeacherLiveLessonNotesPanelProps {
       driveLastSyncedAt?: string;
     }
   ) => void;
-  onAddWordsToDictionary?: (words: StudentDictionaryEntry[], studentEmail?: string) => void;
+  onAddWordsToDictionary?: (
+    words: StudentDictionaryEntry[],
+    studentEmail?: string,
+    studentUid?: string,
+    lessonId?: string
+  ) => Promise<any> | void;
   onAddWordsToWeeklyActivity?: (words: string[], studentEmail: string) => void;
   onSendStudentNotification?: (
     studentEmail: string,
@@ -938,24 +944,30 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             });
           }
 
-          // 4. Automatic Integration with Student's My Dictionary (Alt + W & Alt + P)
-          const targetStudentUid = activeStudent?.uid || activeStudent?.id || '';
+          // 4. Automatic Integration with Student's My Dictionary (Alt + W for New Word)
+          const targetStudentUid =
+            (activeLesson?.studentUid && isValidCanonicalUid(activeLesson.studentUid) ? activeLesson.studentUid : '') ||
+            (activeStudent?.uid && isValidCanonicalUid(activeStudent.uid) ? activeStudent.uid : '') ||
+            '';
+
           if (targetStudentUid || cleanEmail) {
-            syncSessionVocabularyToStudentDictionary({
-              studentUid: targetStudentUid || cleanEmail,
-              studentEmail: cleanEmail,
-              rawNotes: contentToSync,
-              studentLevel: activeStudent?.level || EnglishLevel.INTERMEDIATE,
-              sessionDate: effDate,
-              topic: topicToSync,
-              teacherName: currentAccount?.name || 'Native Friend',
-            })
-              .then((syncedWords) => {
-                if (syncedWords && syncedWords.length > 0 && typeof onAddWordsToDictionary === 'function') {
-                  onAddWordsToDictionary(syncedWords, cleanEmail);
-                }
-              })
-              .catch((syncErr) => console.warn('Vocabulary sync notice:', syncErr));
+            try {
+              const syncedWords = await syncSessionVocabularyToStudentDictionary({
+                studentUid: targetStudentUid,
+                studentEmail: cleanEmail,
+                rawNotes: contentToSync,
+                studentLevel: activeStudent?.level || EnglishLevel.INTERMEDIATE,
+                sessionDate: effDate,
+                topic: topicToSync,
+                teacherName: currentAccount?.name || 'Native Friend',
+                lessonId: targetLessonId || undefined,
+              });
+              if (syncedWords && syncedWords.length > 0 && typeof onAddWordsToDictionary === 'function') {
+                await onAddWordsToDictionary(syncedWords, cleanEmail, targetStudentUid, targetLessonId || undefined);
+              }
+            } catch (syncErr) {
+              console.warn('Vocabulary sync notice:', syncErr);
+            }
           }
         } else {
           setDriveSyncStatus('error');
@@ -1134,24 +1146,27 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           });
         }
 
-        // 4. Automatic Integration with Student's My Dictionary (Alt + W for New Word & Alt + P for Pronounce)
-        const targetStudentUid = activeStudent?.uid || activeStudent?.id || '';
+        // 4. Automatic Integration with Student's My Dictionary (Alt + W for New Word)
+        const targetStudentUid =
+          (activeLesson?.studentUid && isValidCanonicalUid(activeLesson.studentUid) ? activeLesson.studentUid : '') ||
+          (activeStudent?.uid && isValidCanonicalUid(activeStudent.uid) ? activeStudent.uid : '') ||
+          '';
+
         if (targetStudentUid || cleanEmail) {
-          syncSessionVocabularyToStudentDictionary({
-            studentUid: targetStudentUid || cleanEmail,
+          const syncedWords = await syncSessionVocabularyToStudentDictionary({
+            studentUid: targetStudentUid,
             studentEmail: cleanEmail,
             rawNotes: contentToSave,
             studentLevel: activeStudent?.level || EnglishLevel.INTERMEDIATE,
             sessionDate: effectiveDate,
             topic: topicToSave,
             teacherName: currentAccount?.name || 'Native Friend',
-          })
-            .then((syncedWords) => {
-              if (syncedWords && syncedWords.length > 0 && typeof onAddWordsToDictionary === 'function') {
-                onAddWordsToDictionary(syncedWords, cleanEmail);
-              }
-            })
-            .catch((syncErr) => console.warn('Vocabulary sync notice:', syncErr));
+            lessonId: selectedLessonId || undefined,
+          });
+
+          if (syncedWords && syncedWords.length > 0 && typeof onAddWordsToDictionary === 'function') {
+            await onAddWordsToDictionary(syncedWords, cleanEmail, targetStudentUid, selectedLessonId || undefined);
+          }
         }
 
         setLastSavedTimestamp(nowIso);

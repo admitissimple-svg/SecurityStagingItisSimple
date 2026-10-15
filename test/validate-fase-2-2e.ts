@@ -101,15 +101,11 @@ async function runTests() {
     const sentenceText = 'I will persevere with great resilience in my daily studies.';
     const wordsUsedInSentence = ['resilience', 'persevere'];
     const evalResult: WritingEvaluationResult = {
-      score: 95,
-      grammarScore: 95,
-      vocabularyScore: 95,
-      spellingScore: 100,
+      wordFeedbacks: [],
       correctedSentence: sentenceText,
       explanation: 'Excellent, natural use of both targeted words!',
       hasAnyError: false,
       usedWords: wordsUsedInSentence,
-      feedback: 'Great sentence.',
     };
 
     let dailyJournalEntriesState: DailyJournalEntry[] = [];
@@ -545,7 +541,7 @@ async function runTests() {
       'E.6b: Palavra presente em duas fontes é estritamente deduplicada (aparece uma única vez)'
     );
     assert(
-      consistencyResult?.origins && consistencyResult.origins.length >= 2,
+      Boolean(consistencyResult?.origins && consistencyResult.origins.length >= 2),
       'E.6c: Múltiplas origens (rotina + live lesson) preservadas no mesmo registro'
     );
 
