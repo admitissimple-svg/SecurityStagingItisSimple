@@ -3,6 +3,9 @@ import { NATIVE_FRIENDS_DICTIONARY_DATABASE } from '../data/dictionaryDatabase';
 import { parseNotesHtml, ParsedNotesResult } from './notesHtmlParser';
 import { auth } from '../firebase';
 
+export { parseNotesHtml };
+export type { ParsedNotesResult };
+
 export interface PedagogicalMistakeAnalysis {
   id: string;
   original: string;
@@ -40,6 +43,8 @@ export interface PedagogicalVocabularyItem {
   isPronunciationFocus?: boolean;
   isNewWord?: boolean;
   cefrLevel?: string;
+  isProvisional?: boolean;
+  isFallback?: boolean;
 }
 
 export interface PedagogicalLevelAdaptation {

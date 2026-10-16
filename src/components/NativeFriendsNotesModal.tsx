@@ -89,17 +89,37 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
 }) => {
   const isEn = currentLanguage === 'en';
 
-  // Resolved identity for strict UID-level isolation (HOTFIX 4B.8.1: canonical UID only, reject synthetic usr-*)
+  // Resolved identity for strict UID-level isolation (FASE 4B.8.2: authenticated Firebase Auth UID exclusively)
+  const [currentUserAuthUid, setCurrentUserAuthUid] = useState<string>(() => {
+    const uid = auth?.currentUser?.uid;
+    return isValidCanonicalUid(uid) ? (uid as string) : '';
+  });
+
+  useEffect(() => {
+    const syncAuth = () => {
+      const uid = auth?.currentUser?.uid;
+      setCurrentUserAuthUid(isValidCanonicalUid(uid) ? (uid as string) : '');
+    };
+    syncAuth();
+
+    const unsub = auth?.onAuthStateChanged
+      ? auth.onAuthStateChanged((user) => {
+          const uid = user?.uid;
+          setCurrentUserAuthUid(isValidCanonicalUid(uid) ? (uid as string) : '');
+        })
+      : undefined;
+
+    return () => {
+      if (unsub) unsub();
+    };
+  }, []);
+
   const resolvedUid = useMemo(() => {
-    const authUid = auth?.currentUser?.uid;
-    if (isValidCanonicalUid(authUid)) return authUid;
-    if (isValidCanonicalUid(studentUid)) return studentUid;
-    const accUid = (currentAccount as any)?.uid || currentAccount?.id;
-    if (isValidCanonicalUid(accUid)) return accUid;
-    const profUid = userProfile?.uid || userProfile?.id;
-    if (isValidCanonicalUid(profUid)) return profUid;
-    return '';
-  }, [studentUid, userProfile?.uid, userProfile?.id, currentAccount?.id, (currentAccount as any)?.uid]);
+    // Strictly authenticated Firebase Auth UID only, never synthetic or profile IDs
+    return currentUserAuthUid;
+  }, [currentUserAuthUid]);
+
+  const hasValidAuth = Boolean(resolvedUid && isValidCanonicalUid(resolvedUid));
 
   const resolvedEmail = useMemo(() => {
     return (
@@ -133,17 +153,19 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
 
   // Hydrate confirmed persisted dictionary words from student's backend dictionary
   useEffect(() => {
-    if (!isOpen || (!resolvedUid && !resolvedEmail)) return;
+    // FASE 4B.8.2: Await valid canonical authentication before querying protected dictionary data
+    if (!isOpen || !hasValidAuth) return;
     let isMounted = true;
 
     async function loadStudentPersistedDictionary() {
       try {
-        const token = (await getAccessToken().catch(() => null));
+        const token = (await getAccessToken().catch(() => null)) || (await auth?.currentUser?.getIdToken().catch(() => null));
         const headers: Record<string, string> = {};
         if (token) headers['Authorization'] = `Bearer ${token}`;
 
+        // Strictly query by authenticated canonical UID only (never use studentEmail as an identity substitute)
         const res = await fetch(
-          `/api/student-dictionary?studentEmail=${encodeURIComponent(resolvedEmail)}${resolvedUid ? `&uid=${encodeURIComponent(resolvedUid)}` : ''}`,
+          `/api/student-dictionary?uid=${encodeURIComponent(resolvedUid)}`,
           { headers }
         ).catch(() => null);
 
@@ -168,7 +190,7 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
     return () => {
       isMounted = false;
     };
-  }, [isOpen, resolvedUid, resolvedEmail]);
+  }, [isOpen, hasValidAuth, resolvedUid]);
 
   // Transformation data state
   const [transformation, setTransformation] = useState<PedagogicalLessonTransformation | null>(null);
@@ -226,21 +248,26 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
 
   // Load and consolidate sessions for this isolated student (sorted strictly descending: newest first)
   const fetchStudentSessions = useCallback(async () => {
+    // FASE 4B.8.2: Await valid canonical authentication before querying protected sessions
+    if (!hasValidAuth) {
+      setSessionOptions([]);
+      setIsLoadingSessions(false);
+      return;
+    }
+
     setIsLoadingSessions(true);
     const sessionsMap = new Map<string, SessionOption>();
 
     try {
-      // 1. In-memory / passed lessons matching student UID or Email
+      // 1. In-memory / passed lessons strictly matching authenticated student canonical UID
       if (Array.isArray(lessons)) {
         lessons.forEach((l) => {
           if (!l) return;
           const lStudentUid = l.studentUid || (l as any)?.studentId || '';
-          const lStudentEmail = (l.studentEmail || '').toLowerCase().trim();
 
           const matchesUid = resolvedUid && lStudentUid && lStudentUid === resolvedUid;
-          const matchesEmail = resolvedEmail && lStudentEmail && lStudentEmail === resolvedEmail;
 
-          if (matchesUid || matchesEmail || (!resolvedUid && !resolvedEmail)) {
+          if (matchesUid) {
             const raw =
               l.sessionNotesDocument ||
               l.liveNotes ||
@@ -302,11 +329,10 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
         console.warn('NativeFriendsNotes: Firestore /users query notice:', fsErr);
       }
 
-      // 3. Query Server API: /api/session-notes
+      // 3. Query Server API: /api/session-notes strictly by canonical studentUid
       try {
         const queryParams = new URLSearchParams();
-        if (resolvedUid) queryParams.set('studentUid', resolvedUid);
-        if (resolvedEmail) queryParams.set('studentEmail', resolvedEmail);
+        queryParams.set('studentUid', resolvedUid);
 
         const res = await fetch(`/api/session-notes?${queryParams.toString()}`);
         if (res.ok) {
@@ -405,13 +431,14 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
         setTransformation(result);
 
         // Automatically sync session vocabulary (proven Alt + W only) into student's My Dictionary in Firestore via backend
-        if (resolvedUid || resolvedEmail) {
+        // FASE 4B.8.2: Require valid canonical authentication prior to persisting
+        if (hasValidAuth) {
           setIsSyncingVocab(true);
           setVocabSyncError(null);
           try {
             const isDefinitive = Boolean(result.isAiGenerated && !result.isProvisional && !result.isFallback);
             const syncedEntries = await syncSessionVocabularyToStudentDictionary({
-              studentUid: resolvedUid, // Strictly canonical UID, never fallback to email
+              studentUid: resolvedUid, // Strictly canonical UID from authenticated Firebase Auth
               studentEmail: resolvedEmail,
               rawNotes: activeSession.rawContent,
               vocabularyAndExpressions: result.vocabularyAndExpressions,
@@ -612,6 +639,18 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
           )}
         </div>
 
+        {/* Auth status notice for protected operations */}
+        {!hasValidAuth && (
+          <div className="bg-amber-50 border-b border-amber-200/80 px-4 sm:px-7 py-2.5 text-xs text-amber-900 flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+            <span>
+              {isEn
+                ? 'Authenticating session... Protected student notes and vocabulary persistence require a valid Firebase Auth session.'
+                : 'Aguardando autenticação válida com Firebase Auth para acessar e sincronizar anotações e dicionário protegidos do aluno.'}
+            </span>
+          </div>
+        )}
+
         {/* Section Navigation Tabs (Pedagogical Sections) */}
         <div className="bg-white border-b border-[#9AB4FF]/25 px-4 sm:px-7 py-2.5 flex items-center justify-between gap-2 overflow-x-auto [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden shrink-0">
           <div className="flex items-center gap-1.5 shrink-0 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
@@ -715,7 +754,23 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
 
         {/* Modal Scrollable Body */}
         <div className="flex-1 overflow-y-auto p-5 sm:p-7 space-y-4 bg-slate-50/50">
-          {isLoadingSessions || isLoadingTransformation ? (
+          {!hasValidAuth ? (
+            <div className="py-20 flex flex-col items-center justify-center text-center space-y-4">
+              <div className="w-14 h-14 rounded-3xl bg-amber-50 text-amber-600 border border-amber-200/80 flex items-center justify-center shadow-xs">
+                <AlertTriangle className="w-7 h-7" />
+              </div>
+              <div className="max-w-md px-4">
+                <h3 className="text-base font-black text-[#000035]">
+                  {isEn ? 'Awaiting Secure Authentication' : 'Aguardando Autenticação Segura'}
+                </h3>
+                <p className="text-xs text-slate-500 mt-1 leading-relaxed">
+                  {isEn
+                    ? 'Protected student session notes and personal dictionary synchronization require an authenticated Firebase session.'
+                    : 'A visualização de anotações e a persistência no My Dictionary exigem autenticação válida da aluna no Firebase.'}
+                </p>
+              </div>
+            </div>
+          ) : isLoadingSessions || isLoadingTransformation ? (
             <div className="py-20 flex flex-col items-center justify-center text-center space-y-4">
               <div className="w-14 h-14 rounded-3xl bg-[#000035] text-[#9AB4FF] flex items-center justify-center animate-bounce shadow-lg">
                 <Sparkles className="w-7 h-7" />

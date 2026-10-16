@@ -1462,7 +1462,7 @@ function consolidateServerEntries(existingEntries: any[], newEntries: any[]): an
     const resolvedDef = keepExistingDef ? existingDef : (newDef || existingDef || '');
     const resolvedEnrichmentStatus = (isExistingEnriched && isItemProvisional)
       ? 'enriched'
-      : (item.enrichmentStatus === 'enriched' && !isItemProvisional && Boolean(newDef))
+      : (item.enrichmentStatus === 'enriched' && !isItemProvisional && Boolean(newDef) && !isNewGeneric)
       ? 'enriched'
       : (existing.enrichmentStatus === 'enriched' ? 'enriched' : (item.enrichmentStatus || existing.enrichmentStatus || 'pending'));
     const resolvedExample = existing.exampleSentenceEn && (!item.exampleSentenceEn || item.exampleSentenceEn.length < existing.exampleSentenceEn.length)
@@ -1524,6 +1524,7 @@ function consolidateServerEntries(existingEntries: any[], newEntries: any[]): an
       originalWord: item.originalWord || existing.originalWord || rawWord,
       normalizedWord: key,
       definitionEn: resolvedDef,
+      simpleDefinition: item.simpleDefinition || existing.simpleDefinition || undefined,
       exampleSentenceEn: resolvedExample,
       origins: mergedOrigins,
       practiceCount: mergedPracticeCount,

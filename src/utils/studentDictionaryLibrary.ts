@@ -30,6 +30,7 @@ export function normalizeDictionaryWord(rawWord?: string | null): string {
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/['’]/g, "'")
+    .replace(/^[“"']+|[”"']+$/g, '')
     .replace(/\s+/g, ' ');
 }
 
@@ -315,6 +316,10 @@ export function consolidateDictionaryEntries(
       lastPracticedAt: mergedLastPracticedAt,
       practiceHistory: mergedPracticeHistory,
       enrichmentStatus,
+      isProvisional: isIncomingProvisional && !isExistingEnriched,
+      simpleDefinition: (isExistingEnriched && isIncomingProvisional && (existing as any).simpleDefinition)
+        ? (existing as any).simpleDefinition
+        : (incoming.simpleDefinition || (existing as any).simpleDefinition || undefined),
       aiMetadata: incoming.aiMetadata || existing.aiMetadata,
       notFound: existing.notFound && incoming.notFound,
     };

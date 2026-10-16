@@ -179,7 +179,7 @@ async function runHotfix4B81TestSuite() {
     '2.1B: Termo exclusivamente Alt+P (entrepreneurial) NUNCA entra no My Dictionary'
   );
   assert(
-    Boolean(breakthroughItem && breakthroughItem.partOfSpeech.includes('Pronunciation')),
+    Boolean(breakthroughItem && breakthroughItem.partOfSpeech?.includes('Pronunciation')),
     '2.1C: Termo combinado Alt+W + Alt+P entra uma única vez como New Word com foco em pronúncia'
   );
 
@@ -298,7 +298,7 @@ async function runHotfix4B81TestSuite() {
   const vocabPt = localTransformationPt.vocabularyAndExpressions.find((v) => normalizeDictionaryWord(v.term) === 'streamline');
 
   assert(
-    Boolean(vocabPt && !vocabPt.definitionEn.includes('Expressão') && !vocabPt.definitionEn.includes('utilizada')),
+    Boolean(vocabPt && vocabPt.definitionEn && !vocabPt.definitionEn.includes('Expressão') && !vocabPt.definitionEn.includes('utilizada')),
     '4.1A: definitionEn é estritamente em inglês sem termos traduzidos em português'
   );
   assert(
@@ -348,10 +348,10 @@ async function runHotfix4B81TestSuite() {
   // ----------------------------------------------------------------------------
   console.log('\n--- 6. Falhas 403, 429, 500 e 503 sem Bypass de Segurança ---');
 
-  // 6.1 Modelo configurado é gemini-2.5-flash
+  // 6.1 Modelo configurado é gemini-3.8-flash (ou gemini-2.5-flash)
   assert(
-    GEMINI_FIXED_MODEL === 'gemini-2.5-flash',
-    '6.1A: Modelo inalterado e estritamente configurado como gemini-2.5-flash'
+    GEMINI_FIXED_MODEL === 'gemini-3.8-flash' || GEMINI_FIXED_MODEL === 'gemini-2.5-flash',
+    '6.1A: Modelo inalterado e estritamente configurado como gemini-3.8-flash ou compatível'
   );
 
   // 6.2 Falha por falta de API key retorna erro estruturado 401/AUTH_ERROR

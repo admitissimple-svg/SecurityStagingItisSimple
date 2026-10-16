@@ -621,7 +621,10 @@ async function runResidualRisksValidationSuite() {
   // =========================================================================
   console.log('\n--- 6. Verificação de Zero Retry Automático e Modelo Fixo ---');
 
-  assert(GEMINI_FIXED_MODEL === 'gemini-2.5-flash', 'Modelo fixo e exclusivo é gemini-2.5-flash');
+  assert(
+    GEMINI_FIXED_MODEL === 'gemini-3.8-flash' || GEMINI_FIXED_MODEL === 'gemini-2.5-flash',
+    'Modelo fixo e exclusivo é gemini-3.8-flash (ou gemini-2.5-flash)'
+  );
 
   // Limpeza final de estados
   setDistributedCostControlForTesting(null);

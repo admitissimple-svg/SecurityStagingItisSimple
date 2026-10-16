@@ -29,6 +29,8 @@ import { sanitizeTimeZone } from '../utils/timezone';
 import { LiveMeetLessonsPanel } from './LiveMeetLessonsPanel';
 import { NativeFriendsNotesModal } from './NativeFriendsNotesModal';
 import { useNativeFriendsNotesReminder } from '../hooks/useNativeFriendsNotesReminder';
+import { auth } from '../firebase';
+import { isValidCanonicalUid } from '../utils/studentPersistence';
 
 // Pure in-memory tracking for review opened/completed state during active session (ZERO sessionStorage)
 const inMemorySessionReviewKeys = new Set<string>();

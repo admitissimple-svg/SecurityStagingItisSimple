@@ -132,6 +132,7 @@ export interface StudentDictionaryEntry {
   id: string;
   word: string;
   definitionEn: string;
+  simpleDefinition?: string;
   partOfSpeech?: string;
   phonetic?: string;
   exampleSentenceEn?: string;
@@ -167,6 +168,8 @@ export interface StudentDictionaryEntry {
   firstSeenAt?: string;
   practiceHistory?: DictionaryPracticeRecord[];
   enrichmentStatus?: 'pending' | 'enriched' | 'failed' | 'manual' | 'standard' | string;
+  isProvisional?: boolean;
+  isFallback?: boolean;
   aiMetadata?: DictionaryAiMetadata;
 }
 export interface GoogleAccount {

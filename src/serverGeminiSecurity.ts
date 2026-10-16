@@ -16,10 +16,13 @@
  */
 
 import crypto from 'crypto';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { getFirestoreDb } from './serverFirestore';
 
-export const GEMINI_FIXED_MODEL = 'gemini-2.5-flash';
+export const GEMINI_FIXED_MODEL =
+  process.env.GEMINI_MODEL && process.env.GEMINI_MODEL !== 'gemini-2.5-flash'
+    ? process.env.GEMINI_MODEL
+    : 'gemini-3.8-flash';
 
 export type GeminiFeature =
   | 'pedagogical_transform'
@@ -437,12 +440,14 @@ export function validatePayloadBounds(
  * - Strict timeout deadline
  * - Sanitized logging and untrusted input protection
  */
+export type GeminiFailureCategory = 'QUOTA_EXCEEDED' | 'AUTH_ERROR' | 'TIMEOUT' | 'INVALID_RESPONSE' | 'POLICY_VIOLATION' | string;
+
 export interface GeminiSingleAttemptResponse {
   text?: string;
   parsedJson: any | null;
   error?: {
     statusCode?: number;
-    category: GeminiFailureCategory | string;
+    category: GeminiFailureCategory;
     safeReason: string;
     rawMessage?: string;
   };
@@ -502,14 +507,19 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
 
     const contents = `[DATA_BLOCK_START]\n${untrustedUserDataPrompt.trim()}\n[DATA_BLOCK_END]`;
 
-    // Strict config for gemini-2.5-flash:
-    // Notice: thinkingConfig / thinkingLevel is specifically verified and OMITTED because gemini-2.5-flash does not support thinkingLevel.
+    // Config for Gemini model:
+    // FASE 4B.8.2: For Gemini 3 series models (gemini-3.8-flash), configure thinkingLevel: ThinkingLevel.LOW
+    // to minimize latency, protect token budget, and ensure structured JSON adherence without reasoning token overflow.
     const config: any = {
       systemInstruction: hardenedSystemInstruction,
       responseMimeType: 'application/json',
       maxOutputTokens: policy.maxOutputTokens,
       temperature,
     };
+
+    if (GEMINI_FIXED_MODEL.startsWith('gemini-3') || GEMINI_FIXED_MODEL.startsWith('gemini-4')) {
+      config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+    }
 
     let timerId: NodeJS.Timeout | null = null;
     const timeoutPromise = new Promise<never>((_, reject) => {
