@@ -92,6 +92,8 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
     advanceSequentialStep,
     latestSession,
     isReviewCompletedToday,
+    storedLastReminderShownDate,
+    claimDailyReminder,
   } = useNativeFriendsNotesReminder({
     studentUid,
     studentEmail,
@@ -104,7 +106,9 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
   const [isAlertOpen, setIsAlertOpen] = useState(false);
   const hasAutoOpenedRef = useRef<boolean>(false);
 
-  // Regra 1: Abertura Única Inicial: O painel do Sequential Review deve abrir automaticamente apenas na primeira vez que o aluno abrir/carregar o aplicativo na sessão/dia.
+  // Regra 1: Abertura Única Inicial (FASE 4B.8):
+  // Exibição atômica no máximo uma vez por dia por aluno no fuso horário do aluno.
+  // Imune a reload, logout/login, remontagem e troca de dispositivo via backend/Firestore.
   useEffect(() => {
     if (!reminder) return;
     const studentKey = (studentUid || studentEmail || '').trim().toLowerCase();
@@ -118,44 +122,29 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
       day: '2-digit',
     }).format(new Date());
 
-    const sessionOpenedKey = `sequential_review_opened_${studentKey}_${todayStr}`;
-    const sessionCompletedKey = `sequential_review_completed_${studentKey}_${todayStr}`;
-
-    let alreadyOpenedOrCompleted =
-      hasAutoOpenedRef.current ||
-      isReviewCompletedToday ||
-      inMemorySessionReviewKeys.has(sessionOpenedKey) ||
-      inMemorySessionReviewKeys.has(sessionCompletedKey);
-
-    if (!alreadyOpenedOrCompleted) {
-      hasAutoOpenedRef.current = true;
-      inMemorySessionReviewKeys.add(sessionOpenedKey);
-      setIsAlertOpen(true);
+    if (hasAutoOpenedRef.current || isReviewCompletedToday) {
+      return;
     }
-  }, [reminder, studentUid, studentEmail, timeZone, isReviewCompletedToday]);
 
-  // Regra 2: Fechamento ao Concluir: Assim que o aluno concluir a revisão do dia (marcando-a como concluída/lida), o painel deve ser fechado imediatamente.
+    if (storedLastReminderShownDate && storedLastReminderShownDate === todayStr) {
+      return;
+    }
+
+    hasAutoOpenedRef.current = true;
+    claimDailyReminder().then((res) => {
+      if (res && res.canShow) {
+        setIsAlertOpen(true);
+      }
+    }).catch(() => {});
+  }, [reminder, studentUid, studentEmail, timeZone, storedLastReminderShownDate, isReviewCompletedToday, claimDailyReminder]);
+
+  // Regra 2: Fechamento ao Concluir: Assim que o aluno concluir a revisão do dia, fecha imediatamente e avança o ciclo.
   const handleCompleteReview = useCallback(() => {
     setIsAlertOpen(false);
     setIsNotesModalOpen(false);
-
-    const studentKey = (studentUid || studentEmail || '').trim().toLowerCase();
-    const effectiveTz = sanitizeTimeZone(timeZone);
-    const todayStr = new Intl.DateTimeFormat('en-CA', {
-      timeZone: effectiveTz,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    }).format(new Date());
-
     hasAutoOpenedRef.current = true;
-    if (studentKey) {
-      inMemorySessionReviewKeys.add(`sequential_review_opened_${studentKey}_${todayStr}`);
-      inMemorySessionReviewKeys.add(`sequential_review_completed_${studentKey}_${todayStr}`);
-    }
-
     advanceSequentialStep();
-  }, [advanceSequentialStep, studentUid, studentEmail, timeZone]);
+  }, [advanceSequentialStep]);
 
   const handleOpenNotesTab = (tab: 'all' | 'mistakes' | 'grammar' | 'vocab' | 'summary') => {
     setModalInitialTab(tab);

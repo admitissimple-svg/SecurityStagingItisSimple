@@ -4,7 +4,6 @@ import {
   resolveCefrLevel,
   PedagogicalVocabularyItem,
 } from './pedagogicalTransformer';
-import { lookupWord } from './dictionaryService';
 import { persistStudentVocabularyViaBackendApi } from './studentPersistence';
 import { normalizeDictionaryWord } from './studentDictionaryLibrary';
 
@@ -82,6 +81,7 @@ export async function syncSessionVocabularyToStudentDictionary(
     definitionEn?: string;
     exampleSentenceEn?: string;
     phonetic?: string;
+    cefrLevel?: string;
   }
 
   const candidateMap = new Map<string, TermMetadata>();
@@ -154,9 +154,10 @@ export async function syncSessionVocabularyToStudentDictionary(
         isPronounce,
         isNewWord: true,
         partOfSpeech: v.partOfSpeech || (isPronounce ? 'Pronunciation Focus' : 'Expression'),
-        definitionEn: v.simpleDefinition || existing?.definitionEn,
-        exampleSentenceEn: Array.isArray(v.realExamples) && v.realExamples.length > 0 ? v.realExamples[0] : existing?.exampleSentenceEn,
+        definitionEn: v.simpleDefinition || (v as any).definitionEn || existing?.definitionEn,
+        exampleSentenceEn: Array.isArray(v.realExamples) && v.realExamples.length > 0 ? v.realExamples[0] : (v as any).exampleSentenceEn || existing?.exampleSentenceEn,
         phonetic: v.phoneticGuide || existing?.phonetic,
+        cefrLevel: v.cefrLevel || existing?.cefrLevel,
       };
 
       candidateMap.set(key, candidate);
@@ -171,44 +172,11 @@ export async function syncSessionVocabularyToStudentDictionary(
   const dictionaryEntries: StudentDictionaryEntry[] = [];
 
   for (const [key, meta] of candidateMap.entries()) {
-    let definition = meta.definitionEn || '';
-    let example = meta.exampleSentenceEn || '';
-    let partOfSpeech = meta.partOfSpeech || '';
-    let phonetic = meta.phonetic || '';
-
-    // If definition or example is missing, do a pedagogical dictionary lookup (No Gemini)
-    if (!definition || !example || !partOfSpeech) {
-      try {
-        const lookupRes = await lookupWord(meta.term, undefined, studentLevel);
-        if (lookupRes && !lookupRes.notFound && lookupRes.definitionEn) {
-          if (!definition) definition = lookupRes.definitionEn;
-          if (!example && lookupRes.exampleSentenceEn) example = lookupRes.exampleSentenceEn;
-          if (!partOfSpeech && lookupRes.partOfSpeech) partOfSpeech = lookupRes.partOfSpeech;
-          if (!phonetic && lookupRes.phonetic) phonetic = lookupRes.phonetic;
-        }
-      } catch (err) {
-        console.warn(`Dictionary lookup notice for "${meta.term}":`, err);
-      }
-    }
-
-    // Default pedagogical fallback for definitions if API did not return one
-    if (!definition) {
-      definition = meta.isPronounce
-        ? `Pronunciation focus: Pay careful attention to syllable stress, vowel reduction, and clear articulation of "${meta.term}".`
-        : cefrMeta.cefr === 'A1' || cefrMeta.cefr === 'A2'
-        ? `A fundamental word for level ${cefrMeta.cefr}: practice using "${meta.term}" in simple everyday conversations.`
-        : cefrMeta.cefr === 'B1' || cefrMeta.cefr === 'B2'
-        ? `A natural conversational expression to enrich your speaking flow and vocabulary range.`
-        : `An advanced lexical item to elevate your expressive nuance and natural delivery.`;
-    }
-
-    if (!example) {
-      example = `In everyday conversation: "I practiced using '${meta.term}' with my Native Friend today."`;
-    }
-
-    if (!partOfSpeech) {
-      partOfSpeech = meta.isPronounce ? 'Pronunciation Focus' : 'Expression';
-    }
+    const isEnriched = Boolean(meta.definitionEn && meta.definitionEn.trim());
+    const definition = meta.definitionEn || '';
+    const example = meta.exampleSentenceEn || '';
+    const partOfSpeech = meta.partOfSpeech || (meta.isPronounce ? 'Pronunciation Focus' : 'Expression');
+    const phonetic = meta.phonetic || undefined;
 
     const docId = `dict_${key.replace(/[^a-zA-Z0-9_-]/g, '_')}_${sessionDate.replace(/-/g, '')}`;
 
@@ -220,8 +188,8 @@ export async function syncSessionVocabularyToStudentDictionary(
       definitionEn: definition,
       partOfSpeech,
       exampleSentenceEn: formatSentence(example),
-      phonetic: phonetic || undefined,
-      cefrLevel: cefrMeta.cefr,
+      phonetic,
+      cefrLevel: meta.cefrLevel || cefrMeta.cefr,
       sourceActivityName: `Native Friends Notes (${topic})`,
       source: 'live_lesson',
       learnedAt: sessionDate ? `${sessionDate}T12:00:00.000Z` : new Date().toISOString(),
@@ -238,6 +206,7 @@ export async function syncSessionVocabularyToStudentDictionary(
         },
       ],
       lessonRefId: lessonId,
+      enrichmentStatus: isEnriched ? 'enriched' : 'pending',
     });
   }
 

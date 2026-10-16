@@ -716,6 +716,7 @@ export async function fetchPedagogicalTransformation(params: {
   sessionKey?: string;
   language?: string;
   forceRegenerate?: boolean;
+  triggerAiIfMissing?: boolean;
 }): Promise<PedagogicalLessonTransformation> {
   const {
     rawNotes,
@@ -729,6 +730,7 @@ export async function fetchPedagogicalTransformation(params: {
     sessionKey,
     language = 'pt',
     forceRegenerate = false,
+    triggerAiIfMissing = false,
   } = params;
 
   try {
@@ -781,7 +783,7 @@ export async function fetchPedagogicalTransformation(params: {
 
         if (cacheRes.ok) {
           const cachedData = await cacheRes.json();
-          if (cachedData && typeof cachedData === 'object' && !Array.isArray(cachedData) && cachedData.sessionKey) {
+          if (cachedData && typeof cachedData === 'object' && !Array.isArray(cachedData) && cachedData.sessionKey && cachedData.isAiGenerated && !cachedData.isProvisional) {
             return cachedData;
           }
         }
@@ -789,31 +791,33 @@ export async function fetchPedagogicalTransformation(params: {
         console.warn('Pedagogical cache lookup notice:', cacheErr);
       }
 
-      // If no cached entry exists, DO NOT automatically call paid Gemini API.
-      // Return the deterministic local notes flagged as provisional preview with explicit generation invitation.
-      const provisional = generateLocalPedagogicalTransformation({
-        rawNotes,
-        topic,
-        sessionDate,
-        teacherName,
-        studentLevel,
-        studentUid,
-        studentEmail,
-        lessonId,
-        sessionKey,
-        language,
-      });
-      provisional.isFallback = true;
-      provisional.isProvisional = true;
-      provisional.isAiGenerated = false;
-      provisional.needsAiGeneration = true;
-      provisional.aiNotice = language === 'en'
-        ? 'Preliminary teacher-faithful guide. Click "Generate with AI" for synthesized masterclass analysis.'
-        : 'Guia preliminar fiel às anotações do professor. Clique em "Gerar com IA" para sintetizar a análise pedagógica com Gemini.';
-      return provisional;
+      // If no valid cache exists and triggerAiIfMissing is FALSE (e.g. background reminder check or page load):
+      // Return deterministic local notes flagged as provisional preview. DO NOT trigger Gemini!
+      if (!triggerAiIfMissing) {
+        const provisional = generateLocalPedagogicalTransformation({
+          rawNotes,
+          topic,
+          sessionDate,
+          teacherName,
+          studentLevel,
+          studentUid,
+          studentEmail,
+          lessonId,
+          sessionKey,
+          language,
+        });
+        provisional.isFallback = true;
+        provisional.isProvisional = true;
+        provisional.isAiGenerated = false;
+        provisional.needsAiGeneration = true;
+        provisional.aiNotice = language === 'en'
+          ? 'Preliminary teacher-faithful guide. Open notes to synthesize masterclass analysis.'
+          : 'Guia preliminar fiel às anotações do professor. Abra as notas para sintetizar a análise pedagógica com Gemini.';
+        return provisional;
+      }
     }
 
-    // Explicit generation request (forceRegenerate === true):
+    // On-demand generation request (student opening notes or forceRegenerate):
     const res = await fetch('/api/pedagogical-notes/transform', {
       method: 'POST',
       headers,
@@ -828,7 +832,7 @@ export async function fetchPedagogicalTransformation(params: {
         lessonId,
         sessionKey,
         language,
-        forceRegenerate: true,
+        forceRegenerate,
       }),
     });
 

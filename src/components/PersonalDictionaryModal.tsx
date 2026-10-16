@@ -30,6 +30,9 @@ interface PersonalDictionaryModalProps {
   customSavedEntries?: StudentDictionaryEntry[];
   consolidatedEntries?: StudentDictionaryEntry[];
   excludedWords?: string[];
+  studentUid?: string;
+  studentEmail?: string;
+  studentLevel?: string;
   onSaveCustomEntry?: (entry: StudentDictionaryEntry) => void;
   onDeleteEntry?: (word: string) => Promise<any> | void;
   onOpenJournalModal?: () => void;
@@ -43,6 +46,9 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
   customSavedEntries = [],
   consolidatedEntries,
   excludedWords = [],
+  studentUid,
+  studentEmail,
+  studentLevel,
   onSaveCustomEntry,
   onDeleteEntry,
   onOpenJournalModal,
@@ -97,42 +103,70 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
     }
   };
 
-  // Automatically enrich words from routines via Free Dictionary API in background
+  // FASE 4B.8: Enrich words from video routines on demand exclusively via Gemini upon opening My Dictionary
   useEffect(() => {
     if (!isOpen || wordsFromRoutines.length === 0) return;
 
-    const wordsToFetch = wordsFromRoutines
-      .map((r) => (r.word || '').trim().toLowerCase())
-      .filter((w) => w && !apiEnrichedEntries[w] && !effectiveExcludedSet.has(normalizeDictionaryWord(w)));
+    const wordsToEnrich = wordsFromRoutines
+      .map((r) => (r.word || '').trim())
+      .filter((w) => {
+        const norm = normalizeDictionaryWord(w);
+        if (!norm || effectiveExcludedSet.has(norm)) return false;
+        const existing = (customSavedEntries || []).find(
+          (e) => normalizeDictionaryWord(e.normalizedWord || e.word) === norm && Boolean(e.definitionEn && e.definitionEn.trim())
+        );
+        return !existing && !apiEnrichedEntries[norm];
+      });
 
-    if (wordsToFetch.length === 0) return;
+    if (wordsToEnrich.length === 0) return;
 
-    // Fetch definitions for words entered in routine
-    wordsToFetch.slice(0, 15).forEach(async (w) => {
-      try {
-        const res = await lookupWord(w, undefined, undefined, undefined, undefined, customSavedEntries);
-        if (res && res.definitionEn) {
-          setApiEnrichedEntries((prev) => ({
-            ...prev,
-            [w]: {
-              definitionEn: res.definitionEn,
-              exampleSentenceEn: res.exampleSentenceEn,
-              partOfSpeech: res.partOfSpeech,
-              phonetic: res.phonetic,
-              source: res.source,
-              cefrLevel: res.cefrLevel,
-              notFound: res.notFound,
-            },
-          }));
+    const uniqueWords = Array.from(new Set(wordsToEnrich)).slice(0, 10);
+    const targetUid = studentUid || '';
+    const targetEmail = studentEmail || '';
+
+    if (!targetUid && !targetEmail) return;
+
+    fetch('/api/student-dictionary/enrich', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        studentUid: targetUid,
+        studentEmail: targetEmail,
+        words: uniqueWords,
+        studentLevel,
+      }),
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.success && Array.isArray(data.enrichedEntries)) {
+          data.enrichedEntries.forEach((entry: StudentDictionaryEntry) => {
+            const norm = normalizeDictionaryWord(entry.normalizedWord || entry.word);
+            if (norm) {
+              setApiEnrichedEntries((prev) => ({
+                ...prev,
+                [norm]: {
+                  definitionEn: entry.definitionEn,
+                  exampleSentenceEn: entry.exampleSentenceEn,
+                  partOfSpeech: entry.partOfSpeech,
+                  phonetic: entry.phonetic,
+                  cefrLevel: entry.cefrLevel,
+                  translationPt: entry.translationPt,
+                },
+              }));
+              if (onSaveCustomEntry) {
+                onSaveCustomEntry(entry);
+              }
+            }
+          });
         }
-      } catch (err) {
-        console.warn('Routine word background lookup error:', err);
-      }
-    });
-  }, [isOpen, wordsFromRoutines, effectiveExcludedSet, customSavedEntries]);
+      })
+      .catch((err) => {
+        console.warn('PersonalDictionaryModal: video words enrichment notice:', err);
+      });
+  }, [isOpen, wordsFromRoutines, effectiveExcludedSet, customSavedEntries, apiEnrichedEntries, studentUid, studentEmail, studentLevel, onSaveCustomEntry]);
 
   // Convert routine words into canonical StudentDictionaryEntry items
-  // Reusing existing My Dictionary definitions (2.2B.2) and omitting excluded words (2.2B.1)
+  // Reusing existing My Dictionary definitions and omitting excluded words
   const routineEntries: StudentDictionaryEntry[] = useMemo(() => {
     if (!wordsFromRoutines || wordsFromRoutines.length === 0) return [];
 
@@ -146,12 +180,10 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
         const norm = normalizeDictionaryWord(cleanWord);
         const lower = cleanWord.toLowerCase();
         
-        // 2.2B.2: Reutilizar definições ricas existentes no My Dictionary
         const existingInSaved = (customSavedEntries || []).find(
           (e) => normalizeDictionaryWord(e.normalizedWord || e.word) === norm && Boolean(e.definitionEn)
         );
         const enriched = apiEnrichedEntries[norm] || apiEnrichedEntries[lower];
-        const cached = getInstantOrCachedWord(cleanWord, item.sourceActivityName, undefined, undefined, undefined, customSavedEntries);
 
         const isLiveSession =
           (item.sourceActivityName || '').includes('Live Session') ||
@@ -161,15 +193,20 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
         const source = isLiveSession ? 'live_lesson' : 'routine';
         const originSource = isLiveSession ? 'native_notes' : 'routine';
 
+        const defEn = existingInSaved?.definitionEn || enriched?.definitionEn || '';
+        const exEn = existingInSaved?.exampleSentenceEn || enriched?.exampleSentenceEn || '';
+        const pos = existingInSaved?.partOfSpeech || enriched?.partOfSpeech || 'Word';
+        const transPt = existingInSaved?.translationPt || enriched?.translationPt || '';
+
         return {
           id: existingInSaved?.id || `routine_${norm || lower}`,
           word: cleanWord,
           originalWord: cleanWord,
           normalizedWord: norm || lower,
-          definitionEn: existingInSaved?.definitionEn || enriched?.definitionEn || cached.definitionEn || '',
-          partOfSpeech: existingInSaved?.partOfSpeech || enriched?.partOfSpeech || cached.partOfSpeech || '',
-          exampleSentenceEn: existingInSaved?.exampleSentenceEn || enriched?.exampleSentenceEn || cached.exampleSentenceEn || '',
-          translationPt: existingInSaved?.translationPt || cached.translationPt || '',
+          definitionEn: defEn,
+          partOfSpeech: pos,
+          exampleSentenceEn: exEn,
+          translationPt: transPt,
           phonetic: existingInSaved?.phonetic || enriched?.phonetic,
           source,
           sourceActivityName: item.sourceActivityName || 'Daily Routine',
@@ -183,7 +220,8 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
             },
           ],
           practiceCount: existingInSaved?.practiceCount || 0,
-          notFound: !existingInSaved && (enriched?.notFound || false),
+          notFound: false,
+          enrichmentStatus: defEn ? 'enriched' : 'pending',
         };
       });
   }, [wordsFromRoutines, apiEnrichedEntries, customSavedEntries, effectiveExcludedSet]);

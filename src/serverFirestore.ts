@@ -2024,6 +2024,171 @@ export async function saveSessionNotesProgressToFirestore(key: string, cyclePayl
 }
 
 /**
+ * Atomic registration of daily reminder presentation.
+ * Ensures the Native Friends Notes reminder is presented AT MOST ONCE per day per student UID,
+ * immune to page reload, component remount, or switching devices.
+ */
+export async function recordDailyReminderShownServer(
+  studentUid: string,
+  todayInTz: string
+): Promise<{ canShow: boolean; alreadyShown: boolean; lastReminderShownDate: string }> {
+  if (!studentUid || !todayInTz) {
+    return { canShow: false, alreadyShown: true, lastReminderShownDate: todayInTz };
+  }
+
+  const cleanUid = studentUid.trim();
+  const db = getFirestoreDb();
+  if (db && !isCloudWriteDisabled) {
+    try {
+      const userRef = db.collection('users').doc(cleanUid);
+      const subRef = userRef.collection('session_notes').doc('review_cycle');
+
+      if (typeof (db as any).runTransaction === 'function') {
+        const result = await (db as any).runTransaction(async (tx: any) => {
+          const snap = await tx.get(subRef);
+          let lastDate = '';
+          if (snap && snap.exists) {
+            const data = snap.data() || {};
+            lastDate = data.lastReminderShownDate || '';
+          } else {
+            const uSnap = await tx.get(userRef);
+            if (uSnap && uSnap.exists) {
+              const uData = uSnap.data() || {};
+              lastDate = uData.nativeNotesReview?.lastReminderShownDate || uData.lastReminderShownDate || '';
+            }
+          }
+
+          if (lastDate === todayInTz) {
+            return { canShow: false, alreadyShown: true, lastReminderShownDate: lastDate };
+          }
+
+          tx.set(
+            subRef,
+            {
+              lastReminderShownDate: todayInTz,
+              reminderShownAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            },
+            { merge: true }
+          );
+
+          tx.set(
+            userRef,
+            {
+              lastReminderShownDate: todayInTz,
+              'nativeNotesReview.lastReminderShownDate': todayInTz,
+              updatedAt: new Date().toISOString(),
+            },
+            { merge: true }
+          );
+
+          return { canShow: true, alreadyShown: false, lastReminderShownDate: todayInTz };
+        });
+        return result;
+      } else {
+        // Mock / non-transactional fallback
+        const snap = await subRef.get();
+        const data = snap && snap.exists ? snap.data() : null;
+        const lastDate = data?.lastReminderShownDate || '';
+        if (lastDate === todayInTz) {
+          return { canShow: false, alreadyShown: true, lastReminderShownDate: lastDate };
+        }
+        await subRef.set({ lastReminderShownDate: todayInTz, updatedAt: new Date().toISOString() }, { merge: true });
+        await userRef.set({ lastReminderShownDate: todayInTz, 'nativeNotesReview.lastReminderShownDate': todayInTz }, { merge: true });
+        return { canShow: true, alreadyShown: false, lastReminderShownDate: todayInTz };
+      }
+    } catch (err) {
+      console.warn('Firestore recordDailyReminderShownServer notice:', err);
+    }
+  }
+
+  return { canShow: true, alreadyShown: false, lastReminderShownDate: todayInTz };
+}
+
+/**
+ * Retrieve session notes progress from Firestore
+ */
+export async function fetchSessionNotesProgressServer(key: string): Promise<any> {
+  const cleanKey = (key || '').trim();
+  if (!cleanKey) return null;
+  const db = getFirestoreDb();
+  if (!db) return null;
+  try {
+    const userRef = db.collection('users').doc(cleanKey);
+    const subRef = userRef.collection('session_notes').doc('review_cycle');
+    const snap = await subRef.get();
+    if (snap && snap.exists) {
+      return snap.data();
+    }
+    const uSnap = await userRef.get();
+    if (uSnap && uSnap.exists) {
+      const data = uSnap.data() || {};
+      return data.nativeNotesReview || null;
+    }
+  } catch (err) {
+    if (!isPermissionError(err)) {
+      console.warn('fetchSessionNotesProgressServer notice:', err);
+    }
+  }
+  return null;
+}
+
+/**
+ * Persist pedagogical transformation in Cloud Firestore
+ */
+export async function savePedagogicalTransformationToFirestoreServer(
+  compositeCacheKey: string,
+  transformation: any
+): Promise<boolean> {
+  if (isCloudWriteDisabled) return false;
+  const db = getFirestoreDb();
+  if (!db || !compositeCacheKey || !transformation) return false;
+  try {
+    const sanitized = JSON.parse(JSON.stringify(transformation));
+    const sessionKey = transformation.sessionKey || compositeCacheKey.split('__')[0];
+    const sessionRef = db.collection('session_notes').doc(sessionKey);
+    await sessionRef.collection('pedagogical_cache').doc(compositeCacheKey).set(
+      {
+        ...sanitized,
+        cacheKey: compositeCacheKey,
+        savedAt: new Date().toISOString(),
+      },
+      { merge: true }
+    );
+    return true;
+  } catch (err) {
+    console.warn('Firestore savePedagogicalTransformation error:', err);
+    return false;
+  }
+}
+
+/**
+ * Retrieve pedagogical transformation from Cloud Firestore
+ */
+export async function fetchPedagogicalTransformationFromFirestoreServer(
+  compositeCacheKey: string
+): Promise<any | null> {
+  const db = getFirestoreDb();
+  if (!db || !compositeCacheKey) return null;
+  try {
+    const sessionKey = compositeCacheKey.split('__')[0];
+    const sessionRef = db.collection('session_notes').doc(sessionKey);
+    const snap = await sessionRef.collection('pedagogical_cache').doc(compositeCacheKey).get();
+    if (snap && snap.exists) {
+      const data = snap.data();
+      if (data && data.isAiGenerated && !data.isProvisional) {
+        return data;
+      }
+    }
+  } catch (err) {
+    if (!isPermissionError(err)) {
+      console.warn('Firestore fetchPedagogicalTransformation notice:', err);
+    }
+  }
+  return null;
+}
+
+/**
  * Direct persistence for Student Journal entries to users/{docId}
  */
 export async function saveStudentJournalToFirestore(docId: string, journal: any[]): Promise<boolean> {

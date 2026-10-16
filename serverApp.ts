@@ -107,6 +107,10 @@ import {
   isPermissionError,
   consolidateTutorsList,
   scheduleLessonAtomicServer,
+  recordDailyReminderShownServer,
+  fetchSessionNotesProgressServer,
+  savePedagogicalTransformationToFirestoreServer,
+  fetchPedagogicalTransformationFromFirestoreServer,
 } from './src/serverFirestore';
 import { normalizeDictionaryWord } from './src/utils/studentDictionaryLibrary';
 import { DEFAULT_CURATED_PLAYLISTS } from './src/utils/youtubeService';
@@ -146,6 +150,7 @@ import {
   profileWord,
 } from './src/utils/pedagogicalStorySynthesizer';
 import { analyzeSentenceGrammarDeterministic } from './src/utils/writingChecker';
+import { sanitizeTimeZone } from './src/utils/timezone';
 import crypto from 'crypto';
 import { parseNotesHtml } from './src/utils/notesHtmlParser';
 import {
@@ -7547,53 +7552,8 @@ app.post('/api/lessons/:id/notes', async (req, res) => {
     console.warn('Backend Firestore session notes auto-save notice:', err);
   });
 
-  // Automatically migrate vocabulary words to student's personal dictionary (isolated by student UID and email)
-  if (Array.isArray(vocabularyNotes) && vocabularyNotes.length > 0 && (targetStudentEmail || targetStudentUid)) {
-    if (!db.studentDictionaryMap) db.studentDictionaryMap = {};
-    const existingList: any[] =
-      (targetStudentEmail && db.studentDictionaryMap[targetStudentEmail]) ||
-      (targetStudentUid && db.studentDictionaryMap[targetStudentUid]) ||
-      [];
-
-    const dictMap = new Map<string, any>();
-    existingList.forEach((entry: any) => {
-      const w = (entry.word || '').toLowerCase().trim();
-      if (w) dictMap.set(w, entry);
-    });
-
-    vocabularyNotes.forEach((vn: any) => {
-      const w = (vn.word || '').trim();
-      if (!w) return;
-      const lower = w.toLowerCase();
-      dictMap.set(lower, {
-        id: vn.id || `dict_live_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-        word: w,
-        partOfSpeech: vn.partOfSpeech || '',
-        definitionEn: vn.meaningOrTip || '',
-        exampleSentenceEn: vn.exampleSentence || '',
-        phonetic: vn.phonetic,
-        audio: vn.audioUrl,
-        learnedAt: new Date().toISOString(),
-        source: vn.source || 'api',
-        sourceActivityName: `Live Session with ${teacherName || 'Native Friend'}`,
-        teacherEmail,
-        teacherName,
-        studentEmail: targetStudentEmail,
-        studentUid: targetStudentUid,
-      });
-    });
-
-    const updatedDict = Array.from(dictMap.values()).sort((a, b) => (a.word || '').localeCompare(b.word || ''));
-    if (targetStudentEmail) db.studentDictionaryMap[targetStudentEmail] = updatedDict;
-    if (targetStudentUid) db.studentDictionaryMap[targetStudentUid] = updatedDict;
-
-    // Immediately persist accumulated vocabulary to Cloud Firestore
-    saveStudentVocabularyToFirestoreServer(targetStudentUid, updatedDict, targetStudentEmail).catch((err) => {
-      console.warn('Backend Firestore vocabulary save notice:', err);
-    });
-  }
-
   // Invalidate all versions (languages, CEFR levels, hashes) of cached pedagogical transformation for this session
+  // Teacher saving notes does NOT generate Gemini and does NOT write directly to student's dictionary
   invalidatePedagogicalCache(db, {
     canonicalSessionKey: sessionKey,
     sessionKey,
@@ -8031,39 +7991,105 @@ app.get('/api/session-notes/progress', async (req, res) => {
   const studentEmail = ((req.query.studentEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
   const key = studentUid || studentEmail;
   if (!key) return res.status(400).json({ error: 'Missing student identifier' });
-  const progressMap = db.sessionNotesProgressMap || {};
-  return res.json(progressMap[key] || null);
+
+  let progress = (db.sessionNotesProgressMap && db.sessionNotesProgressMap[key]) || null;
+  if ((!progress || !progress.lastReminderShownDate) && studentUid) {
+    const fsProgress = await fetchSessionNotesProgressServer(studentUid);
+    if (fsProgress) {
+      if (!db.sessionNotesProgressMap) db.sessionNotesProgressMap = {};
+      progress = {
+        ...(progress || {}),
+        ...fsProgress,
+      };
+      db.sessionNotesProgressMap[key] = progress;
+    }
+  }
+  return res.json(progress || null);
 });
 
 // Update Native Friends Notes Sequential Review Progress
 app.post('/api/session-notes/progress', async (req, res) => {
-  const { studentUid, studentEmail, lastSessionKey, stepIndex, lastReviewedTab } = req.body;
+  const { studentUid, studentEmail, lastSessionKey, stepIndex, lastReviewedTab, lastReviewedDate } = req.body || {};
   const key = (studentUid || studentEmail || '').trim();
   if (!key) return res.status(400).json({ error: 'Missing student identifier' });
   const db = readDb();
   db.sessionNotesProgressMap = db.sessionNotesProgressMap || {};
-  db.sessionNotesProgressMap[key] = {
-    studentUid: studentUid || '',
-    studentEmail: (studentEmail || '').toLowerCase().trim(),
-    lastSessionKey: lastSessionKey || '',
-    stepIndex: typeof stepIndex === 'number' ? stepIndex : 0,
-    lastReviewedTab: lastReviewedTab || '',
+  const existingProg = db.sessionNotesProgressMap[key] || {};
+
+  const updatedProgress = {
+    ...existingProg,
+    studentUid: studentUid || existingProg.studentUid || '',
+    studentEmail: (studentEmail || existingProg.studentEmail || '').toLowerCase().trim(),
+    lastSessionKey: lastSessionKey !== undefined ? lastSessionKey : (existingProg.lastSessionKey || ''),
+    stepIndex: typeof stepIndex === 'number' ? stepIndex : (existingProg.stepIndex || 0),
+    lastReviewedTab: lastReviewedTab !== undefined ? lastReviewedTab : (existingProg.lastReviewedTab || ''),
+    lastReviewedDate: lastReviewedDate !== undefined ? lastReviewedDate : (existingProg.lastReviewedDate || ''),
+    lastReminderShownDate: existingProg.lastReminderShownDate || '',
     updatedAt: new Date().toISOString(),
   };
-  writeDb(db);
 
-  // Direct atomic write to Cloud Firestore
-  const cyclePayload = {
-    studentUid: studentUid || '',
-    studentEmail: (studentEmail || '').toLowerCase().trim(),
-    lastSessionKey: lastSessionKey || '',
-    stepIndex: typeof stepIndex === 'number' ? stepIndex : 0,
-    lastReviewedTab: lastReviewedTab || '',
+  db.sessionNotesProgressMap[key] = updatedProgress;
+  await writeDbSync(db);
+
+  saveSessionNotesProgressToFirestore(key, updatedProgress).catch(() => {});
+  return res.json({ success: true, progress: updatedProgress });
+});
+
+// Atomic Daily Reminder Claim Endpoint (Presented AT MOST ONCE per day per student)
+app.post('/api/session-notes/reminder/claim', async (req, res) => {
+  const caller = await getVerifiedUserFromRequest(req);
+  const { studentUid, studentEmail, timeZone, dateStr } = req.body || {};
+
+  let effectiveUid = (studentUid || '').trim();
+  let effectiveEmail = (studentEmail || '').toLowerCase().trim();
+
+  if (caller) {
+    const identityRes = await resolveCanonicalStudentIdentity({
+      caller,
+      studentEmail,
+      studentUid,
+    });
+    if (identityRes.authorized && identityRes.canonicalStudentUid) {
+      effectiveUid = identityRes.canonicalStudentUid;
+      effectiveEmail = identityRes.studentEmail || effectiveEmail;
+    }
+  }
+
+  if (!effectiveUid && !effectiveEmail) {
+    return res.status(400).json({ error: 'Missing student identifier' });
+  }
+
+  const primaryKey = effectiveUid || effectiveEmail;
+  const effectiveTz = sanitizeTimeZone(timeZone || 'America/Sao_Paulo');
+  const todayInTz =
+    dateStr ||
+    new Intl.DateTimeFormat('en-CA', {
+      timeZone: effectiveTz,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date());
+
+  const result = await recordDailyReminderShownServer(primaryKey, todayInTz);
+
+  const db = readDb();
+  if (!db.sessionNotesProgressMap) db.sessionNotesProgressMap = {};
+  const existingProg = db.sessionNotesProgressMap[primaryKey] || {};
+  db.sessionNotesProgressMap[primaryKey] = {
+    ...existingProg,
+    studentUid: effectiveUid,
+    studentEmail: effectiveEmail,
+    lastReminderShownDate: todayInTz,
     updatedAt: new Date().toISOString(),
   };
-  saveSessionNotesProgressToFirestore(key, cyclePayload).catch(() => {});
+  await writeDbSync(db);
 
-  return res.json({ success: true, progress: db.sessionNotesProgressMap[key] });
+  return res.json({
+    success: true,
+    canShow: result.canShow,
+    alreadyShown: result.alreadyShown,
+    lastReminderShownDate: result.lastReminderShownDate,
+  });
 });
 
 // Controlled cooldown tracker for Gemini quota exhaustion to prevent repeated 429 floods
@@ -8132,7 +8158,7 @@ function generateServerPedagogicalFallback(params: {
   return generateLocalPedagogicalTransformation(params as any);
 }
 
-function syncTransformationVocabToDictionary(
+async function syncTransformationVocabToDictionary(
   transformation: any,
   studentUid?: string,
   studentEmail?: string
@@ -8144,19 +8170,39 @@ function syncTransformationVocabToDictionary(
 
   const db = readDb();
   if (!db.studentDictionaryMap) db.studentDictionaryMap = {};
-  const currentList =
+
+  let currentList: any[] =
     (studentUid && db.studentDictionaryMap[studentUid]) ||
     (cleanEmail && db.studentDictionaryMap[cleanEmail]) ||
     [];
+
+  let exclusions: string[] = [];
+  if (studentUid) {
+    try {
+      const fsList = await fetchStudentVocabularyFromFirestoreServer(studentUid, cleanEmail);
+      if (Array.isArray(fsList) && fsList.length > 0) {
+        currentList = fsList;
+      }
+      exclusions = await fetchExcludedDictionaryWordsServer(studentUid);
+    } catch {}
+  }
+
+  const exSet = new Set(exclusions.map(normalizeDictionaryWord).filter(Boolean));
   const map = new Map<string, any>();
   currentList.forEach((e: any) => {
-    if (e?.word) map.set(e.word.toLowerCase().trim(), e);
+    const norm = normalizeDictionaryWord(e?.normalizedWord || e?.word);
+    if (norm) map.set(norm, e);
   });
+
+  const isDefinitiveAi = Boolean(
+    transformation.isAiGenerated && !transformation.isProvisional && !transformation.isFallback
+  );
 
   transformation.vocabularyAndExpressions.forEach((v: any) => {
     const rawWord = (v.term || '').trim();
     if (!rawWord) return;
-    const key = rawWord.toLowerCase();
+    const key = normalizeDictionaryWord(rawWord);
+    if (!key || exSet.has(key)) return;
     const existing = map.get(key);
 
     const isPronounce =
@@ -8165,12 +8211,13 @@ function syncTransformationVocabToDictionary(
       Boolean(v.category?.toLowerCase().includes('pronounc'));
 
     const isNewWord =
+      Boolean(v.isNewWord) ||
       Boolean(v.category?.toLowerCase().includes('new word')) ||
       Boolean(v.partOfSpeech?.toLowerCase().includes('new')) ||
       Boolean(existing);
 
-    // ETAPA B RULE:
-    // Only words marked as New Word (Alt+W) enter automatically into My Dictionary.
+    // PEDAGOGICAL RULE:
+    // Only words marked as New Word (Alt+W) enter into My Dictionary.
     // Items exclusively marked as Pronounce (Alt+P) remain in pedagogical notes and do NOT enter automatically!
     if (isPronounce && !isNewWord && !existing) {
       return;
@@ -8178,8 +8225,7 @@ function syncTransformationVocabToDictionary(
 
     const exCount = typeof existing?.practiceCount === 'number' ? existing.practiceCount : 0;
     const existingDef = (existing?.definitionEn || '').trim();
-    const newDef = (v.simpleDefinition || '').trim();
-    const keepExistingDef = existingDef && (!newDef || (existingDef.length > 20 && newDef.length < 15));
+    const newDef = isDefinitiveAi ? (v.simpleDefinition || v.definitionEn || '').trim() : '';
 
     const mergedOrigins = [...(existing?.origins || [])];
     const isDupOrig = mergedOrigins.some(
@@ -8192,6 +8238,7 @@ function syncTransformationVocabToDictionary(
         date: transformation.sessionDate,
         lessonId: transformation.sessionKey,
         context: `Introduced in live session: "${transformation.topic || 'Live Session'}"`,
+        teacherName: transformation.teacherName,
       });
     }
 
@@ -8201,23 +8248,33 @@ function syncTransformationVocabToDictionary(
       word: rawWord,
       originalWord: existing?.originalWord || rawWord,
       normalizedWord: existing?.normalizedWord || key,
-      partOfSpeech: v.partOfSpeech || (isPronounce ? 'Pronunciation Focus' : 'Expression'),
-      definitionEn: keepExistingDef ? existingDef : (newDef || existingDef || ''),
+      partOfSpeech:
+        isDefinitiveAi && v.partOfSpeech
+          ? v.partOfSpeech
+          : existing?.partOfSpeech || (isPronounce ? 'Pronunciation Focus' : 'Expression'),
+      definitionEn: newDef || existingDef || '',
       exampleSentenceEn:
-        (Array.isArray(v.realExamples) && v.realExamples[0]) || existing?.exampleSentenceEn || '',
+        (isDefinitiveAi && Array.isArray(v.realExamples) && v.realExamples[0]) ||
+        existing?.exampleSentenceEn ||
+        '',
+      translationPt: (isDefinitiveAi && v.translationPt) || existing?.translationPt || '',
       phonetic: v.phoneticGuide || existing?.phonetic,
       cefrLevel: transformation.cefrLevel || existing?.cefrLevel || 'B1',
       sourceActivityName: `Native Friends Notes (${transformation.topic || 'Live Session'})`,
       source: 'live_lesson',
-      learnedAt: transformation.sessionDate
-        ? `${transformation.sessionDate}T12:00:00.000Z`
-        : new Date().toISOString(),
+      learnedAt:
+        existing?.learnedAt ||
+        (transformation.sessionDate
+          ? `${transformation.sessionDate}T12:00:00.000Z`
+          : new Date().toISOString()),
       studentEmail: cleanEmail,
       studentUid,
       notFound: false,
       origins: mergedOrigins,
       practiceCount: exCount,
+      practiceHistory: existing?.practiceHistory || [],
       lastPracticedAt: existing?.lastPracticedAt,
+      enrichmentStatus: isDefinitiveAi ? 'enriched' : existing?.enrichmentStatus || 'pending',
     });
   });
 
@@ -8226,7 +8283,15 @@ function syncTransformationVocabToDictionary(
   );
   if (studentUid) db.studentDictionaryMap[studentUid] = updatedList;
   if (cleanEmail) db.studentDictionaryMap[cleanEmail] = updatedList;
-  writeDbSync(db);
+  await writeDbSync(db);
+
+  if (isDefinitiveAi && studentUid) {
+    try {
+      await saveStudentVocabularyToFirestoreServer(studentUid, updatedList, cleanEmail);
+    } catch (saveErr) {
+      console.warn('Backend Firestore vocabulary save notice:', saveErr);
+    }
+  }
 }
 
 // Generate or retrieve Pedagogical Transformation using Gemini AI with fallback
@@ -8355,45 +8420,27 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
     cefrLevel: cefr,
   });
 
-  const cached =
+  let cached =
     db.pedagogicalTransformationsMap[compositeCacheKey] ||
     (language === 'pt' ? db.pedagogicalTransformationsMap[canonicalSessionKey] : undefined);
 
-  if (!forceRegenerate) {
-    if (cached && cached.contentHash === contentHash) {
-      return res.json({
-        success: true,
-        cached: true,
-        transformation: cached,
-      });
-    }
+  if ((!cached || cached.isProvisional) && canonicalSessionKey) {
+    try {
+      const fsCached = await fetchPedagogicalTransformationFromFirestoreServer(compositeCacheKey);
+      if (fsCached && fsCached.contentHash === contentHash && fsCached.isAiGenerated && !fsCached.isProvisional) {
+        cached = fsCached;
+        db.pedagogicalTransformationsMap[compositeCacheKey] = cached;
+      }
+    } catch {}
+  }
 
-    // Security Hotfix (Etapa 2): Require explicit user action (forceRegenerate === true) to invoke Gemini.
-    // Opening a modal or changing the language returns existing cache or deterministic provisional preview.
-    const provisional = generateServerPedagogicalFallback({
-      rawNotes,
-      topic,
-      sessionDate,
-      teacherName,
-      studentLevel: authoritativeLevel,
-      studentUid,
-      studentEmail: cleanEmail,
-      lessonId,
-      sessionKey: canonicalSessionKey,
-      language,
-    });
-    provisional.isAiGenerated = false;
-    provisional.isFallback = true;
-    provisional.isProvisional = true;
-    provisional.needsAiGeneration = true;
-    provisional.aiNotice = language === 'en'
-      ? 'Preliminary teacher-faithful guide. Click "Generate with Gemini" for synthesized masterclass analysis.'
-      : 'Guia preliminar fiel às notas do professor. Clique em "Gerar com Gemini" para sintetizar sua análise com IA.';
-
+  // FASE 4B.8: If a valid, non-provisional AI-generated transformation exists for this contentHash, REUSE IT!
+  // "Não permitir que forceRegenerate provoque chamadas pagas desnecessárias quando já existir cache válido."
+  if (cached && !cached.isProvisional && cached.contentHash === contentHash && cached.isAiGenerated) {
     return res.json({
       success: true,
-      cached: false,
-      transformation: provisional,
+      cached: true,
+      transformation: cached,
     });
   }
 
@@ -8740,7 +8787,8 @@ Please synthesize and transform these notes strictly adhering to the real markin
           if (language === 'pt') {
             db.pedagogicalTransformationsMap[canonicalSessionKey] = transformation;
           }
-          syncTransformationVocabToDictionary(transformation, studentUid, cleanEmail);
+          await savePedagogicalTransformationToFirestoreServer(compositeCacheKey, transformation);
+          await syncTransformationVocabToDictionary(transformation, cleanUid, effectiveEmail);
           await writeDbSync(db);
 
           return res.json({
@@ -8776,15 +8824,9 @@ Please synthesize and transform these notes strictly adhering to the real markin
       fallbackTransformation.cooldownSecondsRemaining = Math.max(1, Math.ceil((geminiQuotaCooldownUntil - Date.now()) / 1000));
     }
 
-    // Store provisional fallback under composite key
-    db.pedagogicalTransformationsMap[compositeCacheKey] = fallbackTransformation;
-    if (language === 'pt') {
-      db.pedagogicalTransformationsMap[canonicalSessionKey] = fallbackTransformation;
-    }
-    syncTransformationVocabToDictionary(fallbackTransformation, studentUid, cleanEmail);
-    await writeDbSync(db);
-
-    res.json({
+    // FASE 4B.8: Do NOT persist provisional fallback as definitive cache!
+    // "Não reutilizar resultados provisórios como se fossem definitivos. Se a IA falhar, manter as notas originais e estado pendente, permitindo nova tentativa controlada. Não persistir conteúdo genérico como definitivo."
+    return res.json({
       success: true,
       cached: false,
       transformation: fallbackTransformation,
@@ -9168,6 +9210,196 @@ app.post('/api/student-dictionary', async (req, res) => {
     studentEmail: verifiedStudentEmail,
     dictionary: updatedList,
     excludedWords: remainingExclusions,
+  });
+});
+
+// Endpoint: Enrich student vocabulary on demand exclusively via Gemini (used for Video routine words & new words)
+app.post('/api/student-dictionary/enrich', async (req, res) => {
+  const db = readDb();
+  const caller = await getVerifiedUserFromRequest(req);
+
+  if (!caller) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Authentication required: verified user token missing.',
+    });
+  }
+
+  const { studentEmail, studentUid, words, studentLevel } = req.body || {};
+
+  const identityRes = await resolveCanonicalStudentIdentity({
+    caller,
+    studentEmail,
+    studentUid,
+  });
+
+  if (!identityRes.authorized) {
+    return res.status(identityRes.statusCode || 403).json({
+      error: 'Forbidden',
+      message: identityRes.error || 'Access denied: unauthorized student dictionary persistence.',
+    });
+  }
+
+  const canonicalStudentUid = identityRes.canonicalStudentUid;
+  const verifiedStudentEmail = identityRes.studentEmail;
+
+  const rawWords: string[] = Array.isArray(words) ? words : [];
+  if (rawWords.length === 0) {
+    return res.json({ success: true, enrichedEntries: [] });
+  }
+
+  // Fetch current vocabulary and exclusions
+  const currentVocab = await fetchStudentVocabularyFromFirestoreServer(canonicalStudentUid, verifiedStudentEmail);
+  const exclusions = await fetchExcludedDictionaryWordsServer(canonicalStudentUid);
+  const exSet = new Set(exclusions.map(normalizeDictionaryWord).filter(Boolean));
+
+  const existingMap = new Map<string, any>();
+  currentVocab.forEach((entry: any) => {
+    const norm = normalizeDictionaryWord(entry.normalizedWord || entry.word);
+    if (norm) existingMap.set(norm, entry);
+  });
+
+  // Identify words needing enrichment (definitionEn missing or empty, and not excluded)
+  const wordsNeedingEnrichment: string[] = [];
+  rawWords.forEach((w) => {
+    const clean = (w || '').trim();
+    const norm = normalizeDictionaryWord(clean);
+    if (!norm || exSet.has(norm)) return;
+    const existing = existingMap.get(norm);
+    if (!existing || !existing.definitionEn || existing.definitionEn.trim().length === 0 || existing.enrichmentStatus === 'pending') {
+      wordsNeedingEnrichment.push(clean);
+    }
+  });
+
+  // If zero words need enrichment (all already have definitions): zero Gemini calls!
+  // "Evitar chamadas Gemini por palavra já enriquecida e válida."
+  if (wordsNeedingEnrichment.length === 0) {
+    const matching = rawWords
+      .map((w) => existingMap.get(normalizeDictionaryWord(w)))
+      .filter(Boolean);
+    return res.json({ success: true, enrichedEntries: matching, cached: true });
+  }
+
+  const registeredStudent = (db.students || []).find((s: any) =>
+    (canonicalStudentUid && (s.uid === canonicalStudentUid || s.id === canonicalStudentUid)) ||
+    (verifiedStudentEmail && (s.email || '').toLowerCase().trim() === verifiedStudentEmail)
+  );
+  const profile = (canonicalStudentUid && db.userProfiles?.[canonicalStudentUid]) || (verifiedStudentEmail && db.userProfiles?.[verifiedStudentEmail]);
+  const authoritativeLevel = profile?.level || profile?.englishLevel || registeredStudent?.level || registeredStudent?.englishLevel || studentLevel || 'intermediario';
+  const cefrMeta = resolveCefrLevel(authoritativeLevel);
+  const cefr = cefrMeta.cefr;
+
+  const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || '';
+  const isCooldownActive = Date.now() < geminiQuotaCooldownUntil;
+
+  // Limit batch to 10 words per request
+  const batchToEnrich = wordsNeedingEnrichment.slice(0, 10);
+  const newlyEnriched: any[] = [];
+
+  if (apiKey && !isCooldownActive) {
+    try {
+      const lockKey = `dictionary_enrich:${canonicalStudentUid}`;
+      const flightLock = await acquireSingleFlightLock(lockKey);
+      if (flightLock.acquired) {
+        try {
+          const systemInstruction = `You are an elite, Cambridge/CELTA-certified Lexicographer and Pedagogical English Teacher.
+For each given English word or phrase, generate:
+1. "word": the exact English term.
+2. "partOfSpeech": Part of speech (e.g., Noun, Verb, Adjective, Phrasal Verb, Expression).
+3. "definitionEn": Crystal-clear, accessible English definition strictly calibrated to CEFR level ${cefr}.
+4. "exampleSentenceEn": Authentic, natural conversational example sentence demonstrating the word in context.
+5. "translationPt": Concise, accurate translation/support in Brazilian Portuguese.
+6. "cefrLevel": "${cefr}".
+
+CRITICAL REQUIREMENTS:
+- definitionEn MUST be in English adapted to CEFR ${cefr}.
+- translationPt MUST be in Portuguese.
+- Return a JSON object with schema: { "words": [ { "word": string, "partOfSpeech": string, "definitionEn": string, "exampleSentenceEn": string, "translationPt": string, "cefrLevel": string } ] }
+- Return JSON ONLY without Markdown formatting.`;
+
+          const prompt = `Words to enrich for CEFR ${cefr} student:
+${batchToEnrich.map((w, i) => `${i + 1}. ${w}`).join('\n')}`;
+
+          const singleAttempt = await executeGeminiSingleAttempt({
+            feature: 'dictionary_define',
+            systemInstruction,
+            untrustedUserDataPrompt: prompt,
+            callerRole: caller.role,
+            apiKey,
+            temperature: 0.2,
+          });
+
+          if (singleAttempt?.parsedJson && Array.isArray(singleAttempt.parsedJson.words)) {
+            singleAttempt.parsedJson.words.forEach((item: any) => {
+              const w = (item.word || '').trim();
+              const norm = normalizeDictionaryWord(w);
+              if (!norm) return;
+              const existing = existingMap.get(norm);
+              const exCount = typeof existing?.practiceCount === 'number' ? existing.practiceCount : 0;
+              const mergedOrigins = [...(existing?.origins || [])];
+              if (!mergedOrigins.some((o: any) => o.source === 'routine')) {
+                mergedOrigins.push({
+                  source: 'routine',
+                  activityName: 'Video of the Day',
+                  date: new Date().toISOString().split('T')[0],
+                });
+              }
+
+              const newEntry = {
+                ...existing,
+                id: existing?.id || `dict_${norm}_${Date.now()}`,
+                word: w,
+                originalWord: existing?.originalWord || w,
+                normalizedWord: norm,
+                partOfSpeech: item.partOfSpeech || 'Word',
+                definitionEn: item.definitionEn || '',
+                exampleSentenceEn: item.exampleSentenceEn || '',
+                translationPt: item.translationPt || '',
+                cefrLevel: item.cefrLevel || cefr,
+                source: existing?.source || 'routine',
+                sourceActivityName: existing?.sourceActivityName || 'Video Routine',
+                learnedAt: existing?.learnedAt || new Date().toISOString(),
+                studentEmail: verifiedStudentEmail,
+                studentUid: canonicalStudentUid,
+                origins: mergedOrigins,
+                practiceCount: exCount,
+                practiceHistory: existing?.practiceHistory || [],
+                lastPracticedAt: existing?.lastPracticedAt,
+                enrichmentStatus: 'enriched',
+                notFound: false,
+              };
+
+              existingMap.set(norm, newEntry);
+              newlyEnriched.push(newEntry);
+            });
+          }
+        } finally {
+          await flightLock.release();
+        }
+      }
+    } catch (geminiErr) {
+      console.warn('Backend dictionary enrichment error:', geminiErr);
+    }
+  }
+
+  // Persist updated entries to Firestore and local memory
+  if (newlyEnriched.length > 0) {
+    try {
+      const allEntries = Array.from(existingMap.values());
+      await saveStudentVocabularyToFirestoreServer(canonicalStudentUid, allEntries, verifiedStudentEmail);
+      if (!db.studentDictionaryMap) db.studentDictionaryMap = {};
+      if (canonicalStudentUid) db.studentDictionaryMap[canonicalStudentUid] = allEntries;
+      if (verifiedStudentEmail) db.studentDictionaryMap[verifiedStudentEmail] = allEntries;
+      await writeDbSync(db);
+    } catch (saveErr) {
+      console.warn('Failed to persist enriched words to Firestore:', saveErr);
+    }
+  }
+
+  return res.json({
+    success: true,
+    enrichedEntries: newlyEnriched,
+    cached: false,
   });
 });
 

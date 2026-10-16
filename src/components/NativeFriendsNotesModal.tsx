@@ -398,6 +398,7 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
           sessionKey: activeSession.key,
           language: currentLanguage,
           forceRegenerate,
+          triggerAiIfMissing: true,
         });
 
         setTransformation(result);

@@ -73,6 +73,7 @@ export function useNativeFriendsNotesReminder({
   const [stepIndex, setStepIndex] = useState<number>(0);
   const [storedSessionKey, setStoredSessionKey] = useState<string>('');
   const [storedLastReviewedDate, setStoredLastReviewedDate] = useState<string>('');
+  const [storedLastReminderShownDate, setStoredLastReminderShownDate] = useState<string>('');
   const [isLoading, setIsLoading] = useState<boolean>(true);
 
   // 1. Fetch past sessions for the isolated student (Strictly Descending: newest first)
@@ -220,6 +221,7 @@ export function useNativeFriendsNotesReminder({
             loadedSessionKey = data.lastSessionKey || '';
             loadedStepIndex = typeof data.stepIndex === 'number' ? data.stepIndex : 0;
             if (data.lastReviewedDate) setStoredLastReviewedDate(data.lastReviewedDate);
+            if (data.lastReminderShownDate) setStoredLastReminderShownDate(data.lastReminderShownDate);
           }
         }
       }
@@ -228,24 +230,25 @@ export function useNativeFriendsNotesReminder({
     }
 
     // 2b. Check Server API fallback
-    if (!loadedSessionKey) {
-      try {
-        const queryParams = new URLSearchParams();
-        if (resolvedUid) queryParams.set('studentUid', resolvedUid);
-        if (resolvedEmail) queryParams.set('studentEmail', resolvedEmail);
+    try {
+      const queryParams = new URLSearchParams();
+      if (resolvedUid) queryParams.set('studentUid', resolvedUid);
+      if (resolvedEmail) queryParams.set('studentEmail', resolvedEmail);
 
-        const res = await fetch(`/api/session-notes/progress?${queryParams.toString()}`);
-        if (res.ok) {
-          const progressData = await res.json();
-          if (progressData && progressData.lastSessionKey) {
+      const res = await fetch(`/api/session-notes/progress?${queryParams.toString()}`);
+      if (res.ok) {
+        const progressData = await res.json();
+        if (progressData) {
+          if (!loadedSessionKey && progressData.lastSessionKey) {
             loadedSessionKey = progressData.lastSessionKey;
             loadedStepIndex = progressData.stepIndex || 0;
-            if (progressData.lastReviewedDate) setStoredLastReviewedDate(progressData.lastReviewedDate);
           }
+          if (progressData.lastReviewedDate) setStoredLastReviewedDate(progressData.lastReviewedDate);
+          if (progressData.lastReminderShownDate) setStoredLastReminderShownDate(progressData.lastReminderShownDate);
         }
-      } catch (err) {
-        console.warn('useNativeFriendsNotesReminder: Server progress read notice:', err);
       }
+    } catch (err) {
+      console.warn('useNativeFriendsNotesReminder: Server progress read notice:', err);
     }
 
     setStoredSessionKey(loadedSessionKey);
@@ -270,6 +273,7 @@ export function useNativeFriendsNotesReminder({
             if (data.lastSessionKey) setStoredSessionKey(data.lastSessionKey);
             if (typeof data.stepIndex === 'number') setStepIndex(data.stepIndex);
             if (data.lastReviewedDate) setStoredLastReviewedDate(data.lastReviewedDate);
+            if (data.lastReminderShownDate) setStoredLastReminderShownDate(data.lastReminderShownDate);
           }
         }
       },
@@ -314,6 +318,8 @@ export function useNativeFriendsNotesReminder({
         lessonId: latestSession.lessonId,
         sessionKey: latestSession.key,
         language: currentLanguage,
+        forceRegenerate: false,
+        triggerAiIfMissing: false,
       })
         .then((trans) => {
           if (!isCancelled) setLatestTransformation(trans);
@@ -626,6 +632,35 @@ export function useNativeFriendsNotesReminder({
     return Boolean(storedLastReviewedDate && storedLastReviewedDate === todayInTz);
   }, [storedLastReviewedDate, todayInTz]);
 
+  const claimDailyReminder = useCallback(async (): Promise<{ canShow: boolean; alreadyShown: boolean }> => {
+    if (!resolvedUid && !resolvedEmail) return { canShow: false, alreadyShown: true };
+    try {
+      const res = await fetch('/api/session-notes/reminder/claim', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          studentUid: resolvedUid,
+          studentEmail: resolvedEmail,
+          timeZone: effectiveTz,
+          dateStr: todayInTz,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.lastReminderShownDate) {
+          setStoredLastReminderShownDate(data.lastReminderShownDate);
+        }
+        return {
+          canShow: Boolean(data.canShow),
+          alreadyShown: Boolean(data.alreadyShown),
+        };
+      }
+    } catch (err) {
+      console.warn('useNativeFriendsNotesReminder: claimDailyReminder notice:', err);
+    }
+    return { canShow: false, alreadyShown: false };
+  }, [resolvedUid, resolvedEmail, effectiveTz, todayInTz]);
+
   return {
     reminder,
     advanceSequentialStep,
@@ -640,5 +675,7 @@ export function useNativeFriendsNotesReminder({
     scheduledLessonToday,
     isReviewCompletedToday,
     storedLastReviewedDate,
+    storedLastReminderShownDate,
+    claimDailyReminder,
   };
 }

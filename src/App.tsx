@@ -7019,6 +7019,9 @@ export default function App() {
         customSavedEntries={studentDictionaryEntries}
         consolidatedEntries={consolidatedActiveDictionary}
         excludedWords={excludedDictionaryWords}
+        studentUid={userProfile?.uid || currentAccount?.id || currentAccount?.uid}
+        studentEmail={userProfile?.email || currentAccount?.email}
+        studentLevel={userProfile?.level}
         onSaveCustomEntry={handleSaveCustomDictionaryEntry}
         onDeleteEntry={handleDeleteCustomDictionaryEntry}
         onOpenJournalModal={() => setIsJournalModalOpen(true)}
