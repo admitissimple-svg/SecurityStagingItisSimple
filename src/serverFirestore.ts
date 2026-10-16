@@ -1396,6 +1396,43 @@ export async function resolveCanonicalStudentIdentity(
 }
 
 /**
+ * Recursively strips all keys with `undefined` values from an object, nested objects, and arrays.
+ * Guarantees that Firestore Admin SDK never throws:
+ * "Cannot use "undefined" as a Firestore value".
+ * Preserves all valid types: strings, numbers, booleans, dates, nulls, arrays, and Firestore FieldValues.
+ * Does NOT invent definitions or replace undefined with placeholder strings.
+ */
+export function removeUndefinedFields<T = any>(val: T): T {
+  if (val === undefined) {
+    return undefined as any;
+  }
+  if (val === null || typeof val !== 'object') {
+    return val;
+  }
+  if (val instanceof Date) {
+    return val;
+  }
+  if (typeof (val as any).isEqual === 'function') {
+    return val;
+  }
+  if (Array.isArray(val)) {
+    return (val as any[])
+      .filter((item) => item !== undefined)
+      .map((item) => removeUndefinedFields(item)) as any;
+  }
+  const result: Record<string, any> = {};
+  for (const [key, v] of Object.entries(val as Record<string, any>)) {
+    if (v !== undefined) {
+      const sanitized = removeUndefinedFields(v);
+      if (sanitized !== undefined) {
+        result[key] = sanitized;
+      }
+    }
+  }
+  return result as T;
+}
+
+/**
  * Server-side consolidation of student dictionary entries.
  * Guarantees:
  * - Richer definitions and authentic examples are preserved.
@@ -1403,6 +1440,7 @@ export async function resolveCanonicalStudentIdentity(
  * - practiceCount is never decreased or reset.
  * - lastPracticedAt is strictly preserved (most recent timestamp kept).
  * - Deduplicated deterministically by normalized word.
+ * - Strips any undefined fields so Firestore Admin SDK never encounters undefined.
  */
 function consolidateServerEntries(existingEntries: any[], newEntries: any[]): any[] {
   const masterMap = new Map<string, any>();
@@ -1412,7 +1450,7 @@ function consolidateServerEntries(existingEntries: any[], newEntries: any[]): an
     const rawWord = (e.word || '').trim();
     const key = (e.normalizedWord || rawWord).toLowerCase().trim();
     if (!key) return;
-    masterMap.set(key, { ...e, word: rawWord, normalizedWord: key });
+    masterMap.set(key, removeUndefinedFields({ ...e, word: rawWord, normalizedWord: key }));
   });
 
   (newEntries || []).forEach((item) => {
@@ -1425,17 +1463,41 @@ function consolidateServerEntries(existingEntries: any[], newEntries: any[]): an
 
     if (!existing) {
       const isItemProvisional = Boolean(item.isProvisional || item.isFallback || item.enrichmentStatus === 'pending');
-      masterMap.set(key, {
+      const singleOrigins = Array.isArray(item.origins)
+        ? item.origins
+        : (item.source
+          ? [
+              removeUndefinedFields({
+                source: item.source,
+                activityName: item.sourceActivityName,
+                dayOfWeek: item.sourceDay,
+                date: item.learnedAt ? item.learnedAt.split('T')[0] : new Date().toISOString().split('T')[0],
+                lessonId: item.lessonRefId,
+                videoId: item.routineRef?.videoId,
+                videoTitle: item.routineRef?.videoTitle,
+              }),
+            ]
+          : []);
+
+      const newEntry: Record<string, any> = {
         ...item,
         id: item.id || `dict_${key.replace(/[^a-zA-Z0-9_-]/g, '_')}_${Date.now()}`,
         word: rawWord,
         originalWord: item.originalWord || rawWord,
         normalizedWord: key,
         practiceCount: typeof item.practiceCount === 'number' ? item.practiceCount : 0,
-        origins: Array.isArray(item.origins) ? item.origins : (item.source ? [{ source: item.source, activityName: item.sourceActivityName }] : []),
+        origins: singleOrigins.map(removeUndefinedFields),
         enrichmentStatus: item.enrichmentStatus === 'enriched' && !isItemProvisional ? 'enriched' : 'pending',
         isProvisional: isItemProvisional,
-      });
+      };
+      if (item.simpleDefinition && typeof item.simpleDefinition === 'string' && item.simpleDefinition.trim()) {
+        newEntry.simpleDefinition = item.simpleDefinition.trim();
+      }
+      if (item.lastPracticedAt) {
+        newEntry.lastPracticedAt = item.lastPracticedAt;
+      }
+
+      masterMap.set(key, removeUndefinedFields(newEntry));
       return;
     }
 
@@ -1481,15 +1543,17 @@ function consolidateServerEntries(existingEntries: any[], newEntries: any[]): an
     } else if (item.source) {
       const isDup = mergedOrigins.some((m: any) => m.source === item.source && m.activityName === item.sourceActivityName);
       if (!isDup) {
-        mergedOrigins.push({
-          source: item.source,
-          activityName: item.sourceActivityName,
-          dayOfWeek: item.sourceDay,
-          date: item.learnedAt ? item.learnedAt.split('T')[0] : new Date().toISOString().split('T')[0],
-          lessonId: item.lessonRefId,
-          videoId: item.routineRef?.videoId,
-          videoTitle: item.routineRef?.videoTitle,
-        });
+        mergedOrigins.push(
+          removeUndefinedFields({
+            source: item.source,
+            activityName: item.sourceActivityName,
+            dayOfWeek: item.sourceDay,
+            date: item.learnedAt ? item.learnedAt.split('T')[0] : new Date().toISOString().split('T')[0],
+            lessonId: item.lessonRefId,
+            videoId: item.routineRef?.videoId,
+            videoTitle: item.routineRef?.videoTitle,
+          })
+        );
       }
     }
 
@@ -1516,7 +1580,8 @@ function consolidateServerEntries(existingEntries: any[], newEntries: any[]): an
       });
     }
 
-    masterMap.set(key, {
+    const resolvedSimpleDef = (item.simpleDefinition || existing.simpleDefinition || '').trim();
+    const mergedEntry: Record<string, any> = {
       ...existing,
       ...item,
       id: existing.id || item.id,
@@ -1524,18 +1589,26 @@ function consolidateServerEntries(existingEntries: any[], newEntries: any[]): an
       originalWord: item.originalWord || existing.originalWord || rawWord,
       normalizedWord: key,
       definitionEn: resolvedDef,
-      simpleDefinition: item.simpleDefinition || existing.simpleDefinition || undefined,
       exampleSentenceEn: resolvedExample,
-      origins: mergedOrigins,
+      origins: mergedOrigins.map(removeUndefinedFields),
       practiceCount: mergedPracticeCount,
       practiceHistory: mergedPracticeHistory,
-      lastPracticedAt: mergedLastPracticedAt,
       enrichmentStatus: resolvedEnrichmentStatus,
       isProvisional: isItemProvisional && !isExistingEnriched,
-    });
+    };
+    if (resolvedSimpleDef) {
+      mergedEntry.simpleDefinition = resolvedSimpleDef;
+    }
+    if (mergedLastPracticedAt) {
+      mergedEntry.lastPracticedAt = mergedLastPracticedAt;
+    }
+
+    masterMap.set(key, removeUndefinedFields(mergedEntry));
   });
 
-  return Array.from(masterMap.values()).sort((a, b) => (a.word || '').localeCompare(b.word || ''));
+  return Array.from(masterMap.values())
+    .map(removeUndefinedFields)
+    .sort((a, b) => (a.word || '').localeCompare(b.word || ''));
 }
 
 /**
@@ -1562,7 +1635,7 @@ export async function saveStudentVocabularyToFirestoreServer(
 
   try {
     const cleanEmail = (studentEmail || '').toLowerCase().trim();
-    const sanitizedEntries = JSON.parse(JSON.stringify(entries || []));
+    const sanitizedEntries = removeUndefinedFields(JSON.parse(JSON.stringify(entries || [])));
 
     // 1. Fetch existing entries from canonical user document
     let existingList: any[] = [];
@@ -1586,30 +1659,29 @@ export async function saveStudentVocabularyToFirestoreServer(
       }
     } catch {}
 
-    // 3. Consolidate entries cumulatively
-    const consolidated = consolidateServerEntries(existingList, sanitizedEntries);
+    // 3. Consolidate entries cumulatively and recursively eliminate all undefined fields
+    const consolidated = removeUndefinedFields(consolidateServerEntries(existingList, sanitizedEntries));
 
-    // 4. Save to canonical root document users/{cleanUid}
-    await db.collection('users').doc(cleanUid).set(
-      {
-        vocabulary: consolidated,
-        updatedAt: new Date().toISOString(),
-      },
-      { merge: true }
-    );
+    // 4. Save to canonical root document users/{cleanUid} with guaranteed zero undefined values
+    const rootPayload = removeUndefinedFields({
+      vocabulary: consolidated,
+      updatedAt: new Date().toISOString(),
+    });
+    await db.collection('users').doc(cleanUid).set(rootPayload, { merge: true });
 
     // 5. Save individual entries to subcollection users/{cleanUid}/vocabulary/{wordDocId}
     for (const item of consolidated) {
       if (item && item.word) {
         const rawWord = (item.normalizedWord || item.word).toLowerCase().trim();
         const wordDocId = rawWord.replace(/[^a-zA-Z0-9_-]/g, '_');
+        const docPayload = removeUndefinedFields({
+          ...item,
+          studentUid: cleanUid,
+          ...(cleanEmail || item.studentEmail ? { studentEmail: cleanEmail || item.studentEmail } : {}),
+          updatedAt: new Date().toISOString(),
+        });
         await db.collection('users').doc(cleanUid).collection('vocabulary').doc(wordDocId).set(
-          {
-            ...item,
-            studentUid: cleanUid,
-            studentEmail: cleanEmail || item.studentEmail,
-            updatedAt: new Date().toISOString(),
-          },
+          docPayload,
           { merge: true }
         );
       }
@@ -1620,11 +1692,11 @@ export async function saveStudentVocabularyToFirestoreServer(
     if (isPermissionError(err)) {
       isCloudWriteDisabled = true;
       console.info('[serverFirestore] Remote vocabulary save restricted by IAM, continuing with local state.');
+      return false;
     } else {
       console.warn('Firestore server vocabulary save notice:', err);
       throw err;
     }
-    return false;
   }
 }
 

@@ -853,7 +853,11 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                     <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
                     <div>
                       <div className="font-bold text-amber-950 flex items-center gap-2 flex-wrap">
-                        <span>{isEn ? 'AI Pedagogical Enrichment Temporarily Unavailable' : 'Enriquecimento por IA Temporariamente Indisponível'}</span>
+                        <span>
+                          {transformation.fallbackReason === 'SERVICE_UNAVAILABLE'
+                            ? (isEn ? 'Gemini Experiencing High Demand (HTTP 503)' : 'Gemini com Alta Demanda Temporária (HTTP 503)')
+                            : (isEn ? 'AI Pedagogical Enrichment Temporarily Unavailable' : 'Enriquecimento por IA Temporariamente Indisponível')}
+                        </span>
                         {transformation.cooldownSecondsRemaining ? (
                           <span className="text-[10px] px-2 py-0.5 rounded-md bg-amber-200/70 text-amber-900 font-bold">
                             {isEn ? `Cooldown: ${transformation.cooldownSecondsRemaining}s` : `Aguarde: ${transformation.cooldownSecondsRemaining}s`}

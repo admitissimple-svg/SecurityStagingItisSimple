@@ -238,40 +238,43 @@ export async function syncSessionVocabularyToStudentDictionary(
     const simpleDef = meta.simpleDefinition || '';
     const example = meta.exampleSentenceEn || '';
     const partOfSpeech = meta.partOfSpeech || (meta.isPronounce ? 'Pronunciation Focus' : 'Expression');
-    const phonetic = meta.phonetic || undefined;
+    const phonetic = meta.phonetic ? meta.phonetic.trim() : '';
 
     const docId = `dict_${key.replace(/[^a-zA-Z0-9_-]/g, '_')}_${sessionDate.replace(/-/g, '')}`;
 
-    dictionaryEntries.push({
+    const originObj: Record<string, any> = {
+      source: 'native_notes',
+      activityName: `Native Friends Notes (${topic})`,
+      date: sessionDate,
+      context: `Introduced by ${teacherName} in live session: "${topic}"`,
+    };
+    if (lessonId) originObj.lessonId = lessonId;
+    if (teacherName) originObj.teacherName = teacherName;
+
+    const entryItem: Record<string, any> = {
       id: docId,
       word: meta.term,
       originalWord: meta.term,
       normalizedWord: key,
       definitionEn: definition,
-      simpleDefinition: simpleDef,
       partOfSpeech,
       exampleSentenceEn: formatSentence(example),
-      phonetic,
       cefrLevel: meta.cefrLevel || cefrMeta.cefr,
       sourceActivityName: `Native Friends Notes (${topic})`,
       source: 'live_lesson',
       learnedAt: sessionDate ? `${sessionDate}T12:00:00.000Z` : new Date().toISOString(),
       customNotes: `Introduced by ${teacherName} in live session`,
       notFound: false,
-      origins: [
-        {
-          source: 'native_notes',
-          activityName: `Native Friends Notes (${topic})`,
-          date: sessionDate,
-          lessonId,
-          context: `Introduced by ${teacherName} in live session: "${topic}"`,
-          teacherName,
-        },
-      ],
-      lessonRefId: lessonId,
+      origins: [originObj],
       enrichmentStatus: isEnriched ? 'enriched' : 'pending',
       isProvisional: !isEnriched,
-    });
+    };
+
+    if (simpleDef) entryItem.simpleDefinition = simpleDef;
+    if (phonetic) entryItem.phonetic = phonetic;
+    if (lessonId) entryItem.lessonRefId = lessonId;
+
+    dictionaryEntries.push(entryItem as StudentDictionaryEntry);
   }
 
   // 4. Save cumulatively and permanently to Cloud Firestore isolated by student UID (if not skipped)

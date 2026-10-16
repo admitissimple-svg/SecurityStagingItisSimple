@@ -440,7 +440,14 @@ export function validatePayloadBounds(
  * - Strict timeout deadline
  * - Sanitized logging and untrusted input protection
  */
-export type GeminiFailureCategory = 'QUOTA_EXCEEDED' | 'AUTH_ERROR' | 'TIMEOUT' | 'INVALID_RESPONSE' | 'POLICY_VIOLATION' | string;
+export type GeminiFailureCategory =
+  | 'QUOTA_EXCEEDED'
+  | 'SERVICE_UNAVAILABLE'
+  | 'AUTH_ERROR'
+  | 'TIMEOUT'
+  | 'INVALID_RESPONSE'
+  | 'POLICY_VIOLATION'
+  | string;
 
 export interface GeminiSingleAttemptResponse {
   text?: string;
@@ -591,20 +598,43 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
     const durationMs = Date.now() - startTime;
     const errMsg = String(err?.message || err);
 
-    const statusCode = Number(err?.status || err?.statusCode || err?.code || 0) ||
-      (errMsg.includes('429') ? 429 : errMsg.includes('403') ? 403 : errMsg.includes('503') ? 503 : 500);
+    const rawStatus = Number(err?.status || err?.statusCode || err?.code || 0);
+    const isServiceUnavailable =
+      rawStatus === 503 ||
+      errMsg.includes('503') ||
+      errMsg.toLowerCase().includes('high demand') ||
+      errMsg.toLowerCase().includes('service unavailable') ||
+      errMsg.toLowerCase().includes('temporarily unavailable') ||
+      errMsg.toLowerCase().includes('overloaded') ||
+      errMsg.toLowerCase().includes('model is experiencing high demand');
 
-    const isQuota = statusCode === 429 || errMsg.toLowerCase().includes('quota') || errMsg.toLowerCase().includes('resource_exhausted');
-    const isAuth = statusCode === 401 || statusCode === 403 || errMsg.toLowerCase().includes('permission_denied') || errMsg.toLowerCase().includes('api_key');
-    const isTimeout = errMsg.toLowerCase().includes('timeout') || statusCode === 408;
+    const statusCode = isServiceUnavailable
+      ? 503
+      : rawStatus || (errMsg.includes('429') ? 429 : errMsg.includes('403') ? 403 : 500);
 
-    const category: GeminiFailureCategory = isQuota
+    const isQuota = !isServiceUnavailable && (statusCode === 429 || errMsg.toLowerCase().includes('quota') || errMsg.toLowerCase().includes('resource_exhausted'));
+    const isAuth = !isServiceUnavailable && (statusCode === 401 || statusCode === 403 || errMsg.toLowerCase().includes('permission_denied') || errMsg.toLowerCase().includes('api_key'));
+    const isTimeout = !isServiceUnavailable && (errMsg.toLowerCase().includes('timeout') || statusCode === 408);
+
+    const category: GeminiFailureCategory = isServiceUnavailable
+      ? 'SERVICE_UNAVAILABLE'
+      : isQuota
       ? 'QUOTA_EXCEEDED'
       : isAuth
       ? 'AUTH_ERROR'
       : isTimeout
       ? 'TIMEOUT'
       : 'INVALID_RESPONSE';
+
+    const safeReason = isServiceUnavailable
+      ? 'Gemini model is temporarily experiencing high demand (HTTP 503).'
+      : isQuota
+      ? 'Gemini quota or rate limit exceeded.'
+      : isAuth
+      ? 'Gemini authentication failed or invalid credentials.'
+      : isTimeout
+      ? 'Request timed out waiting for model response.'
+      : 'Gemini service encountered an internal error.';
 
     logGeminiAudited({
       feature,
@@ -620,13 +650,7 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
       error: {
         statusCode,
         category,
-        safeReason: isQuota
-          ? 'Gemini quota or rate limit exceeded.'
-          : isAuth
-          ? 'Gemini authentication failed or invalid credentials.'
-          : isTimeout
-          ? 'Request timed out waiting for model response.'
-          : 'Gemini service encountered an internal error.',
+        safeReason,
         rawMessage: errMsg.slice(0, 100),
       },
     };

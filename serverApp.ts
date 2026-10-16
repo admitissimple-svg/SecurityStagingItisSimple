@@ -111,6 +111,7 @@ import {
   fetchSessionNotesProgressServer,
   savePedagogicalTransformationToFirestoreServer,
   fetchPedagogicalTransformationFromFirestoreServer,
+  removeUndefinedFields,
 } from './src/serverFirestore';
 import { normalizeDictionaryWord } from './src/utils/studentDictionaryLibrary';
 import { DEFAULT_CURATED_PLAYLISTS } from './src/utils/youtubeService';
@@ -8099,6 +8100,7 @@ const GEMINI_QUOTA_COOLDOWN_MS = 60_000;
 export type GeminiFailureCategory =
   | 'AUTH_ERROR'
   | 'QUOTA_EXCEEDED'
+  | 'SERVICE_UNAVAILABLE'
   | 'MODEL_UNAVAILABLE'
   | 'TIMEOUT'
   | 'INVALID_RESPONSE';
@@ -8109,6 +8111,19 @@ export function categorizeGeminiError(err: any): { category: GeminiFailureCatego
 
   if (msg.includes('timeout') || status === 408 || msg.includes('deadline_exceeded')) {
     return { category: 'TIMEOUT', safeReason: 'Request timed out waiting for model response.' };
+  }
+  if (
+    status === 503 ||
+    msg.includes('503') ||
+    msg.includes('high demand') ||
+    msg.includes('service unavailable') ||
+    msg.includes('temporarily unavailable') ||
+    msg.includes('overloaded')
+  ) {
+    return {
+      category: 'SERVICE_UNAVAILABLE',
+      safeReason: 'Gemini model is temporarily experiencing high demand (HTTP 503).',
+    };
   }
   if (
     status === 429 ||
@@ -8256,24 +8271,26 @@ async function syncTransformationVocabToDictionary(
       isEnriched = false;
     }
 
-    const simpleDef = (typeof v.simpleDefinition === 'string' && v.simpleDefinition.trim()) || existing?.simpleDefinition || undefined;
+    const simpleDef = (typeof v.simpleDefinition === 'string' && v.simpleDefinition.trim()) || (typeof existing?.simpleDefinition === 'string' && existing.simpleDefinition.trim()) || '';
 
     const mergedOrigins = [...(existing?.origins || [])];
     const isDupOrig = mergedOrigins.some(
       (o: any) => o.source === 'native_notes' && o.lessonId === transformation.sessionKey
     );
     if (!isDupOrig) {
-      mergedOrigins.push({
-        source: 'native_notes',
-        activityName: `Native Friends Notes (${transformation.topic || 'Live Session'})`,
-        date: transformation.sessionDate,
-        lessonId: transformation.sessionKey,
-        context: `Introduced in live session: "${transformation.topic || 'Live Session'}"`,
-        teacherName: transformation.teacherName,
-      });
+      mergedOrigins.push(
+        removeUndefinedFields({
+          source: 'native_notes',
+          activityName: `Native Friends Notes (${transformation.topic || 'Live Session'})`,
+          date: transformation.sessionDate,
+          lessonId: transformation.sessionKey,
+          context: `Introduced in live session: "${transformation.topic || 'Live Session'}"`,
+          teacherName: transformation.teacherName,
+        })
+      );
     }
 
-    map.set(key, {
+    const dictEntry: Record<string, any> = {
       ...existing,
       id: existing?.id || `dict_${key.replace(/[^a-zA-Z0-9_-]/g, '_')}_${Date.now()}`,
       word: rawWord,
@@ -8284,13 +8301,11 @@ async function syncTransformationVocabToDictionary(
           ? v.partOfSpeech
           : existing?.partOfSpeech || (isPronounce ? 'Pronunciation Focus' : 'Expression'),
       definitionEn: resolvedDef,
-      simpleDefinition: simpleDef,
       exampleSentenceEn:
         (isDefinitiveAi && Array.isArray(v.realExamples) && v.realExamples[0]) ||
         existing?.exampleSentenceEn ||
         '',
       translationPt: (isDefinitiveAi && v.translationPt) || existing?.translationPt || '',
-      phonetic: v.phoneticGuide || existing?.phonetic,
       cefrLevel: transformation.cefrLevel || existing?.cefrLevel || 'B1',
       sourceActivityName: `Native Friends Notes (${transformation.topic || 'Live Session'})`,
       source: 'live_lesson',
@@ -8299,16 +8314,21 @@ async function syncTransformationVocabToDictionary(
         (transformation.sessionDate
           ? `${transformation.sessionDate}T12:00:00.000Z`
           : new Date().toISOString()),
-      studentEmail: cleanEmail,
-      studentUid,
+      studentEmail: cleanEmail || undefined,
+      studentUid: studentUid || undefined,
       notFound: false,
-      origins: mergedOrigins,
+      origins: mergedOrigins.map(removeUndefinedFields),
       practiceCount: exCount,
       practiceHistory: existing?.practiceHistory || [],
-      lastPracticedAt: existing?.lastPracticedAt,
       enrichmentStatus: isEnriched ? 'enriched' : (existing?.enrichmentStatus || 'pending'),
       isProvisional: !isEnriched,
-    });
+    };
+
+    if (simpleDef) dictEntry.simpleDefinition = simpleDef;
+    if (v.phoneticGuide || existing?.phonetic) dictEntry.phonetic = v.phoneticGuide || existing?.phonetic;
+    if (existing?.lastPracticedAt) dictEntry.lastPracticedAt = existing.lastPracticedAt;
+
+    map.set(key, removeUndefinedFields(dictEntry));
   });
 
   const updatedList = Array.from(map.values()).sort((a, b) =>
@@ -8866,7 +8886,14 @@ Please synthesize and transform these notes strictly adhering to the real markin
     fallbackTransformation.isProvisional = true;
     fallbackTransformation.source = 'fallback';
     fallbackTransformation.fallbackReason = lastFailureCategory || (isCooldownActive ? 'QUOTA_EXCEEDED' : 'AI_UNAVAILABLE');
-    fallbackTransformation.aiNotice = getAiUnavailableNoticeText(language);
+    if (lastFailureCategory === 'SERVICE_UNAVAILABLE') {
+      fallbackTransformation.aiNotice =
+        language === 'pt'
+          ? 'O modelo Gemini está temporariamente indisponível devido à alta demanda (HTTP 503). Suas notas originais foram preservadas e você pode tentar novamente a qualquer momento.'
+          : 'The Gemini model is temporarily experiencing high demand (HTTP 503). Original teacher notes are preserved and you can retry at any time.';
+    } else {
+      fallbackTransformation.aiNotice = getAiUnavailableNoticeText(language);
+    }
     if (isCooldownActive || lastFailureCategory === 'QUOTA_EXCEEDED') {
       fallbackTransformation.cooldownSecondsRemaining = Math.max(1, Math.ceil((geminiQuotaCooldownUntil - Date.now()) / 1000));
     }
@@ -9231,7 +9258,14 @@ app.post('/api/student-dictionary', async (req, res) => {
   // Persist directly and permanently to Cloud Firestore using Firebase Admin SDK
   if (finalItemsToAdd.length > 0) {
     try {
-      await saveStudentVocabularyToFirestoreServer(canonicalStudentUid, finalItemsToAdd, verifiedStudentEmail);
+      const persisted = await saveStudentVocabularyToFirestoreServer(canonicalStudentUid, finalItemsToAdd, verifiedStudentEmail);
+      if (!persisted) {
+        console.error('[serverApp] saveStudentVocabularyToFirestoreServer unconfirmed for canonicalStudentUid:', canonicalStudentUid);
+        return res.status(500).json({
+          error: 'Internal Server Error',
+          message: 'Failed to confirm canonical persistence in Firestore.',
+        });
+      }
     } catch (saveErr: any) {
       console.error('Failed to persist student vocabulary in Firestore:', saveErr);
       return res.status(500).json({
