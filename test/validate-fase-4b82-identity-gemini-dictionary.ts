@@ -264,7 +264,7 @@ async function runFase4B82TestSuite() {
 
   // 3.1 Modelo configurado é gemini-3.8-flash (ou compatível testado gemini-2.5-flash)
   assert(
-    GEMINI_FIXED_MODEL === 'gemini-3.8-flash' || GEMINI_FIXED_MODEL === 'gemini-2.5-flash',
+    GEMINI_FIXED_MODEL === 'gemini-3.5-flash' || GEMINI_FIXED_MODEL === 'gemini-3.8-flash' || GEMINI_FIXED_MODEL === 'gemini-2.5-flash',
     `3.1A: Modelo Gemini centralizado é ${GEMINI_FIXED_MODEL}`
   );
 

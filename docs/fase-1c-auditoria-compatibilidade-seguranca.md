@@ -47,7 +47,7 @@ Foi introduzida a função de validação rigorosa `isAuthorizedOrigin(origin: s
 
 ### 2.2 Google Gemini AI (Modelos Multimodais e de Linguagem)
 - **Biblioteca:** SDK TypeScript `@google/genai` (`GoogleGenAI`).
-- **Modelo:** `gemini-3.6-flash` (ou `gemini-2.5-flash`), com fallback determinístico caso o modelo de ambiente seja inválido.
+- **Modelo:** `gemini-3.5-flash` (configurável via `GEMINI_MODEL`, com fallback determinístico local e zero cascata).
 - **Autenticação:** `GEMINI_API_KEY` injetada via variável de ambiente. No Cloud Run, a chave será montada a partir do Google Secret Manager.
 - **Statelessness:** Cada requisição de correção gramatical, elaboração de tarefas ou síntese pedagógica é autônoma, sem persistência de estado em memória do processo.
 

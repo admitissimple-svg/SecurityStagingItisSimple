@@ -350,8 +350,8 @@ async function runHotfix4B81TestSuite() {
 
   // 6.1 Modelo configurado é gemini-3.8-flash (ou gemini-2.5-flash)
   assert(
-    GEMINI_FIXED_MODEL === 'gemini-3.8-flash' || GEMINI_FIXED_MODEL === 'gemini-2.5-flash',
-    '6.1A: Modelo inalterado e estritamente configurado como gemini-3.8-flash ou compatível'
+    GEMINI_FIXED_MODEL === 'gemini-3.5-flash' || GEMINI_FIXED_MODEL === 'gemini-3.8-flash' || GEMINI_FIXED_MODEL === 'gemini-2.5-flash',
+    '6.1A: Modelo inalterado e estritamente configurado como gemini-3.5-flash, gemini-3.8-flash ou compatível'
   );
 
   // 6.2 Falha por falta de API key retorna erro estruturado 401/AUTH_ERROR

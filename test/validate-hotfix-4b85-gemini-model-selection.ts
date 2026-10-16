@@ -51,8 +51,8 @@ async function runHotfix4B85Validation(): Promise<void> {
   console.log('--- 1. Identificação e Resolução Centralizada de GEMINI_MODEL ---');
 
   assert(
-    DEFAULT_GEMINI_MODEL === 'gemini-3.8-flash',
-    `1.1: Modelo padrão seguro configurado é gemini-3.8-flash (atual: ${DEFAULT_GEMINI_MODEL})`
+    DEFAULT_GEMINI_MODEL === 'gemini-3.5-flash',
+    `1.1: Modelo padrão seguro configurado é gemini-3.5-flash (atual: ${DEFAULT_GEMINI_MODEL})`
   );
 
   // Testar resolução padrão sem env
@@ -60,29 +60,29 @@ async function runHotfix4B85Validation(): Promise<void> {
   try {
     delete process.env.GEMINI_MODEL;
     assert(
-      resolveGeminiModel() === 'gemini-3.8-flash',
-      '1.2: resolveGeminiModel() sem GEMINI_MODEL retorna o padrão gemini-3.8-flash'
+      resolveGeminiModel() === 'gemini-3.5-flash',
+      '1.2: resolveGeminiModel() sem GEMINI_MODEL retorna o padrão gemini-3.5-flash'
     );
 
     // Testar com prefixo 'models/'
-    process.env.GEMINI_MODEL = 'models/gemini-3.8-flash';
-    assert(
-      resolveGeminiModel() === 'gemini-3.8-flash',
-      '1.3: resolveGeminiModel() remove prefixo models/ e normaliza para gemini-3.8-flash'
-    );
-
-    // Testar se valor legado gemini-2.5-flash é protegido e convertido com segurança para gemini-3.8-flash
-    process.env.GEMINI_MODEL = 'gemini-2.5-flash';
-    assert(
-      resolveGeminiModel() === 'gemini-3.8-flash',
-      '1.4: resolveGeminiModel() protege contra resíduo gemini-2.5-flash no container e resolve para gemini-3.8-flash'
-    );
-
-    // Testar modelo compatível explícito (ex: gemini-3.5-flash)
-    process.env.GEMINI_MODEL = 'gemini-3.5-flash';
+    process.env.GEMINI_MODEL = 'models/gemini-3.5-flash';
     assert(
       resolveGeminiModel() === 'gemini-3.5-flash',
-      '1.5: resolveGeminiModel() aceita configuração explícita de modelo Flash confirmado (gemini-3.5-flash)'
+      '1.3: resolveGeminiModel() remove prefixo models/ e normaliza para gemini-3.5-flash'
+    );
+
+    // Testar se valor legado gemini-2.5-flash é protegido e convertido com segurança para gemini-3.5-flash
+    process.env.GEMINI_MODEL = 'gemini-2.5-flash';
+    assert(
+      resolveGeminiModel() === 'gemini-3.5-flash',
+      '1.4: resolveGeminiModel() protege contra resíduo gemini-2.5-flash no container e resolve para gemini-3.5-flash'
+    );
+
+    // Testar modelo compatível explícito (ex: gemini-3.8-flash)
+    process.env.GEMINI_MODEL = 'gemini-3.8-flash';
+    assert(
+      resolveGeminiModel() === 'gemini-3.8-flash',
+      '1.5: resolveGeminiModel() aceita configuração explícita de modelo Flash alternativo (gemini-3.8-flash)'
     );
   } finally {
     if (originalEnvModel !== undefined) {
@@ -97,8 +97,8 @@ async function runHotfix4B85Validation(): Promise<void> {
   // -------------------------------------------------------------------------
   console.log('\n--- 2. Modelo Efetivo Configurado ---');
   assert(
-    GEMINI_FIXED_MODEL === 'gemini-3.8-flash',
-    `2.1: GEMINI_FIXED_MODEL ativo no backend é gemini-3.8-flash (atual: ${GEMINI_FIXED_MODEL})`
+    GEMINI_FIXED_MODEL === 'gemini-3.5-flash',
+    `2.1: GEMINI_FIXED_MODEL ativo no backend é gemini-3.5-flash (atual: ${GEMINI_FIXED_MODEL})`
   );
 
   // -------------------------------------------------------------------------

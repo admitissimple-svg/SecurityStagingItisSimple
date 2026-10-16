@@ -1,12 +1,12 @@
 /**
- * HOTFIX 4B.8.5 — SELEÇÃO CONTROLADA DO MODELO GEMINI
+ * HOTFIX 4B.8.6 — SELEÇÃO CONTROLADA DO MODELO GEMINI (gemini-3.5-flash)
  * 
  * Centralized Gemini Security, Cost Control, Rate Limiting, Single-Flight Coordination,
  * Prompt Privacy Manager, and Controlled Model Selection.
  * 
  * Strict invariants:
  * 1. Single model per attempt: centralized via GEMINI_MODEL environment variable.
- *    Selected & verified default: 'gemini-3.8-flash'.
+ *    Selected & verified default: 'gemini-3.5-flash'.
  * 2. Zero cascades, zero automatic retries on error/timeout/quota. Exactly 1 attempt.
  * 3. Token output limits configured per feature (maxOutputTokens).
  * 4. Compatible thinking options: ThinkingLevel.LOW configured for Gemini 3/4 series.
@@ -20,12 +20,12 @@ import crypto from 'crypto';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { getFirestoreDb } from './serverFirestore';
 
-export const DEFAULT_GEMINI_MODEL = 'gemini-3.8-flash';
+export const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash';
 
 /**
  * Resolves the Gemini model from the environment variable GEMINI_MODEL.
  * Sanitizes input (stripping 'models/' prefix), ignores deprecated/legacy staging values ('gemini-2.5-flash'),
- * and safely defaults to the confirmed Flash model 'gemini-3.8-flash'.
+ * and safely defaults to the confirmed Flash model 'gemini-3.5-flash'.
  */
 export function resolveGeminiModel(): string {
   const envModel = (process.env.GEMINI_MODEL || '').trim().replace(/^models\//, '');
