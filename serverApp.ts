@@ -207,7 +207,7 @@ export const LANGUAGE_NAMES: Record<string, { nameEn: string; nameNative: string
   tr: { nameEn: 'Turkish', nameNative: 'Türkçe' },
 };
 
-// Security Hotfix (Etapa 2): Sole model for all generation routes is gemini-2.5-flash
+// Hotfix 4B.8.5: Controlled Gemini model selection centralized via GEMINI_MODEL (selected: gemini-3.8-flash)
 const GEMINI_TEXT_MODEL = GEMINI_FIXED_MODEL;
 const ACTIVE_FIREBASE_PROJECT_ID = 'itissimple-security-staging';
 const GEMINI_PROJECT_ID = ACTIVE_FIREBASE_PROJECT_ID;

@@ -1,14 +1,15 @@
 /**
- * HOTFIX DE SEGURANÇA — ETAPA 2: CONTROLE DE CUSTOS, CONCORRÊNCIA E PRIVACIDADE GEMINI
+ * HOTFIX 4B.8.5 — SELEÇÃO CONTROLADA DO MODELO GEMINI
  * 
  * Centralized Gemini Security, Cost Control, Rate Limiting, Single-Flight Coordination,
- * and Prompt Privacy Manager.
+ * Prompt Privacy Manager, and Controlled Model Selection.
  * 
  * Strict invariants:
- * 1. Single model: 'gemini-2.5-flash' for all generation routes.
+ * 1. Single model per attempt: centralized via GEMINI_MODEL environment variable.
+ *    Selected & verified default: 'gemini-3.8-flash'.
  * 2. Zero cascades, zero automatic retries on error/timeout/quota. Exactly 1 attempt.
  * 3. Token output limits configured per feature (maxOutputTokens).
- * 4. Compatible thinking options: no thinkingConfig passed to gemini-2.5-flash.
+ * 4. Compatible thinking options: ThinkingLevel.LOW configured for Gemini 3/4 series.
  * 5. Multi-instance rate limiting and single-flight lock backed by Firestore with memory fallback.
  * 6. Semantic input bounds and payload validation before reaching Gemini.
  * 7. Privacy: removal of studentUid, studentEmail, personal identifiers from prompts; untrusted input delimited.
@@ -19,10 +20,22 @@ import crypto from 'crypto';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { getFirestoreDb } from './serverFirestore';
 
-export const GEMINI_FIXED_MODEL =
-  process.env.GEMINI_MODEL && process.env.GEMINI_MODEL !== 'gemini-2.5-flash'
-    ? process.env.GEMINI_MODEL
-    : 'gemini-3.8-flash';
+export const DEFAULT_GEMINI_MODEL = 'gemini-3.8-flash';
+
+/**
+ * Resolves the Gemini model from the environment variable GEMINI_MODEL.
+ * Sanitizes input (stripping 'models/' prefix), ignores deprecated/legacy staging values ('gemini-2.5-flash'),
+ * and safely defaults to the confirmed Flash model 'gemini-3.8-flash'.
+ */
+export function resolveGeminiModel(): string {
+  const envModel = (process.env.GEMINI_MODEL || '').trim().replace(/^models\//, '');
+  if (envModel && envModel !== 'gemini-2.5-flash') {
+    return envModel;
+  }
+  return DEFAULT_GEMINI_MODEL;
+}
+
+export const GEMINI_FIXED_MODEL = resolveGeminiModel();
 
 export type GeminiFeature =
   | 'pedagogical_transform'
@@ -168,6 +181,7 @@ export function logGeminiAudited(event: {
   durationMs?: number;
   tokensEstimated?: number;
   detail?: string;
+  model?: string;
 }): void {
   const cleanDetail = (event.detail || '')
     .replace(/[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+/g, '[REDACTED_EMAIL]')
@@ -178,7 +192,7 @@ export function logGeminiAudited(event: {
   const logPayload = {
     timestamp: new Date().toISOString(),
     feature: event.feature,
-    model: GEMINI_FIXED_MODEL,
+    model: event.model || resolveGeminiModel(),
     status: event.status,
     role: event.callerRole || 'unknown',
     durationMs: event.durationMs ?? 0,
@@ -524,7 +538,8 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
       temperature,
     };
 
-    if (GEMINI_FIXED_MODEL.startsWith('gemini-3') || GEMINI_FIXED_MODEL.startsWith('gemini-4')) {
+    const modelToUse = resolveGeminiModel();
+    if (modelToUse.startsWith('gemini-3') || modelToUse.startsWith('gemini-4')) {
       config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
     }
 
@@ -534,7 +549,7 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
     });
 
     const generatePromise = ai.models.generateContent({
-      model: GEMINI_FIXED_MODEL,
+      model: modelToUse,
       contents,
       config,
     });
