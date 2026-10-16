@@ -76,6 +76,7 @@ export function stripHtmlTags(str: string): string {
 export function cleanExpressionTerm(term: string): string {
   if (!term) return '';
   return decodeHtmlEntities(term)
+    .replace(/\[\[TAG:[A-Z_]+\]\]/g, '')
     .replace(/^[•\-\*–—\s]+/, '')
     .replace(/[•\-\*–—\s]+$/, '')
     .replace(/^[✓✔✗✖✦🎯\s]+/, '')
@@ -197,11 +198,15 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
     // Case 1: Alt+W (New Word)
     if (hasNewWord) {
       const cleanTerm = cleanExpressionTerm(
-        line.replace(/\[\[TAG:NEW_WORD\]\]/g, '')
+        line.replace(/\[\[TAG:[A-Z_]+\]\]/g, '')
       );
       if (cleanTerm && cleanTerm.length > 0 && !seenNewWords.has(cleanTerm.toLowerCase())) {
         seenNewWords.add(cleanTerm.toLowerCase());
         newWords.push(cleanTerm);
+      }
+      if (hasPronounce && cleanTerm && cleanTerm.length > 0 && !seenPronounce.has(cleanTerm.toLowerCase())) {
+        seenPronounce.add(cleanTerm.toLowerCase());
+        pronounceItems.push(cleanTerm);
       }
       continue;
     }
@@ -209,7 +214,7 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
     // Case 2: Alt+P (Pronounce)
     if (hasPronounce) {
       const cleanTerm = cleanExpressionTerm(
-        line.replace(/\[\[TAG:PRONOUNCE\]\]/g, '')
+        line.replace(/\[\[TAG:[A-Z_]+\]\]/g, '')
       );
       if (cleanTerm && cleanTerm.length > 0 && !seenPronounce.has(cleanTerm.toLowerCase())) {
         seenPronounce.add(cleanTerm.toLowerCase());

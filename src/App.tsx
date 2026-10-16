@@ -4411,7 +4411,8 @@ export default function App() {
     entries: StudentDictionaryEntry[],
     studentEmail?: string,
     studentUid?: string,
-    lessonId?: string
+    lessonId?: string,
+    options?: { isAutomaticSync?: boolean; syncType?: string }
   ) => {
     if (!entries || entries.length === 0) return { success: false, error: 'No entries to add' };
 
@@ -4430,11 +4431,12 @@ export default function App() {
     let targetUid = (studentUid && isValidCanonicalUid(studentUid) ? studentUid.trim() : '');
 
     if (!targetUid && targetEmail) {
-      const targetStudent = (studentsList || []).find(
-        (s) => (s.email || '').toLowerCase().trim() === targetEmail
+      const allStudents = (studentsList || students || []) as any[];
+      const targetStudent = allStudents.find(
+        (s) => (s?.email || s?.studentEmail || '').toLowerCase().trim() === targetEmail
       );
-      if (targetStudent && (targetStudent as any).uid && isValidCanonicalUid((targetStudent as any).uid)) {
-        targetUid = (targetStudent as any).uid;
+      if (targetStudent && targetStudent.uid && isValidCanonicalUid(targetStudent.uid)) {
+        targetUid = targetStudent.uid;
       }
     }
 
@@ -4447,8 +4449,8 @@ export default function App() {
       targetUid = '';
     }
 
-    // Call backend API with token and await response
-    const token = await auth.currentUser?.getIdToken().catch(() => null);
+    // Call backend API with Bearer token and await response
+    const token = (await getAccessToken().catch(() => null)) || (await auth.currentUser?.getIdToken().catch(() => null));
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (token) headers['Authorization'] = `Bearer ${token}`;
 
@@ -4462,6 +4464,8 @@ export default function App() {
         teacherEmail: currentAccount?.email,
         teacherName: currentAccount?.name,
         entries,
+        isAutomaticSync: options?.isAutomaticSync !== undefined ? options.isAutomaticSync : true,
+        syncType: options?.syncType || 'automatic',
       }),
     });
 

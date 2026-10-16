@@ -83,7 +83,8 @@ interface TeacherLiveLessonNotesPanelProps {
     words: StudentDictionaryEntry[],
     studentEmail?: string,
     studentUid?: string,
-    lessonId?: string
+    lessonId?: string,
+    options?: { isAutomaticSync?: boolean; syncType?: string }
   ) => Promise<any> | void;
   onAddWordsToWeeklyActivity?: (words: string[], studentEmail: string) => void;
   onSendStudentNotification?: (
@@ -192,6 +193,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   const [lastSavedTimestamp, setLastSavedTimestamp] = useState<string | null>(null);
   const [copiedSuccess, setCopiedSuccess] = useState<boolean>(false);
   const [savedSuccessBanner, setSavedSuccessBanner] = useState<boolean>(false);
+  const [dictionarySyncError, setDictionarySyncError] = useState<string | null>(null);
 
   // Pre-styled Inline Coaching Tag Constants (mirrors exact design system references)
   // Correct tag: Rounded rectangle (6px radius), light green bg (#ecfdf5), dark green border (#15803d), green checkmark (✓)
@@ -961,12 +963,21 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 topic: topicToSync,
                 teacherName: currentAccount?.name || 'Native Friend',
                 lessonId: targetLessonId || undefined,
+                skipClientWrite: true,
               });
               if (syncedWords && syncedWords.length > 0 && typeof onAddWordsToDictionary === 'function') {
-                await onAddWordsToDictionary(syncedWords, cleanEmail, targetStudentUid, targetLessonId || undefined);
+                await onAddWordsToDictionary(
+                  syncedWords,
+                  cleanEmail,
+                  targetStudentUid,
+                  targetLessonId || undefined,
+                  { isAutomaticSync: true, syncType: 'automatic' }
+                );
               }
-            } catch (syncErr) {
+              setDictionarySyncError(null);
+            } catch (syncErr: any) {
               console.warn('Vocabulary sync notice:', syncErr);
+              setDictionarySyncError(syncErr?.message || 'Falha ao sincronizar vocabulário com o My Dictionary.');
             }
           }
         } else {
@@ -1152,31 +1163,55 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           (activeStudent?.uid && isValidCanonicalUid(activeStudent.uid) ? activeStudent.uid : '') ||
           '';
 
-        if (targetStudentUid || cleanEmail) {
-          const syncedWords = await syncSessionVocabularyToStudentDictionary({
-            studentUid: targetStudentUid,
-            studentEmail: cleanEmail,
-            rawNotes: contentToSave,
-            studentLevel: activeStudent?.level || EnglishLevel.INTERMEDIATE,
-            sessionDate: effectiveDate,
-            topic: topicToSave,
-            teacherName: currentAccount?.name || 'Native Friend',
-            lessonId: selectedLessonId || undefined,
-          });
+        let dictSyncErrorOccurred: Error | null = null;
 
-          if (syncedWords && syncedWords.length > 0 && typeof onAddWordsToDictionary === 'function') {
-            await onAddWordsToDictionary(syncedWords, cleanEmail, targetStudentUid, selectedLessonId || undefined);
+        if (targetStudentUid || cleanEmail) {
+          try {
+            const syncedWords = await syncSessionVocabularyToStudentDictionary({
+              studentUid: targetStudentUid,
+              studentEmail: cleanEmail,
+              rawNotes: contentToSave,
+              studentLevel: activeStudent?.level || EnglishLevel.INTERMEDIATE,
+              sessionDate: effectiveDate,
+              topic: topicToSave,
+              teacherName: currentAccount?.name || 'Native Friend',
+              lessonId: targetLessonId || undefined,
+              skipClientWrite: true,
+            });
+
+            if (syncedWords && syncedWords.length > 0 && typeof onAddWordsToDictionary === 'function') {
+              await onAddWordsToDictionary(
+                syncedWords,
+                cleanEmail,
+                targetStudentUid,
+                targetLessonId || undefined,
+                { isAutomaticSync: true, syncType: 'automatic' }
+              );
+            }
+          } catch (syncErr: any) {
+            console.error('Dictionary sync error in persistSessionDocument:', syncErr);
+            dictSyncErrorOccurred = syncErr instanceof Error ? syncErr : new Error(String(syncErr));
           }
         }
 
-        setLastSavedTimestamp(nowIso);
+        if (dictSyncErrorOccurred) {
+          const errMsg = dictSyncErrorOccurred.message || 'Falha ao salvar vocabulário no My Dictionary.';
+          setDictionarySyncError(errMsg);
+          setSavedSuccessBanner(false);
+          // Do NOT declare success when dictionary sync fails!
+        } else {
+          setDictionarySyncError(null);
+          setLastSavedTimestamp(nowIso);
 
-        if (explicitSave) {
-          setSavedSuccessBanner(true);
-          setTimeout(() => setSavedSuccessBanner(false), 3000);
+          if (explicitSave) {
+            setSavedSuccessBanner(true);
+            setTimeout(() => setSavedSuccessBanner(false), 3000);
+          }
         }
-      } catch (err) {
+      } catch (err: any) {
         console.error('persistSessionDocument error:', err);
+        setSavedSuccessBanner(false);
+        setDictionarySyncError(err?.message || 'Falha ao salvar o documento.');
       } finally {
         isSavingRef.current = false;
         setIsSaving(false);
@@ -2614,6 +2649,11 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                     <Loader2 className="w-3.5 h-3.5 animate-spin" />
                     <span>Auto-saving to Firestore...</span>
                   </div>
+                ) : dictionarySyncError ? (
+                  <div className="flex items-center gap-1.5 text-red-700 font-semibold text-xs">
+                    <span className="w-2 h-2 rounded-full bg-red-500" />
+                    <span>Falha na sincronização com My Dictionary</span>
+                  </div>
                 ) : lastSavedTimestamp ? (
                   <div className="flex items-center gap-1.5 text-emerald-700 font-semibold text-xs">
                     <span className="w-2 h-2 rounded-full bg-emerald-500" />
@@ -2631,10 +2671,16 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           {/* Action Bar (Save Document to Firestore) */}
           <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-1">
             <div className="flex items-center gap-2 flex-wrap">
-              {savedSuccessBanner && (
+              {savedSuccessBanner && !dictionarySyncError && (
                 <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-emerald-100 text-emerald-800 text-xs font-bold animate-in fade-in duration-200 shadow-2xs">
                   <CheckCircle2 className="w-4 h-4 text-emerald-600" />
                   <span>Document saved successfully to Firestore!</span>
+                </div>
+              )}
+              {dictionarySyncError && (
+                <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-red-100 text-red-800 text-xs font-bold animate-in fade-in duration-200 shadow-2xs border border-red-200">
+                  <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+                  <span>{dictionarySyncError}</span>
                 </div>
               )}
             </div>
