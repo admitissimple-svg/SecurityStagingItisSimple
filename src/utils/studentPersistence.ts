@@ -459,6 +459,92 @@ export async function saveStudentVocabularyToFirestore(
 }
 
 /**
+ * Persists vocabulary exclusively through the authenticated backend API /api/student-dictionary
+ * with Firebase Bearer token and canonical server-side validation.
+ * ZERO browser-side direct writes to Firestore (strictly compliant with Fase 4B.7A Rule 3 & Rule 4).
+ */
+export async function persistStudentVocabularyViaBackendApi(params: {
+  studentUid: string;
+  studentEmail?: string;
+  lessonId?: string;
+  entries: StudentDictionaryEntry[];
+  isAutomaticSync?: boolean;
+  syncType?: string;
+}): Promise<StudentDictionaryEntry[]> {
+  const { studentUid, studentEmail, lessonId, entries, isAutomaticSync = true, syncType = 'native_notes' } = params;
+  const cleanUid = (studentUid || '').trim();
+  const cleanEmail = (studentEmail || '').toLowerCase().trim();
+
+  if (!entries || entries.length === 0) return [];
+
+  if (typeof window !== 'undefined') {
+    let token: string | null = null;
+    try {
+      token = (await getAccessToken().catch(() => null)) || (await auth.currentUser?.getIdToken().catch(() => null));
+    } catch {}
+
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const res = await fetch('/api/student-dictionary', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        studentEmail: cleanEmail,
+        studentUid: cleanUid,
+        lessonId,
+        entries,
+        isAutomaticSync,
+        syncType,
+      }),
+    });
+
+    if (!res.ok) {
+      const errJson = await res.json().catch(() => ({}));
+      const msg = errJson.message || errJson.error || `HTTP ${res.status}: Falha ao persistir vocabulário no backend.`;
+      throw new Error(msg);
+    }
+
+    const data = await res.json().catch(() => ({}));
+    const updatedDict: StudentDictionaryEntry[] = Array.isArray(data?.dictionary) ? data.dictionary : entries;
+    if (data?.excludedWords && Array.isArray(data.excludedWords)) {
+      cacheExcludedWordsLocally(data.studentUid || cleanUid, data.studentEmail || cleanEmail, data.excludedWords);
+    }
+    cacheVocabularyLocally(data?.studentUid || cleanUid, data?.studentEmail || cleanEmail, updatedDict);
+    return updatedDict;
+  } else {
+    // Node.js test environment support
+    try {
+      const {
+        getFirestoreDb,
+        saveStudentVocabularyToFirestoreServer,
+        fetchExcludedDictionaryWordsServer,
+        fetchStudentVocabularyFromFirestoreServer,
+      } = await import('../serverFirestore');
+      const serverDb = getFirestoreDb();
+      if (serverDb && cleanUid) {
+        let itemsToSave = entries;
+        if (isAutomaticSync) {
+          const exclusions = await fetchExcludedDictionaryWordsServer(cleanUid);
+          const exSet = new Set(exclusions.map(normalizeDictionaryWord).filter(Boolean));
+          itemsToSave = entries.filter((e) => {
+            const norm = normalizeDictionaryWord(e.normalizedWord || e.word);
+            return Boolean(norm && !exSet.has(norm));
+          });
+        }
+        if (itemsToSave.length > 0) {
+          await saveStudentVocabularyToFirestoreServer(cleanUid, itemsToSave, cleanEmail);
+        }
+        const updated = await fetchStudentVocabularyFromFirestoreServer(cleanUid, cleanEmail);
+        cacheVocabularyLocally(cleanUid, cleanEmail, updated);
+        return updated;
+      }
+    } catch {}
+    return entries;
+  }
+}
+
+/**
  * Phase 1B: Mark vocabulary words practiced upon successful completion of Daily Memorization Activity.
  * Increments practiceCount (+1) and sets lastPracticedAt to current ISO timestamp for each word in the queue.
  * Persists through the existing vocabulary persistence architecture.

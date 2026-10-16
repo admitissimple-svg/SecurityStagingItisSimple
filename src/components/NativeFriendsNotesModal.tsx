@@ -26,15 +26,18 @@ import {
   FileText,
   Info,
 } from 'lucide-react';
-import { GoogleAccount, LiveLesson, StudentProfile, UserProfile, EnglishLevel } from '../types';
+import { GoogleAccount, LiveLesson, StudentProfile, UserProfile, EnglishLevel, StudentDictionaryEntry } from '../types';
 import { formatDateInTimeZone } from '../utils/timezone';
 import { speakEnglish } from '../utils/audio';
 import {
   PedagogicalLessonTransformation,
   fetchPedagogicalTransformation,
   resolveCefrLevel,
+  extractNotesMarkings,
 } from '../utils/pedagogicalTransformer';
 import { syncSessionVocabularyToStudentDictionary } from '../utils/sessionVocabularySync';
+import { normalizeDictionaryWord } from '../utils/studentDictionaryLibrary';
+import { getAccessToken } from '../utils/auth';
 import { getDb } from '../firebase';
 import { collection, getDocs, query, where } from 'firebase/firestore';
 
@@ -53,6 +56,7 @@ interface NativeFriendsNotesModalProps {
   currentSequentialTab?: 'mistakes' | 'grammar' | 'vocab' | 'summary';
   currentStepNumber?: number;
   isLessonToday?: boolean;
+  onVocabularySynced?: (entries: StudentDictionaryEntry[]) => void;
 }
 
 interface SessionOption {
@@ -80,6 +84,7 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
   currentSequentialTab,
   currentStepNumber,
   isLessonToday = false,
+  onVocabularySynced,
 }) => {
   const isEn = currentLanguage === 'en';
 
@@ -119,6 +124,50 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
   const [sessionOptions, setSessionOptions] = useState<SessionOption[]>([]);
   const [selectedSessionKey, setSelectedSessionKey] = useState<string>('');
   const [isLoadingSessions, setIsLoadingSessions] = useState<boolean>(true);
+
+  // Confirmed persisted dictionary words for current student (Fase 4B.7A)
+  const [persistedWordsSet, setPersistedWordsSet] = useState<Set<string>>(new Set());
+  const [isSyncingVocab, setIsSyncingVocab] = useState<boolean>(false);
+  const [vocabSyncError, setVocabSyncError] = useState<string | null>(null);
+
+  // Hydrate confirmed persisted dictionary words from student's backend dictionary
+  useEffect(() => {
+    if (!isOpen || (!resolvedUid && !resolvedEmail)) return;
+    let isMounted = true;
+
+    async function loadStudentPersistedDictionary() {
+      try {
+        const token = (await getAccessToken().catch(() => null));
+        const headers: Record<string, string> = {};
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+
+        const res = await fetch(
+          `/api/student-dictionary?studentEmail=${encodeURIComponent(resolvedEmail)}${resolvedUid ? `&uid=${encodeURIComponent(resolvedUid)}` : ''}`,
+          { headers }
+        ).catch(() => null);
+
+        if (res && res.ok) {
+          const data = await res.json().catch(() => ({}));
+          const list: StudentDictionaryEntry[] = Array.isArray(data?.dictionary) ? data.dictionary : Array.isArray(data) ? data : [];
+          const words = new Set<string>();
+          list.forEach((entry) => {
+            const norm = normalizeDictionaryWord(entry.normalizedWord || entry.word);
+            if (norm) words.add(norm);
+          });
+          if (isMounted) {
+            setPersistedWordsSet(words);
+          }
+        }
+      } catch (err) {
+        console.warn('NativeFriendsNotes: notice loading student dictionary', err);
+      }
+    }
+
+    loadStudentPersistedDictionary();
+    return () => {
+      isMounted = false;
+    };
+  }, [isOpen, resolvedUid, resolvedEmail]);
 
   // Transformation data state
   const [transformation, setTransformation] = useState<PedagogicalLessonTransformation | null>(null);
@@ -322,6 +371,11 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
     return sessionOptions.find((s) => s.key === selectedSessionKey) || sessionOptions[0] || null;
   }, [sessionOptions, selectedSessionKey]);
 
+  // Extract raw markings from active session notes (Alt+W: newWords, Alt+P: pronounceItems)
+  const sessionMarkings = useMemo(() => {
+    return activeSession?.rawContent ? extractNotesMarkings(activeSession.rawContent) : { newWords: [], pronounceItems: [] };
+  }, [activeSession?.rawContent]);
+
   // Load and transform pedagogical notes whenever active session changes
   const loadPedagogicalNotes = useCallback(
     async (forceRegenerate: boolean = false) => {
@@ -348,18 +402,45 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
 
         setTransformation(result);
 
-        // Automatically sync session vocabulary (Alt + W and Alt + P) into the student's My Dictionary in Firestore
+        // Automatically sync session vocabulary (proven Alt + W only) into student's My Dictionary in Firestore via backend
         if (resolvedUid || resolvedEmail) {
-          syncSessionVocabularyToStudentDictionary({
-            studentUid: resolvedUid || resolvedEmail,
-            studentEmail: resolvedEmail,
-            rawNotes: activeSession.rawContent,
-            vocabularyAndExpressions: result.vocabularyAndExpressions,
-            studentLevel,
-            sessionDate: activeSession.dateStr,
-            topic: activeSession.topic,
-            teacherName: activeSession.teacherName,
-          }).catch((err) => console.warn('NativeFriendsNotes: vocabulary sync notice:', err));
+          setIsSyncingVocab(true);
+          setVocabSyncError(null);
+          try {
+            const syncedEntries = await syncSessionVocabularyToStudentDictionary({
+              studentUid: resolvedUid || resolvedEmail,
+              studentEmail: resolvedEmail,
+              rawNotes: activeSession.rawContent,
+              vocabularyAndExpressions: result.vocabularyAndExpressions,
+              studentLevel,
+              sessionDate: activeSession.dateStr,
+              topic: activeSession.topic,
+              teacherName: activeSession.teacherName,
+              lessonId: activeSession.lessonId,
+            });
+
+            if (syncedEntries && syncedEntries.length > 0) {
+              setPersistedWordsSet((prev) => {
+                const next = new Set(prev);
+                syncedEntries.forEach((entry) => {
+                  const norm = normalizeDictionaryWord(entry.normalizedWord || entry.word);
+                  if (norm) next.add(norm);
+                });
+                return next;
+              });
+
+              if (onVocabularySynced) {
+                onVocabularySynced(syncedEntries);
+              }
+            }
+          } catch (syncErr: any) {
+            console.error('NativeFriendsNotes: vocabulary sync failure:', syncErr);
+            setVocabSyncError(
+              syncErr?.message || (isEn ? 'Failed to sync vocabulary to My Dictionary.' : 'Falha ao sincronizar vocabulário com o Meu Dicionário.')
+            );
+          } finally {
+            setIsSyncingVocab(false);
+          }
         }
       } catch (err) {
         console.warn('Failed to load pedagogical notes:', err);
@@ -1103,10 +1184,33 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                     </span>
                   </div>
 
+                  {vocabSyncError && (
+                    <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-xs flex items-center justify-between gap-3 shadow-2xs">
+                      <div className="flex items-center gap-2">
+                        <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                        <span>{vocabSyncError}</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => loadPedagogicalNotes(false)}
+                        className="px-3 py-1.5 rounded-xl bg-amber-200/80 hover:bg-amber-300 text-amber-950 font-bold text-xs transition cursor-pointer shrink-0"
+                      >
+                        {isEn ? 'Retry Sync' : 'Tentar Novamente'}
+                      </button>
+                    </div>
+                  )}
+
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
                     {transformation.vocabularyAndExpressions.map((v, idx) => {
-                      const isPronounce = v.isPronunciationFocus || v.partOfSpeech === 'Pronunciation Focus' || v.category?.toLowerCase().includes('pronounc');
-                      const isNewWord = v.category?.toLowerCase().includes('new word') || v.partOfSpeech?.toLowerCase().includes('new');
+                      const normKey = normalizeDictionaryWord(v.term);
+                      const inAltWNotes = (sessionMarkings.newWords || []).some((w) => normalizeDictionaryWord(w) === normKey);
+                      const inAltPNotes = (sessionMarkings.pronounceItems || []).some((p) => normalizeDictionaryWord(p) === normKey);
+                      const isAltW = inAltWNotes || Boolean(v.isNewWord);
+                      const isAltP = inAltPNotes || Boolean(v.isPronunciationFocus);
+                      const isAltPIsolated = inAltPNotes && !inAltWNotes;
+
+                      // Strict Rule 8: Exibir somente após confirmação de persistência real. Alt+P isolado NÃO recebe esse selo por sincronização automática.
+                      const isConfirmedInDictionary = !isAltPIsolated && isAltW && Boolean(normKey && persistedWordsSet.has(normKey));
 
                       return (
                         <div
@@ -1117,16 +1221,20 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                             <div className="flex items-center justify-between gap-2">
                               <span
                                 className={`px-2 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wider ${
-                                  isPronounce
+                                  isAltW && isAltP
+                                    ? 'bg-indigo-50 text-indigo-800 border border-indigo-200/60'
+                                    : isAltPIsolated
                                     ? 'bg-purple-50 text-purple-800 border border-purple-200/60'
-                                    : isNewWord
+                                    : isAltW
                                     ? 'bg-blue-50 text-blue-800 border border-blue-200/60'
                                     : 'bg-slate-100 text-slate-700'
                                 }`}
                               >
-                                {isPronounce
+                                {isAltW && isAltP
+                                  ? (isEn ? 'New Word • Pronunciation' : 'Novo Termo • Pronúncia')
+                                  : isAltPIsolated
                                   ? (isEn ? 'Pronunciation' : 'Pronúncia')
-                                  : isNewWord
+                                  : isAltW
                                   ? (isEn ? 'New Term' : 'Novo Termo')
                                   : v.category || (isEn ? 'Vocabulary' : 'Vocabulário')}
                               </span>
@@ -1136,10 +1244,15 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                                     {v.cefrLevel || transformation.cefrLevel}
                                   </span>
                                 )}
-                                <span className="inline-flex items-center gap-1 text-[10px] text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200/80 font-semibold shadow-2xs">
-                                  <Check className="w-3 h-3 text-emerald-600" />
-                                  <span>{isEn ? 'In My Dictionary' : 'No Meu Dicionário'}</span>
-                                </span>
+                                {isConfirmedInDictionary && (
+                                  <span
+                                    id={`badge-in-dictionary-${normKey}`}
+                                    className="inline-flex items-center gap-1 text-[10px] text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200/80 font-semibold shadow-2xs animate-in fade-in duration-150"
+                                  >
+                                    <Check className="w-3 h-3 text-emerald-600" />
+                                    <span>{isEn ? 'In My Dictionary' : 'No Meu Dicionário'}</span>
+                                  </span>
+                                )}
                                 <span className="text-[10px] font-bold text-[#1C4C96] bg-[#9AB4FF]/20 border border-[#9AB4FF]/40 px-1.5 py-0.5 rounded uppercase tracking-wider shrink-0 select-none">
                                   {v.partOfSpeech}
                                 </span>

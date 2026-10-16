@@ -37,6 +37,7 @@ export interface PedagogicalVocabularyItem {
   category: string;
   phoneticGuide?: string;
   isPronunciationFocus?: boolean;
+  isNewWord?: boolean;
   cefrLevel?: string;
 }
 
@@ -571,7 +572,13 @@ export function generateLocalPedagogicalTransformation(params: {
           realExamples: dbMatch.realExamples || [dbMatch.exampleSentenceEn],
           synonyms: dbMatch.synonyms || ['target phrase'],
           register: dbMatch.register || ('neutral' as const),
-          category: isPronounce ? 'Pronunciation & Phonetics (Alt+P)' : isNewWord ? 'New Words & Expressions (Alt+W)' : 'Core Session Vocabulary',
+          category: isNewWord && isPronounce
+            ? 'New Word & Pronunciation (Alt+W + Alt+P)'
+            : isPronounce
+            ? 'Pronunciation & Phonetics (Alt+P)'
+            : isNewWord
+            ? 'New Words & Expressions (Alt+W)'
+            : 'Core Session Vocabulary',
         }
       : {
           partOfSpeech: isPronounce
@@ -589,7 +596,13 @@ export function generateLocalPedagogicalTransformation(params: {
           ],
           synonyms: ['natural expression', 'target phrase'],
           register: 'neutral' as const,
-          category: isPronounce ? 'Pronunciation & Phonetics (Alt+P)' : isNewWord ? 'New Words & Expressions (Alt+W)' : 'Core Session Vocabulary',
+          category: isNewWord && isPronounce
+            ? 'New Word & Pronunciation (Alt+W + Alt+P)'
+            : isPronounce
+            ? 'Pronunciation & Phonetics (Alt+P)'
+            : isNewWord
+            ? 'New Words & Expressions (Alt+W)'
+            : 'Core Session Vocabulary',
         };
 
     vocabularyAndExpressions.push({
@@ -601,6 +614,7 @@ export function generateLocalPedagogicalTransformation(params: {
         ? `🎯 Pronunciation focus: practice clean syllable stress on "${rawTrimmed}" without adding Portuguese final vowels.`
         : (dbMatch?.phonetic || undefined),
       isPronunciationFocus: isPronounce,
+      isNewWord: isNewWord,
     });
   });
 

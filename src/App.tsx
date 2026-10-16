@@ -6423,6 +6423,11 @@ export default function App() {
                   currentLanguage={currentLanguage}
                   t={t}
                   timeZone={DEFAULT_STUDENT_TIMEZONE}
+                  onVocabularySynced={(syncedEntries) => {
+                    setStudentDictionaryEntries((prev) =>
+                      consolidateDictionaryEntries(prev, syncedEntries, excludedDictionaryWordsRef.current)
+                    );
+                  }}
                 />
 
                 {/* Activity Reminders Manager (5-minute alerts based on registered times) */}

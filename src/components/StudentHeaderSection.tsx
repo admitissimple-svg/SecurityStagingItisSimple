@@ -56,6 +56,7 @@ interface StudentHeaderSectionProps {
   currentLanguage: Language;
   t: Translations;
   timeZone?: string;
+  onVocabularySynced?: (entries: any[]) => void;
 }
 
 export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
@@ -77,6 +78,7 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
   currentLanguage,
   t,
   timeZone = 'America/Sao_Paulo',
+  onVocabularySynced,
 }) => {
   const isEn = currentLanguage === 'en';
   const [isNotesModalOpen, setIsNotesModalOpen] = useState(false);
@@ -694,6 +696,7 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
         currentSequentialTab={reminder?.targetTab}
         currentStepNumber={reminder?.tabNumber}
         isLessonToday={reminder?.isLessonToday}
+        onVocabularySynced={onVocabularySynced}
       />
     </div>
   );

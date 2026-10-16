@@ -1485,6 +1485,17 @@ function consolidateServerEntries(existingEntries: any[], newEntries: any[]): an
       }
     }
 
+    // Practice history: NEVER drop or overwrite existing history
+    const mergedPracticeHistory = [...(existing.practiceHistory || [])];
+    if (Array.isArray(item.practiceHistory)) {
+      item.practiceHistory.forEach((h: any) => {
+        const isDup = mergedPracticeHistory.some(
+          (m: any) => m.date === h.date && m.activityType === h.activityType
+        );
+        if (!isDup) mergedPracticeHistory.push(h);
+      });
+    }
+
     masterMap.set(key, {
       ...existing,
       ...item,
@@ -1496,6 +1507,7 @@ function consolidateServerEntries(existingEntries: any[], newEntries: any[]): an
       exampleSentenceEn: resolvedExample,
       origins: mergedOrigins,
       practiceCount: mergedPracticeCount,
+      practiceHistory: mergedPracticeHistory,
       lastPracticedAt: mergedLastPracticedAt,
     });
   });

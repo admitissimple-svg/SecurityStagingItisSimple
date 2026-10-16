@@ -9111,6 +9111,7 @@ app.post('/api/student-dictionary', async (req, res) => {
     req.body?.isAutomaticSync === true ||
     req.body?.syncType === 'routine_sync' ||
     req.body?.syncType === 'automatic' ||
+    req.body?.syncType === 'native_notes' ||
     req.body?.source === 'routine_sync'
   );
 

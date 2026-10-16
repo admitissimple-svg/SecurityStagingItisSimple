@@ -5,7 +5,7 @@ import {
   PedagogicalVocabularyItem,
 } from './pedagogicalTransformer';
 import { lookupWord } from './dictionaryService';
-import { saveStudentVocabularyToFirestore } from './studentPersistence';
+import { persistStudentVocabularyViaBackendApi } from './studentPersistence';
 import { normalizeDictionaryWord } from './studentDictionaryLibrary';
 
 export interface SyncSessionVocabParams {
@@ -37,14 +37,14 @@ function formatSentence(str?: string): string {
  * Synchronizes words and expressions indicated by the Native Friend/Tutor
  * during a session into the student's "My Dictionary" in Cloud Firestore.
  *
- * Strict Compliance Requirements (Fase 2.1):
+ * Strict Compliance Requirements (Fase 4B.7A):
  * 1. ONLY words explicitly marked as New Word (Alt + W) enter My Dictionary.
  * 2. Items marked exclusively as Pronounce (Alt + P) remain in pedagogical notes
  *    and do NOT enter the personal dictionary automatically.
  * 3. If a term has both New Word (Alt+W) and Pronounce (Alt+P), it enters as a New Word
  *    while retaining its pronunciation focus guidance.
- * 4. Zero localStorage: 100% of data is persisted in Cloud Firestore isolated by student UID.
- * 5. Follows standard app rules for definitions, grammatical classes, CEFR levels, and authentic examples.
+ * 4. Zero direct client Firestore writes: 100% of data is persisted via backend API with Firebase Bearer.
+ * 5. Multi-origin preservation: source 'live_lesson', origin 'native_notes'.
  */
 export async function syncSessionVocabularyToStudentDictionary(
   params: SyncSessionVocabParams
@@ -104,7 +104,7 @@ export async function syncSessionVocabularyToStudentDictionary(
   });
 
   // Check terms from raw markings (Alt + P: Pronounce)
-  // RULE (Etapa B): Items marked EXCLUSIVELY as Pronounce (Alt + P) remain in pedagogical notes
+  // RULE: Items marked EXCLUSIVELY as Pronounce (Alt + P) remain in pedagogical notes
   // and do NOT automatically enter My Dictionary!
   (markings.pronounceItems || []).forEach((p) => {
     const clean = p.trim();
@@ -120,7 +120,7 @@ export async function syncSessionVocabularyToStudentDictionary(
   });
 
   // Merge terms from pedagogical transformation vocabulary (if provided)
-  // Only accept terms that are explicitly New Words (Alt+W)
+  // Strictly enforce Rule 2: Only accept terms that are proven New Words (Alt+W)
   (vocabularyAndExpressions || []).forEach((v) => {
     const clean = (v.term || '').trim();
     if (!clean) return;
@@ -128,18 +128,26 @@ export async function syncSessionVocabularyToStudentDictionary(
     if (!key) return;
     const existing = candidateMap.get(key);
 
+    const inAltWNotes = (markings.newWords || []).some((w) => normalizeDictionaryWord(w) === key);
+    const inAltPNotes = (markings.pronounceItems || []).some((p) => normalizeDictionaryWord(p) === key);
+    const isAltPIsolated = inAltPNotes && !inAltWNotes;
+
+    // Strict Rule 2: Alt+P isolated NEVER enters My Dictionary
+    if (isAltPIsolated) {
+      return;
+    }
+
     const isExplicitNewWord =
       Boolean(existing?.isNewWord) ||
-      (markings.newWords || []).some((w) => normalizeDictionaryWord(w) === key) ||
-      v.category?.toLowerCase().includes('new word') ||
-      v.partOfSpeech?.toLowerCase().includes('new');
+      inAltWNotes ||
+      (!rawNotes && (Boolean(v.isNewWord) || v.category?.toLowerCase().includes('alt+w') || v.category?.toLowerCase().includes('new word')));
 
     // Only if it is explicitly a New Word (Alt+W)
     if (isExplicitNewWord) {
       const isPronounce =
         Boolean(v.isPronunciationFocus) ||
         Boolean(existing?.isPronounce) ||
-        (markings.pronounceItems || []).some((p) => normalizeDictionaryWord(p) === key);
+        inAltPNotes;
 
       const candidate: TermMetadata = {
         term: clean,
@@ -234,11 +242,19 @@ export async function syncSessionVocabularyToStudentDictionary(
   }
 
   // 4. Save cumulatively and permanently to Cloud Firestore isolated by student UID (if not skipped)
+  // Strictly executed via authenticated backend API with verified Firebase Bearer (Rule 3 & Rule 4).
   if (!params.skipClientWrite) {
     try {
-      await saveStudentVocabularyToFirestore(cleanUid, dictionaryEntries, cleanEmail, lessonId);
+      await persistStudentVocabularyViaBackendApi({
+        studentUid: cleanUid,
+        studentEmail: cleanEmail,
+        lessonId,
+        entries: dictionaryEntries,
+        isAutomaticSync: true,
+        syncType: 'native_notes',
+      });
     } catch (err: any) {
-      console.error('syncSessionVocabularyToStudentDictionary Firestore save error:', err);
+      console.error('syncSessionVocabularyToStudentDictionary backend save error:', err);
       throw new Error(`Falha na persistência canônica do vocabulário: ${err?.message || err}`);
     }
   }
