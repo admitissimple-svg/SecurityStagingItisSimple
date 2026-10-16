@@ -436,15 +436,18 @@ export async function saveStudentVocabularyToFirestore(
         }
       } catch (fetchErr: any) {
         // In Node/test/SSR environment where relative URL cannot be resolved:
-        try {
-          const { getFirestoreDb, saveStudentVocabularyToFirestoreServer } = await import('../serverFirestore');
-          const serverDb = getFirestoreDb();
-          if (serverDb) {
-            await saveStudentVocabularyToFirestoreServer(cleanUid, accumulatedList, cleanEmail);
-            cacheVocabularyLocally(cleanUid, cleanEmail, accumulatedList);
-            return true;
-          }
-        } catch {}
+        if (typeof window === 'undefined') {
+          try {
+            const serverModule = '../' + 'serverFirestore';
+            const { getFirestoreDb, saveStudentVocabularyToFirestoreServer } = await import(/* @vite-ignore */ serverModule);
+            const serverDb = getFirestoreDb();
+            if (serverDb) {
+              await saveStudentVocabularyToFirestoreServer(cleanUid, accumulatedList, cleanEmail);
+              cacheVocabularyLocally(cleanUid, cleanEmail, accumulatedList);
+              return true;
+            }
+          } catch {}
+        }
         throw fetchErr;
       }
     }
@@ -480,7 +483,7 @@ export async function persistStudentVocabularyViaBackendApi(params: {
   if (typeof window !== 'undefined') {
     let token: string | null = null;
     try {
-      token = (await getAccessToken().catch(() => null)) || (await auth.currentUser?.getIdToken().catch(() => null));
+      token = (await getAccessToken().catch(() => null)) || (await auth.currentUser?.getIdToken().catch(() => null)) || null;
     } catch {}
 
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -515,12 +518,13 @@ export async function persistStudentVocabularyViaBackendApi(params: {
   } else {
     // Node.js test environment support
     try {
+      const serverModule = '../' + 'serverFirestore';
       const {
         getFirestoreDb,
         saveStudentVocabularyToFirestoreServer,
         fetchExcludedDictionaryWordsServer,
         fetchStudentVocabularyFromFirestoreServer,
-      } = await import('../serverFirestore');
+      } = await import(/* @vite-ignore */ serverModule);
       const serverDb = getFirestoreDb();
       if (serverDb && cleanUid) {
         let itemsToSave = entries;
@@ -757,14 +761,17 @@ export async function deleteStudentVocabularyFromFirestore(
     return true;
   } catch (fetchErr) {
     // In Node / SSR / test environment without browser fetch to relative URL
-    try {
-      const { getFirestoreDb, addExcludedDictionaryWordsServer } = await import('../serverFirestore');
-      const serverDb = getFirestoreDb();
-      if (serverDb) {
-        await addExcludedDictionaryWordsServer(cleanUid, [norm]);
-        return true;
-      }
-    } catch {}
+    if (typeof window === 'undefined') {
+      try {
+        const serverModule = '../' + 'serverFirestore';
+        const { getFirestoreDb, addExcludedDictionaryWordsServer } = await import(/* @vite-ignore */ serverModule);
+        const serverDb = getFirestoreDb();
+        if (serverDb) {
+          await addExcludedDictionaryWordsServer(cleanUid, [norm]);
+          return true;
+        }
+      } catch {}
+    }
     throw fetchErr;
   }
 }
@@ -805,17 +812,20 @@ export async function fetchExcludedDictionaryWords(
     return getCachedExcludedDictionaryWords(cleanUid, cleanEmail);
   }
 
-  try {
-    const { getFirestoreDb, fetchExcludedDictionaryWordsServer } = await import('../serverFirestore');
-    const serverDb = getFirestoreDb();
-    if (serverDb) {
-      const serverWords = await fetchExcludedDictionaryWordsServer(cleanUid);
-      if (serverWords.length > 0) {
-        cacheExcludedWordsLocally(cleanUid, cleanEmail, serverWords);
-        return serverWords;
+  if (typeof window === 'undefined') {
+    try {
+      const serverModule = '../' + 'serverFirestore';
+      const { getFirestoreDb, fetchExcludedDictionaryWordsServer } = await import(/* @vite-ignore */ serverModule);
+      const serverDb = getFirestoreDb();
+      if (serverDb) {
+        const serverWords = await fetchExcludedDictionaryWordsServer(cleanUid);
+        if (serverWords.length > 0) {
+          cacheExcludedWordsLocally(cleanUid, cleanEmail, serverWords);
+          return serverWords;
+        }
       }
-    }
-  } catch {}
+    } catch {}
+  }
 
   if (!db) {
     return getCachedExcludedDictionaryWords(cleanUid, cleanEmail);
@@ -871,14 +881,17 @@ export async function removeExcludedDictionaryWord(
     cacheExcludedWordsLocally(cleanUid, cleanEmail, updatedList);
   }
 
-  try {
-    const { getFirestoreDb, removeExcludedDictionaryWordsServer } = await import('../serverFirestore');
-    const serverDb = getFirestoreDb();
-    if (serverDb) {
-      await removeExcludedDictionaryWordsServer(cleanUid, [norm]);
-      return true;
-    }
-  } catch {}
+  if (typeof window === 'undefined') {
+    try {
+      const serverModule = '../' + 'serverFirestore';
+      const { getFirestoreDb, removeExcludedDictionaryWordsServer } = await import(/* @vite-ignore */ serverModule);
+      const serverDb = getFirestoreDb();
+      if (serverDb) {
+        await removeExcludedDictionaryWordsServer(cleanUid, [norm]);
+        return true;
+      }
+    } catch {}
+  }
 
   const db = getDb();
   if (!db || !cleanUid) return true;

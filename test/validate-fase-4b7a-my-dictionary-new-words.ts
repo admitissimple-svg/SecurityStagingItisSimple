@@ -179,8 +179,8 @@ async function runTestSuite() {
     practiceCount: 3,
     lastPracticedAt: '2026-10-15T18:00:00Z',
     practiceHistory: [
-      { date: '2026-10-12', activityType: 'flashcards', result: 'correct' },
-      { date: '2026-10-15', activityType: 'quiz', result: 'correct' },
+      { date: '2026-10-12', activityType: 'flashcards', correct: true },
+      { date: '2026-10-15', activityType: 'quiz', correct: true },
     ],
     origins: [
       { source: 'routine', activityName: 'Video of the Day', date: '2026-10-10' },
