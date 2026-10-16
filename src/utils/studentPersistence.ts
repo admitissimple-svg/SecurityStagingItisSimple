@@ -427,6 +427,9 @@ export async function saveStudentVocabularyToFirestore(
         }
 
         const resData = await res.json().catch(() => ({}));
+        if (resData?.excludedWords && Array.isArray(resData.excludedWords)) {
+          cacheExcludedWordsLocally(resData.studentUid || cleanUid, resData.studentEmail || cleanEmail, resData.excludedWords);
+        }
         if (resData?.dictionary && Array.isArray(resData.dictionary)) {
           cacheVocabularyLocally(resData.studentUid || cleanUid, resData.studentEmail || cleanEmail, resData.dictionary);
           return true;
@@ -612,85 +615,71 @@ export async function fetchStudentVocabularyFromFirestore(
 }
 
 /**
- * Delete a student vocabulary entry directly from Cloud Firestore and clean up local cache.
+ * Delete a student vocabulary entry logically by persisting tombstones via backend Firebase Admin SDK.
+ * Does not physically delete lesson records, routines, definitions, or practice metrics.
  */
 export async function deleteStudentVocabularyFromFirestore(
   studentUid: string,
   word: string,
   studentEmail?: string
 ): Promise<boolean> {
-  const db = getDb();
-  if (!db || !word) return false;
+  const norm = normalizeDictionaryWord(word);
+  if (!norm) return false;
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
   const cleanUid = normalizeUid(studentUid, cleanEmail);
   if (!cleanUid) return false;
 
-  const cleanWord = word.trim().toLowerCase();
-  const wordDocId = cleanWord.replace(/[^a-zA-Z0-9_-]/g, '_');
+  // 1. Update in-memory exclusions and filter local cache
+  const currentEx = new Set(getCachedExcludedDictionaryWords(cleanUid, cleanEmail));
+  currentEx.add(norm);
+  const updatedExcluded = Array.from(currentEx);
+  cacheExcludedWordsLocally(cleanUid, cleanEmail, updatedExcluded);
 
+  const localVocab = getCachedLocalVocabulary(cleanUid, cleanEmail);
+  const filteredVocab = localVocab.filter((e) => normalizeDictionaryWord(e.normalizedWord || e.word) !== norm);
+  cacheVocabularyLocally(cleanUid, cleanEmail, filteredVocab);
+
+  // 2. Call authenticated backend DELETE endpoint
   try {
-    // 1. Delete from subcollection by predictable wordDocId
-    const itemRef = doc(db, 'users', cleanUid, 'vocabulary', wordDocId);
-    await withFirestoreTimeout(deleteDoc(itemRef), 3000, null);
-
-    // Also remove any documents in the subcollection where word matches cleanWord
+    let token: string | null = null;
     try {
-      const subCol = collection(db, 'users', cleanUid, 'vocabulary');
-      const subSnap = await withFirestoreTimeout(getDocs(subCol), 2500, null);
-      if (subSnap && !subSnap.empty) {
-        for (const docItem of subSnap.docs) {
-          const itemData = docItem.data();
-          if ((itemData?.word || '').trim().toLowerCase() === cleanWord) {
-            await deleteDoc(docItem.ref).catch(() => {});
-          }
-        }
-      }
+      token = await getAccessToken();
     } catch {}
 
-    // 2. Remove from users/{cleanUid}.vocabulary array
-    const userRef = doc(db, 'users', cleanUid);
-    const snap = await withFirestoreTimeout(getDoc(userRef), 2500, null);
-    if (snap && snap.exists()) {
-      const data = snap.data();
-      if (Array.isArray(data?.vocabulary)) {
-        const filtered = data.vocabulary.filter(
-          (item: StudentDictionaryEntry) => (item?.word || '').trim().toLowerCase() !== cleanWord
-        );
-        await withFirestoreTimeout(
-          setDoc(userRef, { vocabulary: filtered, updatedAt: new Date().toISOString() }, { merge: true }),
-          3000,
-          null
-        );
-        cacheVocabularyLocally(cleanUid, cleanEmail, filtered);
-      }
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const res = await fetch('/api/student-dictionary', {
+      method: 'DELETE',
+      headers,
+      body: JSON.stringify({
+        word: norm,
+        studentUid: cleanUid,
+        studentEmail: cleanEmail,
+      }),
+    });
+
+    if (!res.ok) {
+      const errJson = await res.json().catch(() => ({}));
+      throw new Error(errJson.message || errJson.error || `HTTP ${res.status}: Failed to delete dictionary entry.`);
     }
 
-    // Also remove from any legacy doc IDs
-    const allDocIds = getUserDocIds(cleanUid, cleanEmail);
-    for (const altId of allDocIds) {
-      if (altId === cleanUid) continue;
-      try {
-        const altRef = doc(db, 'users', altId);
-        const altSnap = await withFirestoreTimeout(getDoc(altRef), 2000, null);
-        if (altSnap && altSnap.exists()) {
-          const altData = altSnap.data();
-          if (Array.isArray(altData?.vocabulary)) {
-            const filtered = altData.vocabulary.filter(
-              (item: StudentDictionaryEntry) => (item?.word || '').trim().toLowerCase() !== cleanWord
-            );
-            await setDoc(altRef, { vocabulary: filtered, updatedAt: new Date().toISOString() }, { merge: true });
-          }
-        }
-      } catch {}
+    const resData = await res.json().catch(() => ({}));
+    if (Array.isArray(resData?.excludedWords)) {
+      cacheExcludedWordsLocally(cleanUid, cleanEmail, resData.excludedWords);
     }
-
-    // 3. Mark word as excluded so routine consolidation does not resurrect it
-    await addExcludedDictionaryWord(cleanUid, cleanWord, cleanEmail);
-
     return true;
-  } catch (error) {
-    handleFirestoreError(error, OperationType.DELETE, `users/${cleanUid}/vocabulary/${wordDocId}`);
-    return false;
+  } catch (fetchErr) {
+    // In Node / SSR / test environment without browser fetch to relative URL
+    try {
+      const { getFirestoreDb, addExcludedDictionaryWordsServer } = await import('../serverFirestore');
+      const serverDb = getFirestoreDb();
+      if (serverDb) {
+        await addExcludedDictionaryWordsServer(cleanUid, [norm]);
+        return true;
+      }
+    } catch {}
+    throw fetchErr;
   }
 }
 
@@ -726,7 +715,23 @@ export async function fetchExcludedDictionaryWords(
   const db = getDb();
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
   const cleanUid = normalizeUid(studentUid, cleanEmail);
-  if (!db || !cleanUid) {
+  if (!cleanUid) {
+    return getCachedExcludedDictionaryWords(cleanUid, cleanEmail);
+  }
+
+  try {
+    const { getFirestoreDb, fetchExcludedDictionaryWordsServer } = await import('../serverFirestore');
+    const serverDb = getFirestoreDb();
+    if (serverDb) {
+      const serverWords = await fetchExcludedDictionaryWordsServer(cleanUid);
+      if (serverWords.length > 0) {
+        cacheExcludedWordsLocally(cleanUid, cleanEmail, serverWords);
+        return serverWords;
+      }
+    }
+  } catch {}
+
+  if (!db) {
     return getCachedExcludedDictionaryWords(cleanUid, cleanEmail);
   }
 
@@ -749,38 +754,14 @@ export async function fetchExcludedDictionaryWords(
 }
 
 /**
- * Adds a word to the excluded dictionary words list.
+ * Adds a word to the excluded dictionary words list using canonical deletion endpoint.
  */
 export async function addExcludedDictionaryWord(
   studentUid: string,
   word: string,
   studentEmail?: string
 ): Promise<boolean> {
-  const norm = normalizeDictionaryWord(word);
-  if (!norm) return false;
-  const cleanEmail = (studentEmail || '').toLowerCase().trim();
-  const cleanUid = normalizeUid(studentUid, cleanEmail);
-
-  // Update in-memory
-  const current = new Set(getCachedExcludedDictionaryWords(cleanUid, cleanEmail));
-  current.add(norm);
-  const updatedList = Array.from(current);
-  cacheExcludedWordsLocally(cleanUid, cleanEmail, updatedList);
-
-  const db = getDb();
-  if (!db || !cleanUid) return true;
-
-  try {
-    const userRef = doc(db, 'users', cleanUid);
-    await withFirestoreTimeout(
-      setDoc(userRef, { excludedDictionaryWords: updatedList, updatedAt: new Date().toISOString() }, { merge: true }),
-      3000,
-      null
-    );
-    return true;
-  } catch {
-    return false;
-  }
+  return deleteStudentVocabularyFromFirestore(studentUid, word, studentEmail);
 }
 
 /**
@@ -795,18 +776,30 @@ export async function removeExcludedDictionaryWord(
   if (!norm) return false;
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
   const cleanUid = normalizeUid(studentUid, cleanEmail);
+  if (!cleanUid) return false;
 
   const current = new Set(getCachedExcludedDictionaryWords(cleanUid, cleanEmail));
-  if (!current.has(norm)) return true;
-  current.delete(norm);
-  const updatedList = Array.from(current);
-  cacheExcludedWordsLocally(cleanUid, cleanEmail, updatedList);
+  if (current.has(norm)) {
+    current.delete(norm);
+    const updatedList = Array.from(current);
+    cacheExcludedWordsLocally(cleanUid, cleanEmail, updatedList);
+  }
+
+  try {
+    const { getFirestoreDb, removeExcludedDictionaryWordsServer } = await import('../serverFirestore');
+    const serverDb = getFirestoreDb();
+    if (serverDb) {
+      await removeExcludedDictionaryWordsServer(cleanUid, [norm]);
+      return true;
+    }
+  } catch {}
 
   const db = getDb();
   if (!db || !cleanUid) return true;
 
   try {
     const userRef = doc(db, 'users', cleanUid);
+    const updatedList = Array.from(current);
     await withFirestoreTimeout(
       setDoc(userRef, { excludedDictionaryWords: updatedList, updatedAt: new Date().toISOString() }, { merge: true }),
       3000,
@@ -817,6 +810,7 @@ export async function removeExcludedDictionaryWord(
     return false;
   }
 }
+
 
 export type StudentVocabularySubscriptionStatus =
   | 'loading'
@@ -829,6 +823,7 @@ export interface StudentVocabularySnapshotResult {
   status: StudentVocabularySubscriptionStatus;
   studentUid: string;
   error?: string | null;
+  excludedWords?: string[];
 }
 
 /**
@@ -970,6 +965,7 @@ export function subscribeToStudentVocabulary(
       status,
       studentUid: cleanUid,
       error: (docError || colError)?.message || null,
+      excludedWords: Array.from(excluded),
     });
   };
 

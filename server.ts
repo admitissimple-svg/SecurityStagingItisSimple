@@ -19,8 +19,49 @@ const isPlaceholder = (val: string | undefined): boolean => {
   );
 };
 
-// Ensure production mode is set when running in Google Cloud Run or explicit production environments
-if (!process.env.NODE_ENV && (process.env.K_SERVICE || process.env.K_REVISION || process.env.APP_ENV === 'production')) {
+/**
+ * Detects whether the current runtime is an AI Studio Preview or development environment,
+ * even when running inside Google Cloud Run (which injects K_SERVICE / K_REVISION).
+ */
+export function isCloudRunPreviewEnvironment(): boolean {
+  if (process.env.APP_ENV === 'production') {
+    return false;
+  }
+  if (process.env.NODE_ENV === 'development' || process.env.APP_ENV === 'development' || process.env.APP_ENV === 'preview') {
+    return true;
+  }
+  if (process.env.IS_PREVIEW === 'true' || process.env.PREVIEW === 'true') {
+    return true;
+  }
+
+  const kService = (process.env.K_SERVICE || '').toLowerCase();
+  const kRevision = (process.env.K_REVISION || '').toLowerCase();
+
+  if (kService || kRevision) {
+    return (
+      kService.startsWith('ais-') ||
+      kService.includes('preview') ||
+      kService.includes('dev') ||
+      kRevision.startsWith('ais-') ||
+      kRevision.includes('preview') ||
+      kRevision.includes('dev')
+    );
+  }
+
+  if (Boolean(process.env.APPLET_ID)) {
+    return true;
+  }
+  const appUrl = (process.env.APP_URL || '').toLowerCase();
+  return appUrl.includes('ais-') || appUrl.includes('preview');
+}
+
+// In preview/development environments, normalize NODE_ENV to development if unset.
+// Only set production if explicitly running in a production Cloud Run service or APP_ENV=production.
+if (isCloudRunPreviewEnvironment()) {
+  if (!process.env.NODE_ENV) {
+    process.env.NODE_ENV = 'development';
+  }
+} else if (!process.env.NODE_ENV && (process.env.K_SERVICE || process.env.K_REVISION || process.env.APP_ENV === 'production')) {
   process.env.NODE_ENV = 'production';
 }
 

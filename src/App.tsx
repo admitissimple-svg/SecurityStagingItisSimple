@@ -119,6 +119,7 @@ import {
   addExcludedDictionaryWord,
   removeExcludedDictionaryWord,
   getCachedExcludedDictionaryWords,
+  cacheExcludedWordsLocally,
   deleteStudentJournalEntryFromFirestore,
   recordActivityInStudentJournal,
   removeActivityFromStudentJournal,
@@ -836,7 +837,7 @@ export default function App() {
 
   // Generate Weekly Homework automatically whenever routines, dictionary, or targetDay change
   useEffect(() => {
-    const customWordList = studentDictionaryEntries.map((e) => ({
+    const customWordList = consolidatedActiveDictionary.map((e) => ({
       id: e.id,
       word: e.word,
       definitionEn: e.definitionEn,
@@ -860,6 +861,7 @@ export default function App() {
       activeStudyDays: userProfile?.weeklyStudyDays,
       weeklyCycle: userProfile?.weeklyCycle || 1,
       userProfile,
+      excludedWords: excludedDictionaryWords,
     });
 
     // If we already have an AI-generated homework and the collected words haven't changed, preserve it (unless it was generated with old template)!
@@ -915,7 +917,7 @@ export default function App() {
         },
       };
     });
-  }, [routinesByDay, userProfile.name, userProfile.level, studentDictionaryEntries, homeworkTargetDay, userProfile?.weeklyStudyDays, userProfile?.weeklyCycle]);
+  }, [routinesByDay, userProfile.name, userProfile.level, studentDictionaryEntries, excludedDictionaryWords, homeworkTargetDay, userProfile?.weeklyStudyDays, userProfile?.weeklyCycle]);
 
   // Synchronize completedPartsByDay from weeklyChecks so memorization S-Path checks are always in sync
   useEffect(() => {
@@ -1359,27 +1361,25 @@ export default function App() {
               });
           }
 
-          // Fetch student personal dictionary directly from Firestore (Permanent Multi-device Sync)
-          fetchStudentVocabularyFromFirestore(uid, email)
+          // Fetch student exclusions first from Firestore/server, then student vocabulary
+          fetchExcludedDictionaryWords(uid, email)
+            .then((excluded) => {
+              if (isCancelled) return null;
+              if (activeStudentUidRef.current !== uid) return null;
+              if (Array.isArray(excluded)) {
+                excludedDictionaryWordsRef.current = excluded;
+                setExcludedDictionaryWords(excluded);
+              }
+              return fetchStudentVocabularyFromFirestore(uid, email);
+            })
             .then((vocab) => {
-              if (isCancelled) return;
+              if (isCancelled || !vocab) return;
               if (activeStudentUidRef.current !== uid) return;
               if (Array.isArray(vocab) && vocab.length > 0) {
                 setStudentDictionaryEntries((prev) => {
                   if (activeStudentUidRef.current !== uid) return prev;
                   return consolidateDictionaryEntries(prev, vocab, excludedDictionaryWordsRef.current);
                 });
-              }
-            })
-            .catch(() => {});
-
-          fetchExcludedDictionaryWords(uid, email)
-            .then((excluded) => {
-              if (isCancelled) return;
-              if (activeStudentUidRef.current !== uid) return;
-              if (Array.isArray(excluded)) {
-                excludedDictionaryWordsRef.current = excluded;
-                setExcludedDictionaryWords(excluded);
               }
             })
             .catch(() => {});
@@ -1576,14 +1576,26 @@ export default function App() {
       }).catch(() => {
         return fetch(`/api/student-dictionary?studentEmail=${encodeURIComponent(dictEmail)}${canonicalStudentUid ? `&uid=${encodeURIComponent(canonicalStudentUid)}` : ''}`);
       })
-        .then((r) => (r.ok ? r.json() : []))
+        .then((r) => (r.ok ? r.json() : null))
         .then((data) => {
-          if (isCancelled) return;
+          if (isCancelled || !data) return;
           if (role === 'student' && activeStudentUidRef.current !== canonicalStudentUid) return;
-          if (Array.isArray(data) && data.length > 0) {
+
+          const entries = Array.isArray(data) ? data : (Array.isArray(data?.dictionary) ? data.dictionary : []);
+          const excluded = Array.isArray(data?.excludedWords)
+            ? data.excludedWords.map((w: string) => normalizeDictionaryWord(w)).filter(Boolean)
+            : [];
+
+          if (excluded.length > 0) {
+            excludedDictionaryWordsRef.current = excluded;
+            setExcludedDictionaryWords(excluded);
+            cacheExcludedWordsLocally(canonicalStudentUid, dictEmail, excluded);
+          }
+
+          if (entries.length > 0) {
             setStudentDictionaryEntries((prev) => {
               if (role === 'student' && activeStudentUidRef.current !== canonicalStudentUid) return prev;
-              return consolidateDictionaryEntries(prev, data, excludedDictionaryWordsRef.current);
+              return consolidateDictionaryEntries(prev, entries, excludedDictionaryWordsRef.current);
             });
           }
         })
@@ -1925,6 +1937,12 @@ export default function App() {
         return;
       }
 
+      if (snapshotResult?.excludedWords && Array.isArray(snapshotResult.excludedWords)) {
+        const excl = snapshotResult.excludedWords.map((w: string) => normalizeDictionaryWord(w)).filter(Boolean);
+        excludedDictionaryWordsRef.current = excl;
+        setExcludedDictionaryWords(excl);
+      }
+
       if (Array.isArray(cloudEntries)) {
         // Direct authoritative reflection from Cloud Firestore guarantees deletion and addition instant sync across devices!
         const filtered = cloudEntries.filter((e) => {
@@ -1976,26 +1994,6 @@ export default function App() {
 
     let isEffectCancelled = false;
 
-    fetchStudentVocabularyFromFirestore(uid, cleanEmail).then((fsEntries) => {
-      if (isEffectCancelled) return;
-      if (currentAccount?.role === 'student' && activeStudentUidRef.current !== uid) return;
-      if (Array.isArray(fsEntries) && fsEntries.length > 0) {
-        setStudentDictionaryEntries((prev) => {
-          if (currentAccount?.role === 'student' && activeStudentUidRef.current !== uid) return prev;
-          return consolidateDictionaryEntries(prev, fsEntries, excludedDictionaryWordsRef.current);
-        });
-      }
-    });
-
-    fetchExcludedDictionaryWords(uid, cleanEmail).then((exWords) => {
-      if (isEffectCancelled) return;
-      if (currentAccount?.role === 'student' && activeStudentUidRef.current !== uid) return;
-      if (Array.isArray(exWords)) {
-        excludedDictionaryWordsRef.current = exWords;
-        setExcludedDictionaryWords(exWords);
-      }
-    });
-
     auth.currentUser?.getIdToken().then((token) => {
       const headers: Record<string, string> = {};
       if (token) headers['Authorization'] = `Bearer ${token}`;
@@ -2003,23 +2001,38 @@ export default function App() {
     }).catch(() => {
       return fetch(`/api/student-dictionary?studentEmail=${encodeURIComponent(cleanEmail)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`);
     })
-      .then((r) => (r.ok ? r.json() : []))
+      .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
-        if (isEffectCancelled) return;
+        if (isEffectCancelled || !data) return;
         if (currentAccount?.role === 'student' && activeStudentUidRef.current !== uid) return;
-        if (Array.isArray(data) && data.length > 0) {
-          setStudentDictionaryEntries((prev) => {
-            if (currentAccount?.role === 'student' && activeStudentUidRef.current !== uid) return prev;
-            return consolidateDictionaryEntries(prev, data, excludedDictionaryWordsRef.current);
-          });
+
+        const entries = Array.isArray(data) ? data : (Array.isArray(data?.dictionary) ? data.dictionary : []);
+        const excluded = Array.isArray(data?.excludedWords)
+          ? data.excludedWords.map((w: string) => normalizeDictionaryWord(w)).filter(Boolean)
+          : [];
+
+        if (excluded.length > 0) {
+          excludedDictionaryWordsRef.current = excluded;
+          setExcludedDictionaryWords(excluded);
+          cacheExcludedWordsLocally(uid, cleanEmail, excluded);
         }
+
+        const excludedSet = new Set(excluded);
+        setStudentDictionaryEntries((prev) => {
+          if (currentAccount?.role === 'student' && activeStudentUidRef.current !== uid) return prev;
+          const filteredPrev = prev.filter((p) => !excludedSet.has(normalizeDictionaryWord(p.normalizedWord || p.word)));
+          if (entries.length > 0) {
+            return consolidateDictionaryEntries(filteredPrev, entries, excluded);
+          }
+          return filteredPrev;
+        });
       })
       .catch((err) => console.warn('Could not refresh student dictionary:', err));
 
     return () => {
       isEffectCancelled = true;
     };
-  }, [isPersonalDictionaryOpen, currentAccount?.email, currentAccount?.role, currentAccount?.uid, selectedStudentFilter, userProfile?.email, excludedDictionaryWords]);
+  }, [isPersonalDictionaryOpen, currentAccount?.email, currentAccount?.role, currentAccount?.uid, selectedStudentFilter, userProfile?.email]);
 
   // Handler: Manage/Update Native Friend Subscription
   const handleUpdateSubscription = async (teacherEmail: string | null, teacherName: string | null) => {
@@ -4517,31 +4530,82 @@ export default function App() {
     }
   };
 
-  // Handler: Delete entry from Personal Dictionary with atomic Cloud Firestore update
+  // Handler: Delete entry from Personal Dictionary with atomic canonical backend persistence & optimistic rollback
   const handleDeleteCustomDictionaryEntry = async (word: string) => {
     const cleanWord = (word || '').trim().toLowerCase();
     if (!cleanWord) return;
     const norm = normalizeDictionaryWord(cleanWord);
+    if (!norm) return;
 
+    const targetUid = currentAccount?.uid || auth.currentUser?.uid || userProfile?.id || (userProfile as any)?.uid || '';
+    const targetEmail = (currentAccount?.email || auth.currentUser?.email || userProfile?.email || '').toLowerCase().trim();
+
+    // 1. Snapshot previous state for reliable rollback
+    const previousEntries = [...studentDictionaryEntries];
+    const previousExcluded = [...excludedDictionaryWords];
+    const previousExcludedRef = [...excludedDictionaryWordsRef.current];
+
+    // 2. Optimistic UI update
     setStudentDictionaryEntries((prev) =>
       prev.filter((e) => normalizeDictionaryWord(e.normalizedWord || e.word) !== norm)
     );
-
-    if (norm) {
-      if (!excludedDictionaryWordsRef.current.includes(norm)) {
-        excludedDictionaryWordsRef.current = [...excludedDictionaryWordsRef.current, norm];
-      }
-      setExcludedDictionaryWords((prev) => {
-        if (!prev.includes(norm)) return [...prev, norm];
-        return prev;
-      });
+    if (!excludedDictionaryWordsRef.current.includes(norm)) {
+      excludedDictionaryWordsRef.current = [...excludedDictionaryWordsRef.current, norm];
     }
+    setExcludedDictionaryWords((prev) => {
+      if (!prev.includes(norm)) return [...prev, norm];
+      return prev;
+    });
 
-    const targetUid = currentAccount?.uid || auth.currentUser?.uid || userProfile?.id || (userProfile as any)?.uid || '';
-    const targetEmail = currentAccount?.email || auth.currentUser?.email || userProfile?.email || '';
+    try {
+      // 3. Authenticated Backend DELETE with Firebase Bearer Token
+      const token = await auth.currentUser?.getIdToken().catch(() => null);
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (token) headers['Authorization'] = `Bearer ${token}`;
 
-    if (targetUid || targetEmail) {
-      await deleteStudentVocabularyFromFirestore(targetUid, word, targetEmail);
+      const res = await fetch('/api/student-dictionary', {
+        method: 'DELETE',
+        headers,
+        body: JSON.stringify({
+          word: cleanWord,
+          studentUid: targetUid,
+          studentEmail: targetEmail,
+        }),
+      });
+
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(errJson.message || errJson.error || `HTTP ${res.status}: Erro ao excluir palavra do dicionário.`);
+      }
+
+      const resData = await res.json().catch(() => ({}));
+
+      // Guard against out-of-order responses and identity switches
+      if (targetUid && activeStudentUidRef.current && activeStudentUidRef.current !== targetUid) {
+        return;
+      }
+
+      // Synchronize with authoritative backend exclusions list
+      const authoritativeExcluded: string[] = Array.isArray(resData?.excludedWords)
+        ? resData.excludedWords.map((w: string) => normalizeDictionaryWord(w)).filter(Boolean)
+        : excludedDictionaryWordsRef.current;
+
+      excludedDictionaryWordsRef.current = authoritativeExcluded;
+      setExcludedDictionaryWords(authoritativeExcluded);
+      cacheExcludedWordsLocally(targetUid, targetEmail, authoritativeExcluded);
+
+      // Clean in-memory vocabulary caches for this word
+      const updatedList = previousEntries.filter((e) => normalizeDictionaryWord(e.normalizedWord || e.word) !== norm);
+      cacheVocabularyLocally(targetUid, targetEmail, updatedList);
+
+      return resData;
+    } catch (err: any) {
+      // Rollback on failure
+      console.error('Failed to delete word from student dictionary:', err);
+      setStudentDictionaryEntries(previousEntries);
+      setExcludedDictionaryWords(previousExcluded);
+      excludedDictionaryWordsRef.current = previousExcludedRef;
+      throw err;
     }
   };
 

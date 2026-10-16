@@ -84,6 +84,9 @@ import {
   addWatchedVideoToUserDoc,
   saveStudentVocabularyToFirestoreServer,
   fetchStudentVocabularyFromFirestoreServer,
+  addExcludedDictionaryWordsServer,
+  removeExcludedDictionaryWordsServer,
+  fetchExcludedDictionaryWordsServer,
   resolveCanonicalStudentIdentity,
   saveSessionNotesToFirestoreServer,
   fetchSessionNotesFromFirestoreServer,
@@ -105,6 +108,7 @@ import {
   consolidateTutorsList,
   scheduleLessonAtomicServer,
 } from './src/serverFirestore';
+import { normalizeDictionaryWord } from './src/utils/studentDictionaryLibrary';
 import { DEFAULT_CURATED_PLAYLISTS } from './src/utils/youtubeService';
 import {
   syncSessionNotesWithPlatformDrive,
@@ -226,38 +230,92 @@ export function resolvePort(portEnv?: string | number, appPortEnv?: string | num
 export const PORT = resolvePort(process.env.PORT, process.env.APP_PORT, 3000);
 
 /**
+ * Detects whether the current runtime is an AI Studio Preview or development environment,
+ * even when running inside Google Cloud Run (which injects K_SERVICE / K_REVISION).
+ */
+export function isCloudRunPreviewEnvironment(): boolean {
+  if (process.env.APP_ENV === 'production') {
+    return false;
+  }
+  if (process.env.NODE_ENV === 'development' || process.env.APP_ENV === 'development' || process.env.APP_ENV === 'preview') {
+    return true;
+  }
+  if (process.env.IS_PREVIEW === 'true' || process.env.PREVIEW === 'true') {
+    return true;
+  }
+
+  const kService = (process.env.K_SERVICE || '').toLowerCase();
+  const kRevision = (process.env.K_REVISION || '').toLowerCase();
+
+  if (kService || kRevision) {
+    return (
+      kService.startsWith('ais-') ||
+      kService.includes('preview') ||
+      kService.includes('dev') ||
+      kRevision.startsWith('ais-') ||
+      kRevision.includes('preview') ||
+      kRevision.includes('dev')
+    );
+  }
+
+  if (Boolean(process.env.APPLET_ID)) {
+    return true;
+  }
+  const appUrl = (process.env.APP_URL || '').toLowerCase();
+  return appUrl.includes('ais-') || appUrl.includes('preview');
+}
+
+/**
  * Single explicit source of truth for runtime execution mode.
  * Determines whether the application should run in production mode (serving compiled static assets)
  * or development mode (using Vite development middleware).
  *
  * Explicit rules:
- * 1. NODE_ENV === 'production' explicitly signals production mode.
- * 2. Cloud Run runtime indicators (K_SERVICE, K_REVISION) unambiguously signal
- *    execution in Google Cloud Run, where production mode must be used even if
- *    NODE_ENV was not explicitly passed in the service environment.
+ * 1. NODE_ENV === 'test' signals test mode (not production).
+ * 2. NODE_ENV === 'development' or preview/development APP_ENV unambiguously signals development mode.
  * 3. Explicit APP_ENV === 'production' signals production mode.
- * 4. In all other cases (e.g. local development where NODE_ENV is unset or 'development'),
+ * 4. Explicit NODE_ENV === 'production' signals production mode.
+ * 5. Preview indicators in Cloud Run (K_SERVICE/K_REVISION matching ais-* or preview/dev)
+ *    prevent treating Cloud Run as production, serving React via Vite dev middleware.
+ * 6. Production Cloud Run runtime indicators (K_SERVICE, K_REVISION not matching preview patterns)
+ *    signal production mode even if NODE_ENV was not explicitly passed in the service environment.
+ * 7. In all other cases (e.g. local development where NODE_ENV is unset),
  *    it safely resolves to false (development mode), preserving Vite dev middleware.
  */
 export function isProductionMode(): boolean {
   if (process.env.NODE_ENV === 'test') {
     return false;
   }
+  if (process.env.NODE_ENV === 'development') {
+    return false;
+  }
+  if (process.env.APP_ENV === 'development' || process.env.APP_ENV === 'preview') {
+    return false;
+  }
+  if (process.env.APP_ENV === 'production') {
+    return true;
+  }
   if (process.env.NODE_ENV === 'production') {
     return true;
   }
-  if (Boolean(process.env.K_SERVICE || process.env.K_REVISION)) {
-    return true;
+  if (isCloudRunPreviewEnvironment()) {
+    return false;
   }
-  if (process.env.APP_ENV === 'production') {
+  if (Boolean(process.env.K_SERVICE || process.env.K_REVISION)) {
     return true;
   }
   return false;
 }
 
-// Ensure NODE_ENV is normalized to 'production' if runtime indicators detected production mode
-if (process.env.NODE_ENV !== 'test' && isProductionMode() && process.env.NODE_ENV !== 'production') {
-  process.env.NODE_ENV = 'production';
+// Normalize NODE_ENV based on detected execution mode
+if (process.env.NODE_ENV !== 'test') {
+  if (isProductionMode()) {
+    if (process.env.NODE_ENV !== 'production') {
+      process.env.NODE_ENV = 'production';
+    }
+  } else if (process.env.NODE_ENV !== 'development') {
+    process.env.NODE_ENV = 'development';
+  }
 }
 
 export { isDiagnosticMode };
@@ -8843,24 +8901,163 @@ app.get('/api/student-dictionary', async (req, res) => {
 
   // Fetch directly from canonical Firestore path
   const firestoreWords = await fetchStudentVocabularyFromFirestoreServer(canonicalUid, canonicalEmail);
+  const canonicalExclusions = await fetchExcludedDictionaryWordsServer(canonicalUid);
+  const excludedSet = new Set(canonicalExclusions.map(normalizeDictionaryWord).filter(Boolean));
 
-  if (firestoreWords.length > 0) {
+  let activeWords = firestoreWords;
+  if (activeWords.length > 0) {
     if (!db.studentDictionaryMap) db.studentDictionaryMap = {};
-    if (canonicalUid) db.studentDictionaryMap[canonicalUid] = firestoreWords;
-    if (canonicalEmail) db.studentDictionaryMap[canonicalEmail] = firestoreWords;
-    return res.json(firestoreWords);
+    if (canonicalUid) db.studentDictionaryMap[canonicalUid] = activeWords;
+    if (canonicalEmail) db.studentDictionaryMap[canonicalEmail] = activeWords;
+  } else {
+    // Fallback to in-memory db if Firestore had no words, filtering out tombstones
+    const fromEmail: any[] = (canonicalEmail && db.studentDictionaryMap?.[canonicalEmail]) || [];
+    const fromUid: any[] = (canonicalUid && db.studentDictionaryMap?.[canonicalUid]) || [];
+    const map = new Map<string, any>();
+    [...fromEmail, ...fromUid].forEach((entry: any) => {
+      const w = normalizeDictionaryWord(entry.normalizedWord || entry.word);
+      if (w && !excludedSet.has(w)) map.set(w, entry);
+    });
+    activeWords = Array.from(map.values()).sort((a, b) => (a.word || '').localeCompare(b.word || ''));
   }
 
-  // Fallback to in-memory db if Firestore had no words
-  const fromEmail: any[] = (canonicalEmail && db.studentDictionaryMap?.[canonicalEmail]) || [];
-  const fromUid: any[] = (canonicalUid && db.studentDictionaryMap?.[canonicalUid]) || [];
-  const map = new Map<string, any>();
-  [...fromEmail, ...fromUid].forEach((entry: any) => {
-    const w = (entry.normalizedWord || entry.word || '').toLowerCase().trim();
-    if (w) map.set(w, entry);
+  // Backwards compatibility: If legacy array format requested
+  if (req.query.format === 'legacy' || req.headers['x-legacy-format'] === 'true') {
+    return res.json(activeWords);
+  }
+
+  return res.json({
+    success: true,
+    status: activeWords.length > 0 ? 'loaded_with_words' : 'loaded_empty',
+    dictionary: activeWords,
+    excludedWords: canonicalExclusions,
+    count: activeWords.length,
+    studentUid: canonicalUid,
+    studentEmail: canonicalEmail,
   });
-  const list = Array.from(map.values()).sort((a, b) => (a.word || '').localeCompare(b.word || ''));
-  return res.json(list);
+});
+
+app.delete('/api/student-dictionary', async (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  const db = readDb();
+  const caller = await getVerifiedUserFromRequest(req);
+
+  if (!caller) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Authentication required: verified user token missing.',
+    });
+  }
+
+  const rawWord = req.body?.word || req.query?.word;
+  const rawWords = req.body?.words || (rawWord ? [rawWord] : []);
+  const normalizedWords = Array.isArray(rawWords)
+    ? Array.from(new Set(rawWords.map((w: string) => normalizeDictionaryWord(w)).filter(Boolean)))
+    : [];
+
+  if (normalizedWords.length === 0) {
+    return res.status(400).json({
+      error: 'Bad Request',
+      message: 'Word or words array is required for dictionary exclusion.',
+    });
+  }
+
+  let canonicalStudentUid = '';
+  let studentEmail = '';
+
+  if (caller.role === 'student') {
+    // For student callers: identity is strictly determined by verified token UID
+    // Rejects any studentUid or studentEmail that does not match the caller's verified identity
+    const requestedUid = ((req.body?.studentUid || req.query?.studentUid || req.body?.uid || req.query?.uid) as string || '').trim();
+    const requestedEmail = ((req.body?.studentEmail || req.query?.studentEmail || req.body?.email || req.query?.email) as string || '').toLowerCase().trim();
+
+    if (requestedUid && requestedUid !== caller.uid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Students cannot delete dictionary entries of other users.',
+      });
+    }
+
+    if (requestedEmail && caller.email && requestedEmail !== caller.email.toLowerCase().trim()) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Students cannot delete dictionary entries of other users.',
+      });
+    }
+
+    canonicalStudentUid = caller.uid;
+    studentEmail = caller.email?.toLowerCase().trim() || '';
+  } else {
+    // Admin or authorized Teacher
+    const requestedUid = ((req.body?.studentUid || req.query?.studentUid || req.body?.uid || req.query?.uid) as string || '').trim();
+    const requestedEmail = ((req.body?.studentEmail || req.query?.studentEmail || req.body?.email || req.query?.email) as string || '').toLowerCase().trim();
+    const requestedLessonId = ((req.body?.lessonId || req.query?.lessonId) as string || '').trim();
+
+    const identityRes = await resolveCanonicalStudentIdentity({
+      caller,
+      studentEmail: requestedEmail,
+      studentUid: requestedUid,
+      lessonId: requestedLessonId || undefined,
+    });
+
+    if (!identityRes.authorized) {
+      return res.status(identityRes.statusCode || 403).json({
+        error: 'Forbidden',
+        message: identityRes.error || 'Access denied to delete student dictionary entry.',
+      });
+    }
+
+    canonicalStudentUid = identityRes.canonicalStudentUid;
+    studentEmail = identityRes.studentEmail || '';
+  }
+
+  if (!canonicalStudentUid || !isValidCanonicalUid(canonicalStudentUid)) {
+    return res.status(422).json({
+      error: 'Unprocessable Entity',
+      message: 'Canonical student UID could not be unequivocally determined.',
+    });
+  }
+
+  // Persist canonical logical exclusions in users/{canonicalUid}.excludedDictionaryWords
+  let updatedExclusions: string[] = [];
+  try {
+    updatedExclusions = await addExcludedDictionaryWordsServer(canonicalStudentUid, normalizedWords);
+  } catch (saveErr: any) {
+    console.error('Failed to persist student dictionary exclusion:', saveErr);
+    return res.status(500).json({
+      error: 'Internal Server Error',
+      message: 'Failed to persist dictionary exclusions to canonical Cloud Firestore.',
+    });
+  }
+
+  // Filter in-memory db fallback as well
+  const excludedSet = new Set(updatedExclusions.map(normalizeDictionaryWord));
+  if (db.studentDictionaryMap) {
+    if (canonicalStudentUid && Array.isArray(db.studentDictionaryMap[canonicalStudentUid])) {
+      db.studentDictionaryMap[canonicalStudentUid] = db.studentDictionaryMap[canonicalStudentUid].filter(
+        (e: any) => !excludedSet.has(normalizeDictionaryWord(e.normalizedWord || e.word))
+      );
+    }
+    if (studentEmail && Array.isArray(db.studentDictionaryMap[studentEmail])) {
+      db.studentDictionaryMap[studentEmail] = db.studentDictionaryMap[studentEmail].filter(
+        (e: any) => !excludedSet.has(normalizeDictionaryWord(e.normalizedWord || e.word))
+      );
+    }
+    await writeDbSync(db);
+  }
+
+  // Authoritative active words after exclusions
+  const activeWords = await fetchStudentVocabularyFromFirestoreServer(canonicalStudentUid, studentEmail);
+
+  return res.json({
+    success: true,
+    studentUid: canonicalStudentUid,
+    studentEmail,
+    excludedWord: normalizedWords[0],
+    excludedWords: updatedExclusions,
+    activeCount: activeWords.length,
+    dictionary: activeWords,
+  });
 });
 
 app.post('/api/student-dictionary', async (req, res) => {
@@ -8905,22 +9102,58 @@ app.post('/api/student-dictionary', async (req, res) => {
   const itemsToAdd = Array.isArray(entries) ? entries : (entry ? [entry] : []);
   if (itemsToAdd.length === 0) {
     const existing = await fetchStudentVocabularyFromFirestoreServer(canonicalStudentUid, verifiedStudentEmail);
-    return res.json({ success: true, studentUid: canonicalStudentUid, dictionary: existing });
+    const existingExclusions = await fetchExcludedDictionaryWordsServer(canonicalStudentUid);
+    return res.json({ success: true, studentUid: canonicalStudentUid, dictionary: existing, excludedWords: existingExclusions });
+  }
+
+  // ETAPA E: Distinguish automatic sync vs explicit intentional addition
+  const isAutomaticSync = Boolean(
+    req.body?.isAutomaticSync === true ||
+    req.body?.syncType === 'routine_sync' ||
+    req.body?.syncType === 'automatic' ||
+    req.body?.source === 'routine_sync'
+  );
+
+  let finalItemsToAdd = itemsToAdd;
+
+  if (isAutomaticSync) {
+    // Sincronizações automáticas não podem remover tombstones nem ressuscitar palavras excluídas
+    const currentExclusions = await fetchExcludedDictionaryWordsServer(canonicalStudentUid);
+    const exSet = new Set(currentExclusions.map(normalizeDictionaryWord).filter(Boolean));
+    finalItemsToAdd = itemsToAdd.filter((e: any) => {
+      const norm = normalizeDictionaryWord(e.normalizedWord || e.word);
+      return Boolean(norm && !exSet.has(norm));
+    });
+  } else {
+    // Explicit inclusion by student or teacher reintroduces words by removing tombstones atomically
+    const wordsToReintroduce = itemsToAdd
+      .map((e: any) => normalizeDictionaryWord(e.normalizedWord || e.word))
+      .filter(Boolean);
+    if (wordsToReintroduce.length > 0) {
+      try {
+        await removeExcludedDictionaryWordsServer(canonicalStudentUid, wordsToReintroduce);
+      } catch (unexcludeErr) {
+        console.warn('Notice removing exclusion tombstones on explicit add:', unexcludeErr);
+      }
+    }
   }
 
   // Persist directly and permanently to Cloud Firestore using Firebase Admin SDK
-  try {
-    await saveStudentVocabularyToFirestoreServer(canonicalStudentUid, itemsToAdd, verifiedStudentEmail);
-  } catch (saveErr: any) {
-    console.error('Failed to persist student vocabulary in Firestore:', saveErr);
-    return res.status(500).json({
-      error: 'Internal Server Error',
-      message: 'Failed to persist student vocabulary to canonical Cloud Firestore.',
-    });
+  if (finalItemsToAdd.length > 0) {
+    try {
+      await saveStudentVocabularyToFirestoreServer(canonicalStudentUid, finalItemsToAdd, verifiedStudentEmail);
+    } catch (saveErr: any) {
+      console.error('Failed to persist student vocabulary in Firestore:', saveErr);
+      return res.status(500).json({
+        error: 'Internal Server Error',
+        message: 'Failed to persist student vocabulary to canonical Cloud Firestore.',
+      });
+    }
   }
 
   // Retrieve authoritative consolidated list from canonical Firestore path
   const updatedList = await fetchStudentVocabularyFromFirestoreServer(canonicalStudentUid, verifiedStudentEmail);
+  const remainingExclusions = await fetchExcludedDictionaryWordsServer(canonicalStudentUid);
 
   // Sync memory cache
   if (!db.studentDictionaryMap) db.studentDictionaryMap = {};
@@ -8933,8 +9166,10 @@ app.post('/api/student-dictionary', async (req, res) => {
     studentUid: canonicalStudentUid,
     studentEmail: verifiedStudentEmail,
     dictionary: updatedList,
+    excludedWords: remainingExclusions,
   });
 });
+
 
 // Endpoint: Get student journal entries
 app.get('/api/student-journal', (req, res) => {

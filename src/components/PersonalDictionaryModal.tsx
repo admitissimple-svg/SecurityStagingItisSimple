@@ -31,7 +31,7 @@ interface PersonalDictionaryModalProps {
   consolidatedEntries?: StudentDictionaryEntry[];
   excludedWords?: string[];
   onSaveCustomEntry?: (entry: StudentDictionaryEntry) => void;
-  onDeleteEntry?: (word: string) => void;
+  onDeleteEntry?: (word: string) => Promise<any> | void;
   onOpenJournalModal?: () => void;
 }
 
@@ -58,6 +58,8 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
   const [lookupError, setLookupError] = useState<string | null>(null);
   const [apiEnrichedEntries, setApiEnrichedEntries] = useState<Record<string, Partial<StudentDictionaryEntry>>>({});
   const [deletedWordsInSession, setDeletedWordsInSession] = useState<Set<string>>(new Set());
+  const [deletingWords, setDeletingWords] = useState<Set<string>>(new Set());
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const isEn = currentLanguage === 'en';
 
@@ -72,13 +74,26 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
     return set;
   }, [excludedWords, deletedWordsInSession]);
 
-  const handleDeleteWord = (word: string) => {
+  const handleDeleteWord = async (word: string) => {
     const norm = normalizeDictionaryWord(word);
-    if (norm) {
+    if (!norm) return;
+    setDeletingWords((prev) => new Set(prev).add(norm));
+    setDeleteError(null);
+    try {
+      if (onDeleteEntry) {
+        await onDeleteEntry(word);
+      }
       setDeletedWordsInSession((prev) => new Set(prev).add(norm));
-    }
-    if (onDeleteEntry) {
-      onDeleteEntry(word);
+    } catch (err: any) {
+      setDeleteError(
+        err?.message || (isEn ? 'Failed to remove word from dictionary.' : 'Falha ao remover palavra do dicionário.')
+      );
+    } finally {
+      setDeletingWords((prev) => {
+        const next = new Set(prev);
+        next.delete(norm);
+        return next;
+      });
     }
   };
 
@@ -416,6 +431,22 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
           </div>
         </div>
 
+        {deleteError && (
+          <div className="mx-4 sm:mx-6 mt-3 p-3 rounded-xl bg-red-50 border border-red-200 text-red-700 text-xs flex items-center justify-between gap-2 shrink-0">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 shrink-0 text-red-600" />
+              <span>{deleteError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setDeleteError(null)}
+              className="text-red-500 hover:text-red-800 text-xs font-bold cursor-pointer"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
         {/* Add Word Form (Free Dictionary API powered) */}
         {isAddingCustom && (
           <form
@@ -716,10 +747,15 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
                                   <button
                                     type="button"
                                     onClick={() => handleDeleteWord(entry.word)}
-                                    className="p-1.5 rounded-lg text-slate-300 hover:text-red-600 hover:bg-red-50 transition cursor-pointer"
+                                    disabled={deletingWords.has(normalizeDictionaryWord(entry.normalizedWord || entry.word))}
+                                    className="p-1.5 rounded-lg text-slate-300 hover:text-red-600 hover:bg-red-50 disabled:opacity-40 transition cursor-pointer"
                                     title={isEn ? 'Remove word' : 'Remover palavra'}
                                   >
-                                    <Trash2 className="w-3.5 h-3.5" />
+                                    {deletingWords.has(normalizeDictionaryWord(entry.normalizedWord || entry.word)) ? (
+                                      <Loader2 className="w-3.5 h-3.5 animate-spin text-red-500" />
+                                    ) : (
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    )}
                                   </button>
                                 )}
                               </div>
@@ -888,10 +924,15 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
                                   <button
                                     type="button"
                                     onClick={() => handleDeleteWord(entry.word)}
-                                    className="p-1.5 rounded-lg text-slate-300 hover:text-red-600 hover:bg-red-50 transition cursor-pointer"
+                                    disabled={deletingWords.has(normalizeDictionaryWord(entry.normalizedWord || entry.word))}
+                                    className="p-1.5 rounded-lg text-slate-300 hover:text-red-600 hover:bg-red-50 disabled:opacity-40 transition cursor-pointer"
                                     title={isEn ? 'Remove word' : 'Remover palavra'}
                                   >
-                                    <Trash2 className="w-3.5 h-3.5" />
+                                    {deletingWords.has(normalizeDictionaryWord(entry.normalizedWord || entry.word)) ? (
+                                      <Loader2 className="w-3.5 h-3.5 animate-spin text-red-500" />
+                                    ) : (
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    )}
                                   </button>
                                 )}
                               </div>

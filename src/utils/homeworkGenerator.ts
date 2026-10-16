@@ -17,6 +17,7 @@ import {
   profileWord,
 } from './pedagogicalStorySynthesizer';
 import { auth } from '../firebase';
+import { normalizeDictionaryWord } from './studentDictionaryLibrary';
 
 // Rich dictionary knowledge base for routine words
 const ROUTINE_VOCAB_DICT: Record<
@@ -497,7 +498,8 @@ export function generateWeeklyHomework(
   studentName?: string,
   customWords?: Array<Partial<HomeworkVocabItem> & { word: string }>,
   studentLevel?: string,
-  targetDay?: DayOfWeek
+  targetDay?: DayOfWeek,
+  excludedWords?: string[] | Set<string>
 ): WeeklyHomeworkData {
   const email = studentEmail || userProfile?.email || '';
   const name = studentName || userProfile?.name || (email ? email.split('@')[0] : 'Student');
@@ -511,6 +513,12 @@ export function generateWeeklyHomework(
     ? getDailyMemorizationSchedule(targetDay, userProfile?.weeklyStudyDays, userProfile?.weeklyCycle || 1)
     : null;
 
+  const excludedSet = excludedWords instanceof Set
+    ? excludedWords
+    : Array.isArray(excludedWords)
+    ? new Set(excludedWords.map((w) => normalizeDictionaryWord(w)).filter(Boolean))
+    : new Set<string>();
+
   // 1. Gather all candidate vocabulary available to the student
   const candidateItems: HomeworkVocabItem[] = [];
   const seenCandidates = new Set<string>();
@@ -519,8 +527,9 @@ export function generateWeeklyHomework(
   if (Array.isArray(customWords)) {
     customWords.forEach((cw) => {
       const trimmed = (cw?.word || '').trim();
-      if (trimmed && !seenCandidates.has(trimmed.toLowerCase())) {
-        seenCandidates.add(trimmed.toLowerCase());
+      const norm = normalizeDictionaryWord(trimmed);
+      if (trimmed && norm && !excludedSet.has(norm) && !seenCandidates.has(norm)) {
+        seenCandidates.add(norm);
         const prof = profileWord(trimmed, {
           definitionEn: cw.definitionEn,
           translationPt: cw.translationPt,
@@ -550,8 +559,9 @@ export function generateWeeklyHomework(
       if (item.learnedWords && Array.isArray(item.learnedWords)) {
         for (const w of item.learnedWords) {
           const trimmed = (w || '').trim();
-          if (trimmed && !seenCandidates.has(trimmed.toLowerCase())) {
-            seenCandidates.add(trimmed.toLowerCase());
+          const norm = normalizeDictionaryWord(trimmed);
+          if (trimmed && norm && !excludedSet.has(norm) && !seenCandidates.has(norm)) {
+            seenCandidates.add(norm);
             const lower = trimmed.toLowerCase();
             const customMatch = Array.isArray(customWords)
               ? customWords.find(
@@ -570,6 +580,7 @@ export function generateWeeklyHomework(
               translationPt: dictMatch.translationPt,
               exampleSentence: dictMatch.exampleSentence,
             } : undefined));
+
 
             candidateItems.push({
               id: (customMatch as any)?.id,
@@ -741,6 +752,7 @@ export function generateWeeklyHomeworkFromRoutines(params: {
   activeStudyDays?: DayOfWeek[];
   weeklyCycle?: number;
   userProfile?: UserProfile;
+  excludedWords?: string[] | Set<string>;
 }): WeeklyHomeworkData {
   const profile = params.userProfile || ({
     weeklyStudyDays: params.activeStudyDays,
@@ -757,9 +769,11 @@ export function generateWeeklyHomeworkFromRoutines(params: {
     params.studentName,
     params.customWords,
     params.studentLevel,
-    params.targetDay
+    params.targetDay,
+    params.excludedWords
   );
 }
+
 
 /**
  * Async generator that triggers the server-side Gemini AI engine

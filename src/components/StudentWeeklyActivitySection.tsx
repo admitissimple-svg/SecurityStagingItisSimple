@@ -223,15 +223,19 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
       const headers: Record<string, string> = {};
       if (token) headers['Authorization'] = `Bearer ${token}`;
       fetch(`/api/student-dictionary?studentEmail=${encodeURIComponent(studentEmail)}`, { headers })
-        .then((res) => (res.ok ? res.json() : []))
+        .then((res) => (res.ok ? res.json() : null))
         .then((data) => {
-          if (isMounted && Array.isArray(data) && data.length > 0) {
+          if (!isMounted || !data) return;
+          const entries: StudentDictionaryEntry[] = Array.isArray(data)
+            ? data
+            : (Array.isArray(data?.dictionary) ? data.dictionary : []);
+          if (entries.length > 0) {
             setLoadedDictEntries((prev) => {
               const map = new Map<string, StudentDictionaryEntry>();
               prev.forEach((e) => {
                 if (e && e.word) map.set(e.word.toLowerCase().trim(), e);
               });
-              data.forEach((e: StudentDictionaryEntry) => {
+              entries.forEach((e: StudentDictionaryEntry) => {
                 if (e && e.word) map.set(e.word.toLowerCase().trim(), e);
               });
               return Array.from(map.values());

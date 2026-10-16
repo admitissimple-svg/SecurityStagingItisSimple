@@ -1,5 +1,6 @@
-import { getFirestore, Firestore } from 'firebase-admin/firestore';
+import { getFirestore, Firestore, FieldValue } from 'firebase-admin/firestore';
 import { getFirebaseAdminApp, ALLOWED_STAGING_PROJECT_ID } from './serverFirebaseAdmin';
+import { normalizeDictionaryWord } from './utils/studentDictionaryLibrary';
 
 /**
  * Active identifiers for staging persistence.
@@ -1611,8 +1612,12 @@ export async function fetchStudentVocabularyFromFirestoreServer(
     // 1. Fetch from canonical document users/{canonicalStudentUid}
     const userDocRef = db.collection('users').doc(canonicalStudentUid);
     const userSnap = await userDocRef.get();
+    let excludedWords: string[] = [];
     if (userSnap.exists) {
       const data = userSnap.data();
+      if (Array.isArray(data?.excludedDictionaryWords)) {
+        excludedWords = data.excludedDictionaryWords;
+      }
       if (Array.isArray(data?.vocabulary)) {
         data.vocabulary.forEach((item: any) => {
           if (item && item.word) {
@@ -1668,12 +1673,214 @@ export async function fetchStudentVocabularyFromFirestoreServer(
       }
     }
 
-    return Array.from(entryMap.values()).sort((a, b) => (a.word || '').localeCompare(b.word || ''));
+    // Filter out all logically excluded words (tombstones)
+    const excludedSet = new Set(
+      excludedWords.map((w: string) => normalizeDictionaryWord(w)).filter(Boolean)
+    );
+
+    return Array.from(entryMap.values())
+      .filter((item) => {
+        const norm = normalizeDictionaryWord(item.normalizedWord || item.word);
+        return Boolean(norm && !excludedSet.has(norm));
+      })
+      .sort((a, b) => (a.word || '').localeCompare(b.word || ''));
   } catch (err) {
     console.warn('fetchStudentVocabularyFromFirestoreServer error:', err);
     return [];
   }
 }
+
+/**
+ * Fetches canonical list of excluded dictionary words from Firestore users/{canonicalStudentUid}.
+ */
+export async function fetchExcludedDictionaryWordsServer(
+  canonicalStudentUid: string
+): Promise<string[]> {
+  const db = getFirestoreDb();
+  if (!db || !canonicalStudentUid || !isValidCanonicalUid(canonicalStudentUid)) return [];
+
+  try {
+    const userDocRef = db.collection('users').doc(canonicalStudentUid);
+    const userSnap = await userDocRef.get();
+    if (userSnap.exists) {
+      const data = userSnap.data();
+      if (Array.isArray(data?.excludedDictionaryWords)) {
+        return Array.from(
+          new Set(
+            data.excludedDictionaryWords
+              .map((w: string) => normalizeDictionaryWord(w))
+              .filter(Boolean)
+          )
+        );
+      }
+    }
+    return [];
+  } catch (err) {
+    console.warn('fetchExcludedDictionaryWordsServer error:', err);
+    return [];
+  }
+}
+
+/**
+ * Persists normalized dictionary exclusions logically in users/{canonicalStudentUid}.excludedDictionaryWords.
+ * Uses atomic arrayUnion (or transaction) to preserve concurrent exclusions and prevent race conditions.
+ * Idempotent: adding already-excluded words produces no duplicates.
+ * Preserves all pedagogical history, definitions, examples, and practice metrics without physical deletion.
+ * Never modifies legacy documents.
+ */
+export async function addExcludedDictionaryWordsServer(
+  canonicalStudentUid: string,
+  words: string[]
+): Promise<string[]> {
+  if (!isValidCanonicalUid(canonicalStudentUid)) {
+    throw new Error(
+      `[addExcludedDictionaryWordsServer] Rejected non-canonical student UID: "${canonicalStudentUid}". Exclusions strictly require a canonical Firebase Auth UID.`
+    );
+  }
+  const normalizedWords = Array.from(
+    new Set(words.map((w) => normalizeDictionaryWord(w)).filter(Boolean))
+  );
+  if (normalizedWords.length === 0) {
+    return fetchExcludedDictionaryWordsServer(canonicalStudentUid);
+  }
+
+  const db = getFirestoreDb();
+  if (!db) {
+    return normalizedWords;
+  }
+
+  try {
+    const userDocRef = db.collection('users').doc(canonicalStudentUid);
+
+    if (typeof FieldValue !== 'undefined' && FieldValue.arrayUnion) {
+      try {
+        await userDocRef.set(
+          {
+            excludedDictionaryWords: FieldValue.arrayUnion(...normalizedWords),
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        );
+      } catch {
+        const snap = await userDocRef.get();
+        const existing: string[] = snap.exists && Array.isArray(snap.data()?.excludedDictionaryWords)
+          ? snap.data()?.excludedDictionaryWords
+          : [];
+        const merged = Array.from(new Set([...existing.map(normalizeDictionaryWord), ...normalizedWords]));
+        await userDocRef.set(
+          {
+            excludedDictionaryWords: merged,
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        );
+      }
+    } else {
+      const snap = await userDocRef.get();
+      const existing: string[] = snap.exists && Array.isArray(snap.data()?.excludedDictionaryWords)
+        ? snap.data()?.excludedDictionaryWords
+        : [];
+      const merged = Array.from(new Set([...existing.map(normalizeDictionaryWord), ...normalizedWords]));
+      await userDocRef.set(
+        {
+          excludedDictionaryWords: merged,
+          updatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+    }
+
+    return fetchExcludedDictionaryWordsServer(canonicalStudentUid);
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+      console.info('[serverFirestore] Remote exclusion save restricted by IAM, continuing with local state.');
+      return normalizedWords;
+    }
+    console.warn('Firestore server addExcludedDictionaryWordsServer error:', err);
+    throw err;
+  }
+}
+
+/**
+ * Removes words from users/{canonicalStudentUid}.excludedDictionaryWords upon explicit intentional re-addition.
+ * Uses atomic arrayRemove (or transaction) to preserve concurrent exclusions and prevent race conditions.
+ * Idempotent: removing non-excluded words produces no inconsistencies.
+ */
+export async function removeExcludedDictionaryWordsServer(
+  canonicalStudentUid: string,
+  words: string[]
+): Promise<string[]> {
+  if (!isValidCanonicalUid(canonicalStudentUid)) {
+    throw new Error(
+      `[removeExcludedDictionaryWordsServer] Rejected non-canonical student UID: "${canonicalStudentUid}". Exclusions strictly require a canonical Firebase Auth UID.`
+    );
+  }
+  const normalizedWords = Array.from(
+    new Set(words.map((w) => normalizeDictionaryWord(w)).filter(Boolean))
+  );
+  if (normalizedWords.length === 0) {
+    return fetchExcludedDictionaryWordsServer(canonicalStudentUid);
+  }
+
+  const db = getFirestoreDb();
+  if (!db) return [];
+
+  try {
+    const userDocRef = db.collection('users').doc(canonicalStudentUid);
+
+    if (typeof FieldValue !== 'undefined' && FieldValue.arrayRemove) {
+      try {
+        await userDocRef.set(
+          {
+            excludedDictionaryWords: FieldValue.arrayRemove(...normalizedWords),
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        );
+      } catch {
+        const snap = await userDocRef.get();
+        const existing: string[] = snap.exists && Array.isArray(snap.data()?.excludedDictionaryWords)
+          ? snap.data()?.excludedDictionaryWords
+          : [];
+        const normToRemove = new Set(normalizedWords);
+        const filtered = existing.map(normalizeDictionaryWord).filter((w) => w && !normToRemove.has(w));
+        await userDocRef.set(
+          {
+            excludedDictionaryWords: filtered,
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        );
+      }
+    } else {
+      const snap = await userDocRef.get();
+      const existing: string[] = snap.exists && Array.isArray(snap.data()?.excludedDictionaryWords)
+        ? snap.data()?.excludedDictionaryWords
+        : [];
+      const normToRemove = new Set(normalizedWords);
+      const filtered = existing.map(normalizeDictionaryWord).filter((w) => w && !normToRemove.has(w));
+      await userDocRef.set(
+        {
+          excludedDictionaryWords: filtered,
+          updatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+    }
+
+    return fetchExcludedDictionaryWordsServer(canonicalStudentUid);
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+      console.info('[serverFirestore] Remote exclusion removal restricted by IAM, continuing with local state.');
+      return [];
+    }
+    console.warn('Firestore server removeExcludedDictionaryWordsServer error:', err);
+    throw err;
+  }
+}
+
 
 /**
  * Server-side persistent storage of Native Friend In-Session Notes & Recommendations in Cloud Firestore.
