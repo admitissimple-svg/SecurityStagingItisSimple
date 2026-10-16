@@ -1,5 +1,17 @@
+import fs from 'fs';
 import { initializeApp, getApps, applicationDefault, App } from 'firebase-admin/app';
 import { getAuth, Auth } from 'firebase-admin/auth';
+
+if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+  try {
+    const credPath = process.env.GOOGLE_APPLICATION_CREDENTIALS.trim();
+    if (!fs.existsSync(credPath) || credPath.includes('placeholder') || credPath.startsWith('/path/to/')) {
+      delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
+    }
+  } catch {
+    delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  }
+}
 
 /**
  * Strictly authorized Firebase Project ID for staging.

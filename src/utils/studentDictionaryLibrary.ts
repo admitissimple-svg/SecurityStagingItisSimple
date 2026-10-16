@@ -145,6 +145,7 @@ export function consolidateDictionaryEntries(
           ]
         : [];
 
+      const isIncomingProvisional = Boolean(incoming.isProvisional || (incoming as any).isFallback || incoming.enrichmentStatus === 'pending');
       masterMap.set(norm, {
         ...incoming,
         id: incoming.id || `dict_${norm.replace(/[^a-zA-Z0-9_-]/g, '_')}_${Date.now()}`,
@@ -154,13 +155,18 @@ export function consolidateDictionaryEntries(
         origins: initialOrigins,
         firstSeenAt: incoming.firstSeenAt || incoming.learnedAt || new Date().toISOString(),
         practiceCount: typeof incoming.practiceCount === 'number' ? incoming.practiceCount : 0,
+        enrichmentStatus: incoming.enrichmentStatus === 'enriched' && !isIncomingProvisional ? 'enriched' : 'pending',
+        isProvisional: isIncomingProvisional,
       });
       return;
     }
 
     // Merging into existing record:
-    // A. Definitions & Examples: Keep richer definition
-    const keepExistingDef = isDefinitionRicher(existing.definitionEn, incoming.definitionEn);
+    // A. Definitions & Examples: Keep richer definition & protect against provisional overwrites (HOTFIX 4B.8.1)
+    const isIncomingProvisional = Boolean(incoming.isProvisional || (incoming as any).isFallback || incoming.enrichmentStatus === 'pending');
+    const isExistingEnriched = Boolean(existing.enrichmentStatus === 'enriched' || (existing.definitionEn && !existing.isProvisional));
+
+    const keepExistingDef = isDefinitionRicher(existing.definitionEn, incoming.definitionEn) || (isExistingEnriched && isIncomingProvisional);
     const resolvedDefinition = keepExistingDef
       ? existing.definitionEn
       : (incoming.definitionEn || existing.definitionEn || '');
@@ -271,11 +277,12 @@ export function consolidateDictionaryEntries(
       primarySource = 'routine';
     }
 
-    // H. Enrichment status
-    const enrichmentStatus =
-      existing.enrichmentStatus === 'enriched' || incoming.enrichmentStatus === 'enriched'
-        ? 'enriched'
-        : incoming.enrichmentStatus || existing.enrichmentStatus || 'standard';
+    // H. Enrichment status (HOTFIX 4B.8.1: provisional or fallback entries never count as enriched)
+    const enrichmentStatus = (isExistingEnriched && isIncomingProvisional)
+      ? 'enriched'
+      : (incoming.enrichmentStatus === 'enriched' && !isIncomingProvisional && Boolean(incoming.definitionEn))
+      ? 'enriched'
+      : (existing.enrichmentStatus === 'enriched' ? 'enriched' : (incoming.enrichmentStatus || existing.enrichmentStatus || 'pending'));
 
     // Build consolidated record
     const merged: StudentDictionaryEntry = {

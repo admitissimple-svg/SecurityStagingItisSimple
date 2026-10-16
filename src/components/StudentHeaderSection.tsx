@@ -83,8 +83,13 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
   const isEn = currentLanguage === 'en';
   const [isNotesModalOpen, setIsNotesModalOpen] = useState(false);
   const [modalInitialTab, setModalInitialTab] = useState<'all' | 'mistakes' | 'grammar' | 'vocab' | 'summary'>('mistakes');
-  const studentEmail = (currentAccount?.email || userProfile?.email || '').toLowerCase().trim();
-  const studentUid = (currentAccount as any)?.uid || currentAccount?.id || userProfile?.uid || userProfile?.id || '';
+  const studentEmail = (auth?.currentUser?.email || currentAccount?.email || userProfile?.email || '').toLowerCase().trim();
+  const rawUid = (auth?.currentUser?.uid && isValidCanonicalUid(auth.currentUser.uid) ? auth.currentUser.uid : '') ||
+    ((currentAccount as any)?.uid && isValidCanonicalUid((currentAccount as any).uid) ? (currentAccount as any).uid : '') ||
+    (currentAccount?.id && isValidCanonicalUid(currentAccount.id) ? currentAccount.id : '') ||
+    (userProfile?.uid && isValidCanonicalUid(userProfile.uid) ? userProfile.uid : '') ||
+    (userProfile?.id && isValidCanonicalUid(userProfile.id) ? userProfile.id : '');
+  const studentUid = isValidCanonicalUid(rawUid) ? rawUid : '';
 
   // Intelligent Reminder Hook for Native Friends Notes (Strict rules 1, 2, 3, 4 with no localStorage)
   const {

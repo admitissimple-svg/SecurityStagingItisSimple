@@ -29,6 +29,7 @@ export interface PedagogicalVocabularyItem {
   id: string;
   term: string;
   partOfSpeech: string;
+  definitionEn?: string;
   simpleDefinition: string;
   collocations: string[];
   realExamples: string[];
@@ -315,6 +316,7 @@ export function generateLocalPedagogicalTransformation(params: {
     language = 'pt',
   } = params;
 
+  const cleanLang = (language || 'pt').toLowerCase().trim();
   const markings = parseNotesHtml(rawNotes);
   const cefrMeta = resolveCefrLevel(studentLevel);
   const contentHash = computeNotesHash(rawNotes);
@@ -562,14 +564,24 @@ export function generateLocalPedagogicalTransformation(params: {
     const normalizedKey = cleanWord.replace(/[_\-]+/g, ' ');
     const dbMatch = NATIVE_FRIENDS_DICTIONARY_DATABASE[cleanWord] || NATIVE_FRIENDS_DICTIONARY_DATABASE[normalizedKey];
 
+    const isPt = cleanLang === 'pt';
     const entry = dbMatch
       ? {
           partOfSpeech: isPronounce ? 'Pronunciation Focus' : dbMatch.partOfSpeech,
-          simpleDefinition: isPronounce
-            ? `Pronunciation focus: Pay careful attention to syllable stress, vowel reduction, and clear consonant articulation of "${rawTrimmed}".`
+          definitionEn: isPronounce
+            ? `Pronunciation focus: Pay careful attention to syllable stress on "${rawTrimmed}".`
             : dbMatch.definitionEn,
+          simpleDefinition: isPronounce
+            ? (isPt
+                ? `Foco em pronúncia: Preste atenção à tonicidade da sílaba e articulação de "${rawTrimmed}".`
+                : `Pronunciation focus: Pay careful attention to syllable stress on "${rawTrimmed}".`)
+            : (isPt
+                ? (dbMatch.explanationPt || `Expressão comunicativa (${cefrMeta.cefr}): utilizada em conversação para expressar "${rawTrimmed}"${dbMatch.translationPt ? ` (${dbMatch.translationPt})` : ''} com clareza e naturalidade.`)
+                : dbMatch.definitionEn),
           collocations: dbMatch.collocations || [`use "${rawTrimmed}" naturally`],
-          realExamples: dbMatch.realExamples || [dbMatch.exampleSentenceEn],
+          realExamples: (dbMatch.realExamples || [dbMatch.exampleSentenceEn]).map((ex: string) =>
+            ex.startsWith('Didactic Example:') ? ex : `Didactic Example: "${ex.replace(/^["']|["']$/g, '')}"`
+          ),
           synonyms: dbMatch.synonyms || ['target phrase'],
           register: dbMatch.register || ('neutral' as const),
           category: isNewWord && isPronounce
@@ -586,13 +598,20 @@ export function generateLocalPedagogicalTransformation(params: {
             : cleanWord.includes(' ')
             ? 'Idiomatic Expression'
             : 'Vocabulary Item',
-          simpleDefinition: isPronounce
-            ? `Pronunciation focus: Pay careful attention to syllable stress, vowel reduction, and clear consonant articulation of "${rawTrimmed}".`
+          definitionEn: isPronounce
+            ? `Pronunciation focus: Practice clean syllable stress on "${rawTrimmed}".`
             : `Key communicative expression (${cefrMeta.cefr}): used in conversation to communicate "${rawTrimmed}" clearly and naturally.`,
+          simpleDefinition: isPronounce
+            ? (isPt
+                ? `Foco em pronúncia: Preste atenção à tonicidade da sílaba e articulação de "${rawTrimmed}".`
+                : `Pronunciation focus: Pay careful attention to syllable stress on "${rawTrimmed}".`)
+            : (isPt
+                ? `Expressão comunicativa (${cefrMeta.cefr}): utilizada em conversação para expressar "${rawTrimmed}" com clareza e naturalidade.`
+                : `Key communicative expression (${cefrMeta.cefr}): used in conversation to communicate "${rawTrimmed}" clearly and naturally.`),
           collocations: [`use "${rawTrimmed}" naturally`, `frequently heard with "${rawTrimmed}"`],
           realExamples: [
-            `In daily speaking: "I practiced using '${rawTrimmed}' naturally in our conversation today."`,
-            `Practice sentence: "Understanding how native speakers say '${rawTrimmed}' makes your speech flow smoothly."`,
+            `Didactic Example: "I practiced using '${rawTrimmed}' naturally in our conversation today."`,
+            `Didactic Example: "Understanding how native speakers say '${rawTrimmed}' makes your speech flow smoothly."`,
           ],
           synonyms: ['natural expression', 'target phrase'],
           register: 'neutral' as const,
@@ -665,8 +684,6 @@ export function generateLocalPedagogicalTransformation(params: {
     rememberThis,
   };
 
-  const cleanLang = (language || 'pt').toLowerCase().trim();
-
   return {
     lessonId,
     sessionKey,
@@ -683,6 +700,7 @@ export function generateLocalPedagogicalTransformation(params: {
     promptVersion: PEDAGOGICAL_PROMPT_VERSION,
     isAiGenerated: false,
     isFallback: true,
+    isProvisional: true,
     fallbackReason: 'AI_UNAVAILABLE',
     source: 'fallback',
     aiNotice: getAiUnavailableNoticeText(cleanLang),
@@ -734,7 +752,13 @@ export async function fetchPedagogicalTransformation(params: {
   } = params;
 
   try {
-    const token = await auth?.currentUser?.getIdToken().catch(() => null);
+    const currentAuth = auth?.currentUser;
+    const token = await currentAuth?.getIdToken().catch(() => null);
+    const authUid = currentAuth?.uid || '';
+    const isAuthCanonical = Boolean(authUid && !authUid.includes('@') && !authUid.startsWith('usr-') && !authUid.startsWith('st-'));
+    const isParamCanonical = Boolean(studentUid && !studentUid.includes('@') && !studentUid.startsWith('usr-') && !studentUid.startsWith('st-'));
+    const effectiveUid = isAuthCanonical ? authUid : (isParamCanonical ? studentUid!.trim() : '');
+
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (token) {
       headers['Authorization'] = `Bearer ${token}`;
@@ -745,7 +769,7 @@ export async function fetchPedagogicalTransformation(params: {
     // Security Hotfix (Etapa 2): If not an explicit regeneration, check server cache first!
     if (!forceRegenerate && effectiveKey) {
       try {
-        const cacheUrl = `/api/pedagogical-notes?sessionKey=${encodeURIComponent(effectiveKey)}&language=${encodeURIComponent(language)}${studentUid ? `&studentUid=${encodeURIComponent(studentUid)}` : ''}`;
+        const cacheUrl = `/api/pedagogical-notes?sessionKey=${encodeURIComponent(effectiveKey)}&language=${encodeURIComponent(language)}${effectiveUid ? `&studentUid=${encodeURIComponent(effectiveUid)}` : ''}`;
         const cacheRes = await fetch(cacheUrl, { headers });
 
         if (cacheRes.status === 401 || cacheRes.status === 403) {
@@ -827,7 +851,7 @@ export async function fetchPedagogicalTransformation(params: {
         sessionDate,
         teacherName,
         studentLevel,
-        studentUid,
+        studentUid: effectiveUid || undefined,
         studentEmail,
         lessonId,
         sessionKey,

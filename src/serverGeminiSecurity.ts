@@ -437,6 +437,17 @@ export function validatePayloadBounds(
  * - Strict timeout deadline
  * - Sanitized logging and untrusted input protection
  */
+export interface GeminiSingleAttemptResponse {
+  text?: string;
+  parsedJson: any | null;
+  error?: {
+    statusCode?: number;
+    category: GeminiFailureCategory | string;
+    safeReason: string;
+    rawMessage?: string;
+  };
+}
+
 export async function executeGeminiSingleAttempt(params: {
   feature: GeminiFeature;
   systemInstruction: string;
@@ -444,10 +455,10 @@ export async function executeGeminiSingleAttempt(params: {
   temperature?: number;
   apiKey?: string;
   callerRole?: string;
-}): Promise<{ text: string; parsedJson: any } | null> {
+}): Promise<GeminiSingleAttemptResponse | null> {
   const { feature, systemInstruction, untrustedUserDataPrompt, temperature = 0.35, callerRole = 'student' } = params;
   const policy = GEMINI_POLICIES[feature];
-  const apiKey = params.apiKey || process.env.GEMINI_API_KEY || '';
+  const apiKey = params.apiKey !== undefined ? params.apiKey : (process.env.GEMINI_API_KEY || process.env.API_KEY || '');
 
   if (!apiKey) {
     logGeminiAudited({
@@ -456,7 +467,16 @@ export async function executeGeminiSingleAttempt(params: {
       callerRole,
       detail: 'No API key configured; activating deterministic fallback.',
     });
-    return null;
+    return {
+      text: undefined,
+      parsedJson: null,
+      error: {
+        statusCode: 401,
+        category: 'AUTH_ERROR',
+        safeReason: 'Gemini API key is not configured or missing.',
+        rawMessage: 'API_KEY_MISSING',
+      },
+    };
   }
 
   const startTime = Date.now();
@@ -516,7 +536,14 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
         durationMs,
         detail: 'Model returned empty response text.',
       });
-      return null;
+      return {
+        parsedJson: null,
+        error: {
+          statusCode: 502,
+          category: 'INVALID_RESPONSE',
+          safeReason: 'Model returned empty response text.',
+        },
+      };
     }
 
     const cleanJson = rawText.replace(/^```json/i, '').replace(/```$/i, '').trim();
@@ -531,7 +558,14 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
         durationMs,
         detail: 'Model response was not valid JSON.',
       });
-      return null;
+      return {
+        parsedJson: null,
+        error: {
+          statusCode: 502,
+          category: 'INVALID_RESPONSE',
+          safeReason: 'Model response was not valid JSON.',
+        },
+      };
     }
 
     logGeminiAudited({
@@ -547,6 +581,21 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
     const durationMs = Date.now() - startTime;
     const errMsg = String(err?.message || err);
 
+    const statusCode = Number(err?.status || err?.statusCode || err?.code || 0) ||
+      (errMsg.includes('429') ? 429 : errMsg.includes('403') ? 403 : errMsg.includes('503') ? 503 : 500);
+
+    const isQuota = statusCode === 429 || errMsg.toLowerCase().includes('quota') || errMsg.toLowerCase().includes('resource_exhausted');
+    const isAuth = statusCode === 401 || statusCode === 403 || errMsg.toLowerCase().includes('permission_denied') || errMsg.toLowerCase().includes('api_key');
+    const isTimeout = errMsg.toLowerCase().includes('timeout') || statusCode === 408;
+
+    const category: GeminiFailureCategory = isQuota
+      ? 'QUOTA_EXCEEDED'
+      : isAuth
+      ? 'AUTH_ERROR'
+      : isTimeout
+      ? 'TIMEOUT'
+      : 'INVALID_RESPONSE';
+
     logGeminiAudited({
       feature,
       status: 'GEMINI_ERROR',
@@ -555,8 +604,22 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
       detail: errMsg.slice(0, 100),
     });
 
-    // Zero retries! Return null so caller immediately uses deterministic fallback tagged as provisional
-    return null;
+    // Zero retries! Return structured error so caller immediately uses deterministic fallback tagged as provisional
+    return {
+      parsedJson: null,
+      error: {
+        statusCode,
+        category,
+        safeReason: isQuota
+          ? 'Gemini quota or rate limit exceeded.'
+          : isAuth
+          ? 'Gemini authentication failed or invalid credentials.'
+          : isTimeout
+          ? 'Request timed out waiting for model response.'
+          : 'Gemini service encountered an internal error.',
+        rawMessage: errMsg.slice(0, 100),
+      },
+    };
   }
 }
 

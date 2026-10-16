@@ -18,6 +18,7 @@ export interface SyncSessionVocabParams {
   teacherName?: string;
   lessonId?: string;
   skipClientWrite?: boolean;
+  isDefinitiveAi?: boolean;
 }
 
 /**
@@ -60,8 +61,15 @@ export async function syncSessionVocabularyToStudentDictionary(
     lessonId,
   } = params;
 
-  const cleanUid = (studentUid || '').trim();
+  const isDefinitiveAi = params.isDefinitiveAi !== undefined
+    ? Boolean(params.isDefinitiveAi)
+    : (vocabularyAndExpressions.length > 0 && !vocabularyAndExpressions.some((v: any) => v.isProvisional || v.isFallback));
+
+  const rawUid = (studentUid || '').trim();
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
+  // Filter out synthetic IDs (usr-*, st-*) and emails as UID
+  const isSynthetic = !rawUid || rawUid.includes('@') || rawUid.startsWith('usr-') || rawUid.startsWith('st-');
+  const cleanUid = !isSynthetic ? rawUid : '';
 
   if (!cleanUid && !cleanEmail) {
     return [];
@@ -154,7 +162,8 @@ export async function syncSessionVocabularyToStudentDictionary(
         isPronounce,
         isNewWord: true,
         partOfSpeech: v.partOfSpeech || (isPronounce ? 'Pronunciation Focus' : 'Expression'),
-        definitionEn: v.simpleDefinition || (v as any).definitionEn || existing?.definitionEn,
+        // HOTFIX 4B.8.1: definitionEn must be exclusively in English
+        definitionEn: (v as any).definitionEn || (isDefinitiveAi ? v.simpleDefinition : '') || existing?.definitionEn,
         exampleSentenceEn: Array.isArray(v.realExamples) && v.realExamples.length > 0 ? v.realExamples[0] : (v as any).exampleSentenceEn || existing?.exampleSentenceEn,
         phonetic: v.phoneticGuide || existing?.phonetic,
         cefrLevel: v.cefrLevel || existing?.cefrLevel,
@@ -172,7 +181,7 @@ export async function syncSessionVocabularyToStudentDictionary(
   const dictionaryEntries: StudentDictionaryEntry[] = [];
 
   for (const [key, meta] of candidateMap.entries()) {
-    const isEnriched = Boolean(meta.definitionEn && meta.definitionEn.trim());
+    const isEnriched = Boolean(isDefinitiveAi && meta.definitionEn && meta.definitionEn.trim());
     const definition = meta.definitionEn || '';
     const example = meta.exampleSentenceEn || '';
     const partOfSpeech = meta.partOfSpeech || (meta.isPronounce ? 'Pronunciation Focus' : 'Expression');

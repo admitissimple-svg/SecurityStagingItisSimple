@@ -472,9 +472,9 @@ const DEFAULT_DB: AppDb = {
   deletedStudentEmails: PURGED_OBSOLETE_STUDENTS,
   students: [
     {
-      id: 'usr-laviniatilapiafc-gmail-com',
-      studentUid: 'usr-laviniatilapiafc-gmail-com',
-      uid: 'usr-laviniatilapiafc-gmail-com',
+      id: 'student_lala_canonical_uid',
+      studentUid: 'student_lala_canonical_uid',
+      uid: 'student_lala_canonical_uid',
       name: 'Lavinia',
       studentName: 'Lavinia',
       email: 'laviniatilapiafc@gmail.com',
@@ -505,8 +505,8 @@ const DEFAULT_DB: AppDb = {
       role: 'admin',
     },
     'laviniatilapiafc@gmail.com': {
-      uid: 'usr-laviniatilapiafc-gmail-com',
-      id: 'usr-laviniatilapiafc-gmail-com',
+      uid: 'student_lala_canonical_uid',
+      id: 'student_lala_canonical_uid',
       email: 'laviniatilapiafc@gmail.com',
       name: 'Lavinia',
       role: 'student',
@@ -556,7 +556,7 @@ const DEFAULT_DB: AppDb = {
       password: '',
     },
     'laviniatilapiafc@gmail.com': {
-      uid: 'usr-laviniatilapiafc-gmail-com',
+      uid: 'student_lala_canonical_uid',
       email: 'laviniatilapiafc@gmail.com',
       name: 'Lavinia',
       role: 'student',
@@ -8225,7 +8225,8 @@ async function syncTransformationVocabToDictionary(
 
     const exCount = typeof existing?.practiceCount === 'number' ? existing.practiceCount : 0;
     const existingDef = (existing?.definitionEn || '').trim();
-    const newDef = isDefinitiveAi ? (v.simpleDefinition || v.definitionEn || '').trim() : '';
+    // Rule: definitionEn must be exclusively in English. Never copy translated simpleDefinition into definitionEn!
+    const newDef = isDefinitiveAi ? (v.definitionEn || (language === 'en' ? v.simpleDefinition : '') || '').trim() : '';
 
     const mergedOrigins = [...(existing?.origins || [])];
     const isDupOrig = mergedOrigins.some(
@@ -8506,7 +8507,8 @@ The student MUST NEVER see raw, fragmented notes. Instead, they receive a polish
 
 LANGUAGE REQUIREMENT (CRITICAL):
 - The student's chosen study and native interface language is ${targetLang.nameEn} (${targetLang.nameNative}, code: "${language}").
-- All pedagogical explanations, grammar rules, vocabulary definitions, common pitfalls, comparisons, CEFR adaptation advice, rememberThis takeaway, and review summaries MUST be written in ${targetLang.nameEn} (${targetLang.nameNative}).
+- All pedagogical explanations, grammar rules, vocabulary "simpleDefinition" explanations, common pitfalls, comparisons, CEFR adaptation advice, rememberThis takeaway, and review summaries MUST be written in ${targetLang.nameEn} (${targetLang.nameNative}).
+- "definitionEn" MUST BE WRITTEN EXCLUSIVELY IN NATURAL ENGLISH, calibrated to CEFR ${cefr} and the grammatical part of speech. NEVER translate definitionEn or copy non-English text into definitionEn!
 - The target English words, phrasal verbs, collocations, and didactic examples themselves MUST remain in natural, authentic English.
 - Didactic Examples: Any examples created by the AI must be clearly didactic learning examples (e.g. "Didactic Example: ..."), NEVER presented as real student utterances or claimed to be spoken by the student.
 
@@ -8556,7 +8558,8 @@ You MUST produce a JSON object strictly conforming to this schema:
       "id": "vocab-1",
       "term": "Word, phrasal verb, or pronunciation term",
       "partOfSpeech": "Part of speech (e.g. Phrasal Verb, Noun, Pronunciation Focus)",
-      "simpleDefinition": "Clear, accessible definition in ${targetLang.nameEn} adapted to CEFR ${cefr}",
+      "definitionEn": "Simple, accurate definition EXCLUSIVELY in English tailored to student level ${cefr} and part of speech",
+      "simpleDefinition": "Clear, accessible pedagogical explanation in ${targetLang.nameEn} adapted to CEFR ${cefr}",
       "collocations": ["Collocation 1", "Collocation 2"],
       "realExamples": ["Real-world didactic sentence 1", "Real-world didactic sentence 2"],
       "synonyms": ["Synonym 1", "Synonym 2"],
@@ -8680,9 +8683,16 @@ Please synthesize and transform these notes strictly adhering to the real markin
               id: `vocab-${validatedVocab.length + 1}`,
               term: originalTerm,
               partOfSpeech: isPronounce ? 'Pronunciation Focus' : 'Vocabulary Item',
-              simpleDefinition: isPronounce
+              definitionEn: isPronounce
                 ? `Pronunciation focus: Pay careful attention to syllable stress on "${originalTerm}".`
                 : `Key communicative expression (${cefr}): used in conversation to communicate "${originalTerm}" clearly and naturally.`,
+              simpleDefinition: isPronounce
+                ? (language === 'pt'
+                    ? `Foco em pronúncia: Preste atenção à tonicidade da sílaba e articulação de "${originalTerm}".`
+                    : `Pronunciation focus: Pay careful attention to syllable stress on "${originalTerm}".`)
+                : (language === 'pt'
+                    ? `Expressão comunicativa (${cefr}): utilizada em conversação para expressar "${originalTerm}" com clareza e naturalidade.`
+                    : `Key communicative expression (${cefr}): used in conversation to communicate "${originalTerm}" clearly and naturally.`),
               collocations: [`use "${originalTerm}" naturally`],
               realExamples: [`Didactic Example: "Practicing with '${originalTerm}' builds speaking confidence."`],
               synonyms: ['target phrase'],
@@ -8796,6 +8806,11 @@ Please synthesize and transform these notes strictly adhering to the real markin
             cached: false,
             transformation,
           });
+        }
+      } else if (singleAttempt?.error) {
+        lastFailureCategory = singleAttempt.error.category as GeminiFailureCategory;
+        if (singleAttempt.error.statusCode === 429 || lastFailureCategory === 'QUOTA_EXCEEDED') {
+          geminiQuotaCooldownUntil = Date.now() + GEMINI_QUOTA_COOLDOWN_MS;
         }
       }
     }

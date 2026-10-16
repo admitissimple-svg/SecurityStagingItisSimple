@@ -16,9 +16,9 @@
   ],
   "students": [
     {
-      "id": "usr-laviniatilapiafc-gmail-com",
-      "studentUid": "usr-laviniatilapiafc-gmail-com",
-      "uid": "usr-laviniatilapiafc-gmail-com",
+      "id": "student_lala_canonical_uid",
+      "studentUid": "student_lala_canonical_uid",
+      "uid": "student_lala_canonical_uid",
       "name": "Lavinia",
       "studentName": "Lavinia",
       "email": "laviniatilapiafc@gmail.com",
@@ -397,7 +397,7 @@
         }
       ]
     },
-    "usr-laviniatilapiafc-gmail-com": {
+    "student_lala_canonical_uid": {
       "monday": [
         {
           "id": "m1",
@@ -654,8 +654,8 @@
       "role": "admin"
     },
     "laviniatilapiafc@gmail.com": {
-      "uid": "usr-laviniatilapiafc-gmail-com",
-      "id": "usr-laviniatilapiafc-gmail-com",
+      "uid": "student_lala_canonical_uid",
+      "id": "student_lala_canonical_uid",
       "email": "laviniatilapiafc@gmail.com",
       "name": "Lavinia",
       "role": "student",
@@ -737,7 +737,7 @@
   "transactions": [],
   "studentVideoAssignments": {
     "laviniatilapiafc@gmail.com": [],
-    "usr-laviniatilapiafc-gmail-com": []
+    "student_lala_canonical_uid": []
   },
   "studentWatchedVideos": {},
   "studentSpotifyAssignments": {
@@ -746,7 +746,7 @@
         "id": "spot-assign-monday-1791110728906-0",
         "activityId": "act-monday-2",
         "studentEmail": "laviniatilapiafc@gmail.com",
-        "studentUid": "usr-laviniatilapiafc-gmail-com",
+        "studentUid": "student_lala_canonical_uid",
         "teacherUid": "",
         "teacherEmail": "",
         "day": "monday",
@@ -768,7 +768,7 @@
         "id": "spot-assign-tuesday-1791110728906-1",
         "activityId": "act-tuesday-2",
         "studentEmail": "laviniatilapiafc@gmail.com",
-        "studentUid": "usr-laviniatilapiafc-gmail-com",
+        "studentUid": "student_lala_canonical_uid",
         "teacherUid": "",
         "teacherEmail": "",
         "day": "tuesday",
@@ -790,7 +790,7 @@
         "id": "spot-assign-wednesday-1791110728906-2",
         "activityId": "act-wednesday-2",
         "studentEmail": "laviniatilapiafc@gmail.com",
-        "studentUid": "usr-laviniatilapiafc-gmail-com",
+        "studentUid": "student_lala_canonical_uid",
         "teacherUid": "",
         "teacherEmail": "",
         "day": "wednesday",
@@ -812,7 +812,7 @@
         "id": "spot-assign-thursday-1791110728906-3",
         "activityId": "act-thursday-2",
         "studentEmail": "laviniatilapiafc@gmail.com",
-        "studentUid": "usr-laviniatilapiafc-gmail-com",
+        "studentUid": "student_lala_canonical_uid",
         "teacherUid": "",
         "teacherEmail": "",
         "day": "thursday",
@@ -834,7 +834,7 @@
         "id": "spot-assign-friday-1791110728906-4",
         "activityId": "act-friday-2",
         "studentEmail": "laviniatilapiafc@gmail.com",
-        "studentUid": "usr-laviniatilapiafc-gmail-com",
+        "studentUid": "student_lala_canonical_uid",
         "teacherUid": "",
         "teacherEmail": "",
         "day": "friday",
@@ -856,7 +856,7 @@
         "id": "spot-assign-saturday-1791110728906-5",
         "activityId": "act-saturday-2",
         "studentEmail": "laviniatilapiafc@gmail.com",
-        "studentUid": "usr-laviniatilapiafc-gmail-com",
+        "studentUid": "student_lala_canonical_uid",
         "teacherUid": "",
         "teacherEmail": "",
         "day": "saturday",
@@ -878,7 +878,7 @@
         "id": "spot-assign-sunday-1791110728907-6",
         "activityId": "act-sunday-2",
         "studentEmail": "laviniatilapiafc@gmail.com",
-        "studentUid": "usr-laviniatilapiafc-gmail-com",
+        "studentUid": "student_lala_canonical_uid",
         "teacherUid": "",
         "teacherEmail": "",
         "day": "sunday",
@@ -897,12 +897,12 @@
         "trackIndex": 7
       }
     ],
-    "usr-laviniatilapiafc-gmail-com": [
+    "student_lala_canonical_uid": [
       {
         "id": "spot-assign-monday-1791110728906-0",
         "activityId": "act-monday-2",
         "studentEmail": "laviniatilapiafc@gmail.com",
-        "studentUid": "usr-laviniatilapiafc-gmail-com",
+        "studentUid": "student_lala_canonical_uid",
         "teacherUid": "",
         "teacherEmail": "",
         "day": "monday",
@@ -924,7 +924,7 @@
         "id": "spot-assign-tuesday-1791110728906-1",
         "activityId": "act-tuesday-2",
         "studentEmail": "laviniatilapiafc@gmail.com",
-        "studentUid": "usr-laviniatilapiafc-gmail-com",
+        "studentUid": "student_lala_canonical_uid",
         "teacherUid": "",
         "teacherEmail": "",
         "day": "tuesday",
@@ -946,7 +946,7 @@
         "id": "spot-assign-wednesday-1791110728906-2",
         "activityId": "act-wednesday-2",
         "studentEmail": "laviniatilapiafc@gmail.com",
-        "studentUid": "usr-laviniatilapiafc-gmail-com",
+        "studentUid": "student_lala_canonical_uid",
         "teacherUid": "",
         "teacherEmail": "",
         "day": "wednesday",
@@ -968,7 +968,7 @@
         "id": "spot-assign-thursday-1791110728906-3",
         "activityId": "act-thursday-2",
         "studentEmail": "laviniatilapiafc@gmail.com",
-        "studentUid": "usr-laviniatilapiafc-gmail-com",
+        "studentUid": "student_lala_canonical_uid",
         "teacherUid": "",
         "teacherEmail": "",
         "day": "thursday",
@@ -990,7 +990,7 @@
         "id": "spot-assign-friday-1791110728906-4",
         "activityId": "act-friday-2",
         "studentEmail": "laviniatilapiafc@gmail.com",
-        "studentUid": "usr-laviniatilapiafc-gmail-com",
+        "studentUid": "student_lala_canonical_uid",
         "teacherUid": "",
         "teacherEmail": "",
         "day": "friday",
@@ -1012,7 +1012,7 @@
         "id": "spot-assign-saturday-1791110728906-5",
         "activityId": "act-saturday-2",
         "studentEmail": "laviniatilapiafc@gmail.com",
-        "studentUid": "usr-laviniatilapiafc-gmail-com",
+        "studentUid": "student_lala_canonical_uid",
         "teacherUid": "",
         "teacherEmail": "",
         "day": "saturday",
@@ -1034,7 +1034,7 @@
         "id": "spot-assign-sunday-1791110728907-6",
         "activityId": "act-sunday-2",
         "studentEmail": "laviniatilapiafc@gmail.com",
-        "studentUid": "usr-laviniatilapiafc-gmail-com",
+        "studentUid": "student_lala_canonical_uid",
         "teacherUid": "",
         "teacherEmail": "",
         "day": "sunday",
@@ -1057,7 +1057,7 @@
   "studentListenedTracks": {},
   "studentAwaitingTopicSelection": {
     "laviniatilapiafc@gmail.com": true,
-    "usr-laviniatilapiafc-gmail-com": true
+    "student_lala_canonical_uid": true
   },
   "spotifyPlaylists": {},
   "sessionNotesMap": {},
@@ -1072,8 +1072,8 @@
       "password": ""
     },
     "laviniatilapiafc@gmail.com": {
-      "uid": "usr-laviniatilapiafc-gmail-com",
-      "id": "usr-laviniatilapiafc-gmail-com",
+      "uid": "student_lala_canonical_uid",
+      "id": "student_lala_canonical_uid",
       "email": "laviniatilapiafc@gmail.com",
       "name": "Lavinia",
       "role": "student",
@@ -1090,7 +1090,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 21,
-      "updatedAt": "2026-10-11T15:08:05.016Z",
+      "updatedAt": "2026-10-16T19:00:05.846Z",
       "isPublic": true,
       "videos": [
         {
@@ -1376,7 +1376,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 21,
-      "updatedAt": "2026-10-11T15:08:05.016Z",
+      "updatedAt": "2026-10-16T19:00:05.846Z",
       "isPublic": true,
       "videos": [
         {
@@ -1662,7 +1662,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-11T15:08:05.016Z",
+      "updatedAt": "2026-10-16T19:00:05.846Z",
       "isPublic": true,
       "videos": [
         {
@@ -2052,7 +2052,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 27,
-      "updatedAt": "2026-10-11T15:08:05.016Z",
+      "updatedAt": "2026-10-16T19:00:05.846Z",
       "isPublic": true,
       "videos": [
         {
@@ -2416,7 +2416,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 26,
-      "updatedAt": "2026-10-11T15:08:05.016Z",
+      "updatedAt": "2026-10-16T19:00:05.846Z",
       "isPublic": true,
       "videos": [
         {
@@ -2767,7 +2767,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 21,
-      "updatedAt": "2026-10-11T15:08:05.016Z",
+      "updatedAt": "2026-10-16T19:00:05.846Z",
       "isPublic": true,
       "videos": [
         {
@@ -3053,7 +3053,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 23,
-      "updatedAt": "2026-10-11T15:08:05.016Z",
+      "updatedAt": "2026-10-16T19:00:05.846Z",
       "isPublic": true,
       "videos": [
         {
@@ -3365,7 +3365,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 26,
-      "updatedAt": "2026-10-11T15:08:05.016Z",
+      "updatedAt": "2026-10-16T19:00:05.846Z",
       "isPublic": true,
       "videos": [
         {
@@ -3716,7 +3716,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 28,
-      "updatedAt": "2026-10-11T15:08:05.016Z",
+      "updatedAt": "2026-10-16T19:00:05.846Z",
       "isPublic": true,
       "videos": [
         {
@@ -4093,7 +4093,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-11T15:08:05.016Z",
+      "updatedAt": "2026-10-16T19:00:05.846Z",
       "isPublic": true,
       "videos": [
         {
@@ -4483,9 +4483,374 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 28,
-      "updatedAt": "2026-10-11T15:08:05.016Z",
+      "updatedAt": "2026-10-16T19:00:05.846Z",
       "isPublic": true,
-      "videos": []
+      "videos": [
+        {
+          "id": "vid-xmx07H3sn1w",
+          "videoId": "xmx07H3sn1w",
+          "title": "How To Make Small Talk Interesting And Fun",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/xmx07H3sn1w/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=xmx07H3sn1w",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/xmx07H3sn1w?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "8 minutes"
+        },
+        {
+          "id": "vid-i3ku5nx4tMU",
+          "videoId": "i3ku5nx4tMU",
+          "title": "4 things all great listeners know",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/i3ku5nx4tMU/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=i3ku5nx4tMU",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/i3ku5nx4tMU?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "5 minutes"
+        },
+        {
+          "id": "vid-oM-zwv-1rlQ",
+          "videoId": "oM-zwv-1rlQ",
+          "title": "6 Signs Someone Wants To Be MORE Than Friends With You",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/oM-zwv-1rlQ/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=oM-zwv-1rlQ",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/oM-zwv-1rlQ?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "4 minutes"
+        },
+        {
+          "id": "vid-QXiAPiw7vfc",
+          "videoId": "QXiAPiw7vfc",
+          "title": "If You Run Out Of Things To Say, Play This Simple Game",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/QXiAPiw7vfc/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=QXiAPiw7vfc",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/QXiAPiw7vfc?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "4 minutes"
+        },
+        {
+          "id": "vid-3W5JNZBFA1M",
+          "videoId": "3W5JNZBFA1M",
+          "title": "7 Psychological Tricks To Make a Good First Impression",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/3W5JNZBFA1M/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=3W5JNZBFA1M",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/3W5JNZBFA1M?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "3 minutes"
+        },
+        {
+          "id": "vid-eOoCe3An4VE",
+          "videoId": "eOoCe3An4VE",
+          "title": "How to read people: Decode 7 body language cues",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/eOoCe3An4VE/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=eOoCe3An4VE",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/eOoCe3An4VE?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "9 minutes"
+        },
+        {
+          "id": "vid-5VUpo28aAks",
+          "videoId": "5VUpo28aAks",
+          "title": "Why I’m against empathy | Paul Bloom",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/5VUpo28aAks/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=5VUpo28aAks",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/5VUpo28aAks?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "4 minutes"
+        },
+        {
+          "id": "vid-SsRPv8Fmhv0",
+          "videoId": "SsRPv8Fmhv0",
+          "title": "9 Things Introverts Do Better Than Extroverts",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/SsRPv8Fmhv0/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=SsRPv8Fmhv0",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/SsRPv8Fmhv0?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "5 minutes"
+        },
+        {
+          "id": "vid-NjbmUhKpp7k",
+          "videoId": "NjbmUhKpp7k",
+          "title": "How To Tell Stories That Boost Your Charm",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/NjbmUhKpp7k/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=NjbmUhKpp7k",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/NjbmUhKpp7k?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "9 minutes"
+        },
+        {
+          "id": "vid-xsqzzW3Yl28",
+          "videoId": "xsqzzW3Yl28",
+          "title": "Memory hack: Derren Brown teaches the method of loci | Big Think",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/xsqzzW3Yl28/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=xsqzzW3Yl28",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/xsqzzW3Yl28?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "5 minutes"
+        },
+        {
+          "id": "vid-5hvVjOqk_4o",
+          "videoId": "5hvVjOqk_4o",
+          "title": "Tone of Voice in Communication",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/5hvVjOqk_4o/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=5hvVjOqk_4o",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/5hvVjOqk_4o?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "8 minutes"
+        },
+        {
+          "id": "vid-wbroM1Di-bI",
+          "videoId": "wbroM1Di-bI",
+          "title": "How To STOP Letting Social Anxiety Control You",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/wbroM1Di-bI/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=wbroM1Di-bI",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/wbroM1Di-bI?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "6 minutes"
+        },
+        {
+          "id": "vid-zz6s9uiAg6k",
+          "videoId": "zz6s9uiAg6k",
+          "title": "THIS Makes Him Feel Drawn to You",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/zz6s9uiAg6k/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=zz6s9uiAg6k",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/zz6s9uiAg6k?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "6-8 min"
+        },
+        {
+          "id": "vid-sUv353ua7E8",
+          "videoId": "sUv353ua7E8",
+          "title": "How to Find Laughter Anywhere | Chris Duffy | TED",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/sUv353ua7E8/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=sUv353ua7E8",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/sUv353ua7E8?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "7 minutes"
+        },
+        {
+          "id": "vid-u9kAe3eYFAk",
+          "videoId": "u9kAe3eYFAk",
+          "title": "How to join group conversations",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/u9kAe3eYFAk/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=u9kAe3eYFAk",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/u9kAe3eYFAk?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "1 minute"
+        },
+        {
+          "id": "vid-FqH3FFKX6n4",
+          "videoId": "FqH3FFKX6n4",
+          "title": "How To Be A Better Partner for 2025",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/FqH3FFKX6n4/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=FqH3FFKX6n4",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/FqH3FFKX6n4?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "6 minutes"
+        },
+        {
+          "id": "vid-F9XUedayplg",
+          "videoId": "F9XUedayplg",
+          "title": "Be Careful When You Compliment People",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/F9XUedayplg/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=F9XUedayplg",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/F9XUedayplg?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "6-8 min"
+        },
+        {
+          "id": "vid-gCfzeONu3Mo",
+          "videoId": "gCfzeONu3Mo",
+          "title": "How miscommunication happens (and how to avoid it) - Katherine Hampsten",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/gCfzeONu3Mo/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=gCfzeONu3Mo",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/gCfzeONu3Mo?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "4 minutes"
+        },
+        {
+          "id": "vid-GhYerYFzFJA",
+          "videoId": "GhYerYFzFJA",
+          "title": "How To Be Effortlessly Likeable (Steal Pedro Pascal's Habits)",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/GhYerYFzFJA/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=GhYerYFzFJA",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/GhYerYFzFJA?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "7 minutes"
+        },
+        {
+          "id": "vid-FgdivvvD8vQ",
+          "videoId": "FgdivvvD8vQ",
+          "title": "How To Turn Awkwardness Into Attraction",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/FgdivvvD8vQ/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=FgdivvvD8vQ",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/FgdivvvD8vQ?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "3 minutes"
+        },
+        {
+          "id": "vid-IDj1OBG5Tpw",
+          "videoId": "IDj1OBG5Tpw",
+          "title": "Harvard negotiator explains how to argue | Dan Shapiro",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/IDj1OBG5Tpw/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=IDj1OBG5Tpw",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/IDj1OBG5Tpw?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "4 minutes"
+        },
+        {
+          "id": "vid-kOVdiDUlNsg",
+          "videoId": "kOVdiDUlNsg",
+          "title": "How some friendships last — and others don’t - Iseult Gillespie",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/kOVdiDUlNsg/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=kOVdiDUlNsg",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/kOVdiDUlNsg?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "4 minutes"
+        },
+        {
+          "id": "vid-E4BpRRQeE10",
+          "videoId": "E4BpRRQeE10",
+          "title": "How To End An Awkward Conversation",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/E4BpRRQeE10/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=E4BpRRQeE10",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/E4BpRRQeE10?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "8 minutes"
+        },
+        {
+          "id": "vid-iFNwm1eH3Sw",
+          "videoId": "iFNwm1eH3Sw",
+          "title": "6 Signs You’re in a Toxic Friend Group",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/iFNwm1eH3Sw/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=iFNwm1eH3Sw",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/iFNwm1eH3Sw?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "4 minutes"
+        },
+        {
+          "id": "vid-B0heWo1XGhc",
+          "videoId": "B0heWo1XGhc",
+          "title": "A Fun Way to Learn 50 English Phrasal Verbs with Examples!",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/B0heWo1XGhc/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=B0heWo1XGhc",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/B0heWo1XGhc?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "7 minutes"
+        },
+        {
+          "id": "vid-eIho2S0ZahI",
+          "videoId": "eIho2S0ZahI",
+          "title": "How to Speak So That People Want to Listen | Julian Treasure | TED",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/eIho2S0ZahI/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=eIho2S0ZahI",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/eIho2S0ZahI?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "9 minutes"
+        },
+        {
+          "id": "vid-A-CqifOE0Nw",
+          "videoId": "A-CqifOE0Nw",
+          "title": "5 Reasons To Set Healthy Boundaries with Toxic People",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/A-CqifOE0Nw/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=A-CqifOE0Nw",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/A-CqifOE0Nw?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "6 minutes"
+        },
+        {
+          "id": "vid-i7RGw_Smw8g",
+          "videoId": "i7RGw_Smw8g",
+          "title": "Kid on Wire: Let Children Take Risks and Learn to Trust Their Own Intuition, with Philippe Petit",
+          "description": "",
+          "thumbnailUrl": "https://i.ytimg.com/vi/i7RGw_Smw8g/hqdefault.jpg",
+          "url": "https://www.youtube.com/watch?v=i7RGw_Smw8g",
+          "embedUrl": "https://www.youtube-nocookie.com/embed/i7RGw_Smw8g?rel=0&modestbranding=1&enablejsapi=1",
+          "playlistId": "PLfoliGCn39lA",
+          "playlistTitle": "Casual Conversation",
+          "instructions": "Assista a esta aula sobre \"Casual Conversation\" e anote 3 termos ou frases úteis para a rotina.",
+          "duration": "1 minute"
+        }
+      ]
     },
     {
       "id": "PLGn0RuQaXOcE",
@@ -4495,7 +4860,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 30,
-      "updatedAt": "2026-10-11T15:08:05.016Z",
+      "updatedAt": "2026-10-16T19:00:05.846Z",
       "isPublic": true,
       "videos": [
         {
@@ -4898,7 +5263,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-11T15:08:05.016Z",
+      "updatedAt": "2026-10-16T19:00:05.846Z",
       "isPublic": true,
       "videos": [
         {
@@ -5099,7 +5464,7 @@
         {
           "id": "vid-iHzzSao6ypE",
           "videoId": "iHzzSao6ypE",
-          "title": "Traffic Has a Perfect Solution. Humans Are the Problem.",
+          "title": "Traffic Lights Exist Because Drivers Can't Talk to Each Other",
           "description": "",
           "thumbnailUrl": "https://i.ytimg.com/vi/iHzzSao6ypE/hqdefault.jpg",
           "url": "https://www.youtube.com/watch?v=iHzzSao6ypE",
@@ -5288,7 +5653,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 30,
-      "updatedAt": "2026-10-11T15:08:05.016Z",
+      "updatedAt": "2026-10-16T19:00:05.846Z",
       "isPublic": true,
       "videos": [
         {
@@ -5691,7 +6056,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-11T15:08:05.016Z",
+      "updatedAt": "2026-10-16T19:00:05.846Z",
       "isPublic": true,
       "videos": [
         {
@@ -6081,7 +6446,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 27,
-      "updatedAt": "2026-10-11T15:08:05.016Z",
+      "updatedAt": "2026-10-16T19:00:05.846Z",
       "isPublic": true,
       "videos": [
         {
@@ -6445,7 +6810,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 28,
-      "updatedAt": "2026-10-11T15:08:05.016Z",
+      "updatedAt": "2026-10-16T19:00:05.846Z",
       "isPublic": true,
       "videos": [
         {
@@ -6822,7 +7187,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-11T15:08:05.016Z",
+      "updatedAt": "2026-10-16T19:00:05.846Z",
       "isPublic": true,
       "videos": [
         {

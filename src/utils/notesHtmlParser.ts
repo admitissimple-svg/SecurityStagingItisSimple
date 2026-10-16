@@ -77,6 +77,7 @@ export function cleanExpressionTerm(term: string): string {
   if (!term) return '';
   return decodeHtmlEntities(term)
     .replace(/\[\[TAG:[A-Z_]+\]\]/g, '')
+    .replace(/\(Alt\+[WPYN]\)/gi, '')
     .replace(/^[•\-\*–—\s]+/, '')
     .replace(/[•\-\*–—\s]+$/, '')
     .replace(/^[✓✔✗✖✦🎯\s]+/, '')
@@ -119,31 +120,89 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
     };
   }
 
-  // 1. Tag count audit
-  const tagCorrect = (rawContent.match(/data-tag-type=["']correct["']/g) || []).length;
-  const tagIncorrect = (rawContent.match(/data-tag-type=["']incorrect["']/g) || []).length;
-  const tagNewWord = (rawContent.match(/data-tag-type=["']new-word["']/g) || []).length;
-  const tagPronounce = (rawContent.match(/data-tag-type=["']pronounce["']/g) || []).length;
+  const errors: ParsedNoteError[] = [];
+  const newWords: string[] = [];
+  const pronounceItems: string[] = [];
+  const positives: string[] = [];
+  const vocabItems: string[] = [];
+  const seenNewWords = new Set<string>();
+  const seenPronounce = new Set<string>();
+  const seenPositives = new Set<string>();
+  const seenErrors = new Set<string>();
 
-  // Plain symbol audit (excluding any already captured inside data-tag-type spans)
-  const plainWithoutSpans = rawContent.replace(/<span[^>]*data-tag-type=["'][^"']+["'][^>]*>[\s\S]*?<\/span>/gi, '');
+  const isBadgeLabel = (text: string) => {
+    const clean = text.trim();
+    if (!clean) return true;
+    return (
+      /^[✓✔✗✖✦🎯\s]*(new word|pronounce|correct|incorrect)?[✓✔✗✖✦🎯\s]*$/i.test(clean) ||
+      clean === '✦ New Word' ||
+      clean === '🎯 Pronounce' ||
+      clean === '[New Word]' ||
+      clean === '[Pronounce]'
+    );
+  };
+
+  // 1. Pre-process wrapped spans that directly wrap target words (e.g. <span class="new-word">streamline</span>
+  // or nested <span class="new-word"><span class="pronounce">breakthrough</span></span>)
+  let preprocessed = rawContent.replace(
+    /<span\b([^>]*?(?:data-tag-type=["'](new-word|pronounce|correct|incorrect)["']|class=["'][^"']*\b(new-word|pronounce|correct|incorrect)\b)[^>]*)>([\s\S]*?)<\/span>/gi,
+    (fullMatch, attrs, tagType, className, inner) => {
+      const strippedInner = stripHtmlTags(inner).trim();
+      if (!strippedInner || isBadgeLabel(strippedInner)) {
+        return fullMatch; // Let badge tokenization handle it below
+      }
+
+      const hasNw =
+        tagType === 'new-word' ||
+        className === 'new-word' ||
+        /new-word/i.test(attrs) ||
+        /new-word/i.test(inner);
+
+      const hasPr =
+        tagType === 'pronounce' ||
+        className === 'pronounce' ||
+        /pronounce/i.test(attrs) ||
+        /pronounce/i.test(inner);
+
+      const cleanWord = cleanExpressionTerm(strippedInner);
+      if (cleanWord) {
+        const normKey = cleanWord.toLowerCase();
+        if (hasNw && !seenNewWords.has(normKey)) {
+          seenNewWords.add(normKey);
+          newWords.push(cleanWord);
+        }
+        if (hasPr && !seenPronounce.has(normKey)) {
+          seenPronounce.add(normKey);
+          pronounceItems.push(cleanWord);
+        }
+      }
+
+      return ` ${cleanWord} `;
+    }
+  );
+
+  // 2. Tag count audit
+  const countMatches = (regex: RegExp) => (rawContent.match(regex) || []).length;
+  const tagCorrect = countMatches(/data-tag-type=["']correct["']|class=["'][^"']*\bcorrect\b/gi);
+  const tagIncorrect = countMatches(/data-tag-type=["']incorrect["']|class=["'][^"']*\bincorrect\b/gi);
+  const tagNewWord = countMatches(/data-tag-type=["']new-word["']|class=["'][^"']*\bnew-word\b|\[New Word\]|\(Alt\+W\)/gi);
+  const tagPronounce = countMatches(/data-tag-type=["']pronounce["']|class=["'][^"']*\bpronounce\b|\[Pronounce\]|\(Alt\+P\)/gi);
+
+  const plainWithoutSpans = rawContent.replace(/<span[^>]*>[\s\S]*?<\/span>/gi, '');
   const plainCorrect = (plainWithoutSpans.match(/✓|✔/g) || []).length;
   const plainIncorrect = (plainWithoutSpans.match(/✗|✖/g) || []).length;
-  const plainNewWord = (plainWithoutSpans.match(/\[New Word\]/gi) || []).length;
-  const plainPronounce = (plainWithoutSpans.match(/\[Pronounce\]/gi) || []).length;
 
-  const correctCount = tagCorrect + plainCorrect;
-  const incorrectCount = tagIncorrect + plainIncorrect;
-  const newWordCount = tagNewWord + plainNewWord;
-  const pronounceCount = tagPronounce + plainPronounce;
+  const correctCount = Math.max(tagCorrect + plainCorrect, errors.length + positives.length);
+  const incorrectCount = Math.max(tagIncorrect + plainIncorrect, errors.length);
+  const newWordCount = Math.max(tagNewWord, newWords.length);
+  const pronounceCount = Math.max(tagPronounce, pronounceItems.length);
 
-  // 2. Tokenize and normalize HTML tags to unambiguous markers
-  // Tokenize data-tag-type spans (entire span with decorative text is replaced by token)
-  let tokenized = rawContent
-    .replace(/<span[^>]*data-tag-type=["']correct["'][^>]*>[\s\S]*?<\/span>/gi, ' [[TAG:CORRECT]] ')
-    .replace(/<span[^>]*data-tag-type=["']incorrect["'][^>]*>[\s\S]*?<\/span>/gi, ' [[TAG:INCORRECT]] ')
-    .replace(/<span[^>]*data-tag-type=["']new-word["'][^>]*>[\s\S]*?<\/span>/gi, ' [[TAG:NEW_WORD]] ')
-    .replace(/<span[^>]*data-tag-type=["']pronounce["'][^>]*>[\s\S]*?<\/span>/gi, ' [[TAG:PRONOUNCE]] ');
+  // 3. Tokenize remaining badge tags and symbols
+  let tokenized = preprocessed
+    .replace(/<span[^>]*?(?:data-tag-type=["']correct["']|class=["'][^"']*\bcorrect\b)[^>]*>[\s\S]*?<\/span>/gi, ' [[TAG:CORRECT]] ')
+    .replace(/<span[^>]*?(?:data-tag-type=["']incorrect["']|class=["'][^"']*\bincorrect\b)[^>]*>[\s\S]*?<\/span>/gi, ' [[TAG:INCORRECT]] ')
+    .replace(/<span[^>]*?(?:data-tag-type=["']new-word["']|class=["'][^"']*\bnew-word\b)[^>]*>[\s\S]*?<\/span>/gi, ' [[TAG:NEW_WORD]] ')
+    .replace(/<span[^>]*?(?:data-tag-type=["']pronounce["']|class=["'][^"']*\bpronounce\b)[^>]*>[\s\S]*?<\/span>/gi, ' [[TAG:PRONOUNCE]] ');
 
   // Tokenize plain text stamps if present
   tokenized = tokenized
@@ -174,16 +233,6 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
     .map((l) => l.trim())
     .filter(Boolean);
 
-  const errors: ParsedNoteError[] = [];
-  const newWords: string[] = [];
-  const pronounceItems: string[] = [];
-  const positives: string[] = [];
-  const vocabItems: string[] = [];
-  const seenNewWords = new Set<string>();
-  const seenPronounce = new Set<string>();
-  const seenPositives = new Set<string>();
-  const seenErrors = new Set<string>();
-
   for (let i = 0; i < rawLines.length; i++) {
     const line = rawLines[i];
     if (isTemplateHeaderLine(line)) {
@@ -195,28 +244,47 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
     const hasIncorrect = line.includes('[[TAG:INCORRECT]]');
     const hasCorrect = line.includes('[[TAG:CORRECT]]');
 
-    // Case 1: Alt+W (New Word)
+    // Case 1: Alt+W (New Word badge on line)
     if (hasNewWord) {
       const cleanTerm = cleanExpressionTerm(
         line.replace(/\[\[TAG:[A-Z_]+\]\]/g, '')
       );
-      if (cleanTerm && cleanTerm.length > 0 && !seenNewWords.has(cleanTerm.toLowerCase())) {
+      if (
+        cleanTerm &&
+        cleanTerm.length > 0 &&
+        cleanTerm.length <= 60 &&
+        !cleanTerm.includes('.') &&
+        !seenNewWords.has(cleanTerm.toLowerCase())
+      ) {
         seenNewWords.add(cleanTerm.toLowerCase());
         newWords.push(cleanTerm);
       }
-      if (hasPronounce && cleanTerm && cleanTerm.length > 0 && !seenPronounce.has(cleanTerm.toLowerCase())) {
+      if (
+        hasPronounce &&
+        cleanTerm &&
+        cleanTerm.length > 0 &&
+        cleanTerm.length <= 60 &&
+        !cleanTerm.includes('.') &&
+        !seenPronounce.has(cleanTerm.toLowerCase())
+      ) {
         seenPronounce.add(cleanTerm.toLowerCase());
         pronounceItems.push(cleanTerm);
       }
       continue;
     }
 
-    // Case 2: Alt+P (Pronounce)
+    // Case 2: Alt+P (Pronounce badge on line)
     if (hasPronounce) {
       const cleanTerm = cleanExpressionTerm(
         line.replace(/\[\[TAG:[A-Z_]+\]\]/g, '')
       );
-      if (cleanTerm && cleanTerm.length > 0 && !seenPronounce.has(cleanTerm.toLowerCase())) {
+      if (
+        cleanTerm &&
+        cleanTerm.length > 0 &&
+        cleanTerm.length <= 60 &&
+        !cleanTerm.includes('.') &&
+        !seenPronounce.has(cleanTerm.toLowerCase())
+      ) {
         seenPronounce.add(cleanTerm.toLowerCase());
         pronounceItems.push(cleanTerm);
       }

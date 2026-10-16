@@ -38,7 +38,8 @@ import {
 import { syncSessionVocabularyToStudentDictionary } from '../utils/sessionVocabularySync';
 import { normalizeDictionaryWord } from '../utils/studentDictionaryLibrary';
 import { getAccessToken } from '../utils/auth';
-import { getDb } from '../firebase';
+import { getDb, auth } from '../firebase';
+import { isValidCanonicalUid } from '../utils/studentPersistence';
 import { collection, getDocs, query, where } from 'firebase/firestore';
 
 interface NativeFriendsNotesModalProps {
@@ -88,16 +89,16 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
 }) => {
   const isEn = currentLanguage === 'en';
 
-  // Resolved identity for strict UID-level isolation
+  // Resolved identity for strict UID-level isolation (HOTFIX 4B.8.1: canonical UID only, reject synthetic usr-*)
   const resolvedUid = useMemo(() => {
-    return (
-      studentUid ||
-      userProfile?.uid ||
-      userProfile?.id ||
-      currentAccount?.id ||
-      (currentAccount as any)?.uid ||
-      ''
-    );
+    const authUid = auth?.currentUser?.uid;
+    if (isValidCanonicalUid(authUid)) return authUid;
+    if (isValidCanonicalUid(studentUid)) return studentUid;
+    const accUid = (currentAccount as any)?.uid || currentAccount?.id;
+    if (isValidCanonicalUid(accUid)) return accUid;
+    const profUid = userProfile?.uid || userProfile?.id;
+    if (isValidCanonicalUid(profUid)) return profUid;
+    return '';
   }, [studentUid, userProfile?.uid, userProfile?.id, currentAccount?.id, (currentAccount as any)?.uid]);
 
   const resolvedEmail = useMemo(() => {
@@ -408,8 +409,9 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
           setIsSyncingVocab(true);
           setVocabSyncError(null);
           try {
+            const isDefinitive = Boolean(result.isAiGenerated && !result.isProvisional && !result.isFallback);
             const syncedEntries = await syncSessionVocabularyToStudentDictionary({
-              studentUid: resolvedUid || resolvedEmail,
+              studentUid: resolvedUid, // Strictly canonical UID, never fallback to email
               studentEmail: resolvedEmail,
               rawNotes: activeSession.rawContent,
               vocabularyAndExpressions: result.vocabularyAndExpressions,
@@ -418,6 +420,7 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
               topic: activeSession.topic,
               teacherName: activeSession.teacherName,
               lessonId: activeSession.lessonId,
+              isDefinitiveAi: isDefinitive,
             });
 
             if (syncedEntries && syncedEntries.length > 0) {

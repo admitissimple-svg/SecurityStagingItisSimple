@@ -1424,6 +1424,7 @@ function consolidateServerEntries(existingEntries: any[], newEntries: any[]): an
     const existing = masterMap.get(key);
 
     if (!existing) {
+      const isItemProvisional = Boolean(item.isProvisional || item.isFallback || item.enrichmentStatus === 'pending');
       masterMap.set(key, {
         ...item,
         id: item.id || `dict_${key.replace(/[^a-zA-Z0-9_-]/g, '_')}_${Date.now()}`,
@@ -1432,19 +1433,38 @@ function consolidateServerEntries(existingEntries: any[], newEntries: any[]): an
         normalizedWord: key,
         practiceCount: typeof item.practiceCount === 'number' ? item.practiceCount : 0,
         origins: Array.isArray(item.origins) ? item.origins : (item.source ? [{ source: item.source, activityName: item.sourceActivityName }] : []),
+        enrichmentStatus: item.enrichmentStatus === 'enriched' && !isItemProvisional ? 'enriched' : 'pending',
+        isProvisional: isItemProvisional,
       });
       return;
     }
 
-    // Richer definition protection
+    // Richer definition & Provisional protection (HOTFIX 4B.8.1)
     const existingDef = (existing.definitionEn || '').trim();
     const newDef = (item.definitionEn || item.meaningOrTip || '').trim();
+    const isItemProvisional = Boolean(item.isProvisional || item.isFallback || item.enrichmentStatus === 'pending');
+    const isExistingEnriched = Boolean(existing.enrichmentStatus === 'enriched' || (existingDef && !existing.isProvisional));
+
     const genericFallbackRegex = /A (fundamental word|natural conversational expression|practical English term|Key communicative expression)/i;
     const isNewGeneric = genericFallbackRegex.test(newDef);
     const isExistingGeneric = genericFallbackRegex.test(existingDef);
-    const keepExistingDef = Boolean(existingDef && (!newDef || (isNewGeneric && !isExistingGeneric) || (existingDef.length > 20 && newDef.length < 15)));
+
+    // Rule: Provisional or fallback definitions must NEVER overwrite an existing legitimate definition
+    const keepExistingDef = Boolean(
+      existingDef && (
+        !newDef ||
+        (isItemProvisional && isExistingEnriched) ||
+        (isNewGeneric && !isExistingGeneric) ||
+        (existingDef.length > 20 && newDef.length < 15)
+      )
+    );
 
     const resolvedDef = keepExistingDef ? existingDef : (newDef || existingDef || '');
+    const resolvedEnrichmentStatus = (isExistingEnriched && isItemProvisional)
+      ? 'enriched'
+      : (item.enrichmentStatus === 'enriched' && !isItemProvisional && Boolean(newDef))
+      ? 'enriched'
+      : (existing.enrichmentStatus === 'enriched' ? 'enriched' : (item.enrichmentStatus || existing.enrichmentStatus || 'pending'));
     const resolvedExample = existing.exampleSentenceEn && (!item.exampleSentenceEn || item.exampleSentenceEn.length < existing.exampleSentenceEn.length)
       ? existing.exampleSentenceEn
       : (item.exampleSentenceEn || item.exampleSentence || existing.exampleSentenceEn || '');
@@ -1509,6 +1529,8 @@ function consolidateServerEntries(existingEntries: any[], newEntries: any[]): an
       practiceCount: mergedPracticeCount,
       practiceHistory: mergedPracticeHistory,
       lastPracticedAt: mergedLastPracticedAt,
+      enrichmentStatus: resolvedEnrichmentStatus,
+      isProvisional: isItemProvisional && !isExistingEnriched,
     });
   });
 

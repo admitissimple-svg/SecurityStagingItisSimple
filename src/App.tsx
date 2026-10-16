@@ -7019,7 +7019,12 @@ export default function App() {
         customSavedEntries={studentDictionaryEntries}
         consolidatedEntries={consolidatedActiveDictionary}
         excludedWords={excludedDictionaryWords}
-        studentUid={userProfile?.uid || currentAccount?.id || currentAccount?.uid}
+        studentUid={
+          (auth?.currentUser?.uid && isValidCanonicalUid(auth.currentUser.uid) ? auth.currentUser.uid : '') ||
+          (userProfile?.uid && isValidCanonicalUid(userProfile.uid) ? userProfile.uid : '') ||
+          ((currentAccount as any)?.uid && isValidCanonicalUid((currentAccount as any).uid) ? (currentAccount as any).uid : '') ||
+          (currentAccount?.id && isValidCanonicalUid(currentAccount.id) ? currentAccount.id : '')
+        }
         studentEmail={userProfile?.email || currentAccount?.email}
         studentLevel={userProfile?.level}
         onSaveCustomEntry={handleSaveCustomDictionaryEntry}
