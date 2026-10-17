@@ -5156,30 +5156,62 @@ app.get('/api/user-profile', (req, res) => {
 });
 
 app.post('/api/user-profile', async (req, res) => {
+  // 1. Authenticate caller strictly via server-verified Firebase ID token
+  const verifiedUser = await getVerifiedUserFromRequest(req);
+  if (!verifiedUser) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Valid Firebase ID token is required to update user profile',
+    });
+  }
+
   const db = readDb();
-  const rawProfile = req.body.profile || req.body;
-  const email = (req.body.email || rawProfile.email || '').toLowerCase().trim();
-  if (!email) {
-    return res.status(400).json({ error: 'Email is required' });
+  const rawProfile = req.body.profile || req.body || {};
+  const requestedUid = (req.body.uid || rawProfile.uid || rawProfile.id || '').trim();
+  const requestedEmail = (req.body.email || rawProfile.email || '').toLowerCase().trim();
+
+  // 2. Strict authorization: students can ONLY update their own profile
+  if (verifiedUser.role !== 'admin') {
+    if (requestedUid && requestedUid !== verifiedUser.uid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Students can only update their own profile',
+      });
+    }
+    if (requestedEmail && verifiedUser.email && requestedEmail !== verifiedUser.email.toLowerCase().trim()) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Students can only update their own profile',
+      });
+    }
+  }
+
+  const targetUid = verifiedUser.role === 'admin' ? (requestedUid || verifiedUser.uid) : verifiedUser.uid;
+  const targetEmail = (verifiedUser.role === 'admin' && requestedEmail)
+    ? requestedEmail
+    : (verifiedUser.email?.toLowerCase().trim() || requestedEmail);
+
+  if (!targetEmail && !targetUid) {
+    return res.status(400).json({ error: 'Email or UID is required' });
   }
 
   const isTeacherUser =
-    db.authUsers?.[email]?.role === 'teacher' ||
-    (db.tutorsList || []).some((t: any) => (t.email || '').toLowerCase() === email) ||
-    (db.teachers || []).some((t: any) => (t.email || '').toLowerCase() === email && t.role !== 'admin');
+    db.authUsers?.[targetEmail]?.role === 'teacher' ||
+    (db.tutorsList || []).some((t: any) => (t.email || '').toLowerCase() === targetEmail) ||
+    (db.teachers || []).some((t: any) => (t.email || '').toLowerCase() === targetEmail && t.role !== 'admin');
 
   if (isTeacherUser) {
-    const tutorIdx = (db.tutorsList || []).findIndex((t: any) => (t.email || '').toLowerCase() === email);
+    const tutorIdx = (db.tutorsList || []).findIndex((t: any) => (t.email || '').toLowerCase() === targetEmail);
     if (tutorIdx >= 0) {
       db.tutorsList[tutorIdx] = {
         ...db.tutorsList[tutorIdx],
         ...rawProfile,
-        email,
+        email: targetEmail,
         role: 'teacher',
       };
     }
-    if (db.userProfiles?.[email]) {
-      delete db.userProfiles[email];
+    if (db.userProfiles?.[targetEmail]) {
+      delete db.userProfiles[targetEmail];
     }
     writeDb(db);
     return res.json({
@@ -5192,7 +5224,7 @@ app.post('/api/user-profile', async (req, res) => {
   }
 
   if (!db.userProfiles) db.userProfiles = {};
-  const existing = db.userProfiles[email] || {};
+  const existing = db.userProfiles[targetEmail] || {};
 
   const updatedTeacherEmail =
     rawProfile.teacherEmail !== undefined ? (rawProfile.teacherEmail || null) : (existing.teacherEmail ?? null);
@@ -5202,76 +5234,134 @@ app.post('/api/user-profile', async (req, res) => {
   const oldLevelKey = normalizeStudentLevel(existing.level).key;
   const newLevelKey = normalizeStudentLevel(rawProfile.level || existing.level).key;
 
-  db.userProfiles[email] = {
+  const resolvedLevel = rawProfile.level || existing.level || 'iniciante';
+  const resolvedLearningGoal = rawProfile.learningGoal || existing.learningGoal || 'English for everyday life & work';
+  const resolvedStudyDaysTarget = rawProfile.weeklyStudyDaysTarget !== undefined
+    ? Number(rawProfile.weeklyStudyDaysTarget)
+    : (rawProfile.weeklyPracticeDays !== undefined ? Number(rawProfile.weeklyPracticeDays) : (existing.weeklyStudyDaysTarget ?? 7));
+  const resolvedStudyDays = rawProfile.weeklyStudyDays || rawProfile.routineActivities || existing.weeklyStudyDays || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+
+  const updatedProfileObj: Record<string, any> = {
     ...existing,
     ...rawProfile,
-    email,
-    name: rawProfile.name || existing.name,
-    level: rawProfile.level || existing.level,
-    learningGoal: rawProfile.learningGoal || existing.learningGoal,
+    id: targetUid,
+    uid: targetUid,
+    email: targetEmail,
+    name: rawProfile.name || existing.name || (targetEmail ? targetEmail.split('@')[0] : 'Aluno'),
+    level: resolvedLevel,
+    englishLevel: resolvedLevel,
+    userLevel: resolvedLevel,
+    learningGoal: resolvedLearningGoal,
     dailyGoalMinutes: rawProfile.dailyGoalMinutes ?? existing.dailyGoalMinutes ?? 30,
-    contractedLessons: rawProfile.contractedLessons ?? existing.contractedLessons ?? db.contractedLessons?.[email] ?? 0,
-    completedLessonsCount: existing.completedLessonsCount ?? rawProfile.completedLessonsCount ?? 0,
+    contractedLessons: Number(rawProfile.contractedLessons ?? existing.contractedLessons ?? db.contractedLessons?.[targetEmail] ?? 1),
+    completedLessonsCount: Number(existing.completedLessonsCount ?? rawProfile.completedLessonsCount ?? 0),
     teacherEmail: updatedTeacherEmail,
     teacherName: updatedTeacherName,
+    teacherUid: rawProfile.teacherUid ?? existing.teacherUid ?? null,
+    assignedNativeFriendUID: rawProfile.assignedNativeFriendUID ?? rawProfile.teacherUid ?? existing.assignedNativeFriendUID ?? null,
+    nativeFriendUID: rawProfile.nativeFriendUID ?? rawProfile.teacherUid ?? existing.nativeFriendUID ?? null,
+    teacherMeetUrl: rawProfile.teacherMeetUrl ?? existing.teacherMeetUrl ?? null,
     enrollmentStatus: rawProfile.enrollmentStatus || existing.enrollmentStatus || (updatedTeacherEmail ? 'active' : 'not_enrolled'),
-    studentJournal: rawProfile.studentJournal || existing.studentJournal || db.studentActivityJournal?.[email] || [],
+    studentJournal: rawProfile.studentJournal || existing.studentJournal || db.studentActivityJournal?.[targetEmail] || [],
+    weeklyStudyDaysTarget: resolvedStudyDaysTarget,
+    weeklyStudyDays: resolvedStudyDays,
+    routineVideoTime: rawProfile.routineVideoTime || existing.routineVideoTime || '09:00',
+    routineAudioTime: rawProfile.routineAudioTime || existing.routineAudioTime || '14:00',
+    dailyPhraseTime: rawProfile.dailyPhraseTime || existing.dailyPhraseTime || '20:00',
+    hasCompletedTrialLesson: Boolean(rawProfile.hasCompletedTrialLesson ?? existing.hasCompletedTrialLesson ?? false),
+    subscriptionType: rawProfile.subscriptionType || existing.subscriptionType || 'trial',
+    onboardingCompleted: rawProfile.onboardingCompleted !== undefined ? Boolean(rawProfile.onboardingCompleted) : true,
+    updatedAt: new Date().toISOString(),
   };
 
+  if (rawProfile.avatar || rawProfile.picture) {
+    updatedProfileObj.avatar = rawProfile.avatar || rawProfile.picture;
+    updatedProfileObj.picture = rawProfile.avatar || rawProfile.picture;
+  }
+
+  // 3. PERSISTENCE IN FIRESTORE VIA FIREBASE ADMIN SDK
+  // Canonical record strictly in users/{targetUid}
+  const firestoreDb = getFirestoreDb();
+  let persistedToFirestore = false;
+  if (firestoreDb && targetUid) {
+    try {
+      await firestoreDb.collection('users').doc(targetUid).set(updatedProfileObj, { merge: true });
+      persistedToFirestore = true;
+    } catch (fsErr: any) {
+      console.error(`[serverFirestore] Failed to persist user profile in users/${targetUid}:`, fsErr);
+      return res.status(500).json({
+        error: 'Failed to persist user profile to Firestore',
+        message: fsErr?.message || 'Database write error',
+      });
+    }
+  }
+
+  // 4. Update local cache / state
+  db.userProfiles[targetEmail] = updatedProfileObj;
+
   const studentIdx = (db.students || []).findIndex(
-    (s) => (s.email || s.studentEmail || '').toLowerCase() === email
+    (s: any) =>
+      (s.email || s.studentEmail || '').toLowerCase() === targetEmail ||
+      (s.uid && s.uid === targetUid) ||
+      (s.id && s.id === targetUid)
   );
+
   if (studentIdx >= 0) {
     db.students[studentIdx] = {
       ...db.students[studentIdx],
-      name: rawProfile.name || db.students[studentIdx].name,
-      studentName: rawProfile.name || db.students[studentIdx].studentName,
-      level: rawProfile.level || db.students[studentIdx].level,
-      studentLevel: rawProfile.level || db.students[studentIdx].studentLevel,
-      goal: rawProfile.learningGoal || db.students[studentIdx].goal,
-      learningGoal: rawProfile.learningGoal || db.students[studentIdx].learningGoal,
-      picture: rawProfile.avatar || rawProfile.picture || db.students[studentIdx].picture,
-      avatar: rawProfile.avatar || rawProfile.picture || db.students[studentIdx].avatar,
+      id: targetUid,
+      uid: targetUid,
+      name: updatedProfileObj.name,
+      studentName: updatedProfileObj.name,
+      level: updatedProfileObj.level,
+      studentLevel: updatedProfileObj.level,
+      goal: updatedProfileObj.learningGoal,
+      learningGoal: updatedProfileObj.learningGoal,
+      picture: updatedProfileObj.picture,
+      avatar: updatedProfileObj.avatar,
       teacherEmail: updatedTeacherEmail,
       teacherName: updatedTeacherName,
-      status: db.userProfiles[email].enrollmentStatus === 'cancelled' ? 'cancelled' : (updatedTeacherEmail ? 'active' : 'not_enrolled'),
+      teacherUid: updatedProfileObj.teacherUid,
+      contractedLessons: updatedProfileObj.contractedLessons,
+      status: updatedProfileObj.enrollmentStatus === 'cancelled' ? 'cancelled' : (updatedTeacherEmail ? 'active' : 'not_enrolled'),
     };
   } else {
     if (!db.students) db.students = [];
-    const studentName = rawProfile.name || existing.name || email.split('@')[0];
     db.students.push({
-      id: `st-${Date.now()}`,
-      name: studentName,
-      studentName: studentName,
-      email,
-      studentEmail: email,
-      level: rawProfile.level || 'iniciante',
-      studentLevel: rawProfile.level || 'iniciante',
-      goal: rawProfile.learningGoal || 'English for everyday life & work',
-      learningGoal: rawProfile.learningGoal || 'English for everyday life & work',
-      contractedLessons: Number(rawProfile.contractedLessons ?? db.contractedLessons?.[email] ?? 0),
+      id: targetUid,
+      uid: targetUid,
+      name: updatedProfileObj.name,
+      studentName: updatedProfileObj.name,
+      email: targetEmail,
+      studentEmail: targetEmail,
+      level: updatedProfileObj.level,
+      studentLevel: updatedProfileObj.level,
+      goal: updatedProfileObj.learningGoal,
+      learningGoal: updatedProfileObj.learningGoal,
+      contractedLessons: updatedProfileObj.contractedLessons,
       completedLessonsCount: 0,
       teacherEmail: updatedTeacherEmail,
       teacherName: updatedTeacherName,
-      status: db.userProfiles[email].enrollmentStatus === 'cancelled' ? 'cancelled' : (updatedTeacherEmail ? 'active' : 'not_enrolled'),
+      teacherUid: updatedProfileObj.teacherUid,
+      status: updatedProfileObj.enrollmentStatus === 'cancelled' ? 'cancelled' : (updatedTeacherEmail ? 'active' : 'not_enrolled'),
       activeSince: new Date().toISOString().split('T')[0],
       createdAt: new Date().toISOString(),
+      picture: updatedProfileObj.picture,
+      avatar: updatedProfileObj.avatar,
     });
   }
 
-  // If student level changed, redistribute Spotify tracks to match the new level.
-  // YouTube videos are strictly chosen voluntarily by the student ("Choose Video") or assigned by teacher.
-  if (oldLevelKey !== newLevelKey || !db.studentSpotifyAssignments?.[email]) {
+  // If student level changed, redistribute Spotify tracks to match the new level
+  if (oldLevelKey !== newLevelKey || !db.studentSpotifyAssignments?.[targetEmail]) {
     const studentPlanDays: string[] =
-      db.userProfiles[email]?.weeklyStudyDays ||
-      db.userProfiles[email]?.selectedStudyDays ||
+      db.userProfiles[targetEmail]?.weeklyStudyDays ||
+      db.userProfiles[targetEmail]?.selectedStudyDays ||
       DAYS_SEQUENCE;
-    const resolvedUid = db.userProfiles[email]?.uid || '';
-    distributeWeeklySpotifyForStudent(db, email, resolvedUid, newLevelKey, undefined, undefined, studentPlanDays);
+    distributeWeeklySpotifyForStudent(db, targetEmail, targetUid, newLevelKey, undefined, undefined, studentPlanDays);
   }
 
   await writeDbSync(db);
-  res.json({ success: true, profile: db.userProfiles[email] });
+  res.json({ success: true, profile: db.userProfiles[targetEmail], persistedToFirestore });
 });
 
 // Purchase Lesson Package with a specific Native Friend (binds tutor as fixed + adds lessons)

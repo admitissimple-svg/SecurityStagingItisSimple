@@ -2364,21 +2364,10 @@ export default function App() {
         }).catch((err) => console.warn('Backend signup sync error:', err));
       }
 
-      await fetch('/api/user-profile', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          uid: studentUid,
-          email: cleanEmail,
-          profile: updatedProfile,
-        }),
-      }).catch((err) => console.warn('Backend user profile sync error:', err));
-
       // 5. UPDATE REACT STATE AFTER SUCCESSFUL PERSISTENCE:
       const cleanInitialRoutines = createCleanStudentRoutines(data.routineVideoTime);
       setIsOnboardingCompleting(false);
-      setIsOnboardingModalOpen(false);
-      setViewMode('dashboard');
+      // Keep modal open so student advances to Step 6 (Roadmap / Trial lesson scheduling)
       setCurrentAccount(newStudentAccount);
       setUserProfile(updatedProfile);
       setRoutinesByDay(cleanInitialRoutines);

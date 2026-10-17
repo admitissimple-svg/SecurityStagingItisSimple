@@ -337,32 +337,21 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
     };
 
     // Re-fetch and synchronize when authentication state transitions
+    // Re-fetch and synchronize when authentication state transitions
     const unsubAuth = onAuthStateChanged(auth, (user) => {
       if (user && isMounted) {
         fetchPublicNativeFriendsFromFirestore().then(({ allTutors }) => {
           if (!isMounted || allTutors.length === 0) return;
-          setTutors((prev) => {
-            const map = new Map<string, NativeFriendTutor>();
-            prev.forEach((t) => map.set((t.email || t.id).toLowerCase().trim(), t));
-            allTutors.forEach((t) => {
-              const k = (t.email || t.id).toLowerCase().trim();
-              const existing = map.get(k);
-              const approved = isTutorApproved(t);
-              map.set(k, {
-                ...existing,
-                ...t,
-                isApproved: approved,
-                approvalStatus: approved ? 'approved' : ((t.approvalStatus || t.status || 'pending') as 'approved' | 'pending' | 'rejected'),
-                status: approved ? 'approved' : (t.status || t.approvalStatus || 'pending'),
-              });
-            });
-            return Array.from(map.values());
-          });
+          setTutors((prev) => consolidateTutorsList([...prev, ...allTutors]) as NativeFriendTutor[]);
         });
         attachRealtimeListeners();
       } else {
         // Visitor/unauthenticated state: ensure direct Firestore listeners are inactive
         cleanupRealtime();
+        fetchPublicNativeFriendsFromFirestore().then(({ allTutors }) => {
+          if (!isMounted) return;
+          setTutors(consolidateTutorsList(allTutors) as NativeFriendTutor[]);
+        }).catch(() => {});
       }
     });
     unsubs.push(unsubAuth);

@@ -164,6 +164,25 @@ export function mergeTutors(existing: any, incoming: any): CanonicalTutorRecord 
     ...(Array.isArray(incoming.legacyIds) ? incoming.legacyIds : [incoming.legacyId || incoming.id]),
   ].filter(Boolean))).filter((id) => id !== publicTutorId && id !== authUid);
 
+  const isGenericBio = (b?: string) =>
+    !b || b.toLowerCase().includes('ready to help you speak with natural fluency');
+  const isGenericHeadline = (h?: string) =>
+    !h || h.toLowerCase() === 'english conversational native friend';
+  const isGenericName = (n?: string) =>
+    !n || n.toLowerCase() === 'native friend';
+
+  const finalName = !isGenericName(existing.name)
+    ? existing.name
+    : (!isGenericName(incoming.name) ? incoming.name : (existing.name || incoming.name || 'Native Friend'));
+
+  const finalHeadline = !isGenericHeadline(existing.headline)
+    ? existing.headline
+    : (!isGenericHeadline(incoming.headline) ? incoming.headline : (existing.headline || incoming.headline || 'English Conversational Native Friend'));
+
+  const finalBio = !isGenericBio(existing.bio)
+    ? existing.bio
+    : (!isGenericBio(incoming.bio) ? incoming.bio : (existing.bio || incoming.bio || 'Native English speaker ready to help you speak with natural fluency.'));
+
   return {
     ...incoming,
     ...existing,
@@ -174,9 +193,9 @@ export function mergeTutors(existing: any, incoming: any): CanonicalTutorRecord 
     legacyId: legacyIds[0] || existing.legacyId || incoming.legacyId,
     legacyIds,
     email: email || undefined,
-    name: existing.name || incoming.name || 'Native Friend',
-    headline: existing.headline || incoming.headline || 'English Conversational Native Friend',
-    bio: existing.bio || incoming.bio || 'Native English speaker ready to help you speak with natural fluency.',
+    name: finalName,
+    headline: finalHeadline,
+    bio: finalBio,
     avatar: existing.avatar || incoming.avatar || existing.photoUrl || incoming.photoUrl || '',
     photoUrl: existing.photoUrl || incoming.photoUrl || existing.avatar || incoming.avatar || '',
     country: existing.country || incoming.country || 'Global',

@@ -1937,27 +1937,61 @@ export async function saveStudentNativeFriendToFirestore(
     payload.status = teacherData.enrollmentStatus;
   }
 
-  try {
-    // Strictly write to doc(db, 'users', cleanUid) - authenticated user UID single source of truth
-    await withFirestoreTimeout(setDoc(doc(db, 'users', cleanUid), payload, { merge: true }), 3000, null);
-    return true;
-  } catch (error) {
-    console.error(`[Firestore Error] Failed to save student Native Friend for ${cleanUid}:`, error);
-    handleFirestoreError(error, OperationType.WRITE, `users/${cleanUid}`);
+  if (typeof window !== 'undefined') {
+    let token: string | null = null;
+    try {
+      token = (await getAccessToken().catch(() => null)) || (await auth.currentUser?.getIdToken().catch(() => null)) || null;
+    } catch {}
+
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    try {
+      const res = await fetch('/api/user-profile', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          uid: cleanUid,
+          email: cleanEmail,
+          profile: payload,
+        }),
+      });
+
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        console.warn(`[StudentPersistence Error] Backend /api/user-profile returned ${res.status}:`, errJson);
+        return false;
+      }
+      return true;
+    } catch (error) {
+      console.error(`[StudentPersistence Error] Failed to bind Native Friend for ${cleanUid} via backend:`, error);
+      return false;
+    }
+  } else {
+    // Node.js test environment support: direct write via Admin Firestore
+    try {
+      const { getFirestoreDb } = await import('../serverFirestore');
+      const adminDb = getFirestoreDb();
+      if (adminDb) {
+        await adminDb.collection('users').doc(cleanUid).set(payload, { merge: true });
+        return true;
+      }
+    } catch (testErr) {
+      console.warn('[studentPersistence] Node test backend fallback notice:', testErr);
+    }
     return false;
   }
 }
 
 /**
- * Persist the entire student profile directly to Firestore strictly using users/{cleanUid}.
+ * Persist the entire student profile directly via authenticated backend API using Firebase Admin SDK
+ * strictly writing to users/{cleanUid}.
  */
 export async function saveStudentProfileToFirestore(
   studentUid: string,
   profile: Partial<UserProfile>,
   studentEmail?: string
 ): Promise<boolean> {
-  const db = getDb();
-  if (!db) return false;
   const cleanEmail = (profile.email || studentEmail || '').toLowerCase().trim();
   const cleanUid = normalizeUid(studentUid, cleanEmail);
   if (!cleanUid) return false;
@@ -2027,16 +2061,52 @@ export async function saveStudentProfileToFirestore(
     payload.enrollmentStatus = profile.enrollmentStatus;
   }
 
-  try {
-    const stampedPayload = stampSchemaVersion(payload);
-    assertSafeFirestoreWrite(`users/${cleanUid}`, stampedPayload, undefined, true);
+  const stampedPayload = stampSchemaVersion(payload);
 
-    // Strictly write to doc(db, 'users', cleanUid) - authenticated user UID single source of truth
-    await withFirestoreTimeout(setDoc(doc(db, 'users', cleanUid), stampedPayload, { merge: true }), 3000, null);
-    return true;
-  } catch (error) {
-    console.error(`[Firestore Error] Failed to save student profile for ${cleanUid}:`, error);
-    handleFirestoreError(error, OperationType.WRITE, `users/${cleanUid}`);
+  // Authenticated persistence strictly via backend API with Firebase Admin SDK
+  if (typeof window !== 'undefined') {
+    let token: string | null = null;
+    try {
+      token = (await getAccessToken().catch(() => null)) || (await auth.currentUser?.getIdToken().catch(() => null)) || null;
+    } catch {}
+
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    try {
+      const res = await fetch('/api/user-profile', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          uid: cleanUid,
+          email: cleanEmail,
+          profile: stampedPayload,
+        }),
+      });
+
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        const msg = errJson.message || errJson.error || `HTTP ${res.status}: Falha ao persistir perfil no backend.`;
+        console.error(`[StudentPersistence Error] Failed to persist profile for ${cleanUid}: ${msg}`);
+        return false;
+      }
+      return true;
+    } catch (error) {
+      console.error(`[StudentPersistence Error] Network/API failure to persist profile for ${cleanUid}:`, error);
+      return false;
+    }
+  } else {
+    // Node.js test environment support: direct write via Admin Firestore
+    try {
+      const { getFirestoreDb } = await import('../serverFirestore');
+      const adminDb = getFirestoreDb();
+      if (adminDb) {
+        await adminDb.collection('users').doc(cleanUid).set(stampedPayload, { merge: true });
+        return true;
+      }
+    } catch (testErr) {
+      console.warn('[studentPersistence] Node test backend fallback notice:', testErr);
+    }
     return false;
   }
 }

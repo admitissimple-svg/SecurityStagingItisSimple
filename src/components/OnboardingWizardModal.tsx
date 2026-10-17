@@ -42,6 +42,7 @@ import {
 import { firebaseSignUpWithEmail, firebaseSignInWithEmail, googleSignIn } from '../utils/auth';
 import { auth } from '../firebase';
 import { isValidCanonicalUid } from '../utils/studentPersistence';
+import { consolidateTutorsList } from '../utils/tutorConsolidation';
 
 export interface OnboardingResultData {
   learningGoal: string;
@@ -305,9 +306,12 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
   const [dailyPhraseTime, setDailyPhraseTime] = useState<string>('06:00');
 
   // Step 4: Chosen Native Friend & Profile Preview Modal
-  const approvedTutors = tutorsList.filter((t) => (t.approvalStatus || 'approved') === 'approved');
+  const approvedTutors = React.useMemo(() => {
+    const consolidated = consolidateTutorsList(tutorsList || []);
+    return consolidated.filter((t) => (t.approvalStatus || 'approved') === 'approved') as NativeFriendTutor[];
+  }, [tutorsList]);
   const [selectedTutorId, setSelectedTutorId] = useState<string>(
-    approvedTutors[0]?.id || approvedTutors[0]?.email || ''
+    approvedTutors[0]?.id || approvedTutors[0]?.publicTutorId || approvedTutors[0]?.email || ''
   );
   const [previewTutorModal, setPreviewTutorModal] = useState<NativeFriendTutor | null>(null);
 
@@ -413,7 +417,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
 
   // Selected tutor object
   const selectedTutor =
-    approvedTutors.find((t) => t.id === selectedTutorId || t.email === selectedTutorId) ||
+    approvedTutors.find((t) => t.id === selectedTutorId || t.publicTutorId === selectedTutorId || t.email === selectedTutorId) ||
     approvedTutors[0];
 
   // Frequency preset handlers
@@ -1103,12 +1107,13 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
               {/* Tutors Cards Grid */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-80 overflow-y-auto pr-1">
                 {approvedTutors.map((tutor) => {
-                  const isSelected = selectedTutorId === tutor.id || selectedTutorId === tutor.email;
+                  const tutorIdentifier = tutor.publicTutorId || tutor.id || tutor.email;
+                  const isSelected = selectedTutorId === tutor.id || selectedTutorId === tutor.publicTutorId || selectedTutorId === tutor.email;
                   return (
                     <div
-                      key={tutor.id || tutor.email}
-                      id={`onboarding-tutor-${tutor.id || tutor.email}`}
-                      onClick={() => setSelectedTutorId(tutor.id || tutor.email)}
+                      key={tutorIdentifier}
+                      id={`onboarding-tutor-${tutorIdentifier}`}
+                      onClick={() => setSelectedTutorId(tutorIdentifier)}
                       className={`p-3.5 rounded-2xl border text-left transition cursor-pointer flex flex-col justify-between gap-2.5 relative ${
                         isSelected
                           ? 'bg-[#1C4C96] border-[#F4CA54] shadow-lg ring-2 ring-[#F4CA54]/40'
