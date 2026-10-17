@@ -102,22 +102,8 @@ export function buildWeeklyChecksCacheKey(identifier: string, weekId: string): s
   return `${identifier.trim()}::${weekId}`;
 }
 
-export { migrateLegacyLocalStorageToFirestore, normalizeDictionaryWord, consolidateDictionaryEntries };
-
-/**
- * Validates whether an identity represents an explicit canonical Firebase Auth UID.
- * Rejects empty strings, emails, synthesized usr-* IDs, temporary prefixes, and placeholders.
- */
-export function isValidCanonicalUid(uid?: string | null): boolean {
-  if (!uid || typeof uid !== 'string') return false;
-  const clean = uid.trim();
-  if (!clean) return false;
-  if (clean.includes('@')) return false;
-  if (clean.startsWith('usr-')) return false;
-  if (clean.startsWith('teacher-') || clean.startsWith('tutor-') || clean.startsWith('st-') || clean.startsWith('lesson-')) return false;
-  if (clean === 'user-default' || clean === 'anonymous_student' || clean === 'undefined' || clean === 'null') return false;
-  return true;
-}
+import { isValidCanonicalUid } from './tutorConsolidation';
+export { migrateLegacyLocalStorageToFirestore, normalizeDictionaryWord, consolidateDictionaryEntries, isValidCanonicalUid };
 
 export function normalizeUid(rawId?: string | null, email?: string | null): string {
   const cleanRawId = (rawId || '').trim();

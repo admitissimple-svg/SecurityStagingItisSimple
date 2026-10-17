@@ -52,10 +52,12 @@
       "completedLessonsCount": 0,
       "teacherEmail": "laviniafofafc@gmail.com",
       "teacherName": "Skull Bee",
-      "teacherUid": "skull-bee",
+      "teacherUid": "jCkNIhvYEYbyJC2CWGZhFaoHGfo1",
       "status": "active",
       "activeSince": "2026-10-17",
-      "createdAt": "2026-10-17T17:31:31.533Z"
+      "createdAt": "2026-10-17T17:31:31.533Z",
+      "assignedNativeFriendUID": "jCkNIhvYEYbyJC2CWGZhFaoHGfo1",
+      "nativeFriendUID": "jCkNIhvYEYbyJC2CWGZhFaoHGfo1"
     },
     {
       "id": "student_uid_existing_202",
@@ -72,10 +74,12 @@
       "completedLessonsCount": 0,
       "teacherEmail": "laviniafofafc@gmail.com",
       "teacherName": "Skull Bee",
-      "teacherUid": "skull-bee",
+      "teacherUid": "jCkNIhvYEYbyJC2CWGZhFaoHGfo1",
       "status": "active",
       "activeSince": "2026-10-17",
-      "createdAt": "2026-10-17T17:31:31.576Z"
+      "createdAt": "2026-10-17T17:31:31.576Z",
+      "assignedNativeFriendUID": "jCkNIhvYEYbyJC2CWGZhFaoHGfo1",
+      "nativeFriendUID": "jCkNIhvYEYbyJC2CWGZhFaoHGfo1"
     }
   ],
   "meetSettings": {},
@@ -1625,9 +1629,9 @@
       "dailyPhraseTime": "21:00",
       "teacherEmail": "laviniafofafc@gmail.com",
       "teacherName": "Skull Bee",
-      "teacherUid": "skull-bee",
-      "assignedNativeFriendUID": "skull-bee",
-      "nativeFriendUID": "skull-bee",
+      "teacherUid": "jCkNIhvYEYbyJC2CWGZhFaoHGfo1",
+      "assignedNativeFriendUID": "jCkNIhvYEYbyJC2CWGZhFaoHGfo1",
+      "nativeFriendUID": "jCkNIhvYEYbyJC2CWGZhFaoHGfo1",
       "teacherMeetUrl": "https://meet.google.com/skb-live-room",
       "enrollmentStatus": "active",
       "contractedLessons": 1,
@@ -1641,7 +1645,7 @@
       "dailyGoalMinutes": 30,
       "completedLessonsCount": 0,
       "studentJournal": [],
-      "updatedAt": "2026-10-17T17:32:12.937Z"
+      "updatedAt": "2026-10-17T22:34:25.636Z"
     },
     "existinguser@example.com": {
       "learningGoal": "Carreira & Trabalho - Entrevistas e reuniões globais",
@@ -1661,9 +1665,9 @@
       "dailyPhraseTime": "21:00",
       "teacherEmail": "laviniafofafc@gmail.com",
       "teacherName": "Skull Bee",
-      "teacherUid": "skull-bee",
-      "assignedNativeFriendUID": "skull-bee",
-      "nativeFriendUID": "skull-bee",
+      "teacherUid": "jCkNIhvYEYbyJC2CWGZhFaoHGfo1",
+      "assignedNativeFriendUID": "jCkNIhvYEYbyJC2CWGZhFaoHGfo1",
+      "nativeFriendUID": "jCkNIhvYEYbyJC2CWGZhFaoHGfo1",
       "teacherMeetUrl": "https://meet.google.com/skb-live-room",
       "enrollmentStatus": "active",
       "contractedLessons": 1,
@@ -1677,7 +1681,7 @@
       "dailyGoalMinutes": 30,
       "completedLessonsCount": 0,
       "studentJournal": [],
-      "updatedAt": "2026-10-17T17:32:12.981Z"
+      "updatedAt": "2026-10-17T22:34:25.677Z"
     }
   },
   "emailLogs": [],
@@ -2518,7 +2522,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 21,
-      "updatedAt": "2026-10-17T17:31:13.866Z",
+      "updatedAt": "2026-10-17T22:31:31.595Z",
       "isPublic": true,
       "videos": [
         {
@@ -2804,7 +2808,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 21,
-      "updatedAt": "2026-10-17T17:31:13.866Z",
+      "updatedAt": "2026-10-17T22:31:31.595Z",
       "isPublic": true,
       "videos": [
         {
@@ -3090,7 +3094,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-17T17:31:13.866Z",
+      "updatedAt": "2026-10-17T22:31:31.595Z",
       "isPublic": true,
       "videos": [
         {
@@ -3480,7 +3484,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 27,
-      "updatedAt": "2026-10-17T17:31:13.866Z",
+      "updatedAt": "2026-10-17T22:31:31.595Z",
       "isPublic": true,
       "videos": [
         {
@@ -3844,7 +3848,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 26,
-      "updatedAt": "2026-10-17T17:31:13.866Z",
+      "updatedAt": "2026-10-17T22:31:31.595Z",
       "isPublic": true,
       "videos": [
         {
@@ -4195,7 +4199,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 21,
-      "updatedAt": "2026-10-17T17:31:13.866Z",
+      "updatedAt": "2026-10-17T22:31:31.595Z",
       "isPublic": true,
       "videos": [
         {
@@ -4481,7 +4485,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 23,
-      "updatedAt": "2026-10-17T17:31:13.866Z",
+      "updatedAt": "2026-10-17T22:31:31.595Z",
       "isPublic": true,
       "videos": [
         {
@@ -4793,7 +4797,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 26,
-      "updatedAt": "2026-10-17T17:31:13.866Z",
+      "updatedAt": "2026-10-17T22:31:31.595Z",
       "isPublic": true,
       "videos": [
         {
@@ -5144,7 +5148,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 28,
-      "updatedAt": "2026-10-17T17:31:13.866Z",
+      "updatedAt": "2026-10-17T22:31:31.595Z",
       "isPublic": true,
       "videos": [
         {
@@ -5521,7 +5525,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-17T17:31:13.866Z",
+      "updatedAt": "2026-10-17T22:31:31.595Z",
       "isPublic": true,
       "videos": [
         {
@@ -5911,7 +5915,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 28,
-      "updatedAt": "2026-10-17T17:31:13.866Z",
+      "updatedAt": "2026-10-17T22:31:31.595Z",
       "isPublic": true,
       "videos": [
         {
@@ -6288,7 +6292,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 30,
-      "updatedAt": "2026-10-17T17:31:13.866Z",
+      "updatedAt": "2026-10-17T22:31:31.595Z",
       "isPublic": true,
       "videos": [
         {
@@ -6691,7 +6695,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-17T17:31:13.866Z",
+      "updatedAt": "2026-10-17T22:31:31.595Z",
       "isPublic": true,
       "videos": [
         {
@@ -6892,7 +6896,7 @@
         {
           "id": "vid-iHzzSao6ypE",
           "videoId": "iHzzSao6ypE",
-          "title": "Traffic Lights Exist Because Drivers Can't Talk to Each Other",
+          "title": "Traffic Has a Perfect Solution. Humans Are the Problem.",
           "description": "",
           "thumbnailUrl": "https://i.ytimg.com/vi/iHzzSao6ypE/hqdefault.jpg",
           "url": "https://www.youtube.com/watch?v=iHzzSao6ypE",
@@ -7081,7 +7085,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 30,
-      "updatedAt": "2026-10-17T17:31:13.866Z",
+      "updatedAt": "2026-10-17T22:31:31.595Z",
       "isPublic": true,
       "videos": [
         {
@@ -7484,7 +7488,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-17T17:31:13.866Z",
+      "updatedAt": "2026-10-17T22:31:31.595Z",
       "isPublic": true,
       "videos": [
         {
@@ -7874,7 +7878,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 27,
-      "updatedAt": "2026-10-17T17:31:13.866Z",
+      "updatedAt": "2026-10-17T22:31:31.595Z",
       "isPublic": true,
       "videos": [
         {
@@ -8238,7 +8242,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 28,
-      "updatedAt": "2026-10-17T17:31:13.866Z",
+      "updatedAt": "2026-10-17T22:31:31.595Z",
       "isPublic": true,
       "videos": [
         {
@@ -8615,7 +8619,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-17T17:31:13.866Z",
+      "updatedAt": "2026-10-17T22:31:31.595Z",
       "isPublic": true,
       "videos": [
         {

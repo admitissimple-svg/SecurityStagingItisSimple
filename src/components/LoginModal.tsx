@@ -361,7 +361,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
             updatedAt: new Date().toISOString(),
           };
           setDoc(doc(db, 'users', firebaseUid), teacherProfilePayload, { merge: true }).catch(() => null);
-          setDoc(doc(db, 'tutors', publicTutorId), { uid: firebaseUid, id: publicTutorId }, { merge: true }).catch(() => null);
+          setDoc(doc(db, 'tutors', firebaseUid), { ...teacherProfilePayload, uid: firebaseUid, id: firebaseUid, publicTutorId }, { merge: true }).catch(() => null);
         } catch {}
       }
 

@@ -204,9 +204,6 @@ export const GoogleSignInModal: React.FC<GoogleSignInModalProps> = ({
           };
           setDoc(doc(db, 'users', user.uid), teacherProfilePayload, { merge: true }).catch(() => null);
           setDoc(doc(db, 'tutors', user.uid), teacherProfilePayload, { merge: true }).catch(() => null);
-          const legacyTutorDocId = `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
-          setDoc(doc(db, 'tutors', legacyTutorDocId), { uid: user.uid }, { merge: true }).catch(() => null);
-          setDoc(doc(db, 'users', legacyTutorDocId), { uid: user.uid }, { merge: true }).catch(() => null);
         }
       }
 

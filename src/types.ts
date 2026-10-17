@@ -34,6 +34,7 @@ export type UserRole = 'student' | 'teacher' | 'admin';
 export interface NativeFriendTutor {
   id: string;
   uid?: string;
+  authUid?: string;
   publicTutorId?: string;
   name: string;
   email: string;

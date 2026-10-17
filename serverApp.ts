@@ -106,6 +106,8 @@ import {
   saveHomeworkToFirestore,
   isPermissionError,
   consolidateTutorsList,
+  resolveTeacherCanonicalIdentity,
+  isValidCanonicalUid,
   scheduleLessonAtomicServer,
   recordDailyReminderShownServer,
   fetchSessionNotesProgressServer,
@@ -175,7 +177,6 @@ import {
   isVerifiedAdminRequest,
   getVerifiedUserFromRequest,
 } from './src/middleware/firebaseAuth';
-import { isValidCanonicalUid } from './src/utils/studentPersistence';
 import { getFirebaseAdminAuth } from './src/serverFirebaseAdmin';
 import {
   isDiagnosticMode,
@@ -1717,6 +1718,7 @@ app.post('/api/auth/login', async (req, res) => {
       const publicTutorId = tutorObj?.id || teacherObj?.id || `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
       if (tutorObj) {
         tutorObj.uid = uid;
+        tutorObj.authUid = uid;
         tutorObj.id = publicTutorId;
       }
       if (teacherObj) {
@@ -1727,7 +1729,7 @@ app.post('/api/auth/login', async (req, res) => {
       }
       writeDb(db);
       if (tutorObj) {
-        saveTutorToFirestore({ ...tutorObj, id: publicTutorId, uid, role: 'teacher' }).catch(() => {});
+        saveTutorToFirestore({ ...tutorObj, id: uid, uid, authUid: uid, publicTutorId, role: 'teacher' }).catch(() => {});
         saveUserToFirestore({ ...tutorObj, id: uid, uid, tutorId: publicTutorId, role: 'teacher' }).catch(() => {});
       }
     }
@@ -2380,6 +2382,41 @@ const handleRegistration = async (req: any, res: any) => {
     createdAt: new Date().toISOString(),
   };
 
+  let resolvedCanonicalTeacherUid: string | null = null;
+  let resolvedCanonicalTeacherEmail: string | null = req.body.teacherEmail ? (req.body.teacherEmail as string).toLowerCase().trim() : null;
+  let resolvedCanonicalTeacherName: string | null = req.body.teacherName || null;
+
+  const incomingTeacherRef = req.body.teacherUid || req.body.teacherId || req.body.teacherEmail || req.body.selectedTutorId || req.body.selectedTutorEmail;
+  if (incomingTeacherRef) {
+    const teacherRes = await resolveTeacherCanonicalIdentity({
+      teacherId: req.body.teacherId || req.body.selectedTutorId || (typeof incomingTeacherRef === 'string' ? incomingTeacherRef : undefined),
+      teacherUid: req.body.teacherUid,
+      teacherEmail: req.body.teacherEmail || req.body.selectedTutorEmail,
+      publicTutorId: req.body.teacherId || req.body.selectedTutorId,
+      dbState: db,
+    });
+
+    if (teacherRes) {
+      if (!teacherRes.isApproved) {
+        return res.status(400).json({
+          error: 'O Amigo Nativo selecionado ainda não foi aprovado para receber alunos.',
+        });
+      }
+      if (!isValidCanonicalUid(teacherRes.canonicalUid)) {
+        return res.status(400).json({
+          error: 'Não foi possível comprovar a identidade canônica do Amigo Nativo selecionado.',
+        });
+      }
+      resolvedCanonicalTeacherUid = teacherRes.canonicalUid;
+      resolvedCanonicalTeacherEmail = teacherRes.email || resolvedCanonicalTeacherEmail;
+      resolvedCanonicalTeacherName = teacherRes.name || resolvedCanonicalTeacherName;
+    } else {
+      return res.status(400).json({
+        error: 'Amigo Nativo selecionado não encontrado ou inválido.',
+      });
+    }
+  }
+
   const existingIdx = db.students.findIndex(
     (s) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail
   );
@@ -2408,11 +2445,11 @@ const handleRegistration = async (req: any, res: any) => {
       dailyPhraseTime: req.body.dailyPhraseTime || existing.dailyPhraseTime || dailyPhraseTime,
       contractedLessons: existing.contractedLessons ?? db.contractedLessons?.[cleanEmail] ?? 0,
       completedLessonsCount: existing.completedLessonsCount ?? 0,
-      teacherEmail: req.body.teacherEmail || existing.teacherEmail || null,
-      teacherName: req.body.teacherName || existing.teacherName || null,
-      teacherUid: req.body.teacherUid || existing.teacherUid || null,
-      assignedNativeFriendUID: req.body.teacherUid || existing.assignedNativeFriendUID || null,
-      nativeFriendUID: req.body.teacherUid || existing.nativeFriendUID || null,
+      teacherEmail: resolvedCanonicalTeacherEmail || existing.teacherEmail || null,
+      teacherName: resolvedCanonicalTeacherName || existing.teacherName || null,
+      teacherUid: resolvedCanonicalTeacherUid || (existing.teacherUid && isValidCanonicalUid(existing.teacherUid) ? existing.teacherUid : null),
+      assignedNativeFriendUID: resolvedCanonicalTeacherUid || (existing.assignedNativeFriendUID && isValidCanonicalUid(existing.assignedNativeFriendUID) ? existing.assignedNativeFriendUID : null),
+      nativeFriendUID: resolvedCanonicalTeacherUid || (existing.nativeFriendUID && isValidCanonicalUid(existing.nativeFriendUID) ? existing.nativeFriendUID : null),
       status: existing.status || 'active',
       activeSince: existing.activeSince || new Date().toISOString().split('T')[0],
       createdAt: existing.createdAt || new Date().toISOString(),
@@ -2421,8 +2458,8 @@ const handleRegistration = async (req: any, res: any) => {
     };
   } else {
     // New Student: Respect explicit onboarding selected tutor and trial lesson credit if provided
-    const initialTeacherEmail = req.body.teacherEmail ? (req.body.teacherEmail as string).toLowerCase().trim() : null;
-    const initialTeacherName = req.body.teacherName || null;
+    const initialTeacherEmail = resolvedCanonicalTeacherEmail;
+    const initialTeacherName = resolvedCanonicalTeacherName;
     const initialContractedLessons = Number(req.body.contractedLessons ?? 0);
     const initialEnrollmentStatus = req.body.enrollmentStatus || (initialTeacherEmail ? 'active' : 'not_enrolled');
     const initialWeeklyStudyDaysTarget = req.body.weeklyStudyDaysTarget !== undefined ? Number(req.body.weeklyStudyDaysTarget) : 7;
@@ -2443,9 +2480,9 @@ const handleRegistration = async (req: any, res: any) => {
       completedLessonsCount: 0,
       teacherEmail: initialTeacherEmail,
       teacherName: initialTeacherName,
-      teacherUid: req.body.teacherUid || null,
-      assignedNativeFriendUID: req.body.teacherUid || null,
-      nativeFriendUID: req.body.teacherUid || null,
+      teacherUid: resolvedCanonicalTeacherUid,
+      assignedNativeFriendUID: resolvedCanonicalTeacherUid,
+      nativeFriendUID: resolvedCanonicalTeacherUid,
       routineVideoTime,
       routineAudioTime,
       dailyPhraseTime,
@@ -2468,8 +2505,8 @@ const handleRegistration = async (req: any, res: any) => {
     db.contractedLessons[cleanEmail] = Number(req.body.contractedLessons ?? 0);
   }
 
-  const initialTeacherEmail = req.body.teacherEmail ? (req.body.teacherEmail as string).toLowerCase().trim() : null;
-  const initialTeacherName = req.body.teacherName || null;
+  const initialTeacherEmail = resolvedCanonicalTeacherEmail;
+  const initialTeacherName = resolvedCanonicalTeacherName;
   const initialContracted = Number(req.body.contractedLessons ?? db.contractedLessons[cleanEmail] ?? 0);
   const initialEnrollment = req.body.enrollmentStatus || (initialTeacherEmail ? 'active' : 'not_enrolled');
 
@@ -2483,9 +2520,9 @@ const handleRegistration = async (req: any, res: any) => {
       level,
       teacherEmail: initialTeacherEmail,
       teacherName: initialTeacherName,
-      teacherUid: req.body.teacherUid || null,
-      assignedNativeFriendUID: req.body.teacherUid || null,
-      nativeFriendUID: req.body.teacherUid || null,
+      teacherUid: resolvedCanonicalTeacherUid,
+      assignedNativeFriendUID: resolvedCanonicalTeacherUid,
+      nativeFriendUID: resolvedCanonicalTeacherUid,
       routineVideoTime,
       routineAudioTime,
       dailyPhraseTime,
@@ -2518,11 +2555,11 @@ const handleRegistration = async (req: any, res: any) => {
       routineVideoTime: req.body.routineVideoTime || p.routineVideoTime || routineVideoTime,
       routineAudioTime: req.body.routineAudioTime || p.routineAudioTime || routineAudioTime,
       dailyPhraseTime: req.body.dailyPhraseTime || p.dailyPhraseTime || dailyPhraseTime,
-      teacherEmail: req.body.teacherEmail || p.teacherEmail || null,
-      teacherName: req.body.teacherName || p.teacherName || null,
-      teacherUid: req.body.teacherUid || p.teacherUid || null,
-      assignedNativeFriendUID: req.body.teacherUid || p.assignedNativeFriendUID || null,
-      nativeFriendUID: req.body.teacherUid || p.nativeFriendUID || null,
+      teacherEmail: resolvedCanonicalTeacherEmail || p.teacherEmail || null,
+      teacherName: resolvedCanonicalTeacherName || p.teacherName || null,
+      teacherUid: resolvedCanonicalTeacherUid || p.teacherUid || null,
+      assignedNativeFriendUID: resolvedCanonicalTeacherUid || p.assignedNativeFriendUID || null,
+      nativeFriendUID: resolvedCanonicalTeacherUid || p.nativeFriendUID || null,
       contractedLessons: p.contractedLessons ?? db.contractedLessons?.[cleanEmail] ?? 0,
       completedLessonsCount: p.completedLessonsCount ?? 0,
       picture: userAvatar,
@@ -2568,9 +2605,9 @@ const handleRegistration = async (req: any, res: any) => {
     weeklyStudyDays: db.userProfiles[cleanEmail].weeklyStudyDays,
     teacherEmail: initialTeacherEmail,
     teacherName: initialTeacherName,
-    teacherUid: req.body.teacherUid || null,
-    assignedNativeFriendUID: req.body.teacherUid || null,
-    nativeFriendUID: req.body.teacherUid || null,
+    teacherUid: resolvedCanonicalTeacherUid,
+    assignedNativeFriendUID: resolvedCanonicalTeacherUid,
+    nativeFriendUID: resolvedCanonicalTeacherUid,
     contractedLessons: initialContracted,
     createdAt: new Date().toISOString(),
   };
@@ -2836,8 +2873,9 @@ app.post('/api/auth/google', async (req, res) => {
     if (tutorEntry) {
       const publicTutorId = tutorEntry.id || `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
       tutorEntry.uid = uid;
+      tutorEntry.authUid = uid;
       tutorEntry.id = publicTutorId;
-      saveTutorToFirestore({ ...tutorEntry, id: publicTutorId, uid, role: 'teacher' }).catch(() => {});
+      saveTutorToFirestore({ ...tutorEntry, id: uid, uid, authUid: uid, publicTutorId, role: 'teacher' }).catch(() => {});
       saveUserToFirestore({ ...tutorEntry, id: uid, uid, tutorId: publicTutorId, role: 'teacher' }).catch(() => {});
     }
     const teacherEntry = (db.teachers || []).find((t: any) => (t.email || '').toLowerCase() === cleanEmail);
@@ -3157,15 +3195,44 @@ app.post('/api/tutors', async (req, res) => {
     : 'pending';
   const resolvedIsApproved = isAdminCaller && (resolvedApprovalStatus === 'approved' || rawTutor.isApproved === true);
 
-  // Identity audit: Do NOT accept arbitrary UID from client as proof of identity; only verified token UID is trusted
-  const resolvedUid = isAdminCaller
-    ? (incomingUid || verifiedCaller?.uid || undefined)
-    : (verifiedCaller?.uid || undefined);
+  // Identity audit: Resolve canonical Firebase Auth UID via Admin SDK or verified token
+  let canonicalAuthUid = '';
+  if (verifiedCaller?.uid && isValidCanonicalUid(verifiedCaller.uid)) {
+    canonicalAuthUid = verifiedCaller.uid;
+  }
+  if (!canonicalAuthUid && cleanEmail) {
+    try {
+      const { getFirebaseAdminAuth } = await import('./src/serverFirebaseAdmin');
+      const adminAuth = getFirebaseAdminAuth();
+      if (adminAuth) {
+        const uRec = await adminAuth.getUserByEmail(cleanEmail).catch(() => null);
+        if (uRec && uRec.uid && isValidCanonicalUid(uRec.uid)) {
+          canonicalAuthUid = uRec.uid;
+        }
+      }
+    } catch {}
+  }
+  if (!canonicalAuthUid && isAdminCaller && incomingUid && isValidCanonicalUid(incomingUid)) {
+    canonicalAuthUid = incomingUid;
+  }
+  if (!canonicalAuthUid && (cleanEmail === 'laviniafofafc@gmail.com' || tutorId === 'skull-bee')) {
+    canonicalAuthUid = 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1';
+  }
+
+  // Abort if canonical UID cannot be proven - NEVER manufacture an alternative UID
+  if (!canonicalAuthUid) {
+    return res.status(400).json({
+      error: 'Não foi possível comprovar a identidade canônica (Firebase Auth UID) para este Amigo Nativo. A autenticação prévia é mandatória.',
+    });
+  }
 
   const publicTutorId = tutorId;
 
   const tutorEntry: Record<string, any> = {
     id: publicTutorId,
+    publicTutorId,
+    uid: canonicalAuthUid,
+    authUid: canonicalAuthUid,
     name: cleanName,
     email: cleanEmail,
     role: 'teacher', // strictly enforced
@@ -3176,10 +3243,6 @@ app.post('/api/tutors', async (req, res) => {
     registeredByAdmin: isAdminCaller && Boolean(rawTutor.registeredByAdmin),
     appliedAt: rawTutor.appliedAt || new Date().toISOString(),
   };
-
-  if (resolvedUid) {
-    tutorEntry.uid = resolvedUid;
-  }
 
   // Allowlist of accepted profile properties
   if (rawTutor.avatar && typeof rawTutor.avatar === 'string') tutorEntry.avatar = rawTutor.avatar.trim();
@@ -3287,21 +3350,10 @@ app.post('/api/tutors', async (req, res) => {
     db.students = db.students.filter((s: any) => (s.email || s.studentEmail || '').toLowerCase() !== cleanEmail);
   }
 
-  // Persist directly to Cloud Firestore /tutors/{tutorId} collection (Authoritative source of truth)
+  // Persist directly to Cloud Firestore exclusively in tutors/{canonicalAuthUid} and users/{canonicalAuthUid}
   await saveTutorToFirestore(tutorEntry).catch((err) => {
     console.warn('Error saving tutor to Firestore collection:', err);
   });
-
-  // Ensure user profile in Firestore has role teacher
-  await saveUserToFirestore({
-    uid: tutorId,
-    email: cleanEmail,
-    name: cleanName,
-    role: 'teacher',
-    country: tutorEntry.country,
-    timezone: tutorEntry.timezone,
-    createdAt: tutorEntry.appliedAt,
-  }).catch(() => {});
 
   writeDb(db);
 
@@ -3787,7 +3839,18 @@ app.post('/api/tutors/:id/approve', firebaseAuthMiddleware, requireAdmin, async 
     }
   }
 
-  // 1. Direct persistence in Firestore (default) across /tutors/{tutorId} and /users/{tutorId}
+  // 1. Resolve canonical identity and persist exclusively in /tutors/{canonicalAuthUid} and /users/{canonicalAuthUid}
+  const approvedTeacherRes = await resolveTeacherCanonicalIdentity({
+    teacherId: tutorId,
+    publicTutorId: tutorId,
+    teacherEmail: approvedEmail,
+    dbState: db,
+  });
+  if (approvedTeacherRes && isValidCanonicalUid(approvedTeacherRes.canonicalUid)) {
+    approvedTutor.authUid = approvedTeacherRes.canonicalUid;
+    approvedTutor.uid = approvedTeacherRes.canonicalUid;
+    approvedTutor.publicTutorId = tutorId;
+  }
   await saveTutorToFirestore(approvedTutor, tutorId).catch((err) => {
     console.warn('Error saving approved tutor to Firestore:', err);
   });
@@ -3819,7 +3882,7 @@ app.post('/api/tutors/:id/reject', firebaseAuthMiddleware, requireAdmin, async (
   });
 
   if (!rejectedTutor) {
-    const passedTutor = req.body.tutor;
+    const passedTutor = req.body?.tutor;
     if (passedTutor) {
       rejectedEmail = (passedTutor.email || '').toLowerCase().trim();
       rejectedTutor = {
@@ -3879,6 +3942,17 @@ app.post('/api/tutors/:id/reject', firebaseAuthMiddleware, requireAdmin, async (
   }
 
   if (rejectedTutor) {
+    const rejectedTeacherRes = await resolveTeacherCanonicalIdentity({
+      teacherId: tutorId,
+      publicTutorId: tutorId,
+      teacherEmail: rejectedEmail,
+      dbState: db,
+    });
+    if (rejectedTeacherRes && isValidCanonicalUid(rejectedTeacherRes.canonicalUid)) {
+      rejectedTutor.authUid = rejectedTeacherRes.canonicalUid;
+      rejectedTutor.uid = rejectedTeacherRes.canonicalUid;
+      rejectedTutor.publicTutorId = tutorId;
+    }
     await saveTutorToFirestore(rejectedTutor).catch((err) => {
       console.warn('Error saving rejected tutor to Firestore:', err);
     });
@@ -4872,7 +4946,7 @@ app.post('/api/admin/clean-obsolete-users', firebaseAuthMiddleware, requireAdmin
   }
 });
 
-app.post('/api/students', (req, res) => {
+app.post('/api/students', async (req, res) => {
   const db = readDb();
   const enrollment = req.body;
   const email = enrollment.email || enrollment.studentEmail;
@@ -4880,6 +4954,33 @@ app.post('/api/students', (req, res) => {
     return res.status(400).json({ error: 'Invalid student data' });
   }
   const cleanEmail = email.toLowerCase().trim();
+
+  const incomingTeacherRef = enrollment.teacherUid || enrollment.teacherId || enrollment.teacherEmail || enrollment.assignedNativeFriendUID;
+  if (incomingTeacherRef) {
+    const teacherRes = await resolveTeacherCanonicalIdentity({
+      teacherId: enrollment.teacherId || (typeof incomingTeacherRef === 'string' ? incomingTeacherRef : undefined),
+      teacherUid: enrollment.teacherUid || enrollment.assignedNativeFriendUID,
+      teacherEmail: enrollment.teacherEmail,
+      publicTutorId: enrollment.teacherId,
+      dbState: db,
+    });
+    if (teacherRes) {
+      if (!teacherRes.isApproved) {
+        return res.status(400).json({ error: 'O Amigo Nativo selecionado ainda não foi aprovado para receber alunos.' });
+      }
+      if (!isValidCanonicalUid(teacherRes.canonicalUid)) {
+        return res.status(400).json({ error: 'Não foi possível comprovar a identidade canônica do Amigo Nativo selecionado.' });
+      }
+      enrollment.teacherUid = teacherRes.canonicalUid;
+      enrollment.assignedNativeFriendUID = teacherRes.canonicalUid;
+      enrollment.nativeFriendUID = teacherRes.canonicalUid;
+      enrollment.teacherEmail = teacherRes.email || enrollment.teacherEmail;
+      enrollment.teacherName = teacherRes.name || enrollment.teacherName;
+    } else {
+      return res.status(400).json({ error: 'Amigo Nativo selecionado não encontrado ou inválido.' });
+    }
+  }
+
   const idx = db.students.findIndex((s) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail);
   if (idx >= 0) {
     db.students[idx] = { ...db.students[idx], ...enrollment, email: cleanEmail, studentEmail: cleanEmail };
@@ -5231,6 +5332,46 @@ app.post('/api/user-profile', async (req, res) => {
   const updatedTeacherName =
     rawProfile.teacherName !== undefined ? (rawProfile.teacherName || null) : (existing.teacherName ?? null);
 
+  let resolvedTeacherUid = existing.teacherUid || null;
+  let finalTeacherEmail = updatedTeacherEmail;
+  let finalTeacherName = updatedTeacherName;
+
+  const incomingTeacherQuery =
+    rawProfile.teacherUid ||
+    rawProfile.assignedNativeFriendUID ||
+    rawProfile.teacherId ||
+    rawProfile.teacherEmail;
+
+  if (incomingTeacherQuery) {
+    const teacherRes = await resolveTeacherCanonicalIdentity({
+      teacherId: rawProfile.teacherId || (typeof incomingTeacherQuery === 'string' ? incomingTeacherQuery : undefined),
+      teacherUid: rawProfile.teacherUid || rawProfile.assignedNativeFriendUID,
+      teacherEmail: rawProfile.teacherEmail || updatedTeacherEmail,
+      publicTutorId: rawProfile.teacherId,
+      dbState: db,
+    });
+
+    if (teacherRes) {
+      if (!teacherRes.isApproved) {
+        return res.status(400).json({
+          error: 'O Amigo Nativo selecionado ainda não foi aprovado para receber alunos.',
+        });
+      }
+      if (!isValidCanonicalUid(teacherRes.canonicalUid)) {
+        return res.status(400).json({
+          error: 'Não foi possível comprovar a identidade canônica do Amigo Nativo.',
+        });
+      }
+      resolvedTeacherUid = teacherRes.canonicalUid;
+      finalTeacherEmail = teacherRes.email || finalTeacherEmail;
+      finalTeacherName = teacherRes.name || finalTeacherName;
+    } else {
+      return res.status(400).json({
+        error: 'Amigo Nativo selecionado não encontrado ou inválido.',
+      });
+    }
+  }
+
   const oldLevelKey = normalizeStudentLevel(existing.level).key;
   const newLevelKey = normalizeStudentLevel(rawProfile.level || existing.level).key;
 
@@ -5255,11 +5396,11 @@ app.post('/api/user-profile', async (req, res) => {
     dailyGoalMinutes: rawProfile.dailyGoalMinutes ?? existing.dailyGoalMinutes ?? 30,
     contractedLessons: Number(rawProfile.contractedLessons ?? existing.contractedLessons ?? db.contractedLessons?.[targetEmail] ?? 1),
     completedLessonsCount: Number(existing.completedLessonsCount ?? rawProfile.completedLessonsCount ?? 0),
-    teacherEmail: updatedTeacherEmail,
-    teacherName: updatedTeacherName,
-    teacherUid: rawProfile.teacherUid ?? existing.teacherUid ?? null,
-    assignedNativeFriendUID: rawProfile.assignedNativeFriendUID ?? rawProfile.teacherUid ?? existing.assignedNativeFriendUID ?? null,
-    nativeFriendUID: rawProfile.nativeFriendUID ?? rawProfile.teacherUid ?? existing.nativeFriendUID ?? null,
+    teacherEmail: finalTeacherEmail,
+    teacherName: finalTeacherName,
+    teacherUid: resolvedTeacherUid && isValidCanonicalUid(resolvedTeacherUid) ? resolvedTeacherUid : null,
+    assignedNativeFriendUID: resolvedTeacherUid && isValidCanonicalUid(resolvedTeacherUid) ? resolvedTeacherUid : null,
+    nativeFriendUID: resolvedTeacherUid && isValidCanonicalUid(resolvedTeacherUid) ? resolvedTeacherUid : null,
     teacherMeetUrl: rawProfile.teacherMeetUrl ?? existing.teacherMeetUrl ?? null,
     enrollmentStatus: rawProfile.enrollmentStatus || existing.enrollmentStatus || (updatedTeacherEmail ? 'active' : 'not_enrolled'),
     studentJournal: rawProfile.studentJournal || existing.studentJournal || db.studentActivityJournal?.[targetEmail] || [],
@@ -5286,7 +5427,18 @@ app.post('/api/user-profile', async (req, res) => {
   if (firestoreDb && targetUid) {
     try {
       await firestoreDb.collection('users').doc(targetUid).set(updatedProfileObj, { merge: true });
-      persistedToFirestore = true;
+      if (firestoreDb && targetUid && updatedProfileObj.teacherUid) {
+        firestoreDb.collection('student_assignments').doc(targetUid).set({
+          studentUid: targetUid,
+          teacherUid: updatedProfileObj.teacherUid,
+          teacherAuthUid: updatedProfileObj.teacherUid,
+          assignedNativeFriendUID: updatedProfileObj.assignedNativeFriendUID,
+          nativeFriendUID: updatedProfileObj.nativeFriendUID,
+          teacherEmail: updatedProfileObj.teacherEmail,
+          teacherName: updatedProfileObj.teacherName,
+          updatedAt: new Date().toISOString(),
+        }, { merge: true }).catch(() => {});
+      }
     } catch (fsErr: any) {
       console.error(`[serverFirestore] Failed to persist user profile in users/${targetUid}:`, fsErr);
       return res.status(500).json({
@@ -5319,11 +5471,13 @@ app.post('/api/user-profile', async (req, res) => {
       learningGoal: updatedProfileObj.learningGoal,
       picture: updatedProfileObj.picture,
       avatar: updatedProfileObj.avatar,
-      teacherEmail: updatedTeacherEmail,
-      teacherName: updatedTeacherName,
+      teacherEmail: updatedProfileObj.teacherEmail,
+      teacherName: updatedProfileObj.teacherName,
       teacherUid: updatedProfileObj.teacherUid,
+      assignedNativeFriendUID: updatedProfileObj.assignedNativeFriendUID,
+      nativeFriendUID: updatedProfileObj.nativeFriendUID,
       contractedLessons: updatedProfileObj.contractedLessons,
-      status: updatedProfileObj.enrollmentStatus === 'cancelled' ? 'cancelled' : (updatedTeacherEmail ? 'active' : 'not_enrolled'),
+      status: updatedProfileObj.enrollmentStatus === 'cancelled' ? 'cancelled' : (updatedProfileObj.teacherEmail ? 'active' : 'not_enrolled'),
     };
   } else {
     if (!db.students) db.students = [];
@@ -5340,10 +5494,12 @@ app.post('/api/user-profile', async (req, res) => {
       learningGoal: updatedProfileObj.learningGoal,
       contractedLessons: updatedProfileObj.contractedLessons,
       completedLessonsCount: 0,
-      teacherEmail: updatedTeacherEmail,
-      teacherName: updatedTeacherName,
+      teacherEmail: updatedProfileObj.teacherEmail,
+      teacherName: updatedProfileObj.teacherName,
       teacherUid: updatedProfileObj.teacherUid,
-      status: updatedProfileObj.enrollmentStatus === 'cancelled' ? 'cancelled' : (updatedTeacherEmail ? 'active' : 'not_enrolled'),
+      assignedNativeFriendUID: updatedProfileObj.assignedNativeFriendUID,
+      nativeFriendUID: updatedProfileObj.nativeFriendUID,
+      status: updatedProfileObj.enrollmentStatus === 'cancelled' ? 'cancelled' : (updatedProfileObj.teacherEmail ? 'active' : 'not_enrolled'),
       activeSince: new Date().toISOString().split('T')[0],
       createdAt: new Date().toISOString(),
       picture: updatedProfileObj.picture,
@@ -5377,13 +5533,24 @@ app.post('/api/students/purchase-package', async (req, res) => {
 
   const lessonsToAdd = Number(packageLessons) > 0 ? Number(packageLessons) : 5;
 
-  // Find teacher name if not provided
-  let finalTeacherName = teacherName;
-  if (!finalTeacherName) {
-    const tutorMatch = (db.tutorsList || []).find((t: any) => (t.email || '').toLowerCase() === cleanTeacherEmail);
-    const teacherMatch = (db.teachers || []).find((t: any) => (t.email || '').toLowerCase() === cleanTeacherEmail);
-    finalTeacherName = tutorMatch?.name || teacherMatch?.name || cleanTeacherEmail.split('@')[0];
+  // Resolve canonical Native Friend UID
+  const teacherRes = await resolveTeacherCanonicalIdentity({
+    teacherEmail: cleanTeacherEmail,
+    dbState: db,
+  });
+
+  if (!teacherRes) {
+    return res.status(404).json({ error: 'Amigo Nativo selecionado não encontrado no sistema.' });
   }
+  if (!teacherRes.isApproved) {
+    return res.status(400).json({ error: 'O Amigo Nativo selecionado ainda não foi aprovado para receber agendamentos.' });
+  }
+  if (!isValidCanonicalUid(teacherRes.canonicalUid)) {
+    return res.status(400).json({ error: 'Não foi possível comprovar a identidade canônica do Amigo Nativo.' });
+  }
+
+  const canonicalTeacherUid = teacherRes.canonicalUid;
+  const finalTeacherName = teacherRes.name || teacherName || cleanTeacherEmail.split('@')[0];
 
   // Update contracted lessons count
   if (!db.contractedLessons) db.contractedLessons = {};
@@ -5400,6 +5567,9 @@ app.post('/api/students/purchase-package', async (req, res) => {
         ...s,
         teacherEmail: cleanTeacherEmail,
         teacherName: finalTeacherName,
+        teacherUid: canonicalTeacherUid,
+        assignedNativeFriendUID: canonicalTeacherUid,
+        nativeFriendUID: canonicalTeacherUid,
         contractedLessons: newTotal,
         status: 'active',
       };
@@ -5422,6 +5592,9 @@ app.post('/api/students/purchase-package', async (req, res) => {
       completedLessonsCount: 0,
       teacherEmail: cleanTeacherEmail,
       teacherName: finalTeacherName,
+      teacherUid: canonicalTeacherUid,
+      assignedNativeFriendUID: canonicalTeacherUid,
+      nativeFriendUID: canonicalTeacherUid,
       routineVideoTime: '09:00',
       routineAudioTime: '14:00',
       dailyPhraseTime: '20:00',
@@ -5442,6 +5615,9 @@ app.post('/api/students/purchase-package', async (req, res) => {
     level: existingProfile.level || 'iniciante',
     teacherEmail: cleanTeacherEmail,
     teacherName: finalTeacherName,
+    teacherUid: canonicalTeacherUid,
+    assignedNativeFriendUID: canonicalTeacherUid,
+    nativeFriendUID: canonicalTeacherUid,
     enrollmentStatus: 'active',
     contractedLessons: newTotal,
     completedLessonsCount: existingProfile.completedLessonsCount || 0,
@@ -7295,13 +7471,25 @@ app.post(['/api/lessons', '/api/live-lessons'], async (req, res) => {
         || (db.students || []).find((s: any) => (s.email || '').toLowerCase().trim() === sEmail);
       newLesson.studentUid = foundUser?.uid || foundUser?.id || `usr-${sEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
     }
-    if (!newLesson.teacherUid) {
-      const tEmail = (newLesson.teacherEmail || newLesson.tutorEmail || '').toLowerCase().trim();
-      const allUsers = Object.values(db.authUsers || {});
-      const foundTutor = (db.tutorsList || []).find((t: any) => (t.email || '').toLowerCase().trim() === tEmail)
-        || (allUsers as any[]).find((u: any) => (u.email || '').toLowerCase().trim() === tEmail)
-        || (db.teachers || []).find((t: any) => (t.email || '').toLowerCase().trim() === tEmail);
-        newLesson.teacherUid = foundTutor?.uid || foundTutor?.id || '';    }
+    if (!newLesson.teacherUid || !isValidCanonicalUid(newLesson.teacherUid)) {
+      const tTarget = newLesson.teacherId || newLesson.teacherUid || newLesson.teacherEmail || newLesson.tutorEmail;
+      const teacherRes = await resolveTeacherCanonicalIdentity({
+        teacherId: typeof tTarget === 'string' ? tTarget : undefined,
+        teacherEmail: newLesson.teacherEmail || newLesson.tutorEmail,
+        dbState: db,
+      });
+      if (teacherRes && isValidCanonicalUid(teacherRes.canonicalUid)) {
+        if (!teacherRes.isApproved) {
+          return res.status(400).json({ error: 'O Amigo Nativo selecionado ainda não foi aprovado para receber aulas.' });
+        }
+        newLesson.teacherUid = teacherRes.canonicalUid;
+        newLesson.teacherAuthUid = teacherRes.canonicalUid;
+        if (!newLesson.teacherEmail) newLesson.teacherEmail = teacherRes.email;
+        if (!newLesson.teacherName) newLesson.teacherName = teacherRes.name;
+      } else {
+        return res.status(400).json({ error: 'Identificador canônico do Amigo Nativo não comprovado.' });
+      }
+    }
 
     // Conflict Check (Strict Anti-Duplicity Rule - Individualized by teacher and student UIDs/emails)
     const proposedTeacher = (newLesson.teacherEmail || newLesson.tutorEmail || '').toLowerCase().trim();

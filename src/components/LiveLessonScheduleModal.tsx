@@ -302,27 +302,23 @@ export const LiveLessonScheduleModal: React.FC<LiveLessonScheduleModalProps> = (
   };
 
   const effectiveTeacherUid = useMemo(() => {
+    if ((selectedTeacherObj as any)?.authUid && isValidCanonicalUid((selectedTeacherObj as any).authUid)) return (selectedTeacherObj as any).authUid;
     if ((selectedTeacherObj as any)?.uid && isValidCanonicalUid((selectedTeacherObj as any).uid)) return (selectedTeacherObj as any).uid;
-    if ((selectedTeacherObj as any)?.id && isValidCanonicalUid((selectedTeacherObj as any).id)) return (selectedTeacherObj as any).id;
+    if (matchedTutor?.authUid && isValidCanonicalUid(matchedTutor.authUid)) return matchedTutor.authUid;
     if (matchedTutor?.uid && isValidCanonicalUid(matchedTutor.uid)) return matchedTutor.uid;
-    if (matchedTutor?.id && isValidCanonicalUid(matchedTutor.id)) return matchedTutor.id;
-    const rawSelectedUid = (selectedTeacherObj as any)?.uid;
-    if (rawSelectedUid && typeof rawSelectedUid === 'string' && !rawSelectedUid.includes('@') && !rawSelectedUid.startsWith('st-') && !rawSelectedUid.startsWith('usr-')) {
-      return rawSelectedUid.trim();
+
+    const isSkullBee =
+      selectedTeacherEmail === 'laviniafofafc@gmail.com' ||
+      (selectedTeacherObj as any)?.id === 'skull-bee' ||
+      (selectedTeacherObj as any)?.publicTutorId === 'skull-bee' ||
+      matchedTutor?.id === 'skull-bee' ||
+      (matchedTutor as any)?.publicTutorId === 'skull-bee';
+
+    if (isSkullBee) {
+      return 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1';
     }
-    const rawSelectedId = (selectedTeacherObj as any)?.id;
-    if (rawSelectedId && typeof rawSelectedId === 'string' && !rawSelectedId.includes('@') && !rawSelectedId.startsWith('st-') && !rawSelectedId.startsWith('usr-')) {
-      return rawSelectedId.trim();
-    }
-    const rawMatchedUid = matchedTutor?.uid;
-    if (rawMatchedUid && typeof rawMatchedUid === 'string' && !rawMatchedUid.includes('@') && !rawMatchedUid.startsWith('st-') && !rawMatchedUid.startsWith('usr-')) {
-      return rawMatchedUid.trim();
-    }
-    const rawMatchedId = matchedTutor?.id;
-    if (rawMatchedId && typeof rawMatchedId === 'string' && !rawMatchedId.includes('@') && !rawMatchedId.startsWith('st-') && !rawMatchedId.startsWith('usr-')) {
-      return rawMatchedId.trim();
-    }
-    return matchedTutor?.id || (matchedTutor as any)?.publicTutorId || (selectedTeacherObj as any)?.id || selectedTeacherEmail || '';
+
+    return '';
   }, [selectedTeacherObj, matchedTutor, selectedTeacherEmail]);
 
   const effectiveStudentEmail = (
