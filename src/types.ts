@@ -266,6 +266,24 @@ export interface DailyJournalEntry {
   missingWords?: string[];
   studentUid?: string;
   studentEmail?: string;
+
+  // FASE 4B.9 — Native Friends Notes Lesson Review Integration
+  entryType?: 'daily_sentence' | 'lesson_review';
+  teacherName?: string;
+  lessonId?: string;
+  sessionKey?: string;
+  cacheKeyRef?: string;
+  reviewSummary?: {
+    rememberThis: string;
+    keyRules: string[];
+    mustKnowVocabulary: string[];
+    essentialCorrections: { original: string; corrected: string; explanation?: string }[];
+    estimatedMinutes?: string;
+  };
+  keyCorrections?: Array<{ original: string; corrected: string; explanation?: string }>;
+  grammarRules?: string[];
+  pronunciationPoints?: string[];
+  updatedAt?: string;
 }
 
 export type StudentJournalActivityType = 'video' | 'audio' | 'memorization' | 'lesson' | 'sentence' | 'tutor_live';

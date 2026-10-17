@@ -111,6 +111,8 @@ import {
   fetchSessionNotesProgressServer,
   savePedagogicalTransformationToFirestoreServer,
   fetchPedagogicalTransformationFromFirestoreServer,
+  recordLessonReviewInStudentJournalServer,
+  fetchStudentDailyJournalFromServerFirestore,
   removeUndefinedFields,
 } from './src/serverFirestore';
 import { normalizeDictionaryWord } from './src/utils/studentDictionaryLibrary';
@@ -8487,9 +8489,17 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
     } catch {}
   }
 
-  // FASE 4B.8: If a valid, non-provisional AI-generated transformation exists for this contentHash, REUSE IT!
+  // FASE 4B.8 & 4B.9: If a valid, non-provisional AI-generated transformation exists for this contentHash, REUSE IT!
   // "Não permitir que forceRegenerate provoque chamadas pagas desnecessárias quando já existir cache válido."
   if (cached && !cached.isProvisional && cached.contentHash === contentHash && cached.isAiGenerated) {
+    // FASE 4B.9: Guarantee single idempotent journal entry for the session without repeated Gemini calls
+    recordLessonReviewInStudentJournalServer({
+      studentUid: cleanUid,
+      studentEmail: effectiveEmail,
+      transformation: cached,
+      compositeCacheKey,
+    }).catch((journalErr) => console.warn('Cache hit My Journal sync notice:', journalErr));
+
     return res.json({
       success: true,
       cached: true,
@@ -8851,12 +8861,39 @@ Please synthesize and transform these notes strictly adhering to the real markin
           }
           await savePedagogicalTransformationToFirestoreServer(compositeCacheKey, transformation);
           await syncTransformationVocabToDictionary(transformation, cleanUid, effectiveEmail);
+
+          // FASE 4B.9: Record single, validated pedagogical review in Student's My Journal via Firebase Admin SDK
+          let recordedJournalEntry: any = null;
+          try {
+            const journalRes = await recordLessonReviewInStudentJournalServer({
+              studentUid: cleanUid,
+              studentEmail: effectiveEmail,
+              transformation,
+              compositeCacheKey,
+            });
+            if (journalRes.success && journalRes.entry) {
+              recordedJournalEntry = journalRes.entry;
+              if (!db.studentJournalMap) db.studentJournalMap = {};
+              const currentJournal =
+                (cleanUid && db.studentJournalMap[cleanUid]) ||
+                (effectiveEmail && db.studentJournalMap[effectiveEmail]) ||
+                [];
+              const filteredJournal = currentJournal.filter((e: any) => e.id !== journalRes.entry.id);
+              const updatedJournal = [journalRes.entry, ...filteredJournal];
+              if (cleanUid) db.studentJournalMap[cleanUid] = updatedJournal;
+              if (effectiveEmail) db.studentJournalMap[effectiveEmail] = updatedJournal;
+            }
+          } catch (journalErr) {
+            console.warn('Backend My Journal lesson review save notice:', journalErr);
+          }
+
           await writeDbSync(db);
 
           return res.json({
             success: true,
             cached: false,
             transformation,
+            journalEntry: recordedJournalEntry,
           });
         }
       } else if (singleAttempt?.error) {
@@ -8916,6 +8953,7 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
   const sessionKey = (req.query.sessionKey as string) || (req.query.id as string) || '';
   const studentUid = (req.query.studentUid as string) || '';
   const language = ((req.query.language as string) || (req.query.lang as string) || '').toLowerCase().trim();
+  const contentHash = ((req.query.contentHash as string) || '').trim();
 
   const caller = req.user!;
   if (caller.role === 'student') {
@@ -8928,18 +8966,44 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
     let transformation: any = null;
     if (language) {
       const match = Object.entries(db.pedagogicalTransformationsMap || {}).find(([k, v]: [string, any]) => {
-        return (k === sessionKey || k.startsWith(`${sessionKey}__`)) && v.language === language;
+        const matchKey = k === sessionKey || k.startsWith(`${sessionKey}__`);
+        const matchLang = v?.language === language;
+        const matchHash = !contentHash || v?.contentHash === contentHash;
+        return matchKey && matchLang && matchHash;
       });
       if (match) transformation = match[1];
     }
     if (!transformation && db.pedagogicalTransformationsMap?.[sessionKey]) {
-      transformation = db.pedagogicalTransformationsMap[sessionKey];
+      const candidate = db.pedagogicalTransformationsMap[sessionKey];
+      if (!contentHash || candidate.contentHash === contentHash) {
+        transformation = candidate;
+      }
     }
     if (!transformation) {
-      const found = Object.entries(db.pedagogicalTransformationsMap || {}).find(([k]: [string, any]) =>
-        k === sessionKey || k.startsWith(`${sessionKey}__`)
-      );
+      const found = Object.entries(db.pedagogicalTransformationsMap || {}).find(([k, v]: [string, any]) => {
+        const matchKey = k === sessionKey || k.startsWith(`${sessionKey}__`);
+        const matchHash = !contentHash || v?.contentHash === contentHash;
+        return matchKey && matchHash;
+      });
       if (found) transformation = found[1];
+    }
+
+    // Firestore fallback lookup if in-memory cache misses
+    if (!transformation) {
+      try {
+        const fsMatch = await fetchPedagogicalTransformationFromFirestoreServer(sessionKey, { language, contentHash });
+        if (fsMatch && fsMatch.isAiGenerated && !fsMatch.isProvisional) {
+          transformation = fsMatch;
+          const storeKey = fsMatch.cacheKey || `${sessionKey}__hash_${fsMatch.contentHash || 'any'}__lang_${fsMatch.language || language || 'pt'}`;
+          if (!db.pedagogicalTransformationsMap) db.pedagogicalTransformationsMap = {};
+          db.pedagogicalTransformationsMap[storeKey] = fsMatch;
+          if (fsMatch.language === 'pt') {
+            db.pedagogicalTransformationsMap[sessionKey] = fsMatch;
+          }
+        }
+      } catch (fsErr) {
+        console.warn('GET /api/pedagogical-notes Firestore lookup notice:', fsErr);
+      }
     }
 
     if (transformation) {
@@ -9486,7 +9550,7 @@ ${batchToEnrich.map((w, i) => `${i + 1}. ${w}`).join('\n')}`;
 
 
 // Endpoint: Get student journal entries
-app.get('/api/student-journal', (req, res) => {
+app.get('/api/student-journal', async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   const db = readDb();
   const studentEmail = ((req.query.studentEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
@@ -9499,6 +9563,20 @@ app.get('/api/student-journal', (req, res) => {
     [...fromEmail, ...fromUid].forEach((entry: any) => {
       if (entry?.id) map.set(entry.id, entry);
     });
+
+    if (map.size === 0) {
+      const docId = uid || studentEmail;
+      try {
+        const fsEntries = await fetchStudentDailyJournalFromServerFirestore(docId);
+        if (Array.isArray(fsEntries) && fsEntries.length > 0) {
+          if (!db.studentJournalMap) db.studentJournalMap = {};
+          if (uid) db.studentJournalMap[uid] = fsEntries;
+          if (studentEmail) db.studentJournalMap[studentEmail] = fsEntries;
+          return res.json(fsEntries);
+        }
+      } catch {}
+    }
+
     const list = Array.from(map.values()).sort((a, b) => {
       const tA = new Date(a.createdAt || a.date).getTime();
       const tB = new Date(b.createdAt || b.date).getTime();

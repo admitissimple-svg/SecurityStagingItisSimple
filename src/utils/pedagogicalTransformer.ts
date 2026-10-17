@@ -770,11 +770,12 @@ export async function fetchPedagogicalTransformation(params: {
     }
 
     const effectiveKey = sessionKey || lessonId || '';
+    const contentHash = computeNotesHash(rawNotes);
 
-    // Security Hotfix (Etapa 2): If not an explicit regeneration, check server cache first!
+    // Security Hotfix (Etapa 2 & FASE 4B.9): If not an explicit regeneration, check server cache first!
     if (!forceRegenerate && effectiveKey) {
       try {
-        const cacheUrl = `/api/pedagogical-notes?sessionKey=${encodeURIComponent(effectiveKey)}&language=${encodeURIComponent(language)}${effectiveUid ? `&studentUid=${encodeURIComponent(effectiveUid)}` : ''}`;
+        const cacheUrl = `/api/pedagogical-notes?sessionKey=${encodeURIComponent(effectiveKey)}&language=${encodeURIComponent(language)}&contentHash=${encodeURIComponent(contentHash)}${effectiveUid ? `&studentUid=${encodeURIComponent(effectiveUid)}` : ''}`;
         const cacheRes = await fetch(cacheUrl, { headers });
 
         if (cacheRes.status === 401 || cacheRes.status === 403) {
@@ -813,7 +814,9 @@ export async function fetchPedagogicalTransformation(params: {
         if (cacheRes.ok) {
           const cachedData = await cacheRes.json();
           if (cachedData && typeof cachedData === 'object' && !Array.isArray(cachedData) && cachedData.sessionKey && cachedData.isAiGenerated && !cachedData.isProvisional) {
-            return cachedData;
+            if (!cachedData.contentHash || cachedData.contentHash === contentHash) {
+              return cachedData;
+            }
           }
         }
       } catch (cacheErr) {

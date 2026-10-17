@@ -2261,19 +2261,48 @@ export async function savePedagogicalTransformationToFirestoreServer(
  * Retrieve pedagogical transformation from Cloud Firestore
  */
 export async function fetchPedagogicalTransformationFromFirestoreServer(
-  compositeCacheKey: string
+  compositeCacheKeyOrSessionKey: string,
+  options?: { language?: string; contentHash?: string }
 ): Promise<any | null> {
   const db = getFirestoreDb();
-  if (!db || !compositeCacheKey) return null;
+  if (!db || !compositeCacheKeyOrSessionKey) return null;
   try {
-    const sessionKey = compositeCacheKey.split('__')[0];
+    const rawKey = compositeCacheKeyOrSessionKey.trim();
+    const sessionKey = rawKey.split('__')[0];
     const sessionRef = db.collection('session_notes').doc(sessionKey);
-    const snap = await sessionRef.collection('pedagogical_cache').doc(compositeCacheKey).get();
-    if (snap && snap.exists) {
-      const data = snap.data();
-      if (data && data.isAiGenerated && !data.isProvisional) {
-        return data;
+
+    // 1. If exact compositeCacheKey doc exists, check it directly
+    if (rawKey.includes('__')) {
+      const snap = await sessionRef.collection('pedagogical_cache').doc(rawKey).get();
+      if (snap && snap.exists) {
+        const data = snap.data();
+        if (data && data.isAiGenerated && !data.isProvisional) {
+          if (!options?.contentHash || data.contentHash === options.contentHash) {
+            return data;
+          }
+        }
       }
+    }
+
+    // 2. Query pedagogical_cache subcollection for the session
+    const cacheCol = sessionRef.collection('pedagogical_cache');
+    const colSnap = await cacheCol.get();
+    if (colSnap && !colSnap.empty) {
+      let candidate: any = null;
+      for (const d of colSnap.docs) {
+        const data = d.data();
+        if (data && data.isAiGenerated && !data.isProvisional) {
+          const matchLang = !options?.language || data.language === options.language;
+          const matchHash = !options?.contentHash || data.contentHash === options.contentHash;
+          if (matchLang && matchHash) {
+            return data;
+          }
+          if (matchHash && !candidate) {
+            candidate = data;
+          }
+        }
+      }
+      if (candidate) return candidate;
     }
   } catch (err) {
     if (!isPermissionError(err)) {
@@ -2281,6 +2310,136 @@ export async function fetchPedagogicalTransformationFromFirestoreServer(
     }
   }
   return null;
+}
+
+/**
+ * FASE 4B.9 — Record an idempotent, validated Native Friends Notes lesson review in Student's My Journal.
+ * 
+ * Strict invariants:
+ * 1. Saved only after validated definitive AI generation (zero provisional/fallback summaries).
+ * 2. Exactly one entry per student and session (deterministic ID: idempotent, opening again never duplicates).
+ * 3. Uses solely the already validated reviewSummary from transformation (zero additional Gemini calls).
+ * 4. Stored in users/{studentUid}/journal/{entryId} and users/{studentUid}.dailyJournalEntries.
+ */
+export async function recordLessonReviewInStudentJournalServer(params: {
+  studentUid: string;
+  studentEmail?: string;
+  transformation: any;
+  compositeCacheKey: string;
+}): Promise<{ success: boolean; entry?: any }> {
+  const { studentUid, studentEmail, transformation, compositeCacheKey } = params;
+  if (!studentUid || !transformation) {
+    return { success: false };
+  }
+
+  // Reject provisional or fallback transformations from entering My Journal as definitive reviews
+  if (!transformation.isAiGenerated || transformation.isProvisional || transformation.isFallback) {
+    return { success: false };
+  }
+
+  const cleanUid = studentUid.trim();
+  const cleanEmail = (studentEmail || transformation.studentEmail || '').toLowerCase().trim();
+  const sessionKey = transformation.sessionKey || compositeCacheKey.split('__')[0] || 'session';
+  const cleanSessionId = sessionKey.replace(/[^a-zA-Z0-9_-]/g, '_');
+
+  // Deterministic entry ID guaranteeing strict idempotency
+  const entryId = `journal_lesson_${cleanSessionId}_${cleanUid.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+
+  const review = transformation.reviewSummary || {};
+  const essentialCorrections = Array.isArray(review.essentialCorrections) ? review.essentialCorrections : [];
+  const keyRules = Array.isArray(review.keyRules) ? review.keyRules : [];
+  const mustKnowVocabulary = Array.isArray(review.mustKnowVocabulary) ? review.mustKnowVocabulary : [];
+
+  // Filter pronunciation points specifically when present
+  const pronunciationPoints: string[] = [];
+  (transformation.vocabularyAndExpressions || []).forEach((v: any) => {
+    if (v.isPronunciationFocus || v.partOfSpeech === 'Pronunciation Focus') {
+      pronunciationPoints.push(v.term);
+    }
+  });
+
+  const wordsUsed: string[] = Array.from(
+    new Set([
+      ...(transformation.vocabularyAndExpressions || []).map((v: any) => v.term).filter(Boolean),
+      ...pronunciationPoints,
+    ])
+  );
+
+  const primaryCorrection = essentialCorrections[0] || null;
+  const rememberThis = (typeof review.rememberThis === 'string' && review.rememberThis.trim()) || '';
+
+  const journalEntry: any = {
+    id: entryId,
+    entryType: 'lesson_review',
+    date: transformation.sessionDate || new Date().toISOString().split('T')[0],
+    sentence: rememberThis || `Native Friends Notes Quick Review (${transformation.topic || 'Live Coaching'})`,
+    correctedSentence: primaryCorrection ? `✓ ${primaryCorrection.corrected} (instead of "${primaryCorrection.original}")` : undefined,
+    explanation: [
+      transformation.teacherName ? `Native Friend: ${transformation.teacherName}` : '',
+      essentialCorrections.length > 0 ? `Corrections: ${essentialCorrections.map((c: any) => `${c.original} ➜ ${c.corrected}`).join('; ')}` : '',
+      keyRules.length > 0 ? `Grammar: ${keyRules.join(' | ')}` : '',
+      pronunciationPoints.length > 0 ? `Pronunciation: ${pronunciationPoints.join(', ')}` : '',
+    ].filter(Boolean).join(' • '),
+    wordsUsed,
+    hasErrors: false,
+    createdAt: transformation.generatedAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    studentUid: cleanUid,
+    studentEmail: cleanEmail,
+    teacherName: transformation.teacherName || 'Native Friend',
+    lessonId: transformation.lessonId || sessionKey,
+    sessionKey,
+    cacheKeyRef: compositeCacheKey,
+    reviewSummary: {
+      rememberThis,
+      keyRules,
+      mustKnowVocabulary,
+      essentialCorrections,
+      estimatedMinutes: review.estimatedMinutes || '5–10 min',
+    },
+    keyCorrections: essentialCorrections,
+    grammarRules: keyRules,
+    pronunciationPoints,
+  };
+
+  const sanitized = removeUndefinedFields(journalEntry);
+
+  const db = getFirestoreDb();
+  if (db && !isCloudWriteDisabled) {
+    try {
+      const userRef = db.collection('users').doc(cleanUid);
+      const subDocRef = userRef.collection('journal').doc(entryId);
+
+      await subDocRef.set(sanitized, { merge: true });
+
+      // Atomically update dailyJournalEntries array in users/{studentUid}
+      const userSnap = await userRef.get();
+      let currentList: any[] = [];
+      if (userSnap.exists) {
+        const uData = userSnap.data();
+        if (Array.isArray(uData?.dailyJournalEntries)) {
+          currentList = uData.dailyJournalEntries;
+        }
+      }
+
+      const filtered = currentList.filter((e: any) => e.id !== entryId);
+      const updatedList = [sanitized, ...filtered];
+
+      await userRef.set(
+        {
+          dailyJournalEntries: updatedList,
+          updatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+    } catch (fsErr) {
+      if (!isPermissionError(fsErr)) {
+        console.warn('Firestore recordLessonReviewInStudentJournal notice:', fsErr);
+      }
+    }
+  }
+
+  return { success: true, entry: sanitized };
 }
 
 /**
@@ -2308,6 +2467,43 @@ export async function saveStudentJournalToFirestore(docId: string, journal: any[
       console.warn('Firestore saveStudentJournal error:', err);
     }
     return false;
+  }
+}
+
+/**
+ * Fetch student daily journal entries directly from Cloud Firestore (users/{docId}/journal and doc.dailyJournalEntries)
+ */
+export async function fetchStudentDailyJournalFromServerFirestore(docId: string): Promise<any[]> {
+  const db = getFirestoreDb();
+  if (!db || !docId) return [];
+  try {
+    const userRef = db.collection('users').doc(docId);
+    const subCol = await userRef.collection('journal').get();
+    const map = new Map<string, any>();
+    if (!subCol.empty) {
+      subCol.forEach((docSnap) => {
+        const d = docSnap.data();
+        if (d && d.id) map.set(d.id, d);
+      });
+    }
+    const userSnap = await userRef.get();
+    if (userSnap.exists) {
+      const data = userSnap.data();
+      if (Array.isArray(data?.dailyJournalEntries)) {
+        data.dailyJournalEntries.forEach((e: any) => {
+          if (e && e.id) map.set(e.id, e);
+        });
+      }
+    }
+    const list = Array.from(map.values()).sort((a, b) => {
+      const tA = new Date(a.createdAt || a.date).getTime();
+      const tB = new Date(b.createdAt || b.date).getTime();
+      return tB - tA;
+    });
+    return list;
+  } catch (err) {
+    console.warn('fetchStudentDailyJournalFromServerFirestore error:', err);
+    return [];
   }
 }
 

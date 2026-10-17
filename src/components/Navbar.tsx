@@ -11,6 +11,7 @@ import {
   Edit3,
   Users,
   MessageSquare,
+  BookOpen,
 } from 'lucide-react';
 import { GoogleAccount, UserProfile, Language, NativeFriendTutor, LiveLesson } from '../types';
 import { Translations, SUPPORTED_LANGUAGES, getTranslations } from '../utils/i18n';
@@ -34,6 +35,7 @@ export interface NavbarProps {
   onGoToLanding?: () => void;
   onFindTutors?: () => void;
   onLogout?: () => void;
+  onOpenJournal?: () => void;
   tutors?: NativeFriendTutor[];
   lessons?: LiveLesson[];
   students?: GoogleAccount[];
@@ -55,6 +57,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   onGoToLanding,
   onFindTutors,
   onLogout,
+  onOpenJournal,
   tutors = [],
   lessons = [],
   students = [],
@@ -364,6 +367,22 @@ export const Navbar: React.FC<NavbarProps> = ({
                             ? (isEn ? 'Edit Native Friend Profile' : 'Editar Perfil de Amigo Nativo')
                             : (isEn ? 'Edit Profile & Photo' : 'Editar Perfil & Foto')}
                         </span>
+                      </button>
+                    )}
+
+                    {/* My Journal (Student Lesson Reviews & Daily Sentences) */}
+                    {!isTeacher && !isAdmin && onOpenJournal && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsUserMenuOpen(false);
+                          onOpenJournal();
+                        }}
+                        className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-semibold text-[#000035] hover:bg-[#9AB4FF]/15 transition cursor-pointer"
+                        id="menu-btn-student-journal"
+                      >
+                        <BookOpen className="w-4 h-4 text-[#1C4C96]" />
+                        <span>{isEn ? 'My Journal (Reviews & Sentences)' : 'Meu Diário (Revisões & Frases)'}</span>
                       </button>
                     )}
 

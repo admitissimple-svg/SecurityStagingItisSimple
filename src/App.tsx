@@ -1154,6 +1154,13 @@ export default function App() {
       }
     });
 
+    // Real-time synchronization for student journal (Sentence of the Day + Lesson Reviews)
+    const unsubJournal = role === 'student' && uid ? subscribeToStudentDailyJournal(uid, email, (realtimeJournal) => {
+      if (Array.isArray(realtimeJournal)) {
+        setDailyJournalEntries(realtimeJournal);
+      }
+    }) : () => {};
+
     // 2. Fetch user-isolated students list (for teachers and admin)
     if (role === 'teacher' || role === 'admin') {
       fetch(`/api/students?${queryParams}`)
@@ -1345,6 +1352,25 @@ export default function App() {
                   const derivedChecks = deriveWeeklyChecksFromJournal(journalData, loadedCycle);
                   setWeeklyChecks((prev) => ({ ...prev, ...derivedChecks }));
                 }
+              }
+            })
+            .catch(() => {});
+
+          // Hydrate student daily journal (Sentence of the Day + Lesson Reviews)
+          fetch(`/api/student-journal?uid=${encodeURIComponent(uid)}&studentEmail=${encodeURIComponent(email)}`)
+            .then((r) => (r.ok ? r.json() : null))
+            .then((entries) => {
+              if (Array.isArray(entries) && entries.length > 0) {
+                setDailyJournalEntries((prev) => {
+                  const map = new Map<string, any>();
+                  (prev || []).forEach((e) => { if (e?.id) map.set(e.id, e); });
+                  entries.forEach((e) => { if (e?.id) map.set(e.id, e); });
+                  return Array.from(map.values()).sort((a, b) => {
+                    const tA = new Date(a.createdAt || a.date).getTime();
+                    const tB = new Date(b.createdAt || b.date).getTime();
+                    return tB - tA;
+                  });
+                });
               }
             })
             .catch(() => {});
@@ -1629,6 +1655,7 @@ export default function App() {
     return () => {
       isCancelled = true;
       unsubLessons();
+      unsubJournal();
     };
   }, [currentAccount?.email, currentAccount?.role, currentAccount?.uid, selectedStudentFilter, userProfile?.email]);
 
@@ -5953,6 +5980,7 @@ export default function App() {
             onFindTutors={() => setViewMode('find-tutors')}
             onLogout={handleLogout}
             timeZone={isTeacher ? DEFAULT_TEACHER_TIMEZONE : DEFAULT_STUDENT_TIMEZONE}
+            onOpenJournal={() => setIsJournalModalOpen(true)}
             tutors={tutors}
             lessons={lessons}
             students={studentsList}
@@ -6057,6 +6085,7 @@ export default function App() {
             onFindTutors={() => setViewMode('find-tutors')}
             onLogout={handleLogout}
             timeZone={isTeacher ? DEFAULT_TEACHER_TIMEZONE : DEFAULT_STUDENT_TIMEZONE}
+            onOpenJournal={() => setIsJournalModalOpen(true)}
             tutors={tutors}
             lessons={lessons}
             students={studentsList}
@@ -6428,6 +6457,7 @@ export default function App() {
                       consolidateDictionaryEntries(prev, syncedEntries, excludedDictionaryWordsRef.current)
                     );
                   }}
+                  onOpenJournal={() => setIsJournalModalOpen(true)}
                 />
 
                 {/* Activity Reminders Manager (5-minute alerts based on registered times) */}

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   X,
   BookOpen,
@@ -34,6 +34,7 @@ import {
   fetchPedagogicalTransformation,
   resolveCefrLevel,
   extractNotesMarkings,
+  computeNotesHash,
 } from '../utils/pedagogicalTransformer';
 import { syncSessionVocabularyToStudentDictionary } from '../utils/sessionVocabularySync';
 import { normalizeDictionaryWord } from '../utils/studentDictionaryLibrary';
@@ -58,6 +59,7 @@ interface NativeFriendsNotesModalProps {
   currentStepNumber?: number;
   isLessonToday?: boolean;
   onVocabularySynced?: (entries: StudentDictionaryEntry[]) => void;
+  onOpenJournal?: () => void;
 }
 
 interface SessionOption {
@@ -86,6 +88,7 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
   currentStepNumber,
   isLessonToday = false,
   onVocabularySynced,
+  onOpenJournal,
 }) => {
   const isEn = currentLanguage === 'en';
 
@@ -482,11 +485,32 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
     [activeSession, studentLevel, resolvedUid, resolvedEmail, currentLanguage]
   );
 
+  // FASE 4B.9: Active session & content hash tracking to guarantee zero repeated Gemini calls
+  const lastLoadedSessionRef = useRef<{ sessionKey: string; contentHash: string; lang: string } | null>(null);
+
   useEffect(() => {
-    if (isOpen && activeSession) {
-      loadPedagogicalNotes(false);
+    if (!isOpen || !activeSession) return;
+    const currentHash = computeNotesHash(activeSession.rawContent || '');
+    if (
+      lastLoadedSessionRef.current &&
+      lastLoadedSessionRef.current.sessionKey === activeSession.key &&
+      lastLoadedSessionRef.current.contentHash === currentHash &&
+      lastLoadedSessionRef.current.lang === currentLanguage &&
+      transformation &&
+      !transformation.isFallback &&
+      !transformation.isProvisional
+    ) {
+      // Content has not changed, transformation already loaded; avoid redundant network requests
+      return;
     }
-  }, [isOpen, activeSession, loadPedagogicalNotes, currentLanguage]);
+    loadPedagogicalNotes(false).then(() => {
+      lastLoadedSessionRef.current = {
+        sessionKey: activeSession.key,
+        contentHash: currentHash,
+        lang: currentLanguage,
+      };
+    });
+  }, [isOpen, activeSession?.key, activeSession?.rawContent, loadPedagogicalNotes, currentLanguage]);
 
   // Copy 5-10 minute review summary to clipboard
   const handleCopySummary = () => {
@@ -1577,6 +1601,20 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                         </span>
                       </div>
                       <div className="flex items-center gap-2 shrink-0">
+                        {onOpenJournal && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              onClose();
+                              onOpenJournal();
+                            }}
+                            className="px-3.5 py-2 rounded-xl bg-[#000035] hover:bg-[#062863] text-white font-bold text-xs flex items-center gap-1.5 shadow-2xs transition cursor-pointer"
+                            title={isEn ? 'Open My Journal to view all session reviews' : 'Abrir Meu Diário para ver todas as revisões de aula'}
+                          >
+                            <BookOpen className="w-3.5 h-3.5 text-[#9AB4FF]" />
+                            <span>{isEn ? 'My Journal' : 'Meu Diário'}</span>
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={handleMarkAsRead}

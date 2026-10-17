@@ -222,73 +222,174 @@ export const StudentJournalModal: React.FC<StudentJournalModalProps> = ({
                     </div>
                   </div>
 
-                  {/* Student Original Sentence */}
-                  <div className="space-y-1">
-                    <div className="flex items-center justify-between">
-                      <span className="text-[10px] font-bold text-[#062863] uppercase tracking-wider flex items-center gap-1">
-                        <span>{isEn ? 'Your Sentence:' : 'Sua Frase:'}</span>
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => speakText(entry.sentence)}
-                        className="text-[#1C4C96] hover:text-[#000035] text-[11px] font-bold flex items-center gap-1 cursor-pointer"
-                        title={isEn ? 'Listen to sentence' : 'Ouvir pronúncia'}
-                      >
-                        <Volume2 className="w-3.5 h-3.5" />
-                        <span>{isEn ? 'Listen' : 'Ouvir'}</span>
-                      </button>
-                    </div>
-                    <p className="text-xs sm:text-sm text-[#000035] font-medium leading-relaxed bg-[#F8FAFC] p-3 rounded-xl border border-[#607EC9]/20">
-                      "{entry.sentence}"
-                    </p>
-                  </div>
-
-                  {/* AI Corrected Polish Version (if available) */}
-                  {hasAiCorrection && (
-                    <div className="bg-[#EFF6FF] rounded-xl p-3.5 border border-[#9AB4FF]/60 space-y-2">
-                      <div className="flex items-center justify-between">
-                        <span className="text-[10px] font-black text-[#1C4C96] uppercase tracking-wider flex items-center gap-1.5">
-                          <Wand2 className="w-3 h-3 text-[#1C4C96]" />
-                          <span>{isEn ? 'AI Pedagogical Polish:' : 'Versão Aperfeiçoada pela IA:'}</span>
+                  {/* Entry Body: Lesson Review vs Daily Sentence */}
+                  {entry.entryType === 'lesson_review' ? (
+                    <div className="space-y-3">
+                      {/* Badge: Native Friend Teacher */}
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black bg-[#1C4C96]/15 text-[#062863] border border-[#607EC9]/30 flex items-center gap-1.5">
+                          <BookOpen className="w-3 h-3 text-[#1C4C96]" />
+                          <span>{isEn ? `Lesson with ${entry.teacherName || 'Native Friend'}` : `Aula com ${entry.teacherName || 'Native Friend'}`}</span>
                         </span>
-                        <button
-                          type="button"
-                          onClick={() => speakText(entry.correctedSentence!)}
-                          className="text-[#1C4C96] hover:text-[#000035] text-[11px] font-bold flex items-center gap-1 cursor-pointer"
-                          title={isEn ? 'Listen to corrected sentence' : 'Ouvir pronúncia da correção'}
-                        >
-                          <Volume2 className="w-3.5 h-3.5" />
-                          <span>{isEn ? 'Listen' : 'Ouvir'}</span>
-                        </button>
+                        {entry.cacheKeyRef && (
+                          <span className="text-[10px] font-mono font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200">
+                            ✓ {isEn ? 'Analysis Verified' : 'Análise Verificada'}
+                          </span>
+                        )}
                       </div>
-                      <p className="text-xs sm:text-sm font-bold text-[#062863] leading-relaxed">
-                        "{entry.correctedSentence}"
-                      </p>
-                      {entry.explanation && (
-                        <p className="text-[11px] text-[#1C4C96] bg-white/80 p-2 rounded-lg leading-relaxed flex items-start gap-1.5">
-                          <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#1C4C96]" />
-                          <span>{entry.explanation}</span>
+
+                      {/* Quick Review Summary */}
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[10px] font-black text-[#1C4C96] uppercase tracking-wider flex items-center gap-1.5">
+                            <Sparkles className="w-3.5 h-3.5 text-[#F4CA54]" />
+                            <span>{isEn ? 'Quick Review & Remember This:' : 'Resumo Pedagógico da Aula:'}</span>
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => speakText(entry.sentence)}
+                            className="text-[#1C4C96] hover:text-[#000035] text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+                            title={isEn ? 'Listen to summary' : 'Ouvir resumo'}
+                          >
+                            <Volume2 className="w-3.5 h-3.5" />
+                            <span>{isEn ? 'Listen' : 'Ouvir'}</span>
+                          </button>
+                        </div>
+                        <p className="text-xs sm:text-sm text-[#000035] font-semibold leading-relaxed bg-[#F8FAFC] p-3 rounded-xl border border-[#607EC9]/20">
+                          "{entry.sentence}"
                         </p>
+                      </div>
+
+                      {/* Key Corrections (Alt+N) */}
+                      {entry.keyCorrections && entry.keyCorrections.length > 0 && (
+                        <div className="bg-[#EFF6FF] rounded-xl p-3 border border-[#9AB4FF]/50 space-y-1.5">
+                          <span className="text-[10px] font-black text-[#1C4C96] uppercase tracking-wider flex items-center gap-1">
+                            <Wand2 className="w-3 h-3 text-[#1C4C96]" />
+                            <span>{isEn ? 'Essential Corrections:' : 'Principais Correções (Alt + N):'}</span>
+                          </span>
+                          <div className="space-y-1">
+                            {entry.keyCorrections.map((c, cIdx) => (
+                              <div key={cIdx} className="text-xs flex items-center gap-1.5">
+                                <span className="text-red-600 line-through font-medium">✗ {c.original}</span>
+                                <span className="text-[#607EC9]">➜</span>
+                                <span className="text-emerald-700 font-bold">✓ {c.corrected}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Key Grammar Rules */}
+                      {entry.grammarRules && entry.grammarRules.length > 0 && (
+                        <div className="bg-amber-50/60 rounded-xl p-3 border border-amber-200/60 space-y-1.5">
+                          <span className="text-[10px] font-black text-amber-900 uppercase tracking-wider flex items-center gap-1">
+                            <span>⚡ {isEn ? 'Grammar Rules Highlight:' : 'Regras Gramaticais:'}</span>
+                          </span>
+                          <ul className="text-xs text-[#000035] space-y-0.5 list-disc list-inside">
+                            {entry.grammarRules.slice(0, 3).map((r, rIdx) => (
+                              <li key={rIdx} className="leading-relaxed font-medium">{r}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+
+                      {/* Pronunciation Points & Vocabulary */}
+                      {((entry.pronunciationPoints && entry.pronunciationPoints.length > 0) || (entry.wordsUsed && entry.wordsUsed.length > 0)) && (
+                        <div className="flex items-center gap-1.5 flex-wrap pt-1">
+                          <span className="text-[10px] font-bold text-[#607EC9] flex items-center gap-1 mr-1">
+                            <Tag className="w-3 h-3" />
+                            <span>{isEn ? 'Session Terms:' : 'Termos da Aula:'}</span>
+                          </span>
+                          {entry.pronunciationPoints && entry.pronunciationPoints.map((p, pIdx) => (
+                            <span
+                              key={`p-${pIdx}`}
+                              className="px-2 py-0.5 rounded-lg bg-indigo-50 text-indigo-900 text-[10px] font-bold border border-indigo-200"
+                            >
+                              🎯 {p}
+                            </span>
+                          ))}
+                          {entry.wordsUsed && entry.wordsUsed.filter(w => !entry.pronunciationPoints?.includes(w)).map((word, wIdx) => (
+                            <span
+                              key={`w-${wIdx}`}
+                              className="px-2 py-0.5 rounded-lg bg-[#9AB4FF]/20 text-[#062863] text-[10px] font-bold border border-[#9AB4FF]/50"
+                            >
+                              ✨ {word}
+                            </span>
+                          ))}
+                        </div>
                       )}
                     </div>
-                  )}
+                  ) : (
+                    <>
+                      {/* Student Original Sentence */}
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[10px] font-bold text-[#062863] uppercase tracking-wider flex items-center gap-1">
+                            <span>{isEn ? 'Your Sentence:' : 'Sua Frase:'}</span>
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => speakText(entry.sentence)}
+                            className="text-[#1C4C96] hover:text-[#000035] text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+                            title={isEn ? 'Listen to sentence' : 'Ouvir pronúncia'}
+                          >
+                            <Volume2 className="w-3.5 h-3.5" />
+                            <span>{isEn ? 'Listen' : 'Ouvir'}</span>
+                          </button>
+                        </div>
+                        <p className="text-xs sm:text-sm text-[#000035] font-medium leading-relaxed bg-[#F8FAFC] p-3 rounded-xl border border-[#607EC9]/20">
+                          "{entry.sentence}"
+                        </p>
+                      </div>
 
-                  {/* Words Used Chips */}
-                  {entry.wordsUsed && entry.wordsUsed.length > 0 && (
-                    <div className="flex items-center gap-1.5 flex-wrap pt-1">
-                      <span className="text-[10px] font-bold text-[#607EC9] flex items-center gap-1 mr-1">
-                        <Tag className="w-3 h-3" />
-                        <span>{isEn ? 'Words included:' : 'Palavras incluídas:'}</span>
-                      </span>
-                      {entry.wordsUsed.map((word, wIdx) => (
-                        <span
-                          key={wIdx}
-                          className="px-2 py-0.5 rounded-lg bg-[#9AB4FF]/20 text-[#062863] text-[10px] font-bold border border-[#9AB4FF]/50"
-                        >
-                          {word}
-                        </span>
-                      ))}
-                    </div>
+                      {/* AI Corrected Polish Version (if available) */}
+                      {hasAiCorrection && (
+                        <div className="bg-[#EFF6FF] rounded-xl p-3.5 border border-[#9AB4FF]/60 space-y-2">
+                          <div className="flex items-center justify-between">
+                            <span className="text-[10px] font-black text-[#1C4C96] uppercase tracking-wider flex items-center gap-1.5">
+                              <Wand2 className="w-3 h-3 text-[#1C4C96]" />
+                              <span>{isEn ? 'AI Pedagogical Polish:' : 'Versão Aperfeiçoada pela IA:'}</span>
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => speakText(entry.correctedSentence!)}
+                              className="text-[#1C4C96] hover:text-[#000035] text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+                              title={isEn ? 'Listen to corrected sentence' : 'Ouvir pronúncia da correção'}
+                            >
+                              <Volume2 className="w-3.5 h-3.5" />
+                              <span>{isEn ? 'Listen' : 'Ouvir'}</span>
+                            </button>
+                          </div>
+                          <p className="text-xs sm:text-sm font-bold text-[#062863] leading-relaxed">
+                            "{entry.correctedSentence}"
+                          </p>
+                          {entry.explanation && (
+                            <p className="text-[11px] text-[#1C4C96] bg-white/80 p-2 rounded-lg leading-relaxed flex items-start gap-1.5">
+                              <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#1C4C96]" />
+                              <span>{entry.explanation}</span>
+                            </p>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Words Used Chips */}
+                      {entry.wordsUsed && entry.wordsUsed.length > 0 && (
+                        <div className="flex items-center gap-1.5 flex-wrap pt-1">
+                          <span className="text-[10px] font-bold text-[#607EC9] flex items-center gap-1 mr-1">
+                            <Tag className="w-3 h-3" />
+                            <span>{isEn ? 'Words included:' : 'Palavras incluídas:'}</span>
+                          </span>
+                          {entry.wordsUsed.map((word, wIdx) => (
+                            <span
+                              key={wIdx}
+                              className="px-2 py-0.5 rounded-lg bg-[#9AB4FF]/20 text-[#062863] text-[10px] font-bold border border-[#9AB4FF]/50"
+                            >
+                              {word}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </>
                   )}
                 </div>
               );
