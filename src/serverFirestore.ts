@@ -2262,7 +2262,7 @@ export async function savePedagogicalTransformationToFirestoreServer(
  */
 export async function fetchPedagogicalTransformationFromFirestoreServer(
   compositeCacheKeyOrSessionKey: string,
-  options?: { language?: string; contentHash?: string }
+  options?: { language?: string; contentHash?: string; promptVersion?: string }
 ): Promise<any | null> {
   const db = getFirestoreDb();
   if (!db || !compositeCacheKeyOrSessionKey) return null;
@@ -2277,7 +2277,9 @@ export async function fetchPedagogicalTransformationFromFirestoreServer(
       if (snap && snap.exists) {
         const data = snap.data();
         if (data && data.isAiGenerated && !data.isProvisional) {
-          if (!options?.contentHash || data.contentHash === options.contentHash) {
+          const matchHash = !options?.contentHash || data.contentHash === options.contentHash;
+          const matchPv = !options?.promptVersion || data.promptVersion === options.promptVersion;
+          if (matchHash && matchPv) {
             return data;
           }
         }
@@ -2294,10 +2296,11 @@ export async function fetchPedagogicalTransformationFromFirestoreServer(
         if (data && data.isAiGenerated && !data.isProvisional) {
           const matchLang = !options?.language || data.language === options.language;
           const matchHash = !options?.contentHash || data.contentHash === options.contentHash;
-          if (matchLang && matchHash) {
+          const matchPv = !options?.promptVersion || data.promptVersion === options.promptVersion;
+          if (matchLang && matchHash && matchPv) {
             return data;
           }
-          if (matchHash && !candidate) {
+          if (matchHash && matchPv && !candidate) {
             candidate = data;
           }
         }

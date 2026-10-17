@@ -35,6 +35,7 @@ import {
   resolveCefrLevel,
   extractNotesMarkings,
   computeNotesHash,
+  PEDAGOGICAL_PROMPT_VERSION,
 } from '../utils/pedagogicalTransformer';
 import { syncSessionVocabularyToStudentDictionary } from '../utils/sessionVocabularySync';
 import { normalizeDictionaryWord } from '../utils/studentDictionaryLibrary';
@@ -498,9 +499,10 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
       lastLoadedSessionRef.current.lang === currentLanguage &&
       transformation &&
       !transformation.isFallback &&
-      !transformation.isProvisional
+      !transformation.isProvisional &&
+      transformation.promptVersion === PEDAGOGICAL_PROMPT_VERSION
     ) {
-      // Content has not changed, transformation already loaded; avoid redundant network requests
+      // Content has not changed and promptVersion matches; avoid redundant network requests
       return;
     }
     loadPedagogicalNotes(false).then(() => {
@@ -1046,11 +1048,13 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                           </div>
                         )}
 
-                        {/* Natural Examples (if any) */}
+                        {/* Natural or Hypothetical Didactic Examples */}
                         {Array.isArray(item.twoExamples) && item.twoExamples.length > 0 && (
                           <div className="pt-2 border-t border-slate-100 pl-1 text-xs space-y-1">
                             <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
-                              {isEn ? 'Natural examples:' : 'Exemplos no dia a dia:'}
+                              {item.isPendingConfirmation
+                                ? (isEn ? 'Hypothetical didactic examples (to confirm with teacher):' : 'Exemplos didáticos hipotéticos (para confirmar com o professor):')
+                                : (isEn ? 'Natural examples:' : 'Exemplos no dia a dia:')}
                             </span>
                             <div className="space-y-0.5 pl-2 text-slate-700 italic">
                               {item.twoExamples.map((ex, exIdx) => (

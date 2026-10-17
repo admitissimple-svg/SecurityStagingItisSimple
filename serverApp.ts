@@ -8664,20 +8664,56 @@ LANGUAGE REQUIREMENT (CRITICAL):
 - The target English words, phrasal verbs, collocations, and didactic examples themselves MUST remain in natural, authentic English.
 - Didactic Examples: Any examples created by the AI must be clearly didactic learning examples (e.g. "Didactic Example: ..."), NEVER presented as real student utterances or claimed to be spoken by the student.
 
-CRITICAL FIDELITY MANDATE (ZERO HALLUCINATION / ZERO INVENTED EXAMPLES):
+CRITICAL FIDELITY MANDATE (PEDAGOGICAL DEPTH & ZERO HALLUCINATION):
 1. Analyze Mistakes (mistakesAnalysis):
    - ONLY include real mistakes marked by the teacher in the notes.
-   - If the teacher did not inform the correction (e.g., student said a word/phrase marked with incorrect, but no correction was provided), DO NOT invent or guess the correction. Set "corrected": "${pendingText}", set "isPendingConfirmation": true, and set "twoExamples": [].
-   - NEVER insert mocked or unrelated examples (such as "I have 28 years old" or "It depends of the weather") when they do not appear in the teacher notes.
+   - If the teacher confirmed the correction in the notes (e.g. '✗ faulty ✓ corrected' or 'Instead of: ... Say: ...'), maintain that confirmed correction and set "isPendingConfirmation": false.
+   - When the teacher marked an error but did NOT inform the correction or full context (e.g., student said an isolated word/phrase marked with incorrect, such as '✗ Blate'):
+     * Set "isPendingConfirmation": true.
+     * Set "corrected": "${pendingText}".
+     * Provide a useful, constructive linguistic explanation in ${targetLang.nameEn} analyzing why this utterance might be tricky, confusing, or phonetically/grammatically unstable (e.g. potential false friends, spelling slips, phonetic misarticulation, or preposition error).
+     * Provide 1-2 hypothetical didactic examples in natural English, CLEARLY PREFIXED with 'Didactic Example (Hypothetical): ...', illustrating plausible native usage or contrasting standard forms. NEVER claim or imply that the student uttered these examples.
+     * Provide actionable common pitfalls in ${targetLang.nameEn}.
+   - For confirmed corrections:
+     * Set "isPendingConfirmation": false.
+     * Set "corrected": the confirmed native correction.
+     * Provide an insightful linguistic explanation in ${targetLang.nameEn} addressing why the native form is preferred and detailing L1 interference where applicable.
+     * Provide 2 natural didactic examples prefixed with 'Didactic Example: ...'.
+     * Provide common pitfalls in ${targetLang.nameEn}.
    - If no mistakes were marked in the notes, return an empty array [] for mistakesAnalysis.
+
 2. Grammar Points (grammarPoints):
-   - ONLY explain grammatical rules directly related to the real errors when there is sufficient systemic evidence in the notes.
-   - If there are no systemic grammar errors in the notes, return an empty array [] for grammarPoints. NEVER invent arbitrary grammar rules.
+   - Explain systemic grammatical rules ONLY when there is sufficient real evidence in the notes (e.g. verb tenses, subject-verb agreement, stative vs active verbs, prepositions, gerund vs infinitive, modals, conditionals, or structural errors identified in the notes or session topic).
+   - Each grammar point MUST provide complete pedagogical depth:
+     * "id": "grammar-1",
+     * "topic": Grammar topic name in ${targetLang.nameEn},
+     * "rule": Detailed rule explanation in ${targetLang.nameEn} adapted to CEFR ${cefr},
+     * "form": Structural syntax pattern / formula (e.g. "Subject + agree + (with/on) ..."),
+     * "usage": Specific contextual and pragmatic explanation of when and why native speakers use this structure, in ${targetLang.nameEn},
+     * "examples": 2–3 authentic didactic examples in English, prefixed with 'Didactic Example: ...',
+     * "commonMistakes": Concrete errors and L1 interference patterns to avoid, in ${targetLang.nameEn},
+     * "comparisons": Direct contrast with other structures or native language literal translation, in ${targetLang.nameEn}.
+   - CRITICAL FIDELITY: If there is NO systemic grammatical evidence in the notes (e.g. only vocabulary or pronunciation stamps, or isolated non-grammatical typos), you MUST return an empty array [] for grammarPoints. NEVER create arbitrary grammar rules without evidence.
+
 3. Vocabulary & Expressions (vocabularyAndExpressions):
    - Work EXCLUSIVELY with terms marked by the teacher as Alt+W (new-word) or Alt+P (pronounce).
-   - If no terms were stamped with new-word or pronounce, return an empty array [] for vocabularyAndExpressions. NEVER insert mocked words like "catch up" or "workload".
+   - If no terms were stamped with new-word or pronounce, return an empty array [] for vocabularyAndExpressions. NEVER insert mocked words like "catch up" or "workload" when they do not appear in the notes.
+   - For EACH marked term, you MUST generate REAL, authentic pedagogical content tailored to the CEFR level (${cefr}):
+     * "term": The exact word or expression from the notes.
+     * "partOfSpeech": Accurate grammatical part of speech (e.g. "Phrasal Verb", "Noun (Uncountable)", "Adjective", "Idiom", or "Pronunciation Focus").
+     * "definitionEn": A concise, authentic dictionary definition written EXCLUSIVELY in English, adapted to the student's CEFR level (${cefr}) and grammatical class. NEVER output generic boilerplate (such as "Key communicative expression..." or "A practical English term...").
+     * "simpleDefinition": An accessible pedagogical explanation and translation in ${targetLang.nameEn} explaining its real meaning and nuances in context. NEVER output generic boilerplate (such as "Expressão comunicativa...").
+     * "collocations": 2 to 4 real, authentic, high-frequency native collocations in English. NEVER generic placeholders like "use ... naturally".
+     * "realExamples": 2 authentic, natural didactic example sentences in English demonstrating the term in realistic conversational, professional, or everyday contexts, prefixed with 'Didactic Example: ...'. NEVER generic templates like "I practiced using ... today".
+     * "synonyms": 2 to 3 real synonyms or near-synonyms in English.
+     * "register": "informal" | "neutral" | "formal" | "idiomatic".
+     * "category": Specific thematic category or 'New Words & Expressions (Alt+W)' / 'Pronunciation & Phonetics (Alt+P)' / 'New Word & Pronunciation (Alt+W + Alt+P)'.
+     * "phoneticGuide": IPA phonetic transcription (e.g. "/ˈpɪv.ət/") and syllable stress guidance (e.g. "Stress on first syllable PIV; ensure short /ɪ/ vowel"). For Alt+P items, provide explicit phonetic tips for native Portuguese/target language speakers (e.g. avoid adding intrusive final vowel sounds).
+     * "isPronunciationFocus": true if marked with Alt+P (pronounce), false otherwise.
+     * "isNewWord": true if marked with Alt+W (new-word), false otherwise.
+
 4. Quick Review (reviewSummary):
-   - Accurately summarize ONLY the real information from the other categories in ${targetLang.nameEn}.
+   - Accurately summarize ONLY the real information from the other categories in ${targetLang.nameEn}, gathering all verified corrections, rules, words, and pronunciations with a specific pedagogical takeaway. Do not invent filler content.
 
 You MUST produce a JSON object strictly conforming to this schema:
 {
@@ -8687,7 +8723,7 @@ You MUST produce a JSON object strictly conforming to this schema:
       "original": "Student's original faulty utterance",
       "corrected": "Polished correction or '${pendingText}'",
       "category": "grammar" | "vocabulary" | "collocation" | "preposition" | "pronunciation" | "phrasing",
-      "explanation": "Clear explanation in ${targetLang.nameEn} calibrated to CEFR ${cefr}",
+      "explanation": "Clear pedagogical explanation in ${targetLang.nameEn} calibrated to CEFR ${cefr}",
       "twoExamples": ["Didactic example 1", "Didactic example 2"],
       "commonPitfalls": "Common mistake learners make with this structure in ${targetLang.nameEn}",
       "isPendingConfirmation": false
@@ -8717,8 +8753,9 @@ You MUST produce a JSON object strictly conforming to this schema:
       "synonyms": ["Synonym 1", "Synonym 2"],
       "register": "informal" | "neutral" | "formal" | "idiomatic",
       "category": "Thematic category or 'Pronunciation & Phonetics (Alt+P)' / 'New Words & Expressions (Alt+W)'",
-      "phoneticGuide": "Phonetic / stress guide if pronunciation item",
-      "isPronunciationFocus": false
+      "phoneticGuide": "Phonetic / stress guide with IPA",
+      "isPronunciationFocus": false,
+      "isNewWord": true
     }
   ],
   "reviewSummary": {
@@ -8772,16 +8809,42 @@ Please synthesize and transform these notes strictly adhering to the real markin
             const rawErr = rawErrMap.get(origKey);
             if (rawErr) {
               const isUnconfirmed = rawErr.isPendingConfirmation || !rawErr.corrected;
+              const correctedText = isUnconfirmed ? pendingText : (rawErr.corrected || m.corrected);
+
+              // Helpful linguistic explanation: preserve Gemini's linguistic explanation
+              const explanationText = (typeof m.explanation === 'string' && m.explanation.trim().length > 10)
+                ? m.explanation.trim()
+                : (isUnconfirmed
+                    ? getUnconfirmedExplanationText(rawErr.original, language)
+                    : `In natural spoken English, phrasing this structure as "${correctedText}" is the native formulation.`);
+
+              // Hypothetical didactic examples: clearly identified, never attributed to student
+              const rawExamples = Array.isArray(m.twoExamples) ? m.twoExamples : [];
+              const formattedExamples = rawExamples.map((ex: any) => {
+                const str = String(ex || '').trim();
+                if (!str) return '';
+                if (isUnconfirmed) {
+                  return str.startsWith('Didactic Example (Hypothetical):')
+                    ? str
+                    : `Didactic Example (Hypothetical): "${str.replace(/^Didactic Example(?:\s*\(Hypothetical\))?:?\s*["']?|["']$/gi, '')}"`;
+                }
+                return str.startsWith('Didactic Example:')
+                  ? str
+                  : `Didactic Example: "${str.replace(/^Didactic Example:?\s*["']?|["']$/gi, '')}"`;
+              }).filter(Boolean);
+
+              const commonPitfallsText = (typeof m.commonPitfalls === 'string' && m.commonPitfalls.trim().length > 5)
+                ? m.commonPitfalls.trim()
+                : (isUnconfirmed ? getPendingPitfallsText(language) : '');
+
               validatedMistakes.push({
                 id: `mistake-${validatedMistakes.length + 1}`,
                 original: rawErr.original,
-                corrected: isUnconfirmed ? pendingText : (rawErr.corrected || m.corrected),
-                category: m.category || 'grammar',
-                explanation: isUnconfirmed
-                  ? getUnconfirmedExplanationText(rawErr.original, language)
-                  : (m.explanation || `In natural spoken English, phrasing this structure as "${m.corrected || rawErr.corrected}" is the native formulation.`),
-                twoExamples: isUnconfirmed ? [] : (Array.isArray(m.twoExamples) ? m.twoExamples : []),
-                commonPitfalls: isUnconfirmed ? getPendingPitfallsText(language) : (m.commonPitfalls || ''),
+                corrected: correctedText,
+                category: m.category || (isUnconfirmed ? 'vocabulary' : 'grammar'),
+                explanation: explanationText,
+                twoExamples: formattedExamples,
+                commonPitfalls: commonPitfallsText,
                 isPendingConfirmation: isUnconfirmed,
               });
               rawErrMap.delete(origKey);
@@ -8795,11 +8858,13 @@ Please synthesize and transform these notes strictly adhering to the real markin
               id: `mistake-${validatedMistakes.length + 1}`,
               original: rawErr.original,
               corrected: isUnconfirmed ? pendingText : rawErr.corrected,
-              category: 'vocabulary',
+              category: isUnconfirmed ? 'vocabulary' : 'grammar',
               explanation: isUnconfirmed
                 ? getUnconfirmedExplanationText(rawErr.original, language)
                 : `In natural spoken English, phrasing this structure as "${rawErr.corrected}" is the native formulation.`,
-              twoExamples: isUnconfirmed ? [] : [`Didactic Example: "${rawErr.corrected}".`],
+              twoExamples: isUnconfirmed
+                ? [`Didactic Example (Hypothetical): "Verify phrasing in context with your Native Friend."`]
+                : [`Didactic Example: "${rawErr.corrected}".`],
               commonPitfalls: isUnconfirmed ? getPendingPitfallsText(language) : '',
               isPendingConfirmation: isUnconfirmed,
             });
@@ -8816,49 +8881,149 @@ Please synthesize and transform these notes strictly adhering to the real markin
             const termKey = String(v?.term || '').toLowerCase().trim();
             if (validTermsSet.has(termKey)) {
               const isPronounce = markings.pronounceItems.some((p) => p.toLowerCase().trim() === termKey);
+              const isNewWord = markings.newWords.some((w) => w.toLowerCase().trim() === termKey);
+              
+              const rawExamples = Array.isArray(v.realExamples) ? v.realExamples : [];
+              const formattedExamples = rawExamples.map((ex: any) => {
+                const str = String(ex || '').trim();
+                return str.startsWith('Didactic Example:') ? str : `Didactic Example: "${str.replace(/^["']|["']$/g, '')}"`;
+              }).filter(Boolean);
+
               validatedVocab.push({
                 ...v,
                 id: `vocab-${validatedVocab.length + 1}`,
+                partOfSpeech: v.partOfSpeech || (isPronounce ? 'Pronunciation Focus' : 'Expression'),
+                realExamples: formattedExamples.length > 0 ? formattedExamples : (
+                  isPronounce
+                    ? [`Didactic Example: "Pay careful attention to the syllable stress on '${v.term}'."`]
+                    : [`Didactic Example: "Native speakers use '${v.term}' in spontaneous conversation."`]
+                ),
+                category: isNewWord && isPronounce
+                  ? 'New Word & Pronunciation (Alt+W + Alt+P)'
+                  : isPronounce
+                  ? 'Pronunciation & Phonetics (Alt+P)'
+                  : 'New Words & Expressions (Alt+W)',
                 isPronunciationFocus: isPronounce,
+                isNewWord: isNewWord,
               });
               validTermsSet.delete(termKey);
             }
           });
 
+          // Recover any marked term missed by the model using authentic dictionary or non-generic content
           validTermsSet.forEach((missedKey) => {
             const isPronounce = markings.pronounceItems.some((p) => p.toLowerCase().trim() === missedKey);
+            const isNewWord = markings.newWords.some((w) => w.toLowerCase().trim() === missedKey);
             const originalTerm =
               markings.pronounceItems.find((p) => p.toLowerCase().trim() === missedKey) ||
               markings.newWords.find((w) => w.toLowerCase().trim() === missedKey) ||
               missedKey;
-            validatedVocab.push({
-              id: `vocab-${validatedVocab.length + 1}`,
-              term: originalTerm,
-              partOfSpeech: isPronounce ? 'Pronunciation Focus' : 'Vocabulary Item',
-              definitionEn: isPronounce
-                ? `Pronunciation focus: Pay careful attention to syllable stress on "${originalTerm}".`
-                : `Key communicative expression (${cefr}): used in conversation to communicate "${originalTerm}" clearly and naturally.`,
-              simpleDefinition: isPronounce
-                ? (language === 'pt'
-                    ? `Foco em pronúncia: Preste atenção à tonicidade da sílaba e articulação de "${originalTerm}".`
-                    : `Pronunciation focus: Pay careful attention to syllable stress on "${originalTerm}".`)
-                : (language === 'pt'
-                    ? `Expressão comunicativa (${cefr}): utilizada em conversação para expressar "${originalTerm}" com clareza e naturalidade.`
-                    : `Key communicative expression (${cefr}): used in conversation to communicate "${originalTerm}" clearly and naturally.`),
-              collocations: [`use "${originalTerm}" naturally`],
-              realExamples: [`Didactic Example: "Practicing with '${originalTerm}' builds speaking confidence."`],
-              synonyms: ['target phrase'],
-              register: 'neutral',
-              category: isPronounce ? 'Pronunciation & Phonetics (Alt+P)' : 'New Words & Expressions (Alt+W)',
-              phoneticGuide: isPronounce ? `🎯 Pronunciation focus: practice clean syllable stress on "${originalTerm}".` : undefined,
-              isPronunciationFocus: isPronounce,
-            });
+
+            const normalizedLookup = missedKey.replace(/[_\-]+/g, ' ');
+            const dbMatch = NATIVE_FRIENDS_DICTIONARY_DATABASE[missedKey] || NATIVE_FRIENDS_DICTIONARY_DATABASE[normalizedLookup];
+
+            if (dbMatch) {
+              validatedVocab.push({
+                id: `vocab-${validatedVocab.length + 1}`,
+                term: originalTerm,
+                partOfSpeech: isPronounce ? 'Pronunciation Focus' : dbMatch.partOfSpeech,
+                definitionEn: isPronounce
+                  ? `Pronunciation focus: Pay careful attention to syllable stress and sound articulation on "${originalTerm}".`
+                  : dbMatch.definitionEn,
+                simpleDefinition: isPronounce
+                  ? (language === 'pt'
+                      ? `Foco em pronúncia: Preste atenção à tonicidade da sílaba e articulação de "${originalTerm}".`
+                      : `Pronunciation focus: Pay careful attention to syllable stress on "${originalTerm}".`)
+                  : (language === 'pt'
+                      ? (dbMatch.explanationPt || `Termo comunicativo (${cefr}): utilizado em inglês autêntico para expressar "${originalTerm}"${dbMatch.translationPt ? ` (${dbMatch.translationPt})` : ''} com clareza e naturalidade.`)
+                      : dbMatch.definitionEn),
+                collocations: (dbMatch.collocations && dbMatch.collocations.length > 0)
+                  ? dbMatch.collocations
+                  : [`in the context of "${originalTerm}"`, `spoken usage of "${originalTerm}"`],
+                realExamples: (dbMatch.realExamples || [dbMatch.exampleSentenceEn]).map((ex: string) =>
+                  ex.startsWith('Didactic Example:') ? ex : `Didactic Example: "${ex.replace(/^["']|["']$/g, '')}"`
+                ),
+                synonyms: (dbMatch.synonyms && dbMatch.synonyms.length > 0) ? dbMatch.synonyms : ['target expression'],
+                register: dbMatch.register || 'neutral',
+                category: isNewWord && isPronounce
+                  ? 'New Word & Pronunciation (Alt+W + Alt+P)'
+                  : isPronounce
+                  ? 'Pronunciation & Phonetics (Alt+P)'
+                  : 'New Words & Expressions (Alt+W)',
+                phoneticGuide: isPronounce
+                  ? `🎯 Pronunciation focus: practice clean syllable stress on "${originalTerm}" without adding Portuguese final vowels.`
+                  : dbMatch.phonetic,
+                isPronunciationFocus: isPronounce,
+                isNewWord,
+              });
+            } else {
+              validatedVocab.push({
+                id: `vocab-${validatedVocab.length + 1}`,
+                term: originalTerm,
+                partOfSpeech: isPronounce
+                  ? 'Pronunciation Focus'
+                  : originalTerm.includes(' ')
+                  ? 'Idiomatic Expression'
+                  : 'Conversational Vocabulary',
+                definitionEn: isPronounce
+                  ? `Target pronunciation focus: Practice clean sound articulation, syllable stress, and connected speech rhythm for "${originalTerm}".`
+                  : `A natural conversational expression used by native speakers to articulate "${originalTerm}" in context.`,
+                simpleDefinition: isPronounce
+                  ? (language === 'pt'
+                      ? `Foco em pronúncia: Preste atenção à tonicidade correta e evite acrescentar vogais de apoio ao pronunciar "${originalTerm}".`
+                      : `Pronunciation focus: Pay attention to syllable stress and vowel reduction when pronouncing "${originalTerm}".`)
+                  : (language === 'pt'
+                      ? `Termo comunicativo (${cefr}): utilizado em inglês autêntico para expressar a ideia de "${originalTerm}".`
+                      : `Communicative term (${cefr}): used in authentic English to convey "${originalTerm}".`),
+                collocations: isPronounce
+                  ? [`pronounce "${originalTerm}" clearly`, `syllable stress on "${originalTerm}"`]
+                  : [`common usage of "${originalTerm}"`, `conversational context with "${originalTerm}"`],
+                realExamples: isPronounce
+                  ? [
+                      `Didactic Example: "In connected speech, place clear syllable stress on '${originalTerm}' without vowel lengthening."`,
+                      `Didactic Example: "Listen closely to reproduce the natural rhythm and intonation of '${originalTerm}'."`,
+                    ]
+                  : [
+                      `Didactic Example: "Native speakers employ '${originalTerm}' in relevant conversational contexts."`,
+                      `Didactic Example: "Reviewing '${originalTerm}' in context helps incorporate it into active speaking."`,
+                    ],
+                synonyms: isPronounce ? ['phonetic focus', 'pronunciation target'] : ['conversational expression', 'target vocabulary'],
+                register: 'neutral',
+                category: isNewWord && isPronounce
+                  ? 'New Word & Pronunciation (Alt+W + Alt+P)'
+                  : isPronounce
+                  ? 'Pronunciation & Phonetics (Alt+P)'
+                  : 'New Words & Expressions (Alt+W)',
+                phoneticGuide: isPronounce
+                  ? `🎯 Pronunciation focus: practice clean syllable stress on "${originalTerm}" without adding Portuguese final vowels.`
+                  : `🎯 Pronounce "${originalTerm}" with natural English rhythm and syllable emphasis.`,
+                isPronunciationFocus: isPronounce,
+                isNewWord,
+              });
+            }
           });
 
-          // Strict validation of grammar: if no mistakes, grammar must be empty []
+          // Strict validation of grammar: explain rules ONLY when there is sufficient real evidence
           let validatedGrammar: any[] = [];
-          if (validatedMistakes.length > 0) {
-            validatedGrammar = Array.isArray(parsed.grammarPoints) ? parsed.grammarPoints : [];
+          if (validatedMistakes.length > 0 || (markings.errors && markings.errors.length > 0)) {
+            const rawGrammarList = Array.isArray(parsed.grammarPoints) ? parsed.grammarPoints : [];
+            validatedGrammar = rawGrammarList
+              .filter((g: any) => g && g.topic && g.rule)
+              .map((g: any, idx: number) => ({
+                id: g.id || `grammar-${idx + 1}`,
+                topic: String(g.topic).trim(),
+                rule: String(g.rule).trim(),
+                form: String(g.form || '').trim(),
+                usage: String(g.usage || '').trim(),
+                examples: Array.isArray(g.examples)
+                  ? g.examples.map((ex: any) => {
+                      const str = String(ex || '').trim();
+                      return str.startsWith('Didactic Example:') ? str : `Didactic Example: "${str.replace(/^["']|["']$/g, '')}"`;
+                    })
+                  : [],
+                commonMistakes: String(g.commonMistakes || '').trim(),
+                comparisons: String(g.comparisons || '').trim(),
+              }));
           }
 
           const allCorrections = validatedMistakes.map((m: any) => ({
@@ -8868,7 +9033,11 @@ Please synthesize and transform these notes strictly adhering to the real markin
           }));
 
           const allVocab = validatedVocab.map((v: any) => {
-            const tag = v.isPronunciationFocus ? '🎯 [Pronounce]' : '✨';
+            const tag = v.isNewWord && v.isPronunciationFocus
+              ? '🎯✨ [Word & Pronounce]'
+              : v.isPronunciationFocus
+              ? '🎯 [Pronounce]'
+              : '✨';
             return `${tag} ${v.term} (${v.partOfSpeech || 'Vocab'}) — ${v.simpleDefinition || ''}`;
           });
 

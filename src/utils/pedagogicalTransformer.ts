@@ -63,7 +63,7 @@ export interface PedagogicalReviewSummary {
   rememberThis: string;
 }
 
-export const PEDAGOGICAL_PROMPT_VERSION = 'v2.1-pedagogical-gemini';
+export const PEDAGOGICAL_PROMPT_VERSION = 'v2.2-pedagogical-depth';
 
 export interface PedagogicalLessonTransformation {
   lessonId?: string;
@@ -307,6 +307,7 @@ export function generateLocalPedagogicalTransformation(params: {
   lessonId?: string;
   sessionKey?: string;
   language?: string;
+  includeHypotheticalExamples?: boolean;
 }): PedagogicalLessonTransformation {
   const {
     rawNotes,
@@ -319,6 +320,7 @@ export function generateLocalPedagogicalTransformation(params: {
     lessonId,
     sessionKey: customSessionKey,
     language = 'pt',
+    includeHypotheticalExamples = false,
   } = params;
 
   const cleanLang = (language || 'pt').toLowerCase().trim();
@@ -417,13 +419,22 @@ export function generateLocalPedagogicalTransformation(params: {
     if (!hasCorrection) {
       // Teacher marked the mistake but did not provide the correction (e.g. "Blate")
       // Do NOT guess or hallucinate a correction; mark as pending confirmation in student language
+      // HOTFIX 4B.11: allow helpful linguistic explanations and hypothetical didactic examples clearly identified,
+      // without attributing them to the student.
+      const hypotheticalExamples = params.includeHypotheticalExamples
+        ? [
+            `Didactic Example (Hypothetical): "Verify the intended context of '${rawOrig}' with your Native Friend."`,
+            `Didactic Example (Hypothetical): "Practice clear articulation to avoid phonetic confusion during spontaneous speech."`,
+          ]
+        : [];
+
       mistakesAnalysis.push({
         id: `mistake-${mistakesAnalysis.length + 1}`,
         original: rawOrig,
         corrected: getPendingConfirmationText(language),
         category: 'vocabulary',
         explanation: getUnconfirmedExplanationText(rawOrig, language),
-        twoExamples: [],
+        twoExamples: hypotheticalExamples,
         commonPitfalls: getPendingPitfallsText(language),
         isPendingConfirmation: true,
       });
@@ -574,20 +585,22 @@ export function generateLocalPedagogicalTransformation(params: {
       ? {
           partOfSpeech: isPronounce ? 'Pronunciation Focus' : dbMatch.partOfSpeech,
           definitionEn: isPronounce
-            ? `Pronunciation focus: Pay careful attention to syllable stress on "${rawTrimmed}".`
+            ? `Pronunciation focus: Pay careful attention to syllable stress and sound articulation on "${rawTrimmed}".`
             : dbMatch.definitionEn,
           simpleDefinition: isPronounce
             ? (isPt
                 ? `Foco em pronúncia: Preste atenção à tonicidade da sílaba e articulação de "${rawTrimmed}".`
                 : `Pronunciation focus: Pay careful attention to syllable stress on "${rawTrimmed}".`)
             : (isPt
-                ? (dbMatch.explanationPt || `Expressão comunicativa (${cefrMeta.cefr}): utilizada em conversação para expressar "${rawTrimmed}"${dbMatch.translationPt ? ` (${dbMatch.translationPt})` : ''} com clareza e naturalidade.`)
+                ? (dbMatch.explanationPt || `Termo comunicativo (${cefrMeta.cefr}): utilizado em inglês autêntico para expressar "${rawTrimmed}"${dbMatch.translationPt ? ` (${dbMatch.translationPt})` : ''} com clareza e naturalidade.`)
                 : dbMatch.definitionEn),
-          collocations: dbMatch.collocations || [`use "${rawTrimmed}" naturally`],
+          collocations: (dbMatch.collocations && dbMatch.collocations.length > 0)
+            ? dbMatch.collocations
+            : [`in the context of "${rawTrimmed}"`, `spoken usage of "${rawTrimmed}"`],
           realExamples: (dbMatch.realExamples || [dbMatch.exampleSentenceEn]).map((ex: string) =>
             ex.startsWith('Didactic Example:') ? ex : `Didactic Example: "${ex.replace(/^["']|["']$/g, '')}"`
           ),
-          synonyms: dbMatch.synonyms || ['target phrase'],
+          synonyms: (dbMatch.synonyms && dbMatch.synonyms.length > 0) ? dbMatch.synonyms : ['target expression'],
           register: dbMatch.register || ('neutral' as const),
           category: isNewWord && isPronounce
             ? 'New Word & Pronunciation (Alt+W + Alt+P)'
@@ -602,23 +615,30 @@ export function generateLocalPedagogicalTransformation(params: {
             ? 'Pronunciation Focus'
             : cleanWord.includes(' ')
             ? 'Idiomatic Expression'
-            : 'Vocabulary Item',
+            : 'Conversational Vocabulary',
           definitionEn: isPronounce
-            ? `Pronunciation focus: Practice clean syllable stress on "${rawTrimmed}".`
-            : `Key communicative expression (${cefrMeta.cefr}): used in conversation to communicate "${rawTrimmed}" clearly and naturally.`,
+            ? `Target pronunciation focus: Practice clean sound articulation, syllable stress, and connected speech rhythm for "${rawTrimmed}".`
+            : `A natural conversational expression used by native speakers to articulate "${rawTrimmed}" in context.`,
           simpleDefinition: isPronounce
             ? (isPt
-                ? `Foco em pronúncia: Preste atenção à tonicidade da sílaba e articulação de "${rawTrimmed}".`
-                : `Pronunciation focus: Pay careful attention to syllable stress on "${rawTrimmed}".`)
+                ? `Foco em pronúncia: Preste atenção à tonicidade correta e evite acrescentar vogais de apoio ao pronunciar "${rawTrimmed}".`
+                : `Pronunciation focus: Pay attention to syllable stress and vowel reduction when pronouncing "${rawTrimmed}".`)
             : (isPt
-                ? `Expressão comunicativa (${cefrMeta.cefr}): utilizada em conversação para expressar "${rawTrimmed}" com clareza e naturalidade.`
-                : `Key communicative expression (${cefrMeta.cefr}): used in conversation to communicate "${rawTrimmed}" clearly and naturally.`),
-          collocations: [`use "${rawTrimmed}" naturally`, `frequently heard with "${rawTrimmed}"`],
-          realExamples: [
-            `Didactic Example: "I practiced using '${rawTrimmed}' naturally in our conversation today."`,
-            `Didactic Example: "Understanding how native speakers say '${rawTrimmed}' makes your speech flow smoothly."`,
-          ],
-          synonyms: ['natural expression', 'target phrase'],
+                ? `Termo comunicativo (${cefrMeta.cefr}): utilizado em inglês autêntico para expressar a ideia de "${rawTrimmed}".`
+                : `Communicative term (${cefrMeta.cefr}): used in authentic English to convey "${rawTrimmed}".`),
+          collocations: isPronounce
+            ? [`pronounce "${rawTrimmed}" clearly`, `syllable stress on "${rawTrimmed}"`]
+            : [`common usage of "${rawTrimmed}"`, `conversational context with "${rawTrimmed}"`],
+          realExamples: isPronounce
+            ? [
+                `Didactic Example: "In connected speech, place clear syllable stress on '${rawTrimmed}' without vowel lengthening."`,
+                `Didactic Example: "Listen closely to reproduce the natural rhythm and intonation of '${rawTrimmed}'."`,
+              ]
+            : [
+                `Didactic Example: "Native speakers employ '${rawTrimmed}' in relevant conversational contexts."`,
+                `Didactic Example: "Reviewing '${rawTrimmed}' in context helps incorporate it into active speaking."`,
+              ],
+          synonyms: isPronounce ? ['phonetic focus', 'pronunciation target'] : ['conversational expression', 'target vocabulary'],
           register: 'neutral' as const,
           category: isNewWord && isPronounce
             ? 'New Word & Pronunciation (Alt+W + Alt+P)'

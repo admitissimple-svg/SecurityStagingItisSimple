@@ -181,21 +181,17 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
     }
   );
 
-  // 2. Tag count audit
+  // 2. Tag count audit (match full opening span to avoid double-counting on multiple attributes)
   const countMatches = (regex: RegExp) => (rawContent.match(regex) || []).length;
-  const tagCorrect = countMatches(/data-tag-type=["']correct["']|class=["'][^"']*\bcorrect\b/gi);
-  const tagIncorrect = countMatches(/data-tag-type=["']incorrect["']|class=["'][^"']*\bincorrect\b/gi);
-  const tagNewWord = countMatches(/data-tag-type=["']new-word["']|class=["'][^"']*\bnew-word\b|\[New Word\]|\(Alt\+W\)/gi);
-  const tagPronounce = countMatches(/data-tag-type=["']pronounce["']|class=["'][^"']*\bpronounce\b|\[Pronounce\]|\(Alt\+P\)/gi);
+  const tagCorrect = countMatches(/<span\b[^>]*(?:data-tag-type=["']correct["']|class=["'][^"']*\bcorrect(?:-tag)?\b)[^>]*>/gi);
+  const tagIncorrect = countMatches(/<span\b[^>]*(?:data-tag-type=["']incorrect["']|class=["'][^"']*\bincorrect(?:-tag)?\b)[^>]*>/gi);
+  const tagNewWord = countMatches(/<span\b[^>]*(?:data-tag-type=["']new-word["']|class=["'][^"']*\bnew-word(?:-tag)?\b)[^>]*>|\[New Word\]|\(Alt\+W\)/gi);
+  const tagPronounce = countMatches(/<span\b[^>]*(?:data-tag-type=["']pronounce["']|class=["'][^"']*\bpronounce(?:-tag)?\b)[^>]*>|\[Pronounce\]|\(Alt\+P\)/gi);
 
   const plainWithoutSpans = rawContent.replace(/<span[^>]*>[\s\S]*?<\/span>/gi, '');
   const plainCorrect = (plainWithoutSpans.match(/✓|✔/g) || []).length;
   const plainIncorrect = (plainWithoutSpans.match(/✗|✖/g) || []).length;
 
-  const correctCount = Math.max(tagCorrect + plainCorrect, errors.length + positives.length);
-  const incorrectCount = Math.max(tagIncorrect + plainIncorrect, errors.length);
-  const newWordCount = Math.max(tagNewWord, newWords.length);
-  const pronounceCount = Math.max(tagPronounce, pronounceItems.length);
 
   // 3. Tokenize remaining badge tags and symbols
   let tokenized = preprocessed
@@ -412,6 +408,13 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
     .replace(/\[\[TAG:[^\]]+\]\]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+
+  // Final tag count evaluation
+  const correctCount = Math.max(tagCorrect + plainCorrect, positives.length);
+  const incorrectCount = Math.max(tagIncorrect + plainIncorrect, errors.length);
+  const newWordCount = Math.max(tagNewWord, newWords.length);
+  const pronounceCount = Math.max(tagPronounce, pronounceItems.length);
+
 
   return {
     errors,
