@@ -1970,7 +1970,8 @@ export async function saveStudentNativeFriendToFirestore(
   } else {
     // Node.js test environment support: direct write via Admin Firestore
     try {
-      const { getFirestoreDb } = await import('../serverFirestore');
+      const serverModule = '../' + 'serverFirestore';
+      const { getFirestoreDb } = await import(/* @vite-ignore */ serverModule);
       const adminDb = getFirestoreDb();
       if (adminDb) {
         await adminDb.collection('users').doc(cleanUid).set(payload, { merge: true });
@@ -2098,7 +2099,8 @@ export async function saveStudentProfileToFirestore(
   } else {
     // Node.js test environment support: direct write via Admin Firestore
     try {
-      const { getFirestoreDb } = await import('../serverFirestore');
+      const serverModule = '../' + 'serverFirestore';
+      const { getFirestoreDb } = await import(/* @vite-ignore */ serverModule);
       const adminDb = getFirestoreDb();
       if (adminDb) {
         await adminDb.collection('users').doc(cleanUid).set(stampedPayload, { merge: true });
