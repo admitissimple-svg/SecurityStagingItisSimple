@@ -71,10 +71,11 @@ export interface OnboardingWizardModalProps {
   currentUserProfile?: UserProfile | null;
   currentAccount?: GoogleAccount | null;
   initialEmail?: string;
+  initialStep?: number;
+  hasCompletedTrialLesson?: boolean;
   onEmailAlreadyExists?: (email: string) => void;
   onCompleteOnboarding: (onboardingData: OnboardingResultData) => void | Promise<void>;
   onOpenScheduleTrialLesson?: (tutor: NativeFriendTutor, studentInfo?: { name: string; email: string; uid?: string; isTrialLesson?: boolean }) => void;
-  onOpenStartNewWeek?: () => void;
 }
 
 function getYouTubeEmbedId(urlOrId?: string): string | null {
@@ -260,10 +261,11 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
   currentUserProfile,
   currentAccount,
   initialEmail,
+  initialStep,
+  hasCompletedTrialLesson,
   onEmailAlreadyExists,
   onCompleteOnboarding,
   onOpenScheduleTrialLesson,
-  onOpenStartNewWeek,
 }) => {
   const isEn = currentLanguage === 'en';
 
@@ -355,7 +357,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
     if (isOpen) {
       if (!wasOpenRef.current) {
         wasOpenRef.current = true;
-        setCurrentStep(1);
+        setCurrentStep(initialStep || 1);
         setIsSubmitting(false);
         setIsClosing(false);
         setErrorMessage(null);
@@ -390,13 +392,23 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
           if (currentUserProfile.dailyPhraseTime) {
             setDailyPhraseTime(currentUserProfile.dailyPhraseTime);
           }
-          if (currentUserProfile.teacherEmail) {
-            const cleanTarg = currentUserProfile.teacherEmail.toLowerCase().trim();
+          const teacherTarget = (
+            currentUserProfile.teacherEmail ||
+            currentUserProfile.teacherId ||
+            (currentUserProfile as any).publicTutorId ||
+            currentUserProfile.teacherUid ||
+            ''
+          ).toLowerCase().trim();
+          if (teacherTarget) {
             const matchTutor = tutorsList.find(
-              (t) => (t?.email || '').toLowerCase().trim() === cleanTarg
+              (t) =>
+                (t?.email || '').toLowerCase().trim() === teacherTarget ||
+                (t?.id || '').toLowerCase().trim() === teacherTarget ||
+                (t?.publicTutorId || '').toLowerCase().trim() === teacherTarget ||
+                (t?.uid || '').toLowerCase().trim() === teacherTarget
             );
             if (matchTutor) {
-              setSelectedTutorId(matchTutor.id || matchTutor.email);
+              setSelectedTutorId(matchTutor.id || matchTutor.publicTutorId || matchTutor.email);
             }
           }
         }
@@ -642,13 +654,6 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
     onClose();
   };
 
-  const handleFinishToDashboard = () => {
-    if (onOpenStartNewWeek) {
-      onOpenStartNewWeek();
-    }
-    onClose();
-  };
-
   if (!isOpen) return null;
 
   return (
@@ -683,7 +688,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                 {currentStep === 3 && (isEn ? 'Configure your daily routine times' : 'Horários da sua rotina diária')}
                 {currentStep === 4 && (isEn ? 'Choose your Native Friend (Trial Lesson)' : 'Escolha seu Amigo Nativo (Aula Teste)')}
                 {currentStep === 5 && (isEn ? 'Activate account & your Native Friend' : 'Ativar conta & vincular Amigo Nativo')}
-                {currentStep === 6 && (isEn ? 'First week roadmap: Start New Week' : 'Orientação da 1ª Semana: Start New Week')}
+                {currentStep === 6 && (isEn ? 'Mandatory Step: Schedule Your Free Trial Lesson' : 'Passo Obrigatório: Agende sua Aula Experimental Gratuita')}
               </h2>
             </div>
           </div>
@@ -1768,69 +1773,53 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                   <Check className="w-6 h-6" />
                 </div>
                 <h3 className="text-lg font-black text-white">
-                  {isEn ? 'Setup Completed! Welcome to It\'s Simple!' : 'Tudo Pronto! Bem-vindo(a) ao It\'s Simple!'}
+                  {isEn ? 'Profile Linked! Final Mandatory Step:' : 'Perfil Vinculado! Passo Final Obrigatório:'}
                 </h3>
                 <p className="text-xs text-slate-200 max-w-md mx-auto leading-relaxed">
                   {isEn
-                    ? `Your Native Friend ${selectedTutor?.name} is linked. Now complete these two essential steps to kick off your English journey:`
-                    : `Seu Amigo Nativo ${selectedTutor?.name} foi vinculado com sucesso. Siga estes dois passos fundamentais para começar sua jornada:`}
+                    ? `Your Native Friend ${selectedTutor?.name} is linked. To complete your onboarding and activate your weekly study dashboard, schedule your 1st Free Trial Lesson (25 min).`
+                    : `Seu Amigo Nativo ${selectedTutor?.name} foi vinculado com sucesso. Para concluir o seu cadastro e desbloquear o seu painel semanal, agende sua 1ª Aula Experimental Gratuita (25 min).`}
                 </p>
               </div>
 
-              {/* Two Fundamental Steps */}
-              <div className="space-y-3">
-                {/* Step A: Schedule 1st Trial Lesson */}
-                <div className="p-4 rounded-2xl bg-[#062863]/60 border border-[#607EC9]/40 flex items-start gap-3.5">
-                  <div className="w-8 h-8 rounded-xl bg-[#F4CA54] text-[#000035] flex items-center justify-center font-black text-sm shrink-0 shadow-xs mt-0.5">
-                    1
+              {/* Mandatory Trial Lesson Booking Card */}
+              <div className="p-5 rounded-2xl bg-[#062863]/60 border border-[#F4CA54]/50 shadow-md space-y-4">
+                <div className="flex items-start gap-3.5">
+                  <div className="w-10 h-10 rounded-xl bg-[#F4CA54] text-[#000035] flex items-center justify-center font-black text-base shrink-0 shadow-xs mt-0.5">
+                    <Calendar className="w-5 h-5" />
                   </div>
                   <div className="flex-1 min-w-0">
-                    <h4 className="text-xs sm:text-sm font-black text-white">
-                      {isEn ? 'Schedule your 1st Trial Lesson (25 min)' : 'Agende sua 1ª Aula Teste Experimental (25 min)'}
-                    </h4>
-                    <p className="text-[11.5px] text-blue-100/80 mt-1 leading-relaxed">
+                    <div className="flex items-center gap-2">
+                      <h4 className="text-sm sm:text-base font-black text-white">
+                        {isEn ? '1st Trial Lesson (25 min) — 100% Free' : '1ª Aula Teste Experimental (25 min) — 100% Grátis'}
+                      </h4>
+                      <span className="px-2 py-0.5 rounded-full bg-amber-400/20 text-[#F4CA54] border border-[#F4CA54]/40 text-[10px] font-extrabold uppercase">
+                        {isEn ? 'Mandatory' : 'Obrigatório'}
+                      </span>
+                    </div>
+                    <p className="text-xs text-blue-100/90 mt-1 leading-relaxed">
                       {isEn
                         ? `Pick a convenient time slot with ${selectedTutor?.name} via Google Meet to meet each other, discuss your goal (${getFinalLearningGoal()}), and unlock real speaking.`
                         : `Escolha um horário conveniente com ${selectedTutor?.name} via Google Meet para se conhecerem, alinhar seu objetivo (${getFinalLearningGoal()}) e praticar sem travas.`}
                     </p>
-
-                    <button
-                      type="button"
-                      id="onboarding-schedule-trial-btn"
-                      onClick={handleBookTrialLesson}
-                      className="mt-2.5 px-4 py-2 rounded-xl bg-[#F4CA54] hover:bg-amber-400 text-[#000035] font-black text-xs transition cursor-pointer shadow-xs flex items-center gap-1.5"
-                    >
-                      <Calendar className="w-3.5 h-3.5" />
-                      <span>{isEn ? 'Schedule My 1st Lesson Now' : 'Agendar Minha 1ª Aula Teste Agora'}</span>
-                    </button>
                   </div>
                 </div>
 
-                {/* Step B: Start New Week */}
-                <div className="p-4 rounded-2xl bg-[#062863]/60 border border-[#607EC9]/40 flex items-start gap-3.5">
-                  <div className="w-8 h-8 rounded-xl bg-[#9AB4FF] text-[#000035] flex items-center justify-center font-black text-sm shrink-0 shadow-xs mt-0.5">
-                    2
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <h4 className="text-xs sm:text-sm font-black text-white">
-                      {isEn ? 'Click "Start New Week" in your Workspace' : 'Clique em "Start New Week" no seu Painel'}
-                    </h4>
-                    <p className="text-[11.5px] text-blue-100/80 mt-1 leading-relaxed">
-                      {isEn
-                        ? 'The "Start New Week" button calibrates your weekly cycle and automatically generates your daily YouTube videos, Spotify audio tracks, and vocabulary challenges.'
-                        : 'O botão "Start New Week" calibra seu ciclo semanal e carrega automaticamente seus vídeos do YouTube, músicas do Spotify e desafios de vocabulário para cada dia da semana.'}
-                    </p>
-
-                    <button
-                      type="button"
-                      id="onboarding-start-week-btn"
-                      onClick={handleFinishToDashboard}
-                      className="mt-2.5 px-4 py-2 rounded-xl bg-[#1C4C96] hover:bg-[#607EC9] text-white font-extrabold text-xs transition cursor-pointer border border-[#9AB4FF]/50 shadow-xs flex items-center gap-1.5"
-                    >
-                      <Play className="w-3.5 h-3.5" />
-                      <span>{isEn ? 'Go to Dashboard & Start Week' : 'Ir para o Painel & Iniciar Semana'}</span>
-                    </button>
-                  </div>
+                <div className="pt-2 border-t border-[#607EC9]/30 flex flex-col sm:flex-row items-center justify-between gap-3">
+                  <span className="text-[11px] text-blue-200/90 font-medium">
+                    {isEn
+                      ? '⚠️ Dashboard & weekly activities unlock immediately upon scheduling confirmation.'
+                      : '⚠️ O painel e suas atividades semanais são liberados imediatamente após a confirmação do agendamento.'}
+                  </span>
+                  <button
+                    type="button"
+                    id="onboarding-schedule-trial-btn"
+                    onClick={handleBookTrialLesson}
+                    className="w-full sm:w-auto px-5 py-2.5 rounded-xl bg-[#F4CA54] hover:bg-amber-400 text-[#000035] font-black text-xs sm:text-sm transition cursor-pointer shadow-md flex items-center justify-center gap-2 shrink-0"
+                  >
+                    <Calendar className="w-4 h-4" />
+                    <span>{isEn ? 'Schedule My 1st Lesson Now' : 'Agendar Minha 1ª Aula Teste Agora'}</span>
+                  </button>
                 </div>
               </div>
             </div>
@@ -1904,10 +1893,11 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
             <button
               type="button"
               id="onboarding-finish-btn"
-              onClick={handleFinishToDashboard}
-              className="px-6 py-2.5 rounded-xl bg-[#F4CA54] hover:bg-amber-400 text-[#000035] font-black text-xs sm:text-sm transition cursor-pointer shadow-md flex items-center gap-1.5"
+              onClick={handleBookTrialLesson}
+              className="px-6 py-2.5 rounded-xl bg-[#F4CA54] hover:bg-amber-400 text-[#000035] font-black text-xs sm:text-sm transition cursor-pointer shadow-md flex items-center gap-2"
             >
-              <span>{isEn ? 'Enter My Learning Space' : 'Entrar no Meu Espaço de Prática'}</span>
+              <Calendar className="w-4 h-4" />
+              <span>{isEn ? 'Schedule My 1st Trial Lesson' : 'Agendar Minha 1ª Aula Teste'}</span>
               <ArrowRight className="w-4 h-4" />
             </button>
           )}

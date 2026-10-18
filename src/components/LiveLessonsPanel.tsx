@@ -126,7 +126,7 @@ export const LiveLessonsPanel: React.FC<LiveLessonsPanelProps> = ({
   const teacherEmailKey = currentAccount?.email || 'itissimple.school@gmail.com';
   const teacherSettings = teacherMeetSettings[teacherEmailKey] || {
     teacherEmail: teacherEmailKey,
-    meetLink: 'https://meet.google.com/new',
+    meetLink: '',
     workingHoursStart: '08:00',
     workingHoursEnd: '18:00',
     slotDurationMinutes: 30,
@@ -449,11 +449,12 @@ export const LiveLessonsPanel: React.FC<LiveLessonsPanelProps> = ({
               const formattedDate = formatDateInTimeZone(lesson.startDateTime, activeTz, isEn ? 'en' : 'pt');
               const formattedTime = `${formatTimeInTimeZone(lesson.startDateTime, activeTz)} - ${formatTimeInTimeZone(lesson.endDateTime, activeTz)}`;
 
-              let activeMeetUrl =
-                teacherMeetSettings[lesson.teacherEmail]?.meetLink || lesson.meetLink;
-              if (!activeMeetUrl || activeMeetUrl.includes('its-simple-')) {
-                activeMeetUrl = 'https://meet.google.com/gmt-kxnw-zpq';
-              }
+              const rawMeetLink =
+                teacherMeetSettings[lesson.teacherEmail]?.meetLink ||
+                (lesson.teacherUid && teacherMeetSettings[lesson.teacherUid]?.meetLink) ||
+                lesson.meetLink ||
+                '';
+              const activeMeetUrl = (rawMeetLink && !rawMeetLink.includes('meet.google.com/new')) ? rawMeetLink.trim() : '';
 
               const directCalendarUrl =
                 lesson.calendarHtmlLink ||
@@ -532,17 +533,27 @@ export const LiveLessonsPanel: React.FC<LiveLessonsPanelProps> = ({
                   {/* Single Compact & Fluid Actions Bar (All 6 in One Row) */}
                   <div className="pt-2 border-t border-slate-100 flex items-center gap-1.5 flex-wrap">
                     {/* 1. Meet */}
-                    <a
-                      href={activeMeetUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-[11px] font-bold flex items-center gap-1 transition shadow-2xs cursor-pointer shrink-0"
-                      title={t.joinMeetBtn}
-                    >
-                      <Video className="w-3 h-3 text-emerald-100 shrink-0" />
-                      <span>Meet</span>
-                      <ExternalLink className="w-2.5 h-2.5 text-emerald-200 shrink-0" />
-                    </a>
+                    {activeMeetUrl ? (
+                      <a
+                        href={activeMeetUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-[11px] font-bold flex items-center gap-1 transition shadow-2xs cursor-pointer shrink-0"
+                        title={t.joinMeetBtn}
+                      >
+                        <Video className="w-3 h-3 text-emerald-100 shrink-0" />
+                        <span>Meet</span>
+                        <ExternalLink className="w-2.5 h-2.5 text-emerald-200 shrink-0" />
+                      </a>
+                    ) : (
+                      <span
+                        className="px-2.5 py-1 bg-slate-100 text-slate-400 rounded-lg text-[11px] font-semibold flex items-center gap-1 shrink-0 border border-slate-200 cursor-not-allowed"
+                        title={isEn ? 'Meeting link pending' : 'Link da reunião pendente'}
+                      >
+                        <Video className="w-3 h-3 text-slate-300 shrink-0" />
+                        <span>{isEn ? 'Pending' : 'Pendente'}</span>
+                      </span>
+                    )}
 
                     {/* 2. Google Calendar */}
                     <a

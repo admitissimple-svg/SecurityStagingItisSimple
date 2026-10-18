@@ -242,46 +242,53 @@ export const LiveLessonScheduleModal: React.FC<LiveLessonScheduleModalProps> = (
     return (
       tutors?.find((tut) => (tut.email || '').toLowerCase().trim() === clean) ||
       tutors?.find((tut) => (tut.id || '').toLowerCase().trim() === clean) ||
+      tutors?.find((tut) => (tut.publicTutorId || '').toLowerCase().trim() === clean) ||
+      tutors?.find((tut) => (tut.uid || '').toLowerCase().trim() === clean) ||
       tutors?.find((tut) => (tut.id || '').toLowerCase().trim() === (selectedTeacherObj as any)?.id?.toLowerCase().trim()) ||
+      tutors?.find((tut) => (tut.publicTutorId || '').toLowerCase().trim() === (selectedTeacherObj as any)?.id?.toLowerCase().trim()) ||
       null
     );
   }, [tutors, selectedTeacherEmail, selectedTeacherObj]);
 
   // Compute effective Google Meet link strictly honoring the Native Friend's registered profile!
   const effectiveMeetLink = useMemo(() => {
+    const isGenericUrl = (url?: string) => !url || url.includes('/new');
+
     // 1. Direct from registered Tutor profile
     const tutorMeet = (matchedTutor?.meetUrl || matchedTutor?.meetLink || '').trim();
-    if (tutorMeet) return tutorMeet;
+    if (tutorMeet && !isGenericUrl(tutorMeet)) return tutorMeet;
 
     // 2. From selectedTeacherObj (populated from teachersList which merges tutor fields)
     const objMeet = ((selectedTeacherObj as any)?.meetUrl || (selectedTeacherObj as any)?.meetLink || '').trim();
-    if (objMeet) return objMeet;
+    if (objMeet && !isGenericUrl(objMeet)) return objMeet;
 
-    // 3. From teacherMeetSettings (case-insensitive email matching)
+    // 3. From teacherMeetSettings (case-insensitive email matching or uid matching)
     const cleanEmail = (selectedTeacherEmail || '').toLowerCase().trim();
     const safeSettings = teacherMeetSettings || {};
     const settings =
       safeSettings[cleanEmail] ||
       safeSettings[selectedTeacherEmail] ||
+      (matchedTutor?.uid ? safeSettings[matchedTutor.uid] : undefined) ||
+      (matchedTutor?.id ? safeSettings[matchedTutor.id] : undefined) ||
+      (matchedTutor?.publicTutorId ? safeSettings[matchedTutor.publicTutorId] : undefined) ||
       Object.entries(safeSettings).find(([k]) => k.toLowerCase().trim() === cleanEmail)?.[1];
 
-    if (settings?.meetLink && settings.meetLink.trim() && settings.meetLink !== 'https://meet.google.com/gmt-kxnw-zpq') {
+    if (settings?.meetLink && settings.meetLink.trim() && !isGenericUrl(settings.meetLink)) {
       return settings.meetLink.trim();
     }
 
     // 4. From student profile's saved teacher meet url
-    if (userProfile?.teacherEmail?.toLowerCase().trim() === cleanEmail) {
+    if (
+      userProfile?.teacherEmail?.toLowerCase().trim() === cleanEmail ||
+      userProfile?.teacherId === cleanEmail ||
+      (matchedTutor?.id && userProfile?.teacherId === matchedTutor.id)
+    ) {
       const studentTeacherMeet = ((userProfile as any)?.teacherMeetUrl || (userProfile as any)?.teacherMeetLink || '').trim();
-      if (studentTeacherMeet) return studentTeacherMeet;
+      if (studentTeacherMeet && !isGenericUrl(studentTeacherMeet)) return studentTeacherMeet;
     }
 
-    // 5. If settings has custom meetLink
-    if (settings?.meetLink && settings.meetLink.trim()) {
-      return settings.meetLink.trim();
-    }
-
-    // Fallback only if no tutor has set any link
-    return 'https://meet.google.com/new';
+    // Explicit and safe: never fabricate a meeting link
+    return '';
   }, [matchedTutor, selectedTeacherObj, teacherMeetSettings, selectedTeacherEmail, userProfile]);
 
   const safeMeetSettings = teacherMeetSettings || {};

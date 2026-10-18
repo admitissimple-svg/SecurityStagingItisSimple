@@ -196,7 +196,7 @@ export const LiveMeetLessonsPanel: React.FC<LiveMeetLessonsPanelProps> = ({
                     studentName: lesson.studentName,
                     teacherEmail: lesson.teacherEmail,
                     teacherName: lesson.teacherName,
-                    meetLink: lesson.meetLink || 'https://meet.google.com/gmt-kxnw-zpq',
+                    meetLink: (lesson.meetLink && !lesson.meetLink.includes('meet.google.com/new')) ? lesson.meetLink : '',
                   });
                 } catch {
                   return 'https://calendar.google.com/calendar/r';
@@ -259,7 +259,7 @@ export const LiveMeetLessonsPanel: React.FC<LiveMeetLessonsPanelProps> = ({
                         </a>
 
                         {/* Meet: manter o formato atual e padronizar a cor verde */}
-                        {lesson.meetLink && (
+                        {lesson.meetLink && !lesson.meetLink.includes('meet.google.com/new') ? (
                           <a
                             href={lesson.meetLink}
                             target="_blank"
@@ -271,6 +271,14 @@ export const LiveMeetLessonsPanel: React.FC<LiveMeetLessonsPanelProps> = ({
                             <span>Meet</span>
                             <ExternalLink className="w-3 h-3 text-white/80 shrink-0" />
                           </a>
+                        ) : (
+                          <span
+                            className="flex-1 min-w-[100px] h-9 bg-slate-100 text-slate-400 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 border border-slate-200 cursor-not-allowed px-3"
+                            title={isEn ? 'Meeting link pending' : 'Link da reunião pendente'}
+                          >
+                            <Video className="w-4 h-4 text-slate-300 shrink-0" />
+                            <span>{isEn ? 'Pending' : 'Pendente'}</span>
+                          </span>
                         )}
                       </div>
 

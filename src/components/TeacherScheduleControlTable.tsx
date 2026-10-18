@@ -278,7 +278,7 @@ export const TeacherScheduleControlTable: React.FC<TeacherScheduleControlTablePr
     ? { ...rawSettings, timezone: rawSettings.timezone || resolvedTutorTz }
     : {
         teacherEmail: teacherEmailKey,
-        meetLink: tutorProfile?.meetUrl || 'https://meet.google.com/new',
+        meetLink: tutorProfile?.meetUrl || '',
         workingHoursStart: '08:00',
         workingHoursEnd: '18:00',
         slotDurationMinutes: 30,
@@ -687,16 +687,26 @@ export const TeacherScheduleControlTable: React.FC<TeacherScheduleControlTablePr
                     <td className="p-3.5 text-right whitespace-nowrap">
                       <div className="flex items-center justify-end gap-1.5">
                         {/* Meet - padronizado na cor verde */}
-                        <a
-                          href={lesson.meetLink}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-lg text-[11px] transition flex items-center gap-1 shadow-2xs"
-                          title="Open Google Meet"
-                        >
-                          <Video className="w-3.5 h-3.5" />
-                          <span>Meet</span>
-                        </a>
+                        {lesson.meetLink && !lesson.meetLink.includes('meet.google.com/new') ? (
+                          <a
+                            href={lesson.meetLink}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-lg text-[11px] transition flex items-center gap-1 shadow-2xs cursor-pointer"
+                            title="Open Google Meet"
+                          >
+                            <Video className="w-3.5 h-3.5" />
+                            <span>Meet</span>
+                          </a>
+                        ) : (
+                          <span
+                            className="px-2.5 py-1.5 bg-slate-100 text-slate-400 font-semibold rounded-lg text-[11px] flex items-center gap-1 border border-slate-200 cursor-not-allowed"
+                            title="Link da reunião ainda não configurado"
+                          >
+                            <Video className="w-3.5 h-3.5 text-slate-300" />
+                            <span>Pendente</span>
+                          </span>
+                        )}
 
                         {/* Calendar - somente o símbolo do calendário em formato quadrado */}
                         <a

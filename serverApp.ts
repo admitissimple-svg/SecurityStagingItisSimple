@@ -2223,7 +2223,7 @@ const handleRegistration = async (req: any, res: any) => {
       approvalStatus: 'pending', // REQUIRED: All new Native Friends default strictly to pending approval
       appliedAt: new Date().toISOString(),
       registeredByAdmin: false,
-      meetUrl: req.body.meetUrl || req.body.meetLink || 'https://meet.google.com/new',
+      meetUrl: req.body.meetUrl || req.body.meetLink || '',
     };
 
     if (!db.tutorsList) db.tutorsList = [];
@@ -2271,7 +2271,7 @@ const handleRegistration = async (req: any, res: any) => {
     if (!db.meetSettings) db.meetSettings = {};
     db.meetSettings[cleanEmail] = {
       teacherEmail: cleanEmail,
-      meetLink: req.body.meetUrl || req.body.meetLink || 'https://meet.google.com/new',
+      meetLink: req.body.meetUrl || req.body.meetLink || '',
       workingHoursStart: '08:00',
       workingHoursEnd: '18:00',
       slotDurationMinutes: 30,
@@ -3314,6 +3314,33 @@ app.post('/api/tutors', async (req, res) => {
 
   db.tutorsList = db.tutorsList || [];
   db.tutorsList.push(tutorEntry);
+
+  // Initialize teacher meet settings if configured during registration
+  const tutorMeetLink = (tutorEntry.meetUrl || tutorEntry.meetLink || '').trim();
+  if (tutorMeetLink && !tutorMeetLink.includes('meet.google.com/new')) {
+    if (!db.meetSettings) db.meetSettings = {};
+    if (!db.teacherSettings) db.teacherSettings = {};
+    const meetEntry = {
+      teacherEmail: cleanEmail,
+      uid: canonicalAuthUid,
+      meetLink: tutorMeetLink,
+      workingHoursStart: '08:00',
+      workingHoursEnd: '18:00',
+      slotDurationMinutes: 30,
+      availableDays: tutorEntry.availableDays || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday'],
+      availability: tutorEntry.availability || tutorEntry.availableHoursByDay || {},
+      availableHoursByDay: tutorEntry.availableHoursByDay || tutorEntry.availability || {},
+      timezone: tutorEntry.timezone || 'America/Toronto',
+      updatedAt: new Date().toISOString(),
+    };
+    db.meetSettings[cleanEmail] = meetEntry;
+    db.teacherSettings[cleanEmail] = meetEntry;
+    if (canonicalAuthUid) {
+      db.meetSettings[canonicalAuthUid] = meetEntry;
+      db.teacherSettings[canonicalAuthUid] = meetEntry;
+    }
+    saveTeacherAvailabilityToFirestore(canonicalAuthUid || cleanEmail, meetEntry).catch(() => {});
+  }
 
   // Also maintain teachers list for auth
   db.teachers = db.teachers || [];
@@ -4606,8 +4633,29 @@ app.get(['/api/meet-settings', '/api/teacher-settings'], async (req, res) => {
     return res.json(finalResult);
   }
 
-  // Return all known meet settings
-  res.json({ ...db.meetSettings, ...db.teacherSettings });
+  // Return all known meet settings, merging from tutorsList if available
+  const allSettings = { ...(db.meetSettings || {}), ...(db.teacherSettings || {}) };
+  if (Array.isArray(db.tutorsList)) {
+    db.tutorsList.forEach((tut: any) => {
+      const email = (tut.email || '').toLowerCase().trim();
+      const mUrl = (tut.meetUrl || tut.meetLink || '').trim();
+      const isGeneric = !mUrl || mUrl.toLowerCase().includes('meet.google.com/new');
+      if (email && (!allSettings[email] || !allSettings[email].meetLink)) {
+        allSettings[email] = {
+          teacherEmail: email,
+          meetLink: isGeneric ? '' : mUrl,
+          workingHoursStart: tut.workingHoursStart || '08:00',
+          workingHoursEnd: tut.workingHoursEnd || '18:00',
+          slotDurationMinutes: tut.slotDurationMinutes || 30,
+          availableDays: tut.availableDays || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'],
+          availability: tut.availability || tut.availableHoursByDay || {},
+          availableHoursByDay: tut.availableHoursByDay || tut.availability || {},
+          timezone: tut.timezone || 'America/Toronto',
+        };
+      }
+    });
+  }
+  res.json(allSettings);
 });
 
 app.post(['/api/meet-settings', '/api/teacher-settings'], async (req, res) => {

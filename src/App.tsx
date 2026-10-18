@@ -474,7 +474,9 @@ export default function App() {
               contractedLessons: typeof firestoreDoc?.contractedLessons === 'number' ? firestoreDoc.contractedLessons : 1,
               completedLessonsCount: typeof firestoreDoc?.completedLessonsCount === 'number' ? firestoreDoc.completedLessonsCount : 0,
               hasCompletedTrialLesson: Boolean(firestoreDoc?.hasCompletedTrialLesson),
-              onboardingCompleted: firestoreDoc?.onboardingCompleted ?? true,
+              onboardingCompleted: typeof firestoreDoc?.onboardingCompleted === "boolean"
+                ? firestoreDoc.onboardingCompleted
+                : Boolean(firestoreDoc?.hasCompletedTrialLesson),
               subscriptionType: firestoreDoc?.subscriptionType || 'trial',
               enrollmentStatus: firestoreDoc?.enrollmentStatus || (teacherUid ? 'active' : 'not_enrolled'),
             };
@@ -611,6 +613,21 @@ export default function App() {
     teacherEmail?: string;
     teacherName?: string;
   } | null>(null);
+
+  // Authoritative Trial Lesson Status Check (ensuring mandatory onboarding requirement)
+  const hasConfirmedTrialLesson = useMemo(() => {
+    if (userProfile?.hasCompletedTrialLesson) return true;
+    const cleanEmail = (currentAccount?.email || userProfile?.email || '').toLowerCase().trim();
+    const cleanUid = currentAccount?.uid || userProfile?.id || (userProfile as any)?.uid || '';
+    if (!cleanEmail && !cleanUid) return false;
+    return lessons.some((l) => {
+      const isStudentMatch =
+        (cleanEmail && (l.studentEmail || '').toLowerCase().trim() === cleanEmail) ||
+        (cleanUid && (l.studentUid === cleanUid || (l as any).uid === cleanUid));
+      const isCancelled = (l.status as string) === 'cancelled' || (l.status as string) === 'canceled' || Boolean(l.cancelledAt);
+      return isStudentMatch && Boolean(l.isTrialLesson) && !isCancelled;
+    });
+  }, [userProfile?.hasCompletedTrialLesson, lessons, currentAccount?.email, currentAccount?.uid, userProfile?.email, userProfile?.id]);
 
   // Teacher Filter & Minimalist Activity Toggle
   const [selectedStudentFilter, setSelectedStudentFilter] = useState<string>('all');
@@ -2339,7 +2356,7 @@ export default function App() {
         level: selectedLevel,
         userLevel: selectedLevel,
         englishLevel: selectedLevel,
-        onboardingCompleted: true,
+        onboardingCompleted: false,
         learningGoal: data.learningGoal,
         weeklyStudyDaysTarget: data.weeklyStudyDaysTarget,
         weeklyStudyDays: data.weeklyStudyDays,
@@ -2469,8 +2486,9 @@ export default function App() {
       ]);
 
       // Auto-open lesson schedule modal for this tutor with verified student UID ready
-      if (finalTeacherEmail || targetTeacherPublicId) {
-        setTeacherEmailForConfig(finalTeacherEmail);
+      const effectiveTeacherTarget = finalTeacherEmail || targetTeacherPublicId;
+      if (effectiveTeacherTarget) {
+        setTeacherEmailForConfig(effectiveTeacherTarget);
         setScheduleStudentInfo({
           name: effectiveName,
           email: cleanEmail,
@@ -3864,7 +3882,7 @@ export default function App() {
       teacherEmail: cleanTeacherEmail || (matchedTutor?.email || ''),
       teacherName: lessonData.teacherName || matchedTutor?.name || 'Native Friend',
       teacherUid: targetTeacherId,
-      meetLink: lessonData.meetLink || matchedTutor?.meetUrl || 'https://meet.google.com/new',
+      meetLink: lessonData.meetLink || matchedTutor?.meetUrl || matchedTutor?.meetLink || '',
       status: 'scheduled',
       isTrialLesson: isTrialBooking,
       createdAt: new Date().toISOString(),
@@ -3898,7 +3916,8 @@ export default function App() {
         ...prev,
         availableLessons: txResult.remainingLessons,
         contractedLessons: txResult.contractedLessons ?? prev.contractedLessons,
-        hasCompletedTrialLesson: isTrialBooking ? true : prev.hasCompletedTrialLesson,
+        hasCompletedTrialLesson: prev.hasCompletedTrialLesson,
+        onboardingCompleted: isTrialBooking ? true : prev.onboardingCompleted,
         teacherUid: confirmedLesson.teacherUid || prev.teacherUid,
         teacherEmail: confirmedLesson.teacherEmail || prev.teacherEmail,
         teacherName: confirmedLesson.teacherName || prev.teacherName,
@@ -3990,6 +4009,7 @@ export default function App() {
           assignedNativeFriendUID: finalTeacherUid,
           nativeFriendUID: finalTeacherUid,
           enrollmentStatus: 'active',
+          onboardingCompleted: isTrialBooking ? true : Boolean(userProfile?.onboardingCompleted),
           contractedLessons: Math.max(userProfile?.contractedLessons || 0, 1),
         },
         finalStudentEmail
@@ -4007,6 +4027,7 @@ export default function App() {
             teacherEmail: lessonData.teacherEmail,
             teacherName: lessonData.teacherName,
             enrollmentStatus: 'active',
+            onboardingCompleted: isTrialBooking ? true : Boolean(userProfile?.onboardingCompleted),
             contractedLessons: Math.max(userProfile?.contractedLessons || 0, 1),
           },
         }),
@@ -6432,6 +6453,8 @@ export default function App() {
                   onBehavioralComplete={handleBehavioralActivityComplete}
                   dictionaryEntries={consolidatedActiveDictionary}
                   excludedWords={excludedDictionaryWords}
+                  hasConfirmedTrialLesson={hasConfirmedTrialLesson}
+                  onScheduleTrialLesson={() => setIsScheduleModalOpen(true)}
                 />
 
                 {/* Section 3: Weekly Activity (Image 3) */}
@@ -6862,8 +6885,8 @@ export default function App() {
         }}
         onClose={() => {
           setIsOnboardingModalOpen(false);
-          // If student gave up or closed onboarding before completion, or has no account, return to initial landing page
-          if (!isOnboardingCompleting && (!currentAccount || viewMode === 'landing')) {
+          // If student closed onboarding before completing mandatory trial lesson, return to initial landing page
+          if (!hasConfirmedTrialLesson && (!currentAccount || currentAccount.role === 'student')) {
             setViewMode('landing');
           }
         }}
@@ -6872,10 +6895,8 @@ export default function App() {
         currentUserProfile={userProfile}
         currentAccount={currentAccount}
         onCompleteOnboarding={handleCompleteOnboarding}
-        onOpenStartNewWeek={() => {
-          setViewMode('dashboard');
-          setIsOnboardingModalOpen(false);
-        }}
+        initialStep={userProfile?.teacherEmail || userProfile?.teacherId || userProfile?.teacherUid ? 6 : 1}
+        hasCompletedTrialLesson={hasConfirmedTrialLesson}
         onOpenScheduleTrialLesson={(tutor, studentInfo) => {
           setTeacherEmailForConfig(tutor.email || tutor.id);
           if (studentInfo && studentInfo.email) {

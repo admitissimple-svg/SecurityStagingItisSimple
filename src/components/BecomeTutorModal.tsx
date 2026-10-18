@@ -236,6 +236,7 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
       const tutorPayload = {
         id: publicTutorId,
         uid: firebaseUid,
+        authUid: firebaseUid,
         name: formData.name.trim(),
         email: cleanEmail,
         avatar: formData.avatar || '',
@@ -253,6 +254,8 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
         pricePerSessionBrl: Math.round((Number(formData.priceUsd) || 20) * 5.5),
         availableDays: formData.availableDays,
         timezone: formData.timezone || 'America/Toronto',
+        meetUrl: (formData.meetUrl || '').trim(),
+        meetLink: (formData.meetUrl || '').trim(),
         approvalStatus: 'pending',
         isApproved: false,
         status: 'pending',
@@ -279,7 +282,7 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
 
       const createdTutor = resData.tutor || tutorPayload;
 
-      // Save meet settings via authorized backend API
+      // Save meet settings via authorized backend API with canonical uid and clean email
       await fetch('/api/meet-settings', {
         method: 'POST',
         headers: {
@@ -288,8 +291,9 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
         },
         body: JSON.stringify({
           teacherEmail: cleanEmail,
+          uid: firebaseUid,
           settings: {
-            meetLink: formData.meetUrl,
+            meetLink: (formData.meetUrl || '').trim(),
             workingHoursStart: '08:00',
             workingHoursEnd: '18:00',
             slotDurationMinutes: 30,

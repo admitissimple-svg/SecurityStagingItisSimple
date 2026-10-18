@@ -115,8 +115,8 @@ export async function createLiveLessonCalendarEvent(
 
   return {
     id: `event-${Date.now()}`,
-    htmlLink: details.customMeetLink,
-    meetLink: details.customMeetLink || 'https://meet.google.com/new',
+    htmlLink: details.customMeetLink || '',
+    meetLink: details.customMeetLink || '',
   };
 }
 
@@ -303,10 +303,10 @@ export function generateGoogleCalendarWebLink(details: {
     .toISOString()
     .replace(/-|:|\.\d+/g, '');
 
-  const effectiveMeet = details.meetLink || 'https://meet.google.com/new';
+  const effectiveMeet = (details.meetLink && !details.meetLink.includes('meet.google.com/new')) ? details.meetLink.trim() : '';
   const text = encodeURIComponent(details.title || 'It\'s Simple English Session');
   const desc = encodeURIComponent(
-    `${details.description || ''}\n\nGoogle Meet: ${effectiveMeet}\nStudent: ${details.studentName || ''} (${details.studentEmail || ''})\nTeacher / Native Friend: ${details.teacherName || ''} (${details.teacherEmail || ''})`
+    `${details.description || ''}${effectiveMeet ? `\n\nGoogle Meet: ${effectiveMeet}` : ''}\nStudent: ${details.studentName || ''} (${details.studentEmail || ''})\nTeacher / Native Friend: ${details.teacherName || ''} (${details.teacherEmail || ''})`
   );
   const location = encodeURIComponent(effectiveMeet);
 
@@ -353,6 +353,7 @@ export function downloadIcsFile(details: {
     );
   }
 
+  const validMeet = (details.meetLink && !details.meetLink.includes('meet.google.com/new')) ? details.meetLink.trim() : '';
   const icsContent = `BEGIN:VCALENDAR
 VERSION:2.0
 PRODID:-//It's Simple//English Learning//EN
@@ -362,8 +363,8 @@ DTSTAMP:${start}
 DTSTART:${start}
 DTEND:${end}
 SUMMARY:${details.title}
-DESCRIPTION:${(details.description || '').replace(/\n/g, '\\n')}
-LOCATION:${details.meetLink || 'https://meet.google.com/new'}
+DESCRIPTION:${(details.description || '').replace(/\n/g, '\\n')}${validMeet ? `\\nGoogle Meet: ${validMeet}` : ''}
+LOCATION:${validMeet}
 ${attendeesLines.join('\n')}
 STATUS:CONFIRMED
 END:VEVENT

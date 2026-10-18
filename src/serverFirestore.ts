@@ -3050,6 +3050,7 @@ export interface ScheduleLessonServerResult {
   remainingLessons?: number;
   contractedLessons?: number;
   isTrialLesson?: boolean;
+  onboardingCompleted?: boolean;
   error?: string;
   statusCode: number;
 }
@@ -3154,7 +3155,77 @@ export async function scheduleLessonAtomicServer(
   const resolvedPublicTutorId = teacherResolution.publicTutorId;
   const resolvedTeacherEmail = teacherResolution.email;
   const resolvedTeacherName = teacherResolution.name;
-  const resolvedMeetLink = meetLink || teacherResolution.rawDoc?.meetLink || teacherResolution.rawDoc?.meetUrl || 'https://meet.google.com/new';
+
+  const isGenericMeetUrl = (url?: string | null) =>
+    !url || typeof url !== 'string' || !url.trim() || url.toLowerCase().includes('meet.google.com/new');
+
+  // Retrieve the meeting URL belonging to the selected teacher
+  let teacherConfiguredMeetUrl = '';
+  const rawMeet = (teacherResolution.rawDoc?.meetUrl || teacherResolution.rawDoc?.meetLink || '').trim();
+  if (rawMeet && !isGenericMeetUrl(rawMeet)) {
+    teacherConfiguredMeetUrl = rawMeet;
+  }
+
+  // Check centralized settings in in-memory state or database
+  if (!teacherConfiguredMeetUrl && dbState) {
+    const rawId = (teacherResolution.rawDoc as any)?.id;
+    const settingsCand =
+      (canonicalTeacherUid ? (dbState.meetSettings?.[canonicalTeacherUid] || dbState.teacherSettings?.[canonicalTeacherUid]) : null) ||
+      (resolvedTeacherEmail ? (dbState.meetSettings?.[resolvedTeacherEmail] || dbState.teacherSettings?.[resolvedTeacherEmail]) : null) ||
+      (resolvedPublicTutorId ? (dbState.meetSettings?.[resolvedPublicTutorId] || dbState.teacherSettings?.[resolvedPublicTutorId]) : null) ||
+      (rawId ? (dbState.meetSettings?.[rawId] || dbState.teacherSettings?.[rawId]) : null);
+    const candLink = (settingsCand?.meetLink || settingsCand?.meetUrl || '').trim();
+    if (candLink && !isGenericMeetUrl(candLink)) {
+      teacherConfiguredMeetUrl = candLink;
+    }
+  }
+
+  // Check in-memory tutors and teachers list
+  if (!teacherConfiguredMeetUrl && dbState) {
+    const allKnownTutors = [...(dbState.tutorsList || []), ...(dbState.teachers || [])];
+    const matchedTutorItem = allKnownTutors.find((t: any) =>
+      (canonicalTeacherUid && (t.uid === canonicalTeacherUid || t.id === canonicalTeacherUid || t.authUid === canonicalTeacherUid)) ||
+      (resolvedTeacherEmail && (t.email || '').toLowerCase().trim() === resolvedTeacherEmail) ||
+      (resolvedPublicTutorId && (t.publicTutorId === resolvedPublicTutorId || t.id === resolvedPublicTutorId))
+    );
+    const candLink = (matchedTutorItem?.meetUrl || matchedTutorItem?.meetLink || '').trim();
+    if (candLink && !isGenericMeetUrl(candLink)) {
+      teacherConfiguredMeetUrl = candLink;
+    }
+  }
+
+  // Check Firestore if available across tutors, users, and teacher_availability
+  if (!teacherConfiguredMeetUrl && db) {
+    try {
+      const emailDocId = resolvedTeacherEmail ? resolvedTeacherEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : '';
+      const [tUidDoc, tPubDoc, uUidDoc, aUidDoc, aEmailDoc] = await Promise.all([
+        canonicalTeacherUid ? db.collection('tutors').doc(canonicalTeacherUid).get().catch(() => null) : null,
+        resolvedPublicTutorId ? db.collection('tutors').doc(resolvedPublicTutorId).get().catch(() => null) : null,
+        canonicalTeacherUid ? db.collection('users').doc(canonicalTeacherUid).get().catch(() => null) : null,
+        canonicalTeacherUid ? db.collection('teacher_availability').doc(canonicalTeacherUid).get().catch(() => null) : null,
+        emailDocId ? db.collection('teacher_availability').doc(emailDocId).get().catch(() => null) : null,
+      ]);
+      const candT = (tUidDoc && tUidDoc.exists) ? (tUidDoc.data()?.meetUrl || tUidDoc.data()?.meetLink) : null;
+      const candTPub = (tPubDoc && tPubDoc.exists) ? (tPubDoc.data()?.meetUrl || tPubDoc.data()?.meetLink) : null;
+      const candU = (uUidDoc && uUidDoc.exists) ? (uUidDoc.data()?.meetUrl || uUidDoc.data()?.meetLink) : null;
+      const candA = (aUidDoc && aUidDoc.exists) ? (aUidDoc.data()?.meetLink || aUidDoc.data()?.meetUrl) : null;
+      const candAEm = (aEmailDoc && aEmailDoc.exists) ? (aEmailDoc.data()?.meetLink || aEmailDoc.data()?.meetUrl) : null;
+      const valid = [candT, candTPub, candU, candA, candAEm].find((c) => c && typeof c === 'string' && !isGenericMeetUrl(c));
+      if (valid) {
+        teacherConfiguredMeetUrl = valid.trim();
+      }
+    } catch {}
+  }
+
+  // Maintain student/teacher authorization boundaries: student cannot arbitrarily override teacher's room
+  let resolvedMeetLink = teacherConfiguredMeetUrl;
+  if (!resolvedMeetLink && meetLink && !isGenericMeetUrl(meetLink)) {
+    resolvedMeetLink = meetLink.trim();
+  }
+  // Never fabricate a generic system URL like meet.google.com/new
+  if (isGenericMeetUrl(resolvedMeetLink)) {
+    resolvedMeetLink = '';
+  }
 
   // Anti-impersonation: Student cannot be the same as Native Friend
   if (
@@ -3410,6 +3481,7 @@ export async function scheduleLessonAtomicServer(
             teacherMeetUrl: resolvedMeetLink,
             enrollmentStatus: 'active',
             hasCompletedTrialLesson: isTrialLesson ? true : hasAlreadyCompletedTrial,
+            onboardingCompleted: isTrialLesson ? true : (studentDoc?.onboardingCompleted ?? true),
             contractedLessons: newContracted,
             availableLessons: newAvailable,
             updatedAt: nowIso,
@@ -3459,6 +3531,7 @@ export async function scheduleLessonAtomicServer(
       teacherMeetUrl: resolvedMeetLink,
       enrollmentStatus: 'active',
       hasCompletedTrialLesson: isTrialLesson ? true : hasAlreadyCompletedTrial,
+      onboardingCompleted: isTrialLesson ? true : (dbState.userProfiles[profileKey]?.onboardingCompleted ?? true),
       contractedLessons: newContracted,
       availableLessons: newAvailable,
       updatedAt: nowIso,
@@ -3481,6 +3554,8 @@ export async function scheduleLessonAtomicServer(
         status: 'active',
         contractedLessons: newContracted,
         hasCompletedTrialLesson: isTrialLesson ? true : hasAlreadyCompletedTrial,
+        onboardingCompleted: isTrialLesson ? true : ((dbState.students[stIdx] as any)?.onboardingCompleted ?? true),
+        teacherMeetUrl: resolvedMeetLink,
       };
     } else {
       dbState.students.push({
@@ -3496,9 +3571,11 @@ export async function scheduleLessonAtomicServer(
         nativeFriendUID: canonicalTeacherUid,
         teacherEmail: resolvedTeacherEmail,
         teacherName: resolvedTeacherName,
+        teacherMeetUrl: resolvedMeetLink,
         status: 'active',
         contractedLessons: newContracted,
         hasCompletedTrialLesson: isTrialLesson ? true : false,
+        onboardingCompleted: isTrialLesson ? true : false,
         createdAt: nowIso,
       });
     }
@@ -3510,6 +3587,7 @@ export async function scheduleLessonAtomicServer(
     remainingLessons: newAvailable,
     contractedLessons: newContracted,
     isTrialLesson: Boolean(isTrialLesson),
+    onboardingCompleted: isTrialLesson ? true : Boolean(studentDoc?.onboardingCompleted ?? true),
     statusCode: 200,
   };
 }

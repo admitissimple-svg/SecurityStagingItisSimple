@@ -135,6 +135,8 @@ interface StudentRoutineGuideSectionProps {
   }) => void;
   dictionaryEntries?: StudentDictionaryEntry[];
   excludedWords?: string[];
+  hasConfirmedTrialLesson?: boolean;
+  onScheduleTrialLesson?: () => void;
 }
 
 export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProps> = ({
@@ -166,6 +168,8 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
   onBehavioralComplete,
   dictionaryEntries = [],
   excludedWords = [],
+  hasConfirmedTrialLesson,
+  onScheduleTrialLesson,
 }) => {
   const isEn = currentLanguage === 'en';
   const todayDay = getTodayDayOfWeek();
@@ -1588,9 +1592,24 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
             {onStartNewWeek && (
               <button
                 type="button"
-                onClick={() => setIsNewWeekModalOpen(true)}
-                className="px-3.5 py-1.5 rounded-2xl bg-[#F4CA54] hover:bg-[#e0b840] text-[#000035] font-black text-xs transition flex items-center gap-1.5 cursor-pointer shadow-xs border border-[#F4CA54]/40"
-                title={isEn ? 'Start a fresh weekly cycle with brand new content' : 'Iniciar novo ciclo semanal com conteúdos inéditos'}
+                disabled={hasConfirmedTrialLesson === false && !userProfile.hasCompletedTrialLesson}
+                onClick={() => {
+                  if (hasConfirmedTrialLesson === false && !userProfile.hasCompletedTrialLesson) {
+                    if (onScheduleTrialLesson) onScheduleTrialLesson();
+                    return;
+                  }
+                  setIsNewWeekModalOpen(true);
+                }}
+                className={`px-3.5 py-1.5 rounded-2xl font-black text-xs transition flex items-center gap-1.5 shadow-xs border ${
+                  hasConfirmedTrialLesson === false && !userProfile.hasCompletedTrialLesson
+                    ? 'bg-slate-200 text-slate-500 border-slate-300 cursor-not-allowed opacity-70'
+                    : 'bg-[#F4CA54] hover:bg-[#e0b840] text-[#000035] border-[#F4CA54]/40 cursor-pointer'
+                }`}
+                title={
+                  hasConfirmedTrialLesson === false && !userProfile.hasCompletedTrialLesson
+                    ? (isEn ? 'Schedule your mandatory Trial Lesson first to unlock weekly configuration' : 'Agende sua Aula Experimental obrigatória primeiro para desbloquear a configuração semanal')
+                    : (isEn ? 'Start a fresh weekly cycle with brand new content' : 'Iniciar novo ciclo semanal com conteúdos inéditos')
+                }
               >
                 <Sparkles className="w-3.5 h-3.5 text-[#000035]" />
                 <span>{isEn ? 'Start New Week' : 'Iniciar Nova Semana'}</span>
