@@ -66,6 +66,14 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isSubmitted, setIsSubmitted] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<{
+    name?: string;
+    email?: string;
+    password?: string;
+    confirmPassword?: string;
+    availableDays?: string;
+    timezone?: string;
+  }>({});
   const [emailWarning, setEmailWarning] = useState<string | null>(null);
   const [nameWarning, setNameWarning] = useState<string | null>(null);
   const [lastCreatedTutor, setLastCreatedTutor] = useState<any>(null);
@@ -128,33 +136,74 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (emailWarning || nameWarning) {
-      setErrorMessage(emailWarning || nameWarning);
-      return;
+
+    // Comprehensive mandatory field validation — MUST RUN BEFORE ANY FIREBASE AUTH CREATION
+    const errors: {
+      name?: string;
+      email?: string;
+      password?: string;
+      confirmPassword?: string;
+      availableDays?: string;
+      timezone?: string;
+    } = {};
+
+    const cleanName = formData.name.trim();
+    const cleanEmail = formData.email.toLowerCase().trim();
+
+    if (!cleanName) {
+      errors.name = 'Por favor, informe seu nome completo.';
+    } else if (nameWarning) {
+      errors.name = nameWarning;
+    }
+
+    if (!cleanEmail || !cleanEmail.includes('@')) {
+      errors.email = 'Por favor, informe um endereço de e-mail válido.';
+    } else if (emailWarning) {
+      errors.email = emailWarning;
     }
 
     if (!password || password.length < 6) {
-      setErrorMessage('A senha deve conter no mínimo 6 caracteres.');
-      return;
+      errors.password = 'A senha deve conter no mínimo 6 caracteres.';
     }
+
     if (password !== confirmPassword) {
-      setErrorMessage('A confirmação de senha não coincide com a senha digitada.');
-      return;
+      errors.confirmPassword = 'A confirmação de senha não coincide com a senha digitada.';
     }
-    const cleanEmail = formData.email.toLowerCase().trim();
-    if (!cleanEmail || !cleanEmail.includes('@')) {
-      setErrorMessage('Por favor, informe um endereço de e-mail válido.');
-      return;
+
+    if (!formData.timezone || !formData.timezone.trim()) {
+      errors.timezone = 'Por favor, selecione seu fuso horário.';
     }
-    if (!formData.name.trim()) {
-      setErrorMessage('Por favor, informe seu nome completo.');
+
+    if (!Array.isArray(formData.availableDays) || formData.availableDays.length === 0) {
+      errors.availableDays = 'Selecione pelo menos um dia disponível para as sessões.';
+    }
+
+    if (Object.keys(errors).length > 0) {
+      setFieldErrors(errors);
+      const firstErrorMessage =
+        errors.name ||
+        errors.email ||
+        errors.password ||
+        errors.confirmPassword ||
+        errors.availableDays ||
+        errors.timezone ||
+        'Por favor, preencha todos os campos obrigatórios.';
+      setErrorMessage(firstErrorMessage);
+
+      // Navigate to the appropriate step containing the first error
+      if (errors.name || errors.email || errors.password || errors.confirmPassword) {
+        setStep(1);
+      } else if (errors.availableDays || errors.timezone) {
+        setStep(3);
+      }
       return;
     }
 
+    setFieldErrors({});
     setIsSubmitting(true);
     setErrorMessage(null);
 
-    // 1. Create Firebase Authentication Identity
+    // 1. Create Firebase Authentication Identity ONLY after all mandatory fields pass validation
     let firebaseUid: string;
     let idToken: string | null = null;
     try {
@@ -265,12 +314,24 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
   };
 
   const toggleDay = (day: DayOfWeek) => {
-    setFormData((prev) => ({
-      ...prev,
-      availableDays: prev.availableDays.includes(day)
+    setFormData((prev) => {
+      const nextDays = prev.availableDays.includes(day)
         ? prev.availableDays.filter((d) => d !== day)
-        : [...prev.availableDays, day],
-    }));
+        : [...prev.availableDays, day];
+      if (nextDays.length > 0) {
+        setFieldErrors((curr) => {
+          if (!curr.availableDays) return curr;
+          const updated = { ...curr };
+          delete updated.availableDays;
+          return updated;
+        });
+        setErrorMessage(null);
+      }
+      return {
+        ...prev,
+        availableDays: nextDays,
+      };
+    });
   };
 
   return (
@@ -424,16 +485,24 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
                       onChange={(e) => {
                         setFormData({ ...formData, name: e.target.value });
                         if (nameWarning) setNameWarning(null);
+                        if (fieldErrors.name) setFieldErrors((prev) => ({ ...prev, name: undefined }));
                       }}
                       onBlur={() => checkNameExists(formData.name)}
                       placeholder="Ex: Sarah Jenkins"
                       className={`w-full px-3.5 py-2 bg-slate-50 border rounded-xl text-sm text-[#000035] focus:bg-white focus:outline-hidden focus:ring-2 ${
-                        nameWarning
+                        fieldErrors.name
+                          ? 'border-rose-400 ring-2 ring-rose-400/20'
+                          : nameWarning
                           ? 'border-amber-400 ring-2 ring-amber-400/20'
                           : 'border-[#607EC9]/30 focus:ring-[#1C4C96]'
                       }`}
                     />
-                    {nameWarning && (
+                    {fieldErrors.name && (
+                      <p className="mt-1 text-xs text-rose-600 font-semibold bg-rose-50 p-2 rounded-lg border border-rose-200 animate-in fade-in">
+                        ⚠️ {fieldErrors.name}
+                      </p>
+                    )}
+                    {nameWarning && !fieldErrors.name && (
                       <p className="mt-1 text-xs text-amber-700 font-semibold bg-amber-50 p-2 rounded-lg border border-amber-200">
                         ⚠️ {nameWarning}
                       </p>
@@ -451,16 +520,24 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
                       onChange={(e) => {
                         setFormData({ ...formData, email: e.target.value });
                         if (emailWarning) setEmailWarning(null);
+                        if (fieldErrors.email) setFieldErrors((prev) => ({ ...prev, email: undefined }));
                       }}
                       onBlur={() => checkEmailExists(formData.email)}
                       placeholder="Ex: native.friend@gmail.com"
                       className={`w-full px-3.5 py-2 bg-slate-50 border rounded-xl text-sm text-[#000035] focus:bg-white focus:outline-hidden focus:ring-2 ${
-                        emailWarning
+                        fieldErrors.email
+                          ? 'border-rose-400 ring-2 ring-rose-400/20'
+                          : emailWarning
                           ? 'border-rose-400 ring-2 ring-rose-400/20'
                           : 'border-[#607EC9]/30 focus:ring-[#1C4C96]'
                       }`}
                     />
-                    {emailWarning && (
+                    {fieldErrors.email && (
+                      <p className="mt-1 text-xs text-rose-600 font-semibold bg-rose-50 p-2 rounded-lg border border-rose-200 animate-in fade-in">
+                        ⚠️ {fieldErrors.email}
+                      </p>
+                    )}
+                    {emailWarning && !fieldErrors.email && (
                       <div className="mt-1 text-xs text-rose-700 font-semibold bg-rose-50 p-2.5 rounded-lg border border-rose-200 flex flex-col gap-1.5">
                         <p>⚠️ {emailWarning}</p>
                         {onSwitchToLogin && (
@@ -492,11 +569,16 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
                           type={showPassword ? 'text' : 'password'}
                           required
                           value={password}
-                          onChange={(e) => setPassword(e.target.value)}
+                          onChange={(e) => {
+                            setPassword(e.target.value);
+                            if (fieldErrors.password) setFieldErrors((prev) => ({ ...prev, password: undefined }));
+                          }}
                           placeholder="Mínimo 6 caracteres"
                           minLength={6}
                           className={`w-full pl-9 pr-9 py-2 bg-slate-50 border rounded-xl text-sm text-[#000035] focus:bg-white focus:outline-hidden focus:ring-2 ${
-                            password && password.length < 6
+                            fieldErrors.password
+                              ? 'border-rose-400 ring-2 ring-rose-400/20'
+                              : password && password.length < 6
                               ? 'border-amber-400 ring-2 ring-amber-400/20'
                               : 'border-[#607EC9]/30 focus:ring-[#1C4C96]'
                           }`}
@@ -511,7 +593,12 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
                           {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                         </button>
                       </div>
-                      {password && password.length < 6 && (
+                      {fieldErrors.password && (
+                        <p className="mt-1 text-xs text-rose-600 font-semibold bg-rose-50 p-2 rounded-lg border border-rose-200 animate-in fade-in">
+                          ⚠️ {fieldErrors.password}
+                        </p>
+                      )}
+                      {!fieldErrors.password && password && password.length < 6 && (
                         <p className="mt-1 text-[11px] text-amber-600 font-medium">
                           A senha deve conter no mínimo 6 caracteres.
                         </p>
@@ -528,11 +615,16 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
                           type={showConfirmPassword ? 'text' : 'password'}
                           required
                           value={confirmPassword}
-                          onChange={(e) => setConfirmPassword(e.target.value)}
+                          onChange={(e) => {
+                            setConfirmPassword(e.target.value);
+                            if (fieldErrors.confirmPassword) setFieldErrors((prev) => ({ ...prev, confirmPassword: undefined }));
+                          }}
                           placeholder="Repita sua senha"
                           minLength={6}
                           className={`w-full pl-9 pr-9 py-2 bg-slate-50 border rounded-xl text-sm text-[#000035] focus:bg-white focus:outline-hidden focus:ring-2 ${
-                            confirmPassword && confirmPassword !== password
+                            fieldErrors.confirmPassword
+                              ? 'border-rose-400 ring-2 ring-rose-400/20'
+                              : confirmPassword && confirmPassword !== password
                               ? 'border-rose-400 ring-2 ring-rose-400/20'
                               : confirmPassword && confirmPassword === password && password.length >= 6
                               ? 'border-emerald-400 ring-2 ring-emerald-400/20'
@@ -549,12 +641,17 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
                           {showConfirmPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                         </button>
                       </div>
-                      {confirmPassword && confirmPassword !== password && (
+                      {fieldErrors.confirmPassword && (
+                        <p className="mt-1 text-xs text-rose-600 font-semibold bg-rose-50 p-2 rounded-lg border border-rose-200 animate-in fade-in">
+                          ⚠️ {fieldErrors.confirmPassword}
+                        </p>
+                      )}
+                      {!fieldErrors.confirmPassword && confirmPassword && confirmPassword !== password && (
                         <p className="mt-1 text-[11px] text-rose-600 font-medium">
                           As senhas não coincidem.
                         </p>
                       )}
-                      {confirmPassword && confirmPassword === password && password.length >= 6 && (
+                      {!fieldErrors.confirmPassword && confirmPassword && confirmPassword === password && password.length >= 6 && (
                         <p className="mt-1 text-[11px] text-emerald-600 font-medium flex items-center gap-1">
                           <CheckCircle2 className="w-3.5 h-3.5" />
                           <span>Senhas conferem</span>
@@ -739,8 +836,15 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
                     <div className="relative">
                       <select
                         value={formData.timezone}
-                        onChange={(e) => setFormData({ ...formData, timezone: e.target.value })}
-                        className="w-full px-3 py-2 bg-slate-50 border border-[#607EC9]/30 rounded-xl text-xs text-[#000035] focus:bg-white focus:outline-hidden"
+                        onChange={(e) => {
+                          setFormData({ ...formData, timezone: e.target.value });
+                          if (fieldErrors.timezone) setFieldErrors((prev) => ({ ...prev, timezone: undefined }));
+                        }}
+                        className={`w-full px-3 py-2 bg-slate-50 border rounded-xl text-xs text-[#000035] focus:bg-white focus:outline-hidden ${
+                          fieldErrors.timezone
+                            ? 'border-rose-400 ring-2 ring-rose-400/20'
+                            : 'border-[#607EC9]/30'
+                        }`}
                       >
                         {TIMEZONE_OPTIONS.map((opt) => (
                           <option key={opt.value} value={opt.value}>
@@ -749,6 +853,11 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
                         ))}
                       </select>
                     </div>
+                    {fieldErrors.timezone && (
+                      <p className="mt-1 text-xs text-rose-600 font-semibold bg-rose-50 p-2 rounded-lg border border-rose-200 animate-in fade-in">
+                        ⚠️ {fieldErrors.timezone}
+                      </p>
+                    )}
                     <span className="text-[10px] text-slate-500 mt-1 block">
                       Detectado automaticamente pelo país de origem. Você pode alterar manualmente a qualquer momento.
                     </span>
@@ -756,7 +865,7 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
 
                   <div>
                     <label className="block text-xs font-bold text-slate-700 mb-2">
-                      Available Days for Sessions
+                      Available Days for Sessions *
                     </label>
                     <div className="grid grid-cols-4 sm:grid-cols-7 gap-1.5">
                       {(['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'] as DayOfWeek[]).map((d) => {
@@ -778,6 +887,11 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
                         );
                       })}
                     </div>
+                    {fieldErrors.availableDays && (
+                      <p className="mt-2 text-xs text-rose-600 font-semibold bg-rose-50 p-2 rounded-lg border border-rose-200 animate-in fade-in">
+                        ⚠️ {fieldErrors.availableDays}
+                      </p>
+                    )}
                   </div>
 
                   <div className="pt-4 flex justify-between items-center border-t border-slate-100">

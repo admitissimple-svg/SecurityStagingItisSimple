@@ -3130,6 +3130,7 @@ export async function scheduleLessonAtomicServer(
     teacherUid: isTargetUid ? cleanTeacherTarget : teacherUid,
     teacherEmail: isTargetEmail ? cleanTeacherTarget : teacherEmail,
     publicTutorId: (!isTargetUid && !isTargetEmail) ? cleanTeacherTarget : undefined,
+    dbState: dbState,
   });
 
   if (!teacherResolution) {

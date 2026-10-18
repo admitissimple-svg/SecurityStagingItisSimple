@@ -324,6 +324,8 @@ export interface UserProfile {
   teacherEmail?: string;
   teacherName?: string;
   teacherUid?: string;
+  teacherId?: string;
+  publicTutorId?: string;
   teacherMeetUrl?: string;
   teacherMeetLink?: string;
   assignedNativeFriendUID?: string;

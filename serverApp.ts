@@ -3123,6 +3123,9 @@ app.post('/api/tutors', async (req, res) => {
   if (!cleanName) {
     return res.status(400).json({ error: 'Invalid tutor name' });
   }
+  if (!Array.isArray(rawTutor.availableDays) || rawTutor.availableDays.length === 0) {
+    return res.status(400).json({ error: 'Available days are required: at least one day must be selected' });
+  }
   const cleanNameLower = cleanName.toLowerCase();
   const tutorId = (rawTutor.id && typeof rawTutor.id === 'string' && rawTutor.id.trim())
     ? rawTutor.id.trim()
@@ -5343,14 +5346,15 @@ app.post('/api/user-profile', async (req, res) => {
     rawProfile.teacherUid ||
     rawProfile.assignedNativeFriendUID ||
     rawProfile.teacherId ||
+    rawProfile.publicTutorId ||
     rawProfile.teacherEmail;
 
   if (incomingTeacherQuery) {
     const teacherRes = await resolveTeacherCanonicalIdentity({
-      teacherId: rawProfile.teacherId || (typeof incomingTeacherQuery === 'string' ? incomingTeacherQuery : undefined),
+      teacherId: rawProfile.teacherId || rawProfile.publicTutorId || (typeof incomingTeacherQuery === 'string' ? incomingTeacherQuery : undefined),
       teacherUid: rawProfile.teacherUid || rawProfile.assignedNativeFriendUID,
       teacherEmail: rawProfile.teacherEmail || updatedTeacherEmail,
-      publicTutorId: rawProfile.teacherId,
+      publicTutorId: rawProfile.publicTutorId || rawProfile.teacherId,
       dbState: db,
     });
 
@@ -5525,20 +5529,66 @@ app.post('/api/user-profile', async (req, res) => {
 
 // Purchase Lesson Package with a specific Native Friend (binds tutor as fixed + adds lessons)
 app.post('/api/students/purchase-package', async (req, res) => {
-  const db = readDb();
-  const { studentEmail, teacherEmail, teacherName, packageLessons, packageName, packagePriceBrl, packagePriceUsd, paymentMethod } = req.body;
-  const cleanStudentEmail = (studentEmail || '').toLowerCase().trim();
-  const cleanTeacherEmail = (teacherEmail || '').toLowerCase().trim();
-
-  if (!cleanStudentEmail || !cleanTeacherEmail) {
-    return res.status(400).json({ error: 'studentEmail and teacherEmail are required' });
+  // 1. Authenticate caller strictly via server-verified Firebase ID token
+  const verifiedCaller = await getVerifiedUserFromRequest(req);
+  if (!verifiedCaller) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Token de autenticação obrigatório para contratação de pacote.',
+    });
   }
 
-  const lessonsToAdd = Number(packageLessons) > 0 ? Number(packageLessons) : 5;
+  const db = readDb();
+  const { studentEmail, teacherEmail, teacherName, packageLessons, packageName, packagePriceBrl, packagePriceUsd, paymentMethod } = req.body;
+  const requestedEmail = (studentEmail || '').toLowerCase().trim();
 
-  // Resolve canonical Native Friend UID
+  // 2. Strict authorization: students can ONLY purchase packages for their own account
+  if (verifiedCaller.role !== 'admin' && requestedEmail && requestedEmail !== (verifiedCaller.email || '').toLowerCase().trim()) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Não é permitido contratar pacote para outro usuário.',
+    });
+  }
+
+  const cleanStudentEmail = (
+    verifiedCaller.role === 'admin' && requestedEmail
+      ? requestedEmail
+      : (verifiedCaller.email?.toLowerCase().trim() || requestedEmail)
+  );
+  const targetStudentUid = verifiedCaller.role === 'admin' && req.body.studentUid ? req.body.studentUid : verifiedCaller.uid;
+
+  if (!cleanStudentEmail && !targetStudentUid) {
+    return res.status(400).json({ error: 'Identificador do aluno é obrigatório.' });
+  }
+
+  // 3. Idempotency protection to prevent duplicate purchases on retry
+  const idempotencyKey = String(req.body.idempotencyKey || req.body.requestId || req.headers['idempotency-key'] || '').trim();
+  if (idempotencyKey && Array.isArray(db.transactions)) {
+    const existingTx = db.transactions.find((tx: any) => tx.idempotencyKey === idempotencyKey);
+    if (existingTx) {
+      return res.json({
+        success: true,
+        message: 'Package already purchased (idempotent)',
+        contractedLessons: Number(db.contractedLessons?.[cleanStudentEmail] || db.userProfiles?.[cleanStudentEmail]?.contractedLessons || 0),
+        profile: db.userProfiles?.[cleanStudentEmail],
+        transaction: existingTx,
+      });
+    }
+  }
+
+  const cleanTeacherEmail = (teacherEmail || '').toLowerCase().trim();
+  const incomingTeacherRef = req.body.teacherId || req.body.publicTutorId || req.body.tutorId || req.body.teacherUid || cleanTeacherEmail;
+
+  if (!incomingTeacherRef && !cleanTeacherEmail) {
+    return res.status(400).json({ error: 'Identificador do Amigo Nativo é obrigatório.' });
+  }
+
+  // 4. Resolve canonical Native Friend UID strictly via resolveTeacherCanonicalIdentity
   const teacherRes = await resolveTeacherCanonicalIdentity({
-    teacherEmail: cleanTeacherEmail,
+    teacherId: req.body.teacherId || req.body.publicTutorId || (typeof incomingTeacherRef === 'string' && !incomingTeacherRef.includes('@') ? incomingTeacherRef : undefined),
+    teacherUid: req.body.teacherUid,
+    teacherEmail: cleanTeacherEmail || (typeof incomingTeacherRef === 'string' && incomingTeacherRef.includes('@') ? incomingTeacherRef : undefined),
+    publicTutorId: req.body.publicTutorId || req.body.teacherId,
     dbState: db,
   });
 
@@ -5553,22 +5603,90 @@ app.post('/api/students/purchase-package', async (req, res) => {
   }
 
   const canonicalTeacherUid = teacherRes.canonicalUid;
-  const finalTeacherName = teacherRes.name || teacherName || cleanTeacherEmail.split('@')[0];
+  const finalTeacherEmail = teacherRes.email || cleanTeacherEmail;
+  const finalTeacherName = teacherRes.name || teacherName || finalTeacherEmail.split('@')[0];
 
-  // Update contracted lessons count
+  const lessonsToAdd = Number(packageLessons) > 0 ? Number(packageLessons) : 4;
+  let newWeeklyTarget = 1;
+  if (lessonsToAdd === 4) newWeeklyTarget = 1;
+  else if (lessonsToAdd === 8) newWeeklyTarget = 2;
+  else if (lessonsToAdd === 12) newWeeklyTarget = 3;
+  else if (lessonsToAdd > 0) newWeeklyTarget = Math.min(7, Math.ceil(lessonsToAdd / 4));
+
+  const nowIso = new Date().toISOString();
+
+  // 5. ATOMIC TRANSACTION IN FIRESTORE VIA FIREBASE ADMIN SDK
+  const firestoreDb = getFirestoreDb();
+  let atomicContractedTotal = 0;
+  let atomicAvailableTotal = 0;
+
+  if (firestoreDb && targetStudentUid) {
+    try {
+      await firestoreDb.runTransaction(async (transaction) => {
+        const studentRef = firestoreDb.collection('users').doc(targetStudentUid);
+        const teacherRef = firestoreDb.collection('users').doc(canonicalTeacherUid);
+
+        const [studentSnap, teacherSnap] = await Promise.all([
+          transaction.get(studentRef).catch(() => null),
+          transaction.get(teacherRef).catch(() => null),
+        ]);
+
+        const studentData = (studentSnap && studentSnap.exists) ? (studentSnap.data() || {}) : {};
+        const currentContracted = Number(studentData.contractedLessons ?? db.contractedLessons?.[cleanStudentEmail] ?? 0);
+        const currentAvailable = Number(studentData.availableLessons ?? currentContracted);
+
+        atomicContractedTotal = currentContracted + lessonsToAdd;
+        atomicAvailableTotal = currentAvailable + lessonsToAdd;
+
+        const studentUpdate: Record<string, any> = {
+          contractedLessons: atomicContractedTotal,
+          availableLessons: atomicAvailableTotal,
+          teacherUid: canonicalTeacherUid,
+          assignedNativeFriendUID: canonicalTeacherUid,
+          nativeFriendUID: canonicalTeacherUid,
+          teacherEmail: finalTeacherEmail,
+          teacherName: finalTeacherName,
+          enrollmentStatus: 'active',
+          weeklyNativeLessonsTarget: newWeeklyTarget,
+          subscriptionType: 'package',
+          updatedAt: nowIso,
+        };
+
+        transaction.set(studentRef, studentUpdate, { merge: true });
+        if (teacherSnap && teacherSnap.exists) {
+          transaction.set(teacherRef, { updatedAt: nowIso }, { merge: true });
+        }
+      });
+
+      firestoreDb.collection('student_assignments').doc(targetStudentUid).set({
+        studentUid: targetStudentUid,
+        teacherUid: canonicalTeacherUid,
+        teacherAuthUid: canonicalTeacherUid,
+        assignedNativeFriendUID: canonicalTeacherUid,
+        nativeFriendUID: canonicalTeacherUid,
+        teacherEmail: finalTeacherEmail,
+        teacherName: finalTeacherName,
+        updatedAt: nowIso,
+      }, { merge: true }).catch(() => {});
+    } catch (fsErr) {
+      console.warn('[purchase-package] Firestore Admin transaction notice:', fsErr);
+    }
+  }
+
+  // 6. Update local synchronized state
   if (!db.contractedLessons) db.contractedLessons = {};
   const currentContracted = Number(db.contractedLessons[cleanStudentEmail] || 0);
-  const newTotal = currentContracted + lessonsToAdd;
+  const newTotal = atomicContractedTotal > 0 ? atomicContractedTotal : (currentContracted + lessonsToAdd);
   db.contractedLessons[cleanStudentEmail] = newTotal;
 
   // Update student in db.students
   let studentFound = false;
   db.students = (db.students || []).map((s: any) => {
-    if ((s.email || s.studentEmail || '').toLowerCase() === cleanStudentEmail) {
+    if ((s.email || s.studentEmail || '').toLowerCase() === cleanStudentEmail || (targetStudentUid && (s.uid === targetStudentUid || s.id === targetStudentUid))) {
       studentFound = true;
       return {
         ...s,
-        teacherEmail: cleanTeacherEmail,
+        teacherEmail: finalTeacherEmail,
         teacherName: finalTeacherName,
         teacherUid: canonicalTeacherUid,
         assignedNativeFriendUID: canonicalTeacherUid,
@@ -5582,7 +5700,8 @@ app.post('/api/students/purchase-package', async (req, res) => {
 
   if (!studentFound) {
     db.students.push({
-      id: `st-${Date.now()}`,
+      id: targetStudentUid || `st-${Date.now()}`,
+      uid: targetStudentUid || `st-${Date.now()}`,
       name: cleanStudentEmail.split('@')[0],
       studentName: cleanStudentEmail.split('@')[0],
       email: cleanStudentEmail,
@@ -5593,7 +5712,7 @@ app.post('/api/students/purchase-package', async (req, res) => {
       learningGoal: 'English for everyday life & work',
       contractedLessons: newTotal,
       completedLessonsCount: 0,
-      teacherEmail: cleanTeacherEmail,
+      teacherEmail: finalTeacherEmail,
       teacherName: finalTeacherName,
       teacherUid: canonicalTeacherUid,
       assignedNativeFriendUID: canonicalTeacherUid,
@@ -5603,7 +5722,7 @@ app.post('/api/students/purchase-package', async (req, res) => {
       dailyPhraseTime: '20:00',
       status: 'active',
       activeSince: new Date().toISOString().split('T')[0],
-      createdAt: new Date().toISOString(),
+      createdAt: nowIso,
     });
   }
 
@@ -5612,33 +5731,40 @@ app.post('/api/students/purchase-package', async (req, res) => {
   const existingProfile = db.userProfiles[cleanStudentEmail] || {};
   db.userProfiles[cleanStudentEmail] = {
     ...existingProfile,
-    id: existingProfile.id || `usr-${Date.now()}`,
+    id: targetStudentUid || existingProfile.id || `usr-${Date.now()}`,
+    uid: targetStudentUid || existingProfile.uid || `usr-${Date.now()}`,
     email: cleanStudentEmail,
     name: existingProfile.name || cleanStudentEmail.split('@')[0],
     level: existingProfile.level || 'iniciante',
-    teacherEmail: cleanTeacherEmail,
+    teacherEmail: finalTeacherEmail,
     teacherName: finalTeacherName,
     teacherUid: canonicalTeacherUid,
     assignedNativeFriendUID: canonicalTeacherUid,
     nativeFriendUID: canonicalTeacherUid,
     enrollmentStatus: 'active',
     contractedLessons: newTotal,
+    weeklyNativeLessonsTarget: newWeeklyTarget,
+    subscriptionType: 'package',
     completedLessonsCount: existingProfile.completedLessonsCount || 0,
+    updatedAt: nowIso,
   };
 
   // Record transaction
   if (!db.transactions) db.transactions = [];
   const transaction = {
     id: `tx-${Date.now()}`,
+    idempotencyKey: idempotencyKey || undefined,
+    studentUid: targetStudentUid,
     studentEmail: cleanStudentEmail,
-    teacherEmail: cleanTeacherEmail,
+    teacherUid: canonicalTeacherUid,
+    teacherEmail: finalTeacherEmail,
     teacherName: finalTeacherName,
     packageLessons: lessonsToAdd,
     packageName: packageName || `${lessonsToAdd} Aulas`,
     packagePriceBrl: packagePriceBrl || lessonsToAdd * 90,
     packagePriceUsd: packagePriceUsd || lessonsToAdd * 16,
     paymentMethod: paymentMethod || 'credit_card',
-    timestamp: new Date().toISOString(),
+    timestamp: nowIso,
     status: 'completed',
   };
   db.transactions.unshift(transaction);
@@ -5650,6 +5776,7 @@ app.post('/api/students/purchase-package', async (req, res) => {
     success: true,
     message: 'Package purchased successfully and Native Friend assigned',
     contractedLessons: newTotal,
+    teacherUid: canonicalTeacherUid,
     profile: db.userProfiles[cleanStudentEmail],
     transaction,
   });
