@@ -283,11 +283,11 @@ async function runHotfixTests() {
   // 5. Secure Administrator Bootstrap Verification
   // ---------------------------------------------------------
   console.log('\n--- 5. Secure Administrator Bootstrap Logic ---');
-  // 5.1 Test bootstrap script refuses when admin already exists in system records
-  const bootstrapExistingResult = await bootstrapFirstAdministrator('anotheradmin@itissimple.com');
+  // 5.1 Test bootstrap script refuses unauthorized email
+  const bootstrapExistingResult = await bootstrapFirstAdministrator('anotheradmin@itissimple.com', 'Admin', { confirm: true, bypassProjectIdCheckForTesting: true });
   assert(
-    bootstrapExistingResult.success === false && bootstrapExistingResult.error === 'ALREADY_BOOTSTRAPPED',
-    'Administrator bootstrap strictly refuses if an administrator already exists (strictly one-time)'
+    bootstrapExistingResult.success === false && bootstrapExistingResult.error === 'UNAUTHORIZED_TARGET_EMAIL',
+    'Administrator bootstrap strictly refuses unauthorized target email'
   );
 
   // 5.2 Test bootstrap script requires account in Firebase Authentication first
