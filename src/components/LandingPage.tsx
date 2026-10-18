@@ -410,6 +410,22 @@ export const LandingPage: React.FC<LandingPageProps> = ({
         scrollToSection={scrollToSection}
         onOpenBecomeTutorModal={onOpenBecomeTutorModal}
         onOpenAuthModal={onOpenAuthModal}
+        onOpenAdminAuth={() => {
+          if (currentAccount?.role === 'admin') {
+            if (onOpenAdminApprovals) {
+              onOpenAdminApprovals();
+              return;
+            }
+            if (onGoToDashboard) {
+              onGoToDashboard();
+              return;
+            }
+          }
+          onOpenAuthModal('login', 'admin');
+          try {
+            window.history.pushState({ page: 'admin' }, '', '/admin');
+          } catch {}
+        }}
         onOpenAdminApprovals={onOpenAdminApprovals}
         onGoToDashboard={onGoToDashboard}
       />

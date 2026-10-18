@@ -108,8 +108,8 @@ export const LoginModal: React.FC<LoginModalProps> = ({
       if (initialEmail) {
         setEmail(initialEmail.trim());
       }
-      // If window path is stuck on /admin from a previous session, clean it up when opening
-      if (typeof window !== 'undefined' && window.location.pathname === '/admin') {
+      // If window path is stuck on /admin from a previous session, clean it up when opening (only if not admin initialRole)
+      if (initialRole !== 'admin' && typeof window !== 'undefined' && window.location.pathname === '/admin') {
         try {
           window.history.replaceState({}, '', '/');
         } catch {}
@@ -217,14 +217,25 @@ export const LoginModal: React.FC<LoginModalProps> = ({
             ? (isEn
                 ? 'Profile not found. Please register before logging in.'
                 : 'Perfil não encontrado. Por favor, cadastre-se.')
-            : (isEn ? 'Failed to authenticate credentials.' : 'Falha ao autenticar credenciais.'));
+            : (res.status === 403
+                ? (isEn
+                    ? 'Access denied: This account is not authorized as an administrator.'
+                    : 'Acesso negado: esta conta não possui privilégios de administrador ou a custom claim administrativa ainda não foi provisionada.')
+                : (isEn ? 'Failed to authenticate credentials.' : 'Falha ao autenticar credenciais.')));
+
+        // Defensively sign out from Firebase Auth so background listeners do not retain an unauthorized student session
+        try {
+          await auth.signOut();
+        } catch {}
 
         setErrorMsg(userFriendlyError);
         if (onShowToast) {
           onShowToast(
-            isEn ? 'Authentication Failed' : 'Falha na Autenticação',
+            res.status === 403
+              ? (isEn ? 'Access Denied' : 'Acesso Negado')
+              : (isEn ? 'Authentication Failed' : 'Falha na Autenticação'),
             userFriendlyError,
-            'warning'
+            'error'
           );
         }
         setIsLoading(false);
@@ -233,6 +244,27 @@ export const LoginModal: React.FC<LoginModalProps> = ({
 
       const data = await res.json();
       const verifiedRole: UserRole = data.account?.role || 'student';
+
+      // Strict Defense-in-Depth: If Administrator was requested, user MUST be verified as admin
+      if (selectedRole === 'admin' && verifiedRole !== 'admin') {
+        try {
+          await auth.signOut();
+        } catch {}
+        const accessDeniedMsg = isEn
+          ? 'Access denied: This account is not authorized as an administrator.'
+          : 'Acesso negado: esta conta não possui privilégios de administrador ou a custom claim administrativa ainda não foi provisionada.';
+        setErrorMsg(accessDeniedMsg);
+        if (onShowToast) {
+          onShowToast(
+            isEn ? 'Access Denied' : 'Acesso Negado',
+            accessDeniedMsg,
+            'error'
+          );
+        }
+        setIsLoading(false);
+        return;
+      }
+
       setSelectedRole(verifiedRole);
 
       const account: GoogleAccount = data.account || {
@@ -250,6 +282,12 @@ export const LoginModal: React.FC<LoginModalProps> = ({
           } catch {}
         }
       } else if (verifiedRole === 'admin') {
+        // Force refresh ID token if custom claims were recently updated on the server
+        try {
+          if (auth.currentUser) {
+            await auth.currentUser.getIdToken(true);
+          }
+        } catch {}
         if (typeof window !== 'undefined') {
           try {
             window.history.replaceState({ page: 'admin' }, '', '/admin');

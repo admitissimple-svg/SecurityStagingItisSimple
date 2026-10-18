@@ -305,6 +305,11 @@ export default function App() {
 
         // Check if currentAccount matches the active Firebase Auth user and has the verified UID
         if (!currentAccount || currentAccount.email.toLowerCase() !== cleanEmail || currentAccount.uid !== fbUser.uid) {
+          // If an admin login attempt is actively underway in LoginModal, do NOT eagerly hydrate as student
+          if (isAuthModalOpen && authModalRole === 'admin' && !isVerifiedAdmin) {
+            return;
+          }
+
           // If currentAccount already knows this user is a teacher, keep it as high priority default
           const existingRole = currentAccount?.email?.toLowerCase() === cleanEmail ? currentAccount.role : undefined;
           let resolvedRole: UserRole = isVerifiedAdmin ? 'admin' : (existingRole === 'teacher' ? 'teacher' : 'student');
@@ -369,7 +374,7 @@ export default function App() {
               }
 
               // Also check backend user profile to confirm role
-              if (resolvedRole !== 'teacher') {
+              if (resolvedRole !== 'teacher' && !isVerifiedAdmin) {
                 try {
                   const profRes = await fetch(`/api/user-profile?email=${encodeURIComponent(cleanEmail)}&uid=${encodeURIComponent(fbUser.uid)}`);
                   if (profRes.ok) {
@@ -395,6 +400,7 @@ export default function App() {
             }
           } else if (resolvedRole === 'admin') {
             setViewMode('dashboard');
+            setIsAdminApprovalsOpen(true);
             if (typeof window !== 'undefined') {
               try {
                 window.history.replaceState({ page: 'admin' }, '', '/admin');
@@ -6503,6 +6509,22 @@ export default function App() {
               setAuthModalMode(mode);
               setAuthModalRole(role || 'student');
               setIsAuthModalOpen(true);
+            }}
+            onOpenAdminAuth={() => {
+              if (currentAccount?.role === 'admin') {
+                setViewMode('dashboard');
+                setIsAdminApprovalsOpen(true);
+                try {
+                  window.history.replaceState({ page: 'admin' }, '', '/admin');
+                } catch {}
+                return;
+              }
+              setAuthModalMode('login');
+              setAuthModalRole('admin');
+              setIsAuthModalOpen(true);
+              try {
+                window.history.pushState({ page: 'admin' }, '', '/admin');
+              } catch {}
             }}
             onOpenAdminApprovals={() => setIsAdminApprovalsOpen(true)}
             onGoToDashboard={() => setViewMode('dashboard')}

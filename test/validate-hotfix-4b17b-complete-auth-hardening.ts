@@ -206,13 +206,24 @@ async function runHotfixTests() {
 
   assert(resUidMismatch.status === 403, 'POST /api/auth/login rejects identity mismatch (UID) with 403 Forbidden');
 
-  // Test 2.5: Student attempting to elevate to admin role in body -> role forced to student
-  const resStudentLogin = await invokeExpressRoute(
+  // Test 2.5: Student attempting to elevate to admin role in body -> 403 Forbidden (no privilege elevation, access denied)
+  const resStudentAdminAttempt = await invokeExpressRoute(
     app,
     'POST',
     '/api/auth/login',
     { Authorization: 'Bearer valid-student-token' },
     { role: 'admin' }
+  );
+
+  assert(resStudentAdminAttempt.status === 403, 'POST /api/auth/login rejects unprivileged admin access with 403 Forbidden');
+  assert(resStudentAdminAttempt.body.code === 'ADMIN_ACCESS_DENIED', 'Error code reflects ADMIN_ACCESS_DENIED');
+
+  const resStudentLogin = await invokeExpressRoute(
+    app,
+    'POST',
+    '/api/auth/login',
+    { Authorization: 'Bearer valid-student-token' },
+    { role: 'student' }
   );
 
   assert(resStudentLogin.status === 200, 'POST /api/auth/login accepts verified student token');

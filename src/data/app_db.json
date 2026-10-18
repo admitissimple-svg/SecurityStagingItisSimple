@@ -2259,7 +2259,8 @@
     "laviniatilapiafc@gmail.com": [],
     "QLcJOUVRuGMSCKx3isYW3mryZty2": [],
     "student@example.com": [],
-    "student-uid-123": []
+    "student-uid-123": [],
+    "student-canonical-uid-101": []
   },
   "studentWatchedVideos": {},
   "studentSpotifyAssignments": {
@@ -3341,7 +3342,8 @@
     "laviniatilapiafc@gmail.com": true,
     "QLcJOUVRuGMSCKx3isYW3mryZty2": true,
     "student@example.com": true,
-    "student-uid-123": true
+    "student-uid-123": true,
+    "student-canonical-uid-101": true
   },
   "spotifyPlaylists": {},
   "sessionNotesMap": {},
@@ -3349,18 +3351,20 @@
   "pedagogicalTransformationsMap": {},
   "authUsers": {
     "adm.itissimple@gmail.com": {
-      "uid": "admin-master-uid",
+      "uid": "admin-authorized-uid-1",
       "email": "adm.itissimple@gmail.com",
       "name": "Admin It's Simple",
-      "role": "admin"
+      "role": "admin",
+      "createdAt": "2026-10-18T20:44:16.424Z",
+      "updatedAt": "2026-10-18T20:44:41.710Z"
     },
     "laviniatilapiafc@gmail.com": {
-      "uid": "QLcJOUVRuGMSCKx3isYW3mryZty2",
-      "id": "QLcJOUVRuGMSCKx3isYW3mryZty2",
+      "uid": "student-canonical-uid-101",
       "email": "laviniatilapiafc@gmail.com",
       "name": "Lavinia",
       "role": "student",
-      "createdAt": "2026-10-01T00:00:00.000Z"
+      "createdAt": "2026-10-01T00:00:00.000Z",
+      "updatedAt": "2026-10-18T20:44:41.710Z"
     },
     "student@example.com": {
       "uid": "student-uid-123",
@@ -3368,7 +3372,7 @@
       "name": "Student",
       "role": "student",
       "createdAt": "2026-10-18T18:51:50.409Z",
-      "updatedAt": "2026-10-18T19:39:34.733Z"
+      "updatedAt": "2026-10-18T20:44:39.296Z"
     }
   },
   "youtubePlaylists": [
@@ -3380,7 +3384,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 21,
-      "updatedAt": "2026-10-18T19:27:47.920Z",
+      "updatedAt": "2026-10-18T20:39:57.467Z",
       "isPublic": true,
       "videos": [
         {
@@ -3666,7 +3670,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 21,
-      "updatedAt": "2026-10-18T19:27:47.920Z",
+      "updatedAt": "2026-10-18T20:39:57.467Z",
       "isPublic": true,
       "videos": [
         {
@@ -3952,7 +3956,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-18T19:27:47.920Z",
+      "updatedAt": "2026-10-18T20:39:57.467Z",
       "isPublic": true,
       "videos": [
         {
@@ -4342,7 +4346,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 27,
-      "updatedAt": "2026-10-18T19:27:47.920Z",
+      "updatedAt": "2026-10-18T20:39:57.467Z",
       "isPublic": true,
       "videos": [
         {
@@ -4706,7 +4710,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 26,
-      "updatedAt": "2026-10-18T19:27:47.920Z",
+      "updatedAt": "2026-10-18T20:39:57.468Z",
       "isPublic": true,
       "videos": [
         {
@@ -5057,7 +5061,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 21,
-      "updatedAt": "2026-10-18T19:27:47.920Z",
+      "updatedAt": "2026-10-18T20:39:57.468Z",
       "isPublic": true,
       "videos": [
         {
@@ -5343,7 +5347,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 23,
-      "updatedAt": "2026-10-18T19:27:47.920Z",
+      "updatedAt": "2026-10-18T20:39:57.468Z",
       "isPublic": true,
       "videos": [
         {
@@ -5655,7 +5659,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 26,
-      "updatedAt": "2026-10-18T19:27:47.920Z",
+      "updatedAt": "2026-10-18T20:39:57.468Z",
       "isPublic": true,
       "videos": [
         {
@@ -6006,7 +6010,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 28,
-      "updatedAt": "2026-10-18T19:27:47.920Z",
+      "updatedAt": "2026-10-18T20:39:57.468Z",
       "isPublic": true,
       "videos": [
         {
@@ -6383,7 +6387,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-18T19:27:47.920Z",
+      "updatedAt": "2026-10-18T20:39:57.468Z",
       "isPublic": true,
       "videos": [
         {
@@ -6773,7 +6777,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 28,
-      "updatedAt": "2026-10-18T19:27:47.920Z",
+      "updatedAt": "2026-10-18T20:39:57.468Z",
       "isPublic": true,
       "videos": [
         {
@@ -7150,7 +7154,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 30,
-      "updatedAt": "2026-10-18T19:27:47.920Z",
+      "updatedAt": "2026-10-18T20:39:57.468Z",
       "isPublic": true,
       "videos": [
         {
@@ -7553,7 +7557,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-18T19:27:47.920Z",
+      "updatedAt": "2026-10-18T20:39:57.468Z",
       "isPublic": true,
       "videos": [
         {
@@ -7943,7 +7947,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 30,
-      "updatedAt": "2026-10-18T19:27:47.920Z",
+      "updatedAt": "2026-10-18T20:39:57.468Z",
       "isPublic": true,
       "videos": [
         {
@@ -8346,7 +8350,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-18T19:27:47.920Z",
+      "updatedAt": "2026-10-18T20:39:57.468Z",
       "isPublic": true,
       "videos": [
         {
@@ -8736,7 +8740,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 27,
-      "updatedAt": "2026-10-18T19:27:47.920Z",
+      "updatedAt": "2026-10-18T20:39:57.468Z",
       "isPublic": true,
       "videos": [
         {
@@ -9100,7 +9104,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 28,
-      "updatedAt": "2026-10-18T19:27:47.920Z",
+      "updatedAt": "2026-10-18T20:39:57.468Z",
       "isPublic": true,
       "videos": [
         {
@@ -9477,7 +9481,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-18T19:27:47.920Z",
+      "updatedAt": "2026-10-18T20:39:57.468Z",
       "isPublic": true,
       "videos": [
         {

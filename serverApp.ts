@@ -1418,7 +1418,20 @@ app.post('/api/auth/login', async (req, res) => {
     verifiedCaller.role === 'admin' ||
     (db.teachers || []).some(
       (t: any) => t.role === 'admin' && (t.uid === authenticatedUid || t.id === authenticatedUid)
+    ) ||
+    Boolean(
+      db.authUsers?.[cleanEmail]?.role === 'admin' &&
+      db.authUsers?.[cleanEmail]?.uid === authenticatedUid
     );
+
+  // If user requested admin role, they MUST possess verified admin privileges
+  if (requestedRole === 'admin' && !isServerVerifiedAdmin) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      code: 'ADMIN_ACCESS_DENIED',
+      message: 'Acesso negado: esta conta não possui privilégios de administrador ou a custom claim de administrador ainda não foi provisionada.',
+    });
+  }
 
   const tutorObj = (db.tutorsList || []).find(
     (t: any) => t.uid === authenticatedUid || t.authUid === authenticatedUid || (t.email || '').toLowerCase() === cleanEmail

@@ -309,7 +309,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           errData.error ||
           (res.status === 401
             ? 'Conta não autorizada ou perfil não encontrado. Por favor, cadastre-se antes de fazer login.'
-            : 'Erro ao autenticar credenciais no servidor.');
+            : (res.status === 403
+                ? 'Acesso negado: esta conta não possui privilégios de administrador ou a custom claim de administrador ainda não foi provisionada.'
+                : 'Erro ao autenticar credenciais no servidor.'));
+        await firebaseAuthSignOut(auth).catch(() => {});
         setError(errMsg);
         return { success: false, error: errMsg };
       }
@@ -317,6 +320,19 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const data = await res.json();
       const account: GoogleAccount = data.account;
       const verifiedRole: UserRole = account.role as UserRole;
+
+      if (preferredRole === 'admin' && verifiedRole !== 'admin') {
+        await firebaseAuthSignOut(auth).catch(() => {});
+        const errMsg = 'Acesso negado: a conta informada não possui privilégios de administrador.';
+        setError(errMsg);
+        return { success: false, error: errMsg };
+      }
+
+      if (verifiedRole === 'admin') {
+        try {
+          await userCredential.user.getIdToken(true);
+        } catch {}
+      }
 
       setCurrentAccount(account);
 
