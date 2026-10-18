@@ -65,7 +65,8 @@ export async function withFirestoreTimeout<T>(
   const timeoutPromise = new Promise<T>((resolve) => {
     timer = setTimeout(() => resolve(fallback), ms);
   });
-  return Promise.race([promise, timeoutPromise]).finally(() => {
+  const safePromise = promise.catch(() => fallback);
+  return Promise.race([safePromise, timeoutPromise]).finally(() => {
     if (timer) clearTimeout(timer);
   });
 }

@@ -609,11 +609,11 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
         studentAccount: {
           name: studentName.trim() || currentAccount?.name || '',
           email: cleanEmail,
-          password: studentPassword,
           uid: canonicalStudentUid,
         },
       });
 
+      setStudentPassword('');
       setIsSavedSuccessfully(true);
       setCurrentStep(6);
     } catch (err: any) {

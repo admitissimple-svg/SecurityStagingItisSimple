@@ -31,6 +31,7 @@ import { BrandLogo } from './BrandLogo';
 import { GoogleSignInModal } from './GoogleSignInModal';
 import { ImageUploadInput } from './ImageUploadInput';
 import { firebaseSignInWithEmail, firebaseSignUpWithEmail } from '../utils/auth';
+import { sendPasswordResetEmail } from 'firebase/auth';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { getDb, auth } from '../firebase';
 
@@ -473,21 +474,41 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
     try {
       if (mode === 'signup') {
-        // Attempt Firebase Auth account creation to generate real UID
         let firebaseUid: string | undefined;
+        let idToken: string | undefined;
         try {
           const fbAuth = await firebaseSignUpWithEmail(cleanEmail, password);
           firebaseUid = fbAuth.user.uid;
+          idToken = fbAuth.accessToken;
         } catch (fbErr: any) {
-          // If already exists in Firebase Auth, proceed to backend verification
-          console.log('Firebase signup notice:', fbErr?.message || fbErr);
+          const code = fbErr?.code;
+          if (code === 'auth/email-already-in-use') {
+            setErrorMsg(
+              isEn
+                ? 'This email is already registered. Please login instead.'
+                : 'Este e-mail já está cadastrado. Por favor, faça login.'
+            );
+            setIsLoading(false);
+            return;
+          } else if (code === 'auth/weak-password') {
+            setErrorMsg(
+              isEn
+                ? 'Password is too weak. Minimum 6 characters required.'
+                : 'A senha é muito fraca. Mínimo de 6 caracteres.'
+            );
+            setIsLoading(false);
+            return;
+          } else {
+            setErrorMsg(fbErr?.message || (isEn ? 'Failed to create account.' : 'Falha ao criar conta.'));
+            setIsLoading(false);
+            return;
+          }
         }
 
         const payload: Record<string, any> = {
           uid: firebaseUid,
           name,
           email: cleanEmail,
-          password,
           role,
         };
 
@@ -516,9 +537,15 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
         const res = await fetch('/api/auth/signup', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+          },
           body: JSON.stringify(payload),
         });
+
+        // Wipe password state immediately
+        setPassword('');
 
         if (res.ok) {
           const data = await res.json();
@@ -532,13 +559,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               onLoginSuccess(data.account, undefined, data.tutor);
               onClose();
             }, 800);
-          } else if (role === 'admin') {
-            setSuccessMsg(isEn ? 'Administrator registered successfully!' : 'Administrador cadastrado com sucesso!');
-            setHasExistingAdmin(true);
-            setTimeout(() => {
-              onLoginSuccess(data.account);
-              onClose();
-            }, 800);
           } else {
             setSuccessMsg(isEn ? 'Student account created successfully!' : 'Conta de aluno(a) criada com sucesso!');
             const builtProfile: Partial<UserProfile> = data.profile || {
@@ -550,25 +570,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               routineAudioTime,
               dailyPhraseTime,
             };
-
-            const targetStudentUid = firebaseUid || data.account?.uid || '';
-            if (targetStudentUid) {
-              const db = getDb();
-              if (db) {
-                setDoc(
-                  doc(db, 'users', targetStudentUid),
-                  {
-                    ...builtProfile,
-                    id: targetStudentUid,
-                    uid: targetStudentUid,
-                    email: cleanEmail,
-                    role: 'student',
-                    updatedAt: new Date().toISOString(),
-                  },
-                  { merge: true }
-                ).catch(() => null);
-              }
-            }
 
             setTimeout(() => {
               onLoginSuccess(data.account, builtProfile);
@@ -589,7 +590,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           } else if (res.status === 403) {
             setErrorMsg(
               errData.error ||
-                'Já existe um Administrador cadastrado no sistema. Só é permitido um único Administrador.'
+                'Não é permitido cadastrar contas de Administrador via endpoint público.'
             );
           } else {
             setErrorMsg(errData.error || (isEn ? 'Failed to create account' : 'Erro ao criar conta'));
@@ -597,108 +598,36 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         }
       } else {
         // Mode === 'login'
-        // 1. Authenticate user in Firebase Auth and obtain UID
         let firebaseUid: string | undefined;
+        let idToken: string | undefined;
         try {
           const authResult = await firebaseSignInWithEmail(cleanEmail, password);
           firebaseUid = authResult?.user?.uid;
-        } catch (authErr: any) {
-          console.warn('Firebase Auth sign-in notice in AuthModal (will fallback to backend DB check):', authErr?.code || authErr?.message);
-        }
-
-        // 2. Query user document in 'users' collection in Firestore using the authenticated UID
-        let firestoreUserDoc: any = null;
-        const firestoreDb = getDb();
-
-        if (firebaseUid) {
-          try {
-            const userDocRef = doc(firestoreDb, 'users', firebaseUid);
-            const snap = await Promise.race([
-              getDoc(userDocRef),
-              new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
-            ]);
-            if (snap && 'exists' in snap && snap.exists()) {
-              firestoreUserDoc = snap.data();
-            }
-          } catch (fsErr) {
-            console.warn('Firestore user fetch notice in AuthModal:', fsErr);
-          }
-        }
-
-        // Fallback: Query by sanitized email doc ID in users collection if not found by UID
-        if (!firestoreUserDoc && cleanEmail) {
-          try {
-            const cleanDocId = cleanEmail.replace(/[^a-zA-Z0-9]/g, '-');
-            const emailDocRef = doc(firestoreDb, 'users', cleanDocId);
-            const snapEmail = await Promise.race([
-              getDoc(emailDocRef),
-              new Promise<null>((resolve) => setTimeout(() => resolve(null), 2500)),
-            ]);
-            if (snapEmail && 'exists' in snapEmail && snapEmail.exists()) {
-              firestoreUserDoc = snapEmail.data();
-            }
-          } catch (fsErr) {
-            console.warn('Firestore user fetch by email notice in AuthModal:', fsErr);
-          }
-        }
-
-        // Check tutor document in /tutors or /users with tutor prefix
-        if (!firestoreUserDoc && cleanEmail) {
-          try {
-            const cleanTutorId = `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
-            const tutorSnap = await getDoc(doc(firestoreDb, 'tutors', cleanTutorId)).catch(() => null);
-            if (tutorSnap && tutorSnap.exists()) {
-              firestoreUserDoc = { ...tutorSnap.data(), role: 'teacher' };
-            } else {
-              const userTutorSnap = await getDoc(doc(firestoreDb, 'users', cleanTutorId)).catch(() => null);
-              if (userTutorSnap && userTutorSnap.exists()) {
-                firestoreUserDoc = { ...userTutorSnap.data(), role: 'teacher' };
-              }
-            }
-          } catch {}
-        }
-
-        // 3. Read role field corresponding to user's role ('teacher', 'native_friend', 'admin', 'student')
-        const docRole = (firestoreUserDoc?.role || firestoreUserDoc?.userRole || '').toLowerCase().trim();
-        let verifiedRole: UserRole = 'student';
-
-        if (cleanEmail === 'adm.itissimple@gmail.com' || docRole === 'admin') {
-          verifiedRole = 'admin';
-        } else if (docRole === 'teacher' || docRole === 'native_friend' || docRole === 'tutor') {
-          verifiedRole = 'teacher';
-        } else if (docRole === 'student') {
-          verifiedRole = 'student';
-        } else {
-          // Fallback: if Firestore document does not explicitly specify role, align with selected tab if teacher or admin, else default to student
-          verifiedRole = role === 'teacher' || role === 'admin' ? role : 'student';
-        }
-
-        // 4. Synchronize role selection tab state with the authenticated user role
-        setRole(verifiedRole);
-
-        // Strict validation: Visual admin login must correspond to a valid Firebase Auth session
-        if (verifiedRole === 'admin' && (!firebaseUid || !auth.currentUser)) {
-          setErrorMsg(
-            isEn
-              ? 'Administrator session requires a valid Firebase Authentication login. Simulated authentication is not permitted.'
-              : 'A sessão de administrador requer autenticação válida no Firebase Auth. Não é permitido simular autenticação.'
-          );
+          idToken = authResult?.accessToken;
+        } catch {
+          setErrorMsg(isEn ? 'Invalid email or password.' : 'E-mail ou senha incorretos.');
           setIsLoading(false);
           return;
         }
 
-        // 5. Sync with backend API
+        // Wipe password state immediately
+        setPassword('');
+
+        // Authenticate exclusively with backend API using verified Firebase ID Token
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 6000);
+        const timeoutId = setTimeout(() => controller.abort(), 8000);
 
         const res = await fetch('/api/auth/login', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+          },
           body: JSON.stringify({
+            idToken,
             email: cleanEmail,
-            password,
-            role: verifiedRole,
-            uid: firebaseUid || firestoreUserDoc?.uid,
+            role,
+            uid: firebaseUid,
           }),
           signal: controller.signal,
         }).catch(() => {
@@ -714,32 +643,17 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
         if (res.ok) {
           const data = await res.json();
-          const serverRole = (data.account?.role || (data.isTeacher ? 'teacher' : '') || '').toLowerCase();
-          if (serverRole === 'teacher' || serverRole === 'admin') {
-            verifiedRole = serverRole as UserRole;
-            setRole(verifiedRole);
-          }
+          const verifiedRole: UserRole = data.account?.role || 'student';
+          setRole(verifiedRole);
 
           const account: GoogleAccount = data.account || {
-            uid: firebaseUid || firestoreUserDoc?.uid || `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`,
+            uid: firebaseUid || `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`,
             email: cleanEmail,
-            name: firestoreUserDoc?.name || cleanEmail.split('@')[0],
+            name: cleanEmail.split('@')[0],
             role: verifiedRole,
           };
 
-          const effectiveAuthUid = firebaseUid || firestoreUserDoc?.uid || account?.uid || '';
-          if (effectiveAuthUid) {
-            account.uid = effectiveAuthUid;
-            account.id = effectiveAuthUid;
-          }
-          account.role = verifiedRole;
-
-          // 6. Conditional redirection strictly based on verifiedRole:
-          // - Teacher / Native Friend -> /teacher (Native Friend / Teacher Panel)
-          // - Administrator -> /admin (Administrator Panel)
-          // - Student -> /dashboard (Student Space)
-          let resolvedProfile: Partial<UserProfile> | undefined = undefined;
-
+          // Conditional navigation by role
           if (verifiedRole === 'teacher') {
             if (typeof window !== 'undefined') {
               try {
@@ -753,51 +667,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               } catch {}
             }
           } else {
-            // Student space
-            resolvedProfile = {
-              ...(data.profile || {}),
-              id: account.uid,
-              uid: account.uid,
-              name: account.name,
-              email: account.email,
-              nativeFriendUID:
-                firestoreUserDoc?.nativeFriendUID ||
-                firestoreUserDoc?.teacherUid ||
-                (data.profile as any)?.nativeFriendUID ||
-                null,
-              teacherUid:
-                firestoreUserDoc?.teacherUid ||
-                firestoreUserDoc?.nativeFriendUID ||
-                (data.profile as any)?.teacherUid ||
-                null,
-              teacherEmail: firestoreUserDoc?.teacherEmail || data.profile?.teacherEmail || null,
-              teacherName: firestoreUserDoc?.teacherName || data.profile?.teacherName || null,
-              level: firestoreUserDoc?.level || data.profile?.level,
-              studyPlan: firestoreUserDoc?.studyPlan || firestoreUserDoc?.learningGoal || data.profile?.learningGoal || '',
-              learningGoal: firestoreUserDoc?.learningGoal || data.profile?.learningGoal || '',
-              weeklyStudyDaysTarget: firestoreUserDoc?.weeklyStudyDaysTarget ?? data.profile?.weeklyStudyDaysTarget ?? 7,
-              weeklyStudyDays: firestoreUserDoc?.weeklyStudyDays || data.profile?.weeklyStudyDays,
-            };
-
-            const targetStudentUid = account.uid || firebaseUid || '';
-            if (targetStudentUid) {
-              const db = getDb();
-              if (db) {
-                setDoc(
-                  doc(db, 'users', targetStudentUid),
-                  {
-                    ...resolvedProfile,
-                    id: targetStudentUid,
-                    uid: targetStudentUid,
-                    email: cleanEmail,
-                    role: 'student',
-                    updatedAt: new Date().toISOString(),
-                  },
-                  { merge: true }
-                ).catch(() => null);
-              }
-            }
-
             if (typeof window !== 'undefined') {
               try {
                 window.history.replaceState({ page: 'dashboard' }, '', '/dashboard');
@@ -806,12 +675,12 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           }
 
           setIsLoading(false);
-          const tutorPayload = data.tutor || (verifiedRole === 'teacher' ? (firestoreUserDoc || { email: cleanEmail, name: account.name, role: 'teacher' }) : undefined);
-          onLoginSuccess(account, resolvedProfile, tutorPayload);
+          onLoginSuccess(account, data.profile, data.tutor);
           onClose();
         } else {
           const errData = await res.json().catch(() => ({}));
           const userFriendlyError =
+            errData.message ||
             errData.error ||
             (res.status === 401
               ? (isEn
@@ -822,7 +691,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           setErrorMsg(userFriendlyError);
           if (onShowToast) {
             onShowToast(
-              isEn ? 'Account not found' : 'Conta não encontrada',
+              isEn ? 'Authentication Failed' : 'Falha na Autenticação',
               userFriendlyError,
               'warning'
             );
@@ -1315,7 +1184,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   onBlur={() => checkDuplicateEmail(email)}
                   placeholder={
                     role === 'admin'
-                      ? 'adm.itissimple@gmail.com'
+                      ? 'admin@itissimple.com'
                       : isEn ? 'name@example.com' : 'seu.email@exemplo.com'
                   }
                   className={`w-full pl-10 pr-4 py-2.5 bg-slate-50 border rounded-xl text-xs sm:text-sm font-medium text-[#000035] placeholder:text-slate-400 focus:outline-hidden focus:ring-2 focus:border-transparent transition ${

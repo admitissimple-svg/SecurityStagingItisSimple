@@ -10,7 +10,7 @@ import {
   Info,
 } from 'lucide-react';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
-import { getDb } from '../firebase';
+import { getDb, auth } from '../firebase';
 import { GoogleAccount, UserRole, Language } from '../types';
 import { googleSignIn } from '../utils/auth';
 
@@ -84,7 +84,7 @@ export const GoogleSignInModal: React.FC<GoogleSignInModalProps> = ({
     setIsUnauthorizedDomain(false);
 
     try {
-      const { user } = await googleSignIn();
+      const { user, accessToken } = await googleSignIn();
 
       if (!user.email) {
         throw new Error(
@@ -110,21 +110,21 @@ export const GoogleSignInModal: React.FC<GoogleSignInModalProps> = ({
         console.warn('Firestore fetch notice during Google sign-in:', fsErr);
       }
 
-      // 2. Strict role determination from Firestore document
+      // 2. Strict role determination from verified token claims and server profile
       const cleanEmail = user.email.toLowerCase().trim();
-      const isMasterAdmin = cleanEmail === 'adm.itissimple@gmail.com';
+      const idToken = accessToken || (await auth.currentUser?.getIdToken().catch(() => null));
+      const tokenResult = await auth.currentUser?.getIdTokenResult().catch(() => null);
+      const isVerifiedAdmin = tokenResult?.claims?.role === 'admin';
       const docRole = (firestoreUserDoc?.role || '').toLowerCase();
       let verifiedRole: UserRole = 'student';
 
-      if (isMasterAdmin) {
+      if (isVerifiedAdmin) {
         verifiedRole = 'admin';
       } else if (docRole === 'student') {
         // STRICT RBAC: Registered student locked strictly to student role
         verifiedRole = 'student';
       } else if (docRole === 'native_friend' || docRole === 'teacher') {
         verifiedRole = 'teacher';
-      } else if (docRole === 'admin') {
-        verifiedRole = isMasterAdmin ? 'admin' : 'student';
       } else {
         verifiedRole = selectedRole === 'teacher' ? 'teacher' : 'student';
       }
@@ -132,7 +132,10 @@ export const GoogleSignInModal: React.FC<GoogleSignInModalProps> = ({
       // Synchronize authenticated user with backend profile and persistence
       const res = await fetch('/api/auth/google', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+        },
         body: JSON.stringify({
           uid: user.uid,
           email: user.email,
@@ -157,7 +160,7 @@ export const GoogleSignInModal: React.FC<GoogleSignInModalProps> = ({
 
       // Lock role if server or Firestore confirms student
       if (docRole === 'student' || data.isRoleEnforced || account.role === 'student' || verifiedRole === 'student') {
-        if (!isMasterAdmin) {
+        if (!isVerifiedAdmin) {
           verifiedRole = 'student';
           account.role = 'student';
         }

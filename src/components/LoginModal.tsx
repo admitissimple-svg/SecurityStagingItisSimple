@@ -158,110 +158,18 @@ export const LoginModal: React.FC<LoginModalProps> = ({
     try {
       // 1. Authenticate user in Firebase Auth and obtain UID
       let firebaseUid: string | undefined;
-      let firebaseAuthFailed = false;
+      let idToken: string | undefined;
       try {
         const authResult = await firebaseSignInWithEmail(cleanEmail, password);
         firebaseUid = authResult?.user?.uid;
-      } catch (authErr: any) {
-        console.warn('Firebase Auth sign-in notice (will fallback to backend DB check):', authErr?.code || authErr?.message);
-        firebaseAuthFailed = true;
-
-        // If user is a registered teacher (e.g. Queen Bee) doing first login without prior Firebase Auth account,
-        // create their Firebase Auth identity to link securely
-        if (
-          password.length >= 6 &&
-          (authErr?.code === 'auth/user-not-found' || authErr?.code === 'auth/invalid-credential')
-        ) {
-          try {
-            const signUpResult = await firebaseSignUpWithEmail(cleanEmail, password);
-            firebaseUid = signUpResult?.user?.uid;
-            firebaseAuthFailed = false;
-          } catch (signUpErr: any) {
-            console.warn('Firebase Auth first-login linking notice:', signUpErr?.code || signUpErr?.message);
-          }
-        }
-      }
-
-      // 2. Query user document in 'users' collection in Firestore using the authenticated UID
-      let firestoreUserDoc: any = null;
-      const db = getDb();
-
-      if (firebaseUid) {
-        try {
-          const userDocRef = doc(db, 'users', firebaseUid);
-          const snap = await Promise.race([
-            getDoc(userDocRef),
-            new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
-          ]);
-          if (snap && 'exists' in snap && snap.exists()) {
-            firestoreUserDoc = snap.data();
-          }
-        } catch (fsErr) {
-          console.warn('Firestore user fetch by UID notice in LoginModal:', fsErr);
-        }
-      }
-
-      // Fallback query by sanitized email ID if not found by UID
-      if (!firestoreUserDoc && cleanEmail) {
-        try {
-          const cleanDocId = cleanEmail.replace(/[^a-zA-Z0-9]/g, '-');
-          const emailDocRef = doc(db, 'users', cleanDocId);
-          const snapEmail = await Promise.race([
-            getDoc(emailDocRef),
-            new Promise<null>((resolve) => setTimeout(() => resolve(null), 2500)),
-          ]);
-          if (snapEmail && 'exists' in snapEmail && snapEmail.exists()) {
-            firestoreUserDoc = snapEmail.data();
-          }
-        } catch (fsErr) {
-          console.warn('Firestore user fetch by email notice in LoginModal:', fsErr);
-        }
-      }
-
-      // Also check tutor document in /tutors or /users with tutor prefix
-      if (!firestoreUserDoc && cleanEmail) {
-        try {
-          const cleanTutorId = `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
-          const tutorSnap = await getDoc(doc(db, 'tutors', cleanTutorId)).catch(() => null);
-          if (tutorSnap && tutorSnap.exists()) {
-            firestoreUserDoc = { ...tutorSnap.data(), role: 'teacher' };
-          } else {
-            const userTutorSnap = await getDoc(doc(db, 'users', cleanTutorId)).catch(() => null);
-            if (userTutorSnap && userTutorSnap.exists()) {
-              firestoreUserDoc = { ...userTutorSnap.data(), role: 'teacher' };
-            }
-          }
-        } catch {}
-      }
-
-      // 3. Read role field corresponding to user's role ('teacher', 'native_friend', 'admin', 'student')
-      const docRole = (firestoreUserDoc?.role || firestoreUserDoc?.userRole || '').toLowerCase().trim();
-      let verifiedRole: UserRole = 'student';
-
-      if (cleanEmail === 'adm.itissimple@gmail.com' || docRole === 'admin') {
-        verifiedRole = 'admin';
-      } else if (docRole === 'teacher' || docRole === 'native_friend' || docRole === 'tutor') {
-        verifiedRole = 'teacher';
-      } else if (docRole === 'student') {
-        verifiedRole = 'student';
-      } else {
-        // Fallback: if Firestore document does not explicitly specify role, align with selectedRole if teacher or admin, else default to student
-        verifiedRole = selectedRole === 'teacher' || selectedRole === 'admin' ? selectedRole : 'student';
-      }
-
-      // 4. Synchronize role selection tab state with the authenticated user role
-      setSelectedRole(verifiedRole);
-
-      // Strict validation: Visual admin login must correspond to a valid Firebase Auth session
-      if (verifiedRole === 'admin' && (firebaseAuthFailed || !firebaseUid || !auth.currentUser)) {
-        const adminAuthError = isEn
-          ? 'Administrator session requires a valid Firebase Authentication login. Simulated authentication is not permitted.'
-          : 'A sessão de administrador requer autenticação válida no Firebase Auth. Não é permitido simular autenticação.';
-        setErrorMsg(adminAuthError);
+        idToken = authResult?.accessToken;
+      } catch {
+        const userFriendlyError = isEn ? 'Invalid email or password.' : 'E-mail ou senha incorretos.';
+        setErrorMsg(userFriendlyError);
         if (onShowToast) {
           onShowToast(
             isEn ? 'Authentication Failed' : 'Falha na Autenticação',
-            adminAuthError,
+            userFriendlyError,
             'warning'
           );
         }
@@ -269,18 +177,24 @@ export const LoginModal: React.FC<LoginModalProps> = ({
         return;
       }
 
-      // 5. Sync with backend API
+      // Wipe password state immediately
+      setPassword('');
+
+      // 2. Authenticate exclusively with backend API using verified Firebase ID Token
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 12000);
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
 
       const res = await fetch('/api/auth/login', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+        },
         body: JSON.stringify({
+          idToken,
           email: cleanEmail,
-          password,
-          role: verifiedRole,
-          uid: firebaseUid || firestoreUserDoc?.uid,
+          role: selectedRole,
+          uid: firebaseUid,
         }),
         signal: controller.signal,
       }).catch(() => {
@@ -297,6 +211,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         const userFriendlyError =
+          errData.message ||
           errData.error ||
           (res.status === 401
             ? (isEn
@@ -307,7 +222,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
         setErrorMsg(userFriendlyError);
         if (onShowToast) {
           onShowToast(
-            isEn ? 'Profile not found' : 'Perfil não encontrado',
+            isEn ? 'Authentication Failed' : 'Falha na Autenticação',
             userFriendlyError,
             'warning'
           );
@@ -317,60 +232,17 @@ export const LoginModal: React.FC<LoginModalProps> = ({
       }
 
       const data = await res.json();
-      const serverRole = (data.account?.role || (data.isTeacher ? 'teacher' : '') || '').toLowerCase();
-      if (serverRole === 'teacher' || serverRole === 'admin') {
-        verifiedRole = serverRole as UserRole;
-        setSelectedRole(verifiedRole);
-      }
+      const verifiedRole: UserRole = data.account?.role || 'student';
+      setSelectedRole(verifiedRole);
 
       const account: GoogleAccount = data.account || {
-        uid: firebaseUid || firestoreUserDoc?.uid || `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`,
+        uid: firebaseUid || `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`,
         email: cleanEmail,
-        name: firestoreUserDoc?.name || cleanEmail.split('@')[0],
+        name: cleanEmail.split('@')[0],
         role: verifiedRole,
       };
 
-      const effectiveAuthUid = firebaseUid || firestoreUserDoc?.uid || account?.uid || '';
-      if (effectiveAuthUid) {
-        account.uid = effectiveAuthUid;
-        account.id = effectiveAuthUid;
-      }
-      account.role = verifiedRole;
-
-      if (verifiedRole === 'teacher' && firebaseUid) {
-        try {
-          const publicTutorId =
-            data?.tutor?.id ||
-            firestoreUserDoc?.tutorId ||
-            firestoreUserDoc?.id ||
-            `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
-
-          const teacherProfilePayload = {
-            id: firebaseUid,
-            uid: firebaseUid,
-            tutorId: publicTutorId,
-            email: cleanEmail,
-            name: account.name || cleanEmail.split('@')[0],
-            role: 'teacher',
-            approvalStatus: firestoreUserDoc?.approvalStatus || data?.tutor?.approvalStatus || 'pending',
-            isApproved: Boolean(firestoreUserDoc?.isApproved || data?.tutor?.isApproved),
-            status: firestoreUserDoc?.status || data?.tutor?.status || 'pending',
-            approved: Boolean(firestoreUserDoc?.approved || data?.tutor?.approved),
-            ...(firestoreUserDoc || {}),
-            ...(data?.tutor || {}),
-            updatedAt: new Date().toISOString(),
-          };
-          setDoc(doc(db, 'users', firebaseUid), teacherProfilePayload, { merge: true }).catch(() => null);
-          setDoc(doc(db, 'tutors', firebaseUid), { ...teacherProfilePayload, uid: firebaseUid, id: firebaseUid, publicTutorId }, { merge: true }).catch(() => null);
-        } catch {}
-      }
-
-      // 6. Conditional redirection strictly based on verifiedRole:
-      // - Teacher / Native Friend -> /teacher (Native Friend / Teacher Panel)
-      // - Administrator -> /admin (Administrator Panel)
-      // - Student -> /dashboard (Student Space)
-      let resolvedProfile: Partial<UserProfile> | undefined = undefined;
-
+      // 3. Conditional redirection strictly based on verifiedRole:
       if (verifiedRole === 'teacher') {
         if (typeof window !== 'undefined') {
           try {
@@ -384,59 +256,6 @@ export const LoginModal: React.FC<LoginModalProps> = ({
           } catch {}
         }
       } else {
-        // Student space
-        resolvedProfile = {
-          ...(data.profile || {}),
-          id: account.uid,
-          uid: account.uid,
-          name: account.name,
-          email: account.email,
-          nativeFriendUID:
-            firestoreUserDoc?.nativeFriendUID ||
-            firestoreUserDoc?.teacherUid ||
-            (data.profile as any)?.nativeFriendUID ||
-            null,
-          teacherUid:
-            firestoreUserDoc?.teacherUid ||
-            firestoreUserDoc?.nativeFriendUID ||
-            (data.profile as any)?.teacherUid ||
-            null,
-          teacherEmail: firestoreUserDoc?.teacherEmail || data.profile?.teacherEmail || null,
-          teacherName: firestoreUserDoc?.teacherName || data.profile?.teacherName || null,
-          level: firestoreUserDoc?.level || data.profile?.level || EnglishLevel.BEGINNER,
-          studyPlan: firestoreUserDoc?.studyPlan || firestoreUserDoc?.learningGoal || data.profile?.learningGoal || '',
-          learningGoal: firestoreUserDoc?.learningGoal || data.profile?.learningGoal || '',
-          weeklyStudyDaysTarget: firestoreUserDoc?.weeklyStudyDaysTarget ?? data.profile?.weeklyStudyDaysTarget ?? 7,
-          weeklyStudyDays: firestoreUserDoc?.weeklyStudyDays || data.profile?.weeklyStudyDays || [
-            'monday',
-            'tuesday',
-            'wednesday',
-            'thursday',
-            'friday',
-            'saturday',
-            'sunday',
-          ],
-          routineVideoTime: firestoreUserDoc?.routineVideoTime || data.profile?.routineVideoTime || '09:00',
-          routineAudioTime: firestoreUserDoc?.routineAudioTime || data.profile?.routineAudioTime || '14:00',
-          dailyPhraseTime: firestoreUserDoc?.dailyPhraseTime || data.profile?.dailyPhraseTime || '20:00',
-        };
-
-        const targetUid = account.uid || firebaseUid || '';
-        if (targetUid && db) {
-          setDoc(
-            doc(db, 'users', targetUid),
-            {
-              ...resolvedProfile,
-              id: targetUid,
-              uid: targetUid,
-              email: cleanEmail,
-              role: 'student',
-              updatedAt: new Date().toISOString(),
-            },
-            { merge: true }
-          ).catch(() => null);
-        }
-
         if (typeof window !== 'undefined') {
           try {
             window.history.replaceState({ page: 'dashboard' }, '', '/dashboard');
@@ -445,8 +264,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
       }
 
       setIsLoading(false);
-      const tutorPayload = data.tutor || (verifiedRole === 'teacher' ? (firestoreUserDoc || { email: cleanEmail, name: account.name, role: 'teacher' }) : undefined);
-      onLoginSuccess(account, resolvedProfile, tutorPayload);
+      onLoginSuccess(account, data.profile, data.tutor);
       onClose();
     } catch (err: any) {
       const errorText = err.message || (isEn ? 'Unexpected error during login' : 'Erro inesperado ao realizar login');
@@ -618,7 +436,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
                   onChange={(e) => setEmail(e.target.value)}
                   placeholder={
                     selectedRole === 'admin'
-                      ? 'adm.itissimple@gmail.com'
+                      ? 'admin@itissimple.com'
                       : isEn
                       ? 'your.email@domain.com'
                       : 'seu.email@dominio.com'

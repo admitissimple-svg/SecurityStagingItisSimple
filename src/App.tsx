@@ -300,13 +300,14 @@ export default function App() {
     const unsubscribe = onAuthStateChanged(auth, async (fbUser) => {
       if (fbUser && fbUser.email) {
         const cleanEmail = fbUser.email.toLowerCase().trim();
-        const isMasterAdmin = cleanEmail === 'adm.itissimple@gmail.com';
+        const tokenResult = await fbUser.getIdTokenResult().catch(() => null);
+        const isVerifiedAdmin = tokenResult?.claims?.role === 'admin';
 
         // Check if currentAccount matches the active Firebase Auth user and has the verified UID
         if (!currentAccount || currentAccount.email.toLowerCase() !== cleanEmail || currentAccount.uid !== fbUser.uid) {
           // If currentAccount already knows this user is a teacher, keep it as high priority default
           const existingRole = currentAccount?.email?.toLowerCase() === cleanEmail ? currentAccount.role : undefined;
-          let resolvedRole: UserRole = isMasterAdmin ? 'admin' : (existingRole === 'teacher' ? 'teacher' : 'student');
+          let resolvedRole: UserRole = isVerifiedAdmin ? 'admin' : (existingRole === 'teacher' ? 'teacher' : 'student');
           let firestoreDoc: any = null;
           try {
             const db = getDb();
@@ -317,13 +318,13 @@ export default function App() {
             if (snap && snap.exists()) {
               firestoreDoc = snap.data();
               const r = (firestoreDoc.role || firestoreDoc.userRole || '').toLowerCase();
-              if (r === 'admin' || isMasterAdmin) resolvedRole = isMasterAdmin ? 'admin' : 'student';
+              if (r === 'admin' || isVerifiedAdmin) resolvedRole = isVerifiedAdmin ? 'admin' : 'student';
               else if (r === 'teacher' || r === 'native_friend' || r === 'tutor') resolvedRole = 'teacher';
             }
 
             const cleanDocId = cleanEmail.replace(/[^a-zA-Z0-9]/g, '-');
             // If role is still not teacher or admin, check email doc ID and tutor collections in Firestore
-            if (resolvedRole !== 'teacher' && !isMasterAdmin && cleanEmail) {
+            if (resolvedRole !== 'teacher' && !isVerifiedAdmin && cleanEmail) {
               const snapEmail = await Promise.race([
                 getDoc(doc(db, 'users', cleanDocId)),
                 new Promise<null>((r) => setTimeout(() => r(null), 2500)),
@@ -2306,14 +2307,17 @@ export default function App() {
 
       // 3. Sync with backend API — backend resolves canonical UID, verifies approval and enforces student link
       if (isRegisteringStudent) {
+        const idToken = await auth.currentUser?.getIdToken().catch(() => null);
         const signupRes = await fetch('/api/auth/signup', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+          },
           body: JSON.stringify({
             uid: studentUid,
             name: effectiveName,
             email: cleanEmail,
-            password: data.studentAccount?.password || '123456',
             role: 'student',
             isUpdate: true,
             level: selectedLevel,
@@ -4804,7 +4808,7 @@ export default function App() {
   const fetchLatestTutors = async () => {
     setIsRefreshingTutors(true);
     setAdminAuthError(null);
-    const isAdminUser = currentAccount?.role === 'admin' || currentAccount?.email?.toLowerCase() === 'adm.itissimple@gmail.com' || isAdminApprovalsOpen;
+    const isAdminUser = currentAccount?.role === 'admin' || isAdminApprovalsOpen;
     try {
       // 1. Await Firebase Auth state initialization
       const authUser = await waitForAuthUser();
@@ -4912,7 +4916,7 @@ export default function App() {
     const cleanEmail = (tutorToApprove?.email || (tutorId.includes('@') ? tutorId : '')).toLowerCase().trim();
 
     // 1. Verify administrative privileges from currentAccount
-    const isLocalAdmin = currentAccount?.role === 'admin' || currentAccount?.email === 'adm.itissimple@gmail.com';
+    const isLocalAdmin = currentAccount?.role === 'admin';
     if (!isLocalAdmin) {
       return {
         success: false,
@@ -5012,7 +5016,7 @@ export default function App() {
     const tutorToReject = tutorObj || existing;
     const cleanEmail = (tutorToReject?.email || (tutorId.includes('@') ? tutorId : '')).toLowerCase().trim();
 
-    const isLocalAdmin = currentAccount?.role === 'admin' || currentAccount?.email === 'adm.itissimple@gmail.com';
+    const isLocalAdmin = currentAccount?.role === 'admin';
     if (!isLocalAdmin) {
       return {
         success: false,
@@ -5089,7 +5093,7 @@ export default function App() {
 
   // Handler: Admin Delete Tutor
   const handleDeleteTutor = async (tutorId: string, tutorEmail?: string): Promise<{ success: boolean; error?: string }> => {
-    const isLocalAdmin = currentAccount?.role === 'admin' || currentAccount?.email === 'adm.itissimple@gmail.com';
+    const isLocalAdmin = currentAccount?.role === 'admin';
     if (!isLocalAdmin) {
       return {
         success: false,
@@ -5152,7 +5156,7 @@ export default function App() {
       );
     }
 
-    if (cleanEmail && cleanEmail !== 'adm.itissimple@gmail.com') {
+    if (cleanEmail && currentAccount?.role !== 'admin') {
       setAvailableAccounts((prev) => prev.filter((a) => (a?.email ? a.email.toLowerCase().trim() !== cleanEmail : true)));
     }
 

@@ -176,6 +176,9 @@ import {
   requireTeacher,
   isVerifiedAdminRequest,
   getVerifiedUserFromRequest,
+  AuthenticatedUser,
+  extractTrustedRole,
+  markAsVerifiedUser,
 } from './src/middleware/firebaseAuth';
 import { getFirebaseAdminAuth } from './src/serverFirebaseAdmin';
 import {
@@ -404,7 +407,7 @@ interface AppDb {
   studentDictionaryMap: Record<string, any[]>;
   studentJournalMap: Record<string, any[]>;
   studentActivityJournal: Record<string, any[]>;
-  authUsers: Record<string, { uid?: string; email: string; password?: string; name: string; role: string; createdAt?: string; updatedAt?: string }>;
+  authUsers: Record<string, { uid?: string; email: string; name: string; role: string; createdAt?: string; updatedAt?: string }>;
   transactions: any[];
   youtubePlaylists: any[];
   studentVideoAssignments: Record<string, any[]>;
@@ -557,14 +560,12 @@ const DEFAULT_DB: AppDb = {
       email: 'adm.itissimple@gmail.com',
       name: "Admin It's Simple",
       role: 'admin',
-      password: '',
     },
     'laviniatilapiafc@gmail.com': {
       uid: 'student_lala_canonical_uid',
       email: 'laviniatilapiafc@gmail.com',
       name: 'Lavinia',
       role: 'student',
-      password: '',
       createdAt: '2026-10-01T00:00:00.000Z',
     },
   },
@@ -758,8 +759,43 @@ function mergeDbWithDefaults(parsed: any): AppDb {
 
 const LOCAL_DB_PATH = path.join(process.cwd(), 'src', 'data', 'app_db.json');
 
+export function scrubPasswords(db: any): any {
+  if (!db || typeof db !== 'object') return db;
+  if (db.authUsers && typeof db.authUsers === 'object') {
+    for (const key of Object.keys(db.authUsers)) {
+      if (db.authUsers[key]) {
+        delete db.authUsers[key].password;
+      }
+    }
+  }
+  if (db.userProfiles && typeof db.userProfiles === 'object') {
+    for (const key of Object.keys(db.userProfiles)) {
+      if (db.userProfiles[key]) {
+        delete db.userProfiles[key].password;
+      }
+    }
+  }
+  if (Array.isArray(db.students)) {
+    for (const s of db.students) {
+      if (s) delete s.password;
+    }
+  }
+  if (Array.isArray(db.tutorsList)) {
+    for (const t of db.tutorsList) {
+      if (t) delete t.password;
+    }
+  }
+  if (Array.isArray(db.teachers)) {
+    for (const t of db.teachers) {
+      if (t) delete t.password;
+    }
+  }
+  return db;
+}
+
 function saveToDiskSync(db: AppDb) {
   try {
+    scrubPasswords(db);
     const dir = path.dirname(LOCAL_DB_PATH);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -816,6 +852,7 @@ function writeDb(db: AppDb) {
   if (isDiagnosticMode()) {
     return; // Strictly no disk writes or cloud syncing in diagnostic mode
   }
+  scrubPasswords(db);
   inMemoryDb = db;
   saveToDiskSync(db);
 
@@ -839,6 +876,7 @@ async function writeDbSync(db: AppDb): Promise<void> {
   if (isDiagnosticMode()) {
     return; // Strictly no disk writes or cloud syncing in diagnostic mode
   }
+  scrubPasswords(db);
   inMemoryDb = db;
   saveToDiskSync(db);
   if (!isCloudHydrated) {
@@ -962,7 +1000,6 @@ async function initCloudPersistence() {
               id: tId,
               email: key,
               name: t.name || key.split('@')[0],
-              password: t.password || '',
               role: 'teacher',
               createdAt: t.createdAt || new Date().toISOString(),
             };
@@ -1225,24 +1262,6 @@ async function initCloudPersistence() {
     isCloudHydrated = true;
   }
 
-  // Pre-synchronize role=admin custom claim on staging admin users in Firebase Auth
-  try {
-    const adminAuth = getFirebaseAdminAuth();
-    const adminEmailsToSync = ['adm.itissimple@gmail.com', 'admin@itissimple.com'];
-    for (const adminEmail of adminEmailsToSync) {
-      try {
-        const userRec = await adminAuth.getUserByEmail(adminEmail);
-        if (userRec && userRec.customClaims?.role !== 'admin') {
-          await adminAuth.setCustomUserClaims(userRec.uid, { role: 'admin' });
-          console.log(`[FirebaseAdmin] Pre-assigned role=admin custom claim to ${adminEmail} (UID: ${userRec.uid})`);
-        }
-      } catch {
-        // User not yet registered in Auth; claim will sync upon login/registration
-      }
-    }
-  } catch (adminErr) {
-    console.warn('[FirebaseAdmin] Admin claims pre-sync notice:', adminErr);
-  }
 }
 
 // Register isolated diagnostic routes (/api/health, /api/diagnostic/health, /api/diagnostic/firestore)
@@ -1285,13 +1304,6 @@ app.get('/api/auth/verify-session', firebaseAuthMiddleware, (req, res) => {
   });
 });
 
-export const TRUSTED_ADMIN_EMAILS = new Set<string>([
-  'adm.itissimple@gmail.com',
-  'admin@itissimple.com',
-  'estilobeeadm@gmail.com',
-  'estilobeeforkids@gmail.com',
-]);
-
 app.post('/api/auth/sync-admin-claims', firebaseAuthMiddleware, async (req, res) => {
   const caller = req.user;
   if (!caller || !caller.uid) {
@@ -1308,29 +1320,22 @@ app.post('/api/auth/sync-admin-claims', firebaseAuthMiddleware, async (req, res)
     });
   }
 
-  // Rule 2: Caller email MUST belong to authoritative administrator email allowlist
-  if (!TRUSTED_ADMIN_EMAILS.has(cleanEmail)) {
-    return res.status(403).json({
-      error: 'Forbidden',
-      message: 'Access denied: caller is not an authorized administrator',
-    });
-  }
-
   const db = readDb();
+  // Authorization is bound strictly to the verified UID assigned by the bootstrap procedure
   const isTeacherAdmin = (db.teachers || []).some(
-    (t: any) => t.role === 'admin' && (t.email || '').toLowerCase().trim() === cleanEmail
+    (t: any) => t.role === 'admin' && (t.uid === caller.uid || t.id === caller.uid)
   );
   const isAuthUserAdmin =
     db.authUsers &&
     Object.values(db.authUsers).some(
-      (u: any) => u.role === 'admin' && (u.email || '').toLowerCase().trim() === cleanEmail
+      (u: any) => u.role === 'admin' && u.uid === caller.uid
     );
 
-  const isConfirmedAdmin = isTeacherAdmin || isAuthUserAdmin || cleanEmail === 'adm.itissimple@gmail.com';
+  const isConfirmedAdmin = isTeacherAdmin || isAuthUserAdmin || caller.role === 'admin';
   if (!isConfirmedAdmin) {
     return res.status(403).json({
       error: 'Forbidden',
-      message: 'Access denied: administrator account is not active or recognized in system records',
+      message: 'Access denied: caller UID is not an authorized administrator in system records',
     });
   }
 
@@ -1344,417 +1349,159 @@ app.post('/api/auth/sync-admin-claims', firebaseAuthMiddleware, async (req, res)
   }
 });
 
-// 1.1 Auth Endpoints (Preply-style Login & Registration)
+// 1.1 Auth Endpoints: Admin status check (never inspects or exposes credentials)
 app.get('/api/auth/admin-status', (req, res) => {
   const db = readDb();
-  // Check if admin is registered with credentials
-  const adminWithPassword = Object.values(db.authUsers || {}).find(
-    (u: any) => u.role === 'admin' && u.password
-  );
-  const adminAccount = adminWithPassword || db.teachers?.find((t) => t.role === 'admin');
+  const adminAccount =
+    (db.teachers || []).find((t: any) => t.role === 'admin') ||
+    Object.values(db.authUsers || {}).find((u: any) => u.role === 'admin');
 
   res.json({
-    hasAdminRegistered: !!adminWithPassword,
-    adminEmail: adminAccount ? adminAccount.email : null,
-    adminName: adminAccount ? adminAccount.name : null,
-  });
-});
-
-app.get('/api/auth/admin-status', (req, res) => {
-  const db = readDb();
-  const existingAdminWithPassword = Object.values(db.authUsers || {}).find(
-    (u: any) => u.role === 'admin' && u.password
-  );
-  res.json({
-    hasAdmin: !!existingAdminWithPassword,
-    adminEmail: existingAdminWithPassword ? (existingAdminWithPassword as any).email : 'adm.itissimple@gmail.com',
+    hasAdmin: !!adminAccount,
+    hasAdminRegistered: !!adminAccount,
+    adminEmail: adminAccount ? (adminAccount as any).email : null,
+    adminName: adminAccount ? (adminAccount as any).name : null,
   });
 });
 
 app.post('/api/auth/login', async (req, res) => {
   const db = readDb();
-  const { email, password, role: requestedRole, localBackup, uid } = req.body;
-  if (!email) {
-    return res.status(400).json({ error: 'Email or username is required' });
-  }
 
-  const cleanEmail = email.toLowerCase().trim();
-  let authRecord = db.authUsers?.[cleanEmail];
-
-  // Also check case-insensitive match in authUsers
-  if (!authRecord && db.authUsers) {
-    const matchedKey = Object.keys(db.authUsers).find(
-      (k) => k.toLowerCase().trim() === cleanEmail
-    );
-    if (matchedKey) {
-      authRecord = db.authUsers[matchedKey];
-    }
-  }
-
-  // Query Firestore to get user record if not in local cache
-  let firestoreDoc: any = null;
-  if (!authRecord) {
+  // 1. Authenticate exclusively via Firebase Authentication ID Token
+  let verifiedCaller: AuthenticatedUser | null = await getVerifiedUserFromRequest(req);
+  if (!verifiedCaller && req.body.idToken && typeof req.body.idToken === 'string') {
     try {
-      firestoreDoc = await fetchUserFromFirestore(cleanEmail, uid);
-      if (firestoreDoc && !authRecord) {
-        authRecord = {
-          uid: firestoreDoc.uid || uid || `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`,
-          email: cleanEmail,
-          name: firestoreDoc.name || cleanEmail.split('@')[0],
-          password: firestoreDoc.password || password || '',
-          role: firestoreDoc.role || 'student',
-          createdAt: firestoreDoc.createdAt || new Date().toISOString(),
-        };
-        if (!db.authUsers) db.authUsers = {};
-        db.authUsers[cleanEmail] = authRecord;
-      }
-    } catch (fsErr) {
-      console.warn('Firestore hydration notice on login:', fsErr);
-    }
-  }
-
-  // If user is not yet in authUsers, check if client provided a local localStorage backup to restore
-  if (!authRecord && localBackup && localBackup.email && localBackup.email.toLowerCase().trim() === cleanEmail) {
-    console.log('Restoring account from client localStorage backup:', cleanEmail);
-    const restoredUid = localBackup.uid || uid || `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}-${Date.now()}`;
-    authRecord = {
-      uid: restoredUid,
-      email: cleanEmail,
-      name: localBackup.name || cleanEmail.split('@')[0],
-      password: localBackup.password || password || '',
-      role: localBackup.role || 'student',
-      createdAt: localBackup.registeredAt || new Date().toISOString(),
-    };
-    if (!db.authUsers) db.authUsers = {};
-    db.authUsers[cleanEmail] = authRecord;
-
-    if (authRecord.role === 'student') {
-      if (!db.students) db.students = [];
-      const hasStudent = db.students.some((s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail);
-      if (!hasStudent) {
-        db.students.push({
-          id: restoredUid,
-          name: authRecord.name,
-          studentName: authRecord.name,
-          email: cleanEmail,
-          studentEmail: cleanEmail,
-          level: localBackup.profile?.level || 'iniciante',
-          studentLevel: localBackup.profile?.level || 'iniciante',
-          goal: localBackup.profile?.learningGoal || 'English for everyday life & work',
-          learningGoal: localBackup.profile?.learningGoal || 'English for everyday life & work',
-          contractedLessons: 5,
-          completedLessonsCount: 0,
-          status: 'active',
-          activeSince: new Date().toISOString().split('T')[0],
-          createdAt: new Date().toISOString(),
-          avatar: localBackup.profile?.avatar || '',
-          picture: localBackup.profile?.picture || '',
-        });
-      }
-      if (!db.userProfiles) db.userProfiles = {};
-      if (!db.userProfiles[cleanEmail]) {
-        db.userProfiles[cleanEmail] = {
-          id: restoredUid,
-          name: authRecord.name,
-          email: cleanEmail,
-          level: localBackup.profile?.level || 'iniciante',
-          enrollmentStatus: 'active',
-          learningGoal: localBackup.profile?.learningGoal || 'English for everyday life & work',
-          streakDays: 0,
-          streakCount: 0,
-          points: 0,
-          dailyGoalMinutes: 30,
-          completedTodayMinutes: 0,
-          contractedLessons: 5,
-          completedLessonsCount: 0,
-          picture: localBackup.profile?.picture || '',
-          avatar: localBackup.profile?.avatar || '',
-          createdAt: new Date().toISOString(),
-        };
-      }
-    }
-    await writeDbSync(db);
-  }
-
-  // Check if known student across any platform collection, profiles, routines, or assignments
-  const isKnownStudent =
-    (db.students || []).some((s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail) ||
-    Boolean(db.userProfiles?.[cleanEmail]) ||
-    Boolean(db.studentRoutinesMap?.[cleanEmail]) ||
-    Boolean(uid && db.studentRoutinesMap?.[uid]) ||
-    Boolean(db.studentVideoAssignments?.[cleanEmail]) ||
-    Boolean(uid && db.studentVideoAssignments?.[uid]) ||
-    Boolean(db.studentSpotifyAssignments?.[cleanEmail]) ||
-    Boolean(uid && db.studentSpotifyAssignments?.[uid]) ||
-    Boolean(db.studentWeeklyChecks?.[cleanEmail]) ||
-    Boolean(uid && db.studentWeeklyChecks?.[uid]);
-
-  // If student profile or routine/assignment records exist, restore authRecord so registered students are never locked out
-  if (!authRecord && isKnownStudent) {
-    const prof = db.userProfiles?.[cleanEmail];
-    const resolvedUid =
-      prof?.uid ||
-      prof?.id ||
-      uid ||
-      (db.students || []).find((s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail)?.id ||
-      (db.studentVideoAssignments?.[cleanEmail]?.[0]?.studentUid) ||
-      `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
-
-    authRecord = {
-      uid: resolvedUid,
-      email: cleanEmail,
-      name: prof?.name || cleanEmail.split('@')[0],
-      password: password || '',
-      role: 'student',
-      createdAt: prof?.createdAt || new Date().toISOString(),
-    };
-    if (!db.authUsers) db.authUsers = {};
-    db.authUsers[cleanEmail] = authRecord;
-
-    if (!db.userProfiles) db.userProfiles = {};
-    if (!db.userProfiles[cleanEmail]) {
-      db.userProfiles[cleanEmail] = {
-        id: resolvedUid,
-        uid: resolvedUid,
-        name: authRecord.name,
-        email: cleanEmail,
-        level: 'iniciante',
-        enrollmentStatus: 'active',
-        learningGoal: 'English for everyday life & work',
-        weeklyStudyDaysTarget: 7,
-        weeklyStudyDays: ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'],
-        streakDays: 0,
-        streakCount: 0,
-        points: 0,
-        dailyGoalMinutes: 30,
-        completedTodayMinutes: 0,
-        contractedLessons: 5,
-        completedLessonsCount: 0,
-        createdAt: new Date().toISOString(),
-      };
-    }
-    if (!db.students) db.students = [];
-    const hasStudent = db.students.some((s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail);
-    if (!hasStudent) {
-      db.students.push({
-        id: resolvedUid,
-        studentUid: resolvedUid,
-        name: authRecord.name,
-        studentName: authRecord.name,
-        email: cleanEmail,
-        studentEmail: cleanEmail,
-        level: 'iniciante',
-        studentLevel: 'iniciante',
-        goal: 'English for everyday life & work',
-        learningGoal: 'English for everyday life & work',
-        contractedLessons: 5,
-        completedLessonsCount: 0,
-        status: 'active',
-        activeSince: new Date().toISOString().split('T')[0],
-        createdAt: new Date().toISOString(),
+      const adminAuth = getFirebaseAdminAuth();
+      const decoded = await adminAuth.verifyIdToken(req.body.idToken);
+      const trustedRole = extractTrustedRole(decoded);
+      verifiedCaller = markAsVerifiedUser({
+        uid: decoded.uid,
+        email: decoded.email,
+        email_verified: Boolean(decoded.email_verified),
+        role: trustedRole,
       });
-    }
-    await writeDbSync(db);
-    saveUserToFirestore({
-      uid: resolvedUid,
-      id: resolvedUid,
-      email: cleanEmail,
-      name: authRecord.name,
-      role: 'student',
-      password: password || '',
-      updatedAt: new Date().toISOString(),
-    }).catch(() => {});
-  }
-
-  const matchingTutor = (db.tutorsList || []).find((t: any) => (t.email || '').toLowerCase() === cleanEmail);
-  const isKnownTeacher = Boolean(matchingTutor);
-
-  if (!authRecord && isKnownTeacher && matchingTutor) {
-    const tutorId = matchingTutor.id || `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
-    authRecord = {
-      uid: tutorId,
-      email: cleanEmail,
-      name: matchingTutor.name || cleanEmail.split('@')[0],
-      password: matchingTutor.password || password || '',
-      role: 'teacher',
-      createdAt: matchingTutor.createdAt || new Date().toISOString(),
-    };
-    if (!db.authUsers) db.authUsers = {};
-    db.authUsers[cleanEmail] = authRecord;
-    if (!db.userProfiles) db.userProfiles = {};
-    if (!db.userProfiles[cleanEmail]) {
-      db.userProfiles[cleanEmail] = {
-        id: tutorId,
-        uid: tutorId,
-        name: matchingTutor.name || cleanEmail.split('@')[0],
-        email: cleanEmail,
-        role: 'teacher',
-        picture: matchingTutor.avatar || '',
-        avatar: matchingTutor.avatar || '',
-        createdAt: new Date().toISOString(),
-      };
-    }
-    await writeDbSync(db);
-  }
-
-  // Strictly require existing registered account (no auto-creating unregistered accounts on login)
-  if (!authRecord && cleanEmail !== 'adm.itissimple@gmail.com') {
-    if (!isKnownTeacher && !isKnownStudent) {
-      return res.status(401).json({
-        error: 'Conta não encontrada. Por favor, crie seu cadastro antes de fazer login.',
-      });
+    } catch {
+      // Invalid token
     }
   }
 
-  // If user registered with password, enforce password check
-  if (authRecord && authRecord.password && password) {
-    // Special admin handling for adm.itissimple@gmail.com
-    if (cleanEmail === 'adm.itissimple@gmail.com') {
-      if (password === '' || password === '' || authRecord.password === password) {
-        if (authRecord.password !== password) {
-          authRecord.password = password;
-          writeDb(db);
-        }
-      } else {
-        return res.status(401).json({ error: 'Senha incorreta. Por favor, verifique a senha digitada.' });
-      }
-    } else if (authRecord.password !== password) {
-      return res.status(401).json({ error: 'Senha incorreta. Por favor, verifique a senha digitada.' });
-    }
-  } else if (authRecord && !authRecord.password && password) {
-    // If authRecord was restored without password, bind the entered password now
-    authRecord.password = password;
-    writeDb(db);
-    saveUserToFirestore({
-      uid: authRecord.uid,
-      id: authRecord.uid,
-      email: cleanEmail,
-      password,
-      updatedAt: new Date().toISOString(),
-    }).catch(() => {});
-  } else if (!authRecord && cleanEmail === 'adm.itissimple@gmail.com' && password) {
-    if (password !== '' && password !== '') {
-      return res.status(401).json({ error: 'Senha incorreta. Por favor, verifique a senha digitada.' });
-    }
+  if (!verifiedCaller || !verifiedCaller.uid) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Autenticação no Firebase Authentication é obrigatória. Token de ID ausente ou inválido.',
+    });
   }
 
-  // -------------------------------------------------------------
-  // STRICT ROLE-BASED ACCESS CONTROL (RBAC) DETERMINATION
-  // -------------------------------------------------------------
-  const isMasterAdmin = cleanEmail === 'adm.itissimple@gmail.com';
-  const firestoreRole = (firestoreDoc?.role || '').toLowerCase();
-  const authRecordRole = (authRecord?.role || '').toLowerCase();
+  const authenticatedUid = verifiedCaller.uid;
+  const verifiedEmail = (verifiedCaller.email || '').toLowerCase().trim();
 
-  const isStudentInDb = (db.students || []).some(
-    (s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail
-  );
-  const isTutorInDb = (db.tutorsList || []).some(
-    (t: any) => (t.email || '').toLowerCase() === cleanEmail
-  );
-  const isTeacherInDb = (db.teachers || []).some(
-    (t: any) => (t.email || '').toLowerCase() === cleanEmail && t.role !== 'admin'
-  );
+  // Account Impersonation Prevention: client-supplied email/uid cannot conflict with verified identity
+  if (req.body.email && verifiedEmail && req.body.email.toLowerCase().trim() !== verifiedEmail) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Acesso negado: tentativa de personificação detectada. O e-mail não confere com a identidade verificada.',
+    });
+  }
+  if (req.body.uid && req.body.uid !== authenticatedUid) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Acesso negado: tentativa de personificação detectada. O UID não confere com a identidade verificada.',
+    });
+  }
 
-  // Check if user is registered as a teacher/tutor (Native Friend priority)
-  const isRegisteredTeacher = !isMasterAdmin && (
-    firestoreRole === 'teacher' ||
-    firestoreRole === 'native_friend' ||
-    firestoreRole === 'tutor' ||
-    authRecordRole === 'teacher' ||
-    isTutorInDb ||
-    isTeacherInDb ||
-    requestedRole === 'teacher'
-  );
+  const cleanEmail = verifiedEmail || (req.body.email ? req.body.email.toLowerCase().trim() : '');
+  const requestedRole = (req.body.role || '').toLowerCase();
 
-  // Check if user is registered as a student in Firestore or local database (only if not a teacher)
-  const isRegisteredStudent = !isMasterAdmin && !isRegisteredTeacher && (
-    firestoreRole === 'student' ||
-    authRecordRole === 'student' ||
-    isStudentInDb
+  // 2. Strict Server-Side Role-Based Access Control (RBAC)
+  // Admin privileges require cryptographically verified custom claim or trusted server bootstrap record
+  const isServerVerifiedAdmin =
+    verifiedCaller.role === 'admin' ||
+    (db.teachers || []).some(
+      (t: any) => t.role === 'admin' && (t.uid === authenticatedUid || t.id === authenticatedUid)
+    );
+
+  const tutorObj = (db.tutorsList || []).find(
+    (t: any) => t.uid === authenticatedUid || t.authUid === authenticatedUid || (t.email || '').toLowerCase() === cleanEmail
   );
+  const teacherObj = (db.teachers || []).find(
+    (t: any) => (t.uid === authenticatedUid || (t.email || '').toLowerCase() === cleanEmail) && t.role !== 'admin'
+  );
+  const isRegisteredTeacher = !isServerVerifiedAdmin && Boolean(tutorObj || teacherObj || requestedRole === 'teacher');
+
+  const studentObjInDb = (db.students || []).find(
+    (s: any) => s.uid === authenticatedUid || s.id === authenticatedUid || (s.email || s.studentEmail || '').toLowerCase() === cleanEmail
+  );
+  const isRegisteredStudent = !isServerVerifiedAdmin && !isRegisteredTeacher && Boolean(studentObjInDb || db.userProfiles?.[cleanEmail]);
 
   let role: string = 'student';
   let name = cleanEmail.split('@')[0];
   let isRoleEnforced = false;
 
-  if (isMasterAdmin) {
+  if (isServerVerifiedAdmin) {
     role = 'admin';
-    name = authRecord?.name || 'Admin It\'s Simple';
-    const targetAdminUid = uid || authRecord?.uid;
-    if (targetAdminUid) {
+    const adminTeacher = (db.teachers || []).find(
+      (t: any) => t.role === 'admin' && (t.uid === authenticatedUid || t.id === authenticatedUid)
+    );
+    name = adminTeacher?.name || db.authUsers?.[cleanEmail]?.name || 'Admin';
+
+    // Synchronize custom claim in Firebase Auth if not yet on the current token
+    if (verifiedCaller.role !== 'admin') {
       try {
         const adminAuth = getFirebaseAdminAuth();
-        adminAuth.setCustomUserClaims(targetAdminUid, { role: 'admin' }).catch(() => {});
+        adminAuth.setCustomUserClaims(authenticatedUid, { role: 'admin' }).catch(() => {});
       } catch {}
     }
-  } else if (isRegisteredStudent) {
-    // STRICT RBAC: A registered student is locked exclusively to 'student'
-    role = 'student';
-    name = firestoreDoc?.name || authRecord?.name || name;
-    if (requestedRole && requestedRole !== 'student') {
-      isRoleEnforced = true;
-      console.warn(`[RBAC] Blocked user ${cleanEmail} from accessing ${requestedRole} panel. Locked to student space.`);
-    }
-    // Ensure authRecord in DB has role 'student'
-    if (authRecord && authRecord.role !== 'student') {
-      authRecord.role = 'student';
-      writeDb(db);
-    }
   } else if (isRegisteredTeacher) {
-    // STRICT RBAC: A registered Native Friend / Teacher
     role = 'teacher';
-    const tutorObj = (db.tutorsList || []).find((t: any) => (t.email || '').toLowerCase() === cleanEmail);
-    const teacherObj = (db.teachers || []).find((t: any) => (t.email || '').toLowerCase() === cleanEmail);
-    name = tutorObj?.name || teacherObj?.name || authRecord?.name || name;
+    name = tutorObj?.name || teacherObj?.name || db.authUsers?.[cleanEmail]?.name || name;
 
     if (requestedRole === 'admin') {
       isRoleEnforced = true;
       console.warn(`[RBAC] Blocked teacher ${cleanEmail} from accessing admin panel.`);
     }
 
-    // Link real Firebase Auth UID to tutor record without resetting approval or profile
-    // Preserving public tutor ID in tutors list and linking users/{uid}
-    if (uid && isValidCanonicalUid(uid)) {
-      const publicTutorId = tutorObj?.id || teacherObj?.id || `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
-      if (tutorObj) {
-        tutorObj.uid = uid;
-        tutorObj.authUid = uid;
-        tutorObj.id = publicTutorId;
-      }
-      if (teacherObj) {
-        teacherObj.uid = uid;
-      }
-      if (authRecord) {
-        authRecord.uid = uid;
-      }
-      writeDb(db);
-      if (tutorObj) {
-        saveTutorToFirestore({ ...tutorObj, id: uid, uid, authUid: uid, publicTutorId, role: 'teacher' }).catch(() => {});
-        saveUserToFirestore({ ...tutorObj, id: uid, uid, tutorId: publicTutorId, role: 'teacher' }).catch(() => {});
-      }
+    // Link real Firebase Auth UID to tutor record
+    const publicTutorId = tutorObj?.id || teacherObj?.id || `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
+    if (tutorObj) {
+      tutorObj.uid = authenticatedUid;
+      tutorObj.authUid = authenticatedUid;
+      tutorObj.id = publicTutorId;
+    }
+    if (teacherObj) {
+      teacherObj.uid = authenticatedUid;
+    }
+    if (tutorObj) {
+      saveTutorToFirestore({ ...tutorObj, id: authenticatedUid, uid: authenticatedUid, authUid: authenticatedUid, publicTutorId, role: 'teacher' }).catch(() => {});
+      saveUserToFirestore({ ...tutorObj, id: authenticatedUid, uid: authenticatedUid, tutorId: publicTutorId, role: 'teacher' }).catch(() => {});
     }
 
     // Purge any accidental student profile entry for this teacher
     if (db.userProfiles && db.userProfiles[cleanEmail]) {
       delete db.userProfiles[cleanEmail];
-      writeDb(db);
     }
-  } else if (authRecord?.role === 'admin' && isMasterAdmin) {
-    role = 'admin';
-    name = authRecord.name || name;
   } else {
-    // Unregistered/fallback
-    role = requestedRole === 'teacher' ? 'teacher' : 'student';
+    // Registered or new student
+    role = 'student';
+    name = studentObjInDb?.name || studentObjInDb?.studentName || db.userProfiles?.[cleanEmail]?.name || db.authUsers?.[cleanEmail]?.name || name;
+
+    if (requestedRole && requestedRole !== 'student') {
+      isRoleEnforced = true;
+      console.warn(`[RBAC] Blocked student ${cleanEmail} from accessing ${requestedRole} panel. Locked to student space.`);
+    }
   }
 
-  const tutorObj = (db.tutorsList || []).find((t: any) => (t.email || '').toLowerCase() === cleanEmail);
+  // Update authUsers record (NO PASSWORDS EVER)
+  if (!db.authUsers) db.authUsers = {};
+  db.authUsers[cleanEmail] = {
+    uid: authenticatedUid,
+    email: cleanEmail,
+    name,
+    role,
+    createdAt: db.authUsers[cleanEmail]?.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
 
-  const effectiveAccountUid =
-    (uid && isValidCanonicalUid(uid) ? uid : null) ||
-    authRecord?.uid ||
-    (tutorObj as any)?.uid ||
-    (cleanEmail === 'adm.itissimple@gmail.com' ? 'admin-master-uid' : `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`);
-
+  const effectiveAccountUid = authenticatedUid;
   const account = {
     uid: effectiveAccountUid,
     id: effectiveAccountUid,
@@ -1773,23 +1520,23 @@ app.post('/api/auth/login', async (req, res) => {
     );
 
     // Link real Firebase Auth UID to student record preserving trial lesson and tutor links
-    if (uid && isValidCanonicalUid(uid)) {
+    if (authenticatedUid && isValidCanonicalUid(authenticatedUid)) {
       if (studentObj) {
-        studentObj.uid = uid;
-        studentObj.id = uid;
-        studentObj.studentUid = uid;
+        studentObj.uid = authenticatedUid;
+        studentObj.id = authenticatedUid;
+        studentObj.studentUid = authenticatedUid;
       }
       if (db.userProfiles?.[cleanEmail]) {
-        db.userProfiles[cleanEmail].uid = uid;
-        db.userProfiles[cleanEmail].id = uid;
+        db.userProfiles[cleanEmail].uid = authenticatedUid;
+        db.userProfiles[cleanEmail].id = authenticatedUid;
       }
-      if (authRecord) {
-        authRecord.uid = uid;
+      if (db.authUsers?.[cleanEmail]) {
+        db.authUsers[cleanEmail].uid = authenticatedUid;
       }
       writeDb(db);
       const studentToPersist = db.userProfiles?.[cleanEmail] || studentObj;
       if (studentToPersist) {
-        saveUserToFirestore({ ...studentToPersist, id: uid, uid, role: 'student' }).catch(() => {});
+        saveUserToFirestore({ ...studentToPersist, id: authenticatedUid, uid: authenticatedUid, role: 'student' }).catch(() => {});
       }
     }
 
@@ -1930,42 +1677,37 @@ app.post('/api/auth/login', async (req, res) => {
   });
 });
 
-app.post('/api/auth/reset-password', (req, res) => {
-  const db = readDb();
-  const { email, newPassword } = req.body;
-  if (!email || !newPassword) {
-    return res.status(400).json({ error: 'Email e nova senha são obrigatórios.' });
+app.post('/api/auth/reset-password', async (req, res) => {
+  const { email } = req.body;
+  if (!email) {
+    return res.status(400).json({ error: 'Email é obrigatório.' });
   }
   const cleanEmail = email.toLowerCase().trim();
-  if (!db.authUsers) db.authUsers = {};
 
-  if (!db.authUsers[cleanEmail]) {
-    const inStudents = (db.students || []).find(
-      (s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail
-    );
-    const inTeachers = (db.teachers || []).find(
-      (t: any) => t.email?.toLowerCase() === cleanEmail
-    );
-    const inTutors = (db.tutorsList || []).find(
-      (t: any) => t.email?.toLowerCase() === cleanEmail
-    );
-    const role = cleanEmail === 'adm.itissimple@gmail.com' ? 'admin' : inTeachers || inTutors ? 'teacher' : 'student';
-    const name = inStudents?.name || inTeachers?.name || inTutors?.name || cleanEmail.split('@')[0];
+  try {
+    const adminAuth = getFirebaseAdminAuth();
+    // Verify that the user exists in Firebase Authentication
+    await adminAuth.getUserByEmail(cleanEmail);
+    // Generate official Firebase Authentication password reset link
+    await adminAuth.generatePasswordResetLink(cleanEmail);
 
-    db.authUsers[cleanEmail] = {
+    return res.json({
+      success: true,
+      message: 'Instruções de redefinição de senha geradas com sucesso via Firebase Authentication.',
+      resetInitiated: true,
       email: cleanEmail,
-      name,
-      role,
-      password: newPassword,
-      createdAt: new Date().toISOString(),
-    };
-  } else {
-    db.authUsers[cleanEmail].password = newPassword;
-    db.authUsers[cleanEmail].updatedAt = new Date().toISOString();
+    });
+  } catch (err: any) {
+    if (err?.code === 'auth/user-not-found') {
+      return res.status(404).json({
+        error: 'Conta não encontrada no Firebase Authentication. Verifique o e-mail digitado.',
+      });
+    }
+    console.error('Password reset notice via Firebase Auth:', err);
+    return res.status(500).json({
+      error: 'Falha ao processar solicitação de redefinição de senha no Firebase Authentication.',
+    });
   }
-
-  writeDb(db);
-  res.json({ success: true, message: 'Senha atualizada com sucesso!' });
 });
 
 app.get('/api/auth/check-user', async (req, res) => {
@@ -2074,82 +1816,11 @@ const handleRegistration = async (req: any, res: any) => {
   const requestedRole = (role || 'student').toLowerCase();
 
   // ----------------------------------------------------
-  // 1. ADMIN REGISTRATION (Strictly only 1 admin allowed)
+  // 1. ADMIN REGISTRATION (Forbidden on public endpoints)
   // ----------------------------------------------------
   if (requestedRole === 'admin') {
-    // Only pre-authorized administrative emails can ever be registered as admin
-    if (!TRUSTED_ADMIN_EMAILS.has(cleanEmail)) {
-      return res.status(403).json({
-        error: 'Forbidden: não é permitido registrar contas de administrador para este endereço de e-mail.',
-        hasAdminRegistered: true,
-      });
-    }
-
-    // Check if an admin already exists in authUsers or teachers
-    const existingAdminInAuth = Object.values(db.authUsers || {}).find(
-      (u: any) => u.role === 'admin' && u.email !== cleanEmail
-    );
-    const existingAdminInTeachers = (db.teachers || []).find(
-      (t: any) => t.role === 'admin' && (t.email || '').toLowerCase() !== cleanEmail
-    );
-
-    if (existingAdminInAuth || existingAdminInTeachers) {
-      return res.status(403).json({
-        error: 'Já existe um Administrador cadastrado na plataforma. Só é permitido um único Administrador no sistema.',
-        hasAdminRegistered: true,
-      });
-    }
-
-    const adminUid = req.body.uid || 'admin-master-uid';
-    // Register or update admin credentials
-    if (!db.authUsers) db.authUsers = {};
-    db.authUsers[cleanEmail] = {
-      uid: adminUid,
-      email: cleanEmail,
-      name: cleanName,
-      password: password || '',
-      role: 'admin',
-      createdAt: new Date().toISOString(),
-    };
-
-    // Ensure teachers list has this admin marked as admin
-    const tIdx = db.teachers.findIndex((t) => t.email.toLowerCase() === cleanEmail);
-    if (tIdx >= 0) {
-      db.teachers[tIdx] = { ...db.teachers[tIdx], name: cleanName, role: 'admin', registeredByAdmin: true };
-    } else {
-      db.teachers.push({ email: cleanEmail, name: cleanName, role: 'admin', registeredByAdmin: true });
-    }
-
-    if (!db.userProfiles) db.userProfiles = {};
-    db.userProfiles[cleanEmail] = {
-      uid: adminUid,
-      id: adminUid,
-      email: cleanEmail,
-      name: cleanName,
-      role: 'admin',
-    };
-
-    await writeDbSync(db);
-    await saveUserToFirestore({
-      uid: adminUid,
-      email: cleanEmail,
-      name: cleanName,
-      role: 'admin',
-      createdAt: new Date().toISOString(),
-    });
-
-    const account = {
-      uid: adminUid,
-      email: cleanEmail,
-      name: cleanName,
-      role: 'admin',
-      picture: '',
-    };
-
-    return res.json({
-      success: true,
-      account,
-      message: 'Administrador cadastrado com sucesso.',
+    return res.status(403).json({
+      error: 'Forbidden: Não é permitido cadastrar contas de administrador via endpoint público. O administrador deve ser configurado exclusivamente via procedimento seguro de bootstrap do servidor.',
     });
   }
 
@@ -2256,15 +1927,15 @@ const handleRegistration = async (req: any, res: any) => {
       });
     }
 
-    // Save auth credentials
+    // Save auth record (NO PASSWORDS)
     if (!db.authUsers) db.authUsers = {};
     db.authUsers[cleanEmail] = {
       uid: tutorId,
       email: cleanEmail,
       name: cleanName,
-      password: password || '',
       role: 'teacher',
-      createdAt: new Date().toISOString(),
+      createdAt: db.authUsers[cleanEmail]?.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
     };
 
     // Maintain meet settings
@@ -2371,15 +2042,15 @@ const handleRegistration = async (req: any, res: any) => {
   // Zero-leakage: completely clean, no stock or mock photo
   const userAvatar = req.body.avatar || req.body.picture || '';
 
-  // Save student credentials permanently
+  // Save student auth record (NO PASSWORDS)
   if (!db.authUsers) db.authUsers = {};
   db.authUsers[cleanEmail] = {
     uid: userUid,
     email: cleanEmail,
     name: cleanName,
-    password: password || '',
     role: 'student',
-    createdAt: new Date().toISOString(),
+    createdAt: db.authUsers[cleanEmail]?.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
   };
 
   let resolvedCanonicalTeacherUid: string | null = null;
@@ -2641,77 +2312,11 @@ const handleRegistration = async (req: any, res: any) => {
   });
 };
 
-// Endpoint to sync client localStorage registered users to server database
-app.post('/api/auth/sync-local-users', async (req, res) => {
-  const db = readDb();
-  const { users } = req.body;
-  if (!users || typeof users !== 'object') {
-    return res.json({ success: true, synced: 0 });
-  }
-  let count = 0;
-  for (const [rawEmail, user] of Object.entries(users as Record<string, any>)) {
-    const cleanEmail = rawEmail.toLowerCase().trim();
-    if (!cleanEmail || !user) continue;
-    if (!db.authUsers) db.authUsers = {};
-    if (!db.authUsers[cleanEmail]) {
-      db.authUsers[cleanEmail] = {
-        uid: user.uid || `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`,
-        email: cleanEmail,
-        name: user.name || cleanEmail.split('@')[0],
-        password: user.password || '',
-        role: user.role || 'student',
-        createdAt: user.registeredAt || new Date().toISOString(),
-      };
-      count++;
-    }
-    if (user.role === 'student') {
-      if (!db.students) db.students = [];
-      if (!db.students.some((s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail)) {
-        db.students.push({
-          id: user.uid || `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`,
-          name: user.name,
-          studentName: user.name,
-          email: cleanEmail,
-          studentEmail: cleanEmail,
-          level: user.profile?.level || 'iniciante',
-          studentLevel: user.profile?.level || 'iniciante',
-          goal: user.profile?.learningGoal || 'English for everyday life & work',
-          learningGoal: user.profile?.learningGoal || 'English for everyday life & work',
-          contractedLessons: 5,
-          completedLessonsCount: 0,
-          status: 'active',
-          activeSince: new Date().toISOString().split('T')[0],
-          createdAt: new Date().toISOString(),
-          avatar: user.profile?.avatar || '',
-          picture: user.profile?.picture || '',
-        });
-      }
-      if (!db.userProfiles) db.userProfiles = {};
-      if (!db.userProfiles[cleanEmail]) {
-        db.userProfiles[cleanEmail] = {
-          id: user.uid || `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`,
-          name: user.name,
-          email: cleanEmail,
-          level: user.profile?.level || 'iniciante',
-          enrollmentStatus: 'active',
-          learningGoal: user.profile?.learningGoal || 'English for everyday life & work',
-          streakDays: 0,
-          points: 0,
-          dailyGoalMinutes: 30,
-          completedTodayMinutes: 0,
-          contractedLessons: 5,
-          completedLessonsCount: 0,
-          picture: user.profile?.picture || '',
-          avatar: user.profile?.avatar || '',
-          createdAt: new Date().toISOString(),
-        };
-      }
-    }
-  }
-  if (count > 0) {
-    await writeDbSync(db);
-  }
-  res.json({ success: true, synced: count });
+// Endpoint permanently deprecated: credential management is handled exclusively by Firebase Authentication
+app.post('/api/auth/sync-local-users', async (_req, res) => {
+  return res.status(410).json({
+    error: 'Endpoint permanently deprecated. All authentication and credential management is exclusively handled by Firebase Authentication.',
+  });
 });
 
 app.post('/api/auth/register', handleRegistration);
@@ -2724,29 +2329,34 @@ app.post('/api/auth/google', async (req, res) => {
     return res.status(400).json({ error: 'Email is required for Google login' });
   }
 
-  const cleanEmail = email.toLowerCase().trim();
-  const isMasterAdmin = cleanEmail === 'adm.itissimple@gmail.com' || cleanEmail === 'admin@itissimple.com';
+  const cleanEmail = (email || '').toLowerCase().trim();
+  const authRecord = db.authUsers?.[cleanEmail];
+
+  const verifiedCaller = await getVerifiedUserFromRequest(req);
+  const targetUid = (verifiedCaller?.uid && isValidCanonicalUid(verifiedCaller.uid) ? verifiedCaller.uid : null) || uid || authRecord?.uid;
+  const isServerVerifiedAdmin =
+    verifiedCaller?.role === 'admin' ||
+    Boolean(targetUid && (db.teachers || []).some((t: any) => t.role === 'admin' && (t.uid === targetUid || t.id === targetUid)));
   let displayName = name || cleanEmail.split('@')[0];
 
   // Query Firestore to get authoritative doc
   let firestoreDoc: any = null;
   try {
-    firestoreDoc = await fetchUserFromFirestore(cleanEmail, uid);
+    firestoreDoc = await fetchUserFromFirestore(cleanEmail, targetUid);
   } catch (fsErr) {
     console.warn('Firestore fetch notice in google auth:', fsErr);
   }
 
   const firestoreRole = (firestoreDoc?.role || '').toLowerCase();
-  const authRecord = db.authUsers?.[cleanEmail];
   const authRecordRole = (authRecord?.role || '').toLowerCase();
 
-  const isRegisteredStudent = !isMasterAdmin && (
+  const isRegisteredStudent = !isServerVerifiedAdmin && (
     firestoreRole === 'student' ||
     authRecordRole === 'student' ||
     (db.students || []).some((s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail)
   );
 
-  const isRegisteredTeacher = !isMasterAdmin && !isRegisteredStudent && (
+  const isRegisteredTeacher = !isServerVerifiedAdmin && !isRegisteredStudent && (
     firestoreRole === 'teacher' ||
     firestoreRole === 'native_friend' ||
     authRecordRole === 'teacher' ||
@@ -2757,16 +2367,14 @@ app.post('/api/auth/google', async (req, res) => {
   let role: string = 'student';
   let isRoleEnforced = false;
 
-  if (isMasterAdmin) {
+  if (isServerVerifiedAdmin) {
     role = 'admin';
-    if (!name || name === cleanEmail.split('@')[0]) {
-      displayName = "Admin It's Simple";
-    }
-    const targetAdminUid = uid || authRecord?.uid;
-    if (targetAdminUid) {
+    const adminTeacher = (db.teachers || []).find((t: any) => t.role === 'admin' && (t.uid === targetUid || t.id === targetUid));
+    displayName = adminTeacher?.name || name || "Admin";
+    if (targetUid && verifiedCaller?.role !== 'admin') {
       try {
         const adminAuth = getFirebaseAdminAuth();
-        adminAuth.setCustomUserClaims(targetAdminUid, { role: 'admin' }).catch(() => {});
+        adminAuth.setCustomUserClaims(targetUid, { role: 'admin' }).catch(() => {});
       } catch {}
     }
   } else if (isRegisteredStudent) {
@@ -3356,13 +2964,12 @@ app.post('/api/tutors', async (req, res) => {
     approved: resolvedIsApproved,
   });
 
-  // Ensure auth record exists with role 'teacher' - credentials stored separately from tutor public documents
+  // Ensure auth record exists with role 'teacher' (NO PASSWORDS)
   if (!db.authUsers) db.authUsers = {};
   db.authUsers[cleanEmail] = {
     uid: tutorEntry.uid || tutorEntry.id,
     email: cleanEmail,
     name: cleanName,
-    password: rawTutor.password || db.authUsers[cleanEmail]?.password || '',
     role: 'teacher',
     createdAt: db.authUsers[cleanEmail]?.createdAt || new Date().toISOString(),
   };

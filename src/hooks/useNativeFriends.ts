@@ -230,7 +230,7 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
   const [error, setError] = useState<string | null>(null);
 
   const cleanUserEmail = (userEmail || '').toLowerCase().trim();
-  const isAdmin = userRole === 'admin' || cleanUserEmail === 'adm.itissimple@gmail.com';
+  const isAdmin = userRole === 'admin';
 
   const refresh = useCallback(async () => {
     setIsLoading(true);

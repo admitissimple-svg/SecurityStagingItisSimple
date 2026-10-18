@@ -695,7 +695,6 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
               uid: u.uid || u.id || `usr-${key.replace(/[^a-zA-Z0-9]/g, '-')}`,
               email: key,
               name: u.name || key.split('@')[0],
-              password: u.password || '',
               role: u.role || 'student',
               createdAt: u.createdAt || new Date().toISOString(),
             };
@@ -877,6 +876,37 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
     delete mainData.studentHomeworkMap;
     mainData.updatedAt = new Date().toISOString();
 
+    // Security Hardening 4B.17B: Eliminate plaintext password persistence from all state trees
+    if (mainData.authUsers && typeof mainData.authUsers === 'object') {
+      for (const k of Object.keys(mainData.authUsers)) {
+        if (mainData.authUsers[k]) {
+          delete mainData.authUsers[k].password;
+        }
+      }
+    }
+    if (mainData.userProfiles && typeof mainData.userProfiles === 'object') {
+      for (const k of Object.keys(mainData.userProfiles)) {
+        if (mainData.userProfiles[k]) {
+          delete mainData.userProfiles[k].password;
+        }
+      }
+    }
+    if (Array.isArray(mainData.students)) {
+      for (const s of mainData.students) {
+        if (s) delete s.password;
+      }
+    }
+    if (Array.isArray(tutorsData.tutorsList)) {
+      for (const t of tutorsData.tutorsList) {
+        if (t) delete t.password;
+      }
+    }
+    if (Array.isArray(tutorsData.teachers)) {
+      for (const t of tutorsData.teachers) {
+        if (t) delete t.password;
+      }
+    }
+
     let tutorsDocToWrite = tutorsData;
     const hasIntentionalDeletion = Array.isArray(tutorsData.deletedTutorEmails) && tutorsData.deletedTutorEmails.length > 0;
     if ((!tutorsData.tutorsList || tutorsData.tutorsList.length === 0) && !hasIntentionalDeletion) {
@@ -894,6 +924,17 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
           }
         }
       } catch {}
+    }
+
+    if (Array.isArray(tutorsDocToWrite.tutorsList)) {
+      for (const t of tutorsDocToWrite.tutorsList) {
+        if (t) delete t.password;
+      }
+    }
+    if (Array.isArray(tutorsDocToWrite.teachers)) {
+      for (const t of tutorsDocToWrite.teachers) {
+        if (t) delete t.password;
+      }
     }
 
     const tutorSavePromises = (Array.isArray(tutorsDocToWrite.tutorsList) ? tutorsDocToWrite.tutorsList : []).map((tut: any) => {
@@ -916,6 +957,7 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
             role: 'teacher',
             updatedAt: tut.updatedAt || new Date().toISOString(),
           };
+          delete teacherData.password;
           const p1 = db.collection('users').doc(candidateAuthUid).set(teacherData, { merge: true }).catch(() => null);
           const p2 = db.collection('tutors').doc(candidateAuthUid).set(teacherData, { merge: true }).catch(() => null);
           return Promise.all([p1, p2]);
@@ -953,6 +995,11 @@ export async function saveUserToFirestore(user: any): Promise<boolean> {
   if (!db || !user?.email) return false;
   try {
     const sanitized = JSON.parse(JSON.stringify(user));
+    // Security Hardening 4B.17B: Never write credentials or passwords to Firestore documents
+    delete sanitized.password;
+    delete sanitized.confirmPassword;
+    delete sanitized.newPassword;
+
     const cleanEmail = user.email.toLowerCase().trim();
     const docId = user.uid || (user.id && !user.id.includes('@') && !user.id.startsWith('usr-') ? user.id : '');
     if (!docId) {

@@ -304,6 +304,8 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
       }).catch(() => {});
 
       setIsSubmitted(true);
+      setPassword('');
+      setConfirmPassword('');
       setLastCreatedTutor(createdTutor);
       const callback = onRegisteredSuccess || onRegisterSuccess;
       if (callback) {

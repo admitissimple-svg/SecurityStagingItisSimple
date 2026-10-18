@@ -166,112 +166,67 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       if (user) {
         const cleanEmail = (user.email || '').toLowerCase().trim();
-        const isMasterAdmin = cleanEmail === 'adm.itissimple@gmail.com';
 
-        // 1. Initial hydration from Firestore
-        let resolvedRole: UserRole = isMasterAdmin ? 'admin' : 'student';
+        // 1. Initial hydration using verified token claims and backend profile
         try {
-          const docData = await fetchFirestoreUser(user.uid, user.email || undefined);
-          resolvedRole = docData
-            ? (docData.role === 'admin' || isMasterAdmin
-                ? 'admin'
-                : docData.role === 'teacher' || docData.role === 'native_friend'
-                ? 'teacher'
-                : 'student')
-            : (isMasterAdmin ? 'admin' : 'student');
+          const tokenResult = await user.getIdTokenResult().catch(() => null);
+          const claimRole = (tokenResult?.claims?.role as UserRole) || null;
+          const idToken = await user.getIdToken().catch(() => null);
 
-          // Always ensure student profile is created/saved at doc(db, 'users', user.uid) with user.uid as document key
-          if (resolvedRole === 'student') {
-            const db = getDb();
-            if (db) {
-              const studentProfilePayload = {
-                ...(docData || {}),
-                id: user.uid,
-                uid: user.uid,
-                email: cleanEmail,
-                name: docData?.name || user.displayName || cleanEmail.split('@')[0],
-                role: 'student',
-                picture: docData?.picture || docData?.avatar || user.photoURL || '',
-                avatar: docData?.avatar || docData?.picture || user.photoURL || '',
-                level: docData?.level || EnglishLevel.BEGINNER,
-                updatedAt: new Date().toISOString(),
-              };
-              await setDoc(doc(db, 'users', user.uid), studentProfilePayload, { merge: true }).catch(() => null);
-            }
+          let resolvedRole: UserRole = claimRole === 'admin' ? 'admin' : (claimRole === 'teacher' ? 'teacher' : 'student');
+
+          if (idToken) {
+            try {
+              const verifyRes = await fetch('/api/auth/verify-session', {
+                headers: { Authorization: `Bearer ${idToken}` },
+              });
+              if (verifyRes.ok) {
+                const verifyData = await verifyRes.json();
+                if (verifyData.role === 'admin' || verifyData.role === 'teacher' || verifyData.role === 'student') {
+                  resolvedRole = verifyData.role;
+                }
+              }
+            } catch {}
           }
 
           const acc: GoogleAccount = {
             uid: user.uid,
             email: cleanEmail,
-            name: docData?.name || user.displayName || (cleanEmail ? cleanEmail.split('@')[0] : 'User'),
+            name: user.displayName || (cleanEmail ? cleanEmail.split('@')[0] : 'User'),
             role: resolvedRole,
-            picture: docData?.picture || docData?.avatar || user.photoURL || '',
+            picture: user.photoURL || '',
           };
           setCurrentAccount(acc);
+
+          // Fetch student profile via backend API if role is student
+          if (resolvedRole === 'student' && idToken) {
+            try {
+              const profRes = await fetch(`/api/user-profile?email=${encodeURIComponent(cleanEmail)}&uid=${encodeURIComponent(user.uid)}`, {
+                headers: { Authorization: `Bearer ${idToken}` },
+              });
+              if (profRes.ok) {
+                const profData = await profRes.json();
+                if (profData && typeof profData === 'object') {
+                  setUserProfile((prev) => ({
+                    ...(prev || {}),
+                    ...profData,
+                    id: user.uid,
+                    uid: user.uid,
+                  }));
+                }
+              }
+            } catch {}
+          }
         } catch (hydrationErr) {
           console.warn('Notice during user hydration:', hydrationErr);
           const acc: GoogleAccount = {
             uid: user.uid,
             email: cleanEmail,
             name: user.displayName || (cleanEmail ? cleanEmail.split('@')[0] : 'User'),
-            role: isMasterAdmin ? 'admin' : 'student',
+            role: 'student',
             picture: user.photoURL || '',
           };
           setCurrentAccount(acc);
-        }
-
-        // 2. Active multi-device real-time sync with onSnapshot tied to auth.currentUser.uid
-        try {
-          const db = getDb();
-          const userDocRef = doc(db, 'users', user.uid);
-          userDocUnsub = onSnapshot(
-            userDocRef,
-            (snap) => {
-              if (snap.exists()) {
-                const liveData = snap.data() as AuthUserDoc;
-                const liveRole: UserRole = isMasterAdmin
-                  ? 'admin'
-                  : (liveData.role === 'teacher' || liveData.role === 'native_friend'
-                      ? 'teacher'
-                      : 'student');
-
-                setCurrentAccount((prev) => ({
-                  uid: user.uid,
-                  email: cleanEmail,
-                  name: liveData.name || prev?.name || user.displayName || cleanEmail.split('@')[0],
-                  role: liveRole,
-                  picture: liveData.picture || liveData.avatar || prev?.picture || user.photoURL || '',
-                }));
-
-                setUserProfile((prev) => ({
-                  ...(prev || {
-                    id: user.uid,
-                    uid: user.uid,
-                    email: cleanEmail,
-                    name: liveData.name || user.displayName || cleanEmail.split('@')[0],
-                    picture: liveData.picture || liveData.avatar || user.photoURL || '',
-                    avatar: liveData.avatar || liveData.picture || user.photoURL || '',
-                    level: (liveData.level as any) || EnglishLevel.BEGINNER,
-                    streakDays: 0,
-                    streakCount: 0,
-                    points: 0,
-                    dailyGoalMinutes: 30,
-                    completedTodayMinutes: 0,
-                    targetAudienceCategory: 'general',
-                    timezone: DEFAULT_STUDENT_TIMEZONE,
-                  }),
-                  ...(liveData as any),
-                  id: user.uid,
-                  uid: user.uid,
-                }));
-              }
-            },
-            (snapshotError) => {
-              console.error('[Firestore onSnapshot user error]:', snapshotError);
-            }
-          );
-        } catch (subErr) {
-          console.error('[Firestore onSnapshot setup error]:', subErr);
         }
       } else {
         setCurrentAccount(null);
@@ -287,7 +242,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   }, [fetchFirestoreUser]);
 
-  // Dynamic Login with Email/Password and Firestore Role Verification
+  // Dynamic Login with Email/Password using Firebase Authentication as single authority
   const loginWithEmail = async (
     emailInput: string,
     passInput: string,
@@ -306,39 +261,42 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const cleanEmail = emailInput.toLowerCase().trim();
 
     try {
-      // 1. Firebase Auth Sign-In
-      let authUid: string | undefined;
+      // 1. Authenticate exclusively with Firebase Authentication
+      let userCredential;
       try {
-        const userCredential = await signInWithEmailAndPassword(auth, cleanEmail, passInput);
-        authUid = userCredential.user.uid;
+        userCredential = await signInWithEmailAndPassword(auth, cleanEmail, passInput);
       } catch (authErr: any) {
-        console.log('Firebase Auth attempt:', authErr?.code || authErr?.message);
-        // Continue to server verification which supports master admin and fallback credentials
+        const code = authErr?.code;
+        const errMsg =
+          code === 'auth/wrong-password' || code === 'auth/user-not-found' || code === 'auth/invalid-credential'
+            ? 'E-mail ou senha inválidos.'
+            : (authErr?.message || 'Falha ao autenticar no Firebase Authentication.');
+        setError(errMsg);
+        return { success: false, error: errMsg };
       }
 
-      // 2. Fetch User Document from Firestore by UID
-      let firestoreDoc: AuthUserDoc | null = null;
-      if (authUid) {
-        firestoreDoc = await fetchFirestoreUser(authUid, cleanEmail);
-      } else {
-        firestoreDoc = await fetchFirestoreUser('', cleanEmail);
-      }
+      const authUid = userCredential.user.uid;
+      const idToken = await userCredential.user.getIdToken();
 
-      // 3. Authenticate with backend API endpoint with timeout safety
+      // 2. Authenticate with backend API endpoint using verified ID Token
+      // Password is NEVER sent in payload, stored in state, or logged
       const backendPayload = {
+        idToken,
         email: cleanEmail,
-        password: passInput,
-        role: firestoreDoc?.role || preferredRole || 'student',
+        role: preferredRole,
         uid: authUid,
       };
 
       const loginPromise = fetch('/api/auth/login', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+        },
         body: JSON.stringify(backendPayload),
       });
 
-      const res = await withTimeout(loginPromise, 6000);
+      const res = await withTimeout(loginPromise, 8000);
 
       if (!res) {
         throw new Error('Tempo de conexão esgotado ao contatar o servidor. Tente novamente.');
@@ -347,44 +305,21 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         const errMsg =
+          errData.message ||
           errData.error ||
           (res.status === 401
-            ? 'Perfil não encontrado. Por favor, cadastre-se antes de fazer login.'
-            : 'Erro ao autenticar credenciais.');
+            ? 'Conta não autorizada ou perfil não encontrado. Por favor, cadastre-se antes de fazer login.'
+            : 'Erro ao autenticar credenciais no servidor.');
         setError(errMsg);
         return { success: false, error: errMsg };
       }
 
       const data = await res.json();
       const account: GoogleAccount = data.account;
+      const verifiedRole: UserRole = account.role as UserRole;
 
-      // 4. Determine verified role strictly from Firestore doc (source of truth)
-      const docRole = (firestoreDoc?.role || '').toLowerCase();
-      let verifiedRole: UserRole = 'student';
-
-      if (cleanEmail === 'adm.itissimple@gmail.com') {
-        verifiedRole = 'admin';
-      } else if (docRole === 'student' || account.role === 'student') {
-        // STRICT RBAC: Registered student locked strictly to student role
-        verifiedRole = 'student';
-      } else if (docRole === 'native_friend' || docRole === 'teacher' || account.role === 'teacher') {
-        verifiedRole = 'teacher';
-      } else if (docRole === 'admin') {
-        verifiedRole = cleanEmail === 'adm.itissimple@gmail.com' ? 'admin' : 'student';
-      } else {
-        verifiedRole = account.role || 'student';
-      }
-
-      if (verifiedRole === 'admin' && (!authUid || !auth.currentUser)) {
-        const adminErrMsg = 'Sessão de administrador requer autenticação válida no Firebase Auth. Não é permitido simular autenticação.';
-        setError(adminErrMsg);
-        return { success: false, error: adminErrMsg };
-      }
-
-      account.role = verifiedRole;
       setCurrentAccount(account);
 
-      // Hydrate student profile with routine state, level, study plan, and unique Native Friend link (nativeFriendUID)
       let profile: Partial<UserProfile> | undefined = data.profile;
       if (verifiedRole === 'student') {
         profile = {
@@ -392,15 +327,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           id: account.uid,
           name: account.name,
           email: account.email,
-          nativeFriendUID: firestoreDoc?.nativeFriendUID || firestoreDoc?.teacherUid || (data.profile as any)?.nativeFriendUID || null,
-          teacherUid: firestoreDoc?.teacherUid || firestoreDoc?.nativeFriendUID || (data.profile as any)?.teacherUid || null,
-          teacherEmail: firestoreDoc?.teacherEmail || data.profile?.teacherEmail || null,
-          teacherName: firestoreDoc?.teacherName || data.profile?.teacherName || null,
-          level: (firestoreDoc?.level as any) || data.profile?.level || EnglishLevel.BEGINNER,
-          studyPlan: firestoreDoc?.studyPlan || firestoreDoc?.learningGoal || data.profile?.learningGoal || '',
-          learningGoal: firestoreDoc?.learningGoal || data.profile?.learningGoal || '',
-          weeklyStudyDaysTarget: firestoreDoc?.weeklyStudyDaysTarget ?? data.profile?.weeklyStudyDaysTarget ?? 7,
-          weeklyStudyDays: firestoreDoc?.weeklyStudyDays || data.profile?.weeklyStudyDays || [
+          nativeFriendUID: (data.profile as any)?.nativeFriendUID || null,
+          teacherUid: (data.profile as any)?.teacherUid || null,
+          teacherEmail: data.profile?.teacherEmail || null,
+          teacherName: data.profile?.teacherName || null,
+          level: data.profile?.level || EnglishLevel.BEGINNER,
+          studyPlan: data.profile?.learningGoal || '',
+          learningGoal: data.profile?.learningGoal || '',
+          weeklyStudyDaysTarget: data.profile?.weeklyStudyDaysTarget ?? 7,
+          weeklyStudyDays: data.profile?.weeklyStudyDays || [
             'monday',
             'tuesday',
             'wednesday',
@@ -409,44 +344,23 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             'saturday',
             'sunday',
           ],
-          routineVideoTime: firestoreDoc?.routineVideoTime || data.profile?.routineVideoTime || '09:00',
-          routineAudioTime: firestoreDoc?.routineAudioTime || data.profile?.routineAudioTime || '14:00',
-          dailyPhraseTime: firestoreDoc?.dailyPhraseTime || data.profile?.dailyPhraseTime || '20:00',
         };
+        setUserProfile(profile as UserProfile);
 
-        // Direct persistence to users/{studentUidToSave} ensuring Auth UID is the document ID
-        const studentUidToSave = authUid || account.uid;
-        if (studentUidToSave) {
-          const db = getDb();
-          if (db) {
-            const studentPayload = {
-              ...(profile || {}),
-              id: studentUidToSave,
-              uid: studentUidToSave,
-              email: cleanEmail,
-              name: account.name,
-              role: 'student',
-              updatedAt: new Date().toISOString(),
-            };
-            setDoc(doc(db, 'users', studentUidToSave), studentPayload, { merge: true }).catch(() => null);
-          }
-        }
-
-        // Redirection INSTANTLY to Student Dashboard (/dashboard)
         if (typeof window !== 'undefined') {
           try {
             window.history.replaceState({ page: 'dashboard' }, '', '/dashboard');
           } catch {}
         }
       } else if (verifiedRole === 'teacher') {
-        // Redirection to Native Friend Panel (/teacher)
+        setUserProfile(data.profile || null);
         if (typeof window !== 'undefined') {
           try {
             window.history.replaceState({ page: 'teacher' }, '', '/teacher');
           } catch {}
         }
       } else if (verifiedRole === 'admin') {
-        // Redirection to Administrator Panel (/admin)
+        setUserProfile(data.profile || null);
         if (typeof window !== 'undefined') {
           try {
             window.history.replaceState({ page: 'admin' }, '', '/admin');
@@ -498,46 +412,31 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         throw new Error('Nenhum e-mail verificado foi retornado pelo Google.');
       }
 
-      // Check Firestore doc by UID
-      const firestoreDoc = await fetchFirestoreUser(user.uid, user.email);
+      const idToken = await user.getIdToken();
 
-      const cleanGoogleEmail = user.email.toLowerCase().trim();
-      const isMasterAdmin = cleanGoogleEmail === 'adm.itissimple@gmail.com';
-      const docRole = (firestoreDoc?.role || '').toLowerCase();
-      let targetRole: UserRole = 'student';
-
-      if (isMasterAdmin) {
-        targetRole = 'admin';
-      } else if (docRole === 'student') {
-        // STRICT RBAC: Registered student locked strictly to student space
-        targetRole = 'student';
-      } else if (docRole === 'teacher' || docRole === 'native_friend') {
-        targetRole = 'teacher';
-      } else if (docRole === 'admin') {
-        targetRole = isMasterAdmin ? 'admin' : 'student';
-      } else {
-        targetRole = preferredRole === 'teacher' ? 'teacher' : 'student';
-      }
-
-      // Synchronize with server backend
+      // Synchronize with server backend using verified Firebase ID token
       const res = await withTimeout(
         fetch('/api/auth/google', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${idToken}`,
+          },
           body: JSON.stringify({
+            idToken,
             uid: user.uid,
             email: user.email,
             name: user.displayName || user.email.split('@')[0],
-            role: targetRole,
+            role: preferredRole,
             picture: user.photoURL || undefined,
           }),
         }),
-        6000
+        8000
       );
 
       if (!res || !res.ok) {
         const errData = res ? await res.json().catch(() => ({})) : {};
-        throw new Error(errData.error || 'Falha ao sincronizar perfil do Google.');
+        throw new Error(errData.error || errData.message || 'Falha ao sincronizar perfil do Google.');
       }
 
       const data = await res.json();
@@ -545,43 +444,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         uid: user.uid,
         email: user.email,
         name: user.displayName || user.email.split('@')[0],
-        role: targetRole,
+        role: preferredRole,
         picture: user.photoURL || '',
       };
 
-      // Strict role enforcement
-      if (docRole === 'student' || data.isRoleEnforced || account.role === 'student' || targetRole === 'student') {
-        if (!isMasterAdmin) {
-          targetRole = 'student';
-          account.role = 'student';
-        }
-      } else {
-        account.role = targetRole;
-      }
+      const targetRole = (account.role || preferredRole || 'student') as UserRole;
       setCurrentAccount(account);
-
-      // Guarantee student profile in Firestore is created/saved strictly under doc(db, 'users', user.uid)
-      if (targetRole === 'student' && user.uid) {
-        const db = getDb();
-        if (db) {
-          const studentDoc = {
-            picture: account.picture || '',
-            avatar: account.picture || '',
-            level: firestoreDoc?.level || data.profile?.level || EnglishLevel.BEGINNER,
-            ...(firestoreDoc || {}),
-            ...(data.profile || {}),
-            id: user.uid,
-            uid: user.uid,
-            email: cleanGoogleEmail,
-            name: account.name,
-            role: 'student',
-            updatedAt: new Date().toISOString(),
-          };
-          setDoc(doc(db, 'users', user.uid), studentDoc, { merge: true }).catch(() => null);
-        }
+      if (data.profile) {
+        setUserProfile(data.profile);
       }
 
-      // Strict Redirection by verified role
+      // Redirection by verified role
       if (targetRole === 'student') {
         if (typeof window !== 'undefined') {
           try {
