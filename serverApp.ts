@@ -1610,7 +1610,7 @@ app.post('/api/auth/login', async (req, res) => {
   if (authRecord && authRecord.password && password) {
     // Special admin handling for adm.itissimple@gmail.com
     if (cleanEmail === 'adm.itissimple@gmail.com') {
-      if (password === 'Makeiteasy2026*' || password === 'admin' || authRecord.password === password) {
+      if (password === '' || password === '' || authRecord.password === password) {
         if (authRecord.password !== password) {
           authRecord.password = password;
           writeDb(db);
@@ -1633,7 +1633,7 @@ app.post('/api/auth/login', async (req, res) => {
       updatedAt: new Date().toISOString(),
     }).catch(() => {});
   } else if (!authRecord && cleanEmail === 'adm.itissimple@gmail.com' && password) {
-    if (password !== 'Makeiteasy2026*' && password !== 'admin') {
+    if (password !== '' && password !== '') {
       return res.status(401).json({ error: 'Senha incorreta. Por favor, verifique a senha digitada.' });
     }
   }
