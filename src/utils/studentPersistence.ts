@@ -144,6 +144,16 @@ export function normalizeUid(rawId?: string | null, email?: string | null): stri
 export function getUserDocIds(rawId?: string | null, email?: string | null): string[] {
   const cleanEmail = (email || '').toLowerCase().trim();
   const cleanUid = normalizeUid(rawId, cleanEmail);
+  return cleanUid && isValidCanonicalUid(cleanUid) ? [cleanUid] : [];
+}
+
+/**
+ * Retrieve potential legacy document IDs strictly for read-only fallback lookup.
+ * PROHIBITED: Never use this array for write operations.
+ */
+export function getLegacyReadDocIds(rawId?: string | null, email?: string | null): string[] {
+  const cleanEmail = (email || '').toLowerCase().trim();
+  const cleanUid = normalizeUid(rawId, cleanEmail);
   const rawClean = (rawId || '').trim();
   const emailUnderscore = cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : '';
   const emailHyphen = cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9]/g, '-') : '';
@@ -319,8 +329,8 @@ export async function saveStudentVocabularyToFirestore(
       }
     } catch {}
 
-    // 3. Check legacy doc IDs if masterMap is still small or for accounts migrated from email
-    const allDocIds = getUserDocIds(cleanUid, cleanEmail);
+    // 3. Check legacy doc IDs if masterMap is still small or for accounts migrated from email (READ ONLY)
+    const allDocIds = getLegacyReadDocIds(cleanUid, cleanEmail);
     for (const altId of allDocIds) {
       if (altId === cleanUid) continue;
       try {
@@ -649,9 +659,9 @@ export async function fetchStudentVocabularyFromFirestore(
       }
     } catch {}
 
-    // 3. Fallback to legacy document IDs if cleanUid had no words
+    // 3. Fallback to legacy document IDs if cleanUid had no words (READ ONLY)
     if (entryMap.size === 0) {
-      const allDocIds = getUserDocIds(cleanUid, cleanEmail);
+      const allDocIds = getLegacyReadDocIds(cleanUid, cleanEmail);
       for (const altId of allDocIds) {
         if (altId === cleanUid) continue;
         try {
@@ -2235,18 +2245,8 @@ export async function updateLiveLessonInFirestore(
     // Update root lessons/{lessonId}
     await withFirestoreTimeout(setDoc(lessonRef, rootPayload, { merge: true }), 3000, null);
 
-    // 3. Update student subcollection and scheduledLessons array across all canonical doc IDs
-    const studentDocIds = Array.from(
-      new Set(
-        [
-          effStudentUid,
-          effStudentEmail,
-          effStudentEmail ? normalizeUid(null, effStudentEmail) : '',
-          effStudentEmail ? effStudentEmail.replace(/[^a-zA-Z0-9]/g, '-') : '',
-          effStudentEmail ? `usr-${effStudentEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : '',
-        ].filter(Boolean)
-      )
-    );
+    // 3. Update student subcollection and scheduledLessons array strictly on canonical student doc
+    const studentDocIds = getUserDocIds(effStudentUid, effStudentEmail);
 
     for (const docId of studentDocIds) {
       try {
@@ -2280,18 +2280,8 @@ export async function updateLiveLessonInFirestore(
       }
     }
 
-    // 4. Update teacher subcollection and scheduledLessons array if applicable
-    const teacherDocIds = Array.from(
-      new Set(
-        [
-          effTeacherUid,
-          effTeacherEmail,
-          effTeacherEmail ? normalizeUid(null, effTeacherEmail) : '',
-          effTeacherEmail ? effTeacherEmail.replace(/[^a-zA-Z0-9]/g, '-') : '',
-          effTeacherEmail ? `usr-${effTeacherEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : '',
-        ].filter(Boolean)
-      )
-    );
+    // 4. Update teacher subcollection and scheduledLessons array strictly on canonical teacher doc
+    const teacherDocIds = getUserDocIds(effTeacherUid, effTeacherEmail);
 
     for (const tDocId of teacherDocIds) {
       try {
@@ -2382,17 +2372,7 @@ export async function deleteLiveLessonFromFirestore(
 
     await withFirestoreTimeout(deleteDoc(lessonRef), 2500, null);
 
-    const studentDocIds = Array.from(
-      new Set(
-        [
-          effStudentUid,
-          effStudentEmail,
-          effStudentEmail ? normalizeUid(null, effStudentEmail) : '',
-          effStudentEmail ? effStudentEmail.replace(/[^a-zA-Z0-9]/g, '-') : '',
-          effStudentEmail ? `usr-${effStudentEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : '',
-        ].filter(Boolean)
-      )
-    );
+    const studentDocIds = getUserDocIds(effStudentUid, effStudentEmail);
 
     for (const docId of studentDocIds) {
       try {
@@ -3941,11 +3921,13 @@ export async function recordActivityInStudentJournal(
       }
 
       // Direct write to users/{cleanUid}
-      await withFirestoreTimeout(setDoc(userRef, payload, { merge: true }), 3500, null);
+      if (cleanUid && isValidCanonicalUid(cleanUid) && userRef) {
+        await withFirestoreTimeout(setDoc(userRef, payload, { merge: true }), 3500, null);
 
-      // Write discrete entry to subcollection users/{cleanUid}/studentJournal/{entryId}
-      const entryRef = doc(db, 'users', cleanUid, 'studentJournal', sanitizedEntry.id);
-      await withFirestoreTimeout(setDoc(entryRef, sanitizedEntry, { merge: true }), 2000, null);
+        // Write discrete entry to subcollection users/{cleanUid}/studentJournal/{entryId}
+        const entryRef = doc(db, 'users', cleanUid, 'studentJournal', sanitizedEntry.id);
+        await withFirestoreTimeout(setDoc(entryRef, sanitizedEntry, { merge: true }), 2000, null);
+      }
 
       // Mirror to server backend API
       fetch('/api/student-journal/activity', {

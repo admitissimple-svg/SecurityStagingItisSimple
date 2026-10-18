@@ -67,6 +67,7 @@ export const NATIVE_FRIENDS_DICTIONARY_DATABASE: Record<string, PedagogicalWordE
     definitionEn: 'To make an organization, process, or system more efficient and simpler.',
     exampleSentenceEn: 'The team introduced new software to streamline weekly reporting.',
     translationPt: 'otimizar / simplificar',
+    explanationPt: 'Expressão utilizada em inglês autêntico para indicar a otimização e simplificação de processos.',
     collocations: ['streamline the process', 'streamline operations', 'streamline workflow'],
     realExamples: [
       'The team introduced new software to streamline weekly reporting.',
@@ -314,6 +315,23 @@ export const NATIVE_FRIENDS_DICTIONARY_DATABASE: Record<string, PedagogicalWordE
     register: 'informal',
     category: 'Everyday Fluency',
     phonetic: '/ræp ʌp/',
+  },
+  resilience: {
+    word: 'resilience',
+    partOfSpeech: 'Noun (Uncountable)',
+    cefrLevel: 'B2',
+    definitionEn: 'The ability to recover quickly from difficulties, tough challenges, or change.',
+    exampleSentenceEn: 'She showed great resilience during the speaking exercise.',
+    translationPt: 'resiliência / capacidade de superação',
+    collocations: ['show resilience', 'build resilience', 'emotional resilience'],
+    realExamples: [
+      'She showed great resilience during the speaking exercise.',
+      'Developing linguistic resilience helps learners speak without fear of mistakes.',
+    ],
+    synonyms: ['adaptability', 'perseverance', 'toughness'],
+    register: 'neutral',
+    category: 'Personal Development & Fluency',
+    phonetic: '/rɪˈzɪliəns/',
   },
 };
 

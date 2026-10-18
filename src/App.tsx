@@ -2014,8 +2014,24 @@ export default function App() {
   // Refresh student dictionary whenever the modal is opened
   useEffect(() => {
     if (!isPersonalDictionaryOpen) return;
-    const cleanEmail = (currentAccount?.role === 'student' ? (currentAccount?.email || '') : (selectedStudentFilter !== 'all' ? selectedStudentFilter : '')) || auth.currentUser?.email || userProfile?.email || '';
-    const rawUid = (currentAccount?.role === 'student' ? (currentAccount?.uid || '') : (selectedStudentFilter !== 'all' ? selectedStudentFilter : '')) || auth.currentUser?.uid || userProfile?.id || (userProfile as any)?.uid || '';
+    const isStudentUser = currentAccount?.role === 'student';
+    const targetStudentFromFilter = !isStudentUser && selectedStudentFilter && selectedStudentFilter !== 'all'
+      ? studentsList.find((s) =>
+          Boolean(s) &&
+          (((s.email || '').toLowerCase().trim() === (selectedStudentFilter || '').toLowerCase().trim()) ||
+            s.uid === selectedStudentFilter ||
+            s.id === selectedStudentFilter)
+        )
+      : null;
+
+    const cleanEmail = isStudentUser
+      ? (currentAccount?.email || auth.currentUser?.email || userProfile?.email || '').toLowerCase().trim()
+      : (targetStudentFromFilter?.email || (selectedStudentFilter !== 'all' && selectedStudentFilter.includes('@') ? selectedStudentFilter : '')).toLowerCase().trim();
+
+    const rawUid = isStudentUser
+      ? (currentAccount?.uid || auth.currentUser?.uid || userProfile?.id || (userProfile as any)?.uid || '')
+      : (targetStudentFromFilter?.uid || targetStudentFromFilter?.id || (selectedStudentFilter !== 'all' && !selectedStudentFilter.includes('@') ? selectedStudentFilter : ''));
+
     const uid = normalizeUid(rawUid, cleanEmail);
     if (!uid && !cleanEmail) return;
 
@@ -2921,8 +2937,29 @@ export default function App() {
       targetStudentEmail?: string;
     }) => {
       const targetDay = params.dayOfWeek || selectedDay;
-      const uid = params.targetStudentUid || currentAccount?.uid || userProfile?.id || (userProfile as any)?.uid || '';
-      const email = params.targetStudentEmail || currentAccount?.email || userProfile?.email || '';
+      const isTeacherCaller = currentAccount?.role === 'teacher' || currentAccount?.role === 'admin';
+
+      let uid = params.targetStudentUid || '';
+      let email = params.targetStudentEmail || '';
+
+      if (!uid && isTeacherCaller && selectedStudentFilter && selectedStudentFilter !== 'all') {
+        const found = studentsList.find(
+          (s) =>
+            Boolean(s) &&
+            (((s.email || '').toLowerCase().trim() === (selectedStudentFilter || '').toLowerCase().trim()) ||
+              s.uid === selectedStudentFilter ||
+              s.id === selectedStudentFilter)
+        );
+        if (found) {
+          uid = found.uid || found.id || '';
+          email = email || found.email || selectedStudentFilter;
+        }
+      }
+
+      if (!isTeacherCaller) {
+        uid = uid || currentAccount?.uid || userProfile?.id || (userProfile as any)?.uid || '';
+        email = email || currentAccount?.email || userProfile?.email || '';
+      }
 
       const activeCycle = parseWeekCycleNumber(userProfile?.weeklyCycle);
       const activeWeekId = normalizeWeekId(userProfile?.weeklyCycle);

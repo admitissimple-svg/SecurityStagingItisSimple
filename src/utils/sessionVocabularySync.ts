@@ -61,9 +61,31 @@ export async function syncSessionVocabularyToStudentDictionary(
     lessonId,
   } = params;
 
+  let effectiveVocab = [...(params.vocabularyAndExpressions || [])];
+  const cleanUidEarly = (studentUid || '').trim();
+  const cleanEmailEarly = (studentEmail || '').toLowerCase().trim();
+  const isSyntheticEarly = !cleanUidEarly || cleanUidEarly.includes('@') || cleanUidEarly.startsWith('usr-') || cleanUidEarly.startsWith('st-');
+
+  if (effectiveVocab.length === 0 && rawNotes && !isSyntheticEarly) {
+    try {
+      const { generateLocalPedagogicalTransformation } = await import('./pedagogicalTransformer');
+      const localTransform = generateLocalPedagogicalTransformation({
+        rawNotes,
+        topic,
+        sessionDate,
+        teacherName,
+        studentLevel,
+        studentUid: cleanUidEarly,
+        studentEmail: cleanEmailEarly,
+        lessonId,
+      });
+      effectiveVocab = localTransform.vocabularyAndExpressions || [];
+    } catch {}
+  }
+
   const isDefinitiveAi = params.isDefinitiveAi !== undefined
     ? Boolean(params.isDefinitiveAi)
-    : (vocabularyAndExpressions.length > 0 && !vocabularyAndExpressions.some((v: any) => v.isProvisional || v.isFallback));
+    : (effectiveVocab.length > 0 && !effectiveVocab.some((v: any) => v.isProvisional || v.isFallback));
 
   const rawUid = (studentUid || '').trim();
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
@@ -133,7 +155,7 @@ export async function syncSessionVocabularyToStudentDictionary(
 
   // Merge terms from pedagogical transformation vocabulary (if provided)
   // Strictly enforce Rule 2: Only accept terms that are proven New Words (Alt+W)
-  (vocabularyAndExpressions || []).forEach((v) => {
+  (effectiveVocab || []).forEach((v) => {
     const clean = (v.term || '').trim();
     if (!clean) return;
     const key = normalizeDictionaryWord(clean);
@@ -191,6 +213,9 @@ export async function syncSessionVocabularyToStudentDictionary(
       } else if (hasValidAiDefEn) {
         finalDefEn = rawDefEn;
         isValidAiEnglish = true;
+      } else if (rawDefEn && !isGenericFallback) {
+        finalDefEn = rawDefEn;
+        isValidAiEnglish = false;
       } else {
         finalDefEn = existingDefEn;
         isValidAiEnglish = false;
@@ -199,6 +224,9 @@ export async function syncSessionVocabularyToStudentDictionary(
       // simpleDefinition remains exclusively the pedagogical explanation in the target language
       const finalSimpleDef = rawSimpleDef || existing?.simpleDefinition || '';
 
+      const rawExample = Array.isArray(v.realExamples) && v.realExamples.length > 0 ? v.realExamples[0] : (v as any).exampleSentenceEn || existing?.exampleSentenceEn;
+      const cleanExample = typeof rawExample === 'string' ? rawExample.replace(/^Didactic Example:\s*["']?|["']$/g, '') : '';
+
       const candidate: TermMetadata = {
         term: clean,
         isPronounce,
@@ -206,7 +234,7 @@ export async function syncSessionVocabularyToStudentDictionary(
         partOfSpeech: v.partOfSpeech || (isPronounce ? 'Pronunciation Focus' : 'Expression'),
         definitionEn: finalDefEn,
         simpleDefinition: finalSimpleDef,
-        exampleSentenceEn: Array.isArray(v.realExamples) && v.realExamples.length > 0 ? v.realExamples[0] : (v as any).exampleSentenceEn || existing?.exampleSentenceEn,
+        exampleSentenceEn: cleanExample,
         phonetic: v.phoneticGuide || existing?.phonetic,
         cefrLevel: v.cefrLevel || existing?.cefrLevel,
         isValidAiEnglishDef: isValidAiEnglish,

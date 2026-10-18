@@ -230,9 +230,10 @@ export const TeacherScheduleControlTable: React.FC<TeacherScheduleControlTablePr
     }
 
     if (selectedStudentFilter && selectedStudentFilter !== 'all') {
-      const filterEmail = (selectedStudentFilter || '').toLowerCase().trim();
+      const filterVal = (selectedStudentFilter || '').toLowerCase().trim();
       const lStudentEmail = (lesson.studentEmail || '').toLowerCase().trim();
-      if (filterEmail && lStudentEmail !== filterEmail) {
+      const lStudentUid = (lesson.studentUid || '').trim();
+      if (filterVal && lStudentEmail !== filterVal && lStudentUid !== selectedStudentFilter) {
         return false;
       }
     }

@@ -2361,7 +2361,9 @@ export async function saveSessionNotesToFirestoreServer(
       db.collection('session_notes').doc(cleanKey).set(sanitized, { merge: true }),
     ];
 
-    const studentId = data.studentUid || (data.studentEmail ? data.studentEmail.toLowerCase().trim().replace(/[^a-zA-Z0-9_-]/g, '_') : '');
+    const studentId = (data.studentUid && isValidCanonicalUid(data.studentUid))
+      ? data.studentUid
+      : (data.studentEmail ? data.studentEmail.toLowerCase().trim().replace(/[^a-zA-Z0-9_-]/g, '_') : '');
     if (studentId) {
       savePromises.push(
         db.collection('users').doc(studentId).collection('session_notes').doc(cleanKey).set(sanitized, { merge: true })

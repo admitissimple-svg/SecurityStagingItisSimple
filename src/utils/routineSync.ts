@@ -4,6 +4,7 @@ import { getDb, auth } from '../firebase';
 import { DayOfWeek, TeacherOverrideTrack } from '../types';
 import { getSpotifyEmbedUrl } from './spotify';
 import { recordConsumedTrack } from '../hooks/useStudentHistory';
+import { isValidCanonicalUid } from './tutorConsolidation';
 
 export enum OperationType {
   CREATE = 'create',
@@ -110,26 +111,46 @@ const lastSyncedSignatureMap = new Map<string, string>();
  * Prioritizes the authenticated Firebase Auth user UID when available.
  */
 export function normalizeStudentIdForPath(rawIdOrEmail: string): string {
-  if (!rawIdOrEmail || rawIdOrEmail === 'undefined' || rawIdOrEmail === 'null' || rawIdOrEmail === 'user-default' || rawIdOrEmail === 'anonymous_student') {
-    return auth?.currentUser?.uid || '';
+  if (!rawIdOrEmail || typeof rawIdOrEmail !== 'string') {
+    return '';
   }
   const trimmed = rawIdOrEmail.trim();
+  if (
+    !trimmed ||
+    trimmed === 'undefined' ||
+    trimmed === 'null' ||
+    trimmed === 'user-default' ||
+    trimmed === 'anonymous_student' ||
+    trimmed.startsWith('st-') ||
+    trimmed.startsWith('usr-')
+  ) {
+    return '';
+  }
 
-  // If active authenticated user matches the input (by UID or email), strictly bind to auth.currentUser.uid
-  if (auth?.currentUser?.uid) {
+  // If input is an explicit valid canonical UID, return it directly
+  if (isValidCanonicalUid(trimmed)) {
+    return trimmed;
+  }
+
+  // If active authenticated user matches the input by email (self-context as student only),
+  // return auth.currentUser.uid if valid. NEVER use auth.currentUser.uid if caller is teacher/admin!
+  if (auth?.currentUser?.uid && isValidCanonicalUid(auth.currentUser.uid)) {
     const curUid = auth.currentUser.uid;
     const curEmail = (auth.currentUser.email || '').toLowerCase().trim();
     const cleanLower = trimmed.toLowerCase();
-    if (cleanLower === curUid.toLowerCase() || (curEmail && cleanLower === curEmail)) {
+    const isTeacherOrAdmin = (
+      curEmail === 'adm.itissimple@gmail.com' ||
+      curEmail === 'admin@itissimple.com' ||
+      curEmail === 'estilobeeforkids@gmail.com' ||
+      curEmail === 'estilobeeadm@gmail.com'
+    );
+    if (!isTeacherOrAdmin && ((curEmail && cleanLower === curEmail) || cleanLower === curUid.toLowerCase())) {
       return curUid;
     }
   }
 
-  // Standardize email addresses to safe key tokens
-  if (trimmed.includes('@')) {
-    return trimmed.toLowerCase().replace(/[^a-zA-Z0-9_-]/g, '_');
-  }
-  return trimmed;
+  // Never return email or email-derived strings for document paths
+  return '';
 }
 
 /**

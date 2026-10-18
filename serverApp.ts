@@ -7773,6 +7773,12 @@ app.post('/api/lessons/:id/notes', async (req, res) => {
 
   let targetStudentEmail = (req.body?.studentEmail || '').toLowerCase().trim();
   let targetStudentUid = req.body?.studentUid || '';
+  if ((!targetStudentUid || !isValidCanonicalUid(targetStudentUid)) && targetStudentEmail) {
+    const foundStudent = (db.students || []).find((s: any) => (s.email || '').toLowerCase().trim() === targetStudentEmail);
+    if (foundStudent && foundStudent.uid && isValidCanonicalUid(foundStudent.uid)) {
+      targetStudentUid = foundStudent.uid;
+    }
+  }
   let teacherName = req.body?.teacherName || '';
   let teacherEmail = (req.body?.teacherEmail || '').toLowerCase().trim();
 

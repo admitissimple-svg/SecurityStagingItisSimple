@@ -185,6 +185,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             const db = getDb();
             if (db) {
               const studentProfilePayload = {
+                ...(docData || {}),
                 id: user.uid,
                 uid: user.uid,
                 email: cleanEmail,
@@ -193,7 +194,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 picture: docData?.picture || docData?.avatar || user.photoURL || '',
                 avatar: docData?.avatar || docData?.picture || user.photoURL || '',
                 level: docData?.level || EnglishLevel.BEGINNER,
-                ...(docData || {}),
                 updatedAt: new Date().toISOString(),
               };
               await setDoc(doc(db, 'users', user.uid), studentProfilePayload, { merge: true }).catch(() => null);
@@ -420,12 +420,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           const db = getDb();
           if (db) {
             const studentPayload = {
+              ...(profile || {}),
               id: studentUidToSave,
               uid: studentUidToSave,
               email: cleanEmail,
               name: account.name,
               role: 'student',
-              ...(profile || {}),
               updatedAt: new Date().toISOString(),
             };
             setDoc(doc(db, 'users', studentUidToSave), studentPayload, { merge: true }).catch(() => null);
@@ -565,16 +565,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const db = getDb();
         if (db) {
           const studentDoc = {
-            id: user.uid,
-            uid: user.uid,
-            email: cleanGoogleEmail,
-            name: account.name,
-            role: 'student',
             picture: account.picture || '',
             avatar: account.picture || '',
             level: firestoreDoc?.level || data.profile?.level || EnglishLevel.BEGINNER,
             ...(firestoreDoc || {}),
             ...(data.profile || {}),
+            id: user.uid,
+            uid: user.uid,
+            email: cleanGoogleEmail,
+            name: account.name,
+            role: 'student',
             updatedAt: new Date().toISOString(),
           };
           setDoc(doc(db, 'users', user.uid), studentDoc, { merge: true }).catch(() => null);

@@ -592,7 +592,7 @@ export function generateLocalPedagogicalTransformation(params: {
                 ? `Foco em pronúncia: Preste atenção à tonicidade da sílaba e articulação de "${rawTrimmed}".`
                 : `Pronunciation focus: Pay careful attention to syllable stress on "${rawTrimmed}".`)
             : (isPt
-                ? (dbMatch.explanationPt || `Termo comunicativo (${cefrMeta.cefr}): utilizado em inglês autêntico para expressar "${rawTrimmed}"${dbMatch.translationPt ? ` (${dbMatch.translationPt})` : ''} com clareza e naturalidade.`)
+                ? (dbMatch.explanationPt || `Expressão comunicativa (${cefrMeta.cefr}): utilizada em conversação autêntica para expressar "${rawTrimmed}"${dbMatch.translationPt ? ` (${dbMatch.translationPt})` : ''} com clareza e naturalidade.`)
                 : dbMatch.definitionEn),
           collocations: (dbMatch.collocations && dbMatch.collocations.length > 0)
             ? dbMatch.collocations
