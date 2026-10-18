@@ -2256,6 +2256,11 @@ export default function App() {
         canonicalTutorUid = 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1';
       }
 
+      // Reference case (Queen Bee): always resolves to real Auth UID Xpmq4l50aUOE0Jh4UTHwGAtw65B2
+      if (!canonicalTutorUid && (data.selectedTutor?.id === 'queen-bee' || (data.selectedTutor as any)?.publicTutorId === 'queen-bee' || cleanTeacherEmail === 'beeginning4you@gmail.com' || cleanTeacherEmail === 'estilobeeforkids@gmail.com' || cleanTeacherEmail === 'estilobeeadm@gmail.com' || matchedTutor?.publicTutorId === 'queen-bee' || (typeof matchedTutor?.name === 'string' && matchedTutor.name.toLowerCase().includes('queen bee')))) {
+        canonicalTutorUid = 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2';
+      }
+
       if (!canonicalTutorUid) {
         throw new Error(
           currentLanguage === 'en'
@@ -2502,10 +2507,12 @@ export default function App() {
       const cleanTeacherName = params.teacherName ? params.teacherName.trim() : null;
       const matchedTutor = tutors.find((t) => (t.email || '').toLowerCase().trim() === cleanTeacherEmail);
       const isSkullBee = cleanTeacherEmail === 'laviniafofafc@gmail.com' || (matchedTutor as any)?.publicTutorId === 'skull-bee' || matchedTutor?.id === 'skull-bee';
+      const isQueenBee = cleanTeacherEmail === 'beeginning4you@gmail.com' || cleanTeacherEmail === 'estilobeeforkids@gmail.com' || cleanTeacherEmail === 'estilobeeadm@gmail.com' || (matchedTutor as any)?.publicTutorId === 'queen-bee' || matchedTutor?.id === 'queen-bee' || (typeof matchedTutor?.name === 'string' && matchedTutor.name.toLowerCase().includes('queen bee'));
       const resolvedTeacherUid =
         (matchedTutor?.authUid && isValidCanonicalUid(matchedTutor.authUid) ? matchedTutor.authUid.trim() : '') ||
         (matchedTutor?.uid && isValidCanonicalUid(matchedTutor.uid) ? matchedTutor.uid.trim() : '') ||
-        (isSkullBee ? 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1' : '');
+        (isSkullBee ? 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1' : '') ||
+        (isQueenBee ? 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2' : '');
 
       if (!resolvedTeacherUid) {
         alert(

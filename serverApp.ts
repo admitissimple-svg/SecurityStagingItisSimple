@@ -3218,6 +3218,9 @@ app.post('/api/tutors', async (req, res) => {
   if (!canonicalAuthUid && (cleanEmail === 'laviniafofafc@gmail.com' || tutorId === 'skull-bee')) {
     canonicalAuthUid = 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1';
   }
+  if (!canonicalAuthUid && (cleanEmail === 'beeginning4you@gmail.com' || cleanEmail === 'estilobeeforkids@gmail.com' || cleanEmail === 'estilobeeadm@gmail.com' || tutorId === 'queen-bee' || (req.body?.name && typeof req.body.name === 'string' && req.body.name.toLowerCase().includes('queen bee')))) {
+    canonicalAuthUid = 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2';
+  }
 
   // Abort if canonical UID cannot be proven - NEVER manufacture an alternative UID
   if (!canonicalAuthUid) {

@@ -17,6 +17,7 @@ import {
 } from 'lucide-react';
 import { NativeFriendTutor, INITIAL_NATIVE_FRIENDS } from '../data/tutors';
 import { isTutorApproved, isTeacherRole } from '../hooks/useNativeFriends';
+import { consolidateTutorsList, normalizeTutorName } from '../utils/tutorConsolidation';
 import { Language } from '../types';
 import { getTranslations } from '../utils/i18n';
 import { extractYouTubeVideoId } from '../utils/youtube';
@@ -41,8 +42,9 @@ export const FindTutorsSection: React.FC<FindTutorsSectionProps> = ({
   const t = getTranslations(currentLanguage);
   const tutors = useMemo(() => {
     const list = passedTutors && passedTutors.length > 0 ? passedTutors : INITIAL_NATIVE_FRIENDS;
+    const consolidated = consolidateTutorsList(list) as NativeFriendTutor[];
     // Approved Native Friends list for public directory
-    const approvedList = list.filter((t) => {
+    const approvedList = consolidated.filter((t) => {
       return isTutorApproved(t) && isTeacherRole(t);
     });
 
@@ -88,7 +90,7 @@ export const FindTutorsSection: React.FC<FindTutorsSectionProps> = ({
 
   const filteredTutors = useMemo(() => {
     const q = (searchQuery || '').toLowerCase().trim();
-    return (tutors || []).filter((tutor) => {
+    const matched = (tutors || []).filter((tutor) => {
       if (!tutor) return false;
       const matchesSearch = !q || (
         (tutor.name || '').toLowerCase().includes(q) ||
@@ -103,6 +105,17 @@ export const FindTutorsSection: React.FC<FindTutorsSectionProps> = ({
         (Array.isArray(tutor.specialties) && tutor.specialties.includes(selectedSpecialty));
 
       return matchesSearch && matchesCountry && matchesSpecialty;
+    });
+
+    // Strict deduplication safeguard: guarantee each unique Native Friend (e.g. Queen Bee, Skull Bee) appears exactly once
+    const seen = new Set<string>();
+    return matched.filter((tutor) => {
+      const normName = normalizeTutorName(tutor.name);
+      const pubId = (tutor.publicTutorId || tutor.id || '').toLowerCase().trim();
+      const dedupeKey = normName && normName !== 'native friend' ? `name:${normName}` : `id:${pubId}`;
+      if (seen.has(dedupeKey)) return false;
+      seen.add(dedupeKey);
+      return true;
     });
   }, [tutors, searchQuery, selectedCountry, selectedSpecialty]);
 

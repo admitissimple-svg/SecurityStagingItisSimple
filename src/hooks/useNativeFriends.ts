@@ -369,7 +369,8 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
 
   // Filter public tutors for the main landing directory
   const publicTutors = useMemo(() => {
-    return tutors.filter((t) => {
+    const consolidated = consolidateTutorsList(tutors);
+    return consolidated.filter((t) => {
       if (!t) return false;
       const isApproved = isTutorApproved(t);
       const isTeacher = isTeacherRole(t);

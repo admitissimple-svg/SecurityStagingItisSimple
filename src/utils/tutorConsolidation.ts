@@ -89,19 +89,68 @@ export function areSameTutor(a: any, b: any): boolean {
 
   // Reference Case: Skull Bee
   // E-mail: laviniafofafc@gmail.com, UID real: jCkNIhvYEYbyJC2CWGZhFaoHGfo1, ID público: skull-bee
+  const aNameNorm = normalizeTutorName(a.name);
+  const bNameNorm = normalizeTutorName(b.name);
+
   const isSkullBeeA =
     aEmail === 'laviniafofafc@gmail.com' ||
     aPublicId === 'skull-bee' ||
     aAuthUid === 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1' ||
     a.id === 'skull-bee' ||
-    a.id === 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1';
+    a.id === 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1' ||
+    aNameNorm === 'skull bee' ||
+    aNameNorm === 'skullbee';
   const isSkullBeeB =
     bEmail === 'laviniafofafc@gmail.com' ||
     bPublicId === 'skull-bee' ||
     bAuthUid === 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1' ||
     b.id === 'skull-bee' ||
-    b.id === 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1';
+    b.id === 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1' ||
+    bNameNorm === 'skull bee' ||
+    bNameNorm === 'skullbee';
   if (isSkullBeeA && isSkullBeeB) return true;
+
+  // Reference Case: Queen Bee
+  // E-mails: beeginning4you@gmail.com, estilobeeforkids@gmail.com, estilobeeadm@gmail.com
+  // UID oficial do Firebase: Xpmq4l50aUOE0Jh4UTHwGAtw65B2
+  // ID público: queen-bee, Nome: Queen Bee, QueenBee, Teacher Regina
+  const isQueenBeeA =
+    aAuthUid === 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2' ||
+    a.id === 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2' ||
+    aNameNorm === 'queen bee' ||
+    aNameNorm === 'queenbee' ||
+    aNameNorm === 'teacher regina' ||
+    aPublicId === 'queen-bee' ||
+    aPublicId === 'queen_bee' ||
+    a.id === 'queen-bee' ||
+    a.id === 'queen_bee' ||
+    aEmail === 'beeginning4you@gmail.com' ||
+    aEmail === 'estilobeeforkids@gmail.com' ||
+    aEmail === 'estilobeeadm@gmail.com' ||
+    aEmail.includes('estilobee') ||
+    aPublicId.includes('estilobee') ||
+    aPublicId.includes('queen-bee') ||
+    (typeof a.id === 'string' && (a.id.includes('estilobee') || a.id.includes('queen-bee') || a.id.includes('beeginning4you')));
+
+  const isQueenBeeB =
+    bAuthUid === 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2' ||
+    b.id === 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2' ||
+    bNameNorm === 'queen bee' ||
+    bNameNorm === 'queenbee' ||
+    bNameNorm === 'teacher regina' ||
+    bPublicId === 'queen-bee' ||
+    bPublicId === 'queen_bee' ||
+    b.id === 'queen-bee' ||
+    b.id === 'queen_bee' ||
+    bEmail === 'beeginning4you@gmail.com' ||
+    bEmail === 'estilobeeforkids@gmail.com' ||
+    bEmail === 'estilobeeadm@gmail.com' ||
+    bEmail.includes('estilobee') ||
+    bPublicId.includes('estilobee') ||
+    bPublicId.includes('queen-bee') ||
+    (typeof b.id === 'string' && (b.id.includes('estilobee') || b.id.includes('queen-bee') || b.id.includes('beeginning4you')));
+
+  if (isQueenBeeA && isQueenBeeB) return true;
 
   // Cross-match ID to email doc ID
   if (aEmail) {
@@ -122,11 +171,17 @@ export function areSameTutor(a: any, b: any): boolean {
   if (bAuthUid && (aPublicId === bAuthUid.toLowerCase() || a.legacyId === bAuthUid)) return true;
 
   // Distinctive name matching (e.g. "Skull Bee", "Queen Bee", "Charles")
-  const aName = normalizeTutorName(a.name);
-  const bName = normalizeTutorName(b.name);
-  if (aName && bName && aName === bName && aName !== 'native friend' && aName !== 'aluno' && aName !== 'teacher') {
-    // Only match if emails do not explicitly conflict
-    if (!aEmail || !bEmail || aEmail === bEmail) {
+  if (aNameNorm && bNameNorm && aNameNorm === bNameNorm && aNameNorm !== 'native friend' && aNameNorm !== 'aluno' && aNameNorm !== 'teacher') {
+    const isKnownAdminOrAlias =
+      aEmail === 'estilobeeforkids@gmail.com' ||
+      aEmail === 'estilobeeadm@gmail.com' ||
+      aEmail === 'adm.itissimple@gmail.com' ||
+      bEmail === 'estilobeeforkids@gmail.com' ||
+      bEmail === 'estilobeeadm@gmail.com' ||
+      bEmail === 'adm.itissimple@gmail.com';
+
+    // Only match if emails do not explicitly conflict or are known administrative aliases
+    if (!aEmail || !bEmail || aEmail === bEmail || isKnownAdminOrAlias) {
       return true;
     }
   }
@@ -236,11 +291,37 @@ export function mergeTutors(existing: any, incoming: any): CanonicalTutorRecord 
     authUid = 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1';
   }
 
+  const isQueenBeeRecord =
+    normalizeTutorName(existing.name) === 'queen bee' ||
+    normalizeTutorName(incoming.name) === 'queen bee' ||
+    normalizeTutorName(existing.name) === 'queenbee' ||
+    normalizeTutorName(incoming.name) === 'queenbee' ||
+    existing.publicTutorId === 'queen-bee' ||
+    incoming.publicTutorId === 'queen-bee' ||
+    existing.id === 'queen-bee' ||
+    incoming.id === 'queen-bee' ||
+    existing.authUid === 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2' ||
+    incoming.authUid === 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2' ||
+    existing.uid === 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2' ||
+    incoming.uid === 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2' ||
+    existing.id === 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2' ||
+    incoming.id === 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2' ||
+    email === 'beeginning4you@gmail.com' ||
+    email === 'estilobeeforkids@gmail.com' ||
+    email === 'estilobeeadm@gmail.com' ||
+    email.includes('estilobee');
+
+  // Reference case (Queen Bee): Official Firebase Auth UID is strictly Xpmq4l50aUOE0Jh4UTHwGAtw65B2
+  if (isQueenBeeRecord) {
+    authUid = 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2';
+  }
+
   // Prioritize persistent public tutor ID (e.g. 'skull-bee' or 'queen-bee' over synthetic email ids)
   const isPrettyPublicId = (id?: string) =>
     Boolean(id && !id.includes('@') && !id.startsWith('usr-') && !id.startsWith('tutor-') && id.length < 30 && !isValidCanonicalUid(id));
 
   const publicTutorId =
+    (isQueenBeeRecord ? 'queen-bee' : null) ||
     (isPrettyPublicId(existing.publicTutorId) ? existing.publicTutorId : null) ||
     (isPrettyPublicId(incoming.publicTutorId) ? incoming.publicTutorId : null) ||
     (isPrettyPublicId(existing.id) ? existing.id : null) ||
@@ -261,9 +342,11 @@ export function mergeTutors(existing: any, incoming: any): CanonicalTutorRecord 
   const isGenericName = (n?: string) =>
     !n || n.toLowerCase() === 'native friend';
 
-  const finalName = !isGenericName(existing.name)
-    ? existing.name
-    : (!isGenericName(incoming.name) ? incoming.name : (existing.name || incoming.name || 'Native Friend'));
+  const finalName = isQueenBeeRecord
+    ? 'Queen Bee'
+    : (!isGenericName(existing.name)
+        ? existing.name
+        : (!isGenericName(incoming.name) ? incoming.name : (existing.name || incoming.name || 'Native Friend')));
 
   const finalHeadline = !isGenericHeadline(existing.headline)
     ? existing.headline

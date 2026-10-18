@@ -318,6 +318,20 @@ export const LiveLessonScheduleModal: React.FC<LiveLessonScheduleModalProps> = (
       return 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1';
     }
 
+    const isQueenBee =
+      selectedTeacherEmail === 'beeginning4you@gmail.com' ||
+      selectedTeacherEmail === 'estilobeeforkids@gmail.com' ||
+      selectedTeacherEmail === 'estilobeeadm@gmail.com' ||
+      (selectedTeacherObj as any)?.id === 'queen-bee' ||
+      (selectedTeacherObj as any)?.publicTutorId === 'queen-bee' ||
+      matchedTutor?.id === 'queen-bee' ||
+      (matchedTutor as any)?.publicTutorId === 'queen-bee' ||
+      (typeof matchedTutor?.name === 'string' && matchedTutor.name.toLowerCase().includes('queen bee'));
+
+    if (isQueenBee) {
+      return 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2';
+    }
+
     return '';
   }, [selectedTeacherObj, matchedTutor, selectedTeacherEmail]);
 

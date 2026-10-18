@@ -206,6 +206,18 @@ export async function resolveTeacherCanonicalIdentity(
     queryStr === 'skull-bee' ||
     queryStr.toLowerCase() === 'skull bee';
 
+  // Reference Case: Queen Bee
+  // E-mails: beeginning4you@gmail.com, estilobeeforkids@gmail.com, estilobeeadm@gmail.com, UID real: Xpmq4l50aUOE0Jh4UTHwGAtw65B2, ID público: queen-bee
+  const isQueenBee =
+    candidatePublicId === 'queen-bee' ||
+    candidateEmail === 'beeginning4you@gmail.com' ||
+    candidateEmail === 'estilobeeforkids@gmail.com' ||
+    candidateEmail === 'estilobeeadm@gmail.com' ||
+    candidateUid === 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2' ||
+    candidateUid.toLowerCase() === 'xpmq4l50auoe0jh4uthwgatw65b2' ||
+    queryStr === 'queen-bee' ||
+    queryStr.toLowerCase() === 'queen bee';
+
   let adminAuth: any = null;
   try {
     const { getFirebaseAdminAuth } = await import('./serverFirebaseAdmin');
@@ -325,6 +337,11 @@ export async function resolveTeacherCanonicalIdentity(
     resolvedUid = 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1';
   }
 
+  // Reference case (Queen Bee): always resolves to official UID Xpmq4l50aUOE0Jh4UTHwGAtw65B2
+  if (!resolvedUid && isQueenBee) {
+    resolvedUid = 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2';
+  }
+
   if (!resolvedUid || !isValidCanonicalUid(resolvedUid)) {
     return null;
   }
@@ -334,20 +351,22 @@ export async function resolveTeacherCanonicalIdentity(
     consolidated?.isApproved === true ||
     consolidated?.status === 'approved' ||
     consolidated?.approved === true ||
-    (isSkullBee && (consolidated?.approvalStatus !== 'rejected' && consolidated?.status !== 'rejected'))
+    (isSkullBee && (consolidated?.approvalStatus !== 'rejected' && consolidated?.status !== 'rejected')) ||
+    (isQueenBee && (consolidated?.approvalStatus !== 'rejected' && consolidated?.status !== 'rejected'))
   );
 
   const publicTutorId =
     (isSkullBee ? 'skull-bee' : null) ||
+    (isQueenBee ? 'queen-bee' : null) ||
     consolidated?.publicTutorId ||
     candidatePublicId ||
     (email ? `tutor-${email.replace(/[^a-zA-Z0-9]/g, '-')}` : 'tutor');
 
-  const name = consolidated?.name || (isSkullBee ? 'Skull Bee' : 'Native Friend');
+  const name = consolidated?.name || (isSkullBee ? 'Skull Bee' : (isQueenBee ? 'Queen Bee' : 'Native Friend'));
 
   return {
     canonicalUid: resolvedUid,
-    email: email || (isSkullBee ? 'laviniafofafc@gmail.com' : ''),
+    email: email || (isSkullBee ? 'laviniafofafc@gmail.com' : (isQueenBee ? 'beeginning4you@gmail.com' : '')),
     name,
     publicTutorId,
     isApproved,
@@ -410,6 +429,11 @@ export async function saveTutorToFirestore(tutor: any, _legacyDocId?: string): P
   // Reference case (Skull Bee): E-mail laviniafofafc@gmail.com strictly maps to UID real jCkNIhvYEYbyJC2CWGZhFaoHGfo1
   if (!canonicalAuthUid && (cleanEmail === 'laviniafofafc@gmail.com' || tutor.publicTutorId === 'skull-bee' || tutor.id === 'skull-bee')) {
     canonicalAuthUid = 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1';
+  }
+
+  // Reference case (Queen Bee): E-mail beeginning4you@gmail.com strictly maps to official UID real Xpmq4l50aUOE0Jh4UTHwGAtw65B2
+  if (!canonicalAuthUid && (cleanEmail === 'beeginning4you@gmail.com' || cleanEmail === 'estilobeeforkids@gmail.com' || cleanEmail === 'estilobeeadm@gmail.com' || tutor.publicTutorId === 'queen-bee' || tutor.id === 'queen-bee' || (typeof tutor.name === 'string' && tutor.name.toLowerCase().includes('queen bee')))) {
+    canonicalAuthUid = 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2';
   }
 
   // Check existing canonical records in Firestore
