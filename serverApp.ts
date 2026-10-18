@@ -8776,9 +8776,14 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
     } catch {}
   }
 
-  // FASE 4B.8 & 4B.9: If a valid, non-provisional AI-generated transformation exists for this contentHash, REUSE IT!
-  // "Não permitir que forceRegenerate provoque chamadas pagas desnecessárias quando já existir cache válido."
-  if (cached && !cached.isProvisional && cached.contentHash === contentHash && cached.isAiGenerated) {
+  // FASE 4B.8 & 4B.9: If a valid, non-provisional AI-generated transformation exists for this contentHash, REUSE IT,
+  // EXCEPT when the user explicitly triggers forceRegenerate (Refresh Analysis) or when cache contains a legacy pending placeholder!
+  const hasLegacyPendingPlaceholder = Array.isArray(cached?.mistakesAnalysis) && cached.mistakesAnalysis.some((m: any) =>
+    m.isPendingConfirmation === true ||
+    (typeof m.corrected === 'string' && (m.corrected.includes('Pending confirmation') || m.corrected.includes('Pendente de confirmação')))
+  );
+
+  if (!forceRegenerate && !hasLegacyPendingPlaceholder && cached && !cached.isProvisional && cached.contentHash === contentHash && cached.isAiGenerated) {
     // FASE 4B.9: Guarantee single idempotent journal entry for the session without repeated Gemini calls
     recordLessonReviewInStudentJournalServer({
       studentUid: cleanUid,

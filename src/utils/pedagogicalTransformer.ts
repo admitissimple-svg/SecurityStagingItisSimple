@@ -828,7 +828,11 @@ export async function fetchPedagogicalTransformation(params: {
 
         if (cacheRes.ok) {
           const cachedData = await cacheRes.json();
-          if (cachedData && typeof cachedData === 'object' && !Array.isArray(cachedData) && cachedData.sessionKey && cachedData.isAiGenerated && !cachedData.isProvisional) {
+          const hasLegacyPending = Array.isArray(cachedData?.mistakesAnalysis) && cachedData.mistakesAnalysis.some((m: any) =>
+            m.isPendingConfirmation === true ||
+            (typeof m.corrected === 'string' && (m.corrected.includes('Pending confirmation') || m.corrected.includes('Pendente de confirmação')))
+          );
+          if (!hasLegacyPending && cachedData && typeof cachedData === 'object' && !Array.isArray(cachedData) && cachedData.sessionKey && cachedData.isAiGenerated && !cachedData.isProvisional) {
             if (!cachedData.contentHash || cachedData.contentHash === contentHash) {
               return cachedData;
             }
