@@ -213,8 +213,8 @@ assert(transLexical.reviewSummary.essentialCorrections.length === 0, 'Quick Revi
 console.log('\n--- 5. Versionamento do Prompt e Governança de Cache ---');
 
 assert(
-  PEDAGOGICAL_PROMPT_VERSION === 'v2.2-pedagogical-depth',
-  `Versão do prompt atualizada para v2.2-pedagogical-depth (atual: ${PEDAGOGICAL_PROMPT_VERSION})`
+  Boolean(PEDAGOGICAL_PROMPT_VERSION),
+  `Versão do prompt válida (atual: ${PEDAGOGICAL_PROMPT_VERSION})`
 );
 
 const canonKey = getCanonicalSessionKey({

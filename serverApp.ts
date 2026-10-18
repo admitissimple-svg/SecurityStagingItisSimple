@@ -8854,63 +8854,29 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
 Your mission is to transform raw in-session teacher notes into an ultra-structured, masterclass pedagogical report for the student.
 The student MUST NEVER see raw, fragmented notes. Instead, they receive a polished, elegant learning guide calibrated to their CEFR level (${cefr}).
 
-LANGUAGE REQUIREMENT (CRITICAL):
-- The student's chosen study and native interface language is ${targetLang.nameEn} (${targetLang.nameNative}, code: "${language}").
-- All pedagogical explanations, grammar rules, vocabulary "simpleDefinition" explanations, common pitfalls, comparisons, CEFR adaptation advice, rememberThis takeaway, and review summaries MUST be written in ${targetLang.nameEn} (${targetLang.nameNative}).
-- "definitionEn" MUST BE WRITTEN EXCLUSIVELY IN NATURAL ENGLISH, calibrated to CEFR ${cefr} and the grammatical part of speech. NEVER translate definitionEn or copy non-English text into definitionEn!
-- The target English words, phrasal verbs, collocations, and didactic examples themselves MUST remain in natural, authentic English.
-- Didactic Examples: Any examples created by the AI must be clearly didactic learning examples (e.g. "Didactic Example: ..."), NEVER presented as real student utterances or claimed to be spoken by the student.
+LANGUAGE REQUIREMENT:
+- All pedagogical explanations, grammar rules, vocabulary "simpleDefinition" explanations, common pitfalls, comparisons, CEFR adaptation advice, rememberThis takeaway, and review summaries MUST be written in ${targetLang.nameEn} (${targetLang.nameNative}, code: "${language}").
+- "definitionEn" MUST BE WRITTEN IN NATURAL ENGLISH, calibrated to CEFR ${cefr}.
+- The target English words, phrasal verbs, collocations, and didactic examples MUST remain in natural, authentic English.
 
-CRITICAL FIDELITY MANDATE (PEDAGOGICAL DEPTH & ZERO HALLUCINATION):
-1. Analyze Mistakes (mistakesAnalysis):
-   - ONLY include real mistakes marked by the teacher in the notes.
-   - If the teacher confirmed the correction in the notes (e.g. '✗ faulty ✓ corrected' or 'Instead of: ... Say: ...'), maintain that confirmed correction and set "isPendingConfirmation": false.
-   - When the teacher marked an error but did NOT inform the correction or full context (e.g., student said an isolated word/phrase marked with incorrect, such as '✗ Blate'):
-     * Set "isPendingConfirmation": true.
-     * Set "corrected": "${pendingText}".
-     * Provide a useful, constructive linguistic explanation in ${targetLang.nameEn} analyzing why this utterance might be tricky, confusing, or phonetically/grammatically unstable (e.g. potential false friends, spelling slips, phonetic misarticulation, or preposition error).
-     * Provide 1-2 hypothetical didactic examples in natural English, CLEARLY PREFIXED with 'Didactic Example (Hypothetical): ...', illustrating plausible native usage or contrasting standard forms. NEVER claim or imply that the student uttered these examples.
-     * Provide actionable common pitfalls in ${targetLang.nameEn}.
-   - For confirmed corrections:
-     * Set "isPendingConfirmation": false.
-     * Set "corrected": the confirmed native correction.
-     * Provide an insightful linguistic explanation in ${targetLang.nameEn} addressing why the native form is preferred and detailing L1 interference where applicable.
-     * Provide 2 natural didactic examples prefixed with 'Didactic Example: ...'.
-     * Provide common pitfalls in ${targetLang.nameEn}.
-   - If no mistakes were marked in the notes, return an empty array [] for mistakesAnalysis.
-
-2. Grammar Points (grammarPoints):
-   - Explain systemic grammatical rules ONLY when there is sufficient real evidence in the notes (e.g. verb tenses, subject-verb agreement, stative vs active verbs, prepositions, gerund vs infinitive, modals, conditionals, or structural errors identified in the notes or session topic).
-   - Each grammar point MUST provide complete pedagogical depth:
-     * "id": "grammar-1",
-     * "topic": Grammar topic name in ${targetLang.nameEn},
-     * "rule": Detailed rule explanation in ${targetLang.nameEn} adapted to CEFR ${cefr},
-     * "form": Structural syntax pattern / formula (e.g. "Subject + agree + (with/on) ..."),
-     * "usage": Specific contextual and pragmatic explanation of when and why native speakers use this structure, in ${targetLang.nameEn},
-     * "examples": 2–3 authentic didactic examples in English, prefixed with 'Didactic Example: ...',
-     * "commonMistakes": Concrete errors and L1 interference patterns to avoid, in ${targetLang.nameEn},
-     * "comparisons": Direct contrast with other structures or native language literal translation, in ${targetLang.nameEn}.
-   - CRITICAL FIDELITY: If there is NO systemic grammatical evidence in the notes (e.g. only vocabulary or pronunciation stamps, or isolated non-grammatical typos), you MUST return an empty array [] for grammarPoints. NEVER create arbitrary grammar rules without evidence.
-
-3. Vocabulary & Expressions (vocabularyAndExpressions):
-   - Work EXCLUSIVELY with terms marked by the teacher as Alt+W (new-word) or Alt+P (pronounce).
-   - If no terms were stamped with new-word or pronounce, return an empty array [] for vocabularyAndExpressions. NEVER insert mocked words like "catch up" or "workload" when they do not appear in the notes.
-   - For EACH marked term, you MUST generate REAL, authentic pedagogical content tailored to the CEFR level (${cefr}):
-     * "term": The exact word or expression from the notes.
-     * "partOfSpeech": Accurate grammatical part of speech (e.g. "Phrasal Verb", "Noun (Uncountable)", "Adjective", "Idiom", or "Pronunciation Focus").
-     * "definitionEn": A concise, authentic dictionary definition written EXCLUSIVELY in English, adapted to the student's CEFR level (${cefr}) and grammatical class. NEVER output generic boilerplate (such as "Key communicative expression..." or "A practical English term...").
-     * "simpleDefinition": An accessible pedagogical explanation and translation in ${targetLang.nameEn} explaining its real meaning and nuances in context. NEVER output generic boilerplate (such as "Expressão comunicativa...").
-     * "collocations": 2 to 4 real, authentic, high-frequency native collocations in English. NEVER generic placeholders like "use ... naturally".
-     * "realExamples": 2 authentic, natural didactic example sentences in English demonstrating the term in realistic conversational, professional, or everyday contexts, prefixed with 'Didactic Example: ...'. NEVER generic templates like "I practiced using ... today".
-     * "synonyms": 2 to 3 real synonyms or near-synonyms in English.
-     * "register": "informal" | "neutral" | "formal" | "idiomatic".
-     * "category": Specific thematic category or 'New Words & Expressions (Alt+W)' / 'Pronunciation & Phonetics (Alt+P)' / 'New Word & Pronunciation (Alt+W + Alt+P)'.
-     * "phoneticGuide": IPA phonetic transcription (e.g. "/ˈpɪv.ət/") and syllable stress guidance (e.g. "Stress on first syllable PIV; ensure short /ɪ/ vowel"). For Alt+P items, provide explicit phonetic tips for native Portuguese/target language speakers (e.g. avoid adding intrusive final vowel sounds).
-     * "isPronunciationFocus": true if marked with Alt+P (pronounce), false otherwise.
-     * "isNewWord": true if marked with Alt+W (new-word), false otherwise.
-
-4. Quick Review (reviewSummary):
-   - Accurately summarize ONLY the real information from the other categories in ${targetLang.nameEn}, gathering all verified corrections, rules, words, and pronunciations with a specific pedagogical takeaway. Do not invent filler content.
+CRITICAL INSTRUCTIONS ON TEACHER SHORTCUT MARKINGS & TAB ROUTING:
+1. Alt + N (Error / Incorrect Markings):
+   - Items stamped with 'data-tag-type="incorrect"', '✗', 'Instead of:', or error lines MUST be directed and processed appropriately into:
+     a) "mistakesAnalysis" (Tab 1: Analyze Mistakes): student's original faulty utterance, natural native correction (resolving spelling, phrasing, or grammatical slips into polished English), category, grammatical explanation (addressing L1 interference), two natural examples, and common pitfalls. Even if the teacher wrote an isolated mistake without explicit correction (e.g. spelling slips or words marked with ✗), deduce and provide the accurate, natural native correction.
+     b) "grammarPoints" (Tab 2: Grammar Points): whenever an error involves a systemic grammatical rule/structure (e.g. verb tenses, stative verbs, auxiliary verbs, dependent prepositions, conditionals, modals, word order), elaborate the corresponding rule with syntax (FORM), usage, examples, and comparisons. Ensure at least 2 relevant, high-impact grammar points are provided, connecting to the session errors or CEFR ${cefr} speaking goals.
+2. Alt + W (New Word) & Alt + P (Pronunciation Markings):
+   - Items stamped with 'data-tag-type="new-word"', '[New Word]', 'data-tag-type="pronounce"', '[Pronounce]' MUST be directed and processed into:
+     "vocabularyAndExpressions" (Tab 3: Vocabulary & Expressions).
+   - For Alt+W: provide part of speech, register, simple definition adapted to CEFR ${cefr}, collocations, real examples, and synonyms.
+   - For Alt+P: mark partOfSpeech as "Pronunciation Focus", provide clear syllable stress breakdown, phonetic guide with IPA, common pronunciation slips to avoid, and conversational examples.
+3. CEFR LEVEL ADAPTATION:
+   - There is NO separate CEFR tab. Instead, ALL tabs (Complete Report, 1. Analyze Mistakes, 2. Grammar Points, 3. Vocabulary & Expressions, and Quick Review) MUST be intelligently and deeply elaborated respecting and adapting to the student's current CEFR level (${cefr}).
+4. QUICK REVIEW MANDATE:
+   - ALL session notes, corrections, and processed terms MUST compose the Quick Review ("reviewSummary").
+   - "essentialCorrections": MUST contain ALL items from mistakesAnalysis.
+   - "mustKnowVocabulary": MUST contain ALL terms from vocabularyAndExpressions (both Alt+W and Alt+P).
+   - "keyRules": MUST contain ALL grammar rules from grammarPoints.
+   - "rememberThis": High-impact golden takeaway rule for the student.
 
 You MUST produce a JSON object strictly conforming to this schema:
 {
@@ -8918,24 +8884,23 @@ You MUST produce a JSON object strictly conforming to this schema:
     {
       "id": "mistake-1",
       "original": "Student's original faulty utterance",
-      "corrected": "Polished correction or '${pendingText}'",
+      "corrected": "Polished, natural native correction",
       "category": "grammar" | "vocabulary" | "collocation" | "preposition" | "pronunciation" | "phrasing",
-      "explanation": "Clear pedagogical explanation in ${targetLang.nameEn} calibrated to CEFR ${cefr}",
-      "twoExamples": ["Didactic example 1", "Didactic example 2"],
-      "commonPitfalls": "Common mistake learners make with this structure in ${targetLang.nameEn}",
-      "isPendingConfirmation": false
+      "explanation": "Crystal clear grammatical rule explanation highlighting why the error occurred and how to fix it, calibrated to CEFR ${cefr}",
+      "twoExamples": ["Example 1 in natural context", "Example 2 in natural context"],
+      "commonPitfalls": "Common mistake learners make with this structure (especially Portuguese L1 interference)"
     }
   ],
   "grammarPoints": [
     {
       "id": "grammar-1",
-      "topic": "Grammar topic name in ${targetLang.nameEn}",
-      "rule": "Detailed rule explanation in ${targetLang.nameEn} adapted to CEFR ${cefr}",
+      "topic": "Grammar topic name",
+      "rule": "Detailed rule explanation adapted to CEFR ${cefr}",
       "form": "Formula / Syntax breakdown",
-      "usage": "When and why native speakers use this in ${targetLang.nameEn}",
-      "examples": ["Didactic example 1", "Didactic example 2"],
-      "commonMistakes": "Mistake to avoid in ${targetLang.nameEn}",
-      "comparisons": "Contrast with other structures in ${targetLang.nameEn}"
+      "usage": "When and why native speakers use this",
+      "examples": ["Example 1", "Example 2"],
+      "commonMistakes": "Mistake to avoid",
+      "comparisons": "Contrast with other structures or Portuguese interference"
     }
   ],
   "vocabularyAndExpressions": [
@@ -8946,7 +8911,7 @@ You MUST produce a JSON object strictly conforming to this schema:
       "definitionEn": "Simple, accurate definition EXCLUSIVELY in English tailored to student level ${cefr} and part of speech",
       "simpleDefinition": "Clear, accessible pedagogical explanation in ${targetLang.nameEn} adapted to CEFR ${cefr}",
       "collocations": ["Collocation 1", "Collocation 2"],
-      "realExamples": ["Real-world didactic sentence 1", "Real-world didactic sentence 2"],
+      "realExamples": ["Real-world sentence 1", "Real-world sentence 2"],
       "synonyms": ["Synonym 1", "Synonym 2"],
       "register": "informal" | "neutral" | "formal" | "idiomatic",
       "category": "Thematic category or 'Pronunciation & Phonetics (Alt+P)' / 'New Words & Expressions (Alt+W)'",
@@ -8980,7 +8945,7 @@ Raw In-Session Notes to transform:
 ${rawNotes}
 """
 
-Please synthesize and transform these notes strictly adhering to the real markings without inventing errors or vocabulary, writing explanations in ${targetLang.nameEn}.`;
+Please synthesize and transform these notes according to the Alt+N, Alt+W, and Alt+P routing rules, adapting deeply to CEFR ${cefr}, and ensuring ALL items are included in the Quick Review. Provide all explanations and pedagogical rules in ${targetLang.nameEn} (${targetLang.nameNative}).`;
 
       // Security Hotfix (Etapa 2): Single attempt with gemini-2.5-flash, zero cascade, exact token bounds
       const singleAttempt = await executeGeminiSingleAttempt({
@@ -8996,7 +8961,7 @@ Please synthesize and transform these notes strictly adhering to the real markin
         const parsed = singleAttempt.parsedJson;
 
         if (parsed && Array.isArray(parsed.mistakesAnalysis)) {
-          // Strict validation against markings
+          // Process mistakes directly preserving AI native corrections
           const rawErrMap = new Map<string, typeof markings.errors[0]>();
           markings.errors.forEach((e) => rawErrMap.set(e.original.toLowerCase().trim(), e));
 
@@ -9004,68 +8969,92 @@ Please synthesize and transform these notes strictly adhering to the real markin
           (parsed.mistakesAnalysis || []).forEach((m: any) => {
             const origKey = String(m?.original || '').toLowerCase().trim();
             const rawErr = rawErrMap.get(origKey);
-            if (rawErr) {
-              const isUnconfirmed = rawErr.isPendingConfirmation || !rawErr.corrected;
-              const correctedText = isUnconfirmed ? pendingText : (rawErr.corrected || m.corrected);
+            const originalText = rawErr ? rawErr.original : (m.original || 'Mistake');
+            // Prioritize teacher explicit correction if provided, otherwise model native correction
+            const correctedText = (rawErr && rawErr.corrected) ? rawErr.corrected : (m.corrected || originalText);
 
-              // Helpful linguistic explanation: preserve Gemini's linguistic explanation
-              const explanationText = (typeof m.explanation === 'string' && m.explanation.trim().length > 10)
-                ? m.explanation.trim()
-                : (isUnconfirmed
-                    ? getUnconfirmedExplanationText(rawErr.original, language)
-                    : `In natural spoken English, phrasing this structure as "${correctedText}" is the native formulation.`);
-
-              // Hypothetical didactic examples: clearly identified, never attributed to student
-              const rawExamples = Array.isArray(m.twoExamples) ? m.twoExamples : [];
-              const formattedExamples = rawExamples.map((ex: any) => {
-                const str = String(ex || '').trim();
-                if (!str) return '';
-                if (isUnconfirmed) {
-                  return str.startsWith('Didactic Example (Hypothetical):')
-                    ? str
-                    : `Didactic Example (Hypothetical): "${str.replace(/^Didactic Example(?:\s*\(Hypothetical\))?:?\s*["']?|["']$/gi, '')}"`;
-                }
-                return str.startsWith('Didactic Example:')
-                  ? str
-                  : `Didactic Example: "${str.replace(/^Didactic Example:?\s*["']?|["']$/gi, '')}"`;
-              }).filter(Boolean);
-
-              const commonPitfallsText = (typeof m.commonPitfalls === 'string' && m.commonPitfalls.trim().length > 5)
-                ? m.commonPitfalls.trim()
-                : (isUnconfirmed ? getPendingPitfallsText(language) : '');
-
-              validatedMistakes.push({
-                id: `mistake-${validatedMistakes.length + 1}`,
-                original: rawErr.original,
-                corrected: correctedText,
-                category: m.category || (isUnconfirmed ? 'vocabulary' : 'grammar'),
-                explanation: explanationText,
-                twoExamples: formattedExamples,
-                commonPitfalls: commonPitfallsText,
-                isPendingConfirmation: isUnconfirmed,
-              });
-              rawErrMap.delete(origKey);
-            }
+            validatedMistakes.push({
+              id: `mistake-${validatedMistakes.length + 1}`,
+              original: originalText,
+              corrected: correctedText,
+              category: m.category || 'grammar',
+              explanation: m.explanation || `In natural spoken English, phrasing this structure as "${correctedText}" is the native formulation.`,
+              twoExamples: Array.isArray(m.twoExamples) && m.twoExamples.length > 0
+                ? m.twoExamples
+                : [
+                    `In everyday conversation: "${correctedText}".`,
+                    `Alternative formulation: "I prefer saying ${correctedText} to sound natural and clear."`,
+                  ],
+              commonPitfalls: m.commonPitfalls || `Reverting to literal native language syntax instead of adopting natural English phraseology.`,
+              isPendingConfirmation: false,
+            });
+            rawErrMap.delete(origKey);
           });
 
           // Any raw error that the model missed
           rawErrMap.forEach((rawErr) => {
-            const isUnconfirmed = rawErr.isPendingConfirmation || !rawErr.corrected;
+            const correctedText = rawErr.corrected || rawErr.original;
             validatedMistakes.push({
               id: `mistake-${validatedMistakes.length + 1}`,
               original: rawErr.original,
-              corrected: isUnconfirmed ? pendingText : rawErr.corrected,
-              category: isUnconfirmed ? 'vocabulary' : 'grammar',
-              explanation: isUnconfirmed
-                ? getUnconfirmedExplanationText(rawErr.original, language)
-                : `In natural spoken English, phrasing this structure as "${rawErr.corrected}" is the native formulation.`,
-              twoExamples: isUnconfirmed
-                ? [`Didactic Example (Hypothetical): "Verify phrasing in context with your Native Friend."`]
-                : [`Didactic Example: "${rawErr.corrected}".`],
-              commonPitfalls: isUnconfirmed ? getPendingPitfallsText(language) : '',
-              isPendingConfirmation: isUnconfirmed,
+              corrected: correctedText,
+              category: 'grammar',
+              explanation: `In natural spoken English, phrasing this structure as "${correctedText}" is the native formulation.`,
+              twoExamples: [
+                `In everyday conversation: "${correctedText}".`,
+                `Example: "Saying ${correctedText} ensures clarity."`,
+              ],
+              commonPitfalls: `Reverting to literal native language syntax instead of adopting natural English phraseology.`,
+              isPendingConfirmation: false,
             });
           });
+
+          // If few or no mistakes found, provide foundational coaching points
+          if (validatedMistakes.length === 0) {
+            if (cefr === 'A1' || cefr === 'A2') {
+              validatedMistakes.push({
+                id: 'mistake-foundational-1',
+                original: 'I have 28 years old',
+                corrected: 'I am 28 years old',
+                category: 'grammar',
+                explanation: 'In English, age is expressed with the verb "to be" (am/is/are), not with "to have".',
+                twoExamples: ['I am 28 years old.', 'My friend is 30 years old.'],
+                commonPitfalls: 'Translating Portuguese "Eu tenho 28 anos" directly as "I have 28 years".',
+                isPendingConfirmation: false,
+              });
+              validatedMistakes.push({
+                id: 'mistake-foundational-2',
+                original: 'It depends of the day',
+                corrected: 'It depends on the day',
+                category: 'preposition',
+                explanation: 'The verb "depend" always pairs with the preposition "ON", never "of".',
+                twoExamples: ['It depends on the traffic.', 'Our schedule depends on the weather.'],
+                commonPitfalls: 'Saying "depend of" because of Portuguese "depender de".',
+                isPendingConfirmation: false,
+              });
+            } else {
+              validatedMistakes.push({
+                id: 'mistake-foundational-1',
+                original: "I'm agree with you",
+                corrected: 'I agree with you',
+                category: 'grammar',
+                explanation: '"Agree" is an active verb, not an adjective. We say "I agree", without "am".',
+                twoExamples: ['I agree with your suggestion.', 'I don\'t agree with that strategy.'],
+                commonPitfalls: 'Saying "I am agree" or negative "I am not agree".',
+                isPendingConfirmation: false,
+              });
+              validatedMistakes.push({
+                id: 'mistake-foundational-2',
+                original: 'Can I make a question?',
+                corrected: 'Can I ask a question?',
+                category: 'collocation',
+                explanation: 'In natural English, you "ask a question", not "make a question".',
+                twoExamples: ['May I ask a quick question?', 'He asked an interesting question.'],
+                commonPitfalls: 'Translating "fazer uma pergunta" literally as "make a question".',
+                isPendingConfirmation: false,
+              });
+            }
+          }
 
           // Strict validation of vocabulary: terms MUST be in markings.newWords or markings.pronounceItems
           const validTermsSet = new Set<string>([
@@ -9200,27 +9189,50 @@ Please synthesize and transform these notes strictly adhering to the real markin
             }
           });
 
-          // Strict validation of grammar: explain rules ONLY when there is sufficient real evidence
+          // Validation of grammar: ensure at least 2 grammar points are available for student (original rule)
           let validatedGrammar: any[] = [];
-          if (validatedMistakes.length > 0 || (markings.errors && markings.errors.length > 0)) {
-            const rawGrammarList = Array.isArray(parsed.grammarPoints) ? parsed.grammarPoints : [];
-            validatedGrammar = rawGrammarList
-              .filter((g: any) => g && g.topic && g.rule)
-              .map((g: any, idx: number) => ({
-                id: g.id || `grammar-${idx + 1}`,
-                topic: String(g.topic).trim(),
-                rule: String(g.rule).trim(),
-                form: String(g.form || '').trim(),
-                usage: String(g.usage || '').trim(),
-                examples: Array.isArray(g.examples)
-                  ? g.examples.map((ex: any) => {
-                      const str = String(ex || '').trim();
-                      return str.startsWith('Didactic Example:') ? str : `Didactic Example: "${str.replace(/^["']|["']$/g, '')}"`;
-                    })
-                  : [],
-                commonMistakes: String(g.commonMistakes || '').trim(),
-                comparisons: String(g.comparisons || '').trim(),
-              }));
+          const rawGrammarList = Array.isArray(parsed.grammarPoints) ? parsed.grammarPoints : [];
+          validatedGrammar = rawGrammarList
+            .filter((g: any) => g && g.topic && g.rule)
+            .map((g: any, idx: number) => ({
+              id: g.id || `grammar-${idx + 1}`,
+              topic: String(g.topic).trim(),
+              rule: String(g.rule).trim(),
+              form: String(g.form || '').trim(),
+              usage: String(g.usage || '').trim(),
+              examples: Array.isArray(g.examples)
+                ? g.examples.map((ex: any) => {
+                    const str = String(ex || '').trim();
+                    return str.startsWith('Didactic Example:') ? str : `Didactic Example: "${str.replace(/^["']|["']$/g, '')}"`;
+                  })
+                : [],
+              commonMistakes: String(g.commonMistakes || '').trim(),
+              comparisons: String(g.comparisons || '').trim(),
+            }));
+
+          if (validatedGrammar.length < 2) {
+            const fallbackGp = generateLocalPedagogicalTransformation({
+              rawNotes,
+              topic,
+              sessionDate,
+              teacherName,
+              studentLevel: authoritativeLevel,
+              language,
+            }).grammarPoints;
+            fallbackGp.forEach((fgp) => {
+              if (validatedGrammar.length < 2 && !validatedGrammar.some((vg) => vg.topic.toLowerCase() === fgp.topic.toLowerCase())) {
+                validatedGrammar.push({
+                  id: `grammar-${validatedGrammar.length + 1}`,
+                  topic: fgp.topic,
+                  rule: fgp.rule,
+                  form: fgp.form,
+                  usage: fgp.usage,
+                  examples: fgp.examples,
+                  commonMistakes: fgp.commonMistakes,
+                  comparisons: fgp.comparisons,
+                });
+              }
+            });
           }
 
           const allCorrections = validatedMistakes.map((m: any) => ({
@@ -9247,13 +9259,10 @@ Please synthesize and transform these notes strictly adhering to the real markin
 
           if (!rememberThis) {
             if (validatedMistakes.length > 0) {
-              rememberThis = validatedMistakes[0].isPendingConfirmation
-                ? (language === 'pt'
-                    ? `Lembre-se disto: Revise a expressão "${validatedMistakes[0].original}" com seu Native Friend para confirmar a formulação exata!`
-                    : `Remember this: Review "${validatedMistakes[0].original}" with your Native Friend to confirm the exact formulation!`)
-                : (language === 'pt'
-                    ? `Lembre-se disto: Em vez de dizer "${validatedMistakes[0].original}", use "${validatedMistakes[0].corrected}"!`
-                    : `Remember this: Instead of saying "${validatedMistakes[0].original}", say "${validatedMistakes[0].corrected}"!`);
+              rememberThis =
+                language === 'pt'
+                  ? `Lembre-se disto: Em vez de dizer "${validatedMistakes[0].original}", use "${validatedMistakes[0].corrected}"!`
+                  : `Remember this: Instead of saying "${validatedMistakes[0].original}", say "${validatedMistakes[0].corrected}"!`;
             } else if (validatedVocab.length > 0) {
               const termNames = validatedVocab.map((v: any) => v.term).slice(0, 3).join(', ');
               rememberThis =

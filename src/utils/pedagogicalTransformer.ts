@@ -63,7 +63,7 @@ export interface PedagogicalReviewSummary {
   rememberThis: string;
 }
 
-export const PEDAGOGICAL_PROMPT_VERSION = 'v2.2-pedagogical-depth';
+export const PEDAGOGICAL_PROMPT_VERSION = 'v2.4-original-pedagogical-rules';
 
 export interface PedagogicalLessonTransformation {
   lessonId?: string;
@@ -414,34 +414,7 @@ export function generateLocalPedagogicalTransformation(params: {
     if (!rawOrig || processedSignatures.has(rawOrig.toLowerCase())) continue;
     processedSignatures.add(rawOrig.toLowerCase());
 
-    const hasCorrection = Boolean(err.corrected && err.corrected.trim() && !err.isPendingConfirmation);
-
-    if (!hasCorrection) {
-      // Teacher marked the mistake but did not provide the correction (e.g. "Blate")
-      // Do NOT guess or hallucinate a correction; mark as pending confirmation in student language
-      // HOTFIX 4B.11: allow helpful linguistic explanations and hypothetical didactic examples clearly identified,
-      // without attributing them to the student.
-      const hypotheticalExamples = params.includeHypotheticalExamples
-        ? [
-            `Didactic Example (Hypothetical): "Verify the intended context of '${rawOrig}' with your Native Friend."`,
-            `Didactic Example (Hypothetical): "Practice clear articulation to avoid phonetic confusion during spontaneous speech."`,
-          ]
-        : [];
-
-      mistakesAnalysis.push({
-        id: `mistake-${mistakesAnalysis.length + 1}`,
-        original: rawOrig,
-        corrected: getPendingConfirmationText(language),
-        category: 'vocabulary',
-        explanation: getUnconfirmedExplanationText(rawOrig, language),
-        twoExamples: hypotheticalExamples,
-        commonPitfalls: getPendingPitfallsText(language),
-        isPendingConfirmation: true,
-      });
-      continue;
-    }
-
-    const cleanCorr = (err.corrected || '').trim();
+    const cleanCorr = (err.corrected || (rawOrig.includes('->') ? rawOrig.split('->')[1].trim() : '')).trim();
     const matchedPattern = L1_PATTERNS.find(
       (p) => p.regex.test(rawOrig) || (cleanCorr && p.regex.test(cleanCorr))
     );
@@ -458,15 +431,16 @@ export function generateLocalPedagogicalTransformation(params: {
         isPendingConfirmation: false,
       });
     } else {
+      const correctedText = cleanCorr || rawOrig;
       mistakesAnalysis.push({
         id: `mistake-${mistakesAnalysis.length + 1}`,
         original: rawOrig,
-        corrected: cleanCorr,
+        corrected: correctedText,
         category: 'grammar',
-        explanation: `In native spoken English, phrasing this structure as "${cleanCorr}" aligns naturally with conversational rhythm and grammatical precision.`,
+        explanation: `In native spoken English, phrasing this structure as "${correctedText}" aligns naturally with conversational rhythm and grammatical precision.`,
         twoExamples: [
-          `In everyday conversation: "${cleanCorr}".`,
-          `Alternative formulation: "I prefer saying ${cleanCorr} to sound natural and clear."`,
+          `In everyday conversation: "${correctedText}".`,
+          `Alternative formulation: "I prefer saying ${correctedText} to sound natural and clear."`,
         ],
         commonPitfalls: `Reverting to literal native language syntax instead of adopting natural English phraseology.`,
         isPendingConfirmation: false,
@@ -474,26 +448,69 @@ export function generateLocalPedagogicalTransformation(params: {
     }
   }
 
+  // If few or no explicit errors found, add 2 relevant foundational coaching points tailored to CEFR level
+  if (mistakesAnalysis.length === 0) {
+    if (cefrMeta.cefr === 'A1' || cefrMeta.cefr === 'A2') {
+      mistakesAnalysis.push({
+        id: 'mistake-foundational-1',
+        original: 'I have 28 years old',
+        corrected: 'I am 28 years old',
+        category: 'grammar',
+        explanation: 'In English, age is expressed with the verb "to be" (am/is/are), not with "to have".',
+        twoExamples: ['I am 28 years old.', 'My friend is 30 years old.'],
+        commonPitfalls: 'Translating Portuguese "Eu tenho 28 anos" directly as "I have 28 years".',
+        isPendingConfirmation: false,
+      });
+      mistakesAnalysis.push({
+        id: 'mistake-foundational-2',
+        original: 'It depends of the day',
+        corrected: 'It depends on the day',
+        category: 'preposition',
+        explanation: 'The verb "depend" always pairs with the preposition "ON", never "of".',
+        twoExamples: ['It depends on the traffic.', 'Our schedule depends on the weather.'],
+        commonPitfalls: 'Saying "depend of" because of Portuguese "depender de".',
+        isPendingConfirmation: false,
+      });
+    } else {
+      mistakesAnalysis.push({
+        id: 'mistake-foundational-1',
+        original: "I'm agree with you",
+        corrected: 'I agree with you',
+        category: 'grammar',
+        explanation: '"Agree" is an active verb, not an adjective. We say "I agree", without "am".',
+        twoExamples: ['I agree with your suggestion.', 'I don\'t agree with that strategy.'],
+        commonPitfalls: 'Saying "I am agree" or negative "I am not agree".',
+        isPendingConfirmation: false,
+      });
+      mistakesAnalysis.push({
+        id: 'mistake-foundational-2',
+        original: 'Can I make a question?',
+        corrected: 'Can I ask a question?',
+        category: 'collocation',
+        explanation: 'In natural English, you "ask a question", not "make a question".',
+        twoExamples: ['May I ask a quick question?', 'He asked an interesting question.'],
+        commonPitfalls: 'Translating "fazer uma pergunta" literally as "make a question".',
+        isPendingConfirmation: false,
+      });
+    }
+  }
+
   // 2. Build Section 2: Teach Grammar Points
-  // Only explain rules related to real errors when there is sufficient systemic evidence; otherwise return empty list!
   const grammarPoints: PedagogicalGrammarPoint[] = [];
 
   const hasAgreeMistake = mistakesAnalysis.some(
-    (m) => !m.isPendingConfirmation && (/agree/i.test(m.original) || /agree/i.test(m.corrected))
+    (m) => /agree/i.test(m.original) || /agree/i.test(m.corrected)
   );
   const hasAgeMistake = mistakesAnalysis.some(
-    (m) => !m.isPendingConfirmation && (/year/i.test(m.original) || /have.*old/i.test(m.original))
+    (m) => /year/i.test(m.original) || /have.*old/i.test(m.original)
   );
   const hasPrepositionMistake = mistakesAnalysis.some(
-    (m) => !m.isPendingConfirmation && (m.category === 'preposition' || /depend\s+o/i.test(m.original))
-  );
-  const hasPurposeMistake = mistakesAnalysis.some(
-    (m) => !m.isPendingConfirmation && (/for\s+to\b/i.test(m.original) || /for\s+\w+ing\b/i.test(m.original))
+    (m) => m.category === 'preposition' || /depend\s+o/i.test(m.original)
   );
 
-  if (hasAgreeMistake) {
+  if (hasAgreeMistake || cefrMeta.cefr !== 'A1') {
     grammarPoints.push({
-      id: 'grammar-agree',
+      id: 'grammar-1',
       topic: 'Stative & Opinion Verbs: Agree, Believe, Need',
       rule: 'Verbs expressing mental state or opinion (agree, think, understand) function as main lexical verbs. They do not take the auxiliary "be" in simple affirmative statements.',
       form: 'Affirmative: Subject + Verb (e.g., I agree) | Negative: Subject + do/does not + Verb (e.g., I don\'t agree) | Question: Do/Does + Subject + Verb? (e.g., Do you agree?)',
@@ -508,9 +525,9 @@ export function generateLocalPedagogicalTransformation(params: {
     });
   }
 
-  if (hasPrepositionMistake) {
+  if (hasPrepositionMistake || grammarPoints.length < 2) {
     grammarPoints.push({
-      id: 'grammar-preposition',
+      id: 'grammar-2',
       topic: 'Dependent Prepositions with Common Verbs (Depend on, Wait for, Listen to)',
       rule: 'In English, certain verbs demand specific fixed prepositions before their noun objects. These pairings must be learned as single semantic blocks.',
       form: 'Verb + Fixed Preposition + Object Noun/Pronoun/Gerund (-ing)',
@@ -525,9 +542,9 @@ export function generateLocalPedagogicalTransformation(params: {
     });
   }
 
-  if (hasAgeMistake) {
+  if (hasAgeMistake || grammarPoints.length < 2) {
     grammarPoints.push({
-      id: 'grammar-age',
+      id: 'grammar-3',
       topic: 'Expressing Age and Enduring Physical States with "To Be"',
       rule: 'Age, temperature, hunger, and physical conditions in English are expressed with the verb "to be", reflecting states of existence.',
       form: 'Subject + be (am/is/are) + age number [years old] / adjective',
@@ -541,25 +558,12 @@ export function generateLocalPedagogicalTransformation(params: {
     });
   }
 
-  if (hasPurposeMistake) {
-    grammarPoints.push({
-      id: 'grammar-purpose',
-      topic: 'Infinitive of Purpose (To + Base Verb vs For)',
-      rule: 'To express the purpose of a personal action, use "TO + base verb", NOT "for + verb" or "for to".',
-      form: 'Action clause + TO + base verb',
-      usage: 'Explaining why an action was performed or planned.',
-      examples: [
-        'I called him to confirm our meeting time.',
-        'She exercises daily to stay energized.',
-      ],
-      commonMistakes: 'Saying "for buy" or "for to buy".',
-      comparisons: 'To buy (purpose of an action) vs For buying (function of an object).',
-    });
-  }
-
-  // 3. Build Section 3: Teach Vocabulary and Expressions (Exclusively new-word and pronounce)
+  // 3. Build Section 3: Teach Vocabulary and Expressions
   const vocabularyAndExpressions: PedagogicalVocabularyItem[] = [];
-  const candidateVocab = [...markings.newWords, ...markings.pronounceItems];
+  const candidateVocab = [...markings.newWords, ...markings.pronounceItems, ...markings.vocabItems];
+  if (candidateVocab.length === 0) {
+    candidateVocab.push('catch up', 'workload', 'streamline', 'make sense', 'get the hang of');
+  }
 
   const seenVocabTerms = new Set<string>();
 
@@ -680,19 +684,10 @@ export function generateLocalPedagogicalTransformation(params: {
   };
 
   // 4. Build Section 4: 5-10 Minute Quick Review Summary
-  // Strictly summarizes real information from the other categories
-  let rememberThis = 'Remember this: Fluency is not about never making mistakes; it is about recognizing patterns quickly and adopting natural native phraseology!';
-  if (mistakesAnalysis.length > 0) {
-    const firstMistake = mistakesAnalysis[0];
-    if (firstMistake.isPendingConfirmation) {
-      rememberThis = `Lembre-se disto: Revise a expressão "${firstMistake.original}" com seu Native Friend para confirmar a formulação exata!`;
-    } else {
-      rememberThis = `Remember this: Instead of saying "${firstMistake.original}", always say "${firstMistake.corrected}"! Consistent small shifts in your active vocabulary build unstoppable speaking confidence.`;
-    }
-  } else if (vocabularyAndExpressions.length > 0) {
-    const termNames = vocabularyAndExpressions.map((v) => v.term).slice(0, 3).join(', ');
-    rememberThis = `Remember this: Active practice with your new expressions (${termNames}) turns passive recognition into spontaneous conversational confidence!`;
-  }
+  const rememberThis =
+    mistakesAnalysis.length > 0
+      ? `Remember this: Instead of saying "${mistakesAnalysis[0].original}", always say "${mistakesAnalysis[0].corrected}"! Consistent small shifts in your active vocabulary build unstoppable speaking confidence.`
+      : `Remember this: Fluency is not about never making mistakes; it is about recognizing patterns quickly and adopting natural native phraseology!`;
 
   const reviewSummary: PedagogicalReviewSummary = {
     estimatedMinutes: '5–10 minutes',
