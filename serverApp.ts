@@ -103,6 +103,8 @@ import {
   consolidateTutorsList,
   resolveTeacherCanonicalIdentity,
   isValidCanonicalUid,
+  isGenericTutorId,
+  normalizeTutorName,
   scheduleLessonAtomicServer,
   recordDailyReminderShownServer,
   fetchSessionNotesProgressServer,
@@ -2137,13 +2139,40 @@ const handleRegistration = async (req: any, res: any) => {
   let resolvedCanonicalTeacherEmail: string | null = req.body.teacherEmail ? (req.body.teacherEmail as string).toLowerCase().trim() : null;
   let resolvedCanonicalTeacherName: string | null = req.body.teacherName || null;
 
-  const incomingTeacherRef = req.body.teacherUid || req.body.teacherId || req.body.teacherEmail || req.body.selectedTutorId || req.body.selectedTutorEmail;
+  const incomingTeacherRef = req.body.teacherUid || req.body.teacherId || req.body.teacherEmail || req.body.selectedTutorId || req.body.selectedTutorEmail || req.body.teacherName || req.body.selectedTutorName;
   if (incomingTeacherRef) {
+    const isPureGenericTutor =
+      (req.body.teacherId === 'tutor' || req.body.selectedTutorId === 'tutor' || req.body.publicTutorId === 'tutor') &&
+      (!req.body.teacherUid || !isValidCanonicalUid(req.body.teacherUid)) &&
+      (!req.body.teacherEmail || !req.body.teacherEmail.includes('@')) &&
+      (!req.body.selectedTutorEmail || !req.body.selectedTutorEmail.includes('@')) &&
+      (!req.body.teacherName || isGenericTutorId(req.body.teacherName)) &&
+      (!req.body.selectedTutorName || isGenericTutorId(req.body.selectedTutorName));
+
+    if (isPureGenericTutor) {
+      return res.status(400).json({
+        error: 'Identificador de Amigo Nativo genérico ou inválido: o valor "tutor" não é aceito.',
+      });
+    }
+
+    const rawTeacherId = !isGenericTutorId(req.body.teacherId) ? req.body.teacherId : undefined;
+    const rawSelectedTutorId = !isGenericTutorId(req.body.selectedTutorId) ? req.body.selectedTutorId : undefined;
+    const rawPublicTutorId = !isGenericTutorId(req.body.publicTutorId) ? req.body.publicTutorId : undefined;
+    const rawTeacherUid = (req.body.teacherUid && isValidCanonicalUid(req.body.teacherUid)) ? req.body.teacherUid.trim() : undefined;
+    const rawTeacherEmail = (req.body.teacherEmail && !isGenericTutorId(req.body.teacherEmail) && req.body.teacherEmail.includes('@'))
+      ? req.body.teacherEmail
+      : ((req.body.selectedTutorEmail && !isGenericTutorId(req.body.selectedTutorEmail) && req.body.selectedTutorEmail.includes('@')) ? req.body.selectedTutorEmail : undefined);
+    const rawTeacherName = (req.body.teacherName && !isGenericTutorId(req.body.teacherName))
+      ? req.body.teacherName
+      : ((req.body.selectedTutorName && !isGenericTutorId(req.body.selectedTutorName)) ? req.body.selectedTutorName : undefined);
+
     const teacherRes = await resolveTeacherCanonicalIdentity({
-      teacherId: req.body.teacherId || req.body.selectedTutorId || (typeof incomingTeacherRef === 'string' ? incomingTeacherRef : undefined),
-      teacherUid: req.body.teacherUid,
-      teacherEmail: req.body.teacherEmail || req.body.selectedTutorEmail,
-      publicTutorId: req.body.teacherId || req.body.selectedTutorId,
+      teacherId: rawTeacherId || rawSelectedTutorId || rawTeacherUid,
+      teacherUid: rawTeacherUid,
+      teacherEmail: rawTeacherEmail,
+      publicTutorId: rawPublicTutorId || rawTeacherId || rawSelectedTutorId,
+      teacherName: rawTeacherName,
+      selectedTutorName: rawTeacherName,
       dbState: db,
     });
 
@@ -2645,10 +2674,38 @@ app.get('/api/teachers', firebaseAuthMiddleware, requireAdmin, async (req, res) 
  * Preserves ratings, reviews, and teaching counts ONLY when genuinely recorded as numbers (no fake values added).
  */
 function toPublicTutorDto(t: any): Record<string, any> {
-  const publicId = String(t.publicTutorId || t.id || '');
+  const canonicalUid =
+    (t.uid && isValidCanonicalUid(t.uid) ? t.uid.trim() : null) ||
+    (t.authUid && isValidCanonicalUid(t.authUid) ? t.authUid.trim() : null) ||
+    (t.id && isValidCanonicalUid(t.id) ? t.id.trim() : null) ||
+    '';
+
+  const nameSlug = (t.name && typeof t.name === 'string' && !isGenericTutorId(t.name))
+    ? normalizeTutorName(t.name).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+    : '';
+
+  const emailSlug = (t.email && typeof t.email === 'string' && t.email.includes('@'))
+    ? `tutor-${t.email.toLowerCase().trim().replace(/[^a-zA-Z0-9]/g, '-')}`
+    : '';
+
+  let publicSlug = '';
+  if (t.publicTutorId && typeof t.publicTutorId === 'string' && !isGenericTutorId(t.publicTutorId)) {
+    publicSlug = t.publicTutorId.trim();
+  } else if (t.id && typeof t.id === 'string' && !isValidCanonicalUid(t.id) && !isGenericTutorId(t.id)) {
+    publicSlug = t.id.trim();
+  } else if (nameSlug && !isGenericTutorId(nameSlug)) {
+    publicSlug = nameSlug;
+  } else if (emailSlug && !isGenericTutorId(emailSlug)) {
+    publicSlug = emailSlug;
+  }
+
+  const candidatePublicId = publicSlug || canonicalUid || nameSlug || emailSlug;
+  const resolvedPublicId = !isGenericTutorId(candidatePublicId) ? candidatePublicId : (canonicalUid || 'native-friend');
+  const resolvedId = (canonicalUid && isValidCanonicalUid(canonicalUid)) ? canonicalUid : resolvedPublicId;
+
   const dto: Record<string, any> = {
-    id: publicId,
-    publicTutorId: publicId,
+    id: resolvedId,
+    publicTutorId: resolvedPublicId,
     name: String(t.name || ''),
     avatar: String(t.avatar || t.photoUrl || t.picture || ''),
     photoUrl: String(t.avatar || t.photoUrl || t.picture || ''),
@@ -2707,9 +2764,30 @@ function toPublicTutorDto(t: any): Record<string, any> {
  */
 function sanitizePrivateTutorRecord(t: any): Record<string, any> {
   const sanitized = { ...t };
-  const publicId = String(t.publicTutorId || t.id || '');
-  sanitized.id = publicId;
-  sanitized.publicTutorId = publicId;
+  const canonicalUid =
+    (t.uid && isValidCanonicalUid(t.uid) ? t.uid.trim() : null) ||
+    (t.authUid && isValidCanonicalUid(t.authUid) ? t.authUid.trim() : null) ||
+    (t.id && isValidCanonicalUid(t.id) ? t.id.trim() : null) ||
+    '';
+
+  const nameSlug = (t.name && typeof t.name === 'string' && !isGenericTutorId(t.name))
+    ? normalizeTutorName(t.name).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+    : '';
+
+  let publicSlug = '';
+  if (t.publicTutorId && typeof t.publicTutorId === 'string' && !isGenericTutorId(t.publicTutorId)) {
+    publicSlug = t.publicTutorId.trim();
+  } else if (t.id && typeof t.id === 'string' && !isValidCanonicalUid(t.id) && !isGenericTutorId(t.id)) {
+    publicSlug = t.id.trim();
+  } else if (nameSlug && !isGenericTutorId(nameSlug)) {
+    publicSlug = nameSlug;
+  }
+
+  const resolvedPublicId = publicSlug || canonicalUid || '';
+  const resolvedId = (canonicalUid && isValidCanonicalUid(canonicalUid)) ? canonicalUid : resolvedPublicId;
+
+  sanitized.id = resolvedId;
+  sanitized.publicTutorId = resolvedPublicId;
   delete sanitized.password;
   delete sanitized.token;
   delete sanitized.secret;
@@ -2853,7 +2931,7 @@ app.post('/api/tutors', async (req, res) => {
     return res.status(400).json({ error: 'Available days are required: at least one day must be selected' });
   }
   const cleanNameLower = cleanName.toLowerCase();
-  const tutorId = (rawTutor.id && typeof rawTutor.id === 'string' && rawTutor.id.trim())
+  const tutorId = (rawTutor.id && typeof rawTutor.id === 'string' && rawTutor.id.trim() && !isGenericTutorId(rawTutor.id.trim()))
     ? rawTutor.id.trim()
     : `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
 

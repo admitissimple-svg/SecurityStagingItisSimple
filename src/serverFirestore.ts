@@ -120,6 +120,7 @@ import {
   mergeTutors,
   consolidateTutorsList,
   isValidCanonicalUid,
+  isGenericTutorId,
   type CanonicalTutorRecord,
 } from './utils/tutorConsolidation';
 
@@ -129,6 +130,7 @@ export {
   mergeTutors,
   consolidateTutorsList,
   isValidCanonicalUid,
+  isGenericTutorId,
   type CanonicalTutorRecord,
 };
 
@@ -149,7 +151,7 @@ export interface ResolvedTeacherIdentity {
  * Rejects unapproved, non-existent, or unproven tutor identities.
  */
 export async function resolveTeacherCanonicalIdentity(
-  target: string | { teacherId?: string; teacherUid?: string; teacherEmail?: string; publicTutorId?: string; dbState?: any }
+  target: string | { teacherId?: string; teacherUid?: string; teacherEmail?: string; publicTutorId?: string; teacherName?: string; selectedTutorName?: string; name?: string; dbState?: any }
 ): Promise<ResolvedTeacherIdentity | null> {
   const db = getFirestoreDb();
   let queryStr = '';
@@ -157,49 +159,76 @@ export async function resolveTeacherCanonicalIdentity(
   let candidateUid = '';
   let candidatePublicId = '';
 
+  let candidateName = '';
+
   if (typeof target === 'string') {
-    queryStr = target.trim();
-    if (queryStr.includes('@')) {
-      candidateEmail = queryStr.toLowerCase();
-    } else if (isValidCanonicalUid(queryStr)) {
-      candidateUid = queryStr;
-    } else {
-      candidatePublicId = queryStr.toLowerCase();
+    const raw = target.trim();
+    if (!isGenericTutorId(raw)) {
+      queryStr = raw;
+      if (queryStr.includes('@')) {
+        candidateEmail = queryStr.toLowerCase();
+      } else if (isValidCanonicalUid(queryStr)) {
+        candidateUid = queryStr;
+      } else {
+        candidatePublicId = queryStr.toLowerCase();
+        candidateName = normalizeTutorName(queryStr);
+      }
     }
   } else if (target && typeof target === 'object') {
     if (target.teacherEmail) {
       const cleanEm = target.teacherEmail.trim().toLowerCase();
-      if (cleanEm.includes('@')) {
-        if (!candidateEmail) candidateEmail = cleanEm;
-      } else if (isValidCanonicalUid(cleanEm)) {
-        if (!candidateUid) candidateUid = cleanEm;
-      } else if (!candidatePublicId) {
-        candidatePublicId = cleanEm;
+      if (!isGenericTutorId(cleanEm)) {
+        if (cleanEm.includes('@')) {
+          if (!candidateEmail) candidateEmail = cleanEm;
+        } else if (isValidCanonicalUid(cleanEm)) {
+          if (!candidateUid) candidateUid = cleanEm;
+        } else if (!candidatePublicId) {
+          candidatePublicId = cleanEm;
+        }
       }
     }
     if (target.teacherUid) {
       const clean = target.teacherUid.trim();
-      if (clean.includes('@')) {
-        if (!candidateEmail) candidateEmail = clean.toLowerCase();
-      } else if (isValidCanonicalUid(clean)) {
-        if (!candidateUid) candidateUid = clean;
-      } else if (!candidatePublicId) {
-        candidatePublicId = clean.toLowerCase();
+      if (!isGenericTutorId(clean)) {
+        if (clean.includes('@')) {
+          if (!candidateEmail) candidateEmail = clean.toLowerCase();
+        } else if (isValidCanonicalUid(clean)) {
+          if (!candidateUid) candidateUid = clean;
+        } else if (!candidatePublicId) {
+          candidatePublicId = clean.toLowerCase();
+        }
       }
     }
     if (target.teacherId) {
       const clean = target.teacherId.trim();
-      if (clean.includes('@')) {
-        if (!candidateEmail) candidateEmail = clean.toLowerCase();
-      } else if (isValidCanonicalUid(clean)) {
-        if (!candidateUid) candidateUid = clean;
-      } else if (!candidatePublicId) {
-        candidatePublicId = clean.toLowerCase();
+      if (!isGenericTutorId(clean)) {
+        if (clean.includes('@')) {
+          if (!candidateEmail) candidateEmail = clean.toLowerCase();
+        } else if (isValidCanonicalUid(clean)) {
+          if (!candidateUid) candidateUid = clean;
+        } else if (!candidatePublicId) {
+          candidatePublicId = clean.toLowerCase();
+        }
       }
     }
     if (target.publicTutorId && !candidatePublicId) {
-      candidatePublicId = target.publicTutorId.trim().toLowerCase();
+      const clean = target.publicTutorId.trim().toLowerCase();
+      if (!isGenericTutorId(clean)) {
+        candidatePublicId = clean;
+      }
     }
+    const rawName = (target as any).teacherName || (target as any).selectedTutorName || (target as any).name;
+    if (rawName && typeof rawName === 'string') {
+      const norm = normalizeTutorName(rawName);
+      if (!isGenericTutorId(norm)) {
+        candidateName = norm;
+      }
+    }
+  }
+
+  // Reject generic or empty queries immediately
+  if (!candidateEmail && !candidateUid && !candidatePublicId && !candidateName) {
+    return null;
   }
 
   // Reference Case: Skull Bee
@@ -244,12 +273,16 @@ export async function resolveTeacherCanonicalIdentity(
       }
 
       if (candidatePublicId) {
-        const [tPubSnap, tDocSnap] = await Promise.all([
+        const [tPubSnap, uPubSnap, tDocSnap, uDocSnap] = await Promise.all([
           db.collection('tutors').where('publicTutorId', '==', candidatePublicId).get().catch(() => null),
+          db.collection('users').where('publicTutorId', '==', candidatePublicId).get().catch(() => null),
           db.collection('tutors').doc(candidatePublicId).get().catch(() => null),
+          db.collection('users').doc(candidatePublicId).get().catch(() => null),
         ]);
         if (tPubSnap) tPubSnap.forEach((d) => candidateDocs.push({ id: d.id, ...d.data() }));
+        if (uPubSnap) uPubSnap.forEach((d) => candidateDocs.push({ id: d.id, ...d.data() }));
         if (tDocSnap && tDocSnap.exists) candidateDocs.push({ id: tDocSnap.id, ...tDocSnap.data() });
+        if (uDocSnap && uDocSnap.exists) candidateDocs.push({ id: uDocSnap.id, ...uDocSnap.data() });
       }
 
       if (candidateEmail) {
@@ -259,6 +292,20 @@ export async function resolveTeacherCanonicalIdentity(
         ]);
         if (uEmSnap) uEmSnap.forEach((d) => candidateDocs.push({ id: d.id, ...d.data() }));
         if (tEmSnap) tEmSnap.forEach((d) => candidateDocs.push({ id: d.id, ...d.data() }));
+      }
+
+      if (candidateName && candidateDocs.length === 0) {
+        const rawGivenName = String((target as any)?.teacherName || (target as any)?.selectedTutorName || (target as any)?.name || candidateName).trim();
+        const candidateNames = Array.from(new Set([rawGivenName, candidateName].filter(Boolean)));
+        for (const nm of candidateNames) {
+          const [uNameSnap, tNameSnap] = await Promise.all([
+            db.collection('users').where('name', '==', nm).get().catch(() => null),
+            db.collection('tutors').where('name', '==', nm).get().catch(() => null),
+          ]);
+          if (uNameSnap) uNameSnap.forEach((d) => candidateDocs.push({ id: d.id, ...d.data() }));
+          if (tNameSnap) tNameSnap.forEach((d) => candidateDocs.push({ id: d.id, ...d.data() }));
+          if (candidateDocs.length > 0) break;
+        }
       }
     } catch (err) {
       console.warn('[resolveTeacherCanonicalIdentity] Firestore query notice:', err);
@@ -287,10 +334,13 @@ export async function resolveTeacherCanonicalIdentity(
         const itemEmail = (item.email || '').toLowerCase().trim();
         const itemPubId = (item.publicTutorId || item.id || '').toLowerCase().trim();
         const itemUid = (item.uid || item.authUid || '').trim();
+        const itemNameNorm = normalizeTutorName(item.name);
+        const itemSlug = itemNameNorm.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
         const matches =
           (candidateUid && (itemUid === candidateUid || item.id === candidateUid)) ||
-          (candidatePublicId && (itemPubId === candidatePublicId || item.id === candidatePublicId)) ||
-          (candidateEmail && itemEmail === candidateEmail);
+          (candidatePublicId && (itemPubId === candidatePublicId || item.id === candidatePublicId || itemSlug === candidatePublicId)) ||
+          (candidateEmail && itemEmail === candidateEmail) ||
+          (candidateName && !isGenericTutorId(candidateName) && (itemNameNorm === candidateName || itemSlug === candidateName));
         if (matches) {
           candidateDocs.push(item);
         }
@@ -361,14 +411,16 @@ export async function resolveTeacherCanonicalIdentity(
     (isQueenBee && (consolidated?.approvalStatus !== 'rejected' && consolidated?.status !== 'rejected'))
   );
 
+  const name = consolidated?.name || (isSkullBee ? 'Skull Bee' : (isQueenBee ? 'Queen Bee' : 'Native Friend'));
+
   const publicTutorId =
     (isSkullBee ? 'skull-bee' : null) ||
     (isQueenBee ? 'queen-bee' : null) ||
-    consolidated?.publicTutorId ||
-    candidatePublicId ||
-    (email ? `tutor-${email.replace(/[^a-zA-Z0-9]/g, '-')}` : 'tutor');
-
-  const name = consolidated?.name || (isSkullBee ? 'Skull Bee' : (isQueenBee ? 'Queen Bee' : 'Native Friend'));
+    (consolidated?.publicTutorId && !isGenericTutorId(consolidated.publicTutorId) ? consolidated.publicTutorId : null) ||
+    (candidatePublicId && !isGenericTutorId(candidatePublicId) ? candidatePublicId : null) ||
+    (email ? `tutor-${email.replace(/[^a-zA-Z0-9]/g, '-')}` : null) ||
+    (name && !isGenericTutorId(name) ? normalizeTutorName(name).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') : null) ||
+    resolvedUid;
 
   return {
     canonicalUid: resolvedUid,
@@ -419,7 +471,7 @@ export async function saveTutorToFirestore(tutor: any, _legacyDocId?: string): P
           canonicalAuthUid = userRec.uid;
         }
       } catch {
-        canonicalAuthUid = '';
+        // Keep candidate canonicalAuthUid; do not wipe out valid UID if adminAuth fails
       }
     }
     if (!canonicalAuthUid && cleanEmail) {
@@ -497,7 +549,13 @@ export async function saveTutorToFirestore(tutor: any, _legacyDocId?: string): P
     const isApproved = approvalStatus === 'approved' || tutor.isApproved === true || tutor.status === 'approved' || tutor.approved === true;
 
     // Public ID and legacy IDs preserved strictly as metadata inside the document
-    const publicTutorId = tutor.publicTutorId || (tutor.id && !isValidCanonicalUid(tutor.id) ? tutor.id : null) || (cleanEmail === 'laviniafofafc@gmail.com' ? 'skull-bee' : (cleanEmail ? `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : 'tutor'));
+    const publicTutorId =
+      (tutor.publicTutorId && !isGenericTutorId(tutor.publicTutorId) ? tutor.publicTutorId : null) ||
+      (tutor.id && !isValidCanonicalUid(tutor.id) && !isGenericTutorId(tutor.id) ? tutor.id : null) ||
+      (cleanEmail === 'laviniafofafc@gmail.com' ? 'skull-bee' : null) ||
+      (cleanEmail ? `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : null) ||
+      (tutor.name && typeof tutor.name === 'string' && !isGenericTutorId(tutor.name) ? tutor.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') : null) ||
+      canonicalAuthUid;
     const legacyIds = Array.from(new Set([
       ...(Array.isArray(tutor.legacyIds) ? tutor.legacyIds : []),
       (tutor.legacyId && tutor.legacyId !== canonicalAuthUid ? tutor.legacyId : null),
@@ -984,7 +1042,16 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
           (cEmail === 'laviniafofafc@gmail.com' ? 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1' : null);
 
         if (candidateAuthUid) {
-          const publicTutorId = tut.publicTutorId || (tut.id && !isValidCanonicalUid(tut.id) ? tut.id : null) || (cEmail === 'laviniafofafc@gmail.com' ? 'skull-bee' : (cEmail ? `tutor-${cEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : 'tutor'));
+          const nameSlug = tut.name && typeof tut.name === 'string' && !isGenericTutorId(tut.name)
+            ? normalizeTutorName(tut.name).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+            : '';
+          const publicTutorId =
+            (tut.publicTutorId && !isGenericTutorId(tut.publicTutorId) ? tut.publicTutorId : null) ||
+            (tut.id && !isValidCanonicalUid(tut.id) && !isGenericTutorId(tut.id) ? tut.id : null) ||
+            (cEmail === 'laviniafofafc@gmail.com' ? 'skull-bee' : null) ||
+            (cEmail ? `tutor-${cEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : null) ||
+            (nameSlug && !isGenericTutorId(nameSlug) ? nameSlug : null) ||
+            candidateAuthUid;
           const teacherData = {
             ...tut,
             id: candidateAuthUid,

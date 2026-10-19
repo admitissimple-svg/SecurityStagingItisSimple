@@ -88,7 +88,7 @@
       "introVideoUrl": "",
       "youtubeEmbedId": "",
       "availableDays": [],
-      "updatedAt": "2026-10-19T13:56:20.895Z"
+      "updatedAt": "2026-10-19T16:07:47.411Z"
     },
     {
       "id": "cool-tutor",
@@ -143,13 +143,16 @@
       "activeStudents": 0,
       "lessonsTaught": 12,
       "isSuperTutor": false,
+      "assignedStudents": [],
+      "trialBookings": [],
+      "existingLessons": [],
       "approvalStatus": "pending",
       "isApproved": false,
       "status": "pending",
       "approved": false,
       "role": "teacher",
-      "appliedAt": "2026-10-19T13:56:21.533Z",
-      "updatedAt": "2026-10-19T13:56:21.533Z",
+      "appliedAt": "2026-10-19T16:07:47.996Z",
+      "updatedAt": "2026-10-19T16:07:47.996Z",
       "registeredByAdmin": false
     }
   ],
@@ -3540,7 +3543,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 21,
-      "updatedAt": "2026-10-19T13:55:41.938Z",
+      "updatedAt": "2026-10-19T16:01:06.150Z",
       "isPublic": true,
       "videos": [
         {
@@ -3826,7 +3829,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 21,
-      "updatedAt": "2026-10-19T13:55:41.938Z",
+      "updatedAt": "2026-10-19T16:01:06.150Z",
       "isPublic": true,
       "videos": [
         {
@@ -4112,7 +4115,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-19T13:55:41.938Z",
+      "updatedAt": "2026-10-19T16:01:06.150Z",
       "isPublic": true,
       "videos": [
         {
@@ -4502,7 +4505,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 27,
-      "updatedAt": "2026-10-19T13:55:41.938Z",
+      "updatedAt": "2026-10-19T16:01:06.150Z",
       "isPublic": true,
       "videos": [
         {
@@ -4866,7 +4869,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 26,
-      "updatedAt": "2026-10-19T13:55:41.938Z",
+      "updatedAt": "2026-10-19T16:01:06.150Z",
       "isPublic": true,
       "videos": [
         {
@@ -5217,7 +5220,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 21,
-      "updatedAt": "2026-10-19T13:55:41.938Z",
+      "updatedAt": "2026-10-19T16:01:06.150Z",
       "isPublic": true,
       "videos": [
         {
@@ -5503,7 +5506,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 23,
-      "updatedAt": "2026-10-19T13:55:41.938Z",
+      "updatedAt": "2026-10-19T16:01:06.150Z",
       "isPublic": true,
       "videos": [
         {
@@ -5815,7 +5818,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 26,
-      "updatedAt": "2026-10-19T13:55:41.938Z",
+      "updatedAt": "2026-10-19T16:01:06.150Z",
       "isPublic": true,
       "videos": [
         {
@@ -6166,7 +6169,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 28,
-      "updatedAt": "2026-10-19T13:55:41.938Z",
+      "updatedAt": "2026-10-19T16:01:06.150Z",
       "isPublic": true,
       "videos": [
         {
@@ -6543,7 +6546,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-19T13:55:41.938Z",
+      "updatedAt": "2026-10-19T16:01:06.150Z",
       "isPublic": true,
       "videos": [
         {
@@ -6933,7 +6936,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 28,
-      "updatedAt": "2026-10-19T13:55:41.938Z",
+      "updatedAt": "2026-10-19T16:01:06.150Z",
       "isPublic": true,
       "videos": [
         {
@@ -7310,7 +7313,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 30,
-      "updatedAt": "2026-10-19T13:55:41.938Z",
+      "updatedAt": "2026-10-19T16:01:06.150Z",
       "isPublic": true,
       "videos": [
         {
@@ -7713,7 +7716,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-19T13:55:41.938Z",
+      "updatedAt": "2026-10-19T16:01:06.150Z",
       "isPublic": true,
       "videos": [
         {
@@ -8103,7 +8106,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 30,
-      "updatedAt": "2026-10-19T13:55:41.938Z",
+      "updatedAt": "2026-10-19T16:01:06.150Z",
       "isPublic": true,
       "videos": [
         {
@@ -8506,7 +8509,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-19T13:55:41.938Z",
+      "updatedAt": "2026-10-19T16:01:06.150Z",
       "isPublic": true,
       "videos": [
         {
@@ -8896,7 +8899,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 27,
-      "updatedAt": "2026-10-19T13:55:41.938Z",
+      "updatedAt": "2026-10-19T16:01:06.150Z",
       "isPublic": true,
       "videos": [
         {
@@ -9260,7 +9263,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 28,
-      "updatedAt": "2026-10-19T13:55:41.938Z",
+      "updatedAt": "2026-10-19T16:01:06.150Z",
       "isPublic": true,
       "videos": [
         {
@@ -9637,7 +9640,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-19T13:55:41.938Z",
+      "updatedAt": "2026-10-19T16:01:06.150Z",
       "isPublic": true,
       "videos": [
         {

@@ -5,7 +5,7 @@ import { getAllFirestoreDbs, getDb, auth } from '../firebase';
 import { NativeFriendTutor } from '../types';
 import { INITIAL_NATIVE_FRIENDS } from '../data/tutors';
 import { getAdminAccessToken, waitForAuthUser } from '../utils/auth';
-import { consolidateTutorsList } from '../utils/tutorConsolidation';
+import { consolidateTutorsList, isValidCanonicalUid, isGenericTutorId, normalizeTutorName } from '../utils/tutorConsolidation';
 
 export enum OperationType {
   CREATE = 'create',
@@ -91,7 +91,7 @@ export function isTeacherRole(t: any): boolean {
 /**
  * Normalizes a raw Firestore document into a typed NativeFriendTutor.
  */
-function normalizeTutorDoc(docId: string, data: any): NativeFriendTutor | null {
+export function normalizeTutorDoc(docId: string, data: any): NativeFriendTutor | null {
   if (!data) return null;
   const cleanEmail = (data.email || '').toLowerCase().trim();
   const name = (data.name || '').trim();
@@ -102,12 +102,40 @@ function normalizeTutorDoc(docId: string, data: any): NativeFriendTutor | null {
   const isApproved = isTutorApproved(data);
   const approvalStatus = isApproved ? 'approved' : (data.approvalStatus || data.status || 'pending');
 
-  const resolvedId = data.id || docId;
+  const canonicalUid =
+    (data.uid && isValidCanonicalUid(data.uid) ? data.uid.trim() : null) ||
+    (data.authUid && isValidCanonicalUid(data.authUid) ? data.authUid.trim() : null) ||
+    (data.id && isValidCanonicalUid(data.id) ? data.id.trim() : null) ||
+    (docId && isValidCanonicalUid(docId) ? docId.trim() : null) ||
+    undefined;
+
+  const nameSlug = name && !isGenericTutorId(name)
+    ? normalizeTutorName(name).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+    : '';
+
+  const emailSlug = cleanEmail && cleanEmail.includes('@')
+    ? `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`
+    : '';
+
+  const publicTutorId =
+    (data.publicTutorId && !isGenericTutorId(data.publicTutorId) ? data.publicTutorId.trim() : null) ||
+    (data.id && !isValidCanonicalUid(data.id) && !isGenericTutorId(data.id) ? data.id.trim() : null) ||
+    (docId && !isValidCanonicalUid(docId) && !isGenericTutorId(docId) ? docId.trim() : null) ||
+    (nameSlug && !isGenericTutorId(nameSlug) ? nameSlug : null) ||
+    (emailSlug && !isGenericTutorId(emailSlug) ? emailSlug : null) ||
+    canonicalUid ||
+    undefined;
+
+  const rawCandidateId = data.id || docId;
+  const safeIdCandidate = !isGenericTutorId(rawCandidateId) ? rawCandidateId : (publicTutorId || canonicalUid || nameSlug);
+  const resolvedId = canonicalUid || safeIdCandidate || 'native-friend';
   const avatar = data.avatar || data.picture || data.photoUrl || '';
 
   return {
     id: resolvedId,
-    uid: data.uid || resolvedId,
+    uid: canonicalUid || resolvedId,
+    authUid: canonicalUid || undefined,
+    publicTutorId: publicTutorId || (!isValidCanonicalUid(resolvedId) ? resolvedId : undefined),
     name: name || cleanEmail.split('@')[0] || 'Native Friend',
     email: cleanEmail,
     avatar: avatar,

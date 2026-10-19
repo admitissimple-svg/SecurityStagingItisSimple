@@ -146,6 +146,7 @@ import {
 } from './utils/studentPersistence';
 import { buildConsolidatedActiveDictionary } from './utils/studentDictionaryLibrary';
 import { clearDictionaryMemoryCache } from './utils/dictionaryService';
+import { isGenericTutorId, normalizeTutorName } from './utils/tutorConsolidation';
 import { FirestoreSchemaAlertBanner } from './components/FirestoreSchemaAlertBanner';
 import { StudentJournalEntry } from './types';
 import { ManageSubscriptionModal } from './components/ManageSubscriptionModal';
@@ -2270,36 +2271,58 @@ export default function App() {
 
       // 2. Identify selected Native Friend public identity
       const cleanTeacherEmail = (data.selectedTutor?.email || '').toLowerCase().trim();
-      const matchedTutor = tutors.find((t) =>
-        (data.selectedTutor?.id && (t.id === data.selectedTutor.id || t.publicTutorId === data.selectedTutor.id)) ||
-        (cleanTeacherEmail && (t.email || '').toLowerCase().trim() === cleanTeacherEmail)
-      );
+      const selectedTutorIdRaw = data.selectedTutor?.id;
+      const selectedTutorPublicIdRaw = (data.selectedTutor as any)?.publicTutorId;
+      const selectedTutorNameRaw = data.selectedTutor?.name;
+      const selectedTutorUidRaw = data.selectedTutor?.uid || data.selectedTutor?.authUid;
+
+      const matchedTutor = tutors.find((t) => {
+        if (selectedTutorUidRaw && isValidCanonicalUid(selectedTutorUidRaw)) {
+          if (t.uid === selectedTutorUidRaw || t.authUid === selectedTutorUidRaw || t.id === selectedTutorUidRaw) return true;
+        }
+        if (cleanTeacherEmail && cleanTeacherEmail.includes('@')) {
+          if ((t.email || '').toLowerCase().trim() === cleanTeacherEmail) return true;
+        }
+        if (selectedTutorPublicIdRaw && !isGenericTutorId(selectedTutorPublicIdRaw)) {
+          if (t.publicTutorId === selectedTutorPublicIdRaw || t.id === selectedTutorPublicIdRaw) return true;
+        }
+        if (selectedTutorIdRaw && !isGenericTutorId(selectedTutorIdRaw)) {
+          if (t.id === selectedTutorIdRaw || t.publicTutorId === selectedTutorIdRaw) return true;
+        }
+        if (selectedTutorNameRaw && !isGenericTutorId(selectedTutorNameRaw)) {
+          if (normalizeTutorName(t.name) === normalizeTutorName(selectedTutorNameRaw)) return true;
+        }
+        return false;
+      });
 
       const targetTeacherPublicId =
-        data.selectedTutor?.id ||
-        (data.selectedTutor as any)?.publicTutorId ||
-        matchedTutor?.publicTutorId ||
-        matchedTutor?.id ||
+        (selectedTutorPublicIdRaw && !isGenericTutorId(selectedTutorPublicIdRaw) ? selectedTutorPublicIdRaw.trim() : null) ||
+        (matchedTutor?.publicTutorId && !isGenericTutorId(matchedTutor.publicTutorId) ? matchedTutor.publicTutorId.trim() : null) ||
+        (selectedTutorIdRaw && !isGenericTutorId(selectedTutorIdRaw) ? selectedTutorIdRaw.trim() : null) ||
+        (matchedTutor?.id && !isGenericTutorId(matchedTutor.id) ? matchedTutor.id.trim() : null) ||
+        (selectedTutorNameRaw && !isGenericTutorId(selectedTutorNameRaw) ? normalizeTutorName(selectedTutorNameRaw).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') : null) ||
         '';
 
-      const finalTeacherEmail = cleanTeacherEmail || (matchedTutor?.email || '').toLowerCase().trim();
+      const finalTeacherEmail = (cleanTeacherEmail && cleanTeacherEmail.includes('@')) ? cleanTeacherEmail : ((matchedTutor?.email || '').toLowerCase().trim());
       const finalTeacherName = data.selectedTutor?.name || matchedTutor?.name || 'Native Friend';
       const finalTeacherMeetUrl = data.selectedTutor?.meetUrl || (data.selectedTutor as any)?.meetLink || matchedTutor?.meetUrl || '';
 
-      if (!targetTeacherPublicId && !finalTeacherEmail) {
+      // Candidate canonical UID if already verified in client session
+      let canonicalTutorUid =
+        (data.selectedTutor?.authUid && isValidCanonicalUid(data.selectedTutor.authUid) ? data.selectedTutor.authUid.trim() : '') ||
+        (data.selectedTutor?.uid && isValidCanonicalUid(data.selectedTutor.uid) ? data.selectedTutor.uid.trim() : '') ||
+        (data.selectedTutor?.id && isValidCanonicalUid(data.selectedTutor.id) ? data.selectedTutor.id.trim() : '') ||
+        (matchedTutor?.authUid && isValidCanonicalUid(matchedTutor.authUid) ? matchedTutor.authUid.trim() : '') ||
+        (matchedTutor?.uid && isValidCanonicalUid(matchedTutor.uid) ? matchedTutor.uid.trim() : '') ||
+        (matchedTutor?.id && isValidCanonicalUid(matchedTutor.id) ? matchedTutor.id.trim() : '');
+
+      if (!targetTeacherPublicId && !finalTeacherEmail && !canonicalTutorUid) {
         throw new Error(
           currentLanguage === 'en'
             ? 'Please select a valid Native Friend to complete onboarding.'
             : 'Por favor, selecione um Amigo Nativo válido para concluir o onboarding.'
         );
       }
-
-      // Candidate canonical UID if already verified in client session
-      let canonicalTutorUid =
-        (data.selectedTutor?.authUid && isValidCanonicalUid(data.selectedTutor.authUid) ? data.selectedTutor.authUid.trim() : '') ||
-        (data.selectedTutor?.uid && isValidCanonicalUid(data.selectedTutor.uid) ? data.selectedTutor.uid.trim() : '') ||
-        (matchedTutor?.authUid && isValidCanonicalUid(matchedTutor.authUid) ? matchedTutor.authUid.trim() : '') ||
-        (matchedTutor?.uid && isValidCanonicalUid(matchedTutor.uid) ? matchedTutor.uid.trim() : '');
 
       const newStudentAccount: GoogleAccount = {
         uid: studentUid,
@@ -2314,6 +2337,7 @@ export default function App() {
       // 3. Sync with backend API — backend resolves canonical UID, verifies approval and enforces student link
       if (isRegisteringStudent) {
         const idToken = await auth.currentUser?.getIdToken().catch(() => null);
+        const effectiveTeacherId = !isGenericTutorId(targetTeacherPublicId) ? targetTeacherPublicId : (canonicalTutorUid || undefined);
         const signupRes = await fetch('/api/auth/signup', {
           method: 'POST',
           headers: {
@@ -2335,12 +2359,13 @@ export default function App() {
             routineVideoTime: data.routineVideoTime,
             routineAudioTime: data.routineAudioTime,
             dailyPhraseTime: data.dailyPhraseTime,
-            teacherId: targetTeacherPublicId,
-            publicTutorId: targetTeacherPublicId,
-            selectedTutorId: targetTeacherPublicId,
-            teacherEmail: finalTeacherEmail,
+            teacherId: effectiveTeacherId,
+            publicTutorId: effectiveTeacherId,
+            selectedTutorId: effectiveTeacherId,
+            teacherUid: canonicalTutorUid || undefined,
+            teacherEmail: (finalTeacherEmail && finalTeacherEmail.includes('@')) ? finalTeacherEmail : undefined,
             teacherName: finalTeacherName,
-            selectedTutorEmail: finalTeacherEmail,
+            selectedTutorEmail: (finalTeacherEmail && finalTeacherEmail.includes('@')) ? finalTeacherEmail : undefined,
             selectedTutorName: finalTeacherName,
             contractedLessons: 1,
           }),
@@ -2357,6 +2382,7 @@ export default function App() {
       }
 
       // 4. Prepare and persist user profile data with assigned Native Friend and trial lesson balance
+      const effectiveStoredTeacherId = !isGenericTutorId(targetTeacherPublicId) ? targetTeacherPublicId : (canonicalTutorUid || '');
       const updatedProfile: UserProfile = {
         ...createDefaultStudentProfile(newStudentAccount),
         id: studentUid,
@@ -2373,8 +2399,8 @@ export default function App() {
         routineVideoTime: data.routineVideoTime,
         routineAudioTime: data.routineAudioTime,
         dailyPhraseTime: data.dailyPhraseTime,
-        teacherId: targetTeacherPublicId,
-        publicTutorId: targetTeacherPublicId,
+        teacherId: effectiveStoredTeacherId,
+        publicTutorId: effectiveStoredTeacherId,
         teacherEmail: finalTeacherEmail || userProfile.teacherEmail || '',
         teacherName: finalTeacherName || userProfile.teacherName || '',
         teacherMeetUrl: finalTeacherMeetUrl || userProfile.teacherMeetUrl || '',

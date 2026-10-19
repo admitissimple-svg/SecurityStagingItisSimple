@@ -249,6 +249,34 @@ export function isValidCanonicalUid(uid?: string | null): boolean {
 }
 
 /**
+ * Detects whether an identifier or name is a generic placeholder (e.g. 'tutor', 'teacher', 'admin', 'default').
+ * Such values must NEVER be used as canonical teacher identity or valid public tutor slugs.
+ */
+export function isGenericTutorId(id?: string | null): boolean {
+  if (!id || typeof id !== 'string') return true;
+  const clean = id.trim().toLowerCase();
+  return (
+    clean === '' ||
+    clean === 'tutor' ||
+    clean === 'teacher' ||
+    clean === 'admin' ||
+    clean === 'student' ||
+    clean === 'undefined' ||
+    clean === 'null' ||
+    clean === 'unknown' ||
+    clean === 'default' ||
+    clean === 'user_default' ||
+    clean === 'userdefault' ||
+    clean === 'anonymous_student' ||
+    clean === 'native friend' ||
+    clean === 'native_friend' ||
+    clean === 'amigo nativo' ||
+    clean === 'fake' ||
+    clean === 'invalid'
+  );
+}
+
+/**
  * Merges two records for the same Native Friend, strictly preserving approval status,
  * biography, images, availability, pricing, and canonical IDs.
  */
@@ -319,21 +347,47 @@ export function mergeTutors(existing: any, incoming: any): CanonicalTutorRecord 
     authUid = 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2';
   }
 
-  const finalCanonicalUid = resolvedExistingUid || existing.uid || existing.authUid || resolvedIncomingUid || incoming.uid || incoming.authUid;
+  const finalCanonicalUid =
+    resolvedExistingUid ||
+    (existing.uid && !isGenericTutorId(existing.uid) ? existing.uid : null) ||
+    (existing.authUid && !isGenericTutorId(existing.authUid) ? existing.authUid : null) ||
+    resolvedIncomingUid ||
+    (incoming.uid && !isGenericTutorId(incoming.uid) ? incoming.uid : null) ||
+    (incoming.authUid && !isGenericTutorId(incoming.authUid) ? incoming.authUid : null);
 
   // Prioritize persistent public tutor ID (e.g. 'skull-bee' or 'queen-bee' over synthetic email ids)
   const isPrettyPublicId = (id?: string) =>
-    Boolean(id && !id.includes('@') && !id.startsWith('usr-') && !id.startsWith('tutor-') && id.length < 30 && !isValidCanonicalUid(id));
+    Boolean(id && typeof id === 'string' && !isGenericTutorId(id) && !id.includes('@') && !id.startsWith('usr-') && !id.startsWith('tutor-') && id.length < 50 && !isValidCanonicalUid(id));
+
+  const cleanPublicCandidate = (id?: string | null): string | null => {
+    if (!id || typeof id !== 'string') return null;
+    const trimmed = id.trim();
+    if (isGenericTutorId(trimmed)) return null;
+    return trimmed;
+  };
+
+  const generateSlugFromName = (name?: string): string => {
+    const norm = normalizeTutorName(name);
+    if (!norm || isGenericTutorId(norm)) return '';
+    const slug = norm.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    return slug && !isGenericTutorId(slug) ? slug : '';
+  };
+
+  const nameSlug = generateSlugFromName(incoming.name) || generateSlugFromName(existing.name);
+  const emailSlug = email ? `tutor-${email.replace(/[^a-zA-Z0-9]/g, '-')}` : '';
 
   const publicTutorId =
     (isQueenBeeRecord ? 'queen-bee' : null) ||
-    (isPrettyPublicId(existing.publicTutorId) ? existing.publicTutorId : null) ||
-    (isPrettyPublicId(incoming.publicTutorId) ? incoming.publicTutorId : null) ||
-    (isPrettyPublicId(existing.id) ? existing.id : null) ||
-    (isPrettyPublicId(incoming.id) ? incoming.id : null) ||
-    existing.publicTutorId ||
-    incoming.publicTutorId ||
-    (email === 'laviniafofafc@gmail.com' ? 'skull-bee' : (email ? `tutor-${email.replace(/[^a-zA-Z0-9]/g, '-')}` : 'tutor'));
+    cleanPublicCandidate(isPrettyPublicId(existing.publicTutorId) ? existing.publicTutorId : null) ||
+    cleanPublicCandidate(isPrettyPublicId(incoming.publicTutorId) ? incoming.publicTutorId : null) ||
+    cleanPublicCandidate(isPrettyPublicId(existing.id) ? existing.id : null) ||
+    cleanPublicCandidate(isPrettyPublicId(incoming.id) ? incoming.id : null) ||
+    cleanPublicCandidate(existing.publicTutorId) ||
+    cleanPublicCandidate(incoming.publicTutorId) ||
+    (email === 'laviniafofafc@gmail.com' ? 'skull-bee' : null) ||
+    (nameSlug ? nameSlug : null) ||
+    (emailSlug ? emailSlug : null) ||
+    (finalCanonicalUid && isValidCanonicalUid(finalCanonicalUid) ? finalCanonicalUid : undefined);
 
   const legacyIds = Array.from(new Set([
     ...(Array.isArray(existing.legacyIds) ? existing.legacyIds : [existing.legacyId || existing.id]),
@@ -505,13 +559,34 @@ export function mergeTutors(existing: any, incoming: any): CanonicalTutorRecord 
     ? incoming.availableHoursByDay
     : (existing.availableHoursByDay && Object.keys(existing.availableHoursByDay).length > 0 ? existing.availableHoursByDay : finalAvailability);
 
+  const resolvedCanonicalUid = (finalCanonicalUid && isValidCanonicalUid(finalCanonicalUid))
+    ? finalCanonicalUid
+    : (authUid && isValidCanonicalUid(authUid) ? authUid : (existing.uid || existing.authUid || incoming.uid || incoming.authUid || undefined));
+
+  const candidatePublicId =
+    publicTutorId ||
+    (typeof incoming.publicTutorId === 'string' && !isGenericTutorId(incoming.publicTutorId) ? incoming.publicTutorId.trim() : undefined) ||
+    (typeof existing.publicTutorId === 'string' && !isGenericTutorId(existing.publicTutorId) ? existing.publicTutorId.trim() : undefined) ||
+    (typeof incoming.id === 'string' && !isGenericTutorId(incoming.id) && !isValidCanonicalUid(incoming.id) ? incoming.id.trim() : undefined) ||
+    (typeof existing.id === 'string' && !isGenericTutorId(existing.id) && !isValidCanonicalUid(existing.id) ? existing.id.trim() : undefined) ||
+    (nameSlug && !isGenericTutorId(nameSlug) ? nameSlug : undefined) ||
+    (emailSlug && !isGenericTutorId(emailSlug) ? emailSlug : undefined) ||
+    resolvedCanonicalUid ||
+    '';
+
+  const safePublicId = !isGenericTutorId(candidatePublicId)
+    ? candidatePublicId
+    : (nameSlug || (emailSlug && !isGenericTutorId(emailSlug) ? emailSlug : '') || resolvedCanonicalUid || '');
+
+  const resolvedId = resolvedCanonicalUid || safePublicId || 'native-friend';
+
   return {
     ...existing,
     ...incoming,
-    id: publicTutorId,
-    publicTutorId,
-    authUid: authUid || finalCanonicalUid || undefined,
-    uid: finalCanonicalUid || authUid || undefined,
+    id: resolvedId,
+    publicTutorId: safePublicId || resolvedId,
+    authUid: resolvedCanonicalUid || existing.authUid || undefined,
+    uid: resolvedCanonicalUid || existing.uid || undefined,
     legacyId: legacyIds[0] || existing.legacyId || incoming.legacyId,
     legacyIds,
     email: email || undefined,

@@ -41,8 +41,7 @@ import {
 } from '../types';
 import { firebaseSignUpWithEmail, firebaseSignInWithEmail, googleSignIn } from '../utils/auth';
 import { auth } from '../firebase';
-import { isValidCanonicalUid } from '../utils/studentPersistence';
-import { consolidateTutorsList } from '../utils/tutorConsolidation';
+import { consolidateTutorsList, isGenericTutorId, normalizeTutorName, isValidCanonicalUid } from '../utils/tutorConsolidation';
 
 export interface OnboardingResultData {
   learningGoal: string;
@@ -72,6 +71,7 @@ export interface OnboardingWizardModalProps {
   currentAccount?: GoogleAccount | null;
   initialEmail?: string;
   initialStep?: number;
+  initialTutorId?: string;
   hasCompletedTrialLesson?: boolean;
   onEmailAlreadyExists?: (email: string) => void;
   onCompleteOnboarding: (onboardingData: OnboardingResultData) => void | Promise<void>;
@@ -262,6 +262,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
   currentAccount,
   initialEmail,
   initialStep,
+  initialTutorId,
   hasCompletedTrialLesson,
   onEmailAlreadyExists,
   onCompleteOnboarding,
@@ -312,9 +313,18 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
     const consolidated = consolidateTutorsList(tutorsList || []);
     return consolidated.filter((t) => (t.approvalStatus || 'approved') === 'approved') as NativeFriendTutor[];
   }, [tutorsList]);
-  const [selectedTutorId, setSelectedTutorId] = useState<string>(
-    approvedTutors[0]?.id || approvedTutors[0]?.publicTutorId || approvedTutors[0]?.email || ''
-  );
+  const [selectedTutorId, setSelectedTutorId] = useState<string>(() => {
+    if (initialTutorId && !isGenericTutorId(initialTutorId)) {
+      return initialTutorId.trim();
+    }
+    const first = approvedTutors[0];
+    if (!first) return '';
+    const firstCanonicalUid = (first.uid && isValidCanonicalUid(first.uid) ? first.uid.trim() : null) ||
+      (first.id && isValidCanonicalUid(first.id) ? first.id.trim() : null);
+    const validPublicSlug = (first.publicTutorId && !isGenericTutorId(first.publicTutorId) ? first.publicTutorId.trim() : null) ||
+      (first.id && !isGenericTutorId(first.id) ? first.id.trim() : null);
+    return firstCanonicalUid || validPublicSlug || first.email || '';
+  });
   const [previewTutorModal, setPreviewTutorModal] = useState<NativeFriendTutor | null>(null);
 
   // Support ESC key to close preview tutor modal or main wizard modal
@@ -393,22 +403,28 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
             setDailyPhraseTime(currentUserProfile.dailyPhraseTime);
           }
           const teacherTarget = (
-            currentUserProfile.teacherEmail ||
-            currentUserProfile.teacherId ||
-            (currentUserProfile as any).publicTutorId ||
-            currentUserProfile.teacherUid ||
+            currentUserProfile?.teacherUid ||
+            currentUserProfile?.teacherId ||
+            (currentUserProfile as any)?.publicTutorId ||
+            currentUserProfile?.teacherEmail ||
             ''
           ).toLowerCase().trim();
-          if (teacherTarget) {
-            const matchTutor = tutorsList.find(
+          const initialTarget = (initialTutorId || teacherTarget || '').toLowerCase().trim();
+          if (initialTarget && !isGenericTutorId(initialTarget)) {
+            const matchTutor = approvedTutors.find(
               (t) =>
-                (t?.email || '').toLowerCase().trim() === teacherTarget ||
-                (t?.id || '').toLowerCase().trim() === teacherTarget ||
-                (t?.publicTutorId || '').toLowerCase().trim() === teacherTarget ||
-                (t?.uid || '').toLowerCase().trim() === teacherTarget
+                (t?.id && t.id.toLowerCase() === initialTarget) ||
+                (t?.uid && t.uid.toLowerCase() === initialTarget) ||
+                (t?.authUid && t.authUid.toLowerCase() === initialTarget) ||
+                (t?.publicTutorId && t.publicTutorId.toLowerCase() === initialTarget) ||
+                (t?.email && t.email.toLowerCase() === initialTarget) ||
+                (t?.name && normalizeTutorName(t.name) === initialTarget)
             );
             if (matchTutor) {
-              setSelectedTutorId(matchTutor.id || matchTutor.publicTutorId || matchTutor.email);
+              const canonicalUid =
+                (matchTutor.uid && isValidCanonicalUid(matchTutor.uid) ? matchTutor.uid : null) ||
+                (matchTutor.id && isValidCanonicalUid(matchTutor.id) ? matchTutor.id : null);
+              setSelectedTutorId(canonicalUid || matchTutor.publicTutorId || matchTutor.id);
             }
           }
         }
@@ -423,13 +439,23 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
       setIsClosing(false);
       setIsSubmitting(false);
     }
-  }, [isOpen, currentUserProfile, currentAccount, tutorsList]);
+  }, [isOpen, currentUserProfile, currentAccount, tutorsList, initialTutorId]);
 
   if (!isOpen || isClosing) return null;
 
-  // Selected tutor object
+  // Selected tutor object: never accepts generic 'tutor'
   const selectedTutor =
-    approvedTutors.find((t) => t.id === selectedTutorId || t.publicTutorId === selectedTutorId || t.email === selectedTutorId) ||
+    approvedTutors.find((t) => {
+      if (!selectedTutorId || isGenericTutorId(selectedTutorId)) return false;
+      return (
+        (!isGenericTutorId(t.id) && t.id === selectedTutorId) ||
+        (!isGenericTutorId(t.publicTutorId) && t.publicTutorId === selectedTutorId) ||
+        (t.uid && isValidCanonicalUid(t.uid) && t.uid === selectedTutorId) ||
+        (t.authUid && isValidCanonicalUid(t.authUid) && t.authUid === selectedTutorId) ||
+        (t.email && !isGenericTutorId(t.email) && t.email.toLowerCase() === selectedTutorId.toLowerCase()) ||
+        (t.name && normalizeTutorName(t.name) === normalizeTutorName(selectedTutorId))
+      );
+    }) ||
     approvedTutors[0];
 
   // Frequency preset handlers
@@ -595,6 +621,26 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
         return;
       }
 
+      const safeCanonicalUid =
+        (selectedTutor?.uid && isValidCanonicalUid(selectedTutor.uid) ? selectedTutor.uid.trim() : null) ||
+        (selectedTutor?.authUid && isValidCanonicalUid(selectedTutor.authUid) ? selectedTutor.authUid.trim() : null) ||
+        (selectedTutor?.id && isValidCanonicalUid(selectedTutor.id) ? selectedTutor.id.trim() : null);
+
+      const safePublicId =
+        (selectedTutor?.publicTutorId && !isGenericTutorId(selectedTutor.publicTutorId) ? selectedTutor.publicTutorId.trim() : null) ||
+        (selectedTutor?.id && !isValidCanonicalUid(selectedTutor.id) && !isGenericTutorId(selectedTutor.id) ? selectedTutor.id.trim() : null) ||
+        (selectedTutor?.name && !isGenericTutorId(selectedTutor.name) ? normalizeTutorName(selectedTutor.name).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') : null) ||
+        safeCanonicalUid ||
+        '';
+
+      const sanitizedSelectedTutor: NativeFriendTutor = {
+        ...selectedTutor,
+        id: safeCanonicalUid || safePublicId || selectedTutor?.id || 'native-friend',
+        publicTutorId: safePublicId || safeCanonicalUid || undefined,
+        uid: safeCanonicalUid || undefined,
+        authUid: safeCanonicalUid || undefined,
+      };
+
       await onCompleteOnboarding({
         learningGoal: getFinalLearningGoal(),
         level: studentLevel,
@@ -605,7 +651,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
         routineVideoTime,
         routineAudioTime,
         dailyPhraseTime,
-        selectedTutor,
+        selectedTutor: sanitizedSelectedTutor,
         studentAccount: {
           name: studentName.trim() || currentAccount?.name || '',
           email: cleanEmail,
@@ -1112,12 +1158,35 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
               {/* Tutors Cards Grid */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-80 overflow-y-auto pr-1">
                 {approvedTutors.map((tutor) => {
-                  const tutorIdentifier = tutor.publicTutorId || tutor.id || tutor.email;
-                  const isSelected = selectedTutorId === tutor.id || selectedTutorId === tutor.publicTutorId || selectedTutorId === tutor.email;
+                  const canonicalUid =
+                    (tutor.uid && isValidCanonicalUid(tutor.uid) ? tutor.uid.trim() : null) ||
+                    (tutor.authUid && isValidCanonicalUid(tutor.authUid) ? tutor.authUid.trim() : null) ||
+                    (tutor.id && isValidCanonicalUid(tutor.id) ? tutor.id.trim() : null);
+                  const validPublicSlug =
+                    (tutor.publicTutorId && !isGenericTutorId(tutor.publicTutorId) ? tutor.publicTutorId.trim() : null) ||
+                    (tutor.id && !isValidCanonicalUid(tutor.id) && !isGenericTutorId(tutor.id) ? tutor.id.trim() : null) ||
+                    (tutor.name && !isGenericTutorId(tutor.name) ? normalizeTutorName(tutor.name).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') : null);
+                  const tutorIdentifier =
+                    canonicalUid ||
+                    (validPublicSlug && !isGenericTutorId(validPublicSlug) ? validPublicSlug : null) ||
+                    (tutor.email && !isGenericTutorId(tutor.email) && tutor.email.includes('@') ? tutor.email.trim() : null) ||
+                    (tutor.name && !isGenericTutorId(tutor.name) ? tutor.name.trim() : '');
+                  const domKey = validPublicSlug || canonicalUid || (!isGenericTutorId(tutor.id) ? tutor.id : '') || tutor.name;
+                  const isSelected = Boolean(
+                    selectedTutor && (
+                      (canonicalUid && (selectedTutor.uid === canonicalUid || selectedTutor.authUid === canonicalUid || selectedTutor.id === canonicalUid)) ||
+                      (validPublicSlug && (selectedTutor.publicTutorId === validPublicSlug || selectedTutor.id === validPublicSlug)) ||
+                      (tutor.email && selectedTutor.email === tutor.email) ||
+                      (selectedTutor.name && normalizeTutorName(selectedTutor.name) === normalizeTutorName(tutor.name)) ||
+                      (tutorIdentifier && selectedTutorId === tutorIdentifier) ||
+                      (!isGenericTutorId(tutor.id) && selectedTutorId === tutor.id) ||
+                      (!isGenericTutorId(tutor.publicTutorId) && selectedTutorId === tutor.publicTutorId)
+                    )
+                  );
                   return (
                     <div
-                      key={tutorIdentifier}
-                      id={`onboarding-tutor-${tutorIdentifier}`}
+                      key={domKey}
+                      id={`onboarding-tutor-${domKey}`}
                       onClick={() => setSelectedTutorId(tutorIdentifier)}
                       className={`p-3.5 rounded-2xl border text-left transition cursor-pointer flex flex-col justify-between gap-2.5 relative ${
                         isSelected
