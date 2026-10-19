@@ -460,38 +460,12 @@ export const PURGED_OBSOLETE_STUDENTS = [
 const DEFAULT_TUTORS_LIST: any[] = [];
 
 const DEFAULT_DB: AppDb = {
-  teachers: [
-    {
-      email: 'adm.itissimple@gmail.com',
-      name: "Admin It's Simple",
-      role: 'admin',
-      registeredByAdmin: true,
-    },
-  ],
+  teachers: [],
   tutorsList: [],
   deletedTutorIds: [],
   deletedTutorEmails: [],
   deletedStudentEmails: PURGED_OBSOLETE_STUDENTS,
-  students: [
-    {
-      id: 'student_lala_canonical_uid',
-      studentUid: 'student_lala_canonical_uid',
-      uid: 'student_lala_canonical_uid',
-      name: 'Lavinia',
-      studentName: 'Lavinia',
-      email: 'laviniatilapiafc@gmail.com',
-      studentEmail: 'laviniatilapiafc@gmail.com',
-      level: 'iniciante',
-      studentLevel: 'iniciante',
-      goal: 'English for everyday life & work',
-      learningGoal: 'English for everyday life & work',
-      contractedLessons: 5,
-      completedLessonsCount: 0,
-      status: 'active',
-      activeSince: '2026-10-01',
-      createdAt: '2026-10-01T00:00:00.000Z',
-    },
-  ],
+  students: [],
   meetSettings: {},
   teacherSettings: {},
   liveLessons: [],
@@ -499,34 +473,7 @@ const DEFAULT_DB: AppDb = {
   routinesByDay: defaultRoutinesByDay,
   studentRoutinesMap: {},
   contractedLessons: {},
-  userProfiles: {
-    'adm.itissimple@gmail.com': {
-      uid: 'admin-master-uid',
-      email: 'adm.itissimple@gmail.com',
-      name: "Admin It's Simple",
-      role: 'admin',
-    },
-    'laviniatilapiafc@gmail.com': {
-      uid: 'student_lala_canonical_uid',
-      id: 'student_lala_canonical_uid',
-      email: 'laviniatilapiafc@gmail.com',
-      name: 'Lavinia',
-      role: 'student',
-      level: 'iniciante',
-      enrollmentStatus: 'active',
-      learningGoal: 'English for everyday life & work',
-      weeklyStudyDaysTarget: 7,
-      weeklyStudyDays: ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'],
-      streakDays: 0,
-      streakCount: 0,
-      points: 0,
-      dailyGoalMinutes: 30,
-      completedTodayMinutes: 0,
-      contractedLessons: 5,
-      completedLessonsCount: 0,
-      createdAt: '2026-10-01T00:00:00.000Z',
-    },
-  },
+  userProfiles: {},
   emailLogs: [],
   weeklyHomework: null,
   studentHomeworkMap: {},
@@ -549,26 +496,52 @@ const DEFAULT_DB: AppDb = {
   sessionNotesMap: {},
   sessionNotesProgressMap: {},
   pedagogicalTransformationsMap: {},
-  authUsers: {
-    'adm.itissimple@gmail.com': {
-      uid: 'admin-master-uid',
-      email: 'adm.itissimple@gmail.com',
-      name: "Admin It's Simple",
-      role: 'admin',
-    },
-    'laviniatilapiafc@gmail.com': {
-      uid: 'student_lala_canonical_uid',
-      email: 'laviniatilapiafc@gmail.com',
-      name: 'Lavinia',
-      role: 'student',
-      createdAt: '2026-10-01T00:00:00.000Z',
-    },
-  },
+  authUsers: {},
   youtubePlaylists: DEFAULT_CURATED_PLAYLISTS,
 };
 
 // In-memory runtime state hydrated exclusively from Cloud Firestore
 let inMemoryDb: AppDb = DEFAULT_DB;
+
+/**
+ * Merges user profile records ensuring authentic canonical Firebase UIDs are never overwritten by placeholders
+ */
+export function mergeProfilePreservingCanonicalUid(existing: any, incoming: any): any {
+  if (!existing) return incoming;
+  if (!incoming) return existing;
+  const merged = { ...existing, ...incoming };
+  const existingUid = existing.uid || existing.id;
+  const incomingUid = incoming.uid || incoming.id;
+  if (isValidCanonicalUid(existingUid) && !isValidCanonicalUid(incomingUid)) {
+    merged.uid = existingUid;
+    merged.id = existingUid;
+  } else if (isValidCanonicalUid(incomingUid)) {
+    merged.uid = incomingUid;
+    merged.id = incomingUid;
+  }
+  return merged;
+}
+
+/**
+ * Merges student records ensuring authentic canonical Firebase UIDs are never overwritten by placeholders
+ */
+export function mergeStudentPreservingCanonicalUid(existing: any, incoming: any): any {
+  if (!existing) return incoming;
+  if (!incoming) return existing;
+  const merged = { ...existing, ...incoming };
+  const existingUid = existing.uid || existing.studentUid || existing.id;
+  const incomingUid = incoming.uid || incoming.studentUid || incoming.id;
+  if (isValidCanonicalUid(existingUid) && !isValidCanonicalUid(incomingUid)) {
+    merged.uid = existingUid;
+    merged.studentUid = existingUid;
+    merged.id = existingUid;
+  } else if (isValidCanonicalUid(incomingUid)) {
+    merged.uid = incomingUid;
+    merged.studentUid = incomingUid;
+    merged.id = incomingUid;
+  }
+  return merged;
+}
 
 /**
  * Returns the default standard Spotify track for a given day and level from the official curriculum
@@ -819,17 +792,50 @@ function loadFromDisk(): AppDb | null {
 if (!isDiagnosticMode()) {
   const initialDiskDb = loadFromDisk();
   if (initialDiskDb) {
+    // Sanitize fabricated placeholder UIDs during disk load so they never taint runtime memory
+    const diskAuthUsers = { ...(initialDiskDb.authUsers || {}) };
+    const diskUserProfiles = { ...(initialDiskDb.userProfiles || {}) };
+    const diskTeachers = [...(initialDiskDb.teachers || [])];
+    const diskStudents = [...(initialDiskDb.students || [])];
+
+    for (const [em, u] of Object.entries(diskAuthUsers)) {
+      if ((u as any)?.uid === 'admin-master-uid' || (u as any)?.uid === 'student_lala_canonical_uid') {
+        delete diskAuthUsers[em];
+      }
+    }
+    for (const [em, p] of Object.entries(diskUserProfiles)) {
+      if ((p as any)?.uid === 'admin-master-uid' || (p as any)?.uid === 'student_lala_canonical_uid') {
+        delete (p as any).uid;
+        delete (p as any).id;
+      }
+      if ((p as any)?.teacherUid === 'admin-master-uid') {
+        delete (p as any).teacherUid;
+      }
+    }
+    for (const s of diskStudents) {
+      if (s.uid === 'student_lala_canonical_uid' || s.id === 'student_lala_canonical_uid' || s.studentUid === 'student_lala_canonical_uid') {
+        delete s.uid;
+        delete s.id;
+        delete s.studentUid;
+      }
+      if (s.teacherUid === 'admin-master-uid') {
+        delete s.teacherUid;
+      }
+    }
+    for (const t of diskTeachers) {
+      if (t.uid === 'admin-master-uid' || t.id === 'admin-master-uid') {
+        delete t.uid;
+        delete t.id;
+      }
+    }
+
     inMemoryDb = {
       ...DEFAULT_DB,
       ...initialDiskDb,
-      authUsers: { ...DEFAULT_DB.authUsers, ...(initialDiskDb.authUsers || {}) },
-      userProfiles: { ...DEFAULT_DB.userProfiles, ...(initialDiskDb.userProfiles || {}) },
-      students: [
-        ...DEFAULT_DB.students.filter(
-          (defS) => !(initialDiskDb.students || []).some((s: any) => (s.email || '').toLowerCase() === (defS.email || '').toLowerCase())
-        ),
-        ...(initialDiskDb.students || []),
-      ],
+      teachers: diskTeachers,
+      authUsers: diskAuthUsers,
+      userProfiles: diskUserProfiles,
+      students: diskStudents,
     };
   } else {
     saveToDiskSync(inMemoryDb);
@@ -895,14 +901,49 @@ async function initCloudPersistence() {
     const cloudState = await fetchAppStateFromFirestore();
     if (cloudState && typeof cloudState === 'object') {
       console.log('Successfully hydrated database from Firebase Firestore cloud');
-      const mergedAuthUsers = {
+      // Sanitize placeholder UIDs in cloudState before merging
+      if (cloudState.authUsers) {
+        for (const [em, u] of Object.entries(cloudState.authUsers)) {
+          if ((u as any)?.uid === 'admin-master-uid' || (u as any)?.uid === 'student_lala_canonical_uid') {
+            delete (u as any).uid;
+          }
+        }
+      }
+      if (cloudState.userProfiles) {
+        for (const [em, p] of Object.entries(cloudState.userProfiles)) {
+          if ((p as any)?.uid === 'admin-master-uid' || (p as any)?.uid === 'student_lala_canonical_uid') {
+            delete (p as any).uid;
+            delete (p as any).id;
+          }
+          if ((p as any)?.teacherUid === 'admin-master-uid') {
+            delete (p as any).teacherUid;
+          }
+        }
+      }
+
+      // Merge user profiles preserving canonical UIDs
+      const mergedUserProfiles: Record<string, any> = {};
+      const allProfileKeys = new Set([
+        ...Object.keys(inMemoryDb.userProfiles || {}),
+        ...Object.keys(cloudState.userProfiles || {}),
+      ]);
+      allProfileKeys.forEach((key) => {
+        mergedUserProfiles[key] = mergeProfilePreservingCanonicalUid(
+          inMemoryDb.userProfiles?.[key],
+          cloudState.userProfiles?.[key]
+        );
+      });
+
+      const mergedAuthUsers: Record<string, any> = {
         ...(inMemoryDb.authUsers || {}),
         ...(cloudState.authUsers || {}),
       };
-      const mergedUserProfiles = {
-        ...(inMemoryDb.userProfiles || {}),
-        ...(cloudState.userProfiles || {}),
-      };
+      Object.keys(mergedAuthUsers).forEach((k) => {
+        const canonical = mergedUserProfiles[k]?.uid;
+        if (canonical && isValidCanonicalUid(canonical)) {
+          mergedAuthUsers[k].uid = canonical;
+        }
+      });
 
       // Merge tutorsList by email/id so NO tutor is ever lost
       const localTutors = inMemoryDb.tutorsList || [];
@@ -1057,8 +1098,12 @@ async function initCloudPersistence() {
       localStudents.forEach((s: any) => {
         const key = (s.studentEmail || s.email || '').toLowerCase().trim();
         if (key && !allDeletedStudentEmails.includes(key)) {
-          const existing = studentMap.get(key) || {};
-          studentMap.set(key, { ...existing, ...s });
+          const existing = studentMap.get(key);
+          if (existing) {
+            studentMap.set(key, mergeStudentPreservingCanonicalUid(existing, s));
+          } else if (s.uid && isValidCanonicalUid(s.uid)) {
+            studentMap.set(key, s);
+          }
         }
       });
 
@@ -1078,9 +1123,13 @@ async function initCloudPersistence() {
       });
 
       allActiveStudentEmails.forEach((cleanEmail) => {
-        if (ACTIVE_PRODUCTION_STUDENTS.has(cleanEmail) && !allDeletedStudentEmails.includes(cleanEmail)) {
-          const resolvedUid = `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
-          if (!mergedUserProfiles[cleanEmail]) {
+        if (!allDeletedStudentEmails.includes(cleanEmail)) {
+          const existingProfile = mergedUserProfiles[cleanEmail];
+          const resolvedUid = (existingProfile?.uid && isValidCanonicalUid(existingProfile.uid))
+            ? existingProfile.uid
+            : (studentMap.get(cleanEmail)?.uid || null);
+
+          if (!mergedUserProfiles[cleanEmail] && resolvedUid) {
             mergedUserProfiles[cleanEmail] = {
               id: resolvedUid,
               uid: resolvedUid,
@@ -1094,10 +1143,11 @@ async function initCloudPersistence() {
               createdAt: new Date().toISOString(),
             };
           }
-          if (!studentMap.has(cleanEmail)) {
+          if (!studentMap.has(cleanEmail) && resolvedUid) {
             studentMap.set(cleanEmail, {
               id: resolvedUid,
               studentUid: resolvedUid,
+              uid: resolvedUid,
               name: cleanEmail.split('@')[0],
               studentName: cleanEmail.split('@')[0],
               email: cleanEmail,
@@ -1118,10 +1168,10 @@ async function initCloudPersistence() {
 
       const mergedStudents = Array.from(studentMap.values()).filter((s: any) => {
         const em = (s.email || s.studentEmail || '').toLowerCase().trim();
-        return ACTIVE_PRODUCTION_STUDENTS.has(em);
+        return em && !allDeletedStudentEmails.includes(em);
       });
 
-      // Merge liveLessons by id, keeping only valid lessons for active production users
+      // Merge liveLessons by id, keeping only valid lessons
       const localLessons = inMemoryDb.liveLessons || [];
       const cloudLessons = Array.isArray(cloudState.liveLessons) ? cloudState.liveLessons : [];
       const lessonMap = new Map<string, any>();
@@ -1161,23 +1211,16 @@ async function initCloudPersistence() {
         })
         .filter((l: any) => {
           const sEmail = (l.studentEmail || '').toLowerCase().trim();
-          const tEmail = (l.teacherEmail || l.tutorEmail || '').toLowerCase().trim();
-          return (
-            ACTIVE_PRODUCTION_STUDENTS.has(sEmail) &&
-            (tEmail === 'estilobeeforkids@gmail.com' || tEmail === 'adm.itissimple@gmail.com')
-          );
+          return !allDeletedStudentEmails.includes(sEmail);
         });
 
-      // Filter and clean student media assignments, routines and progress maps to remove stale users
+      // Filter and clean student media assignments, routines and progress maps to remove deleted students
       const isAllowedKey = (k: string) => {
         const lk = k.toLowerCase().trim();
-        for (const purged of PURGED_OBSOLETE_STUDENTS) {
+        for (const purged of allDeletedStudentEmails) {
           if (lk.includes(purged) || lk.includes(purged.replace(/[^a-zA-Z0-9]/g, '-'))) return false;
         }
-        for (const allowed of ACTIVE_PRODUCTION_USERS) {
-          if (lk.includes(allowed) || lk.includes(allowed.replace(/[^a-zA-Z0-9]/g, '-'))) return true;
-        }
-        return false;
+        return true;
       };
 
       const rawVideoAssignments = {
@@ -1320,13 +1363,8 @@ app.post('/api/auth/sync-admin-claims', firebaseAuthMiddleware, async (req, res)
   const isTeacherAdmin = (db.teachers || []).some(
     (t: any) => t.role === 'admin' && (t.uid === caller.uid || t.id === caller.uid)
   );
-  const isAuthUserAdmin =
-    db.authUsers &&
-    Object.values(db.authUsers).some(
-      (u: any) => u.role === 'admin' && u.uid === caller.uid
-    );
 
-  const isConfirmedAdmin = isTeacherAdmin || isAuthUserAdmin || caller.role === 'admin';
+  const isConfirmedAdmin = isTeacherAdmin || caller.role === 'admin';
   if (!isConfirmedAdmin) {
     return res.status(403).json({
       error: 'Forbidden',
@@ -1348,8 +1386,7 @@ app.post('/api/auth/sync-admin-claims', firebaseAuthMiddleware, async (req, res)
 app.get('/api/auth/admin-status', (req, res) => {
   const db = readDb();
   const adminAccount =
-    (db.teachers || []).find((t: any) => t.role === 'admin') ||
-    Object.values(db.authUsers || {}).find((u: any) => u.role === 'admin');
+    (db.teachers || []).find((t: any) => t.role === 'admin');
 
   res.json({
     hasAdmin: !!adminAccount,
@@ -1413,10 +1450,6 @@ app.post('/api/auth/login', async (req, res) => {
     verifiedCaller.role === 'admin' ||
     (db.teachers || []).some(
       (t: any) => t.role === 'admin' && (t.uid === authenticatedUid || t.id === authenticatedUid)
-    ) ||
-    Boolean(
-      db.authUsers?.[cleanEmail]?.role === 'admin' &&
-      db.authUsers?.[cleanEmail]?.uid === authenticatedUid
     );
 
   // If user requested admin role, they MUST possess verified admin privileges
@@ -1836,14 +1869,31 @@ const handleRegistration = async (req: any, res: any) => {
   // 2. TEACHER / NATIVE FRIEND REGISTRATION
   // ----------------------------------------------------
   if (requestedRole === 'teacher') {
-    // Check duplicate email across platform
-    const isExistingTutorEmail =
-      (db.tutorsList || []).some((t: any) => t.email?.toLowerCase() === cleanEmail) ||
-      (db.teachers || []).some((t: any) => t.email?.toLowerCase() === cleanEmail && t.role !== 'admin') ||
-      Boolean(db.authUsers?.[cleanEmail]);
-
     const verifiedCaller = await getVerifiedUserFromRequest(req);
+    const verifiedUid = (verifiedCaller?.uid && isValidCanonicalUid(verifiedCaller.uid)) ? verifiedCaller.uid : null;
     const isVerifiedCallerOwner = verifiedCaller && (verifiedCaller.email || '').toLowerCase().trim() === cleanEmail;
+
+    // Check duplicate email across platform
+    const existingTutor = (db.tutorsList || []).find((t: any) => t.email?.toLowerCase() === cleanEmail);
+    const existingTeacher = (db.teachers || []).find((t: any) => t.email?.toLowerCase() === cleanEmail && t.role !== 'admin');
+    const existingAuth = db.authUsers?.[cleanEmail];
+    const isExistingTutorEmail = Boolean(existingTutor || existingTeacher || existingAuth);
+
+    const existingTutorUid =
+      (existingTutor?.uid && isValidCanonicalUid(existingTutor.uid) ? existingTutor.uid : null) ||
+      (existingTutor?.authUid && isValidCanonicalUid(existingTutor.authUid) ? existingTutor.authUid : null) ||
+      (existingTeacher?.uid && isValidCanonicalUid(existingTeacher.uid) ? existingTeacher.uid : null) ||
+      (existingAuth?.uid && isValidCanonicalUid(existingAuth.uid) ? existingAuth.uid : null) ||
+      existingTutor?.uid || existingTeacher?.uid;
+
+    if (verifiedUid && existingTutorUid && existingTutorUid !== verifiedUid && existingTutorUid !== 'admin-master-uid') {
+      return res.status(409).json({
+        error: 'Conflito de identidade detectado: já existe um perfil de professor associado a este e-mail com outro UID. Entre em contato com o suporte para reconciliação segura.',
+        code: 'UID_CONFLICT_RECONCILIATION_REQUIRED',
+        conflictingUid: existingTutorUid,
+        verifiedUid,
+      });
+    }
 
     if (isExistingTutorEmail && !req.body.isUpdate && !isVerifiedCallerOwner) {
       return res.status(409).json({
@@ -1855,11 +1905,10 @@ const handleRegistration = async (req: any, res: any) => {
 
     // Check duplicate name for Native Friend
     const isExistingTutorName =
-      (db.tutorsList || []).some((t: any) => (t.name || '').trim().toLowerCase() === cleanNameLower) ||
-      (db.teachers || []).some((t: any) => (t.name || '').trim().toLowerCase() === cleanNameLower && t.role === 'teacher') ||
-      Object.values(db.authUsers || {}).some((u: any) => (u.name || '').trim().toLowerCase() === cleanNameLower && u.role === 'teacher');
+      (db.tutorsList || []).some((t: any) => (t.name || '').trim().toLowerCase() === cleanNameLower && (t.email || '').toLowerCase() !== cleanEmail) ||
+      (db.teachers || []).some((t: any) => (t.name || '').trim().toLowerCase() === cleanNameLower && t.role === 'teacher' && (t.email || '').toLowerCase() !== cleanEmail);
 
-    if (isExistingTutorName && !req.body.isUpdate) {
+    if (isExistingTutorName && !req.body.isUpdate && !isVerifiedCallerOwner) {
       return res.status(409).json({
         error: 'Já existe um Amigo Nativo cadastrado com este nome na plataforma. Por favor, inclua seu sobrenome ou use um nome distintivo.',
         duplicateField: 'name',
@@ -1867,7 +1916,7 @@ const handleRegistration = async (req: any, res: any) => {
       });
     }
 
-    const tutorId = req.body.id || req.body.uid || `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}-${Date.now()}`;
+    const tutorId = verifiedUid || (req.body.uid && isValidCanonicalUid(req.body.uid) ? req.body.uid : null) || req.body.id || `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}-${Date.now()}`;
     // Zero-leakage: never use stock mock photos. If user provided an avatar use it, otherwise empty string.
     const tutorAvatar = req.body.avatar || req.body.picture || '';
 
@@ -2000,44 +2049,68 @@ const handleRegistration = async (req: any, res: any) => {
   // ----------------------------------------------------
   // 3. STUDENT REGISTRATION
   // ----------------------------------------------------
-  // 3.1 Check duplicate email across any platform table and Firebase Firestore
-  let isExistingStudentEmail =
-    (db.students || []).some(
-      (s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail
-    ) ||
-    Boolean(db.authUsers?.[cleanEmail]) ||
-    Boolean(db.userProfiles?.[cleanEmail]) ||
-    (db.tutorsList || []).some((t: any) => (t.email || '').toLowerCase() === cleanEmail);
+  const verifiedCaller = await getVerifiedUserFromRequest(req);
+  const verifiedUid = (verifiedCaller?.uid && isValidCanonicalUid(verifiedCaller.uid)) ? verifiedCaller.uid : null;
 
-  if (!isExistingStudentEmail && !req.body.isUpdate) {
-    try {
-      const existsInFirestore = await checkUserExistsInFirestore(cleanEmail);
-      if (existsInFirestore) {
-        isExistingStudentEmail = true;
-      }
-    } catch (err) {
-      console.warn('Firestore duplicate check error:', err);
-    }
-  }
+  const existingProfile = db.userProfiles?.[cleanEmail];
+  const existingStudent = (db.students || []).find(
+    (s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail
+  );
+  const existingTutor = (db.tutorsList || []).find((t: any) => (t.email || '').toLowerCase() === cleanEmail);
+  const existingAuthUser = db.authUsers?.[cleanEmail];
 
-  if (isExistingStudentEmail && !req.body.isUpdate) {
+  const existingRecordUid =
+    (existingProfile?.uid && isValidCanonicalUid(existingProfile.uid) ? existingProfile.uid : null) ||
+    (existingStudent?.uid && isValidCanonicalUid(existingStudent.uid) ? existingStudent.uid : null) ||
+    (existingStudent?.studentUid && isValidCanonicalUid(existingStudent.studentUid) ? existingStudent.studentUid : null) ||
+    (existingAuthUser?.uid && isValidCanonicalUid(existingAuthUser.uid) ? existingAuthUser.uid : null) ||
+    (existingProfile?.id && isValidCanonicalUid(existingProfile.id) ? existingProfile.id : null) ||
+    existingProfile?.uid || existingStudent?.uid;
+
+  // 3.1 Anti-Hijacking & UID Conflict Protection
+  if (verifiedUid && existingRecordUid && existingRecordUid !== verifiedUid && existingRecordUid !== 'admin-master-uid' && existingRecordUid !== 'student_lala_canonical_uid') {
     return res.status(409).json({
-      error: 'Este e-mail já possui uma conta cadastrada.',
-      duplicateField: 'email',
-      isExistingUser: true,
+      error: 'Conflito de identidade detectado: já existe um perfil histórico associado a este e-mail com outro UID. Entre em contato com o suporte para reconciliação segura.',
+      code: 'UID_CONFLICT_RECONCILIATION_REQUIRED',
+      conflictingUid: existingRecordUid,
+      verifiedUid,
     });
   }
 
-  // 3.2 Check duplicate name for student
+  // 3.2 Firebase Auth authority check for unauthenticated calls
+  if (!verifiedUid) {
+    let fbAuthUser: any = null;
+    try {
+      const adminAuth = getFirebaseAdminAuth();
+      fbAuthUser = await adminAuth.getUserByEmail(cleanEmail).catch(() => null);
+    } catch {}
+
+    if (fbAuthUser) {
+      return res.status(409).json({
+        error: 'Este e-mail já possui uma conta no Firebase Authentication. Por favor, faça login com sua conta.',
+        duplicateField: 'email',
+        isExistingUser: true,
+      });
+    }
+
+    if ((existingStudent || existingProfile || existingTutor) && !req.body.isUpdate) {
+      return res.status(409).json({
+        error: 'Este e-mail já possui uma conta cadastrada.',
+        duplicateField: 'email',
+        isExistingUser: true,
+      });
+    }
+  }
+
+  // 3.3 Check duplicate name for student
   const isExistingStudentName =
     (db.students || []).some(
-      (s: any) => ((s.name || s.studentName || '') as string).trim().toLowerCase() === cleanNameLower
-    ) ||
-    Object.values(db.authUsers || {}).some(
-      (u: any) => (u.name || '').trim().toLowerCase() === cleanNameLower && u.role === 'student'
+      (s: any) =>
+        ((s.name || s.studentName || '') as string).trim().toLowerCase() === cleanNameLower &&
+        (s.email || s.studentEmail || '').toLowerCase() !== cleanEmail
     );
 
-  if (isExistingStudentName && !req.body.isUpdate) {
+  if (isExistingStudentName && !req.body.isUpdate && !verifiedUid) {
     return res.status(409).json({
       error: 'Já existe um(a) aluno(a) cadastrado(a) com este nome no sistema. Por favor, informe seu nome completo e sobrenome para garantir sua identificação individual.',
       duplicateField: 'name',
@@ -2045,9 +2118,8 @@ const handleRegistration = async (req: any, res: any) => {
     });
   }
 
-  // Generate clean, strictly exclusive UID for this new student
-  const userUid = req.body.uid || req.body.id || `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}-${Date.now()}`;
-  // Zero-leakage: completely clean, no stock or mock photo
+  // Authoritative UID: verified Firebase UID strictly takes precedence; client cannot override it
+  const userUid = verifiedUid || (req.body.uid && isValidCanonicalUid(req.body.uid) ? req.body.uid : null) || req.body.id || `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}-${Date.now()}`;
   const userAvatar = req.body.avatar || req.body.picture || '';
 
   // Save student auth record (NO PASSWORDS)
@@ -2106,7 +2178,9 @@ const handleRegistration = async (req: any, res: any) => {
 
   if (existingIdx >= 0) {
     const existing = db.students[existingIdx];
-    const resolvedCanonicalUid = (req.body.uid && !req.body.uid.startsWith('usr-') && !req.body.uid.startsWith('st-')) ? req.body.uid : (existing.uid || existing.id || userUid);
+    const resolvedCanonicalUid = (verifiedCaller?.uid && isValidCanonicalUid(verifiedCaller.uid))
+      ? verifiedCaller.uid
+      : ((existing.uid && isValidCanonicalUid(existing.uid)) ? existing.uid : ((req.body.uid && isValidCanonicalUid(req.body.uid)) ? req.body.uid : userUid));
     db.students[existingIdx] = {
       ...existing,
       id: resolvedCanonicalUid,
@@ -2223,7 +2297,9 @@ const handleRegistration = async (req: any, res: any) => {
     };
   } else {
     const p = db.userProfiles[cleanEmail];
-    const resolvedCanonicalUid = (req.body.uid && !req.body.uid.startsWith('usr-') && !req.body.uid.startsWith('st-')) ? req.body.uid : (p.uid || p.id || userUid);
+    const resolvedCanonicalUid = (verifiedCaller?.uid && isValidCanonicalUid(verifiedCaller.uid))
+      ? verifiedCaller.uid
+      : ((p.uid && isValidCanonicalUid(p.uid)) ? p.uid : ((req.body.uid && isValidCanonicalUid(req.body.uid)) ? req.body.uid : userUid));
     db.userProfiles[cleanEmail] = {
       ...p,
       id: resolvedCanonicalUid,
@@ -2501,7 +2577,10 @@ app.post('/api/auth/google', async (req, res) => {
     writeDb(db);
   }
 
-  const effectiveUid = uid || db.authUsers?.[cleanEmail]?.uid || (cleanEmail === 'adm.itissimple@gmail.com' ? 'admin-master-uid' : `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`);
+  const effectiveUid =
+    (targetUid && isValidCanonicalUid(targetUid))
+      ? targetUid
+      : (uid || db.authUsers?.[cleanEmail]?.uid || `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`);
 
   const account = {
     uid: effectiveUid,
@@ -4544,106 +4623,15 @@ app.get('/api/students', (req, res) => {
 
 // Dedicated maintenance endpoint to purge obsolete users and sanitize Firestore app_state
 app.post('/api/admin/clean-obsolete-users', firebaseAuthMiddleware, requireAdmin, async (_req, res) => {
-  try {
-    const db = readDb();
-    console.log('[CLEANUP] Starting cleanup of obsolete users...');
-
-    db.deletedStudentEmails = Array.from(
-      new Set([...(db.deletedStudentEmails || []), ...PURGED_OBSOLETE_STUDENTS])
-    );
-
-    // 1. Sanitize students
-    db.students = (db.students || []).filter((s: any) => {
-      const em = (s.email || s.studentEmail || '').toLowerCase().trim();
-      return ACTIVE_PRODUCTION_STUDENTS.has(em);
-    });
-
-    // 2. Sanitize userProfiles
-    if (db.userProfiles) {
-      Object.keys(db.userProfiles).forEach((key) => {
-        const em = key.toLowerCase().trim();
-        if (!ACTIVE_PRODUCTION_USERS.has(em)) {
-          delete db.userProfiles[key];
-        }
-      });
-    }
-
-    // 3. Sanitize authUsers
-    if (db.authUsers) {
-      Object.keys(db.authUsers).forEach((key) => {
-        const em = key.toLowerCase().trim();
-        if (!ACTIVE_PRODUCTION_USERS.has(em)) {
-          delete db.authUsers[key];
-        }
-      });
-    }
-
-    // 4. Sanitize liveLessons
-    if (Array.isArray(db.liveLessons)) {
-      db.liveLessons = db.liveLessons.filter((l: any) => {
-        const sEmail = (l.studentEmail || '').toLowerCase().trim();
-        const tEmail = (l.teacherEmail || l.tutorEmail || '').toLowerCase().trim();
-        return (
-          ACTIVE_PRODUCTION_STUDENTS.has(sEmail) &&
-          (tEmail === 'estilobeeforkids@gmail.com' || tEmail === 'adm.itissimple@gmail.com')
-        );
-      });
-    }
-
-    // 5. Sanitize assignments, routines and dictionary
-    const isAllowedKey = (k: string) => {
-      const lk = k.toLowerCase().trim();
-      for (const purged of PURGED_OBSOLETE_STUDENTS) {
-        if (lk.includes(purged) || lk.includes(purged.replace(/[^a-zA-Z0-9]/g, '-'))) return false;
-      }
-      for (const allowed of ACTIVE_PRODUCTION_USERS) {
-        if (lk.includes(allowed) || lk.includes(allowed.replace(/[^a-zA-Z0-9]/g, '-'))) return true;
-      }
-      return false;
-    };
-
-    if (db.studentVideoAssignments) {
-      Object.keys(db.studentVideoAssignments).forEach((k) => {
-        if (!isAllowedKey(k)) delete db.studentVideoAssignments[k];
-      });
-    }
-    if (db.studentSpotifyAssignments) {
-      Object.keys(db.studentSpotifyAssignments).forEach((k) => {
-        if (!isAllowedKey(k)) delete db.studentSpotifyAssignments[k];
-      });
-    }
-    if (db.studentRoutinesMap) {
-      Object.keys(db.studentRoutinesMap).forEach((k) => {
-        if (!isAllowedKey(k)) delete db.studentRoutinesMap[k];
-      });
-    }
-    if (db.studentWeeklyChecks) {
-      Object.keys(db.studentWeeklyChecks).forEach((k) => {
-        if (!isAllowedKey(k)) delete db.studentWeeklyChecks[k];
-      });
-    }
-    if (db.studentDictionaryMap) {
-      Object.keys(db.studentDictionaryMap).forEach((k) => {
-        if (!isAllowedKey(k)) delete db.studentDictionaryMap[k];
-      });
-    }
-
-    await writeDbSync(db);
-    const saved = await saveAppStateToFirestore(db);
-    console.log('[CLEANUP] Obsolete users cleanup completed. Firestore saved:', saved);
-
-    res.json({
-      success: true,
-      activeStudents: db.students.map((s: any) => s.email || s.studentEmail),
-      activeProfiles: Object.keys(db.userProfiles || {}),
-      activeAuthUsers: Object.keys(db.authUsers || {}),
-      remainingLessons: (db.liveLessons || []).length,
-      firestoreSaved: saved,
-    });
-  } catch (err: any) {
-    console.error('[CLEANUP ERROR]:', err);
-    res.status(500).json({ error: err.message });
-  }
+  // SECURITY HOTFIX 4B.19A: Unsafe destructive bulk cleanup via hardcoded allowlists is permanently disabled.
+  // Preserves administrator-only authorization check while preventing accidental data deletion of legitimate users.
+  return res.status(200).json({
+    success: true,
+    disabled: true,
+    message: 'Bulk cleanup is safely disabled to prevent accidental deletion of legitimate users. Individual UID-based reconciliation required.',
+    deletedCount: 0,
+    modified: false,
+  });
 });
 
 app.post('/api/students', async (req, res) => {

@@ -681,10 +681,11 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
       (directUsers || []).forEach((u: any) => {
         const key = (u.email || '').toLowerCase().trim();
         if (key) {
+          const canonicalUid = (u.uid && isValidCanonicalUid(u.uid)) ? u.uid : (u.id && isValidCanonicalUid(u.id) ? u.id : null);
           if (!mergedUserProfiles[key]) {
             mergedUserProfiles[key] = {
-              id: u.uid || u.id || `usr-${key.replace(/[^a-zA-Z0-9]/g, '-')}`,
-              uid: u.uid || u.id,
+              id: canonicalUid || u.uid || u.id,
+              uid: canonicalUid || u.uid || u.id,
               name: u.name || key.split('@')[0],
               email: key,
               level: u.level || u.englishLevel || 'iniciante',
@@ -694,34 +695,66 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
               weeklyStudyDays: u.weeklyStudyDays || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'],
               createdAt: u.createdAt || new Date().toISOString(),
             };
-          }
-          if (!mergedAuthUsers[key]) {
-            mergedAuthUsers[key] = {
-              uid: u.uid || u.id || `usr-${key.replace(/[^a-zA-Z0-9]/g, '-')}`,
-              email: key,
-              name: u.name || key.split('@')[0],
-              role: u.role || 'student',
-              createdAt: u.createdAt || new Date().toISOString(),
+          } else if (canonicalUid) {
+            mergedUserProfiles[key] = {
+              ...mergedUserProfiles[key],
+              ...u,
+              id: canonicalUid,
+              uid: canonicalUid,
             };
           }
-          if ((u.role === 'student' || !u.role) && !studentMap.has(key)) {
-            studentMap.set(key, {
-              id: u.uid || u.id || `usr-${key.replace(/[^a-zA-Z0-9]/g, '-')}`,
-              studentUid: u.uid || u.id,
-              name: u.name || key.split('@')[0],
-              studentName: u.name || key.split('@')[0],
-              email: key,
-              studentEmail: key,
-              level: u.level || u.englishLevel || 'iniciante',
-              studentLevel: u.level || u.englishLevel || 'iniciante',
-              goal: u.learningGoal || u.goal || 'English for everyday life & work',
-              learningGoal: u.learningGoal || u.goal || 'English for everyday life & work',
-              contractedLessons: u.contractedLessons || 5,
-              completedLessonsCount: u.completedLessonsCount || 0,
-              status: 'active',
-              activeSince: (u.createdAt || new Date().toISOString()).split('T')[0],
-              createdAt: u.createdAt || new Date().toISOString(),
-            });
+
+          if (!mergedAuthUsers[key]) {
+            if (canonicalUid) {
+              mergedAuthUsers[key] = {
+                uid: canonicalUid,
+                id: canonicalUid,
+                email: key,
+                name: u.name || key.split('@')[0],
+                role: u.role || 'student',
+                createdAt: u.createdAt || new Date().toISOString(),
+              };
+            }
+          } else if (canonicalUid) {
+            mergedAuthUsers[key] = {
+              ...mergedAuthUsers[key],
+              uid: canonicalUid,
+              id: canonicalUid,
+            };
+          }
+
+          if (u.role === 'student' || !u.role) {
+            const existingStudent = studentMap.get(key);
+            if (!existingStudent) {
+              if (canonicalUid) {
+                studentMap.set(key, {
+                  id: canonicalUid,
+                  studentUid: canonicalUid,
+                  uid: canonicalUid,
+                  name: u.name || key.split('@')[0],
+                  studentName: u.name || key.split('@')[0],
+                  email: key,
+                  studentEmail: key,
+                  level: u.level || u.englishLevel || 'iniciante',
+                  studentLevel: u.level || u.englishLevel || 'iniciante',
+                  goal: u.learningGoal || u.goal || 'English for everyday life & work',
+                  learningGoal: u.learningGoal || u.goal || 'English for everyday life & work',
+                  contractedLessons: u.contractedLessons || 5,
+                  completedLessonsCount: u.completedLessonsCount || 0,
+                  status: 'active',
+                  activeSince: (u.createdAt || new Date().toISOString()).split('T')[0],
+                  createdAt: u.createdAt || new Date().toISOString(),
+                });
+              }
+            } else if (canonicalUid) {
+              studentMap.set(key, {
+                ...existingStudent,
+                ...u,
+                id: canonicalUid,
+                studentUid: canonicalUid,
+                uid: canonicalUid,
+              });
+            }
           }
         }
       });

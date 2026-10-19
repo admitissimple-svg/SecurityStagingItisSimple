@@ -164,6 +164,14 @@ export const firebaseAuthMiddleware = async (
       return;
     }
 
+    if (errorCode === 'auth/user-disabled') {
+      res.status(401).json({
+        error: 'Unauthorized',
+        message: 'Firebase user account has been disabled',
+      });
+      return;
+    }
+
     res.status(401).json({
       error: 'Unauthorized',
       message: 'Invalid Firebase ID token',
