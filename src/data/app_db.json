@@ -6,29 +6,7 @@
   "deletedStudentEmails": [],
   "students": [],
   "meetSettings": {},
-  "teacherSettings": {
-    "remote-teacher@example.com": {
-      "teacherEmail": "remote-teacher@example.com",
-      "meetLink": "https://meet.google.com/rem-ote-tea"
-    },
-    "tutor2@example.com": {
-      "teacherEmail": "tutor2@example.com"
-    },
-    "managed-tutor@example.com": {
-      "teacherEmail": "managed-tutor@example.com"
-    },
-    "cool.tutor@example.com": {
-      "teacherEmail": "cool.tutor@example.com",
-      "timezone": "America/Toronto",
-      "availableDays": [
-        "monday",
-        "tuesday",
-        "wednesday",
-        "thursday",
-        "friday"
-      ]
-    }
-  },
+  "teacherSettings": {},
   "liveLessons": [],
   "chatMessages": [],
   "routinesByDay": {

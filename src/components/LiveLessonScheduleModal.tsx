@@ -313,34 +313,11 @@ export const LiveLessonScheduleModal: React.FC<LiveLessonScheduleModalProps> = (
     if ((selectedTeacherObj as any)?.uid && isValidCanonicalUid((selectedTeacherObj as any).uid)) return (selectedTeacherObj as any).uid;
     if (matchedTutor?.authUid && isValidCanonicalUid(matchedTutor.authUid)) return matchedTutor.authUid;
     if (matchedTutor?.uid && isValidCanonicalUid(matchedTutor.uid)) return matchedTutor.uid;
-
-    const isSkullBee =
-      selectedTeacherEmail === 'laviniafofafc@gmail.com' ||
-      (selectedTeacherObj as any)?.id === 'skull-bee' ||
-      (selectedTeacherObj as any)?.publicTutorId === 'skull-bee' ||
-      matchedTutor?.id === 'skull-bee' ||
-      (matchedTutor as any)?.publicTutorId === 'skull-bee';
-
-    if (isSkullBee) {
-      return 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1';
-    }
-
-    const isQueenBee =
-      selectedTeacherEmail === 'beeginning4you@gmail.com' ||
-      selectedTeacherEmail === 'estilobeeforkids@gmail.com' ||
-      selectedTeacherEmail === 'estilobeeadm@gmail.com' ||
-      (selectedTeacherObj as any)?.id === 'queen-bee' ||
-      (selectedTeacherObj as any)?.publicTutorId === 'queen-bee' ||
-      matchedTutor?.id === 'queen-bee' ||
-      (matchedTutor as any)?.publicTutorId === 'queen-bee' ||
-      (typeof matchedTutor?.name === 'string' && matchedTutor.name.toLowerCase().includes('queen bee'));
-
-    if (isQueenBee) {
-      return 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2';
-    }
+    if ((selectedTeacherObj as any)?.id && isValidCanonicalUid((selectedTeacherObj as any).id)) return (selectedTeacherObj as any).id;
+    if (matchedTutor?.id && isValidCanonicalUid(matchedTutor.id)) return matchedTutor.id;
 
     return '';
-  }, [selectedTeacherObj, matchedTutor, selectedTeacherEmail]);
+  }, [selectedTeacherObj, matchedTutor]);
 
   const effectiveStudentEmail = (
     (isStudentBookingMode && candidateStudentEmail)

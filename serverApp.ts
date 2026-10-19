@@ -448,10 +448,7 @@ export const ACTIVE_PRODUCTION_USERS = new Set<string>([]);
 
 export const ACTIVE_PRODUCTION_STUDENTS = new Set<string>([]);
 
-export const PURGED_OBSOLETE_STUDENTS = [
-  'test-student@example.com',
-  'test-student-123',
-];
+export const PURGED_OBSOLETE_STUDENTS: string[] = [];
 
 // Clean initial state: zero mock tutors, zero fake test accounts
 const DEFAULT_TUTORS_LIST: any[] = [];
@@ -1291,8 +1288,8 @@ async function initCloudPersistence() {
       if (directTutors && directTutors.length > 0) {
         const cleanDirect = directTutors.filter((t: any) => {
           const em = (t.email || '').toLowerCase().trim();
-          const id = (t.id || t.authUid || t.uid || '').toLowerCase().trim();
-          return !em.includes('example.com') && !em.includes('laviniafofa') && !id.includes('skull-bee') && !id.includes('cool-tutor');
+          const uid = (t.authUid || t.uid || t.id || '').trim();
+          return Boolean(em && uid) && !em.endsWith('@example.com') && !em.endsWith('@test.com');
         });
         console.log(`Recovered ${cleanDirect.length} valid tutors directly from /tutors collection!`);
         inMemoryDb.tutorsList = cleanDirect;
@@ -3016,11 +3013,23 @@ app.post('/api/tutors', async (req, res) => {
   if (!canonicalAuthUid && isAdminCaller && incomingUid && isValidCanonicalUid(incomingUid)) {
     canonicalAuthUid = incomingUid;
   }
-  if (!canonicalAuthUid && (cleanEmail === 'laviniafofafc@gmail.com' || tutorId === 'skull-bee')) {
-    canonicalAuthUid = 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1';
-  }
-  if (!canonicalAuthUid && (cleanEmail === 'beeginning4you@gmail.com' || cleanEmail === 'estilobeeforkids@gmail.com' || cleanEmail === 'estilobeeadm@gmail.com' || tutorId === 'queen-bee' || (req.body?.name && typeof req.body.name === 'string' && req.body.name.toLowerCase().includes('queen bee')))) {
-    canonicalAuthUid = 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2';
+  if (!canonicalAuthUid && cleanEmail) {
+    try {
+      const db = getFirestoreDb();
+      if (db) {
+        const uSnap = await db.collection('users').where('email', '==', cleanEmail).limit(1).get().catch(() => null);
+        if (uSnap && !uSnap.empty) {
+          const doc = uSnap.docs[0];
+          if (isValidCanonicalUid(doc.id)) {
+            canonicalAuthUid = doc.id;
+          } else if (isValidCanonicalUid(doc.data()?.uid)) {
+            canonicalAuthUid = doc.data().uid;
+          } else if (isValidCanonicalUid(doc.data()?.authUid)) {
+            canonicalAuthUid = doc.data().authUid;
+          }
+        }
+      }
+    } catch {}
   }
 
   // Abort if canonical UID cannot be proven - NEVER manufacture an alternative UID
@@ -5667,9 +5676,6 @@ app.post('/api/students/cancel', (req, res) => {
 const GENERIC_PLACEHOLDER_EMAILS = new Set([
   'aluno@itssimple.com',
   'student@itssimple.com',
-  'user@example.com',
-  'test@example.com',
-  'student@example.com',
 ]);
 
 function resolveStudentIdentifiers(

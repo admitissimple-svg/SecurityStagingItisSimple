@@ -147,7 +147,7 @@ export interface ResolvedTeacherIdentity {
 /**
  * Resolves the unequivocal canonical Firebase Auth UID of a Native Friend (Teacher) on the trusted backend.
  * Checks Firebase Admin Auth and canonical Firestore records.
- * Resolves public identifiers (e.g. 'skull-bee'), legacy slugs, and emails to the genuine Auth UID.
+ * Resolves public identifiers, legacy slugs, and emails to the genuine Auth UID.
  * Rejects unapproved, non-existent, or unproven tutor identities.
  */
 export async function resolveTeacherCanonicalIdentity(
@@ -231,27 +231,7 @@ export async function resolveTeacherCanonicalIdentity(
     return null;
   }
 
-  // Reference Case: Skull Bee
-  // E-mail: laviniafofafc@gmail.com, UID real: jCkNIhvYEYbyJC2CWGZhFaoHGfo1, ID público: skull-bee
-  const isSkullBee =
-    candidatePublicId === 'skull-bee' ||
-    candidateEmail === 'laviniafofafc@gmail.com' ||
-    candidateUid === 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1' ||
-    candidateUid.toLowerCase() === 'jcknihvyeybyjc2cwgzhfaohgfo1' ||
-    queryStr === 'skull-bee' ||
-    queryStr.toLowerCase() === 'skull bee';
 
-  // Reference Case: Queen Bee
-  // E-mails: beeginning4you@gmail.com, estilobeeforkids@gmail.com, estilobeeadm@gmail.com, UID real: Xpmq4l50aUOE0Jh4UTHwGAtw65B2, ID público: queen-bee
-  const isQueenBee =
-    candidatePublicId === 'queen-bee' ||
-    candidateEmail === 'beeginning4you@gmail.com' ||
-    candidateEmail === 'estilobeeforkids@gmail.com' ||
-    candidateEmail === 'estilobeeadm@gmail.com' ||
-    candidateUid === 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2' ||
-    candidateUid.toLowerCase() === 'xpmq4l50auoe0jh4uthwgatw65b2' ||
-    queryStr === 'queen-bee' ||
-    queryStr.toLowerCase() === 'queen bee';
 
   let adminAuth: any = null;
   try {
@@ -357,7 +337,7 @@ export async function resolveTeacherCanonicalIdentity(
   }
 
   let resolvedUid = '';
-  const email = (consolidated?.email || candidateEmail || (isSkullBee ? 'laviniafofafc@gmail.com' : '')).toLowerCase().trim();
+  const email = (consolidated?.email || candidateEmail || '').toLowerCase().trim();
 
   if (adminAuth) {
     if (candidateUid) {
@@ -388,16 +368,6 @@ export async function resolveTeacherCanonicalIdentity(
     }
   }
 
-  // Reference case (Skull Bee): always resolves to real UID jCkNIhvYEYbyJC2CWGZhFaoHGfo1
-  if (!resolvedUid && isSkullBee) {
-    resolvedUid = 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1';
-  }
-
-  // Reference case (Queen Bee): always resolves to official UID Xpmq4l50aUOE0Jh4UTHwGAtw65B2
-  if (!resolvedUid && isQueenBee) {
-    resolvedUid = 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2';
-  }
-
   if (!resolvedUid || !isValidCanonicalUid(resolvedUid)) {
     return null;
   }
@@ -406,16 +376,12 @@ export async function resolveTeacherCanonicalIdentity(
     consolidated?.approvalStatus === 'approved' ||
     consolidated?.isApproved === true ||
     consolidated?.status === 'approved' ||
-    consolidated?.approved === true ||
-    (isSkullBee && (consolidated?.approvalStatus !== 'rejected' && consolidated?.status !== 'rejected')) ||
-    (isQueenBee && (consolidated?.approvalStatus !== 'rejected' && consolidated?.status !== 'rejected'))
+    consolidated?.approved === true
   );
 
-  const name = consolidated?.name || (isSkullBee ? 'Skull Bee' : (isQueenBee ? 'Queen Bee' : 'Native Friend'));
+  const name = consolidated?.name || 'Native Friend';
 
   const publicTutorId =
-    (isSkullBee ? 'skull-bee' : null) ||
-    (isQueenBee ? 'queen-bee' : null) ||
     (consolidated?.publicTutorId && !isGenericTutorId(consolidated.publicTutorId) ? consolidated.publicTutorId : null) ||
     (candidatePublicId && !isGenericTutorId(candidatePublicId) ? candidatePublicId : null) ||
     (email ? `tutor-${email.replace(/[^a-zA-Z0-9]/g, '-')}` : null) ||
@@ -424,7 +390,7 @@ export async function resolveTeacherCanonicalIdentity(
 
   return {
     canonicalUid: resolvedUid,
-    email: email || (isSkullBee ? 'laviniafofafc@gmail.com' : (isQueenBee ? 'beeginning4you@gmail.com' : '')),
+    email: email,
     name,
     publicTutorId,
     isApproved,
@@ -482,16 +448,6 @@ export async function saveTutorToFirestore(tutor: any, _legacyDocId?: string): P
         }
       } catch {}
     }
-  }
-
-  // Reference case (Skull Bee): E-mail laviniafofafc@gmail.com strictly maps to UID real jCkNIhvYEYbyJC2CWGZhFaoHGfo1
-  if (!canonicalAuthUid && (cleanEmail === 'laviniafofafc@gmail.com' || tutor.publicTutorId === 'skull-bee' || tutor.id === 'skull-bee')) {
-    canonicalAuthUid = 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1';
-  }
-
-  // Reference case (Queen Bee): E-mail beeginning4you@gmail.com strictly maps to official UID real Xpmq4l50aUOE0Jh4UTHwGAtw65B2
-  if (!canonicalAuthUid && (cleanEmail === 'beeginning4you@gmail.com' || cleanEmail === 'estilobeeforkids@gmail.com' || cleanEmail === 'estilobeeadm@gmail.com' || tutor.publicTutorId === 'queen-bee' || tutor.id === 'queen-bee' || (typeof tutor.name === 'string' && tutor.name.toLowerCase().includes('queen bee')))) {
-    canonicalAuthUid = 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2';
   }
 
   // Check existing canonical records in Firestore
@@ -552,7 +508,6 @@ export async function saveTutorToFirestore(tutor: any, _legacyDocId?: string): P
     const publicTutorId =
       (tutor.publicTutorId && !isGenericTutorId(tutor.publicTutorId) ? tutor.publicTutorId : null) ||
       (tutor.id && !isValidCanonicalUid(tutor.id) && !isGenericTutorId(tutor.id) ? tutor.id : null) ||
-      (cleanEmail === 'laviniafofafc@gmail.com' ? 'skull-bee' : null) ||
       (cleanEmail ? `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : null) ||
       (tutor.name && typeof tutor.name === 'string' && !isGenericTutorId(tutor.name) ? tutor.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') : null) ||
       canonicalAuthUid;
@@ -1038,8 +993,7 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
         const cEmail = (tut.email || '').toLowerCase().trim();
         const candidateAuthUid = (tut.authUid && isValidCanonicalUid(tut.authUid) ? tut.authUid : null) ||
           (tut.uid && isValidCanonicalUid(tut.uid) ? tut.uid : null) ||
-          (tut.id && isValidCanonicalUid(tut.id) ? tut.id : null) ||
-          (cEmail === 'laviniafofafc@gmail.com' ? 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1' : null);
+          (tut.id && isValidCanonicalUid(tut.id) ? tut.id : null);
 
         if (candidateAuthUid) {
           const nameSlug = tut.name && typeof tut.name === 'string' && !isGenericTutorId(tut.name)
@@ -1048,7 +1002,6 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
           const publicTutorId =
             (tut.publicTutorId && !isGenericTutorId(tut.publicTutorId) ? tut.publicTutorId : null) ||
             (tut.id && !isValidCanonicalUid(tut.id) && !isGenericTutorId(tut.id) ? tut.id : null) ||
-            (cEmail === 'laviniafofafc@gmail.com' ? 'skull-bee' : null) ||
             (cEmail ? `tutor-${cEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : null) ||
             (nameSlug && !isGenericTutorId(nameSlug) ? nameSlug : null) ||
             candidateAuthUid;
@@ -3465,17 +3418,11 @@ export async function scheduleLessonAtomicServer(
     const overlaps = lStart < endTime && lEnd > startTime;
     if (!overlaps) return false;
 
-    const isSkullBee =
-      canonicalTeacherUid === 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1' ||
-      resolvedPublicTutorId === 'skull-bee' ||
-      resolvedTeacherEmail === 'laviniafofafc@gmail.com';
-
     // Teacher conflict - supports canonical UID and legacy public ID for backwards compatibility
     const isSameTeacher =
       (l.teacherUid && (
         l.teacherUid === canonicalTeacherUid ||
-        (resolvedPublicTutorId && l.teacherUid === resolvedPublicTutorId) ||
-        (isSkullBee && (l.teacherUid === 'skull-bee' || l.teacherUid === 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1'))
+        (resolvedPublicTutorId && l.teacherUid === resolvedPublicTutorId)
       )) ||
       (l.teacherAuthUid && l.teacherAuthUid === canonicalTeacherUid) ||
       (resolvedTeacherEmail && (l.teacherEmail || '').toLowerCase().trim() === resolvedTeacherEmail);
@@ -3489,17 +3436,12 @@ export async function scheduleLessonAtomicServer(
   });
 
   if (candidateConflict) {
-    const isSkullBee =
-      canonicalTeacherUid === 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1' ||
-      resolvedPublicTutorId === 'skull-bee' ||
-      resolvedTeacherEmail === 'laviniafofafc@gmail.com';
-
     const isTeacher =
       (candidateConflict.teacherUid && (
         candidateConflict.teacherUid === canonicalTeacherUid ||
-        candidateConflict.teacherUid === resolvedPublicTutorId ||
-        (isSkullBee && (candidateConflict.teacherUid === 'skull-bee' || candidateConflict.teacherUid === 'jCkNIhvYEYbyJC2CWGZhFaoHGfo1'))
+        candidateConflict.teacherUid === resolvedPublicTutorId
       )) ||
+      (candidateConflict.teacherAuthUid && candidateConflict.teacherAuthUid === canonicalTeacherUid) ||
       (resolvedTeacherEmail && (candidateConflict.teacherEmail || '').toLowerCase().trim() === resolvedTeacherEmail);
 
     return {
