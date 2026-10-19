@@ -3,7 +3,7 @@
   "appId": "1:334384661166:web:7c6a93d815b2608926233f",
   "apiKey": "AIzaSyAIlasw7SKY8ukVaC3SzujlRchSP5Aep4Y",
   "authDomain": "itissimple-security-staging.firebaseapp.com",
-  "firestoreDatabaseId": "ai-studio-securitystagingi-82447e17-0a01-4d71-b6f9-a8880c9fcea9",
+  "firestoreDatabaseId": "(default)",
   "storageBucket": "itissimple-security-staging.firebasestorage.app",
   "messagingSenderId": "334384661166",
   "measurementId": "",

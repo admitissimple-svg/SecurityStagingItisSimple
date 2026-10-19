@@ -83,12 +83,10 @@ if (isPlaceholder(process.env.FIREBASE_PROJECT_ID) && appletConfig?.projectId) {
 if (!process.env.FIREBASE_PROJECT_ID) {
   process.env.FIREBASE_PROJECT_ID = 'itissimple-security-staging';
 }
-if (isPlaceholder(process.env.FIREBASE_DATABASE_ID) && appletConfig?.firestoreDatabaseId) {
-  process.env.FIREBASE_DATABASE_ID = appletConfig.firestoreDatabaseId;
-}
-if (!process.env.FIREBASE_DATABASE_ID) {
-  process.env.FIREBASE_DATABASE_ID = '(default)';
-}
+// Canonical Firestore database consolidation — HOTFIX 4B.18
+// All application data strictly targets Firestore '(default)'
+process.env.FIREBASE_DATABASE_ID = '(default)';
+process.env.VITE_FIREBASE_DATABASE_ID = '(default)';
 
 if (appletConfig) {
   if (isPlaceholder(process.env.VITE_FIREBASE_PROJECT_ID) && appletConfig.projectId) {
@@ -108,9 +106,6 @@ if (appletConfig) {
   }
   if (isPlaceholder(process.env.VITE_FIREBASE_APP_ID) && appletConfig.appId) {
     process.env.VITE_FIREBASE_APP_ID = appletConfig.appId;
-  }
-  if (isPlaceholder(process.env.VITE_FIREBASE_DATABASE_ID) && appletConfig.firestoreDatabaseId) {
-    process.env.VITE_FIREBASE_DATABASE_ID = appletConfig.firestoreDatabaseId;
   }
 }
 

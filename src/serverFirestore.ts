@@ -26,6 +26,12 @@ export function getFirestoreDb(): Firestore | null {
         `[serverFirestore Security] Unauthorized Firestore instance detected for project '${cachedProjectId}'. Strictly expected '${ALLOWED_STAGING_PROJECT_ID}'.`
       );
     }
+    const cachedDatabaseId = (adminFirestoreInstance as any).databaseId;
+    if (cachedDatabaseId && cachedDatabaseId !== '(default)') {
+      throw new Error(
+        `[serverFirestore Security] Unauthorized Firestore database '${cachedDatabaseId}' detected. Strictly expected '(default)'.`
+      );
+    }
     return adminFirestoreInstance;
   }
 
@@ -37,8 +43,8 @@ export function getFirestoreDb(): Firestore | null {
         `[serverFirestore Security] Firebase Admin App is bound to unauthorized project '${appProjectId}'. Refusing to create Firestore client.`
       );
     }
-    const rawTargetDatabaseId = process.env.FIREBASE_DATABASE_ID?.trim() || '(default)';
-    const targetDatabaseId = rawTargetDatabaseId.startsWith('ai-studio-') ? '(default)' : (rawTargetDatabaseId || '(default)');
+    // Architecture decision HOTFIX 4B.18: Strictly target canonical '(default)' database
+    const targetDatabaseId = '(default)';
     adminFirestoreInstance = getFirestore(app, targetDatabaseId);
     return adminFirestoreInstance;
   } catch (err) {
@@ -540,55 +546,54 @@ export async function saveTutorToFirestore(tutor: any, _legacyDocId?: string): P
 /**
  * Fetch all Native Friend / Teacher profiles directly from unified /users collection (role == 'teacher')
  * with fallback to legacy /tutors collection, consolidated canonically to prevent any duplication.
+ * Executes strictly against canonical (default) Firestore database.
+ * Does not silently swallow query errors.
  */
 export async function fetchTutorsFromFirestore(): Promise<any[]> {
   const db = getFirestoreDb();
-  if (!db) return [];
-  try {
-    const fetchPromise = async () => {
-      const rawList: any[] = [];
-
-      try {
-        const [usersSnap, legacySnap] = await Promise.all([
-          db.collection('users').where('role', '==', 'teacher').get().catch(() => null),
-          db.collection('tutors').get().catch(() => null),
-        ]);
-
-        if (usersSnap) {
-          usersSnap.forEach((d) => {
-            const data = d.data();
-            if (data && (data.email || data.name)) {
-              rawList.push({ id: d.id, ...data, role: 'teacher' });
-            }
-          });
-        }
-
-        if (legacySnap) {
-          legacySnap.forEach((d) => {
-            const data = d.data();
-            if (data && (data.email || data.name)) {
-              rawList.push({ id: d.id, ...data, role: 'teacher' });
-            }
-          });
-        }
-      } catch (dbErr) {
-        console.warn('Error reading tutors from Firestore database:', dbErr);
-      }
-
-      const results = consolidateTutorsList(rawList);
-      const approvedIds = results
-        .filter((t) => t.approvalStatus === 'approved' || t.isApproved === true)
-        .map((t) => t.publicTutorId || t.id || t.email);
-      console.log('[NativeFriends Server] Retrieved consolidated Firestore tutor IDs:', approvedIds);
-      return results;
-    };
-
-    const result = await withTimeout(fetchPromise(), 10000);
-    return Array.isArray(result) ? result : [];
-  } catch (err) {
-    console.warn('Firestore fetchTutors error:', err);
-    return [];
+  if (!db) {
+    throw new Error('[serverFirestore] Canonical Firestore database (default) client is not initialized');
   }
+
+  const fetchPromise = async () => {
+    const rawList: any[] = [];
+
+    const [usersSnap, legacySnap] = await Promise.all([
+      db.collection('users').where('role', '==', 'teacher').get(),
+      db.collection('tutors').get(),
+    ]);
+
+    if (usersSnap) {
+      usersSnap.forEach((d) => {
+        const data = d.data();
+        if (data && (data.email || data.name)) {
+          rawList.push({ id: d.id, ...data, role: 'teacher' });
+        }
+      });
+    }
+
+    if (legacySnap) {
+      legacySnap.forEach((d) => {
+        const data = d.data();
+        if (data && (data.email || data.name)) {
+          rawList.push({ id: d.id, ...data, role: 'teacher' });
+        }
+      });
+    }
+
+    const results = consolidateTutorsList(rawList);
+    const approvedIds = results
+      .filter((t) => t.approvalStatus === 'approved' || t.isApproved === true)
+      .map((t) => t.publicTutorId || t.id || t.email);
+    console.log('[NativeFriends Server] Retrieved consolidated Firestore tutor IDs:', approvedIds);
+    return results;
+  };
+
+  const result = await withTimeout(fetchPromise(), 10000);
+  if (result === null) {
+    throw new Error('[serverFirestore] Timed out querying Firestore database (default) for tutors');
+  }
+  return result;
 }
 
 /**

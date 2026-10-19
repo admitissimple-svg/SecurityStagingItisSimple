@@ -185,6 +185,23 @@ export async function acquirePersistentLock(
     } catch (txErr: any) {
       console.warn('[BootstrapLock] Firestore transaction notice:', txErr?.message || txErr);
     }
+  } else if (db && typeof db.collection === 'function') {
+    try {
+      const doc = await db.collection('app_state').doc('admin_bootstrap').get();
+      if (doc && doc.exists) {
+        const data = doc.data() as BootstrapLockData;
+        if (data.status === 'completed') {
+          return { acquired: false, currentLock: data, error: 'ALREADY_COMPLETED' };
+        }
+        if (data.status === 'in_progress' && data.lockExpiresAt && now < data.lockExpiresAt) {
+          return { acquired: false, currentLock: data, error: 'CONCURRENT_ATTEMPT' };
+        }
+      }
+      await db.collection('app_state').doc('admin_bootstrap').set(newLock, { merge: true });
+      return { acquired: true, currentLock: newLock };
+    } catch (dbErr: any) {
+      console.warn('[BootstrapLock] Firestore direct lock inspection notice:', dbErr?.message || dbErr);
+    }
   }
 
   // File-based atomic fallback

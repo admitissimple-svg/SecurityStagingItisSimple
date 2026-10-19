@@ -187,6 +187,13 @@ export async function fetchPublicNativeFriendsFromFirestore(options?: {
           }
         });
       }
+    } else {
+      const errJson = await res.json().catch(() => null);
+      const errMsg = errJson?.message || errJson?.error || `HTTP ${res.status}`;
+      console.warn('[useNativeFriends] Backend /api/tutors fetch error:', errMsg);
+      if (options?.requireAdminToken) {
+        throw new Error(errMsg);
+      }
     }
   } catch (err) {
     console.warn('[useNativeFriends] Backend /api/tutors fetch notice:', err);
@@ -283,57 +290,10 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
 
     const attachRealtimeListeners = () => {
       cleanupRealtime();
-      if (!auth.currentUser) return;
-
-      const dbs = getAllFirestoreDbs();
-      dbs.forEach((dbInstance) => {
-        try {
-          const teachersQuery = query(collection(dbInstance, 'users'), where('role', '==', 'teacher'));
-          const unsubUsers = onSnapshot(
-            teachersQuery,
-            (snap) => {
-              if (!isMounted) return;
-              const liveList: NativeFriendTutor[] = [];
-              snap.forEach((d) => {
-                const tutor = normalizeTutorDoc(d.id, d.data());
-                if (tutor) liveList.push(tutor);
-              });
-              if (liveList.length > 0) {
-                setTutors((prev) => consolidateTutorsList([...prev, ...liveList]) as NativeFriendTutor[]);
-              }
-            },
-            (err) => {
-              // Gracefully ignore permission denied under restrictive Firestore security rules
-            }
-          );
-          realtimeUnsubs.push(unsubUsers);
-        } catch (err) {
-          console.warn('[useNativeFriends] Realtime users listener notice:', err);
-        }
-
-        try {
-          const unsubTutors = onSnapshot(
-            collection(dbInstance, 'tutors'),
-            (snap) => {
-              if (!isMounted) return;
-              const liveList: NativeFriendTutor[] = [];
-              snap.forEach((d) => {
-                const tutor = normalizeTutorDoc(d.id, d.data());
-                if (tutor) liveList.push(tutor);
-              });
-              if (liveList.length > 0) {
-                setTutors((prev) => consolidateTutorsList([...prev, ...liveList]) as NativeFriendTutor[]);
-              }
-            },
-            (err) => {
-              // Gracefully ignore permission denied under restrictive Firestore security rules
-            }
-          );
-          realtimeUnsubs.push(unsubTutors);
-        } catch (err) {
-          console.warn('[useNativeFriends] Realtime tutors listener notice:', err);
-        }
-      });
+      // Architecture requirement HOTFIX 4B.18:
+      // Keep direct frontend Firestore access disabled under existing default-deny security rules.
+      // All authorized Native Friend data reads/writes are served through authenticated backend APIs (/api/tutors).
+      return;
     };
 
     // Re-fetch and synchronize when authentication state transitions

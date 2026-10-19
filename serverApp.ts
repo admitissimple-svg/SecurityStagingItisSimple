@@ -37,12 +37,10 @@ if (isPlaceholder(process.env.FIREBASE_PROJECT_ID) && appletConfig?.projectId) {
 if (!process.env.FIREBASE_PROJECT_ID) {
   process.env.FIREBASE_PROJECT_ID = 'itissimple-security-staging';
 }
-if (isPlaceholder(process.env.FIREBASE_DATABASE_ID) && appletConfig?.firestoreDatabaseId) {
-  process.env.FIREBASE_DATABASE_ID = appletConfig.firestoreDatabaseId;
-}
-if (!process.env.FIREBASE_DATABASE_ID) {
-  process.env.FIREBASE_DATABASE_ID = '(default)';
-}
+// Canonical Firestore database consolidation — HOTFIX 4B.18
+// All application data strictly targets Firestore '(default)'
+process.env.FIREBASE_DATABASE_ID = '(default)';
+process.env.VITE_FIREBASE_DATABASE_ID = '(default)';
 
 if (appletConfig) {
   if (isPlaceholder(process.env.VITE_FIREBASE_PROJECT_ID) && appletConfig.projectId) {
@@ -62,9 +60,6 @@ if (appletConfig) {
   }
   if (isPlaceholder(process.env.VITE_FIREBASE_APP_ID) && appletConfig.appId) {
     process.env.VITE_FIREBASE_APP_ID = appletConfig.appId;
-  }
-  if (isPlaceholder(process.env.VITE_FIREBASE_DATABASE_ID) && appletConfig.firestoreDatabaseId) {
-    process.env.VITE_FIREBASE_DATABASE_ID = appletConfig.firestoreDatabaseId;
   }
 }
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
@@ -2547,9 +2542,21 @@ app.post('/api/landing-content', (req, res) => {
 });
 
 // 2. Teachers / Native Friends Endpoints
-app.get('/api/teachers', firebaseAuthMiddleware, requireAdmin, (req, res) => {
+app.get('/api/teachers', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
   const db = readDb();
-  res.json({ teachers: db.teachers || [] });
+  try {
+    const directTutors = await fetchTutorsFromFirestore();
+    const mergedList = [...(db.tutorsList || []), ...(directTutors || [])];
+    db.tutorsList = consolidateTutorsList(mergedList);
+  } catch (err: any) {
+    console.error('[serverApp] Error fetching teachers from Firestore (default):', err?.message || err);
+    return res.status(503).json({
+      error: 'FIRESTORE_QUERY_FAILED',
+      message: 'Failed to retrieve teachers from canonical Firestore database (default).',
+      details: err?.message ? String(err.message).replace(/[<>{}\\]/g, '') : 'Query failed',
+    });
+  }
+  res.json({ teachers: db.teachers || [], tutors: db.tutorsList || [] });
 });
 
 /**
@@ -2637,14 +2644,33 @@ app.get('/api/tutors', async (req, res) => {
   res.setHeader('Expires', '0');
 
   const db = readDb();
+  let firestoreQueryError: any = null;
   // Continuously synchronize tutors with Firestore so remotely created profiles (e.g. Charles) appear immediately
   try {
     const directTutors = await fetchTutorsFromFirestore();
     const mergedList = [...(db.tutorsList || []), ...(directTutors || [])];
     db.tutorsList = consolidateTutorsList(mergedList);
-  } catch (err) {
-    console.warn('Error fetching tutors from Firestore in GET /api/tutors:', err);
-    db.tutorsList = consolidateTutorsList(db.tutorsList || []);
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      console.info('[serverApp] Firestore (default) read restricted by cloud IAM credentials, continuing with local tutor state.');
+    } else {
+      firestoreQueryError = err;
+      console.warn('[serverApp] Error fetching tutors from Firestore (default) in GET /api/tutors:', err?.message || err);
+    }
+  }
+
+  // Security & Resilience HOTFIX 4B.18:
+  // Remove silent error suppression that converts Firestore read failures into empty successful responses.
+  // A failed Firestore query must not produce HTTP 200 with an empty candidate list.
+  if (firestoreQueryError && (!db.tutorsList || db.tutorsList.length === 0)) {
+    const sanitizedMsg = firestoreQueryError?.message
+      ? String(firestoreQueryError.message).replace(/[<>{}\\]/g, '')
+      : 'Query failed';
+    return res.status(503).json({
+      error: 'FIRESTORE_QUERY_FAILED',
+      message: 'Failed to retrieve teacher applications from canonical Firestore database (default).',
+      details: sanitizedMsg,
+    });
   }
 
   // SECURITY HOTFIX — Native Friends Public API Authorization
