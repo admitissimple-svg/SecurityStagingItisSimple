@@ -114,7 +114,7 @@ export const DE_TRANSLATIONS: Translations = {
   routineCoffeeSubtitle: '3 Min Video • 5 Wörter notiert',
   routineCommuteTitle: '08:30 - Podcast auf dem Arbeitsweg',
   routineCommuteSubtitle: '5 Min natürliches Hören',
-  routineMeetTitle: '15:00 - 25/50-Min-Meet mit Charles',
+  routineMeetTitle: '15:00 - 25/50-Min-Meet mit Native Friend',
   routineMeetSubtitle: 'Live-Konversation über Google Meet',
   routineJournalTitle: '22:00 - Satz des Tages (KI-Tagebuch)',
   routineJournalSubtitle: '1 Satz mit KI-Feedback',

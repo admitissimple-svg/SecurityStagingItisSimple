@@ -114,7 +114,7 @@ export const ZH_TRANSLATIONS: Translations = {
   routineCoffeeSubtitle: '3分钟视频 • 记录5个生词',
   routineCommuteTitle: '08:30 - 通勤播客',
   routineCommuteSubtitle: '5分钟自然听力',
-  routineMeetTitle: '15:00 - 与Charles进行25/50分钟会话',
+  routineMeetTitle: '15:00 - 与母语伙伴进行25/50分钟会话',
   routineMeetSubtitle: 'Google Meet实时交流',
   routineJournalTitle: '22:00 - 每日金句（AI学习日记）',
   routineJournalSubtitle: '由Gemini AI批改的1句话',

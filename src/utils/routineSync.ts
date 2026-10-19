@@ -134,18 +134,12 @@ export function normalizeStudentIdForPath(rawIdOrEmail: string): string {
   }
 
   // If active authenticated user matches the input by email (self-context as student only),
-  // return auth.currentUser.uid if valid. NEVER use auth.currentUser.uid if caller is teacher/admin!
+  // return auth.currentUser.uid if valid.
   if (auth?.currentUser?.uid && isValidCanonicalUid(auth.currentUser.uid)) {
     const curUid = auth.currentUser.uid;
     const curEmail = (auth.currentUser.email || '').toLowerCase().trim();
     const cleanLower = trimmed.toLowerCase();
-    const isTeacherOrAdmin = (
-      curEmail === 'adm.itissimple@gmail.com' ||
-      curEmail === 'admin@itissimple.com' ||
-      curEmail === 'estilobeeforkids@gmail.com' ||
-      curEmail === 'estilobeeadm@gmail.com'
-    );
-    if (!isTeacherOrAdmin && ((curEmail && cleanLower === curEmail) || cleanLower === curUid.toLowerCase())) {
+    if ((curEmail && cleanLower === curEmail) || cleanLower === curUid.toLowerCase()) {
       return curUid;
     }
   }

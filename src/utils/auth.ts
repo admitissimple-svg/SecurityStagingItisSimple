@@ -53,7 +53,7 @@ export async function requestYouTubeAuth(hintEmail = 'adm.itissimple@gmail.com')
  * Teacher Google Drive OAuth authorization.
  * Authenticates the teacher with Google and requests the drive.file scope,
  * returning the active OAuth access token to manage files directly in their personal Google Drive.
- * Supports optional login_hint (e.g. estilobeeforkids@gmail.com) for seamless, conflict-free authorization.
+ * Supports optional login_hint (e.g. teacher@example.com) for seamless, conflict-free authorization.
  */
 export async function requestGoogleDriveAuth(hintEmail?: string): Promise<string | null> {
   try {

@@ -114,7 +114,7 @@ export const IT_TRANSLATIONS: Translations = {
   routineCoffeeSubtitle: 'Video di 3 min • 5 parole annotate',
   routineCommuteTitle: '08:30 - Podcast durante il tragitto',
   routineCommuteSubtitle: '5 min di ascolto naturale',
-  routineMeetTitle: '15:00 - Sessione di 25/50 min con Charles',
+  routineMeetTitle: '15:00 - Sessione di 25/50 min con Native Friend',
   routineMeetSubtitle: 'Conversazione live su Google Meet',
   routineJournalTitle: '22:00 - Frase del Giorno (Diario IA)',
   routineJournalSubtitle: '1 frase corretta con l\'IA',

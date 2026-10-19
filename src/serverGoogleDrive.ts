@@ -110,7 +110,7 @@ export async function syncSessionNotesWithPlatformDrive(
   const studentName = (params.studentName || 'Student').trim();
   const sessionDate = (params.sessionDate || nowIso.split('T')[0]).trim();
   const fileName = formatSessionNotesFileName(studentName, sessionDate);
-  const teacherEmail = (params.teacherEmail || 'adm.itissimple@gmail.com').toLowerCase().trim();
+  const teacherEmail = (params.teacherEmail || '').toLowerCase().trim();
   const studentEmail = (params.studentEmail || '').toLowerCase().trim();
   const sessionKey =
     params.sessionKey ||

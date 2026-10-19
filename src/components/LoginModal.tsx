@@ -474,7 +474,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
                   onChange={(e) => setEmail(e.target.value)}
                   placeholder={
                     selectedRole === 'admin'
-                      ? 'admin@itissimple.com'
+                      ? 'adm.itissimple@gmail.com'
                       : isEn
                       ? 'your.email@domain.com'
                       : 'seu.email@dominio.com'

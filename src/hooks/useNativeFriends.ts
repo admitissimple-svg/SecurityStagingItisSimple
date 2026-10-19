@@ -178,7 +178,7 @@ export function normalizeTutorDoc(docId: string, data: any): NativeFriendTutor |
 
 /**
  * Direct fetch from unified Firestore collections across production and preview databases.
- * Guarantees no external/remote records (e.g. Charles) are filtered out.
+ * Guarantees no external/remote records (e.g. Teacher) are filtered out.
  */
 export async function fetchPublicNativeFriendsFromFirestore(options?: {
   requireAdminToken?: boolean;

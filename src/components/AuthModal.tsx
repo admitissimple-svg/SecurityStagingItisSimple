@@ -1184,7 +1184,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   onBlur={() => checkDuplicateEmail(email)}
                   placeholder={
                     role === 'admin'
-                      ? 'admin@itissimple.com'
+                      ? 'adm.itissimple@gmail.com'
                       : isEn ? 'name@example.com' : 'seu.email@exemplo.com'
                   }
                   className={`w-full pl-10 pr-4 py-2.5 bg-slate-50 border rounded-xl text-xs sm:text-sm font-medium text-[#000035] placeholder:text-slate-400 focus:outline-hidden focus:ring-2 focus:border-transparent transition ${

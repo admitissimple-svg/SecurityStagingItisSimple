@@ -1240,38 +1240,16 @@ export default function App() {
             (currentAccount!.picture && currentAccount!.picture.trim() !== '' ? currentAccount!.picture : '') ||
             '';
 
-          const isDisallowedDefaultTeacher = (e?: string | null, n?: string | null): boolean => {
-            if (!e && !n) return false;
-            const cleanE = (e || '').toLowerCase().trim();
-            const cleanN = (n || '').toLowerCase().trim();
-            const adminEmails = [
-              'adm.itissimple@gmail.com',
-              'estilobeeforkids@gmail.com',
-              'adm.itssimple@gmail.com',
-              'estilobeeadm@gmail.com',
-              'admin@itissimple.com',
-            ];
-            if (adminEmails.includes(cleanE)) return true;
-            if (cleanN.includes('adm') && cleanN.includes('simple')) return true;
-            return false;
-          };
-
           // Critical: Firestore assigned Native Friend and status take absolute precedence over default/stale API data!
-          let effectiveTeacherEmail =
+          const effectiveTeacherEmail =
             fsProfile?.teacherEmail !== undefined
               ? fsProfile.teacherEmail
               : apiProfileData?.teacherEmail || null;
 
-          let effectiveTeacherName =
+          const effectiveTeacherName =
             fsProfile?.teacherName !== undefined
               ? fsProfile.teacherName
               : apiProfileData?.teacherName || null;
-
-          // Prevent fallback to default hardcoded values (like adm.itissimple or estilobeeforkids) on initialization
-          if (isDisallowedDefaultTeacher(effectiveTeacherEmail, effectiveTeacherName)) {
-            effectiveTeacherEmail = null;
-            effectiveTeacherName = null;
-          }
 
           const effectiveEnrollment =
             fsProfile?.enrollmentStatus ||
@@ -5773,30 +5751,15 @@ export default function App() {
     const isTeacher = currentAccount?.role === 'teacher' || currentAccount?.role === 'admin';
     const teacherEmailClean = (currentAccount?.email || '').toLowerCase().trim();
     const teacherUid = (currentAccount?.id || (currentAccount as any)?.uid || '').trim();
-    const teacherNameClean = (currentAccount?.name || currentTutorProfile?.name || '').toLowerCase().trim();
+    const isAdmin = currentAccount?.role === 'admin';
 
-    const adminEmails = [
-      'adm.itissimple@gmail.com',
-      'adm.itssimple@gmail.com',
-    ];
-
-    const isMatchingTeacher = (sTeacherEmail?: string, sTeacherUid?: string, sTeacherName?: string) => {
+    const isMatchingTeacher = (sTeacherEmail?: string, sTeacherUid?: string, _sTeacherName?: string) => {
+      if (isAdmin) return true;
       const cleanSTeacher = (sTeacherEmail || '').toLowerCase().trim();
       const cleanSTeacherUid = (sTeacherUid || '').trim();
-      const cleanSTeacherName = (sTeacherName || '').toLowerCase().trim();
 
       if (teacherUid && cleanSTeacherUid && teacherUid === cleanSTeacherUid) return true;
       if (teacherEmailClean && cleanSTeacher && teacherEmailClean === cleanSTeacher) return true;
-
-      // Check admin aliases
-      if (adminEmails.includes(teacherEmailClean) && adminEmails.includes(cleanSTeacher)) return true;
-      if (adminEmails.includes(teacherEmailClean) && cleanSTeacherName.includes('simple')) return true;
-      if (teacherNameClean.includes('simple') && (adminEmails.includes(cleanSTeacher) || cleanSTeacherName.includes('simple'))) return true;
-
-      // Both active production students are assigned to Teacher Re (estilobeeforkids@gmail.com)
-      if (teacherEmailClean === 'estilobeeforkids@gmail.com' || adminEmails.includes(teacherEmailClean)) {
-        return true;
-      }
 
       return false;
     };

@@ -114,7 +114,7 @@ export const RU_TRANSLATIONS: Translations = {
   routineCoffeeSubtitle: '3 мин видео • 5 слов записано',
   routineCommuteTitle: '08:30 - Подкаст в дороге',
   routineCommuteSubtitle: '5 мин естественного аудирования',
-  routineMeetTitle: '15:00 - 25/50 мин разговор с Charles',
+  routineMeetTitle: '15:00 - 25/50 мин разговор с Native Friend',
   routineMeetSubtitle: 'Живое общение в Google Meet',
   routineJournalTitle: '22:00 - Фраза дня (Дневник с ИИ)',
   routineJournalSubtitle: '1 предложение с разбором от ИИ',

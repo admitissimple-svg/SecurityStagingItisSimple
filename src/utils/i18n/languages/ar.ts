@@ -114,7 +114,7 @@ export const AR_TRANSLATIONS: Translations = {
   routineCoffeeSubtitle: 'فيديو 3 دقائق • 5 كلمات مسجلة',
   routineCommuteTitle: '08:30 - بودكاست أثناء التنقل',
   routineCommuteSubtitle: '5 دقائق استماع طبيعي',
-  routineMeetTitle: '15:00 - لقاء 25/50 دقيقة مع Charles',
+  routineMeetTitle: '15:00 - لقاء 25/50 دقيقة مع الصديق الأصلي',
   routineMeetSubtitle: 'محادثة مباشرة عبر Google Meet',
   routineJournalTitle: '22:00 - جملة اليوم (مذكرات الذكاء الاصطناعي)',
   routineJournalSubtitle: 'جملة واحدة مصححة بالذكاء الاصطناعي',

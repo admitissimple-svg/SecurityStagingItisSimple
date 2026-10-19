@@ -832,7 +832,7 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
 
   const questions: ReadingQuestion[] = [];
 
-  // SCENARIO 1: The Modern Workplace & Leadership (Regina's specific scenario: nowadays, relationship, boss, employee, environment)
+  // SCENARIO 1: The Modern Workplace & Leadership (Student's specific scenario: nowadays, relationship, boss, employee, environment)
   if (nowadays && environment && (boss || employee || relationship)) {
     title = `Leadership and Culture in the Modern Workplace (${levelLabel})`;
 

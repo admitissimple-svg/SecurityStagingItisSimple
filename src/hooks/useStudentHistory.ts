@@ -64,22 +64,17 @@ export async function verifyStudentNativeFriendLink(
 ): Promise<boolean> {
   const cleanStudent = cleanDocId(studentUid);
   const cleanTeacher = cleanDocId(nativeFriendUid);
+  const currentEmail = (auth.currentUser?.email || '').toLowerCase().trim();
   if (!cleanStudent) return false;
 
-  // 1. Admin bypass - Admins oversee all students and tutors
-  const currentEmail = (auth.currentUser?.email || '').toLowerCase().trim();
-  const adminEmails = [
-    'adm.itissimple@gmail.com',
-    'estilobeeforkids@gmail.com',
-    'adm.itssimple@gmail.com',
-    'estilobeeadm@gmail.com',
-  ];
-  if (
-    cleanTeacher === 'admin' ||
-    adminEmails.includes(currentEmail) ||
-    currentEmail.includes('admin')
-  ) {
-    return true;
+  // 1. Admin bypass - Admins oversee all students and tutors via verified Custom Claims
+  if (auth.currentUser) {
+    try {
+      const tokenResult = await auth.currentUser.getIdTokenResult();
+      if (tokenResult?.claims?.role === 'admin' || tokenResult?.claims?.admin === true) {
+        return true;
+      }
+    } catch {}
   }
 
   // 2. Student accessing their own history

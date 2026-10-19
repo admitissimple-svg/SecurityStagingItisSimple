@@ -648,9 +648,7 @@ function mergeDbWithDefaults(parsed: any): AppDb {
     deletedTutorEmails: Array.isArray(parsed?.deletedTutorEmails) ? parsed.deletedTutorEmails : [],
     deletedStudentEmails: Array.isArray(parsed?.deletedStudentEmails) ? parsed.deletedStudentEmails : [],
     tutorsList: Array.isArray(parsed?.tutorsList) ? parsed.tutorsList : [],
-    teachers: (Array.isArray(parsed?.teachers) ? parsed.teachers : DEFAULT_DB.teachers).filter(
-      (t: any) => t.email?.toLowerCase() !== 'reginahelena1980@gmail.com' && !t.name?.toLowerCase().includes('regina')
-    ),
+    teachers: Array.isArray(parsed?.teachers) ? parsed.teachers : DEFAULT_DB.teachers,
     students: (Array.isArray(parsed?.students) ? parsed.students : []).filter((s: any) => {
       const email = (s.email || s.studentEmail || '').toLowerCase().trim();
       const deletedStudentList: string[] = Array.isArray(parsed?.deletedStudentEmails) ? parsed.deletedStudentEmails : [];
@@ -1015,7 +1013,7 @@ async function initCloudPersistence() {
       });
       const mergedTeachers = Array.from(teacherMap.values()).filter((t: any) => {
         const em = (t.email || '').toLowerCase().trim();
-        if (t.role === 'admin' || em === 'adm.itissimple@gmail.com') return true;
+        if (t.role === 'admin') return true;
         return !allDeletedTutorEmails.includes(em);
       });
 
@@ -1052,7 +1050,7 @@ async function initCloudPersistence() {
       });
 
       allDeletedTutorEmails.forEach((em) => {
-        if (em !== 'adm.itissimple@gmail.com') {
+        if (mergedAuthUsers[em]?.role !== 'admin') {
           delete mergedUserProfiles[em];
           if (mergedAuthUsers[em]?.role === 'teacher') {
             delete mergedAuthUsers[em];
@@ -2793,7 +2791,7 @@ app.get('/api/tutors', async (req, res) => {
 
   const db = readDb();
   let firestoreQueryError: any = null;
-  // Continuously synchronize tutors with Firestore so remotely created profiles (e.g. Charles) appear immediately
+  // Continuously synchronize tutors with Firestore so remotely created profiles (e.g. Teacher) appear immediately
   try {
     const directTutors = await fetchTutorsFromFirestore();
     const mergedList = [...(db.tutorsList || []), ...(directTutors || [])];
@@ -2932,8 +2930,8 @@ app.post('/api/tutors', async (req, res) => {
 
   // Prevent hijacking or overwriting administrator accounts
   const isTargetAdmin =
-    cleanEmail === 'adm.itissimple@gmail.com' ||
-    (db.teachers || []).some((t: any) => t.email?.toLowerCase() === cleanEmail && t.role === 'admin');
+    (db.teachers || []).some((t: any) => t.email?.toLowerCase() === cleanEmail && t.role === 'admin') ||
+    (db.authUsers && db.authUsers[cleanEmail]?.role === 'admin');
   if (isTargetAdmin && !isAdminCaller) {
     return res.status(403).json({
       error: 'Forbidden',
@@ -3363,8 +3361,8 @@ app.put('/api/tutors/:id', firebaseAuthMiddleware, async (req, res) => {
 
   // Prevent modifying an administrator account through tutor profile endpoint by non-admin
   const isTargetAdmin =
-    existingEmail === 'adm.itissimple@gmail.com' ||
-    (db.teachers || []).some((t: any) => t.email?.toLowerCase() === existingEmail && t.role === 'admin');
+    (db.teachers || []).some((t: any) => t.email?.toLowerCase() === existingEmail && t.role === 'admin') ||
+    (db.authUsers && db.authUsers[existingEmail]?.role === 'admin');
 
   if (isTargetAdmin && !isAdmin) {
     return res.status(403).json({
@@ -3590,11 +3588,13 @@ app.delete('/api/tutors/:id', firebaseAuthMiddleware, requireAdmin, async (req, 
   )?.toLowerCase();
 
   // Safeguard: Primary administrator account can NEVER be deleted via tutors endpoint
-  if (
-    targetEmail === 'adm.itissimple@gmail.com' ||
-    tutorId.toLowerCase() === 'adm.itissimple@gmail.com' ||
-    (targetTutor && (targetTutor.role === 'admin' || targetTutor.email?.toLowerCase() === 'adm.itissimple@gmail.com'))
-  ) {
+  const isTargetAdmin = Boolean(
+    targetTutor?.role === 'admin' ||
+    (db.teachers || []).some((t: any) => t.email?.toLowerCase() === targetEmail && t.role === 'admin') ||
+    (db.authUsers && db.authUsers[targetEmail]?.role === 'admin')
+  );
+
+  if (isTargetAdmin) {
     return res.status(403).json({
       error: 'Forbidden',
       message: 'Cannot delete primary system administrator account',
@@ -3623,10 +3623,10 @@ app.delete('/api/tutors/:id', firebaseAuthMiddleware, requireAdmin, async (req, 
     db.teachers = (db.teachers || []).filter(
       (t: any) => t.email?.toLowerCase() !== targetEmail || t.role === 'admin'
     );
-    if (db.meetSettings && targetEmail !== 'adm.itissimple@gmail.com') {
+    if (db.meetSettings && !isTargetAdmin) {
       delete db.meetSettings[targetEmail];
     }
-    if (db.teacherSettings && targetEmail !== 'adm.itissimple@gmail.com') {
+    if (db.teacherSettings && !isTargetAdmin) {
       delete db.teacherSettings[targetEmail];
     }
     // Only delete from authUsers if their role is teacher and not admin!
@@ -3907,8 +3907,8 @@ app.post('/api/teachers', firebaseAuthMiddleware, requireAdmin, (req, res) => {
 
   // Prevent modifying or downgrading administrator accounts
   const isTargetAdmin =
-    cleanEmail === 'adm.itissimple@gmail.com' ||
-    (db.teachers || []).some((t: any) => t.email?.toLowerCase() === cleanEmail && t.role === 'admin');
+    (db.teachers || []).some((t: any) => t.email?.toLowerCase() === cleanEmail && t.role === 'admin') ||
+    (db.authUsers && db.authUsers[cleanEmail]?.role === 'admin');
 
   if (isTargetAdmin) {
     return res.status(403).json({
@@ -3937,8 +3937,8 @@ app.delete('/api/teachers/:email', firebaseAuthMiddleware, requireAdmin, (req, r
   const db = readDb();
   const email = decodeURIComponent(req.params.email).toLowerCase().trim();
   const isTargetAdmin =
-    email === 'adm.itissimple@gmail.com' ||
-    (db.teachers || []).some((t: any) => t.email?.toLowerCase() === email && t.role === 'admin');
+    (db.teachers || []).some((t: any) => t.email?.toLowerCase() === email && t.role === 'admin') ||
+    (db.authUsers && db.authUsers[email]?.role === 'admin');
 
   if (isTargetAdmin) {
     return res.status(403).json({
@@ -4634,34 +4634,13 @@ app.get('/api/students', async (req, res) => {
   res.setHeader('Expires', '0');
 
   const db = readDb();
-  const requesterEmail = (
-    (req.query.email as string) ||
-    (req.query.teacherEmail as string) ||
-    (req.query.studentEmail as string) ||
-    ''
-  ).toLowerCase().trim();
-  const role = req.query.role as string;
-  const uid = (req.query.uid as string) || '';
-
-  const adminEmails = [
-    'adm.itissimple@gmail.com',
-    'estilobeeforkids@gmail.com',
-    'adm.itssimple@gmail.com',
-    'estilobeeadm@gmail.com',
-  ];
-
-  const isTeacherAlias = (tEmail: string, searchEmail: string) => {
-    const t = (tEmail || '').toLowerCase().trim();
-    const s = (searchEmail || '').toLowerCase().trim();
-    if (!t || !s) return false;
-    if (t === s) return true;
-    if (adminEmails.includes(t) && adminEmails.includes(s)) return true;
-    return false;
-  };
-
   const verifiedCaller = await getVerifiedUserFromRequest(req);
+  const paramRole = req.query.role as string;
+  const paramEmail = ((req.query.email || req.query.teacherEmail || req.query.studentEmail) as string || '').toLowerCase().trim();
+  const paramUid = ((req.query.uid || req.query.studentUid) as string || '').trim();
+
   const isAdmin = verifiedCaller?.role === 'admin';
-  const isTeacher = (verifiedCaller?.role === 'teacher' || role === 'teacher' || Boolean(req.query.teacherEmail)) && !isAdmin;
+  const isTeacher = verifiedCaller ? verifiedCaller.role === 'teacher' : (paramRole === 'teacher' && Boolean(paramEmail || paramUid));
 
   // Admin gets all active students directly
   if (isAdmin) {
@@ -4674,32 +4653,30 @@ app.get('/api/students', async (req, res) => {
   }
 
   if (isTeacher) {
+    const callerUid = verifiedCaller?.uid || paramUid;
+    const callerEmail = (verifiedCaller?.email || paramEmail || '').toLowerCase().trim();
     const studentMap = new Map<string, any>();
 
-    // 1. From db.students where teacherEmail matches and subscription is not cancelled
+    // 1. From db.students where teacherUid or teacherEmail matches caller
     (db.students || []).forEach((s: any) => {
       const sTeacher = (s.teacherEmail || '').toLowerCase().trim();
       const sTeacherUid = s.teacherUid || '';
-      const sTeacherName = (s.teacherName || '').toLowerCase().trim();
       const sStatus = s.status || s.enrollmentStatus;
 
-      // Filter out cancelled or not enrolled students
-      if (sStatus === 'cancelled' || sStatus === 'not_enrolled') {
-        return;
-      }
+      if (sStatus === 'cancelled' || sStatus === 'not_enrolled') return;
 
       const matchesTeacher =
-        isTeacherAlias(sTeacher, requesterEmail) ||
-        (uid && sTeacherUid === uid) ||
-        (adminEmails.includes(requesterEmail) && sTeacherName.includes('simple'));
+        Boolean(callerUid && sTeacherUid && (sTeacherUid === callerUid || sTeacherUid === `tutor-${callerUid}`)) ||
+        Boolean(callerEmail && sTeacher && sTeacher === callerEmail);
 
       if (matchesTeacher) {
         const sEmail = (s.email || s.studentEmail || '').toLowerCase().trim();
-        // Check if student profile was transferred or cancelled
         const p = db.userProfiles?.[sEmail];
         if (p) {
           const pTeacher = (p.teacherEmail || '').toLowerCase().trim();
-          if (pTeacher && !isTeacherAlias(pTeacher, requesterEmail)) return;
+          const pTeacherUid = p.teacherUid || '';
+          if (pTeacherUid && callerUid && pTeacherUid !== callerUid && pTeacherUid !== `tutor-${callerUid}`) return;
+          if (pTeacher && callerEmail && pTeacher !== callerEmail) return;
           if (p.enrollmentStatus === 'cancelled' || p.enrollmentStatus === 'not_enrolled') return;
         }
         if (sEmail) {
@@ -4715,14 +4692,14 @@ app.get('/api/students', async (req, res) => {
       }
     });
 
-    // 2. From db.userProfiles where teacherEmail matches and enrollment is active
+    // 2. From db.userProfiles where teacher matches
     Object.entries(db.userProfiles || {}).forEach(([pEmail, profile]: [string, any]) => {
       const cleanPEmail = pEmail.toLowerCase().trim();
       const pTeacher = (profile.teacherEmail || '').toLowerCase().trim();
-      const pTeacherName = (profile.teacherName || '').toLowerCase().trim();
+      const pTeacherUid = profile.teacherUid || '';
       const matchesTeacher =
-        isTeacherAlias(pTeacher, requesterEmail) ||
-        (adminEmails.includes(requesterEmail) && pTeacherName.includes('simple'));
+        Boolean(callerUid && pTeacherUid && (pTeacherUid === callerUid || pTeacherUid === `tutor-${callerUid}`)) ||
+        Boolean(callerEmail && pTeacher && pTeacher === callerEmail);
 
       if (matchesTeacher && profile.role !== 'teacher' && profile.role !== 'admin') {
         if (profile.enrollmentStatus === 'cancelled' || profile.enrollmentStatus === 'not_enrolled' || profile.status === 'cancelled') {
@@ -4730,7 +4707,9 @@ app.get('/api/students', async (req, res) => {
         }
         if (!studentMap.has(cleanPEmail)) {
           studentMap.set(cleanPEmail, {
-            id: profile.id || `st-${cleanPEmail.replace(/[^a-zA-Z0-9]/g, '-')}`,
+            id: profile.uid || profile.id || `st-${cleanPEmail.replace(/[^a-zA-Z0-9]/g, '-')}`,
+            uid: profile.uid || profile.id,
+            studentUid: profile.uid || profile.id,
             name: profile.name || cleanPEmail.split('@')[0],
             studentName: profile.name || cleanPEmail.split('@')[0],
             email: cleanPEmail,
@@ -4739,7 +4718,8 @@ app.get('/api/students', async (req, res) => {
             studentLevel: profile.level || 'iniciante',
             goal: profile.learningGoal || 'English for everyday life & work',
             learningGoal: profile.learningGoal || 'English for everyday life & work',
-            teacherEmail: requesterEmail,
+            teacherEmail: profile.teacherEmail,
+            teacherUid: profile.teacherUid,
             teacherName: profile.teacherName || '',
             contractedLessons: Number(profile.contractedLessons ?? db.contractedLessons?.[cleanPEmail] ?? 0),
             completedLessonsCount: Number(profile.completedLessonsCount || 0),
@@ -4752,28 +4732,36 @@ app.get('/api/students', async (req, res) => {
       }
     });
 
-    // 3. From db.liveLessons where teacherEmail matches and lesson is scheduled/active
+    // 3. From db.liveLessons where teacher matches and lesson is scheduled/active
     (db.liveLessons || []).forEach((l: any) => {
-      const lTeacher = (l.teacherEmail || l.tutorEmail || '').toLowerCase().trim();
-      if (isTeacherAlias(lTeacher, requesterEmail) && l.status === 'scheduled') {
+      if (l.status === 'cancelled') return;
+      const lTeacherEmail = (l.teacherEmail || l.tutorEmail || '').toLowerCase().trim();
+      const lTeacherUid = (l.teacherUid || l.tutorUid || '').trim();
+      const matchesTeacher =
+        Boolean(callerUid && lTeacherUid && (lTeacherUid === callerUid || lTeacherUid === `tutor-${callerUid}`)) ||
+        Boolean(callerEmail && lTeacherEmail && lTeacherEmail === callerEmail);
+
+      if (matchesTeacher && l.studentEmail) {
         const sEmail = (l.studentEmail || '').toLowerCase().trim();
         const p = db.userProfiles?.[sEmail];
         const st = (db.students || []).find((s: any) => (s.email || s.studentEmail || '').toLowerCase().trim() === sEmail);
-        // Exclude if student is known to be cancelled or not enrolled
         if (p?.enrollmentStatus === 'cancelled' || p?.enrollmentStatus === 'not_enrolled' || p?.status === 'cancelled') return;
         if (st?.status === 'cancelled' || st?.status === 'not_enrolled' || st?.enrollmentStatus === 'not_enrolled') return;
         if (sEmail && !studentMap.has(sEmail)) {
           studentMap.set(sEmail, {
-            id: `st-${sEmail.replace(/[^a-zA-Z0-9]/g, '-')}`,
+            id: l.studentUid || p?.uid || p?.id || `st-${sEmail.replace(/[^a-zA-Z0-9]/g, '-')}`,
+            uid: l.studentUid || p?.uid || p?.id,
+            studentUid: l.studentUid || p?.uid || p?.id,
             name: l.studentName || sEmail.split('@')[0],
             studentName: l.studentName || sEmail.split('@')[0],
             email: sEmail,
             studentEmail: sEmail,
-            level: 'iniciante',
-            studentLevel: 'iniciante',
-            goal: 'English for everyday life & work',
-            learningGoal: 'English for everyday life & work',
-            teacherEmail: requesterEmail,
+            level: p?.level || 'iniciante',
+            studentLevel: p?.level || 'iniciante',
+            goal: p?.learningGoal || 'English for everyday life & work',
+            learningGoal: p?.learningGoal || 'English for everyday life & work',
+            teacherEmail: l.teacherEmail,
+            teacherUid: l.teacherUid,
             teacherName: l.teacherName || '',
             status: 'active',
           });
@@ -4788,15 +4776,39 @@ app.get('/api/students', async (req, res) => {
     return res.json(filteredStudents);
   }
 
-  if (role === 'student' || req.query.studentEmail) {
+  // Student caller: may ONLY view their own student record
+  const studentTargetUid = verifiedCaller?.uid || paramUid;
+  const studentTargetEmail = (verifiedCaller?.email || paramEmail || '').toLowerCase().trim();
+
+  if (studentTargetUid || studentTargetEmail) {
     const list = (db.students || []).filter((s: any) => {
       const em = (s.email || s.studentEmail || '').toLowerCase().trim();
-      return Boolean(em && !(db.deletedStudentEmails || []).includes(em)) && (em === requesterEmail || (uid && s.uid === uid));
+      const u = (s.uid || s.studentUid || s.id || '').trim();
+      const matches = (studentTargetUid && u && studentTargetUid === u) || (studentTargetEmail && em && studentTargetEmail === em);
+      return matches && !(db.deletedStudentEmails || []).includes(em);
     });
-    return res.json(list);
+    if (list.length > 0) return res.json(list);
+
+    const prof = db.userProfiles?.[studentTargetEmail];
+    if (prof) {
+      return res.json([{
+        id: prof.uid || prof.id || studentTargetUid || studentTargetEmail,
+        uid: prof.uid || prof.id || studentTargetUid,
+        studentUid: prof.uid || prof.id || studentTargetUid,
+        name: prof.name || studentTargetEmail.split('@')[0],
+        email: studentTargetEmail,
+        studentEmail: studentTargetEmail,
+        level: prof.level || 'iniciante',
+        goal: prof.learningGoal || 'English for everyday life & work',
+        status: prof.enrollmentStatus || 'active',
+        teacherEmail: prof.teacherEmail,
+        teacherUid: prof.teacherUid,
+        teacherName: prof.teacherName,
+      }]);
+    }
   }
 
-  // If unauthenticated or no matching filter, return empty array to prevent data leaks
+  // If unauthenticated or no matching filter, return empty array
   res.json([]);
 });
 
@@ -5018,22 +5030,9 @@ app.get('/api/user-profile', (req, res) => {
     (s) => (s.email || s.studentEmail || '').toLowerCase() === email
   );
 
-  const isDisallowedAdminTeacher = (em?: string, nm?: string) => {
-    const cE = (em || '').toLowerCase().trim();
-    const cN = (nm || '').toLowerCase().trim();
-    return (
-      cE === 'adm.itissimple@gmail.com' ||
-      cE === 'estilobeeforkids@gmail.com' ||
-      cE === 'adm.itssimple@gmail.com' ||
-      cE === 'estilobeeadm@gmail.com' ||
-      cE === 'admin@itissimple.com' ||
-      cN.includes('simple')
-    );
-  };
-
   if (profile && student) {
-    const fallbackTeacherEmail = isDisallowedAdminTeacher(student.teacherEmail, student.teacherName) ? null : student.teacherEmail;
-    const fallbackTeacherName = isDisallowedAdminTeacher(student.teacherEmail, student.teacherName) ? null : student.teacherName;
+    const fallbackTeacherEmail = student.teacherEmail || null;
+    const fallbackTeacherName = student.teacherName || null;
     const canonicalResolvedUid = (uid && !uid.startsWith('usr-') && !uid.startsWith('st-')) ? uid : (profile.uid || (profile.id && !profile.id.startsWith('usr-') && !profile.id.startsWith('st-') ? profile.id : null) || student.uid || student.id || profile.id);
     // Fill in any missing fields from student without overwriting existing profile data
     profile = {
@@ -5054,8 +5053,8 @@ app.get('/api/user-profile', (req, res) => {
     db.userProfiles[email] = profile;
     writeDb(db);
   } else if (!profile && student) {
-    const fallbackTeacherEmail = isDisallowedAdminTeacher(student.teacherEmail, student.teacherName) ? null : student.teacherEmail;
-    const fallbackTeacherName = isDisallowedAdminTeacher(student.teacherEmail, student.teacherName) ? null : student.teacherName;
+    const fallbackTeacherEmail = student.teacherEmail || null;
+    const fallbackTeacherName = student.teacherName || null;
     const canonicalResolvedUid = (uid && !uid.startsWith('usr-') && !uid.startsWith('st-')) ? uid : (student.uid || student.id || `usr-${Date.now()}`);
     profile = {
       id: canonicalResolvedUid,
@@ -7854,7 +7853,7 @@ app.post('/api/session-notes', async (req, res) => {
   const cleanDate = sessionDate || new Date().toISOString().split('T')[0];
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
   const sessionKey = id || (lessonId ? lessonId : `session_${cleanDate}_${cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_')}`);
-  const targetTeacherEmail = (teacherEmail || 'adm.itissimple@gmail.com').toLowerCase().trim();
+  const targetTeacherEmail = (teacherEmail || '').toLowerCase().trim();
 
   // Store Drive sync metadata if provided by explicit teacher action
   let finalDriveFileId = driveFileId || db.sessionNotesMap?.[sessionKey]?.driveFileId || '';
@@ -7949,7 +7948,7 @@ app.post('/api/drive/sync-session-notes', async (req, res) => {
   try {
     const cleanDate = (sessionDate || new Date().toISOString().split('T')[0]).trim();
     const cleanStudentEmail = (studentEmail || '').toLowerCase().trim();
-    const cleanTeacherEmail = (teacherEmail || 'adm.itissimple@gmail.com').toLowerCase().trim();
+    const cleanTeacherEmail = (teacherEmail || '').toLowerCase().trim();
     const effectiveKey = sessionKey || lessonId || `session_${cleanDate}_${cleanStudentEmail.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
 
     const driveRes = await syncSessionNotesWithPlatformDrive({
@@ -8173,7 +8172,7 @@ app.get('/api/session-notes', async (req, res) => {
           lessonId: matchLesson.id,
           studentEmail: matchLesson.studentEmail,
           studentUid: matchLesson.studentUid,
-          teacherEmail: matchLesson.teacherEmail || matchLesson.tutorEmail || 'adm.itissimple@gmail.com',
+          teacherEmail: matchLesson.teacherEmail || matchLesson.tutorEmail || '',
           teacherName: matchLesson.teacherName || matchLesson.tutorName || 'Native Friend',
           topic: matchLesson.title || 'Conversation & Fluency',
           content: matchLesson.sessionNotesDocument || matchLesson.liveNotes || matchLesson.recommendations || '',
@@ -8217,7 +8216,7 @@ app.get('/api/session-notes', async (req, res) => {
               lessonId: l.id,
               studentEmail: l.studentEmail || studentEmail,
               studentUid: l.studentUid || studentUid,
-              teacherEmail: l.teacherEmail || l.tutorEmail || 'adm.itissimple@gmail.com',
+              teacherEmail: l.teacherEmail || l.tutorEmail || '',
               teacherName: l.teacherName || l.tutorName || 'Native Friend',
               topic: l.title || 'Conversation & Fluency',
               content: noteContent,
@@ -12456,45 +12455,10 @@ export async function authorizeStudentAccess(
   const db = readDb();
 
   // 2. Identify caller's trusted server role (admin / teacher / student)
-  const AUTHORITATIVE_ADMIN_EMAILS = new Set([
-    'adm.itissimple@gmail.com',
-    'estilobeeforkids@gmail.com',
-    'adm.itssimple@gmail.com',
-    'estilobeeadm@gmail.com',
-    'admin@itissimple.com',
-  ]);
-
-  const isAdminByEmail = Boolean(
-    callerEmail &&
-    callerEmailVerified &&
-    AUTHORITATIVE_ADMIN_EMAILS.has(callerEmail)
-  );
-
-  const isAdminByTeachers = Boolean(
-    db.teachers?.some((t: any) =>
-      t.role === 'admin' && (
-        (t.uid && t.uid === callerUid) ||
-        (t.id && (t.id === callerUid || t.id === `tutor-${callerUid}`)) ||
-        (callerEmailVerified && t.email && t.email.toLowerCase().trim() === callerEmail)
-      )
-    )
-  );
-
-  const isAdminByAuthUsers = Boolean(
-    db.authUsers &&
-    Object.values(db.authUsers).some((u: any) =>
-      u.role === 'admin' && (
-        (u.uid && u.uid === callerUid) ||
-        (callerEmailVerified && u.email && u.email.toLowerCase().trim() === callerEmail)
-      )
-    )
-  );
-
-  const isVerifiedAdmin =
-    callerTokenRole === 'admin' ||
-    isAdminByEmail ||
-    isAdminByTeachers ||
-    isAdminByAuthUsers;
+  // Strictly enforce that administrator privileges require the verified custom claim role: 'admin'
+  // from the cryptographically verified Firebase ID token (req.user.role === 'admin').
+  // Automatic administrative privileges based solely on email matching or local db stubs are strictly eliminated.
+  const isVerifiedAdmin = callerTokenRole === 'admin';
 
   let isVerifiedTeacher = false;
   if (!isVerifiedAdmin) {
@@ -13483,7 +13447,7 @@ async function generatePart4StoryWithGemini(
   if (!apiKey || !Array.isArray(words) || words.length === 0) return null;
 
   const levelMeta = normalizeStudentLevel(studentLevel);
-  const protagonist = (studentName && studentName !== 'Student' ? studentName.split(' ')[0] : 'Regina').trim();
+  const protagonist = (studentName && studentName !== 'Student' ? studentName.split(' ')[0] : 'Student').trim();
 
   const systemInstruction = `You are a distinguished literary author, linguistic stylist, and senior English Language Teaching (ELT) instructional designer for "It's Simple - Learn English by Living Your Life".
 Your mission is to craft a 100% ORIGINAL, INÉDITA, and COMPELLING short story (Part 4: Routine Reading & Interpretation) and dynamic, narrative-grounded reading comprehension questions tailored to the student's proficiency level (${levelMeta.labelEn} - CEFR ${levelMeta.cefr}).

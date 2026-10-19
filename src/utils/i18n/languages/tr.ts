@@ -114,7 +114,7 @@ export const TR_TRANSLATIONS: Translations = {
   routineCoffeeSubtitle: '3 dk video • 5 kelime kaydedildi',
   routineCommuteTitle: '08:30 - Yolda Podcast',
   routineCommuteSubtitle: '5 dk doğal dinleme',
-  routineMeetTitle: '15:00 - Charles ile 25/50 dk Meet',
+  routineMeetTitle: '15:00 - Native Friend ile 25/50 dk Meet',
   routineMeetSubtitle: 'Google Meet üzerinden canlı sohbet',
   routineJournalTitle: '22:00 - Günün Cümlesi (AI Günlük)',
   routineJournalSubtitle: 'Yapay zeka ile düzeltilmiş 1 cümle',

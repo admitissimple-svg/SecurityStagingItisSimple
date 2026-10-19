@@ -114,7 +114,7 @@ export const KO_TRANSLATIONS: Translations = {
   routineCoffeeSubtitle: '3분 영상 • 5개 단어 기록',
   routineCommuteTitle: '08:30 - 출근길 팟캐스트',
   routineCommuteSubtitle: '5분 자연스러운 리스닝',
-  routineMeetTitle: '15:00 - Charles 튜터와 25/50분 세션',
+  routineMeetTitle: '15:00 - 네이티브 프렌드와 25/50분 세션',
   routineMeetSubtitle: 'Google Meet 라이브 회화',
   routineJournalTitle: '22:00 - 오늘의 문장 (AI 저널)',
   routineJournalSubtitle: 'AI 첨삭이 포함된 1문장',

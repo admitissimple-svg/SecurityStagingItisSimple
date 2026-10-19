@@ -114,28 +114,15 @@ export const TeacherScheduleControlTable: React.FC<TeacherScheduleControlTablePr
     const currentTeacherName = (currentAccount?.name || tutorProfile?.name || '').toLowerCase().trim();
     const isTeacher = currentAccount ? (currentAccount.role === 'teacher' || currentAccount.role === 'admin') : false;
 
-    const adminEmails = [
-      'adm.itissimple@gmail.com',
-      'adm.itssimple@gmail.com',
-    ];
+    const isAdmin = currentAccount ? currentAccount.role === 'admin' : false;
 
-    const isMatchingTeacher = (sTeacherEmail?: string, sTeacherUid?: string, sTeacherName?: string) => {
+    const isMatchingTeacher = (sTeacherEmail?: string, sTeacherUid?: string, _sTeacherName?: string) => {
+      if (isAdmin) return true;
       const cleanSTeacher = (sTeacherEmail || '').toLowerCase().trim();
       const cleanSTeacherUid = (sTeacherUid || '').trim();
-      const cleanSTeacherName = (sTeacherName || '').toLowerCase().trim();
 
       if (currentTeacherUid && cleanSTeacherUid && currentTeacherUid === cleanSTeacherUid) return true;
       if (teacherEmailClean && cleanSTeacher && teacherEmailClean === cleanSTeacher) return true;
-
-      // Check admin aliases
-      if (adminEmails.includes(teacherEmailClean) && adminEmails.includes(cleanSTeacher)) return true;
-      if (adminEmails.includes(teacherEmailClean) && cleanSTeacherName.includes('simple')) return true;
-      if (currentTeacherName.includes('simple') && (adminEmails.includes(cleanSTeacher) || cleanSTeacherName.includes('simple'))) return true;
-
-      // Both active production students are assigned to Teacher Re (estilobeeforkids@gmail.com)
-      if (teacherEmailClean === 'estilobeeforkids@gmail.com' || adminEmails.includes(teacherEmailClean)) {
-        return true;
-      }
 
       return false;
     };

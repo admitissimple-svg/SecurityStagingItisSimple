@@ -107,7 +107,7 @@ export const HeaderMessagesPopover: React.FC<HeaderMessagesPopoverProps> = ({
       return normalizeUid(
         (currentAccount as any)?.uid ||
           currentAccount?.id ||
-          (currentAccount?.email ? `tutor-${currentAccount.email.replace(/[^a-zA-Z0-9]/g, '-')}` : 'tutor-default')
+          (currentAccount?.email ? `tutor-${currentAccount.email.replace(/[^a-zA-Z0-9]/g, '-')}` : '')
       );
     }
     return normalizeUid(
@@ -115,7 +115,7 @@ export const HeaderMessagesPopover: React.FC<HeaderMessagesPopoverProps> = ({
         activeNativeFriend?.id ||
         (activeNativeFriend?.email
           ? `tutor-${activeNativeFriend.email.replace(/[^a-zA-Z0-9]/g, '-')}`
-          : 'tutor-charles-001')
+          : '')
     );
   }, [isTeacher, currentAccount, activeNativeFriend]);
 

@@ -84,19 +84,18 @@ export const LiveMeetLessonsPanel: React.FC<LiveMeetLessonsPanelProps> = ({
         }
         return true;
       } else {
-        // In student view, show scheduled lessons for this student
-        if (currentAccount?.email) {
-          const myEmail = currentAccount.email.toLowerCase().trim();
-          const myName = (currentAccount.name || '').toLowerCase().trim();
+        // In student view, show scheduled lessons for this student strictly by canonical UID or email
+        if (currentAccount && (currentAccount.email || currentAccount.id || (currentAccount as any).uid)) {
+          const myEmail = (currentAccount.email || '').toLowerCase().trim();
+          const myUid = (((currentAccount as any).uid || currentAccount.id) || '').trim();
           const lessonEmail = (l.studentEmail || '').toLowerCase().trim();
-          const lessonName = (l.studentName || '').toLowerCase().trim();
-          return (
-            lessonEmail === myEmail ||
-            (Boolean(myName) && !lessonEmail && lessonName === myName) ||
-            (Boolean(myName) && Boolean(lessonName) && myName === lessonName && (myEmail.includes('vinicius') || lessonEmail.includes('vinicius')))
+          const lessonUid = (l.studentUid || '').trim();
+          return Boolean(
+            (myUid && lessonUid && myUid === lessonUid) ||
+            (myEmail && lessonEmail && myEmail === lessonEmail)
           );
         }
-        return true;
+        return false;
       }
     })
     .sort((a, b) => new Date(a.startDateTime).getTime() - new Date(b.startDateTime).getTime());

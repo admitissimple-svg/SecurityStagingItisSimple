@@ -114,7 +114,7 @@ export const JA_TRANSLATIONS: Translations = {
   routineCoffeeSubtitle: '3分動画 • 5単語記録',
   routineCommuteTitle: '08:30 - 通勤時のポッドキャスト',
   routineCommuteSubtitle: '5分間の自然なリスニング',
-  routineMeetTitle: '15:00 - チャールズとの25/50分Meet',
+  routineMeetTitle: '15:00 - ネイティブフレンドとの25/50分Meet',
   routineMeetSubtitle: 'Google Meetでのライブ英会話',
   routineJournalTitle: '22:00 - 本日のセンテンス（AIジャーナル）',
   routineJournalSubtitle: 'AI添削付きの1センテンス',

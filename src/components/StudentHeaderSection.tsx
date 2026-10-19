@@ -174,33 +174,18 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
 
   // Native Friend assigned to this student from userProfile or from scheduled lessons
   const isCancelledOrUnenrolled = userProfile?.enrollmentStatus === 'cancelled' || userProfile?.enrollmentStatus === 'not_enrolled';
-  const disallowedTeacherEmails = [
-    'adm.itissimple@gmail.com',
-    'estilobeeforkids@gmail.com',
-    'adm.itssimple@gmail.com',
-    'estilobeeadm@gmail.com',
-    'admin@itissimple.com',
-  ];
 
   const fallbackTeacherFromLesson = !isCancelledOrUnenrolled
     ? studentLessons.find(
         (l) =>
           l.teacherEmail &&
           l.status === 'scheduled' &&
-          !l.cancelledAt &&
-          !disallowedTeacherEmails.includes((l.teacherEmail || '').toLowerCase().trim())
+          !l.cancelledAt
       )
     : undefined;
 
-  const rawAssignedTeacherEmail = (userProfile?.teacherEmail || (!isCancelledOrUnenrolled && fallbackTeacherFromLesson?.teacherEmail) || '').toLowerCase().trim();
-  const rawAssignedTeacherName = userProfile?.teacherName || (!isCancelledOrUnenrolled && fallbackTeacherFromLesson?.teacherName) || '';
-
-  const assignedTeacherEmail = disallowedTeacherEmails.includes(rawAssignedTeacherEmail) || rawAssignedTeacherName.toLowerCase().includes('simple')
-    ? ''
-    : rawAssignedTeacherEmail;
-  const assignedTeacherName = disallowedTeacherEmails.includes(rawAssignedTeacherEmail) || rawAssignedTeacherName.toLowerCase().includes('simple')
-    ? ''
-    : rawAssignedTeacherName;
+  const assignedTeacherEmail = (userProfile?.teacherEmail || (!isCancelledOrUnenrolled && fallbackTeacherFromLesson?.teacherEmail) || '').toLowerCase().trim();
+  const assignedTeacherName = userProfile?.teacherName || (!isCancelledOrUnenrolled && fallbackTeacherFromLesson?.teacherName) || '';
 
   const assignedTeacher = assignedTeacherEmail
     ? (teachers.find((tc) => tc.email.toLowerCase() === assignedTeacherEmail) || {

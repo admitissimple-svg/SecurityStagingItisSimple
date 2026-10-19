@@ -2559,7 +2559,7 @@ export async function fetchStudentLessonsFromFirestore(
       } catch {}
     }
 
-    // 3b. Query root collection by hyphenUid (legacy format e.g. usr-reginahelena1980-gmail-com)
+    // 3b. Query root collection by hyphenUid (legacy format e.g. usr-student-gmail-com)
     if (hyphenUid && hyphenUid !== cleanUid) {
       try {
         const qHyphen = query(collection(db, 'lessons'), where('studentUid', '==', hyphenUid));
