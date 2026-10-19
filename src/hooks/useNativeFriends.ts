@@ -247,7 +247,7 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
         requireAdminToken: isAdmin,
       });
       if (allTutors.length > 0) {
-        setTutors((prev) => consolidateTutorsList([...prev, ...allTutors]) as NativeFriendTutor[]);
+        setTutors(consolidateTutorsList(allTutors) as NativeFriendTutor[]);
       }
     } catch (err) {
       console.warn('[useNativeFriends] refresh notice:', err);
@@ -266,7 +266,7 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
       .then(({ allTutors }) => {
         if (!isMounted) return;
         if (allTutors.length > 0) {
-          setTutors((prev) => consolidateTutorsList([...prev, ...allTutors]) as NativeFriendTutor[]);
+          setTutors(consolidateTutorsList(allTutors) as NativeFriendTutor[]);
         }
       })
       .catch((err) => {
@@ -297,12 +297,11 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
     };
 
     // Re-fetch and synchronize when authentication state transitions
-    // Re-fetch and synchronize when authentication state transitions
     const unsubAuth = onAuthStateChanged(auth, (user) => {
       if (user && isMounted) {
         fetchPublicNativeFriendsFromFirestore().then(({ allTutors }) => {
           if (!isMounted || allTutors.length === 0) return;
-          setTutors((prev) => consolidateTutorsList([...prev, ...allTutors]) as NativeFriendTutor[]);
+          setTutors(consolidateTutorsList(allTutors) as NativeFriendTutor[]);
         });
         attachRealtimeListeners();
       } else {

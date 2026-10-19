@@ -9,6 +9,8 @@ import {
   MapPin,
   Globe,
   Sparkles,
+  AlertCircle,
+  Loader2,
 } from 'lucide-react';
 import { NativeFriendTutor, Language } from '../types';
 import { ImageUploadInput } from './ImageUploadInput';
@@ -23,7 +25,7 @@ interface EditTutorProfileModalProps {
   isOpen: boolean;
   onClose: () => void;
   tutor?: NativeFriendTutor | null;
-  onSave: (updated: NativeFriendTutor) => void;
+  onSave: (updated: NativeFriendTutor) => Promise<any> | void;
   currentLanguage: Language;
 }
 
@@ -50,6 +52,8 @@ export const EditTutorProfileModal: React.FC<EditTutorProfileModalProps> = ({
   const [specialtiesText, setSpecialtiesText] = useState(
     (tutor?.specialties || []).join(', ')
   );
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [savedSuccess, setSavedSuccess] = useState(false);
 
   // Synchronize state whenever modal is opened or tutor changes
@@ -57,12 +61,15 @@ export const EditTutorProfileModal: React.FC<EditTutorProfileModalProps> = ({
     if (isOpen && tutor) {
       setFormData({ ...tutor });
       setSpecialtiesText((tutor.specialties || []).join(', '));
+      setSaveError(null);
+      setSavedSuccess(false);
+      setIsSaving(false);
     }
   }, [isOpen, tutor]);
 
   // Support ESC key to easily dismiss the tutor profile modal
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen || isSaving) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         onClose();
@@ -70,7 +77,7 @@ export const EditTutorProfileModal: React.FC<EditTutorProfileModalProps> = ({
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, onClose]);
+  }, [isOpen, isSaving, onClose]);
 
   if (!isOpen || !tutor) return null;
 
@@ -96,36 +103,51 @@ export const EditTutorProfileModal: React.FC<EditTutorProfileModalProps> = ({
   const currentUsdPrice = Number(formData.pricePerSessionUsd) || tutor.pricePerSessionUsd || 15;
   const calculatedBrlPrice = Math.round(currentUsdPrice * 5.5);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const cleanVideoLink = (formData.videoIntroUrl || (formData as any).videoUrl || (formData as any).introVideoUrl || (formData as any).youtubeUrl || '').trim();
-    const extractedEmbedId = extractYouTubeVideoId(cleanVideoLink);
+    if (isSaving) return;
 
-    const updated: NativeFriendTutor = {
-      ...(tutor as NativeFriendTutor),
-      ...formData,
-      videoIntroUrl: cleanVideoLink,
-      youtubeUrl: cleanVideoLink,
-      videoUrl: cleanVideoLink,
-      introVideoUrl: cleanVideoLink,
-      youtubeEmbedId: extractedEmbedId || '',
-      // Strictly preserve schedule and meet link from tutor / centralized settings
-      meetUrl: tutor.meetUrl || (tutor as any).meetLink || '',
-      availableDays: tutor.availableDays || [],
-      availability: tutor.availability || (tutor as any).availableHoursByDay,
-      pricePerSessionUsd: currentUsdPrice,
-      pricePerSessionBrl: calculatedBrlPrice,
-      specialties: specialtiesText
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean),
-    };
-    onSave(updated);
-    setSavedSuccess(true);
-    setTimeout(() => {
-      setSavedSuccess(false);
-      onClose();
-    }, 1000);
+    setIsSaving(true);
+    setSaveError(null);
+    setSavedSuccess(false);
+
+    try {
+      const cleanVideoLink = (formData.videoIntroUrl || (formData as any).videoUrl || (formData as any).introVideoUrl || (formData as any).youtubeUrl || '').trim();
+      const extractedEmbedId = extractYouTubeVideoId(cleanVideoLink);
+
+      const updated: NativeFriendTutor = {
+        ...(tutor as NativeFriendTutor),
+        ...formData,
+        videoIntroUrl: cleanVideoLink,
+        youtubeUrl: cleanVideoLink,
+        videoUrl: cleanVideoLink,
+        introVideoUrl: cleanVideoLink,
+        youtubeEmbedId: extractedEmbedId || '',
+        // Strictly preserve schedule and meet link from tutor / centralized settings
+        meetUrl: tutor.meetUrl || (tutor as any).meetLink || '',
+        availableDays: tutor.availableDays || [],
+        availability: tutor.availability || (tutor as any).availableHoursByDay,
+        pricePerSessionUsd: currentUsdPrice,
+        pricePerSessionBrl: calculatedBrlPrice,
+        specialties: specialtiesText
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean),
+      };
+
+      await onSave(updated);
+
+      setSavedSuccess(true);
+      setTimeout(() => {
+        setSavedSuccess(false);
+        onClose();
+      }, 1200);
+    } catch (err: any) {
+      console.error('Failed to save tutor profile:', err);
+      setSaveError(err?.message || 'Failed to save profile. Please check your connection and try again.');
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   return (
@@ -170,6 +192,16 @@ export const EditTutorProfileModal: React.FC<EditTutorProfileModalProps> = ({
             <div className="p-3.5 bg-emerald-50 border border-emerald-300 rounded-2xl text-xs font-bold text-emerald-800 flex items-center gap-2 animate-in fade-in">
               <Check className="w-4 h-4 text-emerald-600" />
               <span>Profile updated successfully! All changes are synced.</span>
+            </div>
+          )}
+
+          {saveError && (
+            <div className="p-3.5 bg-rose-50 border border-rose-300 rounded-2xl text-xs font-bold text-rose-800 flex items-start gap-2.5 animate-in fade-in" role="alert">
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <p className="font-black text-rose-900">Failed to save profile</p>
+                <p className="text-[11px] text-rose-700 mt-0.5 font-normal">{saveError}</p>
+              </div>
             </div>
           )}
 
@@ -362,18 +394,24 @@ export const EditTutorProfileModal: React.FC<EditTutorProfileModalProps> = ({
           <div className="pt-4 border-t border-slate-200 flex items-center justify-between">
             <button
               type="button"
+              disabled={isSaving}
               onClick={onClose}
-              className="px-4 py-2 text-xs font-bold text-slate-600 hover:text-slate-900 transition cursor-pointer"
+              className="px-4 py-2 text-xs font-bold text-slate-600 hover:text-slate-900 transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
             >
               Cancel
             </button>
 
             <button
               type="submit"
-              className="px-6 py-2.5 bg-[#000035] hover:bg-[#1C4C96] text-white rounded-xl text-xs font-black transition cursor-pointer shadow-md flex items-center gap-2"
+              disabled={isSaving}
+              className="px-6 py-2.5 bg-[#000035] hover:bg-[#1C4C96] text-white rounded-xl text-xs font-black transition cursor-pointer shadow-md flex items-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed"
             >
-              <Save className="w-4 h-4 text-[#F4CA54]" />
-              <span>Save Presentation</span>
+              {isSaving ? (
+                <Loader2 className="w-4 h-4 text-[#F4CA54] animate-spin" />
+              ) : (
+                <Save className="w-4 h-4 text-[#F4CA54]" />
+              )}
+              <span>{isSaving ? 'Saving Changes...' : 'Save Presentation'}</span>
             </button>
           </div>
         </form>

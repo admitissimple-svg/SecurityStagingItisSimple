@@ -5212,29 +5212,90 @@ export default function App() {
         updatedTutor.availableHours,
     };
 
+    // 1. Obtain verified Firebase auth token
+    const token =
+      (await getAccessToken().catch(() => null)) ||
+      (await auth.currentUser?.getIdToken().catch(() => null)) ||
+      null;
+
+    if (!token) {
+      throw new Error('Authentication required: verified user token missing or expired.');
+    }
+
+    // 2. Resolve destination ID for request (prefer canonical UID)
+    const targetId = (mergedTutor.uid && isValidCanonicalUid(mergedTutor.uid))
+      ? mergedTutor.uid
+      : (mergedTutor.id || mergedTutor.uid || cleanEmail);
+
+    const response = await fetch(`/api/tutors/${encodeURIComponent(targetId)}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(mergedTutor),
+    });
+
+    const data = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      const errMsg = data?.message || data?.error || `Server returned error (${response.status})`;
+      if (response.status === 401) {
+        throw new Error('Session expired or unauthorized. Please sign in again.');
+      } else if (response.status === 403) {
+        throw new Error(errMsg || 'Access denied: You are not authorized to update this tutor profile.');
+      } else if (response.status === 404) {
+        throw new Error(errMsg || 'Tutor profile not found in database.');
+      } else if (response.status === 409) {
+        throw new Error(errMsg || 'Conflict: Profile has ambiguous mapping or lacks canonical UID.');
+      } else {
+        throw new Error(errMsg || 'Failed to save profile. Please try again.');
+      }
+    }
+
+    // 3. Persistence confirmed by server: extract canonical saved tutor
+    const canonicalSavedTutor: NativeFriendTutor = data?.tutor
+      ? { ...mergedTutor, ...data.tutor }
+      : mergedTutor;
+
+    // Update local React tutors list with canonical saved tutor
     setTutors((prev) => {
-      const targetEmail = (mergedTutor.email || '').toLowerCase().trim();
+      const targetEmail = (canonicalSavedTutor.email || '').toLowerCase().trim();
+      const targetUid = canonicalSavedTutor.uid;
+      const targetIdVal = canonicalSavedTutor.id;
       const exists = prev.some(
-        (t) => Boolean(t) && (t.id === mergedTutor.id || (targetEmail && (t.email || '').toLowerCase().trim() === targetEmail))
+        (t) =>
+          Boolean(t) &&
+          ((targetUid && t.uid === targetUid) ||
+            (targetIdVal && t.id === targetIdVal) ||
+            (targetEmail && (t.email || '').toLowerCase().trim() === targetEmail))
       );
       if (exists) {
         return prev.map((t) =>
-          Boolean(t) && (t.id === mergedTutor.id || (targetEmail && (t.email || '').toLowerCase().trim() === targetEmail))
-            ? mergedTutor
+          Boolean(t) &&
+          ((targetUid && t.uid === targetUid) ||
+            (targetIdVal && t.id === targetIdVal) ||
+            (targetEmail && (t.email || '').toLowerCase().trim() === targetEmail))
+            ? canonicalSavedTutor
             : t
         );
       }
-      return [...prev, mergedTutor];
+      return [...prev, canonicalSavedTutor];
     });
 
     // Update currentAccount if active user is this tutor
     setCurrentAccount((prev) => {
-      const targetEmail = (mergedTutor.email || '').toLowerCase().trim();
-      if (prev && targetEmail && (prev.email || '').toLowerCase().trim() === targetEmail) {
+      const targetEmail = (canonicalSavedTutor.email || '').toLowerCase().trim();
+      const targetUid = canonicalSavedTutor.uid;
+      if (
+        prev &&
+        ((targetEmail && (prev.email || '').toLowerCase().trim() === targetEmail) ||
+          (targetUid && (prev.uid === targetUid || prev.id === targetUid)))
+      ) {
         return {
           ...prev,
-          name: mergedTutor.name,
-          picture: mergedTutor.avatar || prev.picture,
+          name: canonicalSavedTutor.name,
+          picture: canonicalSavedTutor.avatar || prev.picture,
         };
       }
       return prev;
@@ -5242,20 +5303,23 @@ export default function App() {
 
     // Update available accounts list
     setAvailableAccounts((prev) => {
-      const targetEmail = (mergedTutor.email || '').toLowerCase().trim();
+      const targetEmail = (canonicalSavedTutor.email || '').toLowerCase().trim();
+      const targetUid = canonicalSavedTutor.uid;
       return prev.map((acc) =>
-        Boolean(acc) && targetEmail && (acc.email || '').toLowerCase().trim() === targetEmail
+        Boolean(acc) &&
+        ((targetEmail && (acc.email || '').toLowerCase().trim() === targetEmail) ||
+          (targetUid && (acc.uid === targetUid || acc.id === targetUid)))
           ? {
               ...acc,
-              name: mergedTutor.name,
-              picture: mergedTutor.avatar || acc.picture,
+              name: canonicalSavedTutor.name,
+              picture: canonicalSavedTutor.avatar || acc.picture,
             }
           : acc
       );
     });
 
     // Sync timezone to teacherMeetSettings if provided
-    if (mergedTutor.timezone) {
+    if (canonicalSavedTutor.timezone) {
       setTeacherMeetSettings((prev) => {
         const existing = prev[cleanEmail];
         if (existing) {
@@ -5263,7 +5327,7 @@ export default function App() {
             ...prev,
             [cleanEmail]: {
               ...existing,
-              timezone: mergedTutor.timezone,
+              timezone: canonicalSavedTutor.timezone,
             },
           };
         }
@@ -5271,20 +5335,10 @@ export default function App() {
       });
     }
 
-    // Direct Firestore persistence for instant consistency across unified users collection
-    try {
-      const token = (await getAccessToken().catch(() => null)) || (await auth.currentUser?.getIdToken().catch(() => null)) || null;
-      await fetch(`/api/tutors/${encodeURIComponent(mergedTutor.id)}`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify(mergedTutor),
-      });
-    } catch {
-      // local fallback
-    }
+    // Refresh public directory / invalidate cache so directory reflects the persisted update
+    refreshNativeFriends().catch(() => {});
+
+    return canonicalSavedTutor;
   };
 
   // Handler: Save Student Profile & Photo
@@ -5413,15 +5467,20 @@ export default function App() {
   const currentTutorProfile: NativeFriendTutor = useMemo(() => {
     if (currentAccount && (currentAccount.role === 'teacher' || currentAccount.role === 'admin')) {
       const emailClean = (currentAccount.email || '').toLowerCase().trim();
+      const accountUid = (currentAccount.uid || currentAccount.id || '').trim();
       const settings =
         teacherMeetSettings[emailClean] ||
-        (currentAccount.uid ? teacherMeetSettings[currentAccount.uid] : undefined);
+        (accountUid ? teacherMeetSettings[accountUid] : undefined);
       const found = tutors.find(
-        (t) => Boolean(t) && (t.email || '').toLowerCase().trim() === emailClean
+        (t) =>
+          Boolean(t) &&
+          ((accountUid && (t.uid === accountUid || t.id === accountUid)) ||
+            (emailClean && (t.email || '').toLowerCase().trim() === emailClean))
       );
       if (found) {
         return {
           ...found,
+          uid: found.uid || (isValidCanonicalUid(accountUid) ? accountUid : undefined),
           meetUrl: settings?.meetLink || found.meetUrl || '',
           availableDays:
             settings?.availableDays && settings.availableDays.length > 0
@@ -5433,7 +5492,8 @@ export default function App() {
       }
 
       return {
-        id: `tutor-${(currentAccount.email || currentAccount.id || 'current').replace(/[^a-zA-Z0-9]/g, '-')}`,
+        id: (isValidCanonicalUid(accountUid) ? accountUid : null) || `tutor-${(currentAccount.email || currentAccount.id || 'current').replace(/[^a-zA-Z0-9]/g, '-')}`,
+        uid: isValidCanonicalUid(accountUid) ? accountUid : undefined,
         name: currentAccount.name,
         email: currentAccount.email || '',
         avatar: currentAccount.picture || '',

@@ -277,14 +277,17 @@ export function mergeTutors(existing: any, incoming: any): CanonicalTutorRecord 
     return undefined;
   };
 
-  let authUid = resolveCandidateAuthUid(
-    existing.authUid,
-    incoming.authUid,
-    existing.uid,
-    incoming.uid,
-    existing.id,
-    incoming.id
-  );
+  const resolvedExistingUid =
+    (typeof existing.authUid === 'string' && isValidCanonicalUid(existing.authUid) ? existing.authUid.trim() : null) ||
+    (typeof existing.uid === 'string' && isValidCanonicalUid(existing.uid) ? existing.uid.trim() : null) ||
+    (typeof existing.id === 'string' && isValidCanonicalUid(existing.id) ? existing.id.trim() : null);
+
+  const resolvedIncomingUid =
+    (typeof incoming.authUid === 'string' && isValidCanonicalUid(incoming.authUid) ? incoming.authUid.trim() : null) ||
+    (typeof incoming.uid === 'string' && isValidCanonicalUid(incoming.uid) ? incoming.uid.trim() : null) ||
+    (typeof incoming.id === 'string' && isValidCanonicalUid(incoming.id) ? incoming.id.trim() : null);
+
+  let authUid = resolvedExistingUid || resolvedIncomingUid || existing.authUid || existing.uid || incoming.authUid || incoming.uid;
 
   // Reference case (Skull Bee): email laviniafofafc@gmail.com strictly maps to UID real jCkNIhvYEYbyJC2CWGZhFaoHGfo1
   if (!authUid && (email === 'laviniafofafc@gmail.com' || existing.publicTutorId === 'skull-bee' || incoming.publicTutorId === 'skull-bee' || existing.id === 'skull-bee' || incoming.id === 'skull-bee')) {
@@ -316,6 +319,8 @@ export function mergeTutors(existing: any, incoming: any): CanonicalTutorRecord 
     authUid = 'Xpmq4l50aUOE0Jh4UTHwGAtw65B2';
   }
 
+  const finalCanonicalUid = resolvedExistingUid || existing.uid || existing.authUid || resolvedIncomingUid || incoming.uid || incoming.authUid;
+
   // Prioritize persistent public tutor ID (e.g. 'skull-bee' or 'queen-bee' over synthetic email ids)
   const isPrettyPublicId = (id?: string) =>
     Boolean(id && !id.includes('@') && !id.startsWith('usr-') && !id.startsWith('tutor-') && id.length < 30 && !isValidCanonicalUid(id));
@@ -342,71 +347,214 @@ export function mergeTutors(existing: any, incoming: any): CanonicalTutorRecord 
   const isGenericName = (n?: string) =>
     !n || n.toLowerCase() === 'native friend';
 
-  const finalName = isQueenBeeRecord
-    ? 'Queen Bee'
-    : (!isGenericName(existing.name)
-        ? existing.name
-        : (!isGenericName(incoming.name) ? incoming.name : (existing.name || incoming.name || 'Native Friend')));
+  // Compare timestamps if available to assess whether incoming is newer
+  const existingTime = existing?.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
+  const incomingTime = incoming?.updatedAt ? new Date(incoming.updatedAt).getTime() : 0;
+  const incomingIsNewer = incomingTime >= existingTime || !existingTime;
 
-  const finalHeadline = !isGenericHeadline(existing.headline)
-    ? existing.headline
-    : (!isGenericHeadline(incoming.headline) ? incoming.headline : (existing.headline || incoming.headline || 'English Conversational Native Friend'));
+  // Name resolution: Incoming non-generic non-empty name takes precedence; Queen Bee name can be freely edited
+  let finalName = '';
+  if (incoming.name !== undefined && typeof incoming.name === 'string' && incoming.name.trim() !== '') {
+    const cleanIncName = incoming.name.trim();
+    if (!isGenericName(cleanIncName) || !existing.name || isGenericName(existing.name)) {
+      finalName = cleanIncName;
+    } else {
+      finalName = existing.name.trim();
+    }
+  } else if (existing.name !== undefined && typeof existing.name === 'string' && existing.name.trim() !== '') {
+    finalName = existing.name.trim();
+  } else {
+    finalName = 'Native Friend';
+  }
 
-  const finalBio = !isGenericBio(existing.bio)
-    ? existing.bio
-    : (!isGenericBio(incoming.bio) ? incoming.bio : (existing.bio || incoming.bio || 'Native English speaker ready to help you speak with natural fluency.'));
+  // Headline resolution: Incoming updated headline takes precedence; supports intentional update
+  let finalHeadline = '';
+  if (incoming.headline !== undefined && typeof incoming.headline === 'string') {
+    const cleanIncHeadline = incoming.headline.trim();
+    if (cleanIncHeadline !== '') {
+      finalHeadline = cleanIncHeadline;
+    } else if (incomingIsNewer) {
+      finalHeadline = '';
+    } else {
+      finalHeadline = existing.headline || 'English Conversational Native Friend';
+    }
+  } else if (existing.headline !== undefined && typeof existing.headline === 'string') {
+    finalHeadline = existing.headline;
+  } else {
+    finalHeadline = 'English Conversational Native Friend';
+  }
+
+  // Biography resolution: Incoming updated bio takes precedence; supports intentional update
+  let finalBio = '';
+  if (incoming.bio !== undefined && typeof incoming.bio === 'string') {
+    const cleanIncBio = incoming.bio.trim();
+    if (cleanIncBio !== '') {
+      finalBio = cleanIncBio;
+    } else if (incomingIsNewer) {
+      finalBio = '';
+    } else {
+      finalBio = existing.bio || 'Native English speaker ready to help you speak with natural fluency.';
+    }
+  } else if (existing.bio !== undefined && typeof existing.bio === 'string') {
+    finalBio = existing.bio;
+  } else {
+    finalBio = 'Native English speaker ready to help you speak with natural fluency.';
+  }
+
+  // Avatar / photoUrl resolution: Incoming updated avatar takes precedence; preserves if omitted
+  let finalAvatar = '';
+  if (incoming.avatar !== undefined || incoming.photoUrl !== undefined) {
+    const incAv = (incoming.avatar !== undefined ? incoming.avatar : incoming.photoUrl) || '';
+    if (incAv !== '' || incomingIsNewer) {
+      finalAvatar = incAv;
+    } else {
+      finalAvatar = existing.avatar || existing.photoUrl || '';
+    }
+  } else {
+    finalAvatar = existing.avatar || existing.photoUrl || '';
+  }
+
+  // Accent resolution: Incoming updated accent takes precedence
+  const finalAccent = (incoming.accent !== undefined && incoming.accent.trim() !== '')
+    ? incoming.accent.trim()
+    : (existing.accent || incoming.accent || 'North American');
+
+  // Country resolution
+  const finalCountry = (incoming.country !== undefined && incoming.country.trim() !== '')
+    ? incoming.country.trim()
+    : (existing.country || incoming.country || 'Global');
+
+  const finalCountryCode = (incoming.countryCode !== undefined && incoming.countryCode.trim() !== '')
+    ? incoming.countryCode.trim()
+    : (existing.countryCode || incoming.countryCode || '');
+
+  const finalFlag = (incoming.flag !== undefined && incoming.flag.trim() !== '')
+    ? incoming.flag.trim()
+    : (existing.flag || incoming.flag || '🇺🇸');
+
+  // Timezone resolution
+  const finalTimezone = (incoming.timezone !== undefined && incoming.timezone.trim() !== '')
+    ? incoming.timezone.trim()
+    : (existing.timezone || incoming.timezone || 'America/Toronto');
+
+  // Specialties resolution
+  let finalSpecialties: string[] = [];
+  if (Array.isArray(incoming.specialties) && incoming.specialties.length > 0) {
+    finalSpecialties = incoming.specialties;
+  } else if (Array.isArray(incoming.specialties) && incoming.specialties.length === 0 && incomingIsNewer) {
+    finalSpecialties = [];
+  } else if (Array.isArray(existing.specialties) && existing.specialties.length > 0) {
+    finalSpecialties = existing.specialties;
+  } else {
+    finalSpecialties = ['Conversação', 'Pronúncia', 'Fluência'];
+  }
+
+  // Pricing resolution
+  let finalPriceUsd = 20;
+  if (typeof incoming.pricePerSessionUsd === 'number' && !isNaN(incoming.pricePerSessionUsd) && incoming.pricePerSessionUsd > 0) {
+    finalPriceUsd = incoming.pricePerSessionUsd;
+  } else if (incoming.pricePerSessionUsd !== undefined && Number(incoming.pricePerSessionUsd) > 0) {
+    finalPriceUsd = Number(incoming.pricePerSessionUsd);
+  } else if (typeof existing.pricePerSessionUsd === 'number' && !isNaN(existing.pricePerSessionUsd) && existing.pricePerSessionUsd > 0) {
+    finalPriceUsd = existing.pricePerSessionUsd;
+  } else if (existing.pricePerSessionUsd !== undefined && Number(existing.pricePerSessionUsd) > 0) {
+    finalPriceUsd = Number(existing.pricePerSessionUsd);
+  }
+
+  let finalPriceBrl = Math.round(finalPriceUsd * 5.5);
+  if (typeof incoming.pricePerSessionBrl === 'number' && !isNaN(incoming.pricePerSessionBrl) && incoming.pricePerSessionBrl > 0) {
+    finalPriceBrl = incoming.pricePerSessionBrl;
+  } else if (incoming.pricePerSessionBrl !== undefined && Number(incoming.pricePerSessionBrl) > 0) {
+    finalPriceBrl = Number(incoming.pricePerSessionBrl);
+  } else if (typeof existing.pricePerSessionBrl === 'number' && !isNaN(existing.pricePerSessionBrl) && existing.pricePerSessionBrl > 0) {
+    finalPriceBrl = existing.pricePerSessionBrl;
+  } else if (existing.pricePerSessionBrl !== undefined && Number(existing.pricePerSessionBrl) > 0) {
+    finalPriceBrl = Number(existing.pricePerSessionBrl);
+  }
+
+  // Video presentation links: Support intentional update or clearing
+  let finalVideoLink = '';
+  if (
+    incoming.videoIntroUrl !== undefined ||
+    incoming.youtubeUrl !== undefined ||
+    incoming.videoUrl !== undefined ||
+    incoming.introVideoUrl !== undefined
+  ) {
+    finalVideoLink = (incoming.videoIntroUrl ?? incoming.youtubeUrl ?? incoming.videoUrl ?? incoming.introVideoUrl ?? '').trim();
+  } else {
+    finalVideoLink = (existing.videoIntroUrl ?? existing.youtubeUrl ?? existing.videoUrl ?? existing.introVideoUrl ?? '').trim();
+  }
+
+  // Meet link / URL
+  const finalMeetUrl = (incoming.meetUrl || incoming.meetLink || existing.meetUrl || existing.meetLink || '').trim();
+
+  // Availability & schedule: Preserve existing if omitted in incoming
+  const finalAvailableDays = (Array.isArray(incoming.availableDays) && incoming.availableDays.length > 0)
+    ? incoming.availableDays
+    : (Array.isArray(existing.availableDays) && existing.availableDays.length > 0 ? existing.availableDays : ['monday', 'tuesday', 'wednesday', 'thursday', 'friday']);
+
+  const finalAvailableHours = (Array.isArray(incoming.availableHours) && incoming.availableHours.length > 0)
+    ? incoming.availableHours
+    : (Array.isArray(existing.availableHours) && existing.availableHours.length > 0 ? existing.availableHours : ['09:00', '10:00', '11:00', '14:00', '15:00', '16:00']);
+
+  const finalAvailability = (incoming.availability && Object.keys(incoming.availability).length > 0)
+    ? incoming.availability
+    : (existing.availability && Object.keys(existing.availability).length > 0 ? existing.availability : (existing.availableHoursByDay || incoming.availableHoursByDay || {}));
+
+  const finalAvailableHoursByDay = (incoming.availableHoursByDay && Object.keys(incoming.availableHoursByDay).length > 0)
+    ? incoming.availableHoursByDay
+    : (existing.availableHoursByDay && Object.keys(existing.availableHoursByDay).length > 0 ? existing.availableHoursByDay : finalAvailability);
 
   return {
-    ...incoming,
     ...existing,
+    ...incoming,
     id: publicTutorId,
     publicTutorId,
-    authUid: authUid || undefined,
-    uid: authUid || undefined,
+    authUid: authUid || finalCanonicalUid || undefined,
+    uid: finalCanonicalUid || authUid || undefined,
     legacyId: legacyIds[0] || existing.legacyId || incoming.legacyId,
     legacyIds,
     email: email || undefined,
     name: finalName,
     headline: finalHeadline,
     bio: finalBio,
-    avatar: existing.avatar || incoming.avatar || existing.photoUrl || incoming.photoUrl || '',
-    photoUrl: existing.photoUrl || incoming.photoUrl || existing.avatar || incoming.avatar || '',
-    country: existing.country || incoming.country || 'Global',
-    countryCode: existing.countryCode || incoming.countryCode || '',
-    flag: existing.flag || incoming.flag || '🇺🇸',
-    accent: existing.accent || incoming.accent || 'North American',
-    meetLink: existing.meetLink || incoming.meetLink || existing.meetUrl || incoming.meetUrl || '',
-    meetUrl: existing.meetUrl || incoming.meetUrl || existing.meetLink || incoming.meetLink || '',
-    timezone: existing.timezone || incoming.timezone || 'America/Toronto',
-    specialties: (Array.isArray(existing.specialties) && existing.specialties.length > 0)
-      ? existing.specialties
-      : (Array.isArray(incoming.specialties) && incoming.specialties.length > 0 ? incoming.specialties : ['Conversação', 'Pronúncia', 'Fluência']),
-    availableDays: (Array.isArray(existing.availableDays) && existing.availableDays.length > 0)
-      ? existing.availableDays
-      : (Array.isArray(incoming.availableDays) && incoming.availableDays.length > 0 ? incoming.availableDays : ['monday', 'tuesday', 'wednesday', 'thursday', 'friday']),
-    availableHours: (Array.isArray(existing.availableHours) && existing.availableHours.length > 0)
-      ? existing.availableHours
-      : (Array.isArray(incoming.availableHours) && incoming.availableHours.length > 0 ? incoming.availableHours : ['09:00', '10:00', '11:00', '14:00', '15:00', '16:00']),
-    availableHoursByDay: (existing.availableHoursByDay && Object.keys(existing.availableHoursByDay).length > 0)
-      ? existing.availableHoursByDay
-      : (incoming.availableHoursByDay || {}),
-    availability: (existing.availability && Object.keys(existing.availability).length > 0)
-      ? existing.availability
-      : (incoming.availability || {}),
-    pricePerSessionUsd: Number(existing.pricePerSessionUsd || incoming.pricePerSessionUsd || 20),
-    pricePerSessionBrl: Number(existing.pricePerSessionBrl || incoming.pricePerSessionBrl || 110),
+    avatar: finalAvatar,
+    photoUrl: finalAvatar,
+    country: finalCountry,
+    countryCode: finalCountryCode,
+    flag: finalFlag,
+    accent: finalAccent,
+    meetLink: finalMeetUrl,
+    meetUrl: finalMeetUrl,
+    timezone: finalTimezone,
+    specialties: finalSpecialties,
+    availableDays: finalAvailableDays,
+    availableHours: finalAvailableHours,
+    availableHoursByDay: finalAvailableHoursByDay,
+    availability: finalAvailability,
+    pricePerSessionUsd: finalPriceUsd,
+    pricePerSessionBrl: finalPriceBrl,
+    videoIntroUrl: finalVideoLink,
+    youtubeUrl: finalVideoLink,
+    videoUrl: finalVideoLink,
+    introVideoUrl: finalVideoLink,
+    youtubeEmbedId: incoming.youtubeEmbedId || existing.youtubeEmbedId || '',
     rating: typeof existing.rating === 'number' ? existing.rating : (typeof incoming.rating === 'number' ? incoming.rating : 5.0),
     reviewsCount: typeof existing.reviewsCount === 'number' ? existing.reviewsCount : (typeof incoming.reviewsCount === 'number' ? incoming.reviewsCount : 0),
     activeStudents: typeof existing.activeStudents === 'number' ? existing.activeStudents : (typeof incoming.activeStudents === 'number' ? incoming.activeStudents : 0),
     lessonsTaught: typeof existing.lessonsTaught === 'number' ? existing.lessonsTaught : (typeof incoming.lessonsTaught === 'number' ? incoming.lessonsTaught : 12),
     isSuperTutor: Boolean(existing.isSuperTutor || incoming.isSuperTutor),
+    // Strictly preserve protected records and assignments
+    assignedStudents: existing.assignedStudents || incoming.assignedStudents || [],
+    trialBookings: existing.trialBookings || incoming.trialBookings || [],
+    existingLessons: existing.existingLessons || incoming.existingLessons || [],
     approvalStatus,
     isApproved,
     status: approvalStatus,
     approved: isApproved,
     role: 'teacher',
     appliedAt: existing.appliedAt || incoming.appliedAt || existing.createdAt || incoming.createdAt || new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    updatedAt: incoming.updatedAt || existing.updatedAt || undefined,
   };
 }
 
@@ -421,7 +569,15 @@ export function consolidateTutorsList(list: any[]): CanonicalTutorRecord[] {
     if (!item) continue;
     const existingIndex = consolidated.findIndex((c) => areSameTutor(c, item));
     if (existingIndex >= 0) {
-      consolidated[existingIndex] = mergeTutors(consolidated[existingIndex], item);
+      const existing = consolidated[existingIndex];
+      const exTime = existing.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
+      const itemTime = item.updatedAt ? new Date(item.updatedAt).getTime() : 0;
+      // If neither has explicit updatedAt, or item timestamp >= existing timestamp, item takes precedence as later/incoming
+      if (!existing.updatedAt || itemTime >= exTime) {
+        consolidated[existingIndex] = mergeTutors(existing, item);
+      } else {
+        consolidated[existingIndex] = mergeTutors(item, existing);
+      }
     } else {
       consolidated.push(mergeTutors({}, item));
     }

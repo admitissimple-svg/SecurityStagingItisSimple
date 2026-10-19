@@ -3130,84 +3130,157 @@ app.put('/api/tutors/:id', firebaseAuthMiddleware, async (req, res) => {
   const db = readDb();
   const tutorIdParam = decodeURIComponent(req.params.id || '').trim();
   if (!tutorIdParam) {
-    return res.status(400).json({ error: 'Invalid tutor id' });
+    return res.status(400).json({ error: 'Bad Request', message: 'Invalid tutor id' });
   }
 
   const rawBody = req.body;
   const updatedData = rawBody?.tutor ? { ...rawBody.tutor } : { ...rawBody };
   if ((updatedData as any).tutor) delete (updatedData as any).tutor;
 
-  let existingIdx = (db.tutorsList || []).findIndex(
-    (t: any) =>
-      (t.id && t.id.toLowerCase() === tutorIdParam.toLowerCase()) ||
-      (t.uid && t.uid === tutorIdParam) ||
-      (t.email && t.email.toLowerCase() === tutorIdParam.toLowerCase())
-  );
+  let existingTutor: any = null;
 
-  if (existingIdx === -1) {
-    const teacherEntry = (db.teachers || []).find(
-      (t: any) =>
-        (t.uid && t.uid === tutorIdParam) ||
-        (t.email && t.email.toLowerCase() === tutorIdParam.toLowerCase())
-    );
-    if (teacherEntry) {
-      const cleanEmail = (teacherEntry.email || '').toLowerCase().trim();
-      const syntheticTutor = {
-        id: tutorIdParam.includes('@') ? `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : tutorIdParam,
-        uid: teacherEntry.uid,
-        name: teacherEntry.name,
-        email: cleanEmail,
-        role: 'teacher',
-        approvalStatus: teacherEntry.approvalStatus || 'pending',
-        isApproved: teacherEntry.isApproved || false,
-        status: teacherEntry.status || teacherEntry.approvalStatus || 'pending',
-        approved: teacherEntry.approved || teacherEntry.isApproved || false,
-        avatar: teacherEntry.avatar || '',
-        country: teacherEntry.country || '',
-        accent: teacherEntry.accent || '',
-        timezone: teacherEntry.timezone || '',
-      };
-      db.tutorsList = db.tutorsList || [];
-      db.tutorsList.push(syntheticTutor);
-      existingIdx = db.tutorsList.length - 1;
+  // 1. Resolve target profile using canonical Firestore (default) database first when possible
+  const fsDb = getFirestoreDb();
+  if (fsDb) {
+    try {
+      if (isValidCanonicalUid(tutorIdParam)) {
+        const [tSnap, uSnap] = await Promise.all([
+          fsDb.collection('tutors').doc(tutorIdParam).get(),
+          fsDb.collection('users').doc(tutorIdParam).get(),
+        ]);
+        if (tSnap.exists || uSnap.exists) {
+          existingTutor = {
+            id: tutorIdParam,
+            uid: tutorIdParam,
+            authUid: tutorIdParam,
+            ...(uSnap.exists ? uSnap.data() : {}),
+            ...(tSnap.exists ? tSnap.data() : {}),
+          };
+        }
+      } else {
+        const isEmail = tutorIdParam.includes('@');
+        const cleanEmail = tutorIdParam.toLowerCase();
+
+        const queryList: Promise<any>[] = [
+          fsDb.collection('tutors').where('publicTutorId', '==', tutorIdParam.toLowerCase()).get(),
+          fsDb.collection('tutors').doc(tutorIdParam).get(),
+        ];
+        if (isEmail) {
+          queryList.push(fsDb.collection('tutors').where('email', '==', cleanEmail).get());
+          queryList.push(fsDb.collection('users').where('email', '==', cleanEmail).get());
+        }
+
+        const queryResults = await Promise.all(queryList);
+        const matchedDocs: any[] = [];
+        queryResults.forEach((snap) => {
+          if (snap && snap.docs) {
+            snap.forEach((d: any) => matchedDocs.push({ id: d.id, ...d.data() }));
+          } else if (snap && snap.exists) {
+            matchedDocs.push({ id: snap.id, ...snap.data() });
+          }
+        });
+
+        if (matchedDocs.length > 0) {
+          // Reject ambiguous or conflicting profile mappings across canonical UIDs
+          const distinctUids = new Set(
+            matchedDocs
+              .map((d) => d.uid || d.authUid || (isValidCanonicalUid(d.id) ? d.id : null))
+              .filter((u): u is string => Boolean(u && isValidCanonicalUid(u)))
+          );
+          if (distinctUids.size > 1) {
+            return res.status(409).json({
+              error: 'Conflict',
+              message: 'Ambiguous or conflicting tutor profile mapping across canonical UIDs',
+            });
+          }
+          existingTutor = consolidateTutorsList(matchedDocs)[0];
+        }
+      }
+    } catch (fsErr: any) {
+      console.error('[serverApp] Firestore error during tutor lookup in PUT /api/tutors/:id:', fsErr);
+      return res.status(503).json({
+        error: 'Service Unavailable',
+        message: `Firestore is unavailable: ${fsErr?.message || 'Database connection error'}`,
+      });
     }
   }
 
-  if (existingIdx === -1) {
+  // 2. Fallback to local in-memory DB if not located in Firestore
+  if (!existingTutor) {
+    const localCandidates = [
+      ...(db.tutorsList || []),
+      ...(db.teachers || []),
+    ].filter((t: any) =>
+      Boolean(t) && (
+        (t.id && t.id.toLowerCase() === tutorIdParam.toLowerCase()) ||
+        (t.uid && t.uid === tutorIdParam) ||
+        (t.publicTutorId && t.publicTutorId.toLowerCase() === tutorIdParam.toLowerCase()) ||
+        (t.email && t.email.toLowerCase() === tutorIdParam.toLowerCase())
+      )
+    );
+
+    if (localCandidates.length > 0) {
+      const distinctUids = new Set(
+        localCandidates
+          .map((d: any) => d.uid || d.authUid || (isValidCanonicalUid(d.id) ? d.id : null))
+          .filter((u: any): u is string => Boolean(u && isValidCanonicalUid(u)))
+      );
+      if (distinctUids.size > 1) {
+        return res.status(409).json({
+          error: 'Conflict',
+          message: 'Ambiguous or conflicting tutor profile mapping',
+        });
+      }
+      existingTutor = consolidateTutorsList(localCandidates)[0];
+    }
+  }
+
+  // Reject with 404 only when profile genuinely cannot be found; do NOT create a new tutor implicitly
+  if (!existingTutor) {
     return res.status(404).json({
       error: 'Not Found',
-      message: 'Tutor não encontrado',
+      message: 'Tutor profile not found in database',
     });
   }
 
-  const existingTutor = db.tutorsList[existingIdx];
+  // 3. Resolve canonical owner UID
+  let canonicalUid = '';
+  if (existingTutor.uid && isValidCanonicalUid(existingTutor.uid)) {
+    canonicalUid = existingTutor.uid.trim();
+  } else if (existingTutor.authUid && isValidCanonicalUid(existingTutor.authUid)) {
+    canonicalUid = existingTutor.authUid.trim();
+  } else if (existingTutor.id && isValidCanonicalUid(existingTutor.id)) {
+    canonicalUid = existingTutor.id.trim();
+  } else {
+    const resolvedIdentity = await resolveTeacherCanonicalIdentity(existingTutor);
+    if (resolvedIdentity?.canonicalUid && isValidCanonicalUid(resolvedIdentity.canonicalUid)) {
+      canonicalUid = resolvedIdentity.canonicalUid.trim();
+    }
+  }
+
+  // If the profile has a legacy ID without a trustworthy canonical UID mapping, reject update
+  if (!canonicalUid || !isValidCanonicalUid(canonicalUid)) {
+    return res.status(409).json({
+      error: 'Conflict',
+      message: 'Profile has a legacy identifier without a trustworthy canonical UID mapping. Explicit reconciliation required.',
+    });
+  }
+
   const existingEmail = (existingTutor.email || '').toLowerCase().trim();
-  const existingUid = (existingTutor.uid || '').trim();
-  const existingId = (existingTutor.id || '').trim();
-
-  const callerEmail = (caller.email || '').toLowerCase().trim();
   const callerUid = (caller.uid || '').trim();
-
-  // Audit protection: Check if caller is verified admin
   const isAdmin = caller.role === 'admin';
 
-  // Ownership verification based strictly on server-verified token and trusted record identifiers
-  const isOwner = Boolean(
-    (existingUid && existingUid === callerUid) ||
-    (existingId && existingId === callerUid) ||
-    (callerEmail && existingEmail && callerEmail === existingEmail)
-  );
-
-  // Requirement 2: Autorizar somente o próprio professor ou um administrador com custom claim role === 'admin'
-  const isAuthorized = isAdmin || (caller.role === 'teacher' && isOwner);
-  if (!isAuthorized) {
+  // Ownership verification: Allow verified administrator OR owner whose verified UID matches canonical record UID
+  // Do NOT require a teacher custom claim if ownership is established via verified UID
+  const isOwner = Boolean(canonicalUid && callerUid === canonicalUid);
+  if (!isAdmin && !isOwner) {
     return res.status(403).json({
       error: 'Forbidden',
       message: 'Access denied: You are not authorized to update this tutor profile',
     });
   }
 
-  // Prevent modifying an administrator account through tutor profile endpoint
+  // Prevent modifying an administrator account through tutor profile endpoint by non-admin
   const isTargetAdmin =
     existingEmail === 'adm.itissimple@gmail.com' ||
     (db.teachers || []).some((t: any) => t.email?.toLowerCase() === existingEmail && t.role === 'admin');
@@ -3219,7 +3292,7 @@ app.put('/api/tutors/:id', firebaseAuthMiddleware, async (req, res) => {
     });
   }
 
-  // Requirement 4: Allowlist explícita de campos de perfil editáveis por professores
+  // 4. Filter allowed fields
   const TEACHER_EDITABLE_FIELDS = new Set([
     'name',
     'avatar',
@@ -3251,7 +3324,6 @@ app.put('/api/tutors/:id', firebaseAuthMiddleware, async (req, res) => {
   const fieldsToApply: Record<string, any> = {};
 
   if (isAdmin) {
-    // Admin can update teacher editable fields + approval/status fields
     const ADMIN_ADDITIONAL_FIELDS = new Set([
       'approvalStatus',
       'isApproved',
@@ -3286,9 +3358,6 @@ app.put('/api/tutors/:id', firebaseAuthMiddleware, async (req, res) => {
     }
   }
 
-  // Requirement 6: Não permitir alterações de configurações administrativas, créditos, vínculos com alunos ou permissões
-  // (Ensured by allowlist: any admin settings, credits, student assignments, permissions are ignored)
-
   const tEmail = existingEmail;
   const existingSettings = (db.teacherSettings && db.teacherSettings[tEmail]) || (db.meetSettings && db.meetSettings[tEmail]);
 
@@ -3321,10 +3390,11 @@ app.put('/api/tutors/:id', firebaseAuthMiddleware, async (req, res) => {
   const updatedTutor = {
     ...existingTutor,
     ...fieldsToApply,
-    // Immutable/protected identifiers (Requirement 5):
-    id: existingTutor.id,
-    email: existingTutor.email,
-    uid: existingTutor.uid || caller.uid,
+    id: existingTutor.publicTutorId || existingTutor.id || canonicalUid,
+    publicTutorId: existingTutor.publicTutorId || (isValidCanonicalUid(existingTutor.id) ? undefined : existingTutor.id),
+    email: existingEmail || updatedData.email,
+    uid: canonicalUid,
+    authUid: canonicalUid,
     role: 'teacher',
     approvalStatus: resolvedApprovalStatus,
     isApproved: resolvedIsApproved,
@@ -3338,7 +3408,6 @@ app.put('/api/tutors/:id', firebaseAuthMiddleware, async (req, res) => {
     videoUrl: rawVideoLink,
     introVideoUrl: rawVideoLink,
     youtubeEmbedId: extractedVideoId,
-    // Strictly preserve centralized meetUrl, availableDays, and availability if not in fieldsToApply
     meetUrl: fieldsToApply.meetUrl || existingTutor.meetUrl || existingSettings?.meetLink || '',
     availableDays:
       (fieldsToApply.availableDays && fieldsToApply.availableDays.length > 0)
@@ -3352,10 +3421,42 @@ app.put('/api/tutors/:id', firebaseAuthMiddleware, async (req, res) => {
     updatedAt: new Date().toISOString(),
   };
 
-  db.tutorsList[existingIdx] = updatedTutor;
+  // 5. Persist directly to Cloud Firestore in /tutors/{canonicalUid} and /users/{canonicalUid}
+  try {
+    const saveSuccess = await saveTutorToFirestore(updatedTutor);
+    if (saveSuccess === false) {
+      return res.status(500).json({
+        error: 'Persistence Error',
+        message: 'Failed to persist tutor profile to Firestore',
+      });
+    }
+  } catch (err: any) {
+    console.error('[serverApp] Error persisting tutor to Firestore in PUT /api/tutors/:id:', err);
+    return res.status(500).json({
+      error: 'Persistence Error',
+      message: 'Failed to persist tutor profile to Firestore',
+      details: err?.message || String(err),
+    });
+  }
+
+  // 6. Update local in-memory DB & disk cache
+  db.tutorsList = db.tutorsList || [];
+  const existingLocalIdx = db.tutorsList.findIndex(
+    (t: any) =>
+      (t.uid && t.uid === canonicalUid) ||
+      (t.id && (t.id === updatedTutor.id || t.id.toLowerCase() === tutorIdParam.toLowerCase())) ||
+      (tEmail && t.email && t.email.toLowerCase() === tEmail)
+  );
+  if (existingLocalIdx >= 0) {
+    db.tutorsList[existingLocalIdx] = updatedTutor;
+  } else {
+    db.tutorsList.push(updatedTutor);
+  }
 
   // Sync with db.teachers
-  const teacherIdx = (db.teachers || []).findIndex((tc: any) => tc.email?.toLowerCase() === tEmail);
+  const teacherIdx = (db.teachers || []).findIndex(
+    (tc: any) => (tc.email && tc.email.toLowerCase() === tEmail) || (tc.uid && tc.uid === canonicalUid)
+  );
   if (teacherIdx >= 0) {
     db.teachers[teacherIdx] = {
       ...db.teachers[teacherIdx],
@@ -3385,13 +3486,8 @@ app.put('/api/tutors/:id', firebaseAuthMiddleware, async (req, res) => {
     };
   }
 
-  // Direct Firestore persistence
-  await saveTutorToFirestore(updatedTutor).catch((err) => {
-    console.warn('Error saving updated tutor to Firestore collection:', err);
-  });
-
   writeDb(db);
-  return res.json({ success: true, tutor: updatedTutor, tutors: db.tutorsList });
+  return res.status(200).json({ success: true, tutor: updatedTutor, tutors: db.tutorsList });
 });
 
   // Admin Delete Tutor

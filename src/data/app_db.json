@@ -65,6 +65,92 @@
       "appliedAt": "2026-10-17T17:30:00.000Z",
       "registeredByAdmin": false,
       "meetUrl": ""
+    },
+    {
+      "id": "W111111111111111111111111111",
+      "uid": "W111111111111111111111111111",
+      "authUid": "W111111111111111111111111111",
+      "email": "remote-teacher@example.com",
+      "name": "Remote Teacher Updated",
+      "role": "teacher",
+      "approvalStatus": "approved",
+      "isApproved": true,
+      "bio": "Updated remote bio",
+      "headline": "Remote Headline",
+      "pricePerSessionUsd": 30,
+      "meetUrl": "https://meet.google.com/rem-ote-tea",
+      "status": "approved",
+      "approved": true,
+      "registeredByAdmin": false,
+      "videoIntroUrl": "",
+      "youtubeUrl": "",
+      "videoUrl": "",
+      "introVideoUrl": "",
+      "youtubeEmbedId": "",
+      "availableDays": [],
+      "updatedAt": "2026-10-19T13:56:20.895Z"
+    },
+    {
+      "id": "cool-tutor",
+      "publicTutorId": "cool-tutor",
+      "uid": "L666666666666666666666666666",
+      "email": "cool.tutor@example.com",
+      "name": "Cool Tutor",
+      "authUid": "L666666666666666666666666666",
+      "legacyIds": [],
+      "headline": "Mastering Everyday English",
+      "bio": "Native English speaker ready to help you speak with natural fluency.",
+      "avatar": "",
+      "photoUrl": "",
+      "country": "Global",
+      "countryCode": "",
+      "flag": "🇺🇸",
+      "accent": "North American",
+      "meetLink": "",
+      "meetUrl": "",
+      "timezone": "America/Toronto",
+      "specialties": [
+        "Conversação",
+        "Pronúncia",
+        "Fluência"
+      ],
+      "availableDays": [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday"
+      ],
+      "availableHours": [
+        "09:00",
+        "10:00",
+        "11:00",
+        "14:00",
+        "15:00",
+        "16:00"
+      ],
+      "availableHoursByDay": {},
+      "availability": {},
+      "pricePerSessionUsd": 20,
+      "pricePerSessionBrl": 110,
+      "videoIntroUrl": "",
+      "youtubeUrl": "",
+      "videoUrl": "",
+      "introVideoUrl": "",
+      "youtubeEmbedId": "",
+      "rating": 5,
+      "reviewsCount": 0,
+      "activeStudents": 0,
+      "lessonsTaught": 12,
+      "isSuperTutor": false,
+      "approvalStatus": "pending",
+      "isApproved": false,
+      "status": "pending",
+      "approved": false,
+      "role": "teacher",
+      "appliedAt": "2026-10-19T13:56:21.533Z",
+      "updatedAt": "2026-10-19T13:56:21.533Z",
+      "registeredByAdmin": false
     }
   ],
   "deletedTutorIds": [],
@@ -141,7 +227,23 @@
     }
   ],
   "meetSettings": {},
-  "teacherSettings": {},
+  "teacherSettings": {
+    "remote-teacher@example.com": {
+      "teacherEmail": "remote-teacher@example.com",
+      "meetLink": "https://meet.google.com/rem-ote-tea"
+    },
+    "cool.tutor@example.com": {
+      "teacherEmail": "cool.tutor@example.com",
+      "timezone": "America/Toronto",
+      "availableDays": [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday"
+      ]
+    }
+  },
   "liveLessons": [],
   "chatMessages": [],
   "routinesByDay": {
@@ -3438,7 +3540,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 21,
-      "updatedAt": "2026-10-19T10:55:47.983Z",
+      "updatedAt": "2026-10-19T13:55:41.938Z",
       "isPublic": true,
       "videos": [
         {
@@ -3724,7 +3826,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 21,
-      "updatedAt": "2026-10-19T10:55:47.983Z",
+      "updatedAt": "2026-10-19T13:55:41.938Z",
       "isPublic": true,
       "videos": [
         {
@@ -4010,7 +4112,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-19T10:55:47.983Z",
+      "updatedAt": "2026-10-19T13:55:41.938Z",
       "isPublic": true,
       "videos": [
         {
@@ -4400,7 +4502,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 27,
-      "updatedAt": "2026-10-19T10:55:47.983Z",
+      "updatedAt": "2026-10-19T13:55:41.938Z",
       "isPublic": true,
       "videos": [
         {
@@ -4764,7 +4866,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 26,
-      "updatedAt": "2026-10-19T10:55:47.983Z",
+      "updatedAt": "2026-10-19T13:55:41.938Z",
       "isPublic": true,
       "videos": [
         {
@@ -5115,7 +5217,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 21,
-      "updatedAt": "2026-10-19T10:55:47.983Z",
+      "updatedAt": "2026-10-19T13:55:41.938Z",
       "isPublic": true,
       "videos": [
         {
@@ -5401,7 +5503,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 23,
-      "updatedAt": "2026-10-19T10:55:47.983Z",
+      "updatedAt": "2026-10-19T13:55:41.938Z",
       "isPublic": true,
       "videos": [
         {
@@ -5713,7 +5815,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 26,
-      "updatedAt": "2026-10-19T10:55:47.983Z",
+      "updatedAt": "2026-10-19T13:55:41.938Z",
       "isPublic": true,
       "videos": [
         {
@@ -6064,7 +6166,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 28,
-      "updatedAt": "2026-10-19T10:55:47.983Z",
+      "updatedAt": "2026-10-19T13:55:41.938Z",
       "isPublic": true,
       "videos": [
         {
@@ -6441,7 +6543,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-19T10:55:47.983Z",
+      "updatedAt": "2026-10-19T13:55:41.938Z",
       "isPublic": true,
       "videos": [
         {
@@ -6831,7 +6933,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 28,
-      "updatedAt": "2026-10-19T10:55:47.983Z",
+      "updatedAt": "2026-10-19T13:55:41.938Z",
       "isPublic": true,
       "videos": [
         {
@@ -7208,7 +7310,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 30,
-      "updatedAt": "2026-10-19T10:55:47.983Z",
+      "updatedAt": "2026-10-19T13:55:41.938Z",
       "isPublic": true,
       "videos": [
         {
@@ -7611,7 +7713,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-19T10:55:47.983Z",
+      "updatedAt": "2026-10-19T13:55:41.938Z",
       "isPublic": true,
       "videos": [
         {
@@ -8001,7 +8103,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 30,
-      "updatedAt": "2026-10-19T10:55:47.983Z",
+      "updatedAt": "2026-10-19T13:55:41.938Z",
       "isPublic": true,
       "videos": [
         {
@@ -8404,7 +8506,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-19T10:55:47.983Z",
+      "updatedAt": "2026-10-19T13:55:41.938Z",
       "isPublic": true,
       "videos": [
         {
@@ -8794,7 +8896,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 27,
-      "updatedAt": "2026-10-19T10:55:47.983Z",
+      "updatedAt": "2026-10-19T13:55:41.938Z",
       "isPublic": true,
       "videos": [
         {
@@ -9158,7 +9260,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 28,
-      "updatedAt": "2026-10-19T10:55:47.983Z",
+      "updatedAt": "2026-10-19T13:55:41.938Z",
       "isPublic": true,
       "videos": [
         {
@@ -9535,7 +9637,7 @@
       "channelId": "UCdimJysdxd2Hu9YmlVHB98A",
       "channelTitle": "Adm Itissimple",
       "itemCount": 29,
-      "updatedAt": "2026-10-19T10:55:47.983Z",
+      "updatedAt": "2026-10-19T13:55:41.938Z",
       "isPublic": true,
       "videos": [
         {
