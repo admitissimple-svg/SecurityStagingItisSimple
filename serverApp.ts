@@ -784,50 +784,101 @@ function loadFromDisk(): AppDb | null {
 if (!isDiagnosticMode()) {
   const initialDiskDb = loadFromDisk();
   if (initialDiskDb) {
-    // Sanitize fabricated placeholder UIDs during disk load so they never taint runtime memory
+    // Sanitize non-canonical/fabricated UIDs during disk load so they never taint runtime memory
     const diskAuthUsers = { ...(initialDiskDb.authUsers || {}) };
     const diskUserProfiles = { ...(initialDiskDb.userProfiles || {}) };
     const diskTeachers = [...(initialDiskDb.teachers || [])];
     const diskStudents = [...(initialDiskDb.students || [])];
+    const diskTutorsList = [...(initialDiskDb.tutorsList || [])];
 
+    // 1. Purge non-canonical or fabricated UIDs from authUsers
     for (const [em, u] of Object.entries(diskAuthUsers)) {
-      if ((u as any)?.uid === 'admin-master-uid' || (u as any)?.uid === 'student_lala_canonical_uid') {
+      const uUid = (u as any)?.uid;
+      if (!uUid || !isValidCanonicalUid(uUid)) {
         delete diskAuthUsers[em];
       }
     }
+
+    // 2. Strip non-canonical UIDs and invalid teacher links from user profiles
     for (const [em, p] of Object.entries(diskUserProfiles)) {
-      if ((p as any)?.uid === 'admin-master-uid' || (p as any)?.uid === 'student_lala_canonical_uid') {
+      const pUid = (p as any)?.uid;
+      const pId = (p as any)?.id;
+      const pTeacherUid = (p as any)?.teacherUid;
+      if (pUid && !isValidCanonicalUid(pUid)) {
         delete (p as any).uid;
+      }
+      if (pId && !isValidCanonicalUid(pId)) {
         delete (p as any).id;
       }
-      if ((p as any)?.teacherUid === 'admin-master-uid') {
+      if (pTeacherUid && !isValidCanonicalUid(pTeacherUid)) {
         delete (p as any).teacherUid;
       }
     }
+
+    // 3. Strip non-canonical UIDs and invalid teacher links from students
     for (const s of diskStudents) {
-      if (s.uid === 'student_lala_canonical_uid' || s.id === 'student_lala_canonical_uid' || s.studentUid === 'student_lala_canonical_uid') {
+      if (s.uid && !isValidCanonicalUid(s.uid)) {
         delete s.uid;
-        delete s.id;
+      }
+      if (s.studentUid && !isValidCanonicalUid(s.studentUid)) {
         delete s.studentUid;
       }
-      if (s.teacherUid === 'admin-master-uid') {
+      if (s.id && !isValidCanonicalUid(s.id)) {
+        delete s.id;
+      }
+      if (s.teacherUid && !isValidCanonicalUid(s.teacherUid)) {
         delete s.teacherUid;
       }
     }
+
+    // 4. Strip non-canonical UIDs and generic placeholder IDs from teachers and tutors
     for (const t of diskTeachers) {
-      if (t.uid === 'admin-master-uid' || t.id === 'admin-master-uid') {
+      if (t.uid && !isValidCanonicalUid(t.uid)) {
         delete t.uid;
+      }
+      if (t.id && !isValidCanonicalUid(t.id) && isGenericTutorId(t.id)) {
+        delete t.id;
+      }
+    }
+    for (const t of diskTutorsList) {
+      if (t.uid && !isValidCanonicalUid(t.uid)) {
+        delete t.uid;
+      }
+      if (t.authUid && !isValidCanonicalUid(t.authUid)) {
+        delete t.authUid;
+      }
+      if (t.id && !isValidCanonicalUid(t.id) && isGenericTutorId(t.id)) {
         delete t.id;
       }
     }
 
+    // 5. Ensure deleted records are never resurrected from local disk
+    const diskDeletedTutorEmails = (initialDiskDb.deletedTutorEmails || []).map((e: string) => (e || '').toLowerCase().trim());
+    const diskDeletedTutorIds = (initialDiskDb.deletedTutorIds || []).map((i: string) => (i || '').toLowerCase().trim());
+    const diskDeletedStudentEmails = (initialDiskDb.deletedStudentEmails || []).map((e: string) => (e || '').toLowerCase().trim());
+
+    const sanitizedTeachers = diskTeachers.filter((t: any) => {
+      const em = (t.email || '').toLowerCase().trim();
+      return em && !diskDeletedTutorEmails.includes(em);
+    });
+    const sanitizedTutorsList = diskTutorsList.filter((t: any) => {
+      const em = (t.email || '').toLowerCase().trim();
+      const id = (t.id || '').toLowerCase().trim();
+      return (!em || !diskDeletedTutorEmails.includes(em)) && (!id || !diskDeletedTutorIds.includes(id));
+    });
+    const sanitizedStudents = diskStudents.filter((s: any) => {
+      const em = (s.studentEmail || s.email || '').toLowerCase().trim();
+      return em && !diskDeletedStudentEmails.includes(em);
+    });
+
     inMemoryDb = {
       ...DEFAULT_DB,
       ...initialDiskDb,
-      teachers: diskTeachers,
+      teachers: sanitizedTeachers,
+      tutorsList: sanitizedTutorsList,
       authUsers: diskAuthUsers,
       userProfiles: diskUserProfiles,
-      students: diskStudents,
+      students: sanitizedStudents,
     };
   } else {
     saveToDiskSync(inMemoryDb);
@@ -893,21 +944,27 @@ async function initCloudPersistence() {
     const cloudState = await fetchAppStateFromFirestore();
     if (cloudState && typeof cloudState === 'object') {
       console.log('Successfully hydrated database from Firebase Firestore cloud');
-      // Sanitize placeholder UIDs in cloudState before merging
+      // Sanitize non-canonical placeholder UIDs in cloudState before merging
       if (cloudState.authUsers) {
         for (const [em, u] of Object.entries(cloudState.authUsers)) {
-          if ((u as any)?.uid === 'admin-master-uid' || (u as any)?.uid === 'student_lala_canonical_uid') {
+          const uUid = (u as any)?.uid;
+          if (uUid && !isValidCanonicalUid(uUid)) {
             delete (u as any).uid;
           }
         }
       }
       if (cloudState.userProfiles) {
         for (const [em, p] of Object.entries(cloudState.userProfiles)) {
-          if ((p as any)?.uid === 'admin-master-uid' || (p as any)?.uid === 'student_lala_canonical_uid') {
+          const pUid = (p as any)?.uid;
+          const pId = (p as any)?.id;
+          const pTeacherUid = (p as any)?.teacherUid;
+          if (pUid && !isValidCanonicalUid(pUid)) {
             delete (p as any).uid;
+          }
+          if (pId && !isValidCanonicalUid(pId)) {
             delete (p as any).id;
           }
-          if ((p as any)?.teacherUid === 'admin-master-uid') {
+          if (pTeacherUid && !isValidCanonicalUid(pTeacherUid)) {
             delete (p as any).teacherUid;
           }
         }
@@ -1094,7 +1151,7 @@ async function initCloudPersistence() {
         if (key && !allDeletedStudentEmails.includes(key)) {
           const existing = studentMap.get(key);
           if (existing) {
-            studentMap.set(key, mergeStudentPreservingCanonicalUid(existing, s));
+            studentMap.set(key, mergeStudentPreservingCanonicalUid(s, existing));
           } else if (s.uid && isValidCanonicalUid(s.uid)) {
             studentMap.set(key, s);
           }
@@ -1882,10 +1939,9 @@ const handleRegistration = async (req: any, res: any) => {
       (existingTutor?.uid && isValidCanonicalUid(existingTutor.uid) ? existingTutor.uid : null) ||
       (existingTutor?.authUid && isValidCanonicalUid(existingTutor.authUid) ? existingTutor.authUid : null) ||
       (existingTeacher?.uid && isValidCanonicalUid(existingTeacher.uid) ? existingTeacher.uid : null) ||
-      (existingAuth?.uid && isValidCanonicalUid(existingAuth.uid) ? existingAuth.uid : null) ||
-      existingTutor?.uid || existingTeacher?.uid;
+      (existingAuth?.uid && isValidCanonicalUid(existingAuth.uid) ? existingAuth.uid : null);
 
-    if (verifiedUid && existingTutorUid && existingTutorUid !== verifiedUid && existingTutorUid !== 'admin-master-uid') {
+    if (verifiedUid && existingTutorUid && existingTutorUid !== verifiedUid) {
       return res.status(409).json({
         error: 'Conflito de identidade detectado: já existe um perfil de professor associado a este e-mail com outro UID. Entre em contato com o suporte para reconciliação segura.',
         code: 'UID_CONFLICT_RECONCILIATION_REQUIRED',
@@ -2063,11 +2119,10 @@ const handleRegistration = async (req: any, res: any) => {
     (existingStudent?.uid && isValidCanonicalUid(existingStudent.uid) ? existingStudent.uid : null) ||
     (existingStudent?.studentUid && isValidCanonicalUid(existingStudent.studentUid) ? existingStudent.studentUid : null) ||
     (existingAuthUser?.uid && isValidCanonicalUid(existingAuthUser.uid) ? existingAuthUser.uid : null) ||
-    (existingProfile?.id && isValidCanonicalUid(existingProfile.id) ? existingProfile.id : null) ||
-    existingProfile?.uid || existingStudent?.uid;
+    (existingProfile?.id && isValidCanonicalUid(existingProfile.id) ? existingProfile.id : null);
 
   // 3.1 Anti-Hijacking & UID Conflict Protection
-  if (verifiedUid && existingRecordUid && existingRecordUid !== verifiedUid && existingRecordUid !== 'admin-master-uid' && existingRecordUid !== 'student_lala_canonical_uid') {
+  if (verifiedUid && existingRecordUid && existingRecordUid !== verifiedUid) {
     return res.status(409).json({
       error: 'Conflito de identidade detectado: já existe um perfil histórico associado a este e-mail com outro UID. Entre em contato com o suporte para reconciliação segura.',
       code: 'UID_CONFLICT_RECONCILIATION_REQUIRED',
