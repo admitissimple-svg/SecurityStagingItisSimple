@@ -444,14 +444,9 @@ const DEFAULT_LANDING_CONTENT = {
 };
 
 // Active production users allowed in the platform
-export const ACTIVE_PRODUCTION_USERS = new Set([
-  'adm.itissimple@gmail.com',
-  'laviniatilapiafc@gmail.com',
-]);
+export const ACTIVE_PRODUCTION_USERS = new Set<string>([]);
 
-export const ACTIVE_PRODUCTION_STUDENTS = new Set<string>([
-  'laviniatilapiafc@gmail.com',
-]);
+export const ACTIVE_PRODUCTION_STUDENTS = new Set<string>([]);
 
 export const PURGED_OBSOLETE_STUDENTS = [
   'test-student@example.com',
@@ -1027,15 +1022,17 @@ async function initCloudPersistence() {
         return !allDeletedTutorEmails.includes(em);
       });
 
-      // Ensure all tutors have entries in mergedAuthUsers and mergedUserProfiles
+      // Sync approved tutors with proven canonical UIDs into profiles
       mergedTutorsList.forEach((t: any) => {
         const key = (t.email || '').toLowerCase().trim();
-        if (key && !allDeletedTutorEmails.includes(key)) {
-          const tId = t.id || `tutor-${key.replace(/[^a-zA-Z0-9]/g, '-')}`;
+        const tUid = (t.authUid && isValidCanonicalUid(t.authUid) ? t.authUid : null) ||
+          (t.uid && isValidCanonicalUid(t.uid) ? t.uid : null) ||
+          (t.id && isValidCanonicalUid(t.id) ? t.id : null);
+        if (key && tUid && !allDeletedTutorEmails.includes(key)) {
           if (!mergedAuthUsers[key]) {
             mergedAuthUsers[key] = {
-              uid: tId,
-              id: tId,
+              uid: tUid,
+              id: tUid,
               email: key,
               name: t.name || key.split('@')[0],
               role: 'teacher',
@@ -1044,8 +1041,8 @@ async function initCloudPersistence() {
           }
           if (!mergedUserProfiles[key]) {
             mergedUserProfiles[key] = {
-              id: tId,
-              uid: tId,
+              id: tUid,
+              uid: tUid,
               name: t.name || key.split('@')[0],
               email: key,
               role: 'teacher',
@@ -1292,8 +1289,13 @@ async function initCloudPersistence() {
       console.warn('Could not fetch app_state from Firestore cloud. Attempting recovery from direct collections...');
       const directTutors = await fetchTutorsFromFirestore().catch(() => []);
       if (directTutors && directTutors.length > 0) {
-        console.log(`Recovered ${directTutors.length} tutors directly from /tutors collection!`);
-        inMemoryDb.tutorsList = directTutors;
+        const cleanDirect = directTutors.filter((t: any) => {
+          const em = (t.email || '').toLowerCase().trim();
+          const id = (t.id || t.authUid || t.uid || '').toLowerCase().trim();
+          return !em.includes('example.com') && !em.includes('laviniafofa') && !id.includes('skull-bee') && !id.includes('cool-tutor');
+        });
+        console.log(`Recovered ${cleanDirect.length} valid tutors directly from /tutors collection!`);
+        inMemoryDb.tutorsList = cleanDirect;
       }
       isCloudHydrated = true;
     }
@@ -2447,9 +2449,7 @@ app.post('/api/auth/google', async (req, res) => {
 
   const verifiedCaller = await getVerifiedUserFromRequest(req);
   const targetUid = (verifiedCaller?.uid && isValidCanonicalUid(verifiedCaller.uid) ? verifiedCaller.uid : null) || uid || authRecord?.uid;
-  const isServerVerifiedAdmin =
-    verifiedCaller?.role === 'admin' ||
-    Boolean(targetUid && (db.teachers || []).some((t: any) => t.role === 'admin' && (t.uid === targetUid || t.id === targetUid)));
+  const isServerVerifiedAdmin = verifiedCaller?.role === 'admin';
   let displayName = name || cleanEmail.split('@')[0];
 
   // Query Firestore to get authoritative doc
@@ -2484,12 +2484,6 @@ app.post('/api/auth/google', async (req, res) => {
     role = 'admin';
     const adminTeacher = (db.teachers || []).find((t: any) => t.role === 'admin' && (t.uid === targetUid || t.id === targetUid));
     displayName = adminTeacher?.name || name || "Admin";
-    if (targetUid && verifiedCaller?.role !== 'admin') {
-      try {
-        const adminAuth = getFirebaseAdminAuth();
-        adminAuth.setCustomUserClaims(targetUid, { role: 'admin' }).catch(() => {});
-      } catch {}
-    }
   } else if (isRegisteredStudent) {
     // STRICT RBAC: If registered as a student, session is strictly locked to student space
     role = 'student';
@@ -4464,9 +4458,10 @@ app.get(['/api/meet-settings', '/api/teacher-settings'], async (req, res) => {
   const db = readDb();
   const teacherEmail = ((req.query.teacherEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
   const uid = (req.query.uid as string) || '';
-  const role = req.query.role as string;
+  const verifiedCaller = await getVerifiedUserFromRequest(req);
+  const isCallerAdmin = verifiedCaller?.role === 'admin';
 
-  if (role === 'admin' || teacherEmail === 'adm.itissimple@gmail.com') {
+  if (isCallerAdmin || (!teacherEmail && !uid)) {
     const settings = { ...db.meetSettings, ...db.teacherSettings };
     return res.json(settings);
   }
@@ -4624,7 +4619,7 @@ app.post(['/api/meet-settings', '/api/teacher-settings'], async (req, res) => {
 });
 
 // 4. Students & Enrollments Endpoints
-app.get('/api/students', (req, res) => {
+app.get('/api/students', async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
@@ -4655,8 +4650,9 @@ app.get('/api/students', (req, res) => {
     return false;
   };
 
-  const isAdmin = role === 'admin' || adminEmails.includes(requesterEmail);
-  const isTeacher = role === 'teacher' || Boolean(req.query.teacherEmail);
+  const verifiedCaller = await getVerifiedUserFromRequest(req);
+  const isAdmin = verifiedCaller?.role === 'admin';
+  const isTeacher = (verifiedCaller?.role === 'teacher' || role === 'teacher' || Boolean(req.query.teacherEmail)) && !isAdmin;
 
   // Admin gets all active students directly
   if (isAdmin) {
@@ -6968,18 +6964,8 @@ app.get(
       const email = (user.email || '').trim().toLowerCase();
       const emailVerified = Boolean(user.email_verified);
 
-      // Verify server-side administrative authority strictly
-      const AUTHORITATIVE_ADMIN_EMAILS = new Set([
-        'adm.itissimple@gmail.com',
-        'estilobeeforkids@gmail.com',
-        'adm.itssimple@gmail.com',
-        'estilobeeadm@gmail.com',
-        'admin@itissimple.com',
-      ]);
-
-      const isAdmin =
-        user.role === 'admin' ||
-        (emailVerified && Boolean(email) && AUTHORITATIVE_ADMIN_EMAILS.has(email));
+      // Administrative authority strictly controlled by verified Firebase custom claims
+      const isAdmin = user.role === 'admin';
 
       let teacherInfo: {
         isTeacher: boolean;
@@ -10167,7 +10153,7 @@ app.delete('/api/student-journal/activity', async (req, res) => {
 });
 
 // Endpoint: Strict UID correlation verification between Student and Native Friend
-app.get('/api/students/verify-link', (req, res) => {
+app.get('/api/students/verify-link', async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   const db = readDb();
   const studentUid = ((req.query.studentUid as string) || '').trim();
@@ -10175,18 +10161,19 @@ app.get('/api/students/verify-link', (req, res) => {
   const teacherUid = ((req.query.teacherUid as string) || '').trim();
   const teacherEmail = ((req.query.teacherEmail as string) || '').toLowerCase().trim();
 
-  const adminEmails = [
-    'adm.itissimple@gmail.com',
-    'estilobeeforkids@gmail.com',
-    'adm.itssimple@gmail.com',
-    'estilobeeadm@gmail.com',
-  ];
+  const verifiedCaller = await getVerifiedUserFromRequest(req);
+  if (verifiedCaller?.role === 'admin') {
+    return res.json({ isLinked: true, reason: 'admin' });
+  }
 
-  if (
-    teacherUid === 'admin' ||
-    adminEmails.includes(teacherEmail) ||
-    teacherEmail.includes('admin')
-  ) {
+  const isTeacherAdmin = (db.teachers || []).some(
+    (t: any) => t.role === 'admin' && (
+      (teacherUid && (t.uid === teacherUid || t.id === teacherUid)) ||
+      (teacherEmail && t.email?.toLowerCase() === teacherEmail)
+    )
+  );
+
+  if (isTeacherAdmin) {
     return res.json({ isLinked: true, reason: 'admin' });
   }
 
