@@ -2481,24 +2481,34 @@ export async function fetchStudentLessonsFromFirestore(
     const addOrUpdate = (item: LiveLesson) => {
       if (!item || !item.id) return;
       const isItemCancelled = item.status === 'cancelled' || (item.status as string) === 'canceled' || Boolean(item.cancelledAt);
+      const isItemCompleted = item.status === 'completed' || Boolean(item.completedAt);
       const normalizedItem: LiveLesson = {
         ...item,
         ...(isItemCancelled ? { status: 'cancelled', cancelledAt: item.cancelledAt || new Date().toISOString() } : {}),
+        ...(isItemCompleted ? { status: 'completed', completedAt: item.completedAt || new Date().toISOString() } : {}),
       };
 
       const existing = lessonsMap.get(normalizedItem.id);
       if (existing) {
         // Strict invariant: If existing or item is cancelled, strictly keep cancelled!
         const isCancelled = existing.status === 'cancelled' || normalizedItem.status === 'cancelled' || Boolean(existing.cancelledAt) || Boolean(normalizedItem.cancelledAt);
+        // Strict invariant: If existing or item is completed, strictly keep completed (cannot revert to scheduled)!
+        const isCompleted = existing.status === 'completed' || normalizedItem.status === 'completed' || Boolean(existing.completedAt) || Boolean(normalizedItem.completedAt);
+
         const cancelledAt = existing.cancelledAt || normalizedItem.cancelledAt;
         const cancelledBy = existing.cancelledBy || normalizedItem.cancelledBy;
         const cancellationReason = existing.cancellationReason || normalizedItem.cancellationReason;
+        const completedAt = existing.completedAt || normalizedItem.completedAt;
+
         const merged: LiveLesson = { ...existing, ...normalizedItem };
         if (isCancelled) {
           merged.status = 'cancelled';
           merged.cancelledAt = cancelledAt || new Date().toISOString();
           if (cancelledBy) merged.cancelledBy = cancelledBy;
           if (cancellationReason) merged.cancellationReason = cancellationReason;
+        } else if (isCompleted) {
+          merged.status = 'completed';
+          merged.completedAt = completedAt || new Date().toISOString();
         }
         lessonsMap.set(normalizedItem.id, merged);
       } else {
@@ -2662,11 +2672,17 @@ export function subscribeToStudentLessons(
             item.status === 'cancelled' ||
             (item.status as string) === 'canceled' ||
             Boolean(item.cancelledAt);
+          const isItemCompleted =
+            item.status === 'completed' ||
+            Boolean(item.completedAt);
           const normalizedItem: LiveLesson = {
             ...item,
             id,
             ...(isItemCancelled
               ? { status: 'cancelled', cancelledAt: item.cancelledAt || new Date().toISOString() }
+              : {}),
+            ...(isItemCompleted
+              ? { status: 'completed', completedAt: item.completedAt || new Date().toISOString() }
               : {}),
           };
           const existing = consolidatedMap.get(id);
@@ -2676,9 +2692,15 @@ export function subscribeToStudentLessons(
               normalizedItem.status === 'cancelled' ||
               Boolean(existing.cancelledAt) ||
               Boolean(normalizedItem.cancelledAt);
+            const isCompleted =
+              existing.status === 'completed' ||
+              normalizedItem.status === 'completed' ||
+              Boolean(existing.completedAt) ||
+              Boolean(normalizedItem.completedAt);
             const cancelledAt = existing.cancelledAt || normalizedItem.cancelledAt;
             const cancelledBy = existing.cancelledBy || normalizedItem.cancelledBy;
             const cancellationReason = existing.cancellationReason || normalizedItem.cancellationReason;
+            const completedAt = existing.completedAt || normalizedItem.completedAt;
             const timeExisting = new Date(existing.updatedAt || existing.startDateTime || 0).getTime();
             const timeItem = new Date(normalizedItem.updatedAt || normalizedItem.startDateTime || 0).getTime();
             const latest =
@@ -2688,6 +2710,9 @@ export function subscribeToStudentLessons(
               latest.cancelledAt = cancelledAt || new Date().toISOString();
               if (cancelledBy) latest.cancelledBy = cancelledBy;
               if (cancellationReason) latest.cancellationReason = cancellationReason;
+            } else if (isCompleted) {
+              latest.status = 'completed';
+              latest.completedAt = completedAt || new Date().toISOString();
             }
             consolidatedMap.set(id, latest);
           } else {
@@ -3759,13 +3784,9 @@ export function deriveWeeklyChecksFromJournal(
     if (targetWeek !== undefined && entry.week !== undefined && entry.week !== targetWeek) {
       return;
     }
-    // Do not mark past/retroactive day reviews, but do mark the scheduled day even if it was a repeated video
-    if ((entry as any).reviewedPastDay || (entry as any).isReview) {
-      return;
-    }
     const stepId = mapJournalTypeToStepId(entry.type);
     if (entry.dayOfWeek) {
-      checks[`${stepId}_${entry.dayOfWeek}`] = true;
+      checks[`${stepId}_${entry.dayOfWeek.toLowerCase()}`] = true;
     }
   });
 

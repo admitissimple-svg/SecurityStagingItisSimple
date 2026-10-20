@@ -1113,17 +1113,25 @@ export default function App() {
           const existing = map.get(l.id);
           if (existing && (existing.status === 'cancelled' || existing.cancelledAt) && l.status !== 'cancelled' && !l.cancelledAt) {
             // Keep cancelled
+          } else if (existing && (existing.status === 'completed' || existing.completedAt) && l.status !== 'completed' && !l.completedAt) {
+            // Keep completed
           } else {
             map.set(l.id, { ...existing, ...l });
           }
         });
-        // Strict invariant: any cancelled lesson is permanently marked cancelled
+        // Strict invariant: any cancelled lesson is permanently marked cancelled, any completed lesson is permanently completed
         map.forEach((l, id) => {
           if (l.status === 'cancelled' || l.cancelledAt) {
             map.set(id, {
               ...l,
               status: 'cancelled',
               cancelledAt: l.cancelledAt || new Date().toISOString(),
+            });
+          } else if (l.status === 'completed' || l.completedAt) {
+            map.set(id, {
+              ...l,
+              status: 'completed',
+              completedAt: l.completedAt || new Date().toISOString(),
             });
           }
         });
@@ -3036,24 +3044,13 @@ export default function App() {
             params.video?.videoTitle?.toLowerCase().includes('repetir video anterior'))
       );
 
-      const todayDay = getTodayDayOfWeek();
-      const dayIndex = DAYS_OF_WEEK.indexOf(targetDay);
-      const todayIndex = DAYS_OF_WEEK.indexOf(todayDay);
-      const isPastDay = Boolean(
-        (params as any).reviewedPastDay ||
-        (dayIndex !== -1 && todayIndex !== -1 && dayIndex < todayIndex)
-      );
-
       // 1. Update S-Path (Gráfico S) in React state & direct Firestore users/{studentUID} persistence
-      // S-Path rule: Ensure that if a student completes an activity on a given day (even if it is a repeated video),
-      // that specific day must be marked as completed in the S-Path tracker.
-      // Do not mark past/retroactive days, but do mark the current active day when completed.
-      if (!isPastDay) {
-        setWeeklyChecks((prev) => {
-          if (prev[checkKey]) return prev;
-          return { ...prev, [checkKey]: true };
-        });
-      }
+      // S-Path rule: Ensure that when an activity is completed for any respective day of the week,
+      // it is marked and maintained in the S-Path tracker until the student explicitly starts a new week.
+      setWeeklyChecks((prev) => {
+        if (prev[checkKey]) return prev;
+        return { ...prev, [checkKey]: true };
+      });
 
       const targetDate = getDateForDayInCurrentWeek(targetDay);
       const journalType = mapStepIdToJournalType(params.type);
@@ -3079,8 +3076,6 @@ export default function App() {
             url: params.video?.url || params.track?.url,
             isRepeat: isVideoRepeatAction,
             isRepeatVideo: isVideoRepeatAction,
-            isReview: isPastDay,
-            reviewedPastDay: isPastDay,
           },
           email
         ).then((res) => {
@@ -3089,7 +3084,7 @@ export default function App() {
           }
         });
 
-        if (!isAlreadyChecked && !isPastDay) {
+        if (!isAlreadyChecked) {
           saveStudentWeeklyChecksToFirestore(
             uid,
             { [checkKey]: true },
@@ -3116,7 +3111,7 @@ export default function App() {
             }
           });
 
-          // Routines subcollection update for daily routine tracking (root weeklyChecks write removed)
+          // Routines subcollection update for daily routine tracking
           const db = getDb();
           if (db && uid) {
             setDoc(
@@ -4114,14 +4109,16 @@ export default function App() {
   // Handler: Complete lesson (Automatically marks S-Path tutor_live for the lesson's day)
   const handleCompleteLesson = async (lessonId: string) => {
     let completedLesson: LiveLesson | undefined;
+    const nowIso = new Date().toISOString();
     setLessons((prev) => {
       completedLesson = prev.find((l) => l.id === lessonId);
-      return prev.map((l) => (l.id === lessonId ? { ...l, status: 'completed' } : l));
+      return prev.map((l) => (l.id === lessonId ? { ...l, status: 'completed', completedAt: nowIso } : l));
     });
 
     const targetLesson = completedLesson || lessons.find((l) => l.id === lessonId);
     const targetStudentUid = targetLesson?.studentUid || currentAccount?.uid || userProfile?.id || '';
     const targetStudentEmail = targetLesson?.studentEmail || currentAccount?.email || userProfile?.email || '';
+    const targetTeacherUid = targetLesson?.teacherUid || (isTeacher ? currentAccount?.uid : undefined);
 
     // Calculate lesson day of week
     let lessonDay: DayOfWeek = 'monday';
@@ -4140,7 +4137,14 @@ export default function App() {
     handleUpdateSPathCheck('tutor_live', lessonDay, true, targetStudentUid, targetStudentEmail);
 
     // Persist status change in Firestore
-    updateLiveLessonInFirestore(lessonId, { status: 'completed' }, targetStudentUid || currentAccount?.uid);
+    await updateLiveLessonInFirestore(
+      lessonId,
+      { status: 'completed', completedAt: nowIso },
+      targetStudentUid || currentAccount?.uid,
+      targetTeacherUid,
+      targetLesson,
+      targetStudentEmail
+    );
 
     try {
       await fetch(`/api/lessons/${lessonId}/complete`, { method: 'POST' });

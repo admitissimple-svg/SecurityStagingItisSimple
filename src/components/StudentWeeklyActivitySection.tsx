@@ -531,16 +531,11 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
         });
         if (hasCompletedRoutineVideo) return true;
 
-        // In studentJournal: verify completion strictly for this scheduled day and active week (ignoring past/retroactive reviews)
+        // In studentJournal: verify completion strictly for this scheduled day and active week
         const hasValidJournalVideo = activeJournal.some((entry) => {
           if (!entry) return false;
           const isVideo = entry.type === 'video' || (entry as any).type === 'video_day';
           if (!isVideo) return false;
-
-          // Do not mark past/retroactive day reviews
-          if ((entry as any).reviewedPastDay || (entry as any).isReview) {
-            return false;
-          }
 
           // Strictly match the scheduled day for this routine item and active week
           if (entry.dayOfWeek && entry.dayOfWeek.toLowerCase() === dayKey.toLowerCase()) {
@@ -592,7 +587,6 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
           if (!entry) return false;
           const isAudio = entry.type === 'audio' || (entry as any).type === 'audio_day';
           if (!isAudio) return false;
-          if ((entry as any).reviewedPastDay || (entry as any).isReview) return false;
           if (entry.dayOfWeek && entry.dayOfWeek.toLowerCase() === dayKey.toLowerCase()) {
             if (entry.week === undefined || entry.week === activeWeekCycle || Number(entry.week) === activeWeekCycle) return true;
           }

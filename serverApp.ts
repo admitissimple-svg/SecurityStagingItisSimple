@@ -7665,18 +7665,78 @@ app.post(['/api/lessons', '/api/live-lessons'], async (req, res) => {
   res.json(db.liveLessons);
 });
 
-app.post('/api/lessons/:id/complete', (req, res) => {
+async function syncLessonUpdateToFirestore(lessonId: string, updates: Record<string, any>, lessonMeta?: any) {
+  try {
+    const firestore = getFirestoreDb();
+    if (!firestore || !lessonId) return;
+    const cleanUpdates = JSON.parse(JSON.stringify(updates));
+    const nowIso = new Date().toISOString();
+    cleanUpdates.updatedAt = cleanUpdates.updatedAt || nowIso;
+
+    // 1. Root lessons collection
+    await firestore.collection('lessons').doc(lessonId).set(cleanUpdates, { merge: true });
+
+    // 2. Resolve student and teacher doc IDs
+    const studentUid = (lessonMeta?.studentUid || '').trim();
+    const studentEmail = (lessonMeta?.studentEmail || '').toLowerCase().trim();
+    const teacherUid = (lessonMeta?.teacherUid || lessonMeta?.tutorUid || '').trim();
+    const teacherEmail = (lessonMeta?.teacherEmail || lessonMeta?.tutorEmail || '').toLowerCase().trim();
+
+    const studentDocs = [studentUid, studentEmail ? `usr-${studentEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : ''].filter(Boolean);
+    const teacherDocs = [teacherUid, teacherEmail ? `usr-${teacherEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : ''].filter(Boolean);
+
+    for (const sId of studentDocs) {
+      try {
+        await firestore.collection('users').doc(sId).collection('lessons').doc(lessonId).set(cleanUpdates, { merge: true });
+        const uSnap = await firestore.collection('users').doc(sId).get();
+        if (uSnap.exists) {
+          const uData = uSnap.data();
+          if (Array.isArray(uData?.scheduledLessons)) {
+            const updatedScheduled = cleanUpdates.status === 'cancelled'
+              ? uData.scheduledLessons.filter((l: any) => l.id !== lessonId)
+              : uData.scheduledLessons.map((l: any) => (l.id === lessonId ? { ...l, ...cleanUpdates } : l));
+            await firestore.collection('users').doc(sId).set({ scheduledLessons: updatedScheduled, updatedAt: nowIso }, { merge: true });
+          }
+        }
+      } catch {}
+    }
+
+    for (const tId of teacherDocs) {
+      try {
+        await firestore.collection('users').doc(tId).collection('lessons').doc(lessonId).set(cleanUpdates, { merge: true });
+        const tSnap = await firestore.collection('users').doc(tId).get();
+        if (tSnap.exists) {
+          const tData = tSnap.data();
+          if (Array.isArray(tData?.scheduledLessons)) {
+            const updatedScheduled = cleanUpdates.status === 'cancelled'
+              ? tData.scheduledLessons.filter((l: any) => l.id !== lessonId)
+              : tData.scheduledLessons.map((l: any) => (l.id === lessonId ? { ...l, ...cleanUpdates } : l));
+            await firestore.collection('users').doc(tId).set({ scheduledLessons: updatedScheduled, updatedAt: nowIso }, { merge: true });
+          }
+        }
+      } catch {}
+    }
+  } catch (fsErr) {
+    console.warn('[syncLessonUpdateToFirestore] notice:', fsErr);
+  }
+}
+
+app.post('/api/lessons/:id/complete', async (req, res) => {
   const db = readDb();
   const id = decodeURIComponent(req.params.id);
-  db.liveLessons = db.liveLessons.map((l) => (l.id === id ? { ...l, status: 'completed' } : l));
-  writeDb(db);
+  const nowIso = new Date().toISOString();
+  db.liveLessons = db.liveLessons.map((l) => (l.id === id ? { ...l, status: 'completed', completedAt: l.completedAt || nowIso } : l));
+  await writeDbSync(db);
+  const target = (db.liveLessons || []).find((l: any) => l.id === id);
+  await syncLessonUpdateToFirestore(id, { status: 'completed', completedAt: nowIso }, target);
   res.json({ success: true, liveLessons: db.liveLessons });
 });
 
-app.post('/api/lessons/:id/not-completed', (req, res) => {
+app.post('/api/lessons/:id/not-completed', async (req, res) => {
   const db = readDb();
   const id = decodeURIComponent(req.params.id);
   const { responsible, reason } = req.body;
+  const nowIso = new Date().toISOString();
   db.liveLessons = db.liveLessons.map((l) =>
     l.id === id
       ? {
@@ -7687,50 +7747,70 @@ app.post('/api/lessons/:id/not-completed', (req, res) => {
         }
       : l
   );
-  writeDb(db);
+  await writeDbSync(db);
+  const target = (db.liveLessons || []).find((l: any) => l.id === id);
+  await syncLessonUpdateToFirestore(
+    id,
+    { status: 'not_completed', notCompletedResponsible: responsible, notCompletedReason: reason, updatedAt: nowIso },
+    target
+  );
   res.json({ success: true, liveLessons: db.liveLessons });
 });
 
-app.post('/api/lessons/:id/reschedule', (req, res) => {
+app.post('/api/lessons/:id/reschedule', async (req, res) => {
   const db = readDb();
   const id = decodeURIComponent(req.params.id);
   const { newStartIso, newEndIso, reason, proposedBy } = req.body;
   const isTeacher = proposedBy === 'teacher';
+  const nowIso = new Date().toISOString();
+  const proposalFields = {
+    proposedNewStartDateTime: newStartIso,
+    proposedNewEndDateTime: newEndIso,
+    rescheduleNotes: reason,
+    proposedBy: isTeacher ? 'teacher' : 'student',
+    proposalStatus: isTeacher
+      ? 'pending_student_reschedule'
+      : 'pending_teacher_reschedule',
+    proposedAt: nowIso,
+  };
   db.liveLessons = db.liveLessons.map((l) =>
     l.id === id
       ? {
           ...l,
-          proposedNewStartDateTime: newStartIso,
-          proposedNewEndDateTime: newEndIso,
-          rescheduleNotes: reason,
-          proposedBy: isTeacher ? 'teacher' : 'student',
-          proposalStatus: isTeacher
-            ? 'pending_student_reschedule'
-            : 'pending_teacher_reschedule',
-          proposedAt: new Date().toISOString(),
+          ...proposalFields,
         }
       : l
   );
-  writeDb(db);
+  await writeDbSync(db);
+  const target = (db.liveLessons || []).find((l: any) => l.id === id);
+  await syncLessonUpdateToFirestore(id, proposalFields, target);
   res.json({ success: true, liveLessons: db.liveLessons });
 });
 
-app.post('/api/lessons/:id/accept-reschedule', (req, res) => {
+app.post('/api/lessons/:id/accept-reschedule', async (req, res) => {
   const db = readDb();
   const id = decodeURIComponent(req.params.id);
+  const nowIso = new Date().toISOString();
+  let acceptUpdates: any = null;
   db.liveLessons = db.liveLessons.map((l) => {
     if (l.id === id && l.proposedNewStartDateTime) {
-      return {
-        ...l,
+      acceptUpdates = {
         startDateTime: l.proposedNewStartDateTime,
         endDateTime: l.proposedNewEndDateTime || l.endDateTime,
         rescheduledFrom: {
           startDateTime: l.startDateTime,
           endDateTime: l.endDateTime,
         },
-        rescheduledAt: new Date().toISOString(),
+        rescheduledAt: nowIso,
         rescheduledBy: l.proposedBy,
         rescheduledReason: l.rescheduleNotes,
+        proposedNewStartDateTime: null,
+        proposedNewEndDateTime: null,
+        proposalStatus: null,
+      };
+      return {
+        ...l,
+        ...acceptUpdates,
         proposedNewStartDateTime: undefined,
         proposedNewEndDateTime: undefined,
         proposalStatus: undefined,
@@ -7738,11 +7818,15 @@ app.post('/api/lessons/:id/accept-reschedule', (req, res) => {
     }
     return l;
   });
-  writeDb(db);
+  await writeDbSync(db);
+  const target = (db.liveLessons || []).find((l: any) => l.id === id);
+  if (acceptUpdates) {
+    await syncLessonUpdateToFirestore(id, acceptUpdates, target);
+  }
   res.json({ success: true, liveLessons: db.liveLessons });
 });
 
-app.post('/api/lessons/:id/decline-reschedule', (req, res) => {
+app.post('/api/lessons/:id/decline-reschedule', async (req, res) => {
   const db = readDb();
   const id = decodeURIComponent(req.params.id);
   db.liveLessons = db.liveLessons.map((l) =>
@@ -7755,7 +7839,13 @@ app.post('/api/lessons/:id/decline-reschedule', (req, res) => {
         }
       : l
   );
-  writeDb(db);
+  await writeDbSync(db);
+  const target = (db.liveLessons || []).find((l: any) => l.id === id);
+  await syncLessonUpdateToFirestore(
+    id,
+    { proposedNewStartDateTime: null, proposedNewEndDateTime: null, proposalStatus: null },
+    target
+  );
   res.json({ success: true, liveLessons: db.liveLessons });
 });
 
@@ -7763,7 +7853,17 @@ app.post('/api/lessons/:id/cancel', async (req, res) => {
   const db = readDb();
   const id = decodeURIComponent(req.params.id);
   const { cancelledBy, reason } = req.body || {};
+  const nowIso = new Date().toISOString();
   const target = (db.liveLessons || []).find((l: any) => l.id === id);
+  const cancelUpdates = {
+    status: 'cancelled',
+    cancelledAt: nowIso,
+    cancelledBy: cancelledBy || target?.cancelledBy || 'user',
+    cancellationReason: reason || target?.cancellationReason || 'Cancelled by user',
+    proposalStatus: null,
+    proposedNewStartDateTime: null,
+    proposedNewEndDateTime: null,
+  };
   db.liveLessons = (db.liveLessons || []).map((l: any) =>
     l.id === id ||
     (target &&
@@ -7772,10 +7872,7 @@ app.post('/api/lessons/:id/cancel', async (req, res) => {
       l.startDateTime === target.startDateTime)
       ? {
           ...l,
-          status: 'cancelled',
-          cancelledAt: l.cancelledAt || new Date().toISOString(),
-          cancelledBy: cancelledBy || l.cancelledBy || 'user',
-          cancellationReason: reason || l.cancellationReason || 'Cancelled by user',
+          ...cancelUpdates,
           proposalStatus: undefined,
           proposedNewStartDateTime: undefined,
           proposedNewEndDateTime: undefined,
@@ -7783,6 +7880,7 @@ app.post('/api/lessons/:id/cancel', async (req, res) => {
       : l
   );
   await writeDbSync(db);
+  await syncLessonUpdateToFirestore(id, cancelUpdates, target);
   res.json({ success: true, liveLessons: db.liveLessons });
 });
 
