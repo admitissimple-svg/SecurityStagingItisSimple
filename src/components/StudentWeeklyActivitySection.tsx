@@ -319,7 +319,7 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
         studentUid,
         studentEmail,
         (data) => {
-          if (isMounted && data && data.checks) {
+          if (isMounted && data && data.checks && Object.keys(data.checks).length > 0) {
             setLocalWeeklyChecks((prev) => ({ ...prev, ...data.checks }));
           }
           if (isMounted && typeof data?.weeklyNativeLessonsTarget === 'number' && data.weeklyNativeLessonsTarget > 0) {

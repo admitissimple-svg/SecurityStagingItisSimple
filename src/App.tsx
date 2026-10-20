@@ -1728,8 +1728,8 @@ export default function App() {
       uid,
       email,
       (data) => {
-        if (data && data.checks) {
-          setWeeklyChecks(data.checks);
+        if (data && data.checks && Object.keys(data.checks).length > 0) {
+          setWeeklyChecks((prev) => ({ ...prev, ...data.checks }));
         }
         if (typeof data.weeklyNativeLessonsTarget === 'number' && data.weeklyNativeLessonsTarget > 0) {
           setUserProfile((prev) => ({

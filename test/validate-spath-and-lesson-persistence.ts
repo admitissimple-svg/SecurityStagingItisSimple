@@ -80,6 +80,12 @@ function runPersistenceTests() {
 
   const lessonScheduled: LiveLesson = {
     id: 'lesson-101',
+    title: 'English Conversation Practice',
+    teacherEmail: 'sarah@itssimple.com',
+    teacherName: 'Sarah Jenkins',
+    studentEmail: 'student@example.com',
+    studentName: 'Student Example',
+    meetLink: 'https://meet.google.com/abc-defg-hij',
     startDateTime: '2026-10-22T14:00:00Z',
     endDateTime: '2026-10-22T14:30:00Z',
     status: 'scheduled',

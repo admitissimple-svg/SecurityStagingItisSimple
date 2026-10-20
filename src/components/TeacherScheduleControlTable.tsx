@@ -228,7 +228,9 @@ export const TeacherScheduleControlTable: React.FC<TeacherScheduleControlTablePr
       if (selectedStatusFilter === 'active') {
         if (
           lesson.status === 'cancelled' ||
+          Boolean(lesson.cancelledAt) ||
           lesson.status === 'completed' ||
+          Boolean(lesson.completedAt) ||
           lesson.status === 'not_completed'
         ) {
           return false;

@@ -67,7 +67,12 @@ export const LiveMeetLessonsPanel: React.FC<LiveMeetLessonsPanelProps> = ({
   // Filter active scheduled lessons and sort chronologically (earliest first)
   const activeScheduledLessons = lessons
     .filter((l) => {
-      if (!l || l.status !== 'scheduled' || l.cancelledAt) return false;
+      if (!l) return false;
+      const isCompleted = l.status === 'completed' || Boolean((l as any).completedAt);
+      const isCancelled = l.status === 'cancelled' || (l.status as string) === 'canceled' || Boolean(l.cancelledAt);
+      const isNotCompleted = l.status === 'not_completed';
+      if (isCompleted || isCancelled || isNotCompleted) return false;
+      if (l.status !== 'scheduled' && (l.status as string) !== 'confirmed') return false;
       if (isTeacher) {
         // In teacher view, show scheduled lessons for this teacher
         if (currentAccount?.email) {

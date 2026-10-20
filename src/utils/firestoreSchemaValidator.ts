@@ -199,6 +199,22 @@ export const SCHEMA_DEFINITIONS: Record<string, SchemaValidationRule> = {
       playlistId: 'string',
     },
   },
+  weeklyChecks: {
+    fieldTypes: {
+      id: 'string',
+      weekId: 'string',
+      weeklyCycle: 'number',
+      checks: 'object',
+      weeklyChecks: 'object',
+      sPathChecks: 'object',
+      weeklyNativeLessonsTarget: 'number',
+      weeklyStudyDaysTarget: 'number',
+      studentUid: 'string',
+      studentEmail: 'string',
+      updatedAt: 'string',
+      _schemaVersion: 'number',
+    },
+  },
   teacher_availability: {
     requiredFields: ['teacherEmail'],
     fieldTypes: {
@@ -412,7 +428,8 @@ export function assertSafeFirestoreWrite(
   existingData?: any,
   isUpdate: boolean = true
 ): void {
-  const collectionName = path.split('/')[0] || path;
+  const parts = path.split('/').filter(Boolean);
+  const collectionName = parts.length >= 2 && parts.length % 2 === 0 ? parts[parts.length - 2] : parts[0] || path;
   const validation = validateFirestoreDocument(collectionName, incomingData, {
     isUpdate,
     existingData,

@@ -215,8 +215,15 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
   // 3. Saldo restante = Contratadas - realizadas
   const studentRemainingBalance = Math.max(0, totalContractedCount - studentRealizadasCount);
 
-  // 4. Agendadas = aulas agendadas ativas
-  const activeScheduledLessons = studentLessons.filter((l) => l.status === 'scheduled' && !l.cancelledAt);
+  // 4. Agendadas = aulas agendadas ativas (não concluídas e não canceladas)
+  const activeScheduledLessons = studentLessons.filter((l) => {
+    if (!l) return false;
+    const isCompleted = l.status === 'completed' || Boolean((l as any).completedAt);
+    const isCancelled = l.status === 'cancelled' || (l.status as string) === 'canceled' || Boolean(l.cancelledAt);
+    const isNotCompleted = l.status === 'not_completed';
+    if (isCompleted || isCancelled || isNotCompleted) return false;
+    return l.status === 'scheduled' || (l.status as string) === 'confirmed';
+  });
   const studentScheduledCount = activeScheduledLessons.length;
 
   const handleSaveContract = (e: React.FormEvent) => {

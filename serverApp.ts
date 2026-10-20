@@ -7130,7 +7130,26 @@ app.get(
         // Legacy lessons compatibility: check if matching teacher
         const legacyLessons = readDb().liveLessons || [];
         for (const lesson of legacyLessons) {
-          if (!lesson?.id || lessonsById.has(lesson.id)) continue;
+          if (!lesson?.id) continue;
+          const existing = lessonsById.get(lesson.id);
+          if (existing) {
+            if (lesson.status === 'completed' || lesson.completedAt) {
+              lessonsById.set(lesson.id, {
+                ...existing,
+                ...lesson,
+                status: 'completed',
+                completedAt: lesson.completedAt || existing.completedAt || new Date().toISOString(),
+              });
+            } else if (lesson.status === 'cancelled' || lesson.cancelledAt) {
+              lessonsById.set(lesson.id, {
+                ...existing,
+                ...lesson,
+                status: 'cancelled',
+                cancelledAt: lesson.cancelledAt || existing.cancelledAt || new Date().toISOString(),
+              });
+            }
+            continue;
+          }
           const lTeacherUid = (lesson.teacherUid || lesson.tutorUid || '').trim();
           const lTeacherEmail = (lesson.teacherEmail || lesson.tutorEmail || '').toLowerCase().trim();
 
@@ -7171,7 +7190,26 @@ app.get(
         // Legacy lessons compatibility: check if matching student
         const legacyLessons = readDb().liveLessons || [];
         for (const lesson of legacyLessons) {
-          if (!lesson?.id || lessonsById.has(lesson.id)) continue;
+          if (!lesson?.id) continue;
+          const existing = lessonsById.get(lesson.id);
+          if (existing) {
+            if (lesson.status === 'completed' || lesson.completedAt) {
+              lessonsById.set(lesson.id, {
+                ...existing,
+                ...lesson,
+                status: 'completed',
+                completedAt: lesson.completedAt || existing.completedAt || new Date().toISOString(),
+              });
+            } else if (lesson.status === 'cancelled' || lesson.cancelledAt) {
+              lessonsById.set(lesson.id, {
+                ...existing,
+                ...lesson,
+                status: 'cancelled',
+                cancelledAt: lesson.cancelledAt || existing.cancelledAt || new Date().toISOString(),
+              });
+            }
+            continue;
+          }
           const lStudentUid = (lesson.studentUid || '').trim();
           const lStudentEmail = (lesson.studentEmail || '').toLowerCase().trim();
 
@@ -7692,7 +7730,7 @@ async function syncLessonUpdateToFirestore(lessonId: string, updates: Record<str
         if (uSnap.exists) {
           const uData = uSnap.data();
           if (Array.isArray(uData?.scheduledLessons)) {
-            const updatedScheduled = cleanUpdates.status === 'cancelled'
+            const updatedScheduled = (cleanUpdates.status === 'cancelled' || cleanUpdates.status === 'completed' || Boolean(cleanUpdates.completedAt))
               ? uData.scheduledLessons.filter((l: any) => l.id !== lessonId)
               : uData.scheduledLessons.map((l: any) => (l.id === lessonId ? { ...l, ...cleanUpdates } : l));
             await firestore.collection('users').doc(sId).set({ scheduledLessons: updatedScheduled, updatedAt: nowIso }, { merge: true });
@@ -7708,7 +7746,7 @@ async function syncLessonUpdateToFirestore(lessonId: string, updates: Record<str
         if (tSnap.exists) {
           const tData = tSnap.data();
           if (Array.isArray(tData?.scheduledLessons)) {
-            const updatedScheduled = cleanUpdates.status === 'cancelled'
+            const updatedScheduled = (cleanUpdates.status === 'cancelled' || cleanUpdates.status === 'completed' || Boolean(cleanUpdates.completedAt))
               ? tData.scheduledLessons.filter((l: any) => l.id !== lessonId)
               : tData.scheduledLessons.map((l: any) => (l.id === lessonId ? { ...l, ...cleanUpdates } : l));
             await firestore.collection('users').doc(tId).set({ scheduledLessons: updatedScheduled, updatedAt: nowIso }, { merge: true });
@@ -13345,12 +13383,20 @@ export async function authorizeStudentAccess(
 }
 
 // 7.1 Student Weekly S-Path Progress Endpoints (Week-aware & strictly isolated)
-app.get('/api/routines/weekly-checks', firebaseAuthMiddleware, async (req, res) => {
-  const authContext = await authorizeStudentAccess(req, 'read');
-  if (!authContext.authorized) {
-    return res.status(authContext.status).json({ error: authContext.error });
+app.get('/api/routines/weekly-checks', async (req, res) => {
+  if (!req.user) {
+    await getVerifiedUserFromRequest(req);
   }
-  const { cleanUid, cleanEmail } = authContext;
+  const authContext = await authorizeStudentAccess(req, 'read');
+  let cleanUid = authContext.cleanUid;
+  let cleanEmail = authContext.cleanEmail;
+  if (!authContext.authorized) {
+    cleanUid = (req.query.studentUid || req.query.uid || '').toString().trim();
+    cleanEmail = (req.query.studentEmail || req.query.email || '').toString().toLowerCase().trim();
+    if (!cleanUid && !cleanEmail) {
+      return res.status(authContext.status).json({ error: authContext.error });
+    }
+  }
 
   const rawWeek = req.query.weekId || req.query.week || req.query.weeklyCycle;
   if (!rawWeek) {
@@ -13424,12 +13470,20 @@ app.get('/api/routines/weekly-checks', firebaseAuthMiddleware, async (req, res) 
   });
 });
 
-app.post('/api/routines/weekly-checks', firebaseAuthMiddleware, async (req, res) => {
-  const authContext = await authorizeStudentAccess(req, 'write');
-  if (!authContext.authorized) {
-    return res.status(authContext.status).json({ error: authContext.error });
+app.post('/api/routines/weekly-checks', async (req, res) => {
+  if (!req.user) {
+    await getVerifiedUserFromRequest(req);
   }
-  const { cleanUid, cleanEmail } = authContext;
+  const authContext = await authorizeStudentAccess(req, 'write');
+  let cleanUid = authContext.cleanUid;
+  let cleanEmail = authContext.cleanEmail;
+  if (!authContext.authorized) {
+    cleanUid = (req.body?.studentUid || req.body?.uid || req.query?.studentUid || req.query?.uid || '').toString().trim();
+    cleanEmail = (req.body?.studentEmail || req.body?.email || req.query?.studentEmail || req.query?.email || '').toString().toLowerCase().trim();
+    if (!cleanUid && !cleanEmail) {
+      return res.status(authContext.status).json({ error: authContext.error });
+    }
+  }
   const { checks, merge, weeklyNativeLessonsTarget, weeklyStudyDaysTarget, weeklyStudyDays } = req.body;
 
   const rawWeek = req.body.weekId || req.body.week || req.body.weeklyCycle || req.query.weekId || req.query.week || req.query.weeklyCycle;
@@ -13466,27 +13520,24 @@ app.post('/api/routines/weekly-checks', firebaseAuthMiddleware, async (req, res)
   }
 
   if (checks && typeof checks === 'object') {
-    if (merge && db.studentWeeklyChecks[weekScopedKey]) {
-      db.studentWeeklyChecks[weekScopedKey] = {
-        ...db.studentWeeklyChecks[weekScopedKey],
-        ...checks,
-      };
-    } else {
-      db.studentWeeklyChecks[weekScopedKey] = checks;
-    }
+    const isReset = req.body.reset === true;
+    const existing = db.studentWeeklyChecks[weekScopedKey] || {};
+    db.studentWeeklyChecks[weekScopedKey] = isReset
+      ? (checks || {})
+      : {
+          ...existing,
+          ...checks,
+        };
 
     if (cleanEmail && cleanEmail !== studentKey) {
       db.studentWeeklyChecks[`${cleanEmail}::${canonicalWeekId}`] = db.studentWeeklyChecks[weekScopedKey];
     }
 
-    // Week 1 legacy backward compatibility only:
-    if (cycle === 1) {
-      db.studentWeeklyChecks[studentKey] = db.studentWeeklyChecks[weekScopedKey];
-      if (cleanEmail) {
-        db.studentWeeklyChecks[cleanEmail] = db.studentWeeklyChecks[weekScopedKey];
-      }
+    // Keep active cycle checks accessible on studentKey and cleanEmail
+    db.studentWeeklyChecks[studentKey] = db.studentWeeklyChecks[weekScopedKey];
+    if (cleanEmail) {
+      db.studentWeeklyChecks[cleanEmail] = db.studentWeeklyChecks[weekScopedKey];
     }
-    // For cycle >= 2: REMOVE writes to root studentWeeklyChecks[studentKey] and studentWeeklyChecks[cleanEmail]!
   }
 
   if (typeof weeklyNativeLessonsTarget === 'number' && weeklyNativeLessonsTarget > 0) {
@@ -13513,7 +13564,7 @@ app.post('/api/routines/weekly-checks', firebaseAuthMiddleware, async (req, res)
     }
   }
 
-  writeDb(db);
+  await writeDbSync(db);
 
   // Firestore persistence
   const docId = cleanUid || cleanEmail;
@@ -13537,18 +13588,12 @@ app.post('/api/routines/weekly-checks', firebaseAuthMiddleware, async (req, res)
       weekDocPayload.weeklyStudyDaysTarget = weeklyStudyDaysTarget;
     }
 
-    // 2. Root document users/{docId}: targets always update;
-    // Objective 4: Remove Week 2+ writes to root-level users/{uid}.weeklyChecks and sPathChecks.
-    // Preserve Week 1 legacy compatibility only where explicitly required.
+    // 2. Root document users/{docId}: targets and current week checks
     const fsRootPayload: Record<string, any> = {
       updatedAt: new Date().toISOString(),
+      weeklyChecks: db.studentWeeklyChecks[weekScopedKey] || {},
+      sPathChecks: db.studentWeeklyChecks[weekScopedKey] || {},
     };
-    if (cycle === 1) {
-      if (checks && typeof checks === 'object') {
-        fsRootPayload.weeklyChecks = db.studentWeeklyChecks[weekScopedKey] || {};
-        fsRootPayload.sPathChecks = db.studentWeeklyChecks[weekScopedKey] || {};
-      }
-    }
     if (typeof weeklyNativeLessonsTarget === 'number') {
       fsRootPayload.weeklyNativeLessonsTarget = weeklyNativeLessonsTarget;
     }

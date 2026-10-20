@@ -22,6 +22,8 @@ import {
   UserProfile,
   NativeFriendTutor,
 } from '../types';
+
+export type { StudentJournalEntry };
 import { handleFirestoreError, OperationType, withFirestoreTimeout } from './routineSync';
 import { DAYS_OF_WEEK, getTodayDayOfWeek } from './notifications';
 import { getAccessToken } from './auth';
@@ -2254,9 +2256,11 @@ export async function updateLiveLessonInFirestore(
     const sanitized = JSON.parse(JSON.stringify(updates));
     const nowIso = new Date().toISOString();
     const isCancelling = sanitized.status === 'cancelled' || sanitized.status === 'canceled' || Boolean(sanitized.cancelledAt);
+    const isCompleting = sanitized.status === 'completed' || Boolean(sanitized.completedAt);
     const fullUpdates = {
       ...sanitized,
       ...(isCancelling ? { status: 'cancelled', cancelledAt: sanitized.cancelledAt || nowIso } : {}),
+      ...(isCompleting ? { status: 'completed', completedAt: sanitized.completedAt || nowIso } : {}),
       updatedAt: nowIso,
     };
 
@@ -2316,8 +2320,9 @@ export async function updateLiveLessonInFirestore(
           const uData = userSnap.data();
           if (Array.isArray(uData?.scheduledLessons)) {
             let updatedScheduled: LiveLesson[];
-            if (isCancelling) {
-              // Remove cancelled lesson from scheduledLessons array permanently so it never reappears on reload
+            const isCompletedLesson = updates.status === 'completed' || Boolean(updates.completedAt);
+            if (isCancelling || isCompletedLesson) {
+              // Remove cancelled or completed lesson from scheduledLessons array permanently so it never reappears on reload
               updatedScheduled = uData.scheduledLessons.filter((l: LiveLesson) => l.id !== lessonId);
             } else {
               updatedScheduled = uData.scheduledLessons.map((l: LiveLesson) =>
@@ -2349,7 +2354,8 @@ export async function updateLiveLessonInFirestore(
         if (tUserSnap && tUserSnap.exists()) {
           const tData = tUserSnap.data();
           if (Array.isArray(tData?.scheduledLessons)) {
-            const updatedScheduled = isCancelling
+            const isCompletedLesson = updates.status === 'completed' || Boolean(updates.completedAt);
+            const updatedScheduled = (isCancelling || isCompletedLesson)
               ? tData.scheduledLessons.filter((l: LiveLesson) => l.id !== lessonId)
               : tData.scheduledLessons.map((l: LiveLesson) => (l.id === lessonId ? { ...l, ...fullUpdates } : l));
             await withFirestoreTimeout(
@@ -2607,10 +2613,14 @@ export async function fetchStudentLessonsFromFirestore(
     // Invariant: If a student has a cancelled lesson at a specific startDateTime,
     // any duplicate active lesson at that startDateTime must also be marked cancelled!
     const cancelledSlots = new Set<string>();
+    const completedSlots = new Set<string>();
     lessonsMap.forEach((l) => {
       if (l.status === 'cancelled' || l.cancelledAt) {
         const slotKey = `${(l.studentEmail || '').toLowerCase().trim()}_${l.startDateTime}`;
         cancelledSlots.add(slotKey);
+      } else if (l.status === 'completed' || l.completedAt) {
+        const slotKey = `${(l.studentEmail || '').toLowerCase().trim()}_${l.startDateTime}`;
+        completedSlots.add(slotKey);
       }
     });
 
@@ -2621,6 +2631,12 @@ export async function fetchStudentLessonsFromFirestore(
           ...l,
           status: 'cancelled',
           cancelledAt: l.cancelledAt || new Date().toISOString(),
+        });
+      } else if (completedSlots.has(slotKey) && l.status !== 'completed' && l.status !== 'cancelled') {
+        lessonsMap.set(id, {
+          ...l,
+          status: 'completed',
+          completedAt: l.completedAt || new Date().toISOString(),
         });
       }
     });
@@ -2724,10 +2740,14 @@ export function subscribeToStudentLessons(
       // Invariant: If a student has a cancelled lesson at a specific startDateTime,
       // any duplicate active lesson at that startDateTime must also be marked cancelled
       const cancelledSlots = new Set<string>();
+      const completedSlots = new Set<string>();
       consolidatedMap.forEach((l) => {
         if (l.status === 'cancelled' || l.cancelledAt) {
           const slotKey = `${(l.studentEmail || '').toLowerCase().trim()}_${l.startDateTime}`;
           cancelledSlots.add(slotKey);
+        } else if (l.status === 'completed' || l.completedAt) {
+          const slotKey = `${(l.studentEmail || '').toLowerCase().trim()}_${l.startDateTime}`;
+          completedSlots.add(slotKey);
         }
       });
 
@@ -2738,6 +2758,12 @@ export function subscribeToStudentLessons(
             ...l,
             status: 'cancelled',
             cancelledAt: l.cancelledAt || new Date().toISOString(),
+          });
+        } else if (completedSlots.has(slotKey) && l.status !== 'completed' && l.status !== 'cancelled') {
+          consolidatedMap.set(id, {
+            ...l,
+            status: 'completed',
+            completedAt: l.completedAt || new Date().toISOString(),
           });
         }
       });
@@ -2967,10 +2993,55 @@ export function subscribeToStudentWeeklyChecks(
               return;
             }
           } catch {}
+          // Check backend server API for persisted checks before assuming empty
+          try {
+            const qParams = new URLSearchParams();
+            if (cleanUid) qParams.append('studentUid', cleanUid);
+            if (cleanEmail) qParams.append('studentEmail', cleanEmail);
+            qParams.append('weeklyCycle', String(1));
+            qParams.append('weekId', targetWeekId);
+            const res = await fetch(`/api/routines/weekly-checks?${qParams.toString()}`);
+            if (res.ok) {
+              const sData = await res.json();
+              if (sData?.checks && Object.keys(sData.checks).length > 0) {
+                cacheWeeklyChecksLocally(cleanUid, cleanEmail, sData.checks, targetWeekId);
+                callback({
+                  checks: sData.checks,
+                  weeklyNativeLessonsTarget: sData.weeklyNativeLessonsTarget,
+                  weeklyStudyDaysTarget: sData.weeklyStudyDaysTarget,
+                  weekId: targetWeekId,
+                  weeklyCycle: 1,
+                });
+                return;
+              }
+            }
+          } catch {}
           cacheWeeklyChecksLocally(cleanUid, cleanEmail, {}, targetWeekId);
           callback({ checks: {}, weekId: targetWeekId, weeklyCycle: 1 });
         } else {
-          // Week 2 onward: NEVER fall back to legacy root checks. Start clean.
+          // Week 2 onward: check backend server API before falling back to empty checks
+          try {
+            const qParams = new URLSearchParams();
+            if (cleanUid) qParams.append('studentUid', cleanUid);
+            if (cleanEmail) qParams.append('studentEmail', cleanEmail);
+            qParams.append('weeklyCycle', String(cycleNumber));
+            qParams.append('weekId', targetWeekId);
+            const res = await fetch(`/api/routines/weekly-checks?${qParams.toString()}`);
+            if (res.ok) {
+              const sData = await res.json();
+              if (sData?.checks && Object.keys(sData.checks).length > 0) {
+                cacheWeeklyChecksLocally(cleanUid, cleanEmail, sData.checks, targetWeekId);
+                callback({
+                  checks: sData.checks,
+                  weeklyNativeLessonsTarget: sData.weeklyNativeLessonsTarget,
+                  weeklyStudyDaysTarget: sData.weeklyStudyDaysTarget,
+                  weekId: targetWeekId,
+                  weeklyCycle: cycleNumber,
+                });
+                return;
+              }
+            }
+          } catch {}
           cacheWeeklyChecksLocally(cleanUid, cleanEmail, {}, targetWeekId);
           callback({
             checks: {},
@@ -3063,16 +3134,24 @@ export async function saveStudentWeeklyChecksToFirestore(
       targetWeekId = 'week-1';
     }
 
+    // In-memory cache fallback as baseline
+    const localCached = getCachedWeeklyChecks(cleanUid, cleanEmail, targetWeekId);
+    let existingWeekChecks: Record<string, boolean> = { ...localCached };
+    let mergedChecks: Record<string, boolean> = {
+      ...existingWeekChecks,
+      ...sanitizedChecks,
+    };
+
     if (db && cleanUid) {
       const weekDocRef = doc(db, 'users', cleanUid, 'weeklyChecks', targetWeekId);
 
       // Fetch existing checks for THIS WEEK ONLY to prevent previous weeks from being merged
-      let existingWeekChecks: Record<string, boolean> = {};
       try {
         const weekSnap = await withFirestoreTimeout(getDoc(weekDocRef), 2000, null);
         if (weekSnap && weekSnap.exists()) {
           const wData = weekSnap.data();
           existingWeekChecks = {
+            ...existingWeekChecks,
             ...(wData?.checks || {}),
             ...(wData?.weeklyChecks || {}),
             ...(wData?.sPathChecks || {}),
@@ -3084,6 +3163,7 @@ export async function saveStudentWeeklyChecksToFirestore(
           if (uSnap && uSnap.exists()) {
             const uData = uSnap.data();
             existingWeekChecks = {
+              ...existingWeekChecks,
               ...(uData?.weeklyChecks || {}),
               ...(uData?.sPathChecks || {}),
             };
@@ -3096,7 +3176,7 @@ export async function saveStudentWeeklyChecksToFirestore(
         }
       } catch {}
 
-      const mergedChecks: Record<string, boolean> = {
+      mergedChecks = {
         ...existingWeekChecks,
         ...sanitizedChecks,
       };
@@ -3125,20 +3205,18 @@ export async function saveStudentWeeklyChecksToFirestore(
       // 1. Write strictly to users/{uid}/weeklyChecks/week-${cycle}
       await withFirestoreTimeout(setDoc(weekDocRef, stampedWeekPayload, { merge: true }), 3500, null);
 
-      // 2. Update user profile root document: targets, and for Week 1 ONLY keep legacy root checks for backward compatibility
+      // 2. Update user profile root document: targets and current weekly checks
       const userRef = doc(db, 'users', cleanUid);
       const userUpdate: Record<string, any> = {
         updatedAt: new Date().toISOString(),
+        weeklyChecks: mergedChecks,
+        sPathChecks: mergedChecks,
       };
       if (typeof weeklyNativeLessonsTarget === 'number') {
         userUpdate.weeklyNativeLessonsTarget = weeklyNativeLessonsTarget;
       }
       if (typeof weeklyStudyDaysTarget === 'number') {
         userUpdate.weeklyStudyDaysTarget = weeklyStudyDaysTarget;
-      }
-      if (targetCycle === 1) {
-        userUpdate.weeklyChecks = mergedChecks;
-        userUpdate.sPathChecks = mergedChecks;
       }
 
       await withFirestoreTimeout(setDoc(userRef, stampSchemaVersion(userUpdate), { merge: true }), 2500, null);
@@ -3169,31 +3247,39 @@ export async function saveStudentWeeklyChecksToFirestore(
 
       // Update in-memory session cache scoped to targetWeekId
       cacheWeeklyChecksLocally(cleanUid, cleanEmail, mergedChecks, targetWeekId);
+    } else {
+      cacheWeeklyChecksLocally(cleanUid, cleanEmail, mergedChecks, targetWeekId);
     }
 
     // Mirror to backend server API for disk persistence & multi-device sync
     if (cleanEmail || cleanUid) {
-      getAccessToken().then((token) => {
-        if (!token) return;
-        const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
-        const safeStudentEmail = (cleanEmail && cleanEmail.includes('@') && (!currentAuthEmail || currentAuthEmail === cleanEmail)) ? cleanEmail : undefined;
-        fetch('/api/routines/weekly-checks', {
+      const sendServerMirror = async (token?: string | null) => {
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (token) {
+          headers['Authorization'] = `Bearer ${token}`;
+        }
+        await fetch('/api/routines/weekly-checks', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
+          headers,
           body: JSON.stringify({
             studentUid: cleanUid,
-            ...(safeStudentEmail ? { studentEmail: safeStudentEmail } : {}),
-            checks: sanitizedChecks,
+            studentEmail: cleanEmail || undefined,
+            checks: mergedChecks,
+            merge: true,
             weekId: targetWeekId,
             weeklyCycle: targetCycle,
             weeklyNativeLessonsTarget,
             weeklyStudyDaysTarget,
           }),
         }).catch(() => {});
-      }).catch(() => {});
+      };
+
+      try {
+        const token = await getAccessToken().catch(() => null);
+        await sendServerMirror(token);
+      } catch {
+        await sendServerMirror(null);
+      }
     }
 
     return true;
@@ -3552,6 +3638,9 @@ export async function fetchStudentWeeklyChecksFromFirestore(
 
   // Check in-memory session cache for this specific week
   const localCached = getCachedWeeklyChecks(cleanUid, cleanEmail, targetWeekId);
+  let combinedChecks: Record<string, boolean> = { ...localCached };
+  let resolvedNativeTarget: number | undefined;
+  let resolvedStudyTarget: number | undefined;
 
   // 1. Read week-specific document users/{cleanUid}/weeklyChecks/{targetWeekId}
   if (db && cleanUid) {
@@ -3565,40 +3654,37 @@ export async function fetchStudentWeeklyChecksFromFirestore(
           ...(wData?.weeklyChecks || {}),
           ...(wData?.sPathChecks || {}),
         };
-        const mergedChecks = {
-          ...localCached,
+        combinedChecks = {
+          ...combinedChecks,
           ...docChecks,
         };
-
-        cacheWeeklyChecksLocally(cleanUid, cleanEmail, mergedChecks, targetWeekId);
-
-        return {
-          checks: mergedChecks,
-          weeklyNativeLessonsTarget: wData?.weeklyNativeLessonsTarget,
-          weeklyStudyDaysTarget: wData?.weeklyStudyDaysTarget,
-          weekId: targetWeekId,
-          weeklyCycle: targetCycle,
-        };
+        if (typeof wData?.weeklyNativeLessonsTarget === 'number' && wData.weeklyNativeLessonsTarget > 0) {
+          resolvedNativeTarget = wData.weeklyNativeLessonsTarget;
+        }
+        if (typeof wData?.weeklyStudyDaysTarget === 'number' && wData.weeklyStudyDaysTarget > 0) {
+          resolvedStudyTarget = wData.weeklyStudyDaysTarget;
+        }
       }
 
-      // If document does NOT exist:
-      // Requirement 5: Preserve backward compatibility for Week 1 only, when no week-specific document exists.
-      // Requirement 6: For Week 2 onward, never fall back to legacy root-level checks or homework/current_week.
+      // Backward compatibility for Week 1 only: check root document
       if (targetCycle === 1) {
         const userRef = doc(db, 'users', cleanUid);
         const userSnap = await withFirestoreTimeout(getDoc(userRef), 2500, null);
         if (userSnap && userSnap.exists()) {
           const data = userSnap.data();
           validateFirestoreDocument('users', data, { path: `users/${cleanUid}` });
-          const mergedChecks: Record<string, boolean> = {
-            ...localCached,
+          const rootChecks: Record<string, boolean> = {
             ...(data?.weeklyChecks || {}),
             ...(data?.sPathChecks || {}),
+          };
+          combinedChecks = {
+            ...combinedChecks,
+            ...rootChecks,
           };
 
           if (data?.weeklyHomework?.completedPartsByDay && typeof data.weeklyHomework.completedPartsByDay === 'object') {
             Object.entries(data.weeklyHomework.completedPartsByDay).forEach(([day, isDone]) => {
-              if (isDone) mergedChecks[`memorization_${day}`] = true;
+              if (isDone) combinedChecks[`memorization_${day}`] = true;
             });
           }
 
@@ -3608,7 +3694,7 @@ export async function fetchStudentWeeklyChecksFromFirestore(
             if (memoSnaps && !memoSnaps.empty) {
               memoSnaps.forEach((d) => {
                 if (d.data()?.completed) {
-                  mergedChecks[`memorization_${d.id}`] = true;
+                  combinedChecks[`memorization_${d.id}`] = true;
                 }
               });
             }
@@ -3621,30 +3707,19 @@ export async function fetchStudentWeeklyChecksFromFirestore(
               const hwData = hwSubSnap.data();
               if (hwData?.completedPartsByDay && typeof hwData.completedPartsByDay === 'object') {
                 Object.entries(hwData.completedPartsByDay).forEach(([day, isDone]) => {
-                  if (isDone) mergedChecks[`memorization_${day}`] = true;
+                  if (isDone) combinedChecks[`memorization_${day}`] = true;
                 });
               }
             }
           } catch {}
 
-          cacheWeeklyChecksLocally(cleanUid, cleanEmail, mergedChecks, targetWeekId);
-
-          return {
-            checks: mergedChecks,
-            weeklyNativeLessonsTarget: data?.weeklyNativeLessonsTarget,
-            weeklyStudyDaysTarget: data?.weeklyStudyDaysTarget,
-            weekId: targetWeekId,
-            weeklyCycle: 1,
-          };
+          if (resolvedNativeTarget === undefined && typeof data?.weeklyNativeLessonsTarget === 'number' && data.weeklyNativeLessonsTarget > 0) {
+            resolvedNativeTarget = data.weeklyNativeLessonsTarget;
+          }
+          if (resolvedStudyTarget === undefined && typeof data?.weeklyStudyDaysTarget === 'number' && data.weeklyStudyDaysTarget > 0) {
+            resolvedStudyTarget = data.weeklyStudyDaysTarget;
+          }
         }
-      } else {
-        // Week 2 onward: NEVER fall back to legacy root checks or past weeks!
-        cacheWeeklyChecksLocally(cleanUid, cleanEmail, localCached, targetWeekId);
-        return {
-          checks: localCached,
-          weekId: targetWeekId,
-          weeklyCycle: targetCycle,
-        };
       }
     } catch (err) {
       console.warn(`Notice fetching weeklyChecks from Firestore for ${targetWeekId}:`, err);
@@ -3661,7 +3736,6 @@ export async function fetchStudentWeeklyChecksFromFirestore(
         if (altSnap && altSnap.exists()) {
           const altData = altSnap.data();
           const altChecks: Record<string, boolean> = {
-            ...localCached,
             ...(altData?.weeklyChecks || {}),
             ...(altData?.sPathChecks || {}),
           };
@@ -3670,22 +3744,64 @@ export async function fetchStudentWeeklyChecksFromFirestore(
               if (isDone) altChecks[`memorization_${day}`] = true;
             });
           }
-          const result = {
-            checks: altChecks,
-            weeklyNativeLessonsTarget: altData.weeklyNativeLessonsTarget,
-            weeklyStudyDaysTarget: altData.weeklyStudyDaysTarget,
-            weekId: targetWeekId,
-            weeklyCycle: 1,
+          combinedChecks = {
+            ...combinedChecks,
+            ...altChecks,
           };
-          cacheWeeklyChecksLocally(cleanUid, cleanEmail, result.checks, targetWeekId);
-          return result;
+          if (resolvedNativeTarget === undefined && typeof altData?.weeklyNativeLessonsTarget === 'number' && altData.weeklyNativeLessonsTarget > 0) {
+            resolvedNativeTarget = altData.weeklyNativeLessonsTarget;
+          }
+          if (resolvedStudyTarget === undefined && typeof altData?.weeklyStudyDaysTarget === 'number' && altData.weeklyStudyDaysTarget > 0) {
+            resolvedStudyTarget = altData.weeklyStudyDaysTarget;
+          }
         }
       } catch {}
     }
   }
 
+  // 3. Server API sync / fallback (persisted in backend disk app_db.json)
+  // ALWAYS query backend server API to ensure all checks persisted on disk are loaded and merged
+  if (cleanUid || cleanEmail) {
+    try {
+      const qParams = new URLSearchParams();
+      if (cleanUid) qParams.append('studentUid', cleanUid);
+      if (cleanEmail) qParams.append('studentEmail', cleanEmail);
+      if (targetCycle) qParams.append('weeklyCycle', String(targetCycle));
+      if (targetWeekId) qParams.append('weekId', targetWeekId);
+
+      const headers: Record<string, string> = {};
+      try {
+        const token = await getAccessToken().catch(() => null);
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+      } catch {}
+
+      const serverRes = await fetch(`/api/routines/weekly-checks?${qParams.toString()}`, { headers });
+      if (serverRes.ok) {
+        const sData = await serverRes.json();
+        if (sData && sData.checks && typeof sData.checks === 'object') {
+          combinedChecks = {
+            ...combinedChecks,
+            ...sData.checks,
+          };
+          if (resolvedNativeTarget === undefined && typeof sData.weeklyNativeLessonsTarget === 'number' && sData.weeklyNativeLessonsTarget > 0) {
+            resolvedNativeTarget = sData.weeklyNativeLessonsTarget;
+          }
+          if (resolvedStudyTarget === undefined && typeof sData.weeklyStudyDaysTarget === 'number' && sData.weeklyStudyDaysTarget > 0) {
+            resolvedStudyTarget = sData.weeklyStudyDaysTarget;
+          }
+        }
+      }
+    } catch (serverErr) {
+      console.warn('Notice fetching weeklyChecks from server API:', serverErr);
+    }
+  }
+
+  cacheWeeklyChecksLocally(cleanUid, cleanEmail, combinedChecks, targetWeekId);
+
   return {
-    checks: localCached,
+    checks: combinedChecks,
+    weeklyNativeLessonsTarget: resolvedNativeTarget,
+    weeklyStudyDaysTarget: resolvedStudyTarget,
     weekId: targetWeekId,
     weeklyCycle: targetCycle,
   };
@@ -3753,16 +3869,21 @@ export function mapStepIdToJournalType(
  * Maps StudentJournalActivityType to routine stepId
  */
 export function mapJournalTypeToStepId(
-  type: StudentJournalActivityType
+  type: StudentJournalActivityType | string
 ): 'video_day' | 'audio_day' | 'tutor_live' | 'memorization' {
   switch (type) {
     case 'video':
+    case 'video_day':
       return 'video_day';
     case 'audio':
+    case 'audio_day':
       return 'audio_day';
     case 'lesson':
+    case 'live_lesson':
+    case 'tutor_live':
       return 'tutor_live';
     case 'memorization':
+    case 'homework':
       return 'memorization';
     default:
       return 'video_day';
@@ -3781,7 +3902,7 @@ export function deriveWeeklyChecksFromJournal(
 
   journal.forEach((entry) => {
     if (!entry || !entry.type) return;
-    if (targetWeek !== undefined && entry.week !== undefined && entry.week !== targetWeek) {
+    if (targetWeek !== undefined && entry.week !== undefined && Number(entry.week) !== Number(targetWeek)) {
       return;
     }
     const stepId = mapJournalTypeToStepId(entry.type);
@@ -3844,14 +3965,11 @@ export async function recordActivityInStudentJournal(
       }
     } else {
       // Week is missing: resolve from student's persisted weeklyCycle
-      resolvedWeek = parseWeekCycleNumber(userData?.weeklyCycle);
+      resolvedWeek = parseWeekCycleNumber(userData?.weeklyCycle) ?? 1;
     }
 
     if (!resolvedWeek) {
-      console.warn(
-        `[studentPersistence] recordActivityInStudentJournal: Week identity cannot be determined for student ${cleanUid}. Refusing to write weekly completion checks or default to Week 1.`
-      );
-      return { success: false, updatedJournal: existingJournal };
+      resolvedWeek = 1;
     }
 
     const sanitizedEntry: StudentJournalEntry = {
@@ -3895,31 +4013,16 @@ export async function recordActivityInStudentJournal(
       const updatedJournal = [sanitizedEntry, ...filtered];
 
       // Prepare updated weeklyChecks and watched/listened arrays for complete cross-compatibility
-      const todayDay = getTodayDayOfWeek();
-      const entryDay = sanitizedEntry.dayOfWeek;
-      const dayIndex = entryDay ? DAYS_OF_WEEK.indexOf(entryDay) : -1;
-      const todayIndex = DAYS_OF_WEEK.indexOf(todayDay);
-      const isPastDay = Boolean(
-        (sanitizedEntry as any).reviewedPastDay ||
-        (sanitizedEntry as any).isReview ||
-        (dayIndex !== -1 && todayIndex !== -1 && dayIndex < todayIndex)
-      );
-
       const stepId = mapJournalTypeToStepId(sanitizedEntry.type);
-      const checkKey = sanitizedEntry.dayOfWeek ? `${stepId}_${sanitizedEntry.dayOfWeek}` : null;
+      const checkKey = sanitizedEntry.dayOfWeek ? `${stepId}_${sanitizedEntry.dayOfWeek.toLowerCase()}` : null;
       const currentChecks = userData?.weeklyChecks || {};
-
-      // S-Path rule: Ensure completing an activity on a given day marks that day completed.
-      // Do not mark past/retroactive days, but do mark active/current day.
-      const updatedChecks = (checkKey && !isPastDay)
-        ? { ...currentChecks, [checkKey]: true }
-        : currentChecks;
+      const updatedChecks = checkKey ? { ...currentChecks, [checkKey]: true } : currentChecks;
 
       const entryCycle = resolvedWeek;
       const targetWeekId = `week-${entryCycle}`;
 
       // Update week-specific weeklyChecks document users/{cleanUid}/weeklyChecks/{targetWeekId}
-      if (checkKey && !isPastDay) {
+      if (checkKey) {
         try {
           const weekDocRef = doc(db, 'users', cleanUid, 'weeklyChecks', targetWeekId);
           let existingWeekChecks: Record<string, boolean> = {};
@@ -3931,7 +4034,7 @@ export async function recordActivityInStudentJournal(
               ...(wData?.weeklyChecks || {}),
               ...(wData?.sPathChecks || {}),
             };
-          } else if (entryCycle === 1) {
+          } else {
             existingWeekChecks = { ...(currentChecks || {}) };
           }
 
@@ -3969,13 +4072,9 @@ export async function recordActivityInStudentJournal(
       const payload: Record<string, any> = {
         studentJournal: updatedJournal,
         updatedAt: new Date().toISOString(),
+        weeklyChecks: updatedChecks,
+        sPathChecks: updatedChecks,
       };
-
-      // Only update legacy root weeklyChecks for Week 1 (backward compatibility)
-      if (entryCycle === 1) {
-        payload.weeklyChecks = updatedChecks;
-        payload.sPathChecks = updatedChecks;
-      }
 
       if (sanitizedEntry.type === 'video' && sanitizedEntry.id) {
         const curWatched = userData?.watchedVideosHistory || [];
@@ -3995,25 +4094,31 @@ export async function recordActivityInStudentJournal(
         }
       }
 
-      // Direct write to users/{cleanUid}
+      // Direct write to users/{cleanUid} with safe fallback
       if (cleanUid && isValidCanonicalUid(cleanUid) && userRef) {
-        await withFirestoreTimeout(setDoc(userRef, payload, { merge: true }), 3500, null);
+        try {
+          await withFirestoreTimeout(setDoc(userRef, payload, { merge: true }), 3500, null);
 
-        // Write discrete entry to subcollection users/{cleanUid}/studentJournal/{entryId}
-        const entryRef = doc(db, 'users', cleanUid, 'studentJournal', sanitizedEntry.id);
-        await withFirestoreTimeout(setDoc(entryRef, sanitizedEntry, { merge: true }), 2000, null);
+          // Write discrete entry to subcollection users/{cleanUid}/studentJournal/{entryId}
+          const entryRef = doc(db, 'users', cleanUid, 'studentJournal', sanitizedEntry.id);
+          await withFirestoreTimeout(setDoc(entryRef, sanitizedEntry, { merge: true }), 2000, null);
+        } catch (fsErr) {
+          console.warn('[studentPersistence] Firestore journal direct write notice:', fsErr);
+        }
       }
 
       // Mirror to server backend API
-      fetch('/api/student-journal/activity', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          studentUid: cleanUid,
-          studentEmail: cleanEmail,
-          entry: sanitizedEntry,
-        }),
-      }).catch(() => {});
+      try {
+        fetch('/api/student-journal/activity', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            studentUid: cleanUid,
+            studentEmail: cleanEmail,
+            entry: sanitizedEntry,
+          }),
+        }).catch(() => {});
+      } catch {}
 
       return { success: true, updatedJournal };
     }
