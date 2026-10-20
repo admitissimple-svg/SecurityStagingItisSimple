@@ -307,8 +307,8 @@ export default function App() {
 
         // Check if currentAccount matches the active Firebase Auth user and has the verified UID
         if (!currentAccount || currentAccount.email.toLowerCase() !== cleanEmail || currentAccount.uid !== fbUser.uid) {
-          // If an admin login attempt is actively underway in LoginModal, do NOT eagerly hydrate as student
-          if (isAuthModalOpen && authModalRole === 'admin' && !isVerifiedAdmin) {
+          // If an authentication attempt is actively underway in LoginModal/AuthModal, do NOT eagerly hydrate as student
+          if (isAuthModalOpen) {
             return;
           }
 
@@ -353,17 +353,36 @@ export default function App() {
 
               if (resolvedRole !== 'teacher') {
                 const cleanTutorId = `tutor-${cleanDocId}`;
-                const [tutorSnap, userTutorSnap] = await Promise.all([
+                const [tutorSnap, userTutorSnap, authUidTutorSnap] = await Promise.all([
                   getDoc(doc(db, 'tutors', cleanTutorId)).catch(() => null),
                   getDoc(doc(db, 'users', cleanTutorId)).catch(() => null),
+                  getDoc(doc(db, 'tutors', fbUser.uid)).catch(() => null),
                 ]);
-                if (tutorSnap && tutorSnap.exists()) {
+                if (authUidTutorSnap && authUidTutorSnap.exists()) {
+                  firestoreDoc = { ...(firestoreDoc || {}), ...authUidTutorSnap.data(), role: 'teacher' };
+                  resolvedRole = 'teacher';
+                } else if (tutorSnap && tutorSnap.exists()) {
                   firestoreDoc = { ...(firestoreDoc || {}), ...tutorSnap.data(), role: 'teacher' };
                   resolvedRole = 'teacher';
                 } else if (userTutorSnap && userTutorSnap.exists()) {
                   firestoreDoc = { ...(firestoreDoc || {}), ...userTutorSnap.data(), role: 'teacher' };
                   resolvedRole = 'teacher';
                 }
+              }
+
+              // Also check tutors collection by email query in Firestore
+              if (resolvedRole !== 'teacher') {
+                try {
+                  const qSnap = await Promise.race([
+                    getDocs(query(collection(db, 'tutors'), where('email', '==', cleanEmail))),
+                    new Promise<null>((r) => setTimeout(() => r(null), 2500)),
+                  ]);
+                  if (qSnap && !qSnap.empty) {
+                    const tData = qSnap.docs[0].data();
+                    firestoreDoc = { ...(firestoreDoc || {}), ...tData, role: 'teacher' };
+                    resolvedRole = 'teacher';
+                  }
+                } catch {}
               }
 
               // Also check memory tutors list
@@ -427,7 +446,8 @@ export default function App() {
           };
 
           // Guarantee that student profile in Firestore is created/saved using doc(db, 'users', fbUser.uid)
-          if (resolvedRole === 'student') {
+          // Do NOT overwrite if user has a teacher/tutor role
+          if (resolvedRole === 'student' && firestoreDoc?.role !== 'teacher' && firestoreDoc?.role !== 'native_friend') {
             const db = getDb();
             if (db && fbUser.uid) {
               const studentPayload = {
@@ -490,6 +510,26 @@ export default function App() {
               enrollmentStatus: firestoreDoc?.enrollmentStatus || (teacherUid ? 'active' : 'not_enrolled'),
             };
             setUserProfile(restoredProfile);
+          }
+
+          // Guarantee that teacher profile is saved under doc(db, 'users', fbUser.uid) and doc(db, 'tutors', fbUser.uid)
+          if (resolvedRole === 'teacher') {
+            const db = getDb();
+            if (db && fbUser.uid) {
+              const teacherPayload = {
+                id: fbUser.uid,
+                uid: fbUser.uid,
+                email: cleanEmail,
+                name: account.name,
+                role: 'teacher',
+                picture: account.picture,
+                avatar: account.picture,
+                ...(firestoreDoc || {}),
+                updatedAt: new Date().toISOString(),
+              };
+              setDoc(doc(db, 'users', fbUser.uid), teacherPayload, { merge: true }).catch(() => null);
+              setDoc(doc(db, 'tutors', fbUser.uid), teacherPayload, { merge: true }).catch(() => null);
+            }
           }
 
           setCurrentAccount(account);
@@ -6652,6 +6692,7 @@ export default function App() {
       initialEmail={authInitialEmail}
       currentLanguage={currentLanguage}
       onLoginSuccess={handleLoginSuccess}
+      onRoleChange={(role) => setAuthModalRole(role)}
       onShowToast={(title, message, type) => {
         setNotifications((prev) => [
           {

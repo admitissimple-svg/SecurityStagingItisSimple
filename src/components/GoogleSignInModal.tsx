@@ -120,13 +120,10 @@ export const GoogleSignInModal: React.FC<GoogleSignInModalProps> = ({
 
       if (isVerifiedAdmin) {
         verifiedRole = 'admin';
-      } else if (docRole === 'student') {
-        // STRICT RBAC: Registered student locked strictly to student role
-        verifiedRole = 'student';
-      } else if (docRole === 'native_friend' || docRole === 'teacher') {
+      } else if (selectedRole === 'teacher' || preferredRole === 'teacher' || docRole === 'native_friend' || docRole === 'teacher') {
         verifiedRole = 'teacher';
       } else {
-        verifiedRole = selectedRole === 'teacher' ? 'teacher' : 'student';
+        verifiedRole = 'student';
       }
 
       // Synchronize authenticated user with backend profile and persistence
@@ -158,14 +155,16 @@ export const GoogleSignInModal: React.FC<GoogleSignInModalProps> = ({
       account.uid = user.uid;
       account.id = user.uid;
 
-      // Lock role if server or Firestore confirms student
-      if (docRole === 'student' || data.isRoleEnforced || account.role === 'student' || verifiedRole === 'student') {
-        if (!isVerifiedAdmin) {
-          verifiedRole = 'student';
-          account.role = 'student';
-        }
+      // Ensure teacher role is preserved if user logged in as teacher or backend confirmed teacher
+      if (verifiedRole === 'teacher' || data.account?.role === 'teacher') {
+        verifiedRole = 'teacher';
+        account.role = 'teacher';
+      } else if (isVerifiedAdmin) {
+        verifiedRole = 'admin';
+        account.role = 'admin';
       } else {
-        account.role = verifiedRole;
+        verifiedRole = 'student';
+        account.role = 'student';
       }
 
       // Guarantee student profile is saved under doc(db, 'users', user.uid) with UID as document key

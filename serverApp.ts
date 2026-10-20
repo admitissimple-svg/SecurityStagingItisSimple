@@ -1555,6 +1555,7 @@ app.post('/api/auth/login', async (req, res) => {
   let role: string = 'student';
   let name = cleanEmail.split('@')[0];
   let isRoleEnforced = false;
+  let effectiveTutor: any = null;
 
   if (isServerVerifiedAdmin) {
     role = 'admin';
@@ -1581,22 +1582,49 @@ app.post('/api/auth/login', async (req, res) => {
 
     // Link real Firebase Auth UID to tutor record
     const publicTutorId = tutorObj?.id || teacherObj?.id || `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
+    effectiveTutor = tutorObj || teacherObj || {
+      id: publicTutorId,
+      publicTutorId,
+      uid: authenticatedUid,
+      authUid: authenticatedUid,
+      email: cleanEmail,
+      name,
+      role: 'teacher',
+      approvalStatus: 'approved',
+      isApproved: true,
+      status: 'approved',
+      approved: true,
+      avatar: '',
+      picture: '',
+      headline: 'Native Friend & English Mentor',
+      bio: '',
+      availableDays: ['monday', 'tuesday', 'wednesday', 'thursday', 'friday'],
+    };
+
     if (tutorObj) {
       tutorObj.uid = authenticatedUid;
       tutorObj.authUid = authenticatedUid;
       tutorObj.id = publicTutorId;
+    } else {
+      if (!db.tutorsList) db.tutorsList = [];
+      db.tutorsList.push(effectiveTutor);
     }
     if (teacherObj) {
       teacherObj.uid = authenticatedUid;
+    } else {
+      if (!db.teachers) db.teachers = [];
+      db.teachers.push(effectiveTutor);
     }
-    if (tutorObj) {
-      saveTutorToFirestore({ ...tutorObj, id: authenticatedUid, uid: authenticatedUid, authUid: authenticatedUid, publicTutorId, role: 'teacher' }).catch(() => {});
-      saveUserToFirestore({ ...tutorObj, id: authenticatedUid, uid: authenticatedUid, tutorId: publicTutorId, role: 'teacher' }).catch(() => {});
-    }
+
+    saveTutorToFirestore({ ...effectiveTutor, id: authenticatedUid, uid: authenticatedUid, authUid: authenticatedUid, publicTutorId, role: 'teacher' }).catch(() => {});
+    saveUserToFirestore({ ...effectiveTutor, id: authenticatedUid, uid: authenticatedUid, tutorId: publicTutorId, role: 'teacher' }).catch(() => {});
 
     // Purge any accidental student profile entry for this teacher
     if (db.userProfiles && db.userProfiles[cleanEmail]) {
       delete db.userProfiles[cleanEmail];
+    }
+    if (db.students) {
+      db.students = db.students.filter((s: any) => (s.email || s.studentEmail || '').toLowerCase() !== cleanEmail);
     }
   } else {
     // Registered or new student
@@ -1782,7 +1810,7 @@ app.post('/api/auth/login', async (req, res) => {
 
     writeDb(db);
   } else if (role === 'teacher') {
-    account.picture = tutorObj?.avatar || tutorObj?.picture || '';
+    account.picture = tutorObj?.avatar || tutorObj?.picture || teacherObj?.avatar || effectiveTutor?.avatar || '';
   }
 
   res.json({
@@ -1790,7 +1818,7 @@ app.post('/api/auth/login', async (req, res) => {
     account,
     profile: role === 'teacher' ? null : studentProfile,
     student: role === 'teacher' ? null : (studentObj || (db.students || []).find((s) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail) || null),
-    tutor: tutorObj || null,
+    tutor: tutorObj || teacherObj || effectiveTutor || null,
     isRoleEnforced,
     enforcedRole: role,
   });
@@ -2535,18 +2563,19 @@ app.post('/api/auth/google', async (req, res) => {
   const firestoreRole = (firestoreDoc?.role || '').toLowerCase();
   const authRecordRole = (authRecord?.role || '').toLowerCase();
 
-  const isRegisteredStudent = !isServerVerifiedAdmin && (
-    firestoreRole === 'student' ||
-    authRecordRole === 'student' ||
-    (db.students || []).some((s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail)
-  );
-
-  const isRegisteredTeacher = !isServerVerifiedAdmin && !isRegisteredStudent && (
+  const isRegisteredTeacher = !isServerVerifiedAdmin && (
+    requestedRole === 'teacher' ||
     firestoreRole === 'teacher' ||
     firestoreRole === 'native_friend' ||
     authRecordRole === 'teacher' ||
     (db.teachers || []).some((t: any) => (t.email || '').toLowerCase() === cleanEmail && t.role !== 'admin') ||
     (db.tutorsList || []).some((t: any) => (t.email || '').toLowerCase() === cleanEmail)
+  );
+
+  const isRegisteredStudent = !isServerVerifiedAdmin && !isRegisteredTeacher && (
+    firestoreRole === 'student' ||
+    authRecordRole === 'student' ||
+    (db.students || []).some((s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail)
   );
 
   let role: string = 'student';
@@ -2657,17 +2686,49 @@ app.post('/api/auth/google', async (req, res) => {
     }
   } else if (role === 'teacher' && uid) {
     const tutorEntry = (db.tutorsList || []).find((t: any) => (t.email || '').toLowerCase() === cleanEmail);
+    const teacherEntry = (db.teachers || []).find((t: any) => (t.email || '').toLowerCase() === cleanEmail);
+    const publicTutorId = tutorEntry?.id || teacherEntry?.id || `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
+    const effectiveTutor = tutorEntry || teacherEntry || {
+      id: publicTutorId,
+      publicTutorId,
+      uid,
+      authUid: uid,
+      email: cleanEmail,
+      name: displayName,
+      role: 'teacher',
+      approvalStatus: 'approved',
+      isApproved: true,
+      status: 'approved',
+      approved: true,
+      avatar: picture || '',
+      picture: picture || '',
+      headline: 'Native Friend & English Mentor',
+      bio: '',
+      availableDays: ['monday', 'tuesday', 'wednesday', 'thursday', 'friday'],
+    };
+
     if (tutorEntry) {
-      const publicTutorId = tutorEntry.id || `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
       tutorEntry.uid = uid;
       tutorEntry.authUid = uid;
       tutorEntry.id = publicTutorId;
-      saveTutorToFirestore({ ...tutorEntry, id: uid, uid, authUid: uid, publicTutorId, role: 'teacher' }).catch(() => {});
-      saveUserToFirestore({ ...tutorEntry, id: uid, uid, tutorId: publicTutorId, role: 'teacher' }).catch(() => {});
+    } else {
+      if (!db.tutorsList) db.tutorsList = [];
+      db.tutorsList.push(effectiveTutor);
     }
-    const teacherEntry = (db.teachers || []).find((t: any) => (t.email || '').toLowerCase() === cleanEmail);
     if (teacherEntry) {
       teacherEntry.uid = uid;
+    } else {
+      if (!db.teachers) db.teachers = [];
+      db.teachers.push(effectiveTutor);
+    }
+    saveTutorToFirestore({ ...effectiveTutor, id: uid, uid, authUid: uid, publicTutorId, role: 'teacher' }).catch(() => {});
+    saveUserToFirestore({ ...effectiveTutor, id: uid, uid, tutorId: publicTutorId, role: 'teacher' }).catch(() => {});
+
+    if (db.userProfiles && db.userProfiles[cleanEmail]) {
+      delete db.userProfiles[cleanEmail];
+    }
+    if (db.students) {
+      db.students = db.students.filter((s: any) => (s.email || s.studentEmail || '').toLowerCase() !== cleanEmail);
     }
     writeDb(db);
   }
@@ -5072,7 +5133,7 @@ app.post('/api/students/profile', (req, res) => {
   res.json({ success: true, profile: db.userProfiles[cleanEmail] });
 });
 
-app.get('/api/user-profile', (req, res) => {
+app.get('/api/user-profile', async (req, res) => {
   const db = readDb();
   const rawEmail = ((req.query.email as string) || '').toLowerCase().trim();
   const uid = ((req.query.uid as string) || (req.query.studentUid as string) || '').trim();
@@ -5100,6 +5161,22 @@ app.get('/api/user-profile', (req, res) => {
       tutor: tutor || null,
       message: 'Native Friend profile retrieved successfully',
     });
+  }
+
+  // Also check Firestore for teacher/Native Friend record
+  if (email || uid) {
+    try {
+      const fsUser = await fetchUserFromFirestore(email, uid);
+      if (fsUser && (fsUser.role === 'teacher' || fsUser.isTeacher || fsUser.role === 'native_friend' || fsUser.role === 'tutor')) {
+        return res.json({
+          success: true,
+          role: 'teacher',
+          isTeacher: true,
+          tutor: fsUser,
+          message: 'Native Friend profile retrieved successfully',
+        });
+      }
+    } catch {}
   }
 
   let profile = db.userProfiles?.[email] || null;

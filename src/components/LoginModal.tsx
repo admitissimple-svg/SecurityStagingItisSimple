@@ -34,6 +34,7 @@ export interface LoginModalProps {
   initialRole?: UserRole;
   initialEmail?: string;
   currentLanguage?: Language;
+  onRoleChange?: (role: UserRole) => void;
   onShowToast?: (title: string, message: string, type?: 'info' | 'success' | 'warning' | 'error') => void;
   onLoginSuccess: (
     account: GoogleAccount,
@@ -82,6 +83,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
   initialRole = 'student',
   initialEmail = '',
   currentLanguage = 'pt',
+  onRoleChange,
   onShowToast,
   onLoginSuccess,
   onSwitchToSignUp,
@@ -90,8 +92,8 @@ export const LoginModal: React.FC<LoginModalProps> = ({
   const isEn = currentLanguage === 'en';
   const roleText = ROLE_LABELS[currentLanguage] || ROLE_LABELS.pt;
 
-  // 1. Mandatory requirement: default role MUST be 'student' (Student Access)
-  const [selectedRole, setSelectedRole] = useState<UserRole>('student');
+  // 1. Mandatory requirement: default role MUST be 'student' (Student Access) unless specified by initialRole
+  const [selectedRole, setSelectedRole] = useState<UserRole>(initialRole || 'student');
   const [email, setEmail] = useState<string>(initialEmail || '');
   const [password, setPassword] = useState<string>('');
   const [showPassword, setShowPassword] = useState<boolean>(false);
@@ -99,10 +101,14 @@ export const LoginModal: React.FC<LoginModalProps> = ({
   const [errorMsg, setErrorMsg] = useState<string>('');
   const [showGoogleSignIn, setShowGoogleSignIn] = useState<boolean>(false);
 
-  // Initialize and reset on modal open - synchronizing with initialRole
+  // Initialize and reset on modal open
   useEffect(() => {
     if (isOpen) {
-      setSelectedRole(initialRole || 'student');
+      const startingRole = initialRole || 'student';
+      setSelectedRole(startingRole);
+      if (onRoleChange) {
+        onRoleChange(startingRole);
+      }
       setErrorMsg('');
       setIsLoading(false);
       if (initialEmail) {
@@ -115,7 +121,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
         } catch {}
       }
     }
-  }, [isOpen, initialRole, initialEmail]);
+  }, [isOpen]);
 
   // Support ESC key
   useEffect(() => {
@@ -135,6 +141,9 @@ export const LoginModal: React.FC<LoginModalProps> = ({
   const handleRoleSelect = (role: UserRole) => {
     setSelectedRole(role);
     setErrorMsg('');
+    if (onRoleChange) {
+      onRoleChange(role);
+    }
     // If switching away from admin, clear /admin URL state
     if (role !== 'admin' && typeof window !== 'undefined' && window.location.pathname === '/admin') {
       try {
