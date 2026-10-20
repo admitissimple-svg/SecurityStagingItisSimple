@@ -179,6 +179,7 @@ const createDefaultStudentProfile = (account?: GoogleAccount | null): UserProfil
     routineAudioTime: '',
     dailyPhraseTime: '',
     weeklyNativeLessonsTarget: 1,
+    weeklyCycle: 1,
   };
 };
 
@@ -3009,13 +3010,8 @@ export default function App() {
         email = email || currentAccount?.email || userProfile?.email || '';
       }
 
-      const activeCycle = parseWeekCycleNumber(userProfile?.weeklyCycle);
-      const activeWeekId = normalizeWeekId(userProfile?.weeklyCycle);
-
-      if (activeCycle === null || !activeWeekId) {
-        console.warn('[handleBehavioralActivityComplete] Active week cycle is unknown or invalid. Preventing weekly completion write.');
-        return;
-      }
+      const activeCycle = parseWeekCycleNumber(userProfile?.weeklyCycle) ?? 1;
+      const activeWeekId = normalizeWeekId(userProfile?.weeklyCycle) || 'week-1';
 
       const stepMapping: Record<string, 'video_day' | 'audio_day' | 'memorization' | 'tutor_live'> = {
         video: 'video_day',
@@ -3317,13 +3313,8 @@ export default function App() {
       const uid = targetUid || currentAccount?.uid || userProfile?.id || '';
       const email = targetEmail || currentAccount?.email || userProfile?.email || '';
 
-      const activeCycle = parseWeekCycleNumber(userProfile?.weeklyCycle);
-      const activeWeekId = normalizeWeekId(userProfile?.weeklyCycle);
-
-      if (activeCycle === null || !activeWeekId) {
-        console.warn('[handleUpdateSPathCheck] Active week cycle is unknown or invalid. Preventing weekly completion write.');
-        return;
-      }
+      const activeCycle = parseWeekCycleNumber(userProfile?.weeklyCycle) ?? 1;
+      const activeWeekId = normalizeWeekId(userProfile?.weeklyCycle) || 'week-1';
 
       if (isCompleted && (stepId === 'video_day' || stepId === 'audio_day')) {
         handleBehavioralActivityComplete({
@@ -3333,6 +3324,33 @@ export default function App() {
           targetStudentEmail: email,
         });
         return;
+      }
+
+      if (!isCompleted && (stepId === 'video_day' || stepId === 'audio_day')) {
+        setRoutinesByDay((prev) => {
+          const dayList = prev[dayKey] || [];
+          const updated = dayList.map((item) => {
+            const actName = (item.activityName || '').toLowerCase();
+            const isTarget =
+              (stepId === 'video_day' &&
+                ((item.teacherVideos && item.teacherVideos.length > 0) ||
+                  actName.includes('video') ||
+                  actName.includes('vídeo') ||
+                  item.id.endsWith('1'))) ||
+              (stepId === 'audio_day' &&
+                (Boolean(item.teacherSpotify) ||
+                  actName.includes('audio') ||
+                  actName.includes('áudio') ||
+                  actName.includes('som') ||
+                  actName.includes('ouvir') ||
+                  item.id.endsWith('2')));
+            if (isTarget) {
+              return { ...item, completedToday: false, completed: false };
+            }
+            return item;
+          });
+          return { ...prev, [dayKey]: updated };
+        });
       }
 
       const checkKey = `${stepId}_${dayKey}`;

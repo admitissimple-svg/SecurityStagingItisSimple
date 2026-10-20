@@ -2971,18 +2971,17 @@ export function subscribeToStudentWeeklyChecks(
       (uSnap) => {
         if (uSnap.exists()) {
           const uData = uSnap.data();
-          const resolvedCycle = typeof uData?.weeklyCycle === 'number' && uData.weeklyCycle > 0 ? uData.weeklyCycle : null;
-          if (resolvedCycle) {
-            const resolvedWeekId = `week-${resolvedCycle}`;
-            subscribeToSpecificWeek(resolvedWeekId, resolvedCycle, resolvedCycle === 1);
-          } else {
-            console.warn(
-              `[studentPersistence] subscribeToStudentWeeklyChecks: User ${cleanUid} has no weeklyCycle defined. Caller must provide explicit week parameter (Phase 02-B dependency). Refusing to default to Week 1.`
-            );
-          }
+          const resolvedCycle = typeof uData?.weeklyCycle === 'number' && uData.weeklyCycle > 0 ? uData.weeklyCycle : 1;
+          const resolvedWeekId = `week-${resolvedCycle}`;
+          subscribeToSpecificWeek(resolvedWeekId, resolvedCycle, resolvedCycle === 1);
+        } else {
+          subscribeToSpecificWeek('week-1', 1, true);
         }
       },
-      (err) => console.warn(`Real-time notice for profile user ${cleanUid}:`, err)
+      (err) => {
+        console.warn(`Real-time notice for profile user ${cleanUid}:`, err);
+        subscribeToSpecificWeek('week-1', 1, true);
+      }
     );
   }
 
@@ -3035,10 +3034,8 @@ export async function saveStudentWeeklyChecksToFirestore(
     }
 
     if (!targetWeekId || !targetCycle) {
-      console.warn(
-        `[studentPersistence] saveStudentWeeklyChecksToFirestore: Week identity is unknown for ${cleanUid}. Explicit week parameter required (Phase 02-B dependency). Refusing to default to Week 1.`
-      );
-      return false;
+      targetCycle = 1;
+      targetWeekId = 'week-1';
     }
 
     if (db && cleanUid) {
@@ -3763,7 +3760,7 @@ export function deriveWeeklyChecksFromJournal(
       return;
     }
     // Do not mark past/retroactive day reviews, but do mark the scheduled day even if it was a repeated video
-    if ((entry as any).reviewedPastDay) {
+    if ((entry as any).reviewedPastDay || (entry as any).isReview) {
       return;
     }
     const stepId = mapJournalTypeToStepId(entry.type);
@@ -3883,6 +3880,7 @@ export async function recordActivityInStudentJournal(
       const todayIndex = DAYS_OF_WEEK.indexOf(todayDay);
       const isPastDay = Boolean(
         (sanitizedEntry as any).reviewedPastDay ||
+        (sanitizedEntry as any).isReview ||
         (dayIndex !== -1 && todayIndex !== -1 && dayIndex < todayIndex)
       );
 

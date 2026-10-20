@@ -141,8 +141,8 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
   const todayDay = getTodayDayOfWeek();
 
   // Canonical active week cycle and week ID derived strictly from userProfile.weeklyCycle
-  const activeWeekCycle = parseWeekCycleNumber(userProfile?.weeklyCycle);
-  const activeWeekId = normalizeWeekId(userProfile?.weeklyCycle);
+  const activeWeekCycle = parseWeekCycleNumber(userProfile?.weeklyCycle) ?? 1;
+  const activeWeekId = normalizeWeekId(userProfile?.weeklyCycle) || 'week-1';
 
   // Active study days from student's single source of truth plan
   const activeStudyDays: DayOfWeek[] = useMemo(() => {
@@ -492,7 +492,7 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
           const isMemo = entry.type === 'memorization' || (entry as any).type === 'homework';
           if (!isMemo) return false;
           if (entry.dayOfWeek && entry.dayOfWeek.toLowerCase() === dayKey.toLowerCase()) {
-            if (entry.week === activeWeekCycle) return true;
+            if (entry.week === undefined || entry.week === activeWeekCycle || Number(entry.week) === activeWeekCycle) return true;
           }
           return false;
         });
@@ -506,7 +506,6 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
       // 2. Video of the Day: S-Path evolution tracker logic
       // Rule: If a student completes an activity on a given day (even if it is a repeated video),
       // that specific day must be marked as completed in the S-Path tracker.
-      // Do not mark past/retroactive days, but do mark the current active day when completed.
       if (rowId === 'video_day') {
         // Strictly only scheduled study days count
         if (!activeStudyDays.includes(dayKey)) {
@@ -539,13 +538,13 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
           if (!isVideo) return false;
 
           // Do not mark past/retroactive day reviews
-          if ((entry as any).reviewedPastDay) {
+          if ((entry as any).reviewedPastDay || (entry as any).isReview) {
             return false;
           }
 
           // Strictly match the scheduled day for this routine item and active week
           if (entry.dayOfWeek && entry.dayOfWeek.toLowerCase() === dayKey.toLowerCase()) {
-            if (entry.week === activeWeekCycle) {
+            if (entry.week === undefined || entry.week === activeWeekCycle || Number(entry.week) === activeWeekCycle) {
               return true;
             }
           }
@@ -561,33 +560,73 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
         return false;
       }
 
-      // 3. Audio of the Day & Live Tutor Lessons
-      if (rowId === 'audio_day' && !activeStudyDays.includes(dayKey)) {
+      // 3. Audio of the Day
+      if (rowId === 'audio_day') {
+        if (!activeStudyDays.includes(dayKey)) {
+          return false;
+        }
+
+        if (weeklyChecks && Boolean(weeklyChecks[checkKey])) return true;
+
+        // Check if completed in routinesByDay
+        const dayList = routinesByDay?.[dayKey] || [];
+        const hasCompletedRoutineAudio = dayList.some((act) => {
+          if (!act) return false;
+          const actName = (act.activityName || '').toLowerCase();
+          const isAudio =
+            Boolean(act.teacherSpotify) ||
+            act.id?.endsWith('2') ||
+            actName.includes('audio') ||
+            actName.includes('áudio') ||
+            actName.includes('som') ||
+            actName.includes('ouvir') ||
+            actName.includes('listen') ||
+            actName.includes('podcast') ||
+            actName.includes('música') ||
+            actName.includes('music');
+          return isAudio && Boolean(act.completedToday || act.completed);
+        });
+        if (hasCompletedRoutineAudio) return true;
+
+        const hasMatchingAudio = activeJournal.some((entry) => {
+          if (!entry) return false;
+          const isAudio = entry.type === 'audio' || (entry as any).type === 'audio_day';
+          if (!isAudio) return false;
+          if ((entry as any).reviewedPastDay || (entry as any).isReview) return false;
+          if (entry.dayOfWeek && entry.dayOfWeek.toLowerCase() === dayKey.toLowerCase()) {
+            if (entry.week === undefined || entry.week === activeWeekCycle || Number(entry.week) === activeWeekCycle) return true;
+          }
+          return false;
+        });
+        if (hasMatchingAudio) return true;
+
+        const localCached = getCachedWeeklyChecks(studentUid, studentEmail, activeWeekCycle);
+        if (localCached && Boolean(localCached[checkKey])) return true;
+
         return false;
       }
 
-      if (weeklyChecks && Boolean(weeklyChecks[checkKey])) return true;
+      // 4. Live Tutor Lessons
+      if (rowId === 'tutor_live') {
+        if (weeklyChecks && Boolean(weeklyChecks[checkKey])) return true;
 
-      const targetType = mapStepIdToJournalType(rowId);
+        const hasMatchingLesson = activeJournal.some((entry) => {
+          if (!entry) return false;
+          const isLesson = entry.type === 'lesson' || (entry as any).type === 'tutor_live';
+          if (!isLesson) return false;
+          if (entry.dayOfWeek && entry.dayOfWeek.toLowerCase() === dayKey.toLowerCase()) {
+            if (entry.week === undefined || entry.week === activeWeekCycle || Number(entry.week) === activeWeekCycle) return true;
+          }
+          return false;
+        });
 
-      const hasMatchingJournal = activeJournal.some((entry) => {
-        if (!entry) return false;
-        const matchesType =
-          entry.type === targetType ||
-          (rowId === 'tutor_live' && (entry.type === 'lesson' || (entry as any).type === 'tutor_live')) ||
-          (rowId === 'audio_day' && (entry.type === 'audio' || (entry as any).type === 'audio_day'));
-        if (!matchesType) return false;
+        if (hasMatchingLesson) return true;
 
-        if (entry.dayOfWeek && entry.dayOfWeek.toLowerCase() === dayKey.toLowerCase()) {
-          if (entry.week === activeWeekCycle) return true;
-        }
+        const localCached = getCachedWeeklyChecks(studentUid, studentEmail, activeWeekCycle);
+        if (localCached && Boolean(localCached[checkKey])) return true;
+
         return false;
-      });
-
-      if (hasMatchingJournal) return true;
-
-      const localCached = getCachedWeeklyChecks(studentUid, studentEmail, activeWeekCycle);
-      if (localCached && Boolean(localCached[checkKey])) return true;
+      }
 
       return false;
     },
