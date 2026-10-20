@@ -631,26 +631,8 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
         timeZone={timeZone}
       />
 
-      {/* Buttons: Native Friends Notes & My Journal (placed immediately below Live 1-on-1 Sessions with Your Native Friend) */}
+      {/* Button: Native Friends Notes (placed immediately below Live 1-on-1 Sessions with Your Native Friend) */}
       <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-end gap-2.5 pt-1" id="student-notes-journal-buttons-container">
-        {onOpenJournal && (
-          <button
-            type="button"
-            onClick={onOpenJournal}
-            className="w-full sm:w-auto inline-flex items-center justify-center gap-2.5 px-5 py-3 rounded-2xl bg-white hover:bg-[#EFF6FF] text-[#000035] hover:text-[#1C4C96] font-bold text-xs sm:text-sm shadow-xs hover:shadow-md transition-all duration-200 border border-[#9AB4FF]/50 cursor-pointer active:scale-98 group"
-            id="btn-student-journal-header"
-            title={isEn ? 'Open My Journal (Lesson Reviews & Daily Sentences)' : 'Abrir Meu Diário (Revisões de Aula & Frases do Dia)'}
-          >
-            <div className="w-7 h-7 rounded-xl bg-[#1C4C96]/10 flex items-center justify-center text-[#1C4C96] group-hover:scale-110 transition-transform">
-              <Sparkles className="w-4 h-4 text-[#1C4C96]" />
-            </div>
-            <span className="tracking-wide">{isEn ? 'My Journal' : 'Meu Diário'}</span>
-            <span className="text-[10px] sm:text-xs px-2 py-0.5 rounded-full bg-[#1C4C96]/10 text-[#1C4C96] font-extrabold border border-[#1C4C96]/20">
-              {isEn ? 'Class Reviews' : 'Revisões de Aula'}
-            </span>
-          </button>
-        )}
-
         <button
           type="button"
           onClick={() => handleOpenNotesTab(reminder?.targetTab || 'mistakes')}
