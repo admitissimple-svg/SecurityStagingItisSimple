@@ -73,6 +73,19 @@ export async function authenticateYouTubeAccount(hintEmail = YOUTUBE_ASSOCIATED_
     }
 
     setGoogleOAuthToken(token);
+
+    // Register token immediately with backend to authorize backend-wide synchronization
+    fetch('/api/youtube-playlists/authorize', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ token }),
+    }).catch((err) => {
+      console.warn('Notice: Background token authorization on backend:', err);
+    });
+
     return token;
   } catch (err: any) {
     console.error('Error during YouTube OAuth authentication:', err);
@@ -82,40 +95,50 @@ export async function authenticateYouTubeAccount(hintEmail = YOUTUBE_ASSOCIATED_
 
 /**
  * Directly queries YouTube Data API v3 playlists.list for all playlists owned by adm.itissimple@gmail.com
- * using the authenticated OAuth 2.0 access token (with `mine=true`).
+ * using the authenticated OAuth 2.0 access token (with `mine=true`), supporting full pagination.
  */
 export async function fetchPlaylistsFromYouTubeApi(accessToken: string): Promise<YouTubePlaylistItem[]> {
   if (!accessToken) {
     throw new Error('OAuth access token is required to fetch YouTube playlists.');
   }
 
-  // 1. Fetch all playlists owned by the authenticated account
-  const listUrl = 'https://www.googleapis.com/youtube/v3/playlists?part=snippet,contentDetails,status&mine=true&maxResults=50';
-  const listRes = await fetch(listUrl, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      Accept: 'application/json',
-    },
-  });
+  // 1. Fetch all playlists owned by the authenticated account with pagination
+  const rawPlaylists: any[] = [];
+  let pageToken: string | undefined = undefined;
 
-  if (listRes.status === 401) {
-    throw new Error('AUTH_EXPIRED: Access token expired or invalid');
+  while (true) {
+    const pageParam: string = pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : '';
+    const listUrl: string = `https://www.googleapis.com/youtube/v3/playlists?part=snippet,contentDetails,status&mine=true&maxResults=50${pageParam}`;
+    const listRes: Response = await fetch(listUrl, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/json',
+      },
+    });
+
+    if (listRes.status === 401) {
+      throw new Error('AUTH_EXPIRED: Access token expired or invalid');
+    }
+
+    if (!listRes.ok) {
+      const errorText: string = await listRes.text();
+      console.warn(`YouTube API playlists.list failed [${listRes.status}]:`, errorText);
+      throw new Error(`YouTube API error: ${listRes.status}`);
+    }
+
+    const listData: any = await listRes.json();
+    if (Array.isArray(listData.items)) {
+      rawPlaylists.push(...listData.items);
+    }
+    pageToken = listData.nextPageToken || undefined;
+    if (!pageToken) break;
   }
-
-  if (!listRes.ok) {
-    const errorText = await listRes.text();
-    console.warn(`YouTube API playlists.list failed [${listRes.status}]:`, errorText);
-    throw new Error(`YouTube API error: ${listRes.status}`);
-  }
-
-  const listData = await listRes.json();
-  const rawPlaylists: any[] = listData.items || [];
 
   if (rawPlaylists.length === 0) {
     return [];
   }
 
-  // 2. Fetch playlist items (videos) for each retrieved playlist
+  // 2. Fetch playlist items (videos) for each retrieved playlist with pagination
   const parsedPlaylists: YouTubePlaylistItem[] = [];
 
   for (const pl of rawPlaylists) {
@@ -131,44 +154,57 @@ export async function fetchPlaylistsFromYouTubeApi(accessToken: string): Promise
 
     let videos: YouTubeVideoSummary[] = [];
     try {
-      const itemsUrl = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails&playlistId=${plId}&maxResults=50`;
-      const itemsRes = await fetch(itemsUrl, {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: 'application/json',
-        },
-      });
+      let vidPageToken: string | undefined = undefined;
+      const allItems: any[] = [];
 
-      if (itemsRes.ok) {
-        const itemsData = await itemsRes.json();
-        const rawItems = itemsData.items || [];
-        videos = rawItems
-          .filter(
-            (it: any) =>
-              it.snippet?.resourceId?.videoId &&
-              it.snippet?.title !== 'Private video' &&
-              it.snippet?.title !== 'Deleted video'
-          )
-          .map((it: any) => {
-            const vidId = it.snippet.resourceId.videoId;
-            return {
-              id: `vid-${vidId}`,
-              videoId: vidId,
-              title: it.snippet.title,
-              description: it.snippet.description || '',
-              thumbnailUrl:
-                it.snippet?.thumbnails?.high?.url ||
-                it.snippet?.thumbnails?.medium?.url ||
-                `https://i.ytimg.com/vi/${vidId}/hqdefault.jpg`,
-              url: `https://www.youtube.com/watch?v=${vidId}`,
-              embedUrl: `https://www.youtube-nocookie.com/embed/${vidId}?rel=0&modestbranding=1&enablejsapi=1`,
-              playlistId: plId,
-              playlistTitle: title,
-              duration: '6-8 min',
-              instructions: `Assista a esta aula sobre "${title}" e anote 3 termos ou frases úteis para a rotina.`,
-            };
-          });
+      while (true) {
+        const vidPageParam: string = vidPageToken ? `&pageToken=${encodeURIComponent(vidPageToken)}` : '';
+        const itemsUrl: string = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails&playlistId=${plId}&maxResults=50${vidPageParam}`;
+        const itemsRes: Response = await fetch(itemsUrl, {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'application/json',
+          },
+        });
+
+        if (itemsRes.ok) {
+          const itemsData: any = await itemsRes.json();
+          if (Array.isArray(itemsData.items)) {
+            allItems.push(...itemsData.items);
+          }
+          vidPageToken = itemsData.nextPageToken || undefined;
+          if (!vidPageToken) break;
+        } else {
+          break;
+        }
       }
+
+      videos = allItems
+        .filter(
+          (it: any) =>
+            it.snippet?.resourceId?.videoId &&
+            it.snippet?.title !== 'Private video' &&
+            it.snippet?.title !== 'Deleted video'
+        )
+        .map((it: any) => {
+          const vidId = it.snippet.resourceId.videoId;
+          return {
+            id: `vid-${vidId}`,
+            videoId: vidId,
+            title: it.snippet.title,
+            description: it.snippet.description || '',
+            thumbnailUrl:
+              it.snippet?.thumbnails?.high?.url ||
+              it.snippet?.thumbnails?.medium?.url ||
+              `https://i.ytimg.com/vi/${vidId}/hqdefault.jpg`,
+            url: `https://www.youtube.com/watch?v=${vidId}`,
+            embedUrl: `https://www.youtube-nocookie.com/embed/${vidId}?rel=0&modestbranding=1&enablejsapi=1`,
+            playlistId: plId,
+            playlistTitle: title,
+            duration: '6-8 min',
+            instructions: `Assista a esta aula sobre "${title}" e anote 3 termos ou frases úteis para a rotina.`,
+          };
+        });
     } catch (itemErr) {
       console.warn(`Could not fetch items for playlist ${plId}:`, itemErr);
     }
@@ -219,9 +255,9 @@ export async function savePlaylistsToServer(playlists: YouTubePlaylistItem[]): P
 /**
  * Main coordinator to load YouTube playlists dynamically:
  * 1. Checks server API `/api/youtube-playlists` (with OAuth token if available).
- * 2. If force=true or server list is empty and an OAuth token exists, queries YouTube API directly.
- * 3. Identifies whether re-authentication is required.
- * 4. Yields fallback playlists so students always have working curated topics.
+ * 2. On force=true, bypasses client and server cache to perform upstream revalidation.
+ * 3. Does not leak tokens or force students to authenticate the official account.
+ * 4. Yields fallback curated playlists if network fails, never replacing with fake data.
  */
 export async function fetchDynamicYouTubePlaylists(options?: {
   force?: boolean;
@@ -229,14 +265,14 @@ export async function fetchDynamicYouTubePlaylists(options?: {
   const force = Boolean(options?.force);
   const token = getGoogleOAuthToken();
 
-  // 1. Try server endpoint first
+  // 1. Query centralized backend endpoint
   try {
     const headers: Record<string, string> = { Accept: 'application/json' };
     if (token) {
       headers['Authorization'] = `Bearer ${token}`;
     }
 
-    const serverUrl = `/api/youtube-playlists${force ? '?force=true' : ''}`;
+    const serverUrl = `/api/youtube-playlists?_t=${Date.now()}${force ? '&force=true' : ''}`;
     const serverRes = await fetch(serverUrl, { headers });
 
     if (serverRes.ok) {
@@ -245,6 +281,8 @@ export async function fetchDynamicYouTubePlaylists(options?: {
         return {
           playlists: serverPlaylists,
           source: 'server',
+          reauthRequired: false,
+          error: null,
         };
       }
     }
@@ -252,7 +290,7 @@ export async function fetchDynamicYouTubePlaylists(options?: {
     console.warn('Error fetching playlists from /api/youtube-playlists:', serverErr);
   }
 
-  // 2. If server has no playlists or force sync is desired, and we have an OAuth token, query YouTube directly
+  // 2. Direct client fallback ONLY if token exists and server was unreachable
   if (token) {
     try {
       const directPlaylists = await fetchPlaylistsFromYouTubeApi(token);
@@ -260,6 +298,8 @@ export async function fetchDynamicYouTubePlaylists(options?: {
         return {
           playlists: directPlaylists,
           source: 'api',
+          reauthRequired: false,
+          error: null,
         };
       }
     } catch (apiErr: any) {
@@ -268,24 +308,18 @@ export async function fetchDynamicYouTubePlaylists(options?: {
         return {
           playlists: DEFAULT_CURATED_PLAYLISTS,
           reauthRequired: true,
-          error: 'Sessão do YouTube expirada. Clique para reautenticar a conta adm.itissimple@gmail.com.',
+          error: 'Sessão do YouTube da conta institucional expirada. Clique para reautenticar adm.itissimple@gmail.com.',
           source: 'fallback',
         };
       }
       console.warn('Direct YouTube API fetch notice:', apiErr);
     }
-  } else {
-    // No token stored yet
-    return {
-      playlists: DEFAULT_CURATED_PLAYLISTS,
-      reauthRequired: true,
-      error: 'Conecte a conta do YouTube (adm.itissimple@gmail.com) para sincronizar todas as suas playlists em tempo real.',
-      source: 'fallback',
-    };
   }
 
+  // 3. Fallback to default authentic channel playlists without demanding student auth
   return {
     playlists: DEFAULT_CURATED_PLAYLISTS,
+    reauthRequired: false,
     source: 'fallback',
   };
 }

@@ -71,7 +71,7 @@ export function formatSessionNotesFileName(studentName?: string, sessionDate?: s
 /**
  * Retrieves pre-authenticated platform token from metadata service or environment
  */
-async function getPlatformGoogleAccessToken(): Promise<string | null> {
+export async function getPlatformGoogleAccessToken(): Promise<string | null> {
   // 1. Check explicit environment override
   if (process.env.GOOGLE_DRIVE_TOKEN) return process.env.GOOGLE_DRIVE_TOKEN;
   if (process.env.PLATFORM_GOOGLE_TOKEN) return process.env.PLATFORM_GOOGLE_TOKEN;

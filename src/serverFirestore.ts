@@ -812,18 +812,26 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
 export async function saveYouTubePlaylistsToFirestore(playlists: any[]): Promise<boolean> {
   if (isCloudWriteDisabled) return false;
   const db = getFirestoreDb();
-  if (!db || !Array.isArray(playlists)) return false;
+  if (!db || !Array.isArray(playlists) || playlists.length === 0) return false;
   try {
     const sanitized = JSON.parse(JSON.stringify(playlists));
+    const totalVideos = sanitized.reduce(
+      (acc: number, p: any) => acc + (Array.isArray(p.videos) ? p.videos.length : 0),
+      0
+    );
     const savePromise = db.collection('app_state').doc('youtube_playlists').set(
       {
         playlists: sanitized,
         count: sanitized.length,
+        totalVideos,
         updatedAt: new Date().toISOString(),
+        lastSyncSuccess: new Date().toISOString(),
+        channelId: 'UCdimJysdxd2Hu9YmlVHB98A',
+        channelTitle: 'Adm Itissimple',
       },
       { merge: true }
     ).then(() => true);
-    const result = await withTimeout(savePromise, 3000);
+    const result = await withTimeout(savePromise, 4000);
     return !!result;
   } catch (err: any) {
     if (isPermissionError(err)) {
@@ -836,7 +844,13 @@ export async function saveYouTubePlaylistsToFirestore(playlists: any[]): Promise
   }
 }
 
-export async function fetchYouTubePlaylistsFromFirestore(): Promise<any[] | null> {
+export async function fetchYouTubePlaylistsDocFromFirestore(): Promise<{
+  playlists: any[];
+  count: number;
+  totalVideos: number;
+  updatedAt?: string;
+  lastSyncSuccess?: string;
+} | null> {
   const db = getFirestoreDb();
   if (!db) return null;
   try {
@@ -844,15 +858,72 @@ export async function fetchYouTubePlaylistsFromFirestore(): Promise<any[] | null
       const snap = await db.collection('app_state').doc('youtube_playlists').get();
       if (snap.exists) {
         const data = snap.data();
-        if (Array.isArray(data?.playlists)) {
-          return data.playlists;
+        if (Array.isArray(data?.playlists) && data.playlists.length > 0) {
+          return {
+            playlists: data.playlists,
+            count: data.playlists.length,
+            totalVideos: data.totalVideos || 0,
+            updatedAt: data.updatedAt,
+            lastSyncSuccess: data.lastSyncSuccess,
+          };
+        }
+      }
+      return null;
+    };
+    return await withTimeout(fetchPromise(), 4000);
+  } catch (err) {
+    console.warn('Firestore fetchYouTubePlaylistsDoc error:', err);
+    return null;
+  }
+}
+
+export async function fetchYouTubePlaylistsFromFirestore(): Promise<any[] | null> {
+  const doc = await fetchYouTubePlaylistsDocFromFirestore();
+  return doc?.playlists || null;
+}
+
+export async function saveYouTubeAuthToFirestore(authData: { token: string; updatedAt?: string }): Promise<boolean> {
+  if (isCloudWriteDisabled) return false;
+  const db = getFirestoreDb();
+  if (!db || !authData?.token) return false;
+  try {
+    const savePromise = db.collection('app_state').doc('youtube_auth').set(
+      {
+        token: authData.token,
+        updatedAt: authData.updatedAt || new Date().toISOString(),
+        account: 'adm.itissimple@gmail.com',
+      },
+      { merge: true }
+    ).then(() => true);
+    const result = await withTimeout(savePromise, 3000);
+    return !!result;
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+    }
+    return false;
+  }
+}
+
+export async function fetchYouTubeAuthFromFirestore(): Promise<{ token: string; updatedAt?: string } | null> {
+  const db = getFirestoreDb();
+  if (!db) return null;
+  try {
+    const fetchPromise = async () => {
+      const snap = await db.collection('app_state').doc('youtube_auth').get();
+      if (snap.exists) {
+        const data = snap.data();
+        if (data?.token) {
+          return {
+            token: data.token,
+            updatedAt: data.updatedAt,
+          };
         }
       }
       return null;
     };
     return await withTimeout(fetchPromise(), 3000);
   } catch (err) {
-    console.warn('Firestore fetchYouTubePlaylists error:', err);
     return null;
   }
 }

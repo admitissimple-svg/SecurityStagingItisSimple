@@ -216,6 +216,16 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
       const result = await fetchDynamicYouTubePlaylists({ force });
       if (result.playlists && result.playlists.length > 0) {
         setPlaylists(result.playlists);
+        if (force) {
+          setPlaylistFeedback({
+            activityId: selectedActivityId || '',
+            type: 'success',
+            message: isEn
+              ? '✨ YouTube catalog synced successfully!'
+              : '✨ Catálogo do YouTube sincronizado com sucesso!',
+          });
+          setTimeout(() => setPlaylistFeedback(null), 3500);
+        }
       }
       if (result.reauthRequired) {
         setReauthRequired(true);
