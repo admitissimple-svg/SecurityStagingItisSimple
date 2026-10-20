@@ -1399,30 +1399,230 @@ export async function fetchTeacherAvailabilityFromFirestore(uidOrEmail: string):
 
 /**
  * Persists daily routine video selection to users/{uid}/routines/{dayOfWeek}
+ * and mirrors to users/{uid}.routinesByDay with weekly cycle binding
  */
 export async function saveRoutineVideoSubcollection(
   uid: string,
   dayOfWeek: string,
-  data: any
+  data: any,
+  weeklyCycle?: number
 ): Promise<boolean> {
   if (isCloudWriteDisabled) return false;
   const db = getFirestoreDb();
   if (!db || !uid || !dayOfWeek) return false;
   try {
+    const userRef = db.collection('users').doc(uid);
+    let targetCycle = weeklyCycle;
+    if (typeof targetCycle !== 'number' || targetCycle <= 0) {
+      try {
+        const uSnap = await withTimeout(userRef.get(), 2500);
+        if (uSnap && uSnap.exists) {
+          const uData = uSnap.data();
+          if (typeof uData?.weeklyCycle === 'number' && uData.weeklyCycle > 0) {
+            targetCycle = uData.weeklyCycle;
+          }
+        }
+      } catch {}
+    }
+    if (!targetCycle || targetCycle <= 0) targetCycle = 1;
+
+    const cleanVidId = (data.videoId || '').trim();
+    const cleanTitle = (data.title || data.videoTitle || (cleanVidId ? 'Daily Video Practice' : 'Video of the Day')).trim();
+    const cleanUrl = data.url || (cleanVidId ? `https://www.youtube.com/watch?v=${cleanVidId}` : '');
+
     const sanitized = JSON.parse(JSON.stringify({
       ...data,
+      id: data.id || (cleanVidId ? `vid-${cleanVidId}` : `vid-${dayOfWeek}`),
+      videoId: cleanVidId,
+      title: cleanTitle,
+      videoTitle: cleanTitle,
+      url: cleanUrl,
+      playlistId: data.playlistId || '',
+      playlistTitle: data.playlistTitle || '',
       dayOfWeek,
+      activityId: data.activityId || 'act-1',
+      isRepeatVideo: Boolean(data.isRepeatVideo),
+      instructions: data.instructions || '',
+      duration: data.duration || '5-10 min',
+      weeklyCycle: targetCycle,
       updatedAt: data.updatedAt || new Date().toISOString(),
     }));
-    const savePromise = db.collection('users').doc(uid).collection('routines').doc(dayOfWeek).set(sanitized, { merge: true }).then(() => true);
-    const result = await withTimeout(savePromise, 2000);
-    return !!result;
+
+    const savePromise = userRef.collection('routines').doc(dayOfWeek).set(sanitized, { merge: true }).then(() => true);
+    const saveResult = await withTimeout(savePromise, 4500);
+
+    // Also mirror to user doc routinesByDay for instant multi-device hydration
+    await withTimeout(
+      userRef.set(
+        {
+          routinesByDay: {
+            [dayOfWeek]: sanitized,
+          },
+          weeklyCycle: targetCycle,
+          updatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      ),
+      3500
+    );
+
+    return !!saveResult;
   } catch (err: any) {
     if (isPermissionError(err)) {
       isCloudWriteDisabled = true;
       console.info('[serverFirestore] Remote routine video write restricted by IAM, continuing with local state.');
     } else {
       console.warn('Firestore saveRoutineVideoSubcollection error:', err);
+    }
+    return false;
+  }
+}
+
+/**
+ * Retrieves persisted daily routine video selections from users/{uid}/routines/{dayOfWeek}
+ * filtered strictly by the student's active weekly cycle.
+ */
+export async function fetchRoutineVideosFromFirestoreServer(
+  uid: string,
+  weeklyCycle?: number
+): Promise<{
+  routinesByDay: Record<string, any>;
+  weeklyCycle: number;
+  watchedVideosHistory: string[];
+}> {
+  const result: {
+    routinesByDay: Record<string, any>;
+    weeklyCycle: number;
+    watchedVideosHistory: string[];
+  } = {
+    routinesByDay: {},
+    weeklyCycle: weeklyCycle || 1,
+    watchedVideosHistory: [],
+  };
+
+  const db = getFirestoreDb();
+  if (!db || !uid) return result;
+
+  try {
+    const userRef = db.collection('users').doc(uid);
+    const userSnap = await withTimeout(userRef.get(), 4000);
+
+    let activeCycle = weeklyCycle || 1;
+    if (userSnap && userSnap.exists) {
+      const uData = userSnap.data() || {};
+      if (typeof uData.weeklyCycle === 'number' && uData.weeklyCycle > 0) {
+        activeCycle = uData.weeklyCycle;
+      }
+      result.weeklyCycle = activeCycle;
+
+      const history = uData.watchedVideosHistory || uData.watchedVideos || [];
+      const journal = Array.isArray(uData.studentJournal) ? uData.studentJournal : [];
+      const idsFromHistory = Array.isArray(history)
+        ? history.map((item: any) => (typeof item === 'string' ? item : item?.videoId || item?.id || '')).filter(Boolean)
+        : [];
+      const idsFromJournal = journal
+        .filter((entry: any) => entry && entry.type === 'video' && entry.id)
+        .map((entry: any) => (typeof entry.id === 'string' ? entry.id : entry.id?.videoId || ''))
+        .filter(Boolean);
+      result.watchedVideosHistory = Array.from(new Set([...idsFromHistory, ...idsFromJournal]));
+
+      if (uData.routinesByDay && typeof uData.routinesByDay === 'object') {
+        Object.entries(uData.routinesByDay).forEach(([day, item]: [string, any]) => {
+          if (item && typeof item === 'object') {
+            const itemCycle = typeof item.weeklyCycle === 'number' ? item.weeklyCycle : activeCycle;
+            if (itemCycle === activeCycle) {
+              result.routinesByDay[day] = item;
+            }
+          }
+        });
+      }
+    }
+
+    const routinesSnap = await withTimeout(userRef.collection('routines').get(), 4000);
+    if (routinesSnap && !routinesSnap.empty) {
+      routinesSnap.forEach((docSnap: any) => {
+        const data = docSnap.data();
+        if (data) {
+          const day = docSnap.id;
+          const itemCycle = typeof data.weeklyCycle === 'number' ? data.weeklyCycle : activeCycle;
+          if (itemCycle === activeCycle) {
+            result.routinesByDay[day] = {
+              ...data,
+              dayOfWeek: day,
+            };
+          }
+        }
+      });
+    }
+
+    return result;
+  } catch (err: any) {
+    if (!isPermissionError(err)) {
+      console.warn('[serverFirestore] Error in fetchRoutineVideosFromFirestoreServer:', err);
+    }
+    return result;
+  }
+}
+
+/**
+ * Resets daily routines in Firestore for a new weekly cycle:
+ * Clears videoId, title, playlistId, and repeat flags so all days start cleanly on "Choose a Topic".
+ * Preserves past cycle history in weeklyHistory.
+ */
+export async function resetDailyRoutinesForNewWeekInFirestoreServer(
+  uid: string,
+  targetCycle: number,
+  days: string[] = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+): Promise<boolean> {
+  const db = getFirestoreDb();
+  if (!db || !uid) return false;
+
+  try {
+    const userRef = db.collection('users').doc(uid);
+    const routinesCol = userRef.collection('routines');
+
+    const emptyRoutinesByDay: Record<string, any> = {};
+
+    const resetPromises = days.map((day) => {
+      const resetPayload = {
+        videoId: '',
+        title: '',
+        videoTitle: '',
+        url: '',
+        playlistId: '',
+        playlistTitle: '',
+        isRepeatVideo: false,
+        dayOfWeek: day,
+        activityId: 'act-1',
+        instructions: '',
+        duration: '',
+        completed: false,
+        completedToday: false,
+        weeklyCycle: targetCycle,
+        updatedAt: new Date().toISOString(),
+      };
+      emptyRoutinesByDay[day] = resetPayload;
+      return routinesCol.doc(day).set(resetPayload, { merge: true });
+    });
+
+    await withTimeout(Promise.all(resetPromises), 5000);
+
+    await withTimeout(
+      userRef.set(
+        {
+          weeklyCycle: targetCycle,
+          routinesByDay: emptyRoutinesByDay,
+          updatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      ),
+      3500
+    );
+
+    return true;
+  } catch (err: any) {
+    if (!isPermissionError(err)) {
+      console.warn('[serverFirestore] Error in resetDailyRoutinesForNewWeekInFirestoreServer:', err);
     }
     return false;
   }

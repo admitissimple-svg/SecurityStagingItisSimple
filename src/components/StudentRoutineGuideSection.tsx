@@ -744,13 +744,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
           playlistTitle: persistedVideo!.playlistTitle,
           isRepeatVideo: persistedVideo!.isRepeatVideo,
         } as any)
-      : isPersistedClean
-      ? null
-      : ((activeActivity?.teacherVideos && activeActivity.teacherVideos.length > 0 && activeActivity.teacherVideos[0]?.videoId
-          ? activeActivity.teacherVideos[0]
-          : null) ||
-        currentDayActivities.find((act) => act && act.teacherVideos && act.teacherVideos.length > 0 && act.teacherVideos[0]?.videoId)?.teacherVideos?.[0] ||
-        null);
+      : null;
 
   const userChosenTopicForDay =
     selectedTopicByDay[selectedDay] ||
@@ -764,24 +758,11 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     (rawAssignedVideo as any)?.playlistTitle === 'Repeat Previous Video' ||
     (rawAssignedVideo as any)?.playlistTitle === 'Repetir Vídeo Anterior' ||
     (rawAssignedVideo as any)?.isRepeatVideo === true ||
-    activeActivity?.activityName === 'Repeat Previous Video' ||
-    activeActivity?.activityName === 'Repetir Vídeo Anterior' ||
-    (activeActivity as any)?.isRepeatVideo === true ||
     userChosenTopicForDay === 'repeat_previous_video';
 
-  const hasPersistedOrAssignedVideo = Boolean(
-    (userChosenTopicForDay && userChosenTopicForDay !== '') ||
-    hasPersistedVideoId ||
-    (persistedVideo?.isRepeatVideo) ||
-    ((rawAssignedVideo as any)?.isCustomSuggestion) ||
-    ((rawAssignedVideo as any)?.isRepeatVideo) ||
-    ((rawAssignedVideo as any)?.assignedByTeacher)
-  );
+  const hasPersistedOrAssignedVideo = hasPersistedVideoId;
 
-  const isTopicVoluntarilyChosen =
-    Boolean(userChosenTopicForDay) ||
-    isRepeatVideoToday ||
-    hasPersistedOrAssignedVideo;
+  const isTopicVoluntarilyChosen = hasPersistedVideoId || Boolean(userChosenTopicForDay);
 
   const assignedVideo: TeacherAssignedVideo | null = isTopicVoluntarilyChosen ? rawAssignedVideo : null;
 
@@ -1177,7 +1158,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
         }
 
         if (effectiveStudentUid && repeatedWithMeta) {
-          saveVideoForDay(selectedDay, {
+          const saveOk = await saveVideoForDay(selectedDay, {
             videoId: repeatedWithMeta.videoId,
             videoTitle: repeatedWithMeta.title,
             title: repeatedWithMeta.title,
@@ -1188,7 +1169,10 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
             isRepeatVideo: true,
             instructions: repeatedWithMeta.instructions,
             duration: repeatedWithMeta.duration,
-          }).catch((e) => console.warn('Firestore routine repeat save notice:', e));
+          });
+          if (!saveOk) {
+            console.warn('[StudentRoutineGuideSection] Failed to persist repeated video to Firestore');
+          }
         }
 
         setPlaylistFeedback({
@@ -1211,7 +1195,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
           onAssignVideoToActivity(activityId, repeatedWithMeta, selectedDay);
 
           if (effectiveStudentUid) {
-            saveVideoForDay(selectedDay, {
+            const saveOk = await saveVideoForDay(selectedDay, {
               videoId: repeatedWithMeta.videoId,
               videoTitle: repeatedWithMeta.title,
               title: repeatedWithMeta.title,
@@ -1222,7 +1206,10 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
               isRepeatVideo: true,
               instructions: repeatedWithMeta.instructions,
               duration: repeatedWithMeta.duration,
-            }).catch((e) => console.warn('Firestore routine repeat save notice:', e));
+            });
+            if (!saveOk) {
+              console.warn('[StudentRoutineGuideSection] Failed to persist repeated fallback video');
+            }
           }
 
           setPlaylistFeedback({
@@ -1285,7 +1272,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
 
         // Immediately save to Firestore users/{studentUID}/routines/{dayOfWeek}
         if (effectiveStudentUid) {
-          saveVideoForDay(selectedDay, {
+          const saveOk = await saveVideoForDay(selectedDay, {
             videoId: data.video.videoId,
             videoTitle: data.video.title,
             title: data.video.title,
@@ -1296,10 +1283,12 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
             isRepeatVideo: false,
             instructions: data.video.instructions,
             duration: data.video.duration,
-          }).catch((e) => console.warn('Firestore routine save notice:', e));
+          });
 
-          if (data.video.videoId) {
+          if (saveOk && data.video.videoId) {
             markVideoAsWatched(data.video.videoId).catch(() => {});
+          } else if (!saveOk) {
+            console.warn('[StudentRoutineGuideSection] Failed to persist assigned playlist video to Firestore');
           }
         }
 
@@ -1463,7 +1452,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
       }
 
       if (effectiveStudentUid && customVideo) {
-        saveVideoForDay(selectedDay, {
+        const saveOk = await saveVideoForDay(selectedDay, {
           videoId: customVideo.videoId,
           videoTitle: customVideo.title,
           title: customVideo.title,
@@ -1474,10 +1463,12 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
           isRepeatVideo: false,
           instructions: customVideo.instructions,
           duration: customVideo.duration,
-        }).catch((e) => console.warn('Firestore custom suggestion save notice:', e));
+        });
 
-        if (customVideo.videoId) {
+        if (saveOk && customVideo.videoId) {
           markVideoAsWatched(customVideo.videoId).catch(() => {});
+        } else if (!saveOk) {
+          console.warn('[StudentRoutineGuideSection] Failed to persist custom video suggestion to Firestore');
         }
       }
 

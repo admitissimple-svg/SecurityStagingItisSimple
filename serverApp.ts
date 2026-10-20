@@ -75,6 +75,8 @@ import {
   saveTeacherAvailabilityToFirestore,
   fetchTeacherAvailabilityFromFirestore,
   saveRoutineVideoSubcollection,
+  fetchRoutineVideosFromFirestoreServer,
+  resetDailyRoutinesForNewWeekInFirestoreServer,
   resetRepeatFlagsSubcollection,
   addWatchedVideoToUserDoc,
   saveStudentVocabularyToFirestoreServer,
@@ -6724,26 +6726,30 @@ app.post(['/api/student-routines/start-new-week', '/api/student/reset-week'], as
 
   // 5. Cloud Firestore synchronization linked to UID
   if (resolved.uid) {
-    resetRepeatFlagsSubcollection(resolved.uid).catch(() => {});
-    const watched = db.studentWatchedVideos[resolved.uid] || [];
-    watched.forEach((vidId: string) => {
-      addWatchedVideoToUserDoc(resolved.uid, vidId).catch(() => {});
-    });
+    try {
+      await resetDailyRoutinesForNewWeekInFirestoreServer(resolved.uid, nextCycle);
+      const watched = db.studentWatchedVideos[resolved.uid] || [];
+      for (const vidId of watched) {
+        await addWatchedVideoToUserDoc(resolved.uid, vidId);
+      }
 
-    saveStudentAssignmentsByUid(resolved.uid, {
-      uid: resolved.uid,
-      email: resolved.email,
-      level: studentLevel,
-      weeklyCycle: nextCycle,
-      weeklyStudyDaysTarget: weeklyStudyDaysTarget || db.weeklyStudyDaysTargets?.[resolved.uid] || 7,
-      weeklyStudyDays: weeklyStudyDays || db.weeklyStudyDays?.[resolved.uid] || [],
-      videoAssignments: newVideos,
-      spotifyAssignments: newTracks,
-      routines,
-      watchedVideos: db.studentWatchedVideos[resolved.uid] || [],
-      listenedTracks: db.studentListenedTracks[resolved.uid] || [],
-      updatedAt: new Date().toISOString(),
-    }).catch((e) => console.warn('Firestore sync notice for student assignments:', e));
+      await saveStudentAssignmentsByUid(resolved.uid, {
+        uid: resolved.uid,
+        email: resolved.email,
+        level: studentLevel,
+        weeklyCycle: nextCycle,
+        weeklyStudyDaysTarget: weeklyStudyDaysTarget || db.weeklyStudyDaysTargets?.[resolved.uid] || 7,
+        weeklyStudyDays: weeklyStudyDays || db.weeklyStudyDays?.[resolved.uid] || [],
+        videoAssignments: newVideos,
+        spotifyAssignments: newTracks,
+        routines,
+        watchedVideos: db.studentWatchedVideos[resolved.uid] || [],
+        listenedTracks: db.studentListenedTracks[resolved.uid] || [],
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (e) {
+      console.warn('Firestore sync notice for start-new-week:', e);
+    }
   }
   saveAppStateToFirestore(db).catch(() => {});
 
@@ -11625,7 +11631,7 @@ app.get('/api/student-video-assignments', (req, res) => {
   });
 });
 
-app.post('/api/student-video-assignments/assign', (req, res) => {
+app.post('/api/student-video-assignments/assign', async (req, res) => {
   const db = readDb();
   const { studentEmail, studentUid, teacherUid, teacherEmail, playlistId, activityId, day, teacherNotes, videoUrl } = req.body;
   const { email: cleanEmail, uid } = resolveStudentIdentifiers(db, studentEmail, studentUid);
@@ -11965,34 +11971,38 @@ app.post('/api/student-video-assignments/assign', (req, res) => {
   writeDb(db);
 
   if (uid) {
-    saveRoutineVideoSubcollection(uid, targetDay, {
-      videoId: validVidId,
-      videoTitle: assignedVideoObj.title,
-      title: assignedVideoObj.title,
-      url: cleanVideoUrl,
-      playlistId: assignedVideoObj.playlistId,
-      playlistTitle: assignedVideoObj.playlistTitle,
-      dayOfWeek: targetDay,
-      activityId: activityId || 'act-1',
-      isRepeatVideo: playlistId === 'repeat_previous_video',
-      instructions: assignedVideoObj.instructions || '',
-      duration: assignedVideoObj.duration || '5-10 min',
-      updatedAt: new Date().toISOString(),
-    }).catch((e) => console.warn('Firestore routine subcollection notice:', e));
+    try {
+      await saveRoutineVideoSubcollection(uid, targetDay, {
+        videoId: validVidId,
+        videoTitle: assignedVideoObj.title,
+        title: assignedVideoObj.title,
+        url: cleanVideoUrl,
+        playlistId: assignedVideoObj.playlistId,
+        playlistTitle: assignedVideoObj.playlistTitle,
+        dayOfWeek: targetDay,
+        activityId: activityId || 'act-1',
+        isRepeatVideo: playlistId === 'repeat_previous_video',
+        instructions: assignedVideoObj.instructions || '',
+        duration: assignedVideoObj.duration || '5-10 min',
+        updatedAt: new Date().toISOString(),
+      });
 
-    if (validVidId && playlistId !== 'repeat_previous_video') {
-      addWatchedVideoToUserDoc(uid, validVidId).catch(() => {});
+      if (validVidId && playlistId !== 'repeat_previous_video') {
+        await addWatchedVideoToUserDoc(uid, validVidId);
+      }
+
+      await saveStudentAssignmentsByUid(uid, {
+        uid,
+        email: cleanEmail,
+        level: studentLevel,
+        videoAssignments: db.studentVideoAssignments?.[uid] || db.studentVideoAssignments?.[cleanEmail] || [],
+        spotifyAssignments: db.studentSpotifyAssignments?.[uid] || db.studentSpotifyAssignments?.[cleanEmail] || [],
+        routines: studentRoutineObj,
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (fsErr) {
+      console.warn('[serverApp] Firestore saveStudentAssignments notice:', fsErr);
     }
-
-    saveStudentAssignmentsByUid(uid, {
-      uid,
-      email: cleanEmail,
-      level: studentLevel,
-      videoAssignments: db.studentVideoAssignments?.[uid] || db.studentVideoAssignments?.[cleanEmail] || [],
-      spotifyAssignments: db.studentSpotifyAssignments?.[uid] || db.studentSpotifyAssignments?.[cleanEmail] || [],
-      routines: studentRoutineObj,
-      updatedAt: new Date().toISOString(),
-    }).catch((err) => console.warn('Firestore saveStudentAssignmentsByUid (YouTube assign) notice:', err));
   }
 
   // Count remaining unseen videos in this playlist for this student
@@ -12081,36 +12091,154 @@ app.post('/api/student-video-assignments/watch', (req, res) => {
   });
 });
 
-app.post('/api/routines/daily-video', (req, res) => {
+app.get('/api/routines/daily-video', async (req, res) => {
   const db = readDb();
-  const { studentUid, studentEmail, day, dayOfWeek, videoId, title, videoTitle, url, playlistId, playlistTitle, isRepeatVideo } = req.body;
+  let callerUid = '';
+  const authHeader = req.headers.authorization || '';
+  if (authHeader.startsWith('Bearer ')) {
+    const token = authHeader.substring(7).trim();
+    try {
+      const adminAuth = getFirebaseAdminAuth();
+      const decoded = await adminAuth.verifyIdToken(token);
+      if (decoded?.uid) callerUid = decoded.uid;
+    } catch {}
+  }
+
+  const queryUid = ((req.query.studentUid as string) || (req.query.uid as string) || '').trim();
+  const queryEmail = ((req.query.studentEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
+  const targetUid = callerUid || queryUid;
+
+  const resolved = resolveStudentIdentifiers(db, queryEmail, targetUid);
+  const effectiveUid = callerUid || resolved.uid || targetUid;
+
+  if (!effectiveUid && !resolved.email) {
+    return res.status(400).json({ error: 'studentUid or studentEmail is required' });
+  }
+
+  const firestoreData = effectiveUid
+    ? await fetchRoutineVideosFromFirestoreServer(effectiveUid)
+    : { routinesByDay: {}, weeklyCycle: 1, watchedVideosHistory: [] };
+
+  const inMemoryAssignments =
+    (effectiveUid && db.studentVideoAssignments?.[effectiveUid]) ||
+    (resolved.email && db.studentVideoAssignments?.[resolved.email]) ||
+    [];
+
+  const mergedRoutines: Record<string, any> = { ...firestoreData.routinesByDay };
+  if (Array.isArray(inMemoryAssignments) && inMemoryAssignments.length > 0) {
+    inMemoryAssignments.forEach((assign: any) => {
+      const d = assign.day || assign.dayOfWeek;
+      if (d && !mergedRoutines[d] && assign.videoId) {
+        mergedRoutines[d] = {
+          videoId: assign.videoId,
+          title: assign.videoTitle || assign.title || 'Daily Video Practice',
+          videoTitle: assign.videoTitle || assign.title || 'Daily Video Practice',
+          url: assign.url || assign.videoUrl || `https://www.youtube.com/watch?v=${assign.videoId}`,
+          playlistId: assign.playlistId || '',
+          playlistTitle: assign.playlistTitle || '',
+          dayOfWeek: d,
+          isRepeatVideo: Boolean(assign.isRepeatVideo),
+          activityId: assign.activityId || 'act-1',
+          duration: assign.duration || '5-10 min',
+          instructions: assign.instructions || '',
+          updatedAt: assign.assignedAt || new Date().toISOString(),
+        };
+      }
+    });
+  }
+
+  const currentDay = (req.query.day || req.query.dayOfWeek) as string | undefined;
+
+  res.json({
+    success: true,
+    studentUid: effectiveUid,
+    weeklyCycle: firestoreData.weeklyCycle,
+    routinesByDay: mergedRoutines,
+    watchedVideosHistory: firestoreData.watchedVideosHistory,
+    currentDayRoutine: currentDay ? mergedRoutines[currentDay] || null : undefined,
+  });
+});
+
+app.post('/api/routines/daily-video', async (req, res) => {
+  const db = readDb();
+  let callerUid = '';
+  const authHeader = req.headers.authorization || '';
+  if (authHeader.startsWith('Bearer ')) {
+    const token = authHeader.substring(7).trim();
+    try {
+      const adminAuth = getFirebaseAdminAuth();
+      const decoded = await adminAuth.verifyIdToken(token);
+      if (decoded?.uid) callerUid = decoded.uid;
+    } catch {}
+  }
+
+  const {
+    studentUid,
+    studentEmail,
+    day,
+    dayOfWeek,
+    videoId,
+    title,
+    videoTitle,
+    url,
+    playlistId,
+    playlistTitle,
+    isRepeatVideo,
+    activityId,
+    instructions,
+    duration,
+  } = req.body;
+
   const targetDay = dayOfWeek || day;
-  if ((!studentUid && !studentEmail) || !targetDay) {
+  if ((!studentUid && !studentEmail && !callerUid) || !targetDay) {
     return res.status(400).json({ error: 'studentUid/studentEmail and day are required' });
   }
 
-  const { email, uid } = resolveStudentIdentifiers(db, studentEmail, studentUid);
-  const targetKeys = Array.from(new Set([email, uid, studentUid, studentEmail].filter(Boolean) as string[]));
+  const resolved = resolveStudentIdentifiers(db, studentEmail, callerUid || studentUid);
+  const effectiveUid = callerUid || resolved.uid || studentUid;
+  const targetKeys = Array.from(new Set([resolved.email, effectiveUid, studentUid, studentEmail].filter(Boolean) as string[]));
 
   const cleanVidId = extractServerYouTubeId(videoId || url);
-  const cleanTitle = title || videoTitle || 'Daily Video Practice';
+  const cleanTitle = title || videoTitle || (cleanVidId ? 'Daily Video Practice' : 'Video of the Day');
   const cleanUrl = url || (cleanVidId ? `https://www.youtube.com/watch?v=${cleanVidId}` : '');
 
+  const currentCycle =
+    (effectiveUid && db.userProfiles?.[effectiveUid]?.weeklyCycle) ||
+    (resolved.email && db.userProfiles?.[resolved.email]?.weeklyCycle) ||
+    1;
+
   const videoObj = {
-    id: cleanVidId || videoId,
-    videoId: cleanVidId || videoId,
+    id: cleanVidId || videoId || `vid-${targetDay}-${Date.now()}`,
+    videoId: cleanVidId || videoId || '',
     title: cleanTitle,
     videoTitle: cleanTitle,
     url: cleanUrl,
     playlistId: playlistId || '',
     playlistTitle: playlistTitle || '',
     dayOfWeek: targetDay,
+    activityId: activityId || 'act-1',
     isRepeatVideo: Boolean(isRepeatVideo),
+    instructions: instructions || '',
+    duration: duration || '5-10 min',
+    weeklyCycle: currentCycle,
     updatedAt: new Date().toISOString(),
   };
 
+  // 1. Persist to Firestore default database via Firebase Admin SDK and confirm
+  let firestoreSaved = false;
+  if (effectiveUid) {
+    try {
+      firestoreSaved = await saveRoutineVideoSubcollection(effectiveUid, targetDay, videoObj, currentCycle);
+      if (cleanVidId && !isRepeatVideo) {
+        await addWatchedVideoToUserDoc(effectiveUid, cleanVidId, cleanTitle);
+      }
+    } catch (fsErr) {
+      console.warn('[serverApp] Error saving routine video to Firestore:', fsErr);
+    }
+  }
+
+  // 2. Update local in-memory DB
   targetKeys.forEach((k) => {
-    // 1. Update studentVideoAssignments
     if (!db.studentVideoAssignments) db.studentVideoAssignments = {};
     if (!Array.isArray(db.studentVideoAssignments[k])) db.studentVideoAssignments[k] = [];
     const existingIdx = db.studentVideoAssignments[k].findIndex((v: any) => (v.day || v.dayOfWeek) === targetDay);
@@ -12120,12 +12248,10 @@ app.post('/api/routines/daily-video', (req, res) => {
       db.studentVideoAssignments[k].push({ ...videoObj, day: targetDay });
     }
 
-    // 2. Clear awaiting topic selection
     if (db.studentAwaitingTopicSelection) {
       db.studentAwaitingTopicSelection[k] = false;
     }
 
-    // 3. Update studentRoutinesMap
     if (!db.studentRoutinesMap) db.studentRoutinesMap = {};
     if (!db.studentRoutinesMap[k]) {
       db.studentRoutinesMap[k] = JSON.parse(JSON.stringify(db.routinesByDay || defaultRoutinesByDay));
@@ -12148,14 +12274,13 @@ app.post('/api/routines/daily-video', (req, res) => {
 
   writeDb(db);
 
-  if (cleanVidId && uid) {
-    saveRoutineVideoSubcollection(uid, targetDay, videoObj).catch(() => {});
-    if (!isRepeatVideo) {
-      addWatchedVideoToUserDoc(uid, cleanVidId).catch(() => {});
-    }
-  }
-
-  res.json({ success: true });
+  res.json({
+    success: true,
+    savedRoutine: videoObj,
+    firestoreConfirmed: firestoreSaved,
+    studentUid: effectiveUid,
+    day: targetDay,
+  });
 });
 
 app.post('/api/routines/update-time', (req, res) => {
