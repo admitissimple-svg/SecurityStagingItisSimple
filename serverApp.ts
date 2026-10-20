@@ -9104,10 +9104,9 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
               const isNewWord = markings.newWords.some((w) => w.toLowerCase().trim() === termKey);
               
               const rawExamples = Array.isArray(v.realExamples) ? v.realExamples : [];
-              const formattedExamples = rawExamples.map((ex: any) => {
-                const str = String(ex || '').trim();
-                return str.startsWith('Didactic Example:') ? str : `Didactic Example: "${str.replace(/^["']|["']$/g, '')}"`;
-              }).filter(Boolean);
+              const formattedExamples = rawExamples
+                .map((ex: any) => String(ex || '').trim().replace(/^["']|["']$/g, ''))
+                .filter(Boolean);
 
               validatedVocab.push({
                 ...v,
@@ -9115,8 +9114,8 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
                 partOfSpeech: v.partOfSpeech || (isPronounce ? 'Pronunciation Focus' : 'Expression'),
                 realExamples: formattedExamples.length > 0 ? formattedExamples : (
                   isPronounce
-                    ? [`Didactic Example: "Pay careful attention to the syllable stress on '${v.term}'."`]
-                    : [`Didactic Example: "Native speakers use '${v.term}' in spontaneous conversation."`]
+                    ? [`Pay careful attention to the syllable stress on '${v.term}'.`]
+                    : [`Native speakers use '${v.term}' in spontaneous conversation.`]
                 ),
                 category: isNewWord && isPronounce
                   ? 'New Word & Pronunciation (Alt+W + Alt+P)'
@@ -9161,7 +9160,7 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
                   ? dbMatch.collocations
                   : [`in the context of "${originalTerm}"`, `spoken usage of "${originalTerm}"`],
                 realExamples: (dbMatch.realExamples || [dbMatch.exampleSentenceEn]).map((ex: string) =>
-                  ex.startsWith('Didactic Example:') ? ex : `Didactic Example: "${ex.replace(/^["']|["']$/g, '')}"`
+                  String(ex || '').trim().replace(/^["']|["']$/g, '')
                 ),
                 synonyms: (dbMatch.synonyms && dbMatch.synonyms.length > 0) ? dbMatch.synonyms : ['target expression'],
                 register: dbMatch.register || 'neutral',
@@ -9200,12 +9199,12 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
                   : [`common usage of "${originalTerm}"`, `conversational context with "${originalTerm}"`],
                 realExamples: isPronounce
                   ? [
-                      `Didactic Example: "In connected speech, place clear syllable stress on '${originalTerm}' without vowel lengthening."`,
-                      `Didactic Example: "Listen closely to reproduce the natural rhythm and intonation of '${originalTerm}'."`,
+                      `In connected speech, place clear syllable stress on '${originalTerm}' without vowel lengthening.`,
+                      `Listen closely to reproduce the natural rhythm and intonation of '${originalTerm}'.`,
                     ]
                   : [
-                      `Didactic Example: "Native speakers employ '${originalTerm}' in relevant conversational contexts."`,
-                      `Didactic Example: "Reviewing '${originalTerm}' in context helps incorporate it into active speaking."`,
+                      `Native speakers employ '${originalTerm}' in relevant conversational contexts.`,
+                      `Reviewing '${originalTerm}' in context helps incorporate it into active speaking.`,
                     ],
                 synonyms: isPronounce ? ['phonetic focus', 'pronunciation target'] : ['conversational expression', 'target vocabulary'],
                 register: 'neutral',
@@ -9235,10 +9234,7 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
               form: String(g.form || '').trim(),
               usage: String(g.usage || '').trim(),
               examples: Array.isArray(g.examples)
-                ? g.examples.map((ex: any) => {
-                    const str = String(ex || '').trim();
-                    return str.startsWith('Didactic Example:') ? str : `Didactic Example: "${str.replace(/^["']|["']$/g, '')}"`;
-                  })
+                ? g.examples.map((ex: any) => String(ex || '').trim().replace(/^["']|["']$/g, '')).filter(Boolean)
                 : [],
               commonMistakes: String(g.commonMistakes || '').trim(),
               comparisons: String(g.comparisons || '').trim(),

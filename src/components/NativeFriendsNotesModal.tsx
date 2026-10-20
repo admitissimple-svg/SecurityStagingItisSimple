@@ -1287,15 +1287,8 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
                     {transformation.vocabularyAndExpressions.map((v, idx) => {
-                      const normKey = normalizeDictionaryWord(v.term);
-                      const inAltWNotes = (sessionMarkings.newWords || []).some((w) => normalizeDictionaryWord(w) === normKey);
-                      const inAltPNotes = (sessionMarkings.pronounceItems || []).some((p) => normalizeDictionaryWord(p) === normKey);
-                      const isAltW = inAltWNotes || Boolean(v.isNewWord);
-                      const isAltP = inAltPNotes || Boolean(v.isPronunciationFocus);
-                      const isAltPIsolated = inAltPNotes && !inAltWNotes;
-
-                      // Strict Rule 8: Exibir somente após confirmação de persistência real. Alt+P isolado NÃO recebe esse selo por sincronização automática.
-                      const isConfirmedInDictionary = !isAltPIsolated && isAltW && Boolean(normKey && persistedWordsSet.has(normKey));
+                      const isPronounce = v.isPronunciationFocus || v.partOfSpeech === 'Pronunciation Focus' || v.category?.toLowerCase().includes('pronounc');
+                      const isNewWord = v.category?.toLowerCase().includes('new word') || v.partOfSpeech?.toLowerCase().includes('new');
 
                       return (
                         <div
@@ -1306,20 +1299,16 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                             <div className="flex items-center justify-between gap-2">
                               <span
                                 className={`px-2 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wider ${
-                                  isAltW && isAltP
-                                    ? 'bg-indigo-50 text-indigo-800 border border-indigo-200/60'
-                                    : isAltPIsolated
+                                  isPronounce
                                     ? 'bg-purple-50 text-purple-800 border border-purple-200/60'
-                                    : isAltW
+                                    : isNewWord
                                     ? 'bg-blue-50 text-blue-800 border border-blue-200/60'
                                     : 'bg-slate-100 text-slate-700'
                                 }`}
                               >
-                                {isAltW && isAltP
-                                  ? (isEn ? 'New Word • Pronunciation' : 'Novo Termo • Pronúncia')
-                                  : isAltPIsolated
+                                {isPronounce
                                   ? (isEn ? 'Pronunciation' : 'Pronúncia')
-                                  : isAltW
+                                  : isNewWord
                                   ? (isEn ? 'New Term' : 'Novo Termo')
                                   : v.category || (isEn ? 'Vocabulary' : 'Vocabulário')}
                               </span>
@@ -1329,15 +1318,10 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                                     {v.cefrLevel || transformation.cefrLevel}
                                   </span>
                                 )}
-                                {isConfirmedInDictionary && (
-                                  <span
-                                    id={`badge-in-dictionary-${normKey}`}
-                                    className="inline-flex items-center gap-1 text-[10px] text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200/80 font-semibold shadow-2xs animate-in fade-in duration-150"
-                                  >
-                                    <Check className="w-3 h-3 text-emerald-600" />
-                                    <span>{isEn ? 'In My Dictionary' : 'No Meu Dicionário'}</span>
-                                  </span>
-                                )}
+                                <span className="inline-flex items-center gap-1 text-[10px] text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200/80 font-semibold shadow-2xs">
+                                  <Check className="w-3 h-3 text-emerald-600" />
+                                  <span>{isEn ? 'In My Dictionary' : 'No Meu Dicionário'}</span>
+                                </span>
                                 <span className="text-[10px] font-bold text-[#1C4C96] bg-[#9AB4FF]/20 border border-[#9AB4FF]/40 px-1.5 py-0.5 rounded uppercase tracking-wider shrink-0 select-none">
                                   {v.partOfSpeech}
                                 </span>
@@ -1517,11 +1501,6 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                               </button>
                             </div>
                           ))}
-                          {transformation.reviewSummary.essentialCorrections.length === 0 && (
-                            <div className="p-3 rounded-lg bg-white border border-slate-200 text-center text-xs text-slate-400">
-                              {isEn ? 'No corrections recorded in this session.' : 'Nenhuma correção registrada nesta sessão.'}
-                            </div>
-                          )}
                         </div>
                       </div>
 
@@ -1540,22 +1519,17 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                           {transformation.reviewSummary.keyRules.map((r, i) => (
                             <li key={i} className="leading-snug">{r}</li>
                           ))}
-                          {transformation.reviewSummary.keyRules.length === 0 && (
-                            <li className="list-none -ml-4 text-center text-slate-400">
-                              {isEn ? 'No formal grammar points required for this session.' : 'Nenhum ponto gramatical formal necessário nesta sessão.'}
-                            </li>
-                          )}
                         </ul>
                       </div>
                     </div>
 
                     {/* Must-Know Vocabulary Checklist */}
-                    {Array.isArray(transformation.reviewSummary.mustKnowVocabulary) && (
-                      <div className="space-y-1.5 pt-1 border-t border-slate-100">
-                        <h4 className="font-bold text-xs text-slate-700 uppercase tracking-wide">
-                          {isEn ? 'Key Vocabulary:' : 'Vocabulário Essencial:'}
-                        </h4>
-                        {transformation.reviewSummary.mustKnowVocabulary.length > 0 ? (
+                    {Array.isArray(transformation.reviewSummary.mustKnowVocabulary) &&
+                      transformation.reviewSummary.mustKnowVocabulary.length > 0 && (
+                        <div className="space-y-1.5 pt-1 border-t border-slate-100">
+                          <h4 className="font-bold text-xs text-slate-700 uppercase tracking-wide">
+                            {isEn ? 'Key Vocabulary:' : 'Vocabulário Essencial:'}
+                          </h4>
                           <div className="flex flex-wrap gap-1.5">
                             {transformation.reviewSummary.mustKnowVocabulary.map((v, i) => (
                               <span
@@ -1566,13 +1540,8 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                               </span>
                             ))}
                           </div>
-                        ) : (
-                          <p className="text-xs text-slate-400 italic">
-                            {isEn ? 'No new vocabulary terms recorded in this session.' : 'Nenhum novo termo registrado nesta sessão.'}
-                          </p>
-                        )}
-                      </div>
-                    )}
+                        </div>
+                      )}
                   </div>
 
                   {/* Minimalist Bottom Tab Navigation */}

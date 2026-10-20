@@ -1590,8 +1590,9 @@ export default function App() {
     }
 
     // Fetch user-isolated student dictionary entries and journal entries directly from Firestore
-    const dictEmail = (role === 'student' ? email : (selectedStudentFilter !== 'all' ? selectedStudentFilter : '')) || userProfile?.email || '';
-    if (dictEmail || (role === 'student' && uid)) {
+    // Strictly isolate: teachers and non-students must NEVER query the student's private dictionary endpoint
+    if (role === 'student' && (email || uid)) {
+      const dictEmail = email || userProfile?.email || '';
       const canonicalStudentUid = normalizeUid(uid, dictEmail);
       // 1. Direct Firestore fetch for vocabulary (cumulative)
       fetchStudentVocabularyFromFirestore(canonicalStudentUid, dictEmail).then((fsEntries) => {
@@ -2022,9 +2023,9 @@ export default function App() {
     };
   }, [selectedDay, selectedActivityId, currentAccount?.role, currentAccount?.uid, currentAccount?.email]);
 
-  // Refresh student dictionary whenever the modal is opened
+  // Refresh student dictionary whenever the modal is opened (students only)
   useEffect(() => {
-    if (!isPersonalDictionaryOpen) return;
+    if (!isPersonalDictionaryOpen || currentAccount?.role !== 'student') return;
     const isStudentUser = currentAccount?.role === 'student';
     const targetStudentFromFilter = !isStudentUser && selectedStudentFilter && selectedStudentFilter !== 'all'
       ? studentsList.find((s) =>
@@ -4487,10 +4488,11 @@ export default function App() {
     if (!entries || entries.length === 0) return { success: false, error: 'No entries to add' };
 
     const isTeacherCaller = currentAccount?.role === 'teacher' || currentAccount?.role === 'admin';
-
-    // Strict identity resolution:
-    // If teacher is caller, target student MUST come from explicitly supplied studentEmail / studentUid,
-    // NEVER from currentAccount (which is the teacher's identity!)
+    if (isTeacherCaller) {
+      // HOTFIX 4B.21: The teacher does not read or write directly to the student's private My Dictionary endpoint.
+      // Notes already migrate to Native Friends Notes.
+      return { success: true, count: entries.length };
+    }
     let targetEmail = (
       studentEmail ||
       (!isTeacherCaller ? currentAccount?.email : '') ||

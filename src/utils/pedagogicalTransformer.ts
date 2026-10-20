@@ -558,12 +558,31 @@ export function generateLocalPedagogicalTransformation(params: {
     });
   }
 
-  // 3. Build Section 3: Teach Vocabulary and Expressions
+  // 3. Build Section 3: Teach Vocabulary and Expressions (Mapped from Alt+W and Alt+P + bullets)
   const vocabularyAndExpressions: PedagogicalVocabularyItem[] = [];
+
+  // Combine Alt+W (New Word), Alt+P (Pronounce), and general vocab markings
   const candidateVocab = [...markings.newWords, ...markings.pronounceItems, ...markings.vocabItems];
   if (candidateVocab.length === 0) {
     candidateVocab.push('catch up', 'workload', 'streamline', 'make sense', 'get the hang of');
   }
+
+  const VOCAB_DATABASE: Record<string, Omit<PedagogicalVocabularyItem, 'id' | 'term'>> = {
+    ...Object.fromEntries(
+      Object.entries(NATIVE_FRIENDS_DICTIONARY_DATABASE).map(([key, item]) => [
+        key,
+        {
+          partOfSpeech: item.partOfSpeech,
+          simpleDefinition: item.definitionEn,
+          collocations: item.collocations || [`use "${item.word}" naturally`],
+          realExamples: item.realExamples || [item.exampleSentenceEn],
+          synonyms: item.synonyms || ['target phrase'],
+          register: item.register || ('neutral' as const),
+          category: item.category || 'Core Session Vocabulary',
+        },
+      ])
+    ),
+  };
 
   const seenVocabTerms = new Set<string>();
 
@@ -584,74 +603,32 @@ export function generateLocalPedagogicalTransformation(params: {
     const normalizedKey = cleanWord.replace(/[_\-]+/g, ' ');
     const dbMatch = NATIVE_FRIENDS_DICTIONARY_DATABASE[cleanWord] || NATIVE_FRIENDS_DICTIONARY_DATABASE[normalizedKey];
 
-    const isPt = cleanLang === 'pt';
-    const entry = dbMatch
-      ? {
-          partOfSpeech: isPronounce ? 'Pronunciation Focus' : dbMatch.partOfSpeech,
-          definitionEn: isPronounce
-            ? `Pronunciation focus: Pay careful attention to syllable stress and sound articulation on "${rawTrimmed}".`
-            : dbMatch.definitionEn,
-          simpleDefinition: isPronounce
-            ? (isPt
-                ? `Foco em pronúncia: Preste atenção à tonicidade da sílaba e articulação de "${rawTrimmed}".`
-                : `Pronunciation focus: Pay careful attention to syllable stress on "${rawTrimmed}".`)
-            : (isPt
-                ? (dbMatch.explanationPt || `Expressão comunicativa (${cefrMeta.cefr}): utilizada em conversação autêntica para expressar "${rawTrimmed}"${dbMatch.translationPt ? ` (${dbMatch.translationPt})` : ''} com clareza e naturalidade.`)
-                : dbMatch.definitionEn),
-          collocations: (dbMatch.collocations && dbMatch.collocations.length > 0)
-            ? dbMatch.collocations
-            : [`in the context of "${rawTrimmed}"`, `spoken usage of "${rawTrimmed}"`],
-          realExamples: (dbMatch.realExamples || [dbMatch.exampleSentenceEn]).map((ex: string) =>
-            ex.startsWith('Didactic Example:') ? ex : `Didactic Example: "${ex.replace(/^["']|["']$/g, '')}"`
-          ),
-          synonyms: (dbMatch.synonyms && dbMatch.synonyms.length > 0) ? dbMatch.synonyms : ['target expression'],
-          register: dbMatch.register || ('neutral' as const),
-          category: isNewWord && isPronounce
-            ? 'New Word & Pronunciation (Alt+W + Alt+P)'
-            : isPronounce
-            ? 'Pronunciation & Phonetics (Alt+P)'
-            : isNewWord
-            ? 'New Words & Expressions (Alt+W)'
-            : 'Core Session Vocabulary',
-        }
-      : {
-          partOfSpeech: isPronounce
-            ? 'Pronunciation Focus'
-            : cleanWord.includes(' ')
-            ? 'Idiomatic Expression'
-            : 'Conversational Vocabulary',
-          definitionEn: isPronounce
-            ? `Target pronunciation focus: Practice clean sound articulation, syllable stress, and connected speech rhythm for "${rawTrimmed}".`
-            : `A natural conversational expression used by native speakers to articulate "${rawTrimmed}" in context.`,
-          simpleDefinition: isPronounce
-            ? (isPt
-                ? `Foco em pronúncia: Preste atenção à tonicidade correta e evite acrescentar vogais de apoio ao pronunciar "${rawTrimmed}".`
-                : `Pronunciation focus: Pay attention to syllable stress and vowel reduction when pronouncing "${rawTrimmed}".`)
-            : (isPt
-                ? `Termo comunicativo (${cefrMeta.cefr}): utilizado em inglês autêntico para expressar a ideia de "${rawTrimmed}".`
-                : `Communicative term (${cefrMeta.cefr}): used in authentic English to convey "${rawTrimmed}".`),
-          collocations: isPronounce
-            ? [`pronounce "${rawTrimmed}" clearly`, `syllable stress on "${rawTrimmed}"`]
-            : [`common usage of "${rawTrimmed}"`, `conversational context with "${rawTrimmed}"`],
-          realExamples: isPronounce
-            ? [
-                `Didactic Example: "In connected speech, place clear syllable stress on '${rawTrimmed}' without vowel lengthening."`,
-                `Didactic Example: "Listen closely to reproduce the natural rhythm and intonation of '${rawTrimmed}'."`,
-              ]
-            : [
-                `Didactic Example: "Native speakers employ '${rawTrimmed}' in relevant conversational contexts."`,
-                `Didactic Example: "Reviewing '${rawTrimmed}' in context helps incorporate it into active speaking."`,
-              ],
-          synonyms: isPronounce ? ['phonetic focus', 'pronunciation target'] : ['conversational expression', 'target vocabulary'],
-          register: 'neutral' as const,
-          category: isNewWord && isPronounce
-            ? 'New Word & Pronunciation (Alt+W + Alt+P)'
-            : isPronounce
-            ? 'Pronunciation & Phonetics (Alt+P)'
-            : isNewWord
-            ? 'New Words & Expressions (Alt+W)'
-            : 'Core Session Vocabulary',
-        };
+    const entry = VOCAB_DATABASE[cleanWord] || (dbMatch ? {
+      partOfSpeech: dbMatch.partOfSpeech,
+      simpleDefinition: dbMatch.definitionEn,
+      collocations: dbMatch.collocations || [`use "${rawTrimmed}" naturally`],
+      realExamples: dbMatch.realExamples || [dbMatch.exampleSentenceEn],
+      synonyms: dbMatch.synonyms || ['target phrase'],
+      register: dbMatch.register || ('neutral' as const),
+      category: isPronounce ? 'Pronunciation & Phonetics (Alt+P)' : isNewWord ? 'New Words & Expressions (Alt+W)' : 'Core Session Vocabulary',
+    } : {
+      partOfSpeech: isPronounce
+        ? 'Pronunciation Focus'
+        : cleanWord.includes(' ')
+        ? 'Idiomatic Expression'
+        : 'Vocabulary Item',
+      simpleDefinition: isPronounce
+        ? `Pronunciation focus: Pay careful attention to the syllable stress, vowel reduction, and clear consonant articulation of "${rawTrimmed}".`
+        : `Key communicative expression (${cefrMeta.cefr}): used in conversation to communicate "${rawTrimmed}" clearly and naturally.`,
+      collocations: [`use "${rawTrimmed}" naturally`, `frequently heard with "${rawTrimmed}"`],
+      realExamples: [
+        `In daily speaking: "I practiced using '${rawTrimmed}' naturally in our conversation today."`,
+        `Practice sentence: "Understanding how native speakers say '${rawTrimmed}' makes your speech flow smoothly."`,
+      ],
+      synonyms: ['natural expression', 'target phrase'],
+      register: 'neutral' as const,
+      category: isPronounce ? 'Pronunciation & Phonetics (Alt+P)' : isNewWord ? 'New Words & Expressions (Alt+W)' : 'Core Session Vocabulary',
+    });
 
     vocabularyAndExpressions.push({
       id: `vocab-${vocabularyAndExpressions.length + 1}`,
