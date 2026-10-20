@@ -6382,6 +6382,7 @@ export default function App() {
                             weekId={`week-${stWeeklyCycle}`}
                             weeklyCycle={stWeeklyCycle}
                             activeStudyDays={stActiveDays}
+                            lessons={studentLessons}
                           />
                         </div>
                       )}

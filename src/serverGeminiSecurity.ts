@@ -45,7 +45,8 @@ export type GeminiFeature =
   | 'check_writing'
   | 'homework_evaluate'
   | 'dictionary_define'
-  | 'vocab_generate';
+  | 'vocab_generate'
+  | 'lesson_insights';
 
 export interface FeaturePolicy {
   maxOutputTokens: number;
@@ -111,6 +112,13 @@ export const GEMINI_POLICIES: Record<GeminiFeature, FeaturePolicy> = {
     rateLimitMaxRequests: 10,
     maxInputLengthChars: 3000,
     timeoutMs: 8000,
+  },
+  lesson_insights: {
+    maxOutputTokens: 250,
+    rateLimitWindowSeconds: 60,
+    rateLimitMaxRequests: 12,
+    maxInputLengthChars: 3000,
+    timeoutMs: 12000,
   },
 };
 

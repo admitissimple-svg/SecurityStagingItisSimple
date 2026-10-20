@@ -22,6 +22,7 @@ import {
   subscribeToStudentJournal,
   fetchStudentJournalActivitiesFromFirestore,
 } from '../utils/studentPersistence';
+import { apiClient } from '../utils/apiClient';
 
 interface NativeFriendLessonInsightsProps {
   studentUid: string;
@@ -34,6 +35,8 @@ interface NativeFriendLessonInsightsProps {
   weeklyCycle?: number;
   currentDayOfWeek?: DayOfWeek;
   activeStudyDays?: DayOfWeek[];
+  lessons?: any[];
+  activeLessonId?: string;
 }
 
 export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProps> = ({
@@ -45,10 +48,127 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
   teacherName,
   weekId = 'week-1',
   weeklyCycle = 1,
+  lessons = [],
+  activeLessonId,
 }) => {
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [copiedAll, setCopiedAll] = useState<boolean>(false);
   const [questionVariant, setQuestionVariant] = useState<number>(0);
+
+  // Lesson selection state for multiple scheduled sessions
+  const studentLessons = useMemo(() => {
+    return (lessons || []).filter((l: any) => l && l.status !== 'cancelled' && l.status !== 'canceled');
+  }, [lessons]);
+
+  const [selectedLessonId, setSelectedLessonId] = useState<string>(() => {
+    if (activeLessonId) return activeLessonId;
+    if (studentLessons.length > 0) {
+      const now = new Date().toISOString();
+      const upcoming = studentLessons.find((l: any) => l.startDateTime && l.startDateTime >= now);
+      return upcoming?.id || studentLessons[0]?.id || '';
+    }
+    return '';
+  });
+
+  const effectiveLessonId = selectedLessonId || `lesson_${studentUid}_week${weeklyCycle}`;
+
+  // Pedagogical Weekly Learning Snapshot state (strictly <= 90 words, English)
+  const [snapshot, setSnapshot] = useState<any | null>(null);
+  const [isLoadingSnapshot, setIsLoadingSnapshot] = useState<boolean>(false);
+  const [snapshotError, setSnapshotError] = useState<string | null>(null);
+  const [isReusedSnapshot, setIsReusedSnapshot] = useState<boolean>(false);
+  const [copiedSnapshot, setCopiedSnapshot] = useState<boolean>(false);
+
+  // Load or generate snapshot upon selecting student/lesson
+  useEffect(() => {
+    if (!effectiveLessonId || !studentUid) return;
+    let isCancelled = false;
+
+    async function loadSnapshot() {
+      setIsLoadingSnapshot(true);
+      setSnapshotError(null);
+      try {
+        // 1. Try to fetch cached snapshot first (Zero AI calls)
+        const getRes = await apiClient.get('/api/lesson-insights', {
+          params: { lessonId: effectiveLessonId, studentUid },
+        });
+
+        if (isCancelled) return;
+
+        if (getRes?.exists && getRes.snapshot) {
+          setSnapshot(getRes.snapshot);
+          setIsReusedSnapshot(true);
+          setIsLoadingSnapshot(false);
+          return;
+        }
+
+        // 2. If not cached, generate on-demand for this specific lesson
+        const postRes = await apiClient.post('/api/lesson-insights/generate', {
+          body: {
+            lessonId: effectiveLessonId,
+            studentUid,
+            studentEmail,
+          },
+        });
+
+        if (isCancelled) return;
+
+        if (postRes?.success && postRes.snapshot) {
+          setSnapshot(postRes.snapshot);
+          setIsReusedSnapshot(Boolean(postRes.reused));
+        } else if (postRes?.message) {
+          setSnapshotError(postRes.message);
+        }
+      } catch (err: any) {
+        if (!isCancelled) {
+          console.warn('Lesson insights fetch notice:', err);
+          setSnapshotError('Unable to generate learning snapshot at this moment. Please try again later.');
+        }
+      } finally {
+        if (!isCancelled) {
+          setIsLoadingSnapshot(false);
+        }
+      }
+    }
+
+    loadSnapshot();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [effectiveLessonId, studentUid, studentEmail]);
+
+  const handleRegenerateSnapshot = async () => {
+    if (!effectiveLessonId || !studentUid || isLoadingSnapshot) return;
+    setIsLoadingSnapshot(true);
+    setSnapshotError(null);
+    try {
+      const res = await apiClient.post('/api/lesson-insights/generate', {
+        body: {
+          lessonId: effectiveLessonId,
+          studentUid,
+          studentEmail,
+        },
+      });
+      if (res?.success && res.snapshot) {
+        setSnapshot(res.snapshot);
+        setIsReusedSnapshot(Boolean(res.reused));
+      } else if (res?.message) {
+        setSnapshotError(res.message);
+      }
+    } catch {
+      setSnapshotError('Unable to generate learning snapshot at this moment. Please try again later.');
+    } finally {
+      setIsLoadingSnapshot(false);
+    }
+  };
+
+  const handleCopySnapshot = () => {
+    if (!snapshot?.summary) return;
+    navigator.clipboard.writeText(snapshot.summary);
+    setCopiedSnapshot(true);
+    setTimeout(() => setCopiedSnapshot(false), 2500);
+  };
 
   // Hook for strict UID-isolated weekly history
   const {
@@ -360,6 +480,182 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
       </div>
 
       <div className="p-5 sm:p-6 space-y-6">
+        {/* ===================================================================== */}
+        {/* HOTFIX PONTUAL — Weekly Learning Snapshot (Always in English, <=90 words) */}
+        {/* ===================================================================== */}
+        <div className="bg-gradient-to-br from-indigo-900 via-[#0A0F24] to-slate-900 border-2 border-indigo-500/40 rounded-2xl p-5 sm:p-6 text-white shadow-md relative overflow-hidden">
+          {/* Background subtle decoration */}
+          <div className="absolute top-0 right-0 -mr-16 -mt-16 w-64 h-64 bg-indigo-500/10 rounded-full blur-3xl pointer-events-none" />
+
+          {/* Snapshot Header */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-indigo-400/20">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-amber-400/20 text-amber-300 border border-amber-400/30">
+                  <Sparkles className="w-3.5 h-3.5 text-amber-300" />
+                  Weekly Learning Snapshot
+                </span>
+                <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-white/10 text-slate-300">
+                  Always English • Max 90 words
+                </span>
+                {isReusedSnapshot && (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                    <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                    Saved Snapshot (0 AI tokens)
+                  </span>
+                )}
+                {snapshot?.wordCount && (
+                  <span className="text-[10px] font-medium text-slate-400">
+                    {snapshot.wordCount} words
+                  </span>
+                )}
+              </div>
+              <h3 className="text-base sm:text-lg font-black tracking-tight text-white">
+                Live Session Overview & Icebreakers for {displayName}
+              </h3>
+            </div>
+
+            {/* Lesson selector (if student has multiple lessons) + Actions */}
+            <div className="flex items-center gap-2 flex-wrap self-start sm:self-center">
+              {studentLessons.length > 1 && (
+                <select
+                  value={selectedLessonId}
+                  onChange={(e) => setSelectedLessonId(e.target.value)}
+                  className="bg-white/10 border border-white/20 text-white text-xs font-semibold rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-2 focus:ring-indigo-400"
+                  title="Select which lesson session to view"
+                >
+                  {studentLessons.map((l: any, idx: number) => {
+                    const lDate = l.date || (l.startDateTime ? l.startDateTime.split('T')[0] : `Lesson ${idx + 1}`);
+                    const lTime = l.time || (l.startDateTime ? l.startDateTime.split('T')[1]?.slice(0, 5) : '');
+                    return (
+                      <option key={l.id || idx} value={l.id} className="bg-slate-900 text-white">
+                        {lDate} {lTime ? `(${lTime})` : ''} — {l.title || 'Lesson'}
+                      </option>
+                    );
+                  })}
+                </select>
+              )}
+
+              {snapshot?.summary && (
+                <button
+                  type="button"
+                  onClick={handleCopySnapshot}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold bg-white/10 hover:bg-white/20 text-white border border-white/15 transition cursor-pointer"
+                  title="Copy snapshot to clipboard"
+                >
+                  {copiedSnapshot ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      <span className="text-emerald-300">Copied!</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Copy Snapshot</span>
+                    </>
+                  )}
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={handleRegenerateSnapshot}
+                disabled={isLoadingSnapshot}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-400/30 transition cursor-pointer disabled:opacity-50"
+                title="Refresh or regenerate snapshot"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isLoadingSnapshot ? 'animate-spin' : ''}`} />
+                <span>{isLoadingSnapshot ? 'Generating...' : 'Refresh'}</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Snapshot Content */}
+          <div className="pt-4">
+            {isLoadingSnapshot ? (
+              <div className="py-6 flex flex-col items-center justify-center space-y-2 text-center">
+                <RefreshCw className="w-6 h-6 text-amber-400 animate-spin" />
+                <p className="text-xs font-semibold text-slate-300">
+                  Synthesizing real videos and 5 Words studied since last lesson...
+                </p>
+                <p className="text-[11px] text-slate-400">
+                  Strictly grounded in Firestore records • English • Max 90 words
+                </p>
+              </div>
+            ) : snapshotError ? (
+              <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-400/30 text-amber-200 text-xs flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span>{snapshotError}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleRegenerateSnapshot}
+                  className="px-2.5 py-1 rounded bg-amber-400/20 hover:bg-amber-400/30 text-amber-200 font-bold text-[11px] cursor-pointer"
+                >
+                  Retry
+                </button>
+              </div>
+            ) : snapshot?.summary ? (
+              <div className="space-y-3.5">
+                {/* Formatted snapshot text */}
+                <div className="bg-black/30 backdrop-blur-xs border border-white/10 rounded-xl p-4 text-slate-100 text-xs sm:text-sm leading-relaxed whitespace-pre-wrap font-sans">
+                  {snapshot.summary}
+                </div>
+
+                {/* Structured Pills for rapid visual scanning */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 pt-1">
+                  {/* Videos & Topics */}
+                  {Array.isArray(snapshot.videoTopics) && snapshot.videoTopics.length > 0 && (
+                    <div className="p-3 rounded-xl bg-white/5 border border-white/10 flex flex-col justify-between">
+                      <div className="flex items-center gap-1.5 text-[11px] font-bold text-[#9AB4FF] uppercase tracking-wider mb-1.5">
+                        <Video className="w-3.5 h-3.5" />
+                        <span>Studied Videos & Themes</span>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {snapshot.videoTopics.map((top: string, i: number) => (
+                          <span
+                            key={i}
+                            className="inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-medium bg-[#9AB4FF]/15 text-[#9AB4FF] border border-[#9AB4FF]/25"
+                          >
+                            {top}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Key Vocabulary */}
+                  {Array.isArray(snapshot.keyVocabulary) && snapshot.keyVocabulary.length > 0 && (
+                    <div className="p-3 rounded-xl bg-white/5 border border-white/10 flex flex-col justify-between">
+                      <div className="flex items-center gap-1.5 text-[11px] font-bold text-amber-300 uppercase tracking-wider mb-1.5">
+                        <BookOpen className="w-3.5 h-3.5" />
+                        <span>Key 5 Words Vocabulary</span>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {snapshot.keyVocabulary.map((word: string, i: number) => (
+                          <span
+                            key={i}
+                            className="inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-bold bg-amber-400/20 text-amber-200 border border-amber-400/30"
+                          >
+                            {word}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="py-4 text-center">
+                <p className="text-xs text-slate-300">
+                  Click "Refresh" above to generate the learning snapshot for this session.
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
+
         {/* Section 1: Weekly Media & Topic Consumption */}
         <div>
           <div className="flex items-center justify-between mb-3">

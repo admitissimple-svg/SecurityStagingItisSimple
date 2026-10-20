@@ -118,6 +118,10 @@ import {
   recordLessonReviewInStudentJournalServer,
   fetchStudentDailyJournalFromServerFirestore,
   removeUndefinedFields,
+  fetchLessonInsightsFromFirestoreServer,
+  saveLessonInsightsToFirestoreServer,
+  verifyTeacherLessonAccessServer,
+  getStudentActivitiesBetweenLessonsServer,
 } from './src/serverFirestore';
 import { normalizeDictionaryWord } from './src/utils/studentDictionaryLibrary';
 import { DEFAULT_CURATED_PLAYLISTS } from './src/utils/youtubeService';
@@ -9691,6 +9695,236 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
   }
 
   res.json(Object.values(db.pedagogicalTransformationsMap || {}));
+});
+
+// ============================================================================
+// HOTFIX PONTUAL — Insights & Icebreakers Endpoints
+// ============================================================================
+
+// 1. Retrieve saved lesson insights snapshot (Zero AI call)
+app.get('/api/lesson-insights', firebaseAuthMiddleware, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  const caller = req.user;
+  if (!caller || !caller.uid) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required' });
+  }
+
+  const lessonId = ((req.query.lessonId as string) || '').trim();
+  const studentUid = ((req.query.studentUid as string) || (req.query.uid as string) || '').trim();
+
+  if (!lessonId) {
+    return res.status(400).json({ error: 'Bad Request', message: 'Missing required lessonId query param.' });
+  }
+
+  if (caller.role !== 'teacher' && caller.role !== 'admin') {
+    return res.status(403).json({ error: 'Forbidden', message: 'Access denied: Teacher or administrator privileges required.' });
+  }
+
+  if (caller.role === 'teacher') {
+    const isAuthorized = await verifyTeacherLessonAccessServer(
+      caller.uid,
+      caller.email,
+      studentUid,
+      lessonId,
+      caller.role
+    );
+    if (!isAuthorized) {
+      return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to this lesson.' });
+    }
+  }
+
+  try {
+    const cached = await fetchLessonInsightsFromFirestoreServer(lessonId);
+    if (cached) {
+      return res.json({ exists: true, snapshot: cached });
+    }
+    return res.json({ exists: false, snapshot: null });
+  } catch (err: any) {
+    return res.status(500).json({ error: 'Internal Server Error', message: err?.message || 'Failed to fetch insights.' });
+  }
+});
+
+// 2. Generate or retrieve on-demand pedagogical snapshot for a specific student and lesson
+app.post('/api/lesson-insights/generate', firebaseAuthMiddleware, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  const caller = req.user;
+  if (!caller || !caller.uid) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required' });
+  }
+
+  if (caller.role !== 'teacher' && caller.role !== 'admin') {
+    return res.status(403).json({ error: 'Forbidden', message: 'Access denied: Teacher or administrator privileges required.' });
+  }
+
+  const body = req.body || {};
+  const lessonId = (body.lessonId || '').trim();
+  const studentUid = (body.studentUid || '').trim();
+  const studentEmail = (body.studentEmail || '').toLowerCase().trim();
+
+  if (!lessonId || !studentUid) {
+    return res.status(400).json({ error: 'Bad Request', message: 'Missing required lessonId or studentUid.' });
+  }
+
+  if (caller.role === 'teacher') {
+    const isAuthorized = await verifyTeacherLessonAccessServer(
+      caller.uid,
+      caller.email,
+      studentUid,
+      lessonId,
+      caller.role
+    );
+    if (!isAuthorized) {
+      return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access: you may only generate insights for your assigned students.' });
+    }
+  }
+
+  try {
+    // A. Recheck Firestore cache: if already saved, return immediately with ZERO AI calls!
+    const cached = await fetchLessonInsightsFromFirestoreServer(lessonId);
+    if (cached && cached.summary) {
+      return res.json({
+        success: true,
+        reused: true,
+        snapshot: cached,
+      });
+    }
+
+    // B. Fetch student's real completed activities between previous lesson and current lesson
+    const activities = await getStudentActivitiesBetweenLessonsServer(
+      studentUid,
+      studentEmail,
+      lessonId,
+      caller.uid
+    );
+
+    // C. If student has no activities logged, show discreet English message with ZERO AI calls!
+    if (!activities.hasActivities || (activities.videos.length === 0 && activities.vocabulary.length === 0)) {
+      const emptyMessage = 'No routine activities or 5 Words logged by the student since the last lesson.';
+      return res.json({
+        success: true,
+        hasActivities: false,
+        reused: false,
+        message: emptyMessage,
+        snapshot: {
+          lessonId,
+          studentUid,
+          teacherUid: caller.uid,
+          summary: `Weekly Learning Snapshot\n- Videos & Topics: None logged yet\n- Key Vocabulary: None logged yet\n- Conversation Starters:\n  1. How was your week, and did you have time to practice English?\n  2. What topic would you like to explore together today?`,
+          videoTopics: [],
+          keyVocabulary: [],
+          conversationStarters: [
+            'How was your week, and did you have time to practice English?',
+            'What topic would you like to explore together today?',
+          ],
+          wordCount: 36,
+          isAiGenerated: false,
+          isNoActivityNotice: true,
+          createdAt: new Date().toISOString(),
+        },
+      });
+    }
+
+    // D. Acquire single-flight lock to avoid duplicate calls on rapid clicks
+    const lockKey = `lesson_insights:${lessonId}`;
+    const lock = await acquireSingleFlightLock(lockKey);
+    if (!lock.acquired) {
+      await new Promise((r) => setTimeout(r, 1200));
+      const newlyCached = await fetchLessonInsightsFromFirestoreServer(lessonId);
+      if (newlyCached) {
+        return res.json({ success: true, reused: true, snapshot: newlyCached });
+      }
+      return res.status(429).json({ error: 'RateLimited', message: 'An insights request for this lesson is already processing. Please wait.' });
+    }
+
+    try {
+      const rateLimitCheck = await checkAndConsumeRateLimit(caller.uid, 'lesson_insights');
+      if (!rateLimitCheck.allowed) {
+        return res.status(429).json({ error: 'RateLimited', message: `Too many requests. Please retry in ${rateLimitCheck.retryAfterSeconds}s.` });
+      }
+
+      // E. Build minimal prompt strictly limited to studied videos & 5 Words (no sensitive identifiers)
+      const videoTitles = activities.videos.map((v, i) => `${i + 1}. ${v.title} (${v.dayOfWeek || 'routine'})`).join('\n');
+      const vocabItems = activities.vocabulary.map((w, i) => `${i + 1}. "${w.word}" - Context: ${w.context || 'Routine'}`).join('\n');
+
+      const promptData = `Real student activities completed between last lesson and current lesson:
+[VIDEOS STUDIED]
+${videoTitles || 'None'}
+
+[5 WORDS ROUTINE VOCABULARY]
+${vocabItems || 'None'}`;
+
+      const systemInstruction = `You are an expert pedagogical assistant for 1-on-1 English teachers (Native Friends).
+Generate a concise learning snapshot in English based strictly on the student's real completed activities since the last lesson.
+The output MUST be a valid JSON object adhering to this schema:
+{
+  "summary": "Weekly Learning Snapshot\\n- Videos & Topics: <summarized themes from real videos>\\n- Key Vocabulary: <up to 5 real words>\\n- Conversation Starters:\\n  1. <conversational question 1>\\n  2. <conversational question 2>",
+  "videoTopics": ["topic 1", ...],
+  "keyVocabulary": ["word 1", ...],
+  "conversationStarters": ["question 1", "question 2"]
+}
+
+STRICT CONSTRAINTS:
+1. ALWAYS IN ENGLISH.
+2. The entire "summary" string MUST NOT EXCEED 90 WORDS. Keep it concise, punchy, and natural.
+3. NEVER invent activities, videos, or words. Ground yourself strictly in the provided data.
+4. No filler, no apologies, no conversational greetings in JSON.`;
+
+      const geminiResult = await executeGeminiSingleAttempt({
+        feature: 'lesson_insights',
+        callerRole: caller.role,
+        systemInstruction,
+        untrustedUserDataPrompt: promptData,
+      });
+
+      if (!geminiResult || !geminiResult.parsedJson) {
+        return res.status(503).json({
+          error: 'ServiceUnavailable',
+          message: 'Unable to generate learning snapshot at this moment. Please try again later.',
+        });
+      }
+
+      const parsed = geminiResult.parsedJson;
+      let summaryText = (parsed.summary || '').trim();
+
+      // Enforce word count limit: max 90 words
+      const words = summaryText.split(/\s+/).filter(Boolean);
+      if (words.length > 90) {
+        summaryText = words.slice(0, 90).join(' ') + '...';
+      }
+      const finalWordCount = summaryText.split(/\s+/).filter(Boolean).length;
+
+      const snapshotPayload = {
+        lessonId,
+        studentUid,
+        teacherUid: caller.uid,
+        summary: summaryText,
+        videoTopics: Array.isArray(parsed.videoTopics) ? parsed.videoTopics : activities.videos.map((v) => v.title),
+        keyVocabulary: Array.isArray(parsed.keyVocabulary) ? parsed.keyVocabulary : activities.vocabulary.map((w) => w.word),
+        conversationStarters: Array.isArray(parsed.conversationStarters) ? parsed.conversationStarters : [],
+        wordCount: finalWordCount,
+        isAiGenerated: true,
+        sourceActivitiesCount: {
+          videos: activities.videos.length,
+          vocabulary: activities.vocabulary.length,
+        },
+        createdAt: new Date().toISOString(),
+      };
+
+      // F. Persist to Firestore collection 'lesson_insights' in '(default)'
+      await saveLessonInsightsToFirestoreServer(lessonId, snapshotPayload);
+
+      return res.json({
+        success: true,
+        reused: false,
+        snapshot: snapshotPayload,
+      });
+    } finally {
+      await lock.release();
+    }
+  } catch (err: any) {
+    console.warn('POST /api/lesson-insights/generate error:', err);
+    return res.status(500).json({ error: 'Internal Server Error', message: 'Failed to generate lesson snapshot.' });
+  }
 });
 
 // Student Personal Dictionary Endpoints (isolated by student UID and email with verified authorization)

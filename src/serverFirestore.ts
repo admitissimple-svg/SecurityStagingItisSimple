@@ -3956,3 +3956,346 @@ export async function scheduleLessonAtomicServer(
     statusCode: 200,
   };
 }
+
+/**
+ * HOTFIX PONTUAL — Insights & Icebreakers Persistence
+ */
+const localInsightsMap = new Map<string, any>();
+
+/**
+ * Fetches saved lesson insights snapshot from Firestore collection 'lesson_insights'
+ */
+export async function fetchLessonInsightsFromFirestoreServer(lessonId: string): Promise<any | null> {
+  const cleanId = (lessonId || '').trim();
+  if (!cleanId) return null;
+
+  const db = getFirestoreDb();
+  if (db && !isCloudWriteDisabled) {
+    try {
+      const snap = await db.collection('lesson_insights').doc(cleanId).get();
+      if (snap.exists) {
+        const data = { id: snap.id, ...snap.data() };
+        localInsightsMap.set(cleanId, data);
+        return data;
+      }
+    } catch (err: any) {
+      if (!isPermissionError(err)) {
+        console.warn('[serverFirestore] fetchLessonInsights notice:', err);
+      }
+    }
+  }
+
+  return localInsightsMap.get(cleanId) || null;
+}
+
+/**
+ * Saves lesson insights snapshot to Firestore collection 'lesson_insights'
+ */
+export async function saveLessonInsightsToFirestoreServer(lessonId: string, data: any): Promise<boolean> {
+  const cleanId = (lessonId || '').trim();
+  if (!cleanId) return false;
+
+  const payload = removeUndefinedFields({
+    ...data,
+    lessonId: cleanId,
+    updatedAt: new Date().toISOString(),
+  });
+  localInsightsMap.set(cleanId, payload);
+
+  const db = getFirestoreDb();
+  if (db && !isCloudWriteDisabled) {
+    try {
+      await db.collection('lesson_insights').doc(cleanId).set(payload, { merge: true });
+      return true;
+    } catch (err: any) {
+      if (isPermissionError(err)) {
+        isCloudWriteDisabled = true;
+      } else {
+        console.warn('[serverFirestore] saveLessonInsights notice:', err);
+      }
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Verifies that a teacher is authorized to access a given student and lesson
+ */
+export async function verifyTeacherLessonAccessServer(
+  callerUid: string,
+  callerEmail: string | undefined,
+  studentUid: string,
+  lessonId: string,
+  callerRole?: string
+): Promise<boolean> {
+  if (callerRole === 'admin') return true;
+  const db = getFirestoreDb();
+  if (!db) return false;
+
+  const cleanTeacherUid = (callerUid || '').trim();
+  const cleanTeacherEmail = (callerEmail || '').toLowerCase().trim();
+  const cleanStudentUid = (studentUid || '').trim();
+  const cleanLessonId = (lessonId || '').trim();
+
+  if (cleanLessonId) {
+    try {
+      const snap = await db.collection('lessons').doc(cleanLessonId).get();
+      if (snap.exists) {
+        const l = snap.data();
+        const lTeacherUid = (l?.teacherUid || l?.tutorUid || '').trim();
+        const lTeacherEmail = (l?.teacherEmail || l?.tutorEmail || '').toLowerCase().trim();
+        const lStudentUid = (l?.studentUid || '').trim();
+        const lStudentEmail = (l?.studentEmail || '').toLowerCase().trim();
+
+        const teacherMatches =
+          (cleanTeacherUid && lTeacherUid === cleanTeacherUid) ||
+          (cleanTeacherEmail && lTeacherEmail === cleanTeacherEmail);
+
+        const studentMatches =
+          (cleanStudentUid && lStudentUid === cleanStudentUid) ||
+          (cleanStudentUid && lStudentEmail === cleanStudentUid);
+
+        if (teacherMatches && studentMatches) {
+          return true;
+        }
+      }
+    } catch {}
+  }
+
+  if (cleanStudentUid) {
+    try {
+      const stSnap = await db.collection('users').doc(cleanStudentUid).get();
+      if (stSnap.exists) {
+        const stData = stSnap.data();
+        const assignedTeacher = (stData?.assignedNativeFriendUID || stData?.assignedTutorId || stData?.teacherUid || '').trim();
+        const assignedEmail = (stData?.teacherEmail || '').toLowerCase().trim();
+        if (
+          (cleanTeacherUid && assignedTeacher === cleanTeacherUid) ||
+          (cleanTeacherEmail && assignedEmail === cleanTeacherEmail)
+        ) {
+          return true;
+        }
+      }
+    } catch {}
+  }
+
+  return false;
+}
+
+/**
+ * Queries student's real completed activities (videos & 5 Words) between previous lesson and current lesson.
+ * Strictly checks Firestore '(default)'.
+ */
+export async function getStudentActivitiesBetweenLessonsServer(
+  studentUid: string,
+  studentEmail: string | undefined,
+  lessonId: string,
+  callerTeacherUid: string
+): Promise<{
+  videos: Array<{ id?: string; title: string; dayOfWeek?: string; date?: string }>;
+  vocabulary: Array<{ word: string; context?: string; translation?: string }>;
+  prevLesson: any | null;
+  currentLesson: any | null;
+  hasActivities: boolean;
+}> {
+  const db = getFirestoreDb();
+  if (!db || !studentUid) {
+    return { videos: [], vocabulary: [], prevLesson: null, currentLesson: null, hasActivities: false };
+  }
+
+  const cleanUid = studentUid.trim();
+  const cleanEmail = (studentEmail || '').toLowerCase().trim();
+  const cleanLessonId = (lessonId || '').trim();
+
+  // 1. Fetch current lesson
+  let currentLesson: any = null;
+  if (cleanLessonId) {
+    try {
+      const snap = await db.collection('lessons').doc(cleanLessonId).get();
+      if (snap.exists) {
+        currentLesson = { id: snap.id, ...snap.data() };
+      }
+    } catch {}
+  }
+
+  // 2. Fetch all student lessons to establish chronological sequence
+  const studentLessons: any[] = [];
+  try {
+    const q1 = await db.collection('lessons').where('studentUid', '==', cleanUid).get();
+    q1.forEach((docSnap) => studentLessons.push({ id: docSnap.id, ...docSnap.data() }));
+
+    if (cleanEmail && studentLessons.length === 0) {
+      const q2 = await db.collection('lessons').where('studentEmail', '==', cleanEmail).get();
+      q2.forEach((docSnap) => {
+        if (!studentLessons.some((l) => l.id === docSnap.id)) {
+          studentLessons.push({ id: docSnap.id, ...docSnap.data() });
+        }
+      });
+    }
+  } catch {}
+
+  // Filter out cancelled lessons and sort chronologically
+  const activeLessons = studentLessons
+    .filter((l) => l && l.status !== 'cancelled' && l.status !== 'canceled')
+    .sort((a, b) => {
+      const timeA = new Date(a.startDateTime || a.date || 0).getTime();
+      const timeB = new Date(b.startDateTime || b.date || 0).getTime();
+      return timeA - timeB;
+    });
+
+  let prevLesson: any = null;
+  if (currentLesson) {
+    const currIdx = activeLessons.findIndex((l) => l.id === currentLesson.id);
+    if (currIdx > 0) {
+      prevLesson = activeLessons[currIdx - 1];
+    } else if (currIdx === -1 && activeLessons.length > 0) {
+      const currTime = new Date(currentLesson.startDateTime || currentLesson.date || 0).getTime();
+      const earlier = activeLessons.filter((l) => new Date(l.startDateTime || l.date || 0).getTime() < currTime);
+      if (earlier.length > 0) {
+        prevLesson = earlier[earlier.length - 1];
+      }
+    }
+  } else if (activeLessons.length > 0) {
+    currentLesson = activeLessons[activeLessons.length - 1];
+    if (activeLessons.length > 1) {
+      prevLesson = activeLessons[activeLessons.length - 2];
+    }
+  }
+
+  const cutoffIso = prevLesson?.startDateTime || (prevLesson?.date ? `${prevLesson.date}T00:00:00.000Z` : null);
+  const cutoffTime = cutoffIso ? new Date(cutoffIso).getTime() : 0;
+  const currentIso = currentLesson?.startDateTime || (currentLesson?.date ? `${currentLesson.date}T23:59:59.999Z` : new Date().toISOString());
+  const currentTime = new Date(currentIso).getTime();
+
+  // 3. Query Studied Videos
+  const rawVideos: Array<{ id?: string; title: string; dayOfWeek?: string; date?: string; timestamp?: number }> = [];
+
+  try {
+    const journalSnap = await db.collection('users').doc(cleanUid).collection('journal').get();
+    journalSnap.forEach((docSnap) => {
+      const d = docSnap.data();
+      if (d && (d.type === 'video' || d.activityType === 'video') && (d.title || d.videoTitle)) {
+        rawVideos.push({
+          id: d.id || d.videoId,
+          title: d.title || d.videoTitle,
+          dayOfWeek: d.dayOfWeek,
+          date: d.date,
+          timestamp: d.timestamp || (d.date ? new Date(d.date).getTime() : 0),
+        });
+      }
+    });
+  } catch {}
+
+  let userDocData: any = null;
+  try {
+    const uSnap = await db.collection('users').doc(cleanUid).get();
+    if (uSnap.exists) {
+      userDocData = uSnap.data();
+      if (Array.isArray(userDocData?.studentJournal)) {
+        userDocData.studentJournal.forEach((d: any) => {
+          if (d && (d.type === 'video' || d.activityType === 'video') && (d.title || d.videoTitle)) {
+            rawVideos.push({
+              id: d.id || d.videoId,
+              title: d.title || d.videoTitle,
+              dayOfWeek: d.dayOfWeek,
+              date: d.date,
+              timestamp: d.timestamp || (d.date ? new Date(d.date).getTime() : 0),
+            });
+          }
+        });
+      }
+    }
+  } catch {}
+
+  // Filter videos between cutoffTime and currentTime
+  const filteredVideos: Array<{ id?: string; title: string; dayOfWeek?: string; date?: string }> = [];
+  const seenVideoTitles = new Set<string>();
+
+  for (const v of rawVideos) {
+    if (!v.title) continue;
+    const norm = v.title.toLowerCase().trim();
+    if (seenVideoTitles.has(norm)) continue;
+
+    if (cutoffTime > 0) {
+      const itemTime = v.timestamp || (v.date ? new Date(v.date).getTime() : 0);
+      if (itemTime > 0 && (itemTime < cutoffTime || itemTime > currentTime + 86400000)) {
+        continue;
+      }
+    }
+    seenVideoTitles.add(norm);
+    filteredVideos.push({
+      id: v.id,
+      title: v.title,
+      dayOfWeek: v.dayOfWeek,
+      date: v.date,
+    });
+    if (filteredVideos.length >= 5) break;
+  }
+
+  // 4. Query 5 Words activity vocabulary
+  const rawWords: any[] = [];
+  try {
+    const vocabSnap = await db.collection('users').doc(cleanUid).collection('vocabulary').get();
+    vocabSnap.forEach((docSnap) => rawWords.push(docSnap.data()));
+  } catch {}
+
+  if (Array.isArray(userDocData?.vocabulary)) {
+    userDocData.vocabulary.forEach((item: any) => {
+      if (!rawWords.some((w) => (w.word || '').toLowerCase().trim() === (item.word || '').toLowerCase().trim())) {
+        rawWords.push(item);
+      }
+    });
+  }
+
+  // Filter 5 Words: routine words studied between cutoffTime and currentTime
+  const filteredWords: Array<{ word: string; context?: string; translation?: string }> = [];
+  const seenWords = new Set<string>();
+
+  for (const w of rawWords) {
+    if (!w || !w.word) continue;
+    const cleanW = w.word.toLowerCase().trim();
+    if (seenWords.has(cleanW)) continue;
+
+    // Check if origin is routine / 5 Words
+    const isRoutine =
+      w.source === 'routine' ||
+      (Array.isArray(w.origins) && w.origins.some((o: any) => o.source === 'routine' || (o.context && o.context.includes('5 Words')))) ||
+      (w.sourceActivityName && w.sourceActivityName.toLowerCase().includes('routine'));
+
+    if (!isRoutine) continue;
+
+    if (cutoffTime > 0) {
+      const learnedTime = new Date(w.learnedAt || w.date || w.createdAt || w.updatedAt || 0).getTime();
+      if (learnedTime > 0 && (learnedTime < cutoffTime || learnedTime > currentTime + 86400000)) {
+        continue;
+      }
+    }
+
+    seenWords.add(cleanW);
+    const routineContext =
+      w.context ||
+      w.origins?.find((o: any) => o.context)?.context ||
+      w.sourceActivityName ||
+      w.exampleSentenceEn ||
+      'Routine 5 Words study';
+
+    filteredWords.push({
+      word: w.word,
+      context: routineContext,
+      translation: w.translationPt || w.translation || '',
+    });
+    if (filteredWords.length >= 5) break;
+  }
+
+  const hasActivities = filteredVideos.length > 0 || filteredWords.length > 0;
+
+  return {
+    videos: filteredVideos,
+    vocabulary: filteredWords,
+    prevLesson,
+    currentLesson,
+    hasActivities,
+  };
+}
+
