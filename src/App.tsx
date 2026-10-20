@@ -43,7 +43,7 @@ import {
 } from './hooks/useRoutine';
 import { recordConsumedVideo, recordConsumedTrack } from './hooks/useStudentHistory';
 import { extractYouTubeVideoId, getYouTubeWatchUrl } from './utils/youtube';
-import { getInstantOrCachedWord } from './utils/dictionaryService';
+import { getInstantOrCachedWord, lookupWord } from './utils/dictionaryService';
 import { auth, getDb, getAllFirestoreDbs } from './firebase';
 import { getAccessToken, getAdminAccessToken, waitForAuthUser, firebaseSignUpWithEmail, firebaseSignInWithEmail } from './utils/auth';
 import { useNativeFriends, isTutorApproved, isTeacherRole } from './hooks/useNativeFriends';
@@ -2902,6 +2902,43 @@ export default function App() {
 
     if (dictEntries.length > 0) {
       handleAddWordsToDictionary(dictEntries);
+
+      // Asynchronously enrich any words that did not have cached definitions adhering to Native Friend Notes standard
+      const wordsNeedingEnrichment = dictEntries.filter((e) => !e.definitionEn || e.definitionEn.trim().length === 0);
+      if (wordsNeedingEnrichment.length > 0) {
+        Promise.all(
+          wordsNeedingEnrichment.map(async (entry) => {
+            try {
+              const enriched = await lookupWord(
+                entry.word,
+                entry.sourceActivityName,
+                userProfile?.level,
+                userProfile?.uid,
+                userProfile?.email,
+                studentDictionaryEntries
+              );
+              if (enriched && enriched.definitionEn) {
+                return {
+                  ...entry,
+                  definitionEn: enriched.definitionEn,
+                  exampleSentenceEn: enriched.exampleSentenceEn || entry.exampleSentenceEn,
+                  partOfSpeech: enriched.partOfSpeech || entry.partOfSpeech,
+                  translationPt: enriched.translationPt || entry.translationPt,
+                  cefrLevel: enriched.cefrLevel || entry.cefrLevel,
+                };
+              }
+            } catch {
+              return null;
+            }
+            return null;
+          })
+        ).then((enrichedList) => {
+          const validEnriched = enrichedList.filter(Boolean) as StudentDictionaryEntry[];
+          if (validEnriched.length > 0) {
+            handleAddWordsToDictionary(validEnriched);
+          }
+        });
+      }
     }
 
     const activeEmail = currentAccount?.email || userProfile?.email;

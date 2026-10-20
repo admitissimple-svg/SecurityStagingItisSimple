@@ -351,7 +351,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     });
     setWordDefinitions(initialDefs);
 
-    // Reduced delay: 200ms debounce with selective lookup for terms needing AI enrichment
+    // Native Friend Notes Standard: 600ms debounce with selective lookup to minimize AI queries and cost
     const timer = setTimeout(() => {
       const wordsToLookup = words
         .map((w, idx) => ({ word: w.trim(), idx }))
@@ -387,7 +387,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
           // Handled gracefully
         }
       });
-    }, 200);
+    }, 600);
 
     return () => clearTimeout(timer);
   }, [words, userProfile?.level, userProfile?.uid, userProfile?.email, dictionaryEntries]);
@@ -546,27 +546,15 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     Boolean(w && (sentenceInput || '').toLowerCase().includes(w.toLowerCase()))
   );
 
-  // Handlers for 5 Words with automatic debounced background save
-  const wordsDebounceRef = useRef<any>(null);
+  // Handlers for 5 Words: editing updates local state, saving feeds My Dictionary strictly upon user click
   const handleWordChange = (index: number, val: string) => {
     const updated = [...words];
     updated[index] = val;
     setWords(updated);
-
-    if (activeActivity) {
-      if (wordsDebounceRef.current) clearTimeout(wordsDebounceRef.current);
-      wordsDebounceRef.current = setTimeout(() => {
-        const cleanWords = updated.map((w) => w.trim()).filter((w) => w.length > 0);
-        if (cleanWords.length > 0) {
-          onSaveLearnedWords(activeActivity.id, cleanWords);
-        }
-      }, 700);
-    }
   };
 
   const handleSaveWords = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (wordsDebounceRef.current) clearTimeout(wordsDebounceRef.current);
     if (!activeActivity) return;
     const cleanWords = words.map((w) => w.trim()).filter((w) => w.length > 0);
     onSaveLearnedWords(activeActivity.id, cleanWords);

@@ -430,8 +430,27 @@ export function generateLocalPedagogicalTransformation(params: {
         commonPitfalls: matchedPattern.commonPitfalls,
         isPendingConfirmation: false,
       });
+    } else if (err.isPendingConfirmation || !cleanCorr) {
+      const isPt = cleanLang === 'pt';
+      const pendingText = getPendingConfirmationText(cleanLang);
+      const hypothetical = includeHypotheticalExamples
+        ? [
+            `Didactic Example (Hypothetical): "Verify the intended phrasing for '${rawOrig}'."`,
+            `Didactic Example (Hypothetical): "Discuss with your Native Friend how native speakers phrase this."`,
+          ]
+        : [];
+      mistakesAnalysis.push({
+        id: `mistake-${mistakesAnalysis.length + 1}`,
+        original: rawOrig,
+        corrected: pendingText,
+        category: 'vocabulary',
+        explanation: getUnconfirmedExplanationText(rawOrig, cleanLang),
+        twoExamples: hypothetical,
+        commonPitfalls: getPendingPitfallsText(cleanLang),
+        isPendingConfirmation: true,
+      });
     } else {
-      const correctedText = cleanCorr || rawOrig;
+      const correctedText = cleanCorr;
       mistakesAnalysis.push({
         id: `mistake-${mistakesAnalysis.length + 1}`,
         original: rawOrig,
@@ -448,8 +467,8 @@ export function generateLocalPedagogicalTransformation(params: {
     }
   }
 
-  // If few or no explicit errors found, add 2 relevant foundational coaching points tailored to CEFR level
-  if (mistakesAnalysis.length === 0) {
+  // If no explicit errors found and notes are empty, add foundational coaching points
+  if (mistakesAnalysis.length === 0 && !markings.cleanText.trim()) {
     if (cefrMeta.cefr === 'A1' || cefrMeta.cefr === 'A2') {
       mistakesAnalysis.push({
         id: 'mistake-foundational-1',
@@ -495,20 +514,20 @@ export function generateLocalPedagogicalTransformation(params: {
     }
   }
 
-  // 2. Build Section 2: Teach Grammar Points
+  // 2. Build Section 2: Teach Grammar Points (Strictly when systemic evidence exists)
   const grammarPoints: PedagogicalGrammarPoint[] = [];
 
   const hasAgreeMistake = mistakesAnalysis.some(
-    (m) => /agree/i.test(m.original) || /agree/i.test(m.corrected)
+    (m) => (/agree/i.test(m.original) || /agree/i.test(m.corrected)) && !m.isPendingConfirmation
   );
   const hasAgeMistake = mistakesAnalysis.some(
-    (m) => /year/i.test(m.original) || /have.*old/i.test(m.original)
+    (m) => (/year/i.test(m.original) || /have.*old/i.test(m.original)) && !m.isPendingConfirmation
   );
   const hasPrepositionMistake = mistakesAnalysis.some(
-    (m) => m.category === 'preposition' || /depend\s+o/i.test(m.original)
+    (m) => m.category === 'preposition' && !m.isPendingConfirmation
   );
 
-  if (hasAgreeMistake || cefrMeta.cefr !== 'A1') {
+  if (hasAgreeMistake) {
     grammarPoints.push({
       id: 'grammar-1',
       topic: 'Stative & Opinion Verbs: Agree, Believe, Need',
@@ -525,7 +544,7 @@ export function generateLocalPedagogicalTransformation(params: {
     });
   }
 
-  if (hasPrepositionMistake || grammarPoints.length < 2) {
+  if (hasPrepositionMistake) {
     grammarPoints.push({
       id: 'grammar-2',
       topic: 'Dependent Prepositions with Common Verbs (Depend on, Wait for, Listen to)',
@@ -542,7 +561,7 @@ export function generateLocalPedagogicalTransformation(params: {
     });
   }
 
-  if (hasAgeMistake || grammarPoints.length < 2) {
+  if (hasAgeMistake) {
     grammarPoints.push({
       id: 'grammar-3',
       topic: 'Expressing Age and Enduring Physical States with "To Be"',
@@ -563,7 +582,7 @@ export function generateLocalPedagogicalTransformation(params: {
 
   // Combine Alt+W (New Word), Alt+P (Pronounce), and general vocab markings
   const candidateVocab = [...markings.newWords, ...markings.pronounceItems, ...markings.vocabItems];
-  if (candidateVocab.length === 0) {
+  if (candidateVocab.length === 0 && !markings.cleanText.trim()) {
     candidateVocab.push('catch up', 'workload', 'streamline', 'make sense', 'get the hang of');
   }
 
@@ -618,12 +637,12 @@ export function generateLocalPedagogicalTransformation(params: {
         ? 'Idiomatic Expression'
         : 'Vocabulary Item',
       simpleDefinition: isPronounce
-        ? `Pronunciation focus: Pay careful attention to the syllable stress, vowel reduction, and clear consonant articulation of "${rawTrimmed}".`
-        : `Key communicative expression (${cefrMeta.cefr}): used in conversation to communicate "${rawTrimmed}" clearly and naturally.`,
-      collocations: [`use "${rawTrimmed}" naturally`, `frequently heard with "${rawTrimmed}"`],
+        ? `Phonetic articulation and syllable stress focus for "${rawTrimmed}".`
+        : `Authentic lexical expression (${cefrMeta.cefr}) for natural spoken English.`,
+      collocations: [`express "${rawTrimmed}" accurately`, `frequently used with "${rawTrimmed}"`],
       realExamples: [
-        `In daily speaking: "I practiced using '${rawTrimmed}' naturally in our conversation today."`,
-        `Practice sentence: "Understanding how native speakers say '${rawTrimmed}' makes your speech flow smoothly."`,
+        `She focused on expressing "${rawTrimmed}" accurately in context.`,
+        `Daily usage: practicing "${rawTrimmed}" builds natural speaking fluency.`,
       ],
       synonyms: ['natural expression', 'target phrase'],
       register: 'neutral' as const,
