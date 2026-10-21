@@ -479,9 +479,6 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
 
       // 1. Memorization Activity: Permanent Firestore persistence and multi-device sync
       if (rowId === 'memorization') {
-        // Strictly only scheduled study days count for memorization
-        if (!activeStudyDays.includes(dayKey)) return false;
-
         // Direct weeklyChecks checkmark
         if (weeklyChecks && Boolean(weeklyChecks[checkKey])) return true;
         // Direct homework completed parts by day

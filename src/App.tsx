@@ -3458,7 +3458,7 @@ export default function App() {
         ).then((success) => {
           const curCycle = parseWeekCycleNumber(userProfile?.weeklyCycle);
           if (curCycle !== activeCycle) return;
-          if (!success) {
+          if (!success && !isCompleted) {
             setWeeklyChecks((prev) => ({
               ...prev,
               [checkKey]: previousChecked,
@@ -3466,13 +3466,27 @@ export default function App() {
           }
         }).catch(() => {
           const curCycle = parseWeekCycleNumber(userProfile?.weeklyCycle);
-          if (curCycle === activeCycle) {
+          if (curCycle === activeCycle && !isCompleted) {
             setWeeklyChecks((prev) => ({
               ...prev,
               [checkKey]: previousChecked,
             }));
           }
         });
+
+        // Direct atomic write to Firestore users/{uid} (matching GitHub original)
+        const db = getDb();
+        if (db && uid) {
+          setDoc(
+            doc(db, 'users', uid),
+            {
+              weeklyChecks: { [checkKey]: isCompleted },
+              sPathChecks: { [checkKey]: isCompleted },
+              updatedAt: new Date().toISOString(),
+            },
+            { merge: true }
+          ).catch(() => {});
+        }
       }
 
       // Feedback toast/notification for student

@@ -20,16 +20,16 @@ import crypto from 'crypto';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { getFirestoreDb } from './serverFirestore';
 
-export const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash';
+export const DEFAULT_GEMINI_MODEL = 'gemini-3.8-flash';
 
 /**
  * Resolves the Gemini model from the environment variable GEMINI_MODEL.
  * Sanitizes input (stripping 'models/' prefix), ignores deprecated/legacy staging values ('gemini-2.5-flash'),
- * and safely defaults to the confirmed Flash model 'gemini-3.5-flash'.
+ * and safely defaults to the confirmed Flash model 'gemini-3.8-flash'.
  */
 export function resolveGeminiModel(): string {
   const envModel = (process.env.GEMINI_MODEL || '').trim().replace(/^models\//, '');
-  if (envModel && envModel !== 'gemini-2.5-flash') {
+  if (envModel && envModel !== 'gemini-2.5-flash' && envModel !== 'gemini-3.5-flash') {
     return envModel;
   }
   return DEFAULT_GEMINI_MODEL;
@@ -86,11 +86,11 @@ export const GEMINI_POLICIES: Record<GeminiFeature, FeaturePolicy> = {
     timeoutMs: 5500,
   },
   check_writing: {
-    maxOutputTokens: 600,
+    maxOutputTokens: 1000,
     rateLimitWindowSeconds: 60,
     rateLimitMaxRequests: 15,
     maxInputLengthChars: 500,
-    timeoutMs: 6000,
+    timeoutMs: 10000,
   },
   homework_evaluate: {
     maxOutputTokens: 1200,
@@ -151,13 +151,18 @@ export function isDistributedCostControlActive(): boolean {
   if (process.env.NODE_ENV === 'test' && process.env.REQUIRE_DISTRIBUTED_COST_CONTROL !== 'true') {
     return false;
   }
-  if (Boolean(process.env.K_SERVICE || process.env.K_REVISION || process.env.K_CONFIGURATION)) {
-    return true;
-  }
   if (
     process.env.REQUIRE_DISTRIBUTED_COST_CONTROL === 'true' ||
     process.env.ENABLE_DISTRIBUTED_COST_CONTROL === 'true'
   ) {
+    return true;
+  }
+  // In AI Studio development and preview environments, use in-memory cost controls
+  const kService = process.env.K_SERVICE || '';
+  if (kService.startsWith('ais-dev-') || kService.startsWith('ais-pre-')) {
+    return false;
+  }
+  if (Boolean(process.env.K_SERVICE || process.env.K_REVISION || process.env.K_CONFIGURATION)) {
     return true;
   }
   return false;
@@ -233,7 +238,7 @@ export async function checkAndConsumeRateLimit(
   const isDistributed = isDistributedCostControlActive();
 
   const db = getFirestoreDb();
-  if (db) {
+  if (db && isDistributed) {
     try {
       const ref = db.collection('gemini_rate_limits').doc(docId);
       const res = await db.runTransaction(async (tx) => {
@@ -331,7 +336,7 @@ export async function acquireSingleFlightLock(
 
   // 2. Firestore distributed check & acquire
   const db = getFirestoreDb();
-  if (db) {
+  if (db && isDistributed) {
     try {
       const lockDocRef = db.collection('gemini_inflight_locks').doc(lockKey);
       const acquired = await db.runTransaction(async (tx) => {
@@ -537,8 +542,8 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
     const contents = `[DATA_BLOCK_START]\n${untrustedUserDataPrompt.trim()}\n[DATA_BLOCK_END]`;
 
     // Config for Gemini model:
-    // FASE 4B.8.2: For Gemini 3 series models (gemini-3.8-flash), configure thinkingLevel: ThinkingLevel.LOW
-    // to minimize latency, protect token budget, and ensure structured JSON adherence without reasoning token overflow.
+    // For Gemini 3/4 series models (gemini-3.8-flash), configure thinkingBudget: 0
+    // to minimize latency, protect token budget, and ensure instant structured JSON adherence without reasoning token delays.
     const config: any = {
       systemInstruction: hardenedSystemInstruction,
       responseMimeType: 'application/json',
@@ -548,7 +553,7 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
 
     const modelToUse = resolveGeminiModel();
     if (modelToUse.startsWith('gemini-3') || modelToUse.startsWith('gemini-4')) {
-      config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+      config.thinkingConfig = { thinkingBudget: 0 };
     }
 
     let timerId: NodeJS.Timeout | null = null;

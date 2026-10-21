@@ -546,7 +546,8 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     if (isCompletedNow && !isTodayPartCompleted && autoCompletedDayRef.current !== completionKey) {
       autoCompletedDayRef.current = completionKey;
 
-      markSPathCompleted(targetDay, dailySchedule.partKey);
+      const partToComplete = (activeTab !== 'results' && isCurrentActiveTabComplete) ? activeTab : dailySchedule.partKey;
+      markSPathCompleted(targetDay, partToComplete);
 
       setSubmittedFeedbackToast(
         isEn
