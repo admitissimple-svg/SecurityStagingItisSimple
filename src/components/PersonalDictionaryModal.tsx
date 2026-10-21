@@ -21,6 +21,7 @@ import {
   consolidateDictionaryEntries,
   normalizeDictionaryWord,
 } from '../utils/studentDictionaryLibrary';
+import { auth } from '../firebase';
 
 interface PersonalDictionaryModalProps {
   isOpen: boolean;
@@ -121,23 +122,31 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
     if (wordsToEnrich.length === 0) return;
 
     const uniqueWords = Array.from(new Set(wordsToEnrich)).slice(0, 10);
-    const targetUid = studentUid || '';
-    const targetEmail = studentEmail || '';
+    const targetUid = auth?.currentUser?.uid || studentUid || '';
+    const targetEmail = (auth?.currentUser?.email || studentEmail || '').toLowerCase().trim();
 
     if (!targetUid && !targetEmail) return;
 
-    fetch('/api/student-dictionary/enrich', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        studentUid: targetUid,
-        studentEmail: targetEmail,
-        words: uniqueWords,
-        studentLevel,
-      }),
-    })
-      .then((res) => res.json())
-      .then((data) => {
+    (async () => {
+      try {
+        const token = await auth?.currentUser?.getIdToken().catch(() => null);
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (token) {
+          headers['Authorization'] = `Bearer ${token}`;
+        }
+
+        const res = await fetch('/api/student-dictionary/enrich', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            studentUid: targetUid,
+            studentEmail: targetEmail,
+            words: uniqueWords,
+            studentLevel,
+          }),
+        });
+
+        const data = await res.json();
         if (data.success && Array.isArray(data.enrichedEntries)) {
           data.enrichedEntries.forEach((entry: StudentDictionaryEntry) => {
             const norm = normalizeDictionaryWord(entry.normalizedWord || entry.word);
@@ -159,10 +168,10 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
             }
           });
         }
-      })
-      .catch((err) => {
+      } catch (err) {
         console.warn('PersonalDictionaryModal: video words enrichment notice:', err);
-      });
+      }
+    })();
   }, [isOpen, wordsFromRoutines, effectiveExcludedSet, customSavedEntries, apiEnrichedEntries, studentUid, studentEmail, studentLevel, onSaveCustomEntry]);
 
   // Convert routine words into canonical StudentDictionaryEntry items

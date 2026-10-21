@@ -280,6 +280,7 @@ async function fetchFromBackendApi(
         context,
         studentLevel: studentLevel || 'intermediate',
         level: studentLevel || 'intermediate',
+        studentUid: auth?.currentUser?.uid || '',
       }),
       signal,
     });

@@ -784,6 +784,7 @@ export async function generateWeeklyHomeworkWithAi(params: {
   studentName?: string;
   studentLevel?: string;
   studentEmail?: string;
+  studentUid?: string;
   customWords?: Array<Partial<HomeworkVocabItem> & { word: string }>;
   targetDay?: DayOfWeek;
   activeStudyDays?: DayOfWeek[];
@@ -810,6 +811,8 @@ export async function generateWeeklyHomeworkWithAi(params: {
     const controller = new AbortController();
     const abortTimeout = setTimeout(() => controller.abort(), 35000);
 
+    const currentUid = auth?.currentUser?.uid || params.studentUid || '';
+    const currentEmail = (auth?.currentUser?.email || params.studentEmail || '').toLowerCase().trim();
     const token = await auth?.currentUser?.getIdToken().catch(() => null);
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (token) {
@@ -825,7 +828,8 @@ export async function generateWeeklyHomeworkWithAi(params: {
         wordDetails: localBaseline.vocabularyList,
         studentLevel: params.studentLevel || 'Intermediate',
         studentName: params.studentName || 'Student',
-        studentEmail: params.studentEmail || '',
+        studentEmail: currentEmail,
+        studentUid: currentUid,
         weekLabel: localBaseline.weekLabel,
       }),
     });
@@ -883,6 +887,8 @@ export async function generatePart4StoryWithAi(params: {
   words: string[];
   studentLevel?: string;
   studentName?: string;
+  studentUid?: string;
+  studentEmail?: string;
   wordDetails?: any[];
 }): Promise<ReadingPassage | null> {
   const cleanWords = Array.from(new Set(params.words.filter(Boolean)));
@@ -892,6 +898,8 @@ export async function generatePart4StoryWithAi(params: {
     const controller = new AbortController();
     const abortTimeout = setTimeout(() => controller.abort(), 20000);
 
+    const currentUid = auth?.currentUser?.uid || params.studentUid || '';
+    const currentEmail = (auth?.currentUser?.email || params.studentEmail || '').toLowerCase().trim();
     const token = await auth?.currentUser?.getIdToken().catch(() => null);
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (token) {
@@ -906,6 +914,8 @@ export async function generatePart4StoryWithAi(params: {
         words: cleanWords,
         studentLevel: params.studentLevel || 'Intermediate',
         studentName: params.studentName || 'Student',
+        studentUid: currentUid,
+        studentEmail: currentEmail,
         wordDetails: params.wordDetails || [],
       }),
     });

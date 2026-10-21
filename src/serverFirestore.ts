@@ -1467,12 +1467,15 @@ export async function saveTeacherAvailabilityToFirestore(
       updatedAt: data.updatedAt || new Date().toISOString(),
     }));
 
-    const cleanDocId = uidOrEmail.toLowerCase().trim().replace(/[^a-zA-Z0-9_-]/g, '_');
-    const savePromise = db.collection('teacher_availability').doc(cleanDocId).set(sanitized, { merge: true }).then(() => true);
+    // Resolve canonical document ID:
+    // If a canonical UID is provided (in data.uid or uidOrEmail without '@'),
+    // preserve its exact case (Firebase Auth UID). Never lowercase canonical UIDs.
+    const isUid = (data.uid && !data.uid.includes('@')) || (!uidOrEmail.includes('@'));
+    const canonicalDocId = isUid
+      ? (data.uid || uidOrEmail).trim()
+      : uidOrEmail.toLowerCase().trim().replace(/[^a-zA-Z0-9_-]/g, '_');
 
-    if (data.uid && data.uid !== cleanDocId) {
-      db.collection('teacher_availability').doc(data.uid).set(sanitized, { merge: true }).catch(() => {});
-    }
+    const savePromise = db.collection('teacher_availability').doc(canonicalDocId).set(sanitized, { merge: true }).then(() => true);
 
     const result = await withTimeout(savePromise, 2000);
     return !!result;
@@ -1491,14 +1494,24 @@ export async function fetchTeacherAvailabilityFromFirestore(uidOrEmail: string):
   const db = getFirestoreDb();
   if (!db || !uidOrEmail) return null;
   try {
-    const cleanDocId = uidOrEmail.toLowerCase().trim().replace(/[^a-zA-Z0-9_-]/g, '_');
-    const fetchPromise = db.collection('teacher_availability').doc(cleanDocId).get().then(async (snap) => {
+    const rawId = uidOrEmail.trim();
+    const fetchPromise = db.collection('teacher_availability').doc(rawId).get().then(async (snap) => {
       if (snap.exists) {
         return snap.data();
       }
-      if (uidOrEmail !== cleanDocId) {
-        const snapDirect = await db.collection('teacher_availability').doc(uidOrEmail).get();
-        if (snapDirect.exists) return snapDirect.data();
+      // For backward compatibility: if not found and input has uppercase letters, check lowercase doc
+      const lowerId = rawId.toLowerCase();
+      if (lowerId !== rawId) {
+        const snapLower = await db.collection('teacher_availability').doc(lowerId).get();
+        if (snapLower.exists) return snapLower.data();
+      }
+      // If email, try sanitized email format
+      if (rawId.includes('@')) {
+        const cleanEmailId = lowerId.replace(/[^a-zA-Z0-9_-]/g, '_');
+        if (cleanEmailId !== rawId && cleanEmailId !== lowerId) {
+          const snapEmail = await db.collection('teacher_availability').doc(cleanEmailId).get();
+          if (snapEmail.exists) return snapEmail.data();
+        }
       }
       return null;
     });

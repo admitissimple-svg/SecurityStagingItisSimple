@@ -807,6 +807,8 @@ export async function checkDailySentenceAi(
   const localAnalysis = analyzeSentenceGrammarDeterministic(cleanSentence, cleanDailyWords);
 
   try {
+    const currentUid = auth?.currentUser?.uid || '';
+    const currentEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
     const token = await auth?.currentUser?.getIdToken().catch(() => null);
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -821,6 +823,8 @@ export async function checkDailySentenceAi(
       body: JSON.stringify({
         sentence: cleanSentence,
         dailyWords: cleanDailyWords,
+        studentUid: currentUid,
+        studentEmail: currentEmail,
         projectId: GEMINI_PROJECT_ID,
       }),
     });

@@ -1031,6 +1031,7 @@ export default function App() {
         routinesByDay,
         studentName: userProfile.name,
         studentLevel: userProfile.level,
+        studentUid: auth?.currentUser?.uid || currentAccount?.uid || userProfile?.id || '',
         studentEmail: currentAccount?.email || userProfile.email || '',
         targetDay: homeworkTargetDay,
         activeStudyDays: userProfile?.weeklyStudyDays,
@@ -5737,8 +5738,8 @@ export default function App() {
     wordsUsed: string[],
     evaluationResult?: WritingEvaluationResult | null
   ) => {
-    const studentUid = currentAccount?.uid || userProfile?.id || '';
-    const studentEmail = (currentAccount?.email || userProfile?.email || '').toLowerCase().trim();
+    const studentUid = auth?.currentUser?.uid || currentAccount?.uid || userProfile?.id || '';
+    const studentEmail = (auth?.currentUser?.email || currentAccount?.email || userProfile?.email || '').toLowerCase().trim();
 
     const effectiveWords = (wordsUsed && wordsUsed.length > 0)
       ? wordsUsed
