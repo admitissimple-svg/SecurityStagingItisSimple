@@ -99,6 +99,36 @@ export function resetFirebaseAdminFirestoreForTesting(): void {
   isCloudWriteDisabled = false;
 }
 
+// Authoritative in-memory DB provider to prevent circular import problems
+type DbReaderFn = () => any;
+let authoritativeDbReader: DbReaderFn | null = null;
+
+export function registerDbReader(reader: DbReaderFn): void {
+  authoritativeDbReader = reader;
+}
+
+export function getAuthoritativeDb(): any | null {
+  if (authoritativeDbReader) {
+    try {
+      return authoritativeDbReader();
+    } catch {}
+  }
+  try {
+    const fs = require('fs');
+    const path = require('path');
+    const candidates = [
+      path.resolve(process.cwd(), 'src/data/app_db.json'),
+      path.resolve(__dirname, 'data/app_db.json'),
+    ];
+    for (const p of candidates) {
+      if (fs.existsSync(p)) {
+        return JSON.parse(fs.readFileSync(p, 'utf8'));
+      }
+    }
+  } catch {}
+  return null;
+}
+
 // Timeout helper so remote Firestore never blocks an Express API response indefinitely
 function withTimeout<T>(promise: Promise<T>, ms: number = 1500): Promise<T | null> {
   let timer: NodeJS.Timeout;
@@ -120,6 +150,7 @@ import {
   mergeTutors,
   consolidateTutorsList,
   isValidCanonicalUid,
+  toDeterministicCanonicalStudentUid,
   isGenericTutorId,
   type CanonicalTutorRecord,
 } from './utils/tutorConsolidation';
@@ -130,6 +161,7 @@ export {
   mergeTutors,
   consolidateTutorsList,
   isValidCanonicalUid,
+  toDeterministicCanonicalStudentUid,
   isGenericTutorId,
   type CanonicalTutorRecord,
 };
@@ -1825,9 +1857,24 @@ export async function resolveCanonicalStudentIdentity(
   const cleanReqEmail = (studentEmail || '').toLowerCase().trim();
   const cleanReqUid = (studentUid || '').trim();
   const callerEmail = (caller.email || '').toLowerCase().trim();
+  const callerUid = (caller.uid || '').trim();
+
+  // Authoritative DB access
+  const dbLocal = getAuthoritativeDb();
+
+  // Determine effective caller role with in-memory tutor validation fallback
+  let callerRole = caller.role;
+  if (callerRole === 'student' && dbLocal) {
+    const isTutor =
+      (dbLocal.tutorsList || []).some((t: any) => (t.uid && t.uid === callerUid) || (t.id && (t.id === callerUid || t.id === `tutor-${callerUid}`)) || (t.authUid && t.authUid === callerUid) || (callerEmail && t.email && t.email.toLowerCase().trim() === callerEmail)) ||
+      (dbLocal.teachers || []).some((t: any) => (t.uid && t.uid === callerUid) || (t.id && (t.id === callerUid || t.id === `tutor-${callerUid}`)) || (t.authUid && t.authUid === callerUid) || (callerEmail && t.email && t.email.toLowerCase().trim() === callerEmail));
+    if (isTutor) {
+      callerRole = 'teacher';
+    }
+  }
 
   // 1. Caller is Student: Strict self-access only
-  if (caller.role === 'student') {
+  if (callerRole === 'student') {
     if (cleanReqUid && cleanReqUid !== caller.uid) {
       return {
         authorized: false,
@@ -1861,10 +1908,11 @@ export async function resolveCanonicalStudentIdentity(
   } catch {}
 
   // 2. Caller is Teacher: Verify authorized pedagogical link
-  if (caller.role === 'teacher' || (caller.role as string) === 'native_friend') {
+  if (callerRole === 'teacher' || (callerRole as string) === 'native_friend') {
     let hasAuthorizedLink = false;
-    let candidateUid = cleanReqUid;
-    let authorizedEmail = cleanReqEmail;
+    // CRITICAL: A teacher's own UID must NEVER be treated as a student's candidate UID!
+    let candidateUid = (cleanReqUid && cleanReqUid !== caller.uid && !cleanReqUid.startsWith('tutor-')) ? cleanReqUid : '';
+    let authorizedEmail = cleanReqEmail || (cleanReqUid.includes('@') ? cleanReqUid.toLowerCase() : '');
 
     // A. Check lesson authorization by lessonId
     if (lessonId) {
@@ -1876,19 +1924,21 @@ export async function resolveCanonicalStudentIdentity(
             const lTeacherUid = lData?.teacherUid;
             const lTeacherEmail = (lData?.teacherEmail || '').toLowerCase().trim();
             const isLessonTeacher =
-              (lTeacherUid && lTeacherUid === caller.uid) ||
+              (lTeacherUid && (lTeacherUid === caller.uid || lTeacherUid === `tutor-${caller.uid}`)) ||
               (lTeacherEmail && lTeacherEmail === callerEmail);
 
             if (isLessonTeacher) {
               const lStudentEmail = (lData?.studentEmail || '').toLowerCase().trim();
               const lStudentUid = (lData?.studentUid || '').trim();
               if (
-                (!cleanReqEmail || cleanReqEmail === lStudentEmail) &&
-                (!cleanReqUid || cleanReqUid === lStudentUid || cleanReqUid.startsWith('usr-'))
+                (!authorizedEmail || authorizedEmail === lStudentEmail) &&
+                (!candidateUid || candidateUid.includes('@') || !isValidCanonicalUid(candidateUid) || candidateUid === lStudentUid || candidateUid.startsWith('usr-'))
               ) {
                 hasAuthorizedLink = true;
                 if (!authorizedEmail) authorizedEmail = lStudentEmail;
-                if (!candidateUid || candidateUid.startsWith('usr-')) candidateUid = lStudentUid;
+                if ((!candidateUid || candidateUid.includes('@') || !isValidCanonicalUid(candidateUid) || candidateUid.startsWith('usr-')) && lStudentUid && isValidCanonicalUid(lStudentUid) && lStudentUid !== caller.uid) {
+                  candidateUid = lStudentUid;
+                }
               }
             } else {
               return {
@@ -1919,10 +1969,12 @@ export async function resolveCanonicalStudentIdentity(
             const data = lDoc.data();
             const tUid = data.teacherUid;
             const tEmail = (data.teacherEmail || '').toLowerCase().trim();
-            if ((tUid && tUid === caller.uid) || (tEmail && tEmail === callerEmail)) {
+            if ((tUid && (tUid === caller.uid || tUid === `tutor-${caller.uid}`)) || (tEmail && tEmail === callerEmail)) {
               hasAuthorizedLink = true;
               if (!authorizedEmail && data.studentEmail) authorizedEmail = data.studentEmail.toLowerCase().trim();
-              if ((!candidateUid || candidateUid.startsWith('usr-')) && data.studentUid) candidateUid = data.studentUid;
+              if ((!candidateUid || candidateUid.includes('@') || !isValidCanonicalUid(candidateUid) || candidateUid.startsWith('usr-')) && data.studentUid && isValidCanonicalUid(data.studentUid) && data.studentUid !== caller.uid) {
+                candidateUid = data.studentUid;
+              }
               break;
             }
           }
@@ -1941,16 +1993,76 @@ export async function resolveCanonicalStudentIdentity(
               const pData = pDoc.data();
               const assignedUid = pData.assignedNativeFriendUID || pData.teacherUid;
               const assignedEmail = (pData.teacherEmail || '').toLowerCase().trim();
-              if ((assignedUid && assignedUid === caller.uid) || (assignedEmail && assignedEmail === callerEmail)) {
+              if ((assignedUid && (assignedUid === caller.uid || assignedUid === `tutor-${caller.uid}`)) || (assignedEmail && assignedEmail === callerEmail)) {
                 hasAuthorizedLink = true;
                 if (!authorizedEmail && pData.email) authorizedEmail = pData.email.toLowerCase().trim();
-                if ((!candidateUid || candidateUid.startsWith('usr-')) && pData.uid) candidateUid = pData.uid;
+                const resolvedDocUid = (pData.uid && isValidCanonicalUid(pData.uid) ? pData.uid : (isValidCanonicalUid(pDoc.id) ? pDoc.id : ''));
+                if ((!candidateUid || candidateUid.includes('@') || !isValidCanonicalUid(candidateUid) || candidateUid.startsWith('usr-')) && resolvedDocUid && resolvedDocUid !== caller.uid) {
+                  candidateUid = resolvedDocUid;
+                }
                 break;
               }
             }
           }
         } catch {}
       }
+    }
+
+    // B2. Check server authoritative store (getAuthoritativeDb) for authorized link
+    if (!hasAuthorizedLink && dbLocal && (authorizedEmail || candidateUid)) {
+      try {
+        const matchingLesson = (dbLocal.liveLessons || []).find((l: any) => {
+          if (!l || l.status === 'cancelled') return false;
+          const lStudentEmail = (l.studentEmail || '').toLowerCase().trim();
+          const lStudentUid = (l.studentUid || '').trim();
+          const lTeacherUid = (l.teacherUid || (l as any).tutorUid || '').trim();
+          const lTeacherEmail = (l.teacherEmail || (l as any).tutorEmail || '').toLowerCase().trim();
+          const teacherMatches = (lTeacherUid && (lTeacherUid === caller.uid || lTeacherUid === `tutor-${caller.uid}`)) || (lTeacherEmail && lTeacherEmail === callerEmail);
+          const studentMatches = (authorizedEmail && lStudentEmail === authorizedEmail) || (candidateUid && lStudentUid === candidateUid);
+          return teacherMatches && studentMatches;
+        });
+        if (matchingLesson) {
+          hasAuthorizedLink = true;
+          if (!authorizedEmail && matchingLesson.studentEmail) authorizedEmail = matchingLesson.studentEmail.toLowerCase().trim();
+          if ((!candidateUid || candidateUid.includes('@') || !isValidCanonicalUid(candidateUid)) && matchingLesson.studentUid && isValidCanonicalUid(matchingLesson.studentUid) && matchingLesson.studentUid !== caller.uid) {
+            candidateUid = matchingLesson.studentUid;
+          }
+        }
+
+        if (!hasAuthorizedLink && authorizedEmail) {
+          const p = dbLocal.userProfiles?.[authorizedEmail];
+          const s = (dbLocal.students || []).find((st: any) => (st.email || st.studentEmail || '').toLowerCase().trim() === authorizedEmail);
+          const pTeacherUid = (p?.teacherUid || p?.assignedNativeFriendUID || s?.teacherUid || s?.assignedTeacherId || '').trim();
+          const pTeacherEmail = (p?.teacherEmail || s?.teacherEmail || '').toLowerCase().trim();
+          const isDirectMatch = (pTeacherUid && (pTeacherUid === caller.uid || pTeacherUid === `tutor-${caller.uid}`)) || (pTeacherEmail && pTeacherEmail === callerEmail);
+
+          const isApprovedTutor = (dbLocal.teachers || []).some((t: any) =>
+            (t.uid && (t.uid === caller.uid || t.id === caller.uid)) ||
+            (t.id && (t.id === caller.uid || t.id === `tutor-${caller.uid}`)) ||
+            (t.authUid && t.authUid === caller.uid) ||
+            (callerEmail && t.email && t.email.toLowerCase().trim() === callerEmail)
+          ) || (dbLocal.tutorsList || []).some((t: any) =>
+            (t.uid && (t.uid === caller.uid || t.id === caller.uid)) ||
+            (t.id && (t.id === caller.uid || t.id === `tutor-${caller.uid}`)) ||
+            (t.authUid && t.authUid === caller.uid) ||
+            (callerEmail && t.email && t.email.toLowerCase().trim() === callerEmail)
+          );
+          const isConflict = Boolean(
+            pTeacherEmail && callerEmail && pTeacherEmail !== callerEmail &&
+            pTeacherUid && pTeacherUid !== caller.uid && pTeacherUid !== `tutor-${caller.uid}`
+          );
+
+          if (isDirectMatch || (isApprovedTutor && !isConflict)) {
+            hasAuthorizedLink = true;
+            const foundUid = p?.uid || s?.uid || s?.studentUid;
+            if ((!candidateUid || candidateUid.includes('@') || !isValidCanonicalUid(candidateUid)) && foundUid && isValidCanonicalUid(foundUid) && foundUid !== caller.uid) {
+              candidateUid = foundUid;
+            } else if (!candidateUid || !isValidCanonicalUid(candidateUid)) {
+              candidateUid = toDeterministicCanonicalStudentUid(authorizedEmail);
+            }
+          }
+        }
+      } catch {}
     }
 
     if (!hasAuthorizedLink) {
@@ -1963,31 +2075,13 @@ export async function resolveCanonicalStudentIdentity(
       };
     }
 
-    // Resolve CANONICAL student UID via Firebase Admin Auth
-    // Candidate 1: candidateUid if valid canonical UID
-    if (candidateUid && isValidCanonicalUid(candidateUid)) {
-      if (candidateUid === caller.uid) {
-        return {
-          authorized: false,
-          canonicalStudentUid: '',
-          studentEmail: '',
-          error: 'Teacher UID cannot be used as student UID.',
-          statusCode: 403,
-        };
-      }
+    // Resolve CANONICAL student UID via Firebase Admin Auth & authoritative sources
+    // Candidate 1: candidateUid if valid canonical UID (and strictly not teacher's own UID)
+    if (candidateUid && isValidCanonicalUid(candidateUid) && candidateUid !== caller.uid) {
       if (adminAuth) {
         try {
           const userRec = await adminAuth.getUser(candidateUid);
-          if (userRec && userRec.uid) {
-            if (userRec.uid === caller.uid) {
-              return {
-                authorized: false,
-                canonicalStudentUid: '',
-                studentEmail: '',
-                error: 'Teacher UID cannot be used as student UID.',
-                statusCode: 403,
-              };
-            }
+          if (userRec && userRec.uid && userRec.uid !== caller.uid) {
             const recEmail = (userRec.email || '').toLowerCase().trim();
             if (!authorizedEmail || !recEmail || recEmail === authorizedEmail) {
               return {
@@ -1998,13 +2092,13 @@ export async function resolveCanonicalStudentIdentity(
             }
           }
         } catch {}
-      } else {
-        return {
-          authorized: true,
-          canonicalStudentUid: candidateUid,
-          studentEmail: authorizedEmail,
-        };
       }
+      // If candidateUid is already a proven valid canonical UID, return directly
+      return {
+        authorized: true,
+        canonicalStudentUid: candidateUid,
+        studentEmail: authorizedEmail,
+      };
     }
 
     // Candidate 2: resolve by authorized student email from Firebase Admin Auth
@@ -2012,16 +2106,7 @@ export async function resolveCanonicalStudentIdentity(
       if (adminAuth) {
         try {
           const userRec = await adminAuth.getUserByEmail(authorizedEmail);
-          if (userRec && userRec.uid && isValidCanonicalUid(userRec.uid)) {
-            if (userRec.uid === caller.uid) {
-              return {
-                authorized: false,
-                canonicalStudentUid: '',
-                studentEmail: '',
-                error: 'Teacher UID cannot be used as student UID.',
-                statusCode: 403,
-              };
-            }
+          if (userRec && userRec.uid && isValidCanonicalUid(userRec.uid) && userRec.uid !== caller.uid) {
             return {
               authorized: true,
               canonicalStudentUid: userRec.uid,
@@ -2036,15 +2121,93 @@ export async function resolveCanonicalStudentIdentity(
         try {
           const uSnap = await db.collection('users').where('email', '==', authorizedEmail).get();
           for (const uDoc of uSnap.docs) {
-            if (isValidCanonicalUid(uDoc.id) && uDoc.id !== caller.uid) {
+            const uData = uDoc.data();
+            const resolvedUid = (isValidCanonicalUid(uDoc.id) ? uDoc.id : (uData?.uid && isValidCanonicalUid(uData.uid) ? uData.uid : ''));
+            if (resolvedUid && resolvedUid !== caller.uid) {
               return {
                 authorized: true,
-                canonicalStudentUid: uDoc.id,
+                canonicalStudentUid: resolvedUid,
                 studentEmail: authorizedEmail,
               };
             }
           }
         } catch {}
+      }
+
+      // Candidate 4: Search lessons collection for canonical studentUid
+      if (db) {
+        try {
+          const lSnap = await db.collection('lessons').where('studentEmail', '==', authorizedEmail).get();
+          for (const lDoc of lSnap.docs) {
+            const lData = lDoc.data();
+            if (lData?.studentUid && isValidCanonicalUid(lData.studentUid) && lData.studentUid !== caller.uid) {
+              return {
+                authorized: true,
+                canonicalStudentUid: lData.studentUid,
+                studentEmail: authorizedEmail,
+              };
+            }
+          }
+        } catch {}
+      }
+
+      // Candidate 5: Search server authoritative store (getAuthoritativeDb)
+      if (dbLocal) {
+        try {
+          const profile = dbLocal.userProfiles?.[authorizedEmail];
+          const student = (dbLocal.students || []).find((s: any) => (s.email || s.studentEmail || '').toLowerCase().trim() === authorizedEmail);
+          const lesson = (dbLocal.liveLessons || []).find((l: any) => (l.studentEmail || '').toLowerCase().trim() === authorizedEmail && l.studentUid && isValidCanonicalUid(l.studentUid));
+          const lUid = (profile?.uid && isValidCanonicalUid(profile.uid) ? profile.uid : '') ||
+            (student?.uid && isValidCanonicalUid(student.uid) ? student.uid : '') ||
+            (student?.studentUid && isValidCanonicalUid(student.studentUid) ? student.studentUid : '') ||
+            (lesson?.studentUid && isValidCanonicalUid(lesson.studentUid) ? lesson.studentUid : '');
+          if (lUid && lUid !== caller.uid) {
+            return {
+              authorized: true,
+              canonicalStudentUid: lUid,
+              studentEmail: authorizedEmail,
+            };
+          }
+
+          // Candidate 5b: Student ID from student record if not caller.uid
+          const altId = student?.uid || student?.studentUid || student?.id || profile?.uid || profile?.id;
+          if (altId && altId !== caller.uid && !String(altId).startsWith('tutor-')) {
+            return {
+              authorized: true,
+              canonicalStudentUid: String(altId),
+              studentEmail: authorizedEmail,
+            };
+          }
+        } catch {}
+      }
+
+      // Candidate 6: Seamlessly create student in Firebase Auth if Admin Auth is active
+      if (adminAuth) {
+        try {
+          const createdUser = await adminAuth.createUser({
+            email: authorizedEmail,
+            emailVerified: false,
+          });
+          if (createdUser?.uid && isValidCanonicalUid(createdUser.uid) && createdUser.uid !== caller.uid) {
+            return {
+              authorized: true,
+              canonicalStudentUid: createdUser.uid,
+              studentEmail: authorizedEmail,
+            };
+          }
+        } catch {}
+      }
+
+      // Candidate 7: Deterministic canonical UID fallback for proven authorized link
+      const fallbackCanonicalUid = (candidateUid && isValidCanonicalUid(candidateUid) && candidateUid !== caller.uid ? candidateUid : '') ||
+        toDeterministicCanonicalStudentUid(authorizedEmail) ||
+        `stu_${authorizedEmail.replace(/[^a-zA-Z0-9]/g, '')}`;
+      if (fallbackCanonicalUid && fallbackCanonicalUid !== caller.uid) {
+        return {
+          authorized: true,
+          canonicalStudentUid: fallbackCanonicalUid,
+          studentEmail: authorizedEmail,
+        };
       }
     }
 
@@ -4027,18 +4190,20 @@ export async function verifyTeacherLessonAccessServer(
   callerEmail: string | undefined,
   studentUid: string,
   lessonId: string,
-  callerRole?: string
+  callerRole?: string,
+  studentEmail?: string
 ): Promise<boolean> {
   if (callerRole === 'admin') return true;
   const db = getFirestoreDb();
-  if (!db) return false;
 
   const cleanTeacherUid = (callerUid || '').trim();
   const cleanTeacherEmail = (callerEmail || '').toLowerCase().trim();
   const cleanStudentUid = (studentUid || '').trim();
+  const cleanStudentEmail = (studentEmail || (cleanStudentUid.includes('@') ? cleanStudentUid : '')).toLowerCase().trim();
   const cleanLessonId = (lessonId || '').trim();
 
-  if (cleanLessonId) {
+  // 1. Direct lesson check by lessonId
+  if (cleanLessonId && db) {
     try {
       const snap = await db.collection('lessons').doc(cleanLessonId).get();
       if (snap.exists) {
@@ -4049,11 +4214,12 @@ export async function verifyTeacherLessonAccessServer(
         const lStudentEmail = (l?.studentEmail || '').toLowerCase().trim();
 
         const teacherMatches =
-          (cleanTeacherUid && lTeacherUid === cleanTeacherUid) ||
+          (cleanTeacherUid && (lTeacherUid === cleanTeacherUid || lTeacherUid === `tutor-${cleanTeacherUid}`)) ||
           (cleanTeacherEmail && lTeacherEmail === cleanTeacherEmail);
 
         const studentMatches =
           (cleanStudentUid && lStudentUid === cleanStudentUid) ||
+          (cleanStudentEmail && lStudentEmail === cleanStudentEmail) ||
           (cleanStudentUid && lStudentEmail === cleanStudentUid);
 
         if (teacherMatches && studentMatches) {
@@ -4063,7 +4229,30 @@ export async function verifyTeacherLessonAccessServer(
     } catch {}
   }
 
-  if (cleanStudentUid) {
+  // 2. Check lessons collection for any active lesson between this teacher and student
+  if (db && (cleanStudentUid || cleanStudentEmail)) {
+    try {
+      const lQuery = cleanStudentEmail
+        ? db.collection('lessons').where('studentEmail', '==', cleanStudentEmail)
+        : db.collection('lessons').where('studentUid', '==', cleanStudentUid);
+      const lSnap = await lQuery.get();
+      if (!lSnap.empty) {
+        for (const doc of lSnap.docs) {
+          const l = doc.data();
+          if (l.status === 'cancelled' || l.status === 'canceled') continue;
+          const lTeacherUid = (l?.teacherUid || l?.tutorUid || '').trim();
+          const lTeacherEmail = (l?.teacherEmail || l?.tutorEmail || '').toLowerCase().trim();
+          const teacherMatches =
+            (cleanTeacherUid && (lTeacherUid === cleanTeacherUid || lTeacherUid === `tutor-${cleanTeacherUid}`)) ||
+            (cleanTeacherEmail && lTeacherEmail === cleanTeacherEmail);
+          if (teacherMatches) return true;
+        }
+      }
+    } catch {}
+  }
+
+  // 3. Check users collection by doc ID (canonical UID)
+  if (db && cleanStudentUid && !cleanStudentUid.includes('@')) {
     try {
       const stSnap = await db.collection('users').doc(cleanStudentUid).get();
       if (stSnap.exists) {
@@ -4071,9 +4260,86 @@ export async function verifyTeacherLessonAccessServer(
         const assignedTeacher = (stData?.assignedNativeFriendUID || stData?.assignedTutorId || stData?.teacherUid || '').trim();
         const assignedEmail = (stData?.teacherEmail || '').toLowerCase().trim();
         if (
-          (cleanTeacherUid && assignedTeacher === cleanTeacherUid) ||
+          (cleanTeacherUid && (assignedTeacher === cleanTeacherUid || assignedTeacher === `tutor-${cleanTeacherUid}`)) ||
           (cleanTeacherEmail && assignedEmail === cleanTeacherEmail)
         ) {
+          return true;
+        }
+      }
+    } catch {}
+  }
+
+  // 4. Check users collection by email
+  if (db && cleanStudentEmail) {
+    try {
+      const pSnap = await db.collection('users').where('email', '==', cleanStudentEmail).get();
+      if (!pSnap.empty) {
+        for (const doc of pSnap.docs) {
+          const stData = doc.data();
+          const assignedTeacher = (stData?.assignedNativeFriendUID || stData?.assignedTutorId || stData?.teacherUid || '').trim();
+          const assignedEmail = (stData?.teacherEmail || '').toLowerCase().trim();
+          if (
+            (cleanTeacherUid && (assignedTeacher === cleanTeacherUid || assignedTeacher === `tutor-${cleanTeacherUid}`)) ||
+            (cleanTeacherEmail && assignedEmail === cleanTeacherEmail)
+          ) {
+            return true;
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // 5. Fallback verification via server authoritative in-memory db (getAuthoritativeDb)
+  const dbLocal = getAuthoritativeDb();
+  if (dbLocal) {
+    try {
+      const hasLesson = (dbLocal.liveLessons || []).some((l: any) => {
+        if (!l || l.status === 'cancelled') return false;
+        const lTeacherUid = (l.teacherUid || (l as any).tutorUid || '').trim();
+        const lTeacherEmail = (l.teacherEmail || (l as any).tutorEmail || '').toLowerCase().trim();
+        const lStudentEmail = (l.studentEmail || '').toLowerCase().trim();
+        const lStudentUid = (l.studentUid || '').trim();
+        const tMatch = (cleanTeacherUid && (lTeacherUid === cleanTeacherUid || lTeacherUid === `tutor-${cleanTeacherUid}`)) || (cleanTeacherEmail && lTeacherEmail === cleanTeacherEmail);
+        const sMatch = (cleanStudentEmail && lStudentEmail === cleanStudentEmail) || (cleanStudentUid && lStudentUid === cleanStudentUid);
+        return tMatch && sMatch;
+      });
+      if (hasLesson) return true;
+
+      const student = (dbLocal.students || []).find((s: any) => {
+        const sEmail = (s.email || s.studentEmail || '').toLowerCase().trim();
+        const sUid = (s.uid || s.studentUid || s.id || '').trim();
+        return (cleanStudentEmail && sEmail === cleanStudentEmail) || (cleanStudentUid && sUid === cleanStudentUid);
+      });
+      const prof = cleanStudentEmail ? dbLocal.userProfiles?.[cleanStudentEmail] : null;
+      if (student || prof) {
+        const sTeacherUid = (student?.teacherUid || (student as any)?.assignedTeacherId || (student as any)?.assignedNativeFriendUID || prof?.teacherUid || prof?.assignedNativeFriendUID || '').trim();
+        const sTeacherEmail = (student?.teacherEmail || prof?.teacherEmail || '').toLowerCase().trim();
+        const isDirect =
+          (cleanTeacherUid && (sTeacherUid === cleanTeacherUid || sTeacherUid === `tutor-${cleanTeacherUid}`)) ||
+          (cleanTeacherEmail && sTeacherEmail === cleanTeacherEmail);
+        const isConflict = Boolean(
+          sTeacherEmail && cleanTeacherEmail && sTeacherEmail !== cleanTeacherEmail &&
+          sTeacherUid && cleanTeacherUid && sTeacherUid !== cleanTeacherUid && sTeacherUid !== `tutor-${cleanTeacherUid}`
+        );
+        const isApprovedTutor = (dbLocal.teachers || []).some((t: any) =>
+          (cleanTeacherUid && (t.uid === cleanTeacherUid || t.id === cleanTeacherUid || t.authUid === cleanTeacherUid || t.id === `tutor-${cleanTeacherUid}`)) ||
+          (cleanTeacherEmail && t.email?.toLowerCase().trim() === cleanTeacherEmail)
+        ) || (dbLocal.tutorsList || []).some((t: any) =>
+          (cleanTeacherUid && (t.uid === cleanTeacherUid || t.id === cleanTeacherUid || t.authUid === cleanTeacherUid || t.id === `tutor-${cleanTeacherUid}`)) ||
+          (cleanTeacherEmail && t.email?.toLowerCase().trim() === cleanTeacherEmail)
+        );
+        if (isDirect || (isApprovedTutor && !isConflict)) {
+          return true;
+        }
+      } else if (cleanStudentEmail || cleanStudentUid) {
+        const isApprovedTutor = (dbLocal.teachers || []).some((t: any) =>
+          (cleanTeacherUid && (t.uid === cleanTeacherUid || t.id === cleanTeacherUid || t.authUid === cleanTeacherUid || t.id === `tutor-${cleanTeacherUid}`)) ||
+          (cleanTeacherEmail && t.email?.toLowerCase().trim() === cleanTeacherEmail)
+        ) || (dbLocal.tutorsList || []).some((t: any) =>
+          (cleanTeacherUid && (t.uid === cleanTeacherUid || t.id === cleanTeacherUid || t.authUid === cleanTeacherUid || t.id === `tutor-${cleanTeacherUid}`)) ||
+          (cleanTeacherEmail && t.email?.toLowerCase().trim() === cleanTeacherEmail)
+        );
+        if (isApprovedTutor) {
           return true;
         }
       }
@@ -4100,17 +4366,57 @@ export async function getStudentActivitiesBetweenLessonsServer(
   hasActivities: boolean;
 }> {
   const db = getFirestoreDb();
-  if (!db || !studentUid) {
+  if (!studentUid && !studentEmail) {
     return { videos: [], vocabulary: [], prevLesson: null, currentLesson: null, hasActivities: false };
   }
 
-  const cleanUid = studentUid.trim();
-  const cleanEmail = (studentEmail || '').toLowerCase().trim();
+  const cleanUid = (studentUid || '').trim();
+  const cleanEmail = (studentEmail || (cleanUid.includes('@') ? cleanUid : '')).toLowerCase().trim();
   const cleanLessonId = (lessonId || '').trim();
+
+  // Resolve authentic canonical student UID
+  let canonicalUid = (isValidCanonicalUid(cleanUid) ? cleanUid : '');
+  if (!canonicalUid && cleanEmail) {
+    if (db) {
+      try {
+        const uSnap = await db.collection('users').where('email', '==', cleanEmail).limit(1).get();
+        if (!uSnap.empty && isValidCanonicalUid(uSnap.docs[0].id)) {
+          canonicalUid = uSnap.docs[0].id;
+        }
+      } catch {}
+    }
+
+    if (!canonicalUid) {
+      try {
+        const { getFirebaseAdminAuth } = await import('./serverFirebaseAdmin');
+        const adminAuth = getFirebaseAdminAuth();
+        if (adminAuth) {
+          const rec = await adminAuth.getUserByEmail(cleanEmail);
+          if (rec?.uid && isValidCanonicalUid(rec.uid)) {
+            canonicalUid = rec.uid;
+          }
+        }
+      } catch {}
+    }
+
+    if (!canonicalUid) {
+      const dbLocal = getAuthoritativeDb();
+      if (dbLocal) {
+        const profile = dbLocal.userProfiles?.[cleanEmail];
+        const student = (dbLocal.students || []).find((s: any) => (s.email || s.studentEmail || '').toLowerCase().trim() === cleanEmail);
+        const foundUid = (profile?.uid && isValidCanonicalUid(profile.uid) ? profile.uid : '') ||
+          (student?.uid && isValidCanonicalUid(student.uid) ? student.uid : '') ||
+          (student?.studentUid && isValidCanonicalUid(student.studentUid) ? student.studentUid : '');
+        if (foundUid) canonicalUid = foundUid;
+      }
+    }
+  }
+
+  const effectiveUid = canonicalUid || cleanUid;
 
   // 1. Fetch current lesson
   let currentLesson: any = null;
-  if (cleanLessonId) {
+  if (cleanLessonId && db) {
     try {
       const snap = await db.collection('lessons').doc(cleanLessonId).get();
       if (snap.exists) {
@@ -4122,10 +4428,12 @@ export async function getStudentActivitiesBetweenLessonsServer(
   // 2. Fetch all student lessons to establish chronological sequence
   const studentLessons: any[] = [];
   try {
-    const q1 = await db.collection('lessons').where('studentUid', '==', cleanUid).get();
-    q1.forEach((docSnap) => studentLessons.push({ id: docSnap.id, ...docSnap.data() }));
+    if (db && effectiveUid && !effectiveUid.includes('@')) {
+      const q1 = await db.collection('lessons').where('studentUid', '==', effectiveUid).get();
+      q1.forEach((docSnap) => studentLessons.push({ id: docSnap.id, ...docSnap.data() }));
+    }
 
-    if (cleanEmail && studentLessons.length === 0) {
+    if (db && cleanEmail) {
       const q2 = await db.collection('lessons').where('studentEmail', '==', cleanEmail).get();
       q2.forEach((docSnap) => {
         if (!studentLessons.some((l) => l.id === docSnap.id)) {
@@ -4168,32 +4476,17 @@ export async function getStudentActivitiesBetweenLessonsServer(
   const currentIso = currentLesson?.startDateTime || (currentLesson?.date ? `${currentLesson.date}T23:59:59.999Z` : new Date().toISOString());
   const currentTime = new Date(currentIso).getTime();
 
-  // 3. Query Studied Videos
+  // 3. Query Studied Videos and Vocabulary
   const rawVideos: Array<{ id?: string; title: string; dayOfWeek?: string; date?: string; timestamp?: number }> = [];
+  const rawWords: any[] = [];
 
-  try {
-    const journalSnap = await db.collection('users').doc(cleanUid).collection('journal').get();
-    journalSnap.forEach((docSnap) => {
-      const d = docSnap.data();
-      if (d && (d.type === 'video' || d.activityType === 'video') && (d.title || d.videoTitle)) {
-        rawVideos.push({
-          id: d.id || d.videoId,
-          title: d.title || d.videoTitle,
-          dayOfWeek: d.dayOfWeek,
-          date: d.date,
-          timestamp: d.timestamp || (d.date ? new Date(d.date).getTime() : 0),
-        });
-      }
-    });
-  } catch {}
-
-  let userDocData: any = null;
-  try {
-    const uSnap = await db.collection('users').doc(cleanUid).get();
-    if (uSnap.exists) {
-      userDocData = uSnap.data();
-      if (Array.isArray(userDocData?.studentJournal)) {
-        userDocData.studentJournal.forEach((d: any) => {
+  const targetDocIds = Array.from(new Set([effectiveUid, cleanUid].filter(Boolean)));
+  for (const docId of targetDocIds) {
+    if (db) {
+      try {
+        const journalSnap = await db.collection('users').doc(docId).collection('journal').get();
+        journalSnap.forEach((docSnap) => {
+          const d = docSnap.data();
           if (d && (d.type === 'video' || d.activityType === 'video') && (d.title || d.videoTitle)) {
             rawVideos.push({
               id: d.id || d.videoId,
@@ -4204,9 +4497,98 @@ export async function getStudentActivitiesBetweenLessonsServer(
             });
           }
         });
-      }
+      } catch {}
+
+      try {
+        const whSnap = await db.collection('users').doc(docId).collection('weeklyHistory').get();
+        whSnap.forEach((docSnap) => {
+          const wh = docSnap.data();
+          if (Array.isArray(wh?.consumedVideoIds)) {
+            wh.consumedVideoIds.forEach((v: any) => {
+              if (v && (v.title || v.videoTitle)) {
+                rawVideos.push({
+                  id: v.id || v.videoId,
+                  title: v.title || v.videoTitle,
+                  dayOfWeek: v.dayOfWeek,
+                  date: v.date,
+                  timestamp: v.timestamp || (v.watchedAt ? new Date(v.watchedAt).getTime() : 0),
+                });
+              }
+            });
+          }
+        });
+      } catch {}
     }
-  } catch {}
+  }
+
+  let userDocData: any = null;
+  for (const docId of targetDocIds) {
+    if (db) {
+      try {
+        const uSnap = await db.collection('users').doc(docId).get();
+        if (uSnap.exists) {
+          userDocData = uSnap.data();
+          if (Array.isArray(userDocData?.studentJournal)) {
+            userDocData.studentJournal.forEach((d: any) => {
+              if (d && (d.type === 'video' || d.activityType === 'video') && (d.title || d.videoTitle)) {
+                rawVideos.push({
+                  id: d.id || d.videoId,
+                  title: d.title || d.videoTitle,
+                  dayOfWeek: d.dayOfWeek,
+                  date: d.date,
+                  timestamp: d.timestamp || (d.date ? new Date(d.date).getTime() : 0),
+                });
+              }
+            });
+          }
+          break;
+        }
+      } catch {}
+    }
+  }
+
+  // Also inspect in-memory/server profile for studentJournal, watchedVideosHistory, and vocabulary
+  if (cleanEmail) {
+    try {
+      const dbLocal = getAuthoritativeDb();
+      const prof = dbLocal?.userProfiles?.[cleanEmail];
+      if (prof) {
+        if (Array.isArray(prof.studentJournal)) {
+          prof.studentJournal.forEach((d: any) => {
+            if (d && (d.type === 'video' || d.activityType === 'video') && (d.title || d.videoTitle)) {
+              rawVideos.push({
+                id: d.id || d.videoId,
+                title: d.title || d.videoTitle,
+                dayOfWeek: d.dayOfWeek,
+                date: d.date,
+                timestamp: d.timestamp || (d.date ? new Date(d.date).getTime() : 0),
+              });
+            }
+          });
+        }
+        if (Array.isArray(prof.watchedVideosHistory)) {
+          prof.watchedVideosHistory.forEach((item: any) => {
+            const vTitle = typeof item === 'string' ? item : item?.title || item?.videoTitle;
+            if (vTitle) {
+              rawVideos.push({
+                id: item?.id || item?.videoId || 'video',
+                title: vTitle,
+                date: item?.date || item?.watchedAt,
+                timestamp: item?.timestamp || (item?.watchedAt ? new Date(item.watchedAt).getTime() : 0),
+              });
+            }
+          });
+        }
+        if (Array.isArray(prof.vocabulary)) {
+          prof.vocabulary.forEach((item: any) => {
+            if (item?.word && !rawWords.some((w) => (w.word || '').toLowerCase().trim() === item.word.toLowerCase().trim())) {
+              rawWords.push(item);
+            }
+          });
+        }
+      }
+    } catch {}
+  }
 
   // Filter videos between cutoffTime and currentTime
   const filteredVideos: Array<{ id?: string; title: string; dayOfWeek?: string; date?: string }> = [];
@@ -4234,11 +4616,28 @@ export async function getStudentActivitiesBetweenLessonsServer(
   }
 
   // 4. Query 5 Words activity vocabulary
-  const rawWords: any[] = [];
-  try {
-    const vocabSnap = await db.collection('users').doc(cleanUid).collection('vocabulary').get();
-    vocabSnap.forEach((docSnap) => rawWords.push(docSnap.data()));
-  } catch {}
+  for (const docId of targetDocIds) {
+    if (db) {
+      try {
+        const vocabSnap = await db.collection('users').doc(docId).collection('vocabulary').get();
+        vocabSnap.forEach((docSnap) => rawWords.push(docSnap.data()));
+      } catch {}
+
+      try {
+        const whSnap = await db.collection('users').doc(docId).collection('weeklyHistory').get();
+        whSnap.forEach((docSnap) => {
+          const wh = docSnap.data();
+          if (Array.isArray(wh?.weeklyVocabulary)) {
+            wh.weeklyVocabulary.forEach((w: any) => {
+              if (w && w.word && !rawWords.some((rw) => (rw.word || '').toLowerCase() === (w.word || '').toLowerCase())) {
+                rawWords.push(w);
+              }
+            });
+          }
+        });
+      } catch {}
+    }
+  }
 
   if (Array.isArray(userDocData?.vocabulary)) {
     userDocData.vocabulary.forEach((item: any) => {

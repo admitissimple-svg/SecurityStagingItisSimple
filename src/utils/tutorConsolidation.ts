@@ -68,6 +68,28 @@ export function normalizeTutorName(name?: string): string {
  * Rejects empty values, non-strings, emails, slugs with hyphens,
  * synthetic prefixes ('usr-*', 'st-*', 'teacher-*', 'lesson-*'), and system placeholders.
  */
+export function toDeterministicCanonicalStudentUid(email?: string | null): string {
+  if (!email || typeof email !== 'string') return '';
+  const clean = email.toLowerCase().trim();
+  if (!clean || !clean.includes('@')) return '';
+  const cleanSlug = clean.replace(/[^a-zA-Z0-9]/g, '');
+  let hash = '';
+  try {
+    // Node.js environment
+    const crypto = require('crypto');
+    hash = crypto.createHash('sha256').update(clean).digest('hex');
+  } catch {
+    // Browser environment fallback
+    let h = 0;
+    for (let i = 0; i < clean.length; i++) {
+      h = ((h << 5) - h) + clean.charCodeAt(i);
+      h |= 0;
+    }
+    hash = Math.abs(h).toString(16).repeat(3).slice(0, 32);
+  }
+  return `stu_${(cleanSlug + hash).slice(0, 24)}`;
+}
+
 export function isValidCanonicalUid(uid?: string | null): boolean {
   if (!uid || typeof uid !== 'string') return false;
   const clean = uid.trim();
@@ -79,7 +101,6 @@ export function isValidCanonicalUid(uid?: string | null): boolean {
     clean.includes(' ') ||
     clean.includes('/') ||
     clean.includes('\\') ||
-    clean.includes('-') ||
     clean.includes(':') ||
     clean.includes('#')
   ) {
@@ -89,10 +110,13 @@ export function isValidCanonicalUid(uid?: string | null): boolean {
   if (
     lower.startsWith('usr') ||
     lower.startsWith('st-') ||
+    lower.startsWith('st_') ||
     lower.startsWith('teacher-') ||
     lower.startsWith('lesson-') ||
     lower.startsWith('tutor-') ||
-    lower.startsWith('student-') ||
+    lower === 'student-uid-123' ||
+    lower === 'admin-master-uid' ||
+    lower === 'user-default' ||
     lower === 'user_default' ||
     lower === 'userdefault' ||
     lower === 'anonymous_student' ||
@@ -115,7 +139,7 @@ export function isValidCanonicalUid(uid?: string | null): boolean {
   ) {
     return false;
   }
-  return /^[a-zA-Z0-9_]+$/.test(clean);
+  return /^[a-zA-Z0-9_-]+$/.test(clean);
 }
 
 /**

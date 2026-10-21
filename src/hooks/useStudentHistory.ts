@@ -23,6 +23,7 @@ import {
   extractVideoIdFromHistoryItem,
   extractVideoTitleFromHistoryItem,
 } from './useRoutine';
+import { toDeterministicCanonicalStudentUid } from '../utils/tutorConsolidation';
 
 export interface UseStudentHistoryParams {
   studentUid?: string;
@@ -30,6 +31,7 @@ export interface UseStudentHistoryParams {
   weekId?: string;
   weeklyCycle?: number;
   nativeFriendUid?: string; // Teacher UID for strict access validation
+  nativeFriendEmail?: string; // Teacher email for authorized validation
 }
 
 export interface UseStudentHistoryReturn {
@@ -60,11 +62,12 @@ function cleanDocId(id?: string): string {
 export async function verifyStudentNativeFriendLink(
   studentUid: string,
   nativeFriendUid: string,
-  studentEmail?: string
+  studentEmail?: string,
+  nativeFriendEmail?: string
 ): Promise<boolean> {
   const cleanStudent = cleanDocId(studentUid);
   const cleanTeacher = cleanDocId(nativeFriendUid);
-  const currentEmail = (auth.currentUser?.email || '').toLowerCase().trim();
+  const currentEmail = (nativeFriendEmail || auth.currentUser?.email || '').toLowerCase().trim();
   if (!cleanStudent) return false;
 
   // 1. Admin bypass - Admins oversee all students and tutors via verified Custom Claims
@@ -77,101 +80,107 @@ export async function verifyStudentNativeFriendLink(
     } catch {}
   }
 
-  // 2. Student accessing their own history
-  if (!cleanTeacher || cleanStudent === cleanTeacher) return true;
-  if (auth.currentUser && (auth.currentUser.uid === cleanStudent || auth.currentUser.email?.toLowerCase().trim() === cleanStudent)) {
+  // 2. Student accessing their own history (only if no teacher is querying)
+  if (!cleanTeacher) return true;
+  if (!cleanTeacher && auth.currentUser && (auth.currentUser.uid === cleanStudent || auth.currentUser.email?.toLowerCase().trim() === cleanStudent)) {
     return true;
   }
 
+  const emailToSearch = (studentEmail || (cleanStudent.includes('@') ? cleanStudent : '')).toLowerCase().trim();
+
+  // 3. Client Firestore verification (if authorized in rules)
   try {
     const db = getDb();
-    const studentDocRef = doc(db, 'users', cleanStudent);
-    let snap = await getDoc(studentDocRef);
-    let targetRef = studentDocRef;
+    if (cleanStudent && !cleanStudent.includes('@')) {
+      const studentDocRef = doc(db, 'users', cleanStudent);
+      let snap = await getDoc(studentDocRef);
+      let targetRef = studentDocRef;
 
-    // Check by email if document not directly found
-    const emailToSearch = (studentEmail || (cleanStudent.includes('@') ? cleanStudent : '')).toLowerCase().trim();
-    if (!snap.exists() && emailToSearch) {
-      const q = query(collection(db, 'users'), where('email', '==', emailToSearch));
-      const qSnap = await getDocs(q);
-      if (!qSnap.empty) {
-        snap = qSnap.docs[0];
-        targetRef = snap.ref;
-      }
-    }
-
-    if (snap.exists()) {
-      const data = snap.data();
-      const assignedUid = (data.assignedNativeFriendUID || data.nativeFriendUID || '').trim();
-      const sTeacherEmail = (data.teacherEmail || data.assignedTeacherEmail || '').toLowerCase().trim();
-      const sTeacherUid = (data.teacherUid || '').trim();
-
-      // If directly assigned to this teacher UID
-      if (assignedUid && assignedUid === cleanTeacher) {
-        return true;
+      // Check by email if document not directly found
+      if (!snap.exists() && emailToSearch) {
+        const q = query(collection(db, 'users'), where('email', '==', emailToSearch));
+        const qSnap = await getDocs(q);
+        if (!qSnap.empty) {
+          snap = qSnap.docs[0];
+          targetRef = snap.ref;
+        }
       }
 
-      // If assigned to a DIFFERENT teacher UID, reject to prevent cross-profile leakage
-      if (assignedUid && assignedUid !== cleanTeacher) {
-        if (sTeacherEmail && (cleanTeacher.toLowerCase().includes(sTeacherEmail) || currentEmail === sTeacherEmail)) {
+      if (snap.exists()) {
+        const data = snap.data();
+        const assignedUid = (data.assignedNativeFriendUID || data.nativeFriendUID || '').trim();
+        const sTeacherEmail = (data.teacherEmail || data.assignedTeacherEmail || '').toLowerCase().trim();
+        const sTeacherUid = (data.teacherUid || '').trim();
+
+        // If directly assigned to this teacher UID
+        if (assignedUid && assignedUid === cleanTeacher) {
           return true;
         }
-        return false;
-      }
 
-      // If no assignedUid yet, check if student matches by teacherUid or teacherEmail
-      const teacherMatches =
-        (sTeacherUid && sTeacherUid === cleanTeacher) ||
-        (sTeacherEmail && (cleanTeacher.toLowerCase().includes(sTeacherEmail) || currentEmail === sTeacherEmail));
+        // If assigned to a DIFFERENT teacher UID, reject to prevent cross-profile leakage
+        if (assignedUid && assignedUid !== cleanTeacher) {
+          if (sTeacherEmail && (cleanTeacher.toLowerCase().includes(sTeacherEmail) || currentEmail === sTeacherEmail)) {
+            return true;
+          }
+          return false;
+        }
 
-      if (teacherMatches) {
-        await setDoc(
-          targetRef,
-          {
-            assignedNativeFriendUID: cleanTeacher,
-            nativeFriendUID: cleanTeacher,
-            updatedAt: new Date().toISOString(),
-          },
-          { merge: true }
-        );
-        return true;
-      }
-    }
+        // If no assignedUid yet, check if student matches by teacherUid or teacherEmail
+        const teacherMatches =
+          (sTeacherUid && sTeacherUid === cleanTeacher) ||
+          (sTeacherEmail && (cleanTeacher.toLowerCase().includes(sTeacherEmail) || currentEmail === sTeacherEmail));
 
-    // Secondary check: query users collection where assignedNativeFriendUID == cleanTeacher and uid == cleanStudent
-    const q = query(
-      collection(db, 'users'),
-      where('assignedNativeFriendUID', '==', cleanTeacher)
-    );
-    const querySnap = await getDocs(q);
-    let matched = false;
-    querySnap.forEach((d) => {
-      if (d.id === cleanStudent || d.data().uid === cleanStudent || (emailToSearch && d.data().email === emailToSearch)) {
-        matched = true;
-      }
-    });
-
-    if (matched) return true;
-
-    // Direct backend verification fallback
-    try {
-      const resp = await fetch(
-        `/api/students/verify-link?studentUid=${encodeURIComponent(cleanStudent)}&studentEmail=${encodeURIComponent(emailToSearch)}&teacherUid=${encodeURIComponent(cleanTeacher)}&teacherEmail=${encodeURIComponent(currentEmail)}`
-      );
-      if (resp.ok) {
-        const json = await resp.json();
-        if (typeof json.isLinked === 'boolean') {
-          return json.isLinked;
+        if (teacherMatches) {
+          await setDoc(
+            targetRef,
+            {
+              assignedNativeFriendUID: cleanTeacher,
+              nativeFriendUID: cleanTeacher,
+              updatedAt: new Date().toISOString(),
+            },
+            { merge: true }
+          );
+          return true;
         }
       }
-    } catch {}
 
-    // Strict default: If not explicitly linked or authorized, return false to prevent cross-profile leakage
-    return false;
-  } catch (err) {
-    console.warn('Notice verifying student-nativeFriend UID link:', err);
-    return false;
+      // Secondary check: query users collection where assignedNativeFriendUID == cleanTeacher and uid == cleanStudent
+      const q = query(
+        collection(db, 'users'),
+        where('assignedNativeFriendUID', '==', cleanTeacher)
+      );
+      const querySnap = await getDocs(q);
+      let matched = false;
+      querySnap.forEach((d) => {
+        if (d.id === cleanStudent || d.data().uid === cleanStudent || (emailToSearch && d.data().email === emailToSearch)) {
+          matched = true;
+        }
+      });
+
+      if (matched) return true;
+    }
+  } catch (fsErr) {
+    // Client SDK might be restricted by firestore.rules; proceed to authoritative backend verification
   }
+
+  // 4. Authoritative backend verification fallback
+  try {
+    const studentUidParam = cleanStudent && !cleanStudent.includes('@') && cleanStudent !== cleanTeacher ? cleanStudent : '';
+    const resp = await fetch(
+      `/api/students/verify-link?studentUid=${encodeURIComponent(studentUidParam)}&studentEmail=${encodeURIComponent(emailToSearch)}&teacherUid=${encodeURIComponent(cleanTeacher)}&teacherEmail=${encodeURIComponent(currentEmail)}`
+    );
+    if (resp.ok) {
+      const json = await resp.json();
+      if (typeof json.isLinked === 'boolean') {
+        return json.isLinked;
+      }
+    }
+  } catch (apiErr) {
+    console.warn('Notice querying /api/students/verify-link:', apiErr);
+  }
+
+  // Strict default: If not explicitly linked or authorized, return false to prevent cross-profile leakage
+  return false;
 }
 
 /**
@@ -530,8 +539,9 @@ export function useStudentHistory({
   weekId = 'week-1',
   weeklyCycle,
   nativeFriendUid,
+  nativeFriendEmail,
 }: UseStudentHistoryParams): UseStudentHistoryReturn {
-  const effectiveUid = cleanDocId(studentUid);
+  const effectiveUid = cleanDocId(studentUid) || (studentEmail ? toDeterministicCanonicalStudentUid(studentEmail) : '');
   const effectiveWeekId = cleanDocId(weekId) || (weeklyCycle ? `week-${weeklyCycle}` : 'week-1');
   const cleanTeacherUid = cleanDocId(nativeFriendUid);
 
@@ -565,7 +575,7 @@ export function useStudentHistory({
         return;
       }
 
-      if (!cleanTeacherUid) {
+      if (!cleanTeacherUid && !nativeFriendEmail) {
         // Accessed by student themselves
         if (active) setIsAuthorized(true);
         return;
@@ -573,7 +583,7 @@ export function useStudentHistory({
 
       // Teacher is accessing - strictly verify assignedNativeFriendUID
       setIsLoading(true);
-      const isLinked = await verifyStudentNativeFriendLink(effectiveUid, cleanTeacherUid, studentEmail);
+      const isLinked = await verifyStudentNativeFriendLink(effectiveUid, cleanTeacherUid, studentEmail, nativeFriendEmail);
       if (active) {
         setIsAuthorized(isLinked);
         if (!isLinked) {
@@ -589,7 +599,7 @@ export function useStudentHistory({
     return () => {
       active = false;
     };
-  }, [effectiveUid, cleanTeacherUid, studentEmail]);
+  }, [effectiveUid, cleanTeacherUid, studentEmail, nativeFriendEmail]);
 
   // Real-time listener on weeklyHistory document if authorized
   useEffect(() => {

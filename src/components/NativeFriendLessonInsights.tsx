@@ -21,7 +21,9 @@ import { DayOfWeek, StudentJournalEntry } from '../types';
 import {
   subscribeToStudentJournal,
   fetchStudentJournalActivitiesFromFirestore,
+  isValidCanonicalUid,
 } from '../utils/studentPersistence';
+import { toDeterministicCanonicalStudentUid } from '../utils/tutorConsolidation';
 import { apiClient } from '../utils/apiClient';
 
 interface NativeFriendLessonInsightsProps {
@@ -30,6 +32,7 @@ interface NativeFriendLessonInsightsProps {
   studentName?: string;
   studentLevel?: string;
   teacherUid: string;
+  teacherEmail?: string;
   teacherName?: string;
   weekId?: string;
   weeklyCycle?: number;
@@ -45,6 +48,7 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
   studentName,
   studentLevel = 'iniciante',
   teacherUid,
+  teacherEmail,
   teacherName,
   weekId = 'week-1',
   weeklyCycle = 1,
@@ -60,6 +64,38 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
     return (lessons || []).filter((l: any) => l && l.status !== 'cancelled' && l.status !== 'canceled');
   }, [lessons]);
 
+  // Canonical student UID resolution and local synchronization state
+  const [canonicalStudentUid, setCanonicalStudentUid] = useState<string>(() => {
+    if (studentUid && isValidCanonicalUid(studentUid) && studentUid !== teacherUid) return studentUid;
+    const fromLesson = (lessons || []).find(
+      (l: any) => l.studentUid && isValidCanonicalUid(l.studentUid) && l.studentUid !== teacherUid
+    );
+    if (fromLesson?.studentUid) return fromLesson.studentUid;
+    if (studentEmail) return toDeterministicCanonicalStudentUid(studentEmail);
+    return '';
+  });
+
+  useEffect(() => {
+    if (studentUid && isValidCanonicalUid(studentUid) && studentUid !== teacherUid) {
+      setCanonicalStudentUid(studentUid);
+    } else {
+      const fromLesson = (lessons || []).find(
+        (l: any) => l.studentUid && isValidCanonicalUid(l.studentUid) && l.studentUid !== teacherUid
+      );
+      if (fromLesson?.studentUid) {
+        setCanonicalStudentUid(fromLesson.studentUid);
+      } else if (studentEmail) {
+        setCanonicalStudentUid(toDeterministicCanonicalStudentUid(studentEmail));
+      }
+    }
+  }, [studentUid, lessons, teacherUid, studentEmail]);
+
+  const effectiveStudentUid = (canonicalStudentUid && canonicalStudentUid !== teacherUid && isValidCanonicalUid(canonicalStudentUid))
+    ? canonicalStudentUid
+    : (studentUid && isValidCanonicalUid(studentUid) && studentUid !== teacherUid)
+      ? studentUid
+      : (studentEmail ? toDeterministicCanonicalStudentUid(studentEmail) : '');
+
   const [selectedLessonId, setSelectedLessonId] = useState<string>(() => {
     if (activeLessonId) return activeLessonId;
     if (studentLessons.length > 0) {
@@ -70,7 +106,21 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
     return '';
   });
 
-  const effectiveLessonId = selectedLessonId || `lesson_${studentUid}_week${weeklyCycle}`;
+  // Keep selectedLessonId in sync when lessons or activeLessonId change
+  useEffect(() => {
+    if (activeLessonId) {
+      setSelectedLessonId(activeLessonId);
+    } else if (studentLessons.length > 0) {
+      const now = new Date().toISOString();
+      const upcoming = studentLessons.find((l: any) => l.startDateTime && l.startDateTime >= now);
+      const chosen = upcoming?.id || studentLessons[0]?.id || '';
+      if (!selectedLessonId || !studentLessons.some((l: any) => l.id === selectedLessonId)) {
+        setSelectedLessonId(chosen);
+      }
+    }
+  }, [activeLessonId, studentLessons, selectedLessonId]);
+
+  const effectiveLessonId = selectedLessonId || (effectiveStudentUid ? `lesson_${effectiveStudentUid}_week${weeklyCycle}` : (studentEmail ? `lesson_${studentEmail.replace(/[^a-zA-Z0-9]/g, '_')}_week${weeklyCycle}` : 'lesson_default'));
 
   // Pedagogical Weekly Learning Snapshot state (strictly <= 90 words, English)
   const [snapshot, setSnapshot] = useState<any | null>(null);
@@ -81,7 +131,7 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
 
   // Load or generate snapshot upon selecting student/lesson
   useEffect(() => {
-    if (!effectiveLessonId || !studentUid) return;
+    if (!effectiveStudentUid && !studentEmail) return;
     let isCancelled = false;
 
     async function loadSnapshot() {
@@ -90,10 +140,18 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
       try {
         // 1. Try to fetch cached snapshot first (Zero AI calls)
         const getRes = await apiClient.get('/api/lesson-insights', {
-          params: { lessonId: effectiveLessonId, studentUid },
+          params: {
+            lessonId: effectiveLessonId,
+            studentUid: effectiveStudentUid || undefined,
+            studentEmail,
+          },
         });
 
         if (isCancelled) return;
+
+        if (getRes?.canonicalStudentUid && isValidCanonicalUid(getRes.canonicalStudentUid) && getRes.canonicalStudentUid !== teacherUid) {
+          setCanonicalStudentUid(getRes.canonicalStudentUid);
+        }
 
         if (getRes?.exists && getRes.snapshot) {
           setSnapshot(getRes.snapshot);
@@ -106,12 +164,16 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
         const postRes = await apiClient.post('/api/lesson-insights/generate', {
           body: {
             lessonId: effectiveLessonId,
-            studentUid,
+            studentUid: effectiveStudentUid || undefined,
             studentEmail,
           },
         });
 
         if (isCancelled) return;
+
+        if (postRes?.canonicalStudentUid && isValidCanonicalUid(postRes.canonicalStudentUid) && postRes.canonicalStudentUid !== teacherUid) {
+          setCanonicalStudentUid(postRes.canonicalStudentUid);
+        }
 
         if (postRes?.success && postRes.snapshot) {
           setSnapshot(postRes.snapshot);
@@ -122,7 +184,8 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
       } catch (err: any) {
         if (!isCancelled) {
           console.warn('Lesson insights fetch notice:', err);
-          setSnapshotError('Unable to generate learning snapshot at this moment. Please try again later.');
+          const errorMsg = err?.data?.message || err?.message || 'Unable to generate learning snapshot at this moment. Please try again later.';
+          setSnapshotError(errorMsg);
         }
       } finally {
         if (!isCancelled) {
@@ -136,28 +199,32 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
     return () => {
       isCancelled = true;
     };
-  }, [effectiveLessonId, studentUid, studentEmail]);
+  }, [effectiveLessonId, effectiveStudentUid, studentEmail, teacherUid]);
 
   const handleRegenerateSnapshot = async () => {
-    if (!effectiveLessonId || !studentUid || isLoadingSnapshot) return;
+    if ((!effectiveStudentUid && !studentEmail) || isLoadingSnapshot) return;
     setIsLoadingSnapshot(true);
     setSnapshotError(null);
     try {
       const res = await apiClient.post('/api/lesson-insights/generate', {
         body: {
           lessonId: effectiveLessonId,
-          studentUid,
+          studentUid: effectiveStudentUid || undefined,
           studentEmail,
         },
       });
+      if (res?.canonicalStudentUid && isValidCanonicalUid(res.canonicalStudentUid) && res.canonicalStudentUid !== teacherUid) {
+        setCanonicalStudentUid(res.canonicalStudentUid);
+      }
       if (res?.success && res.snapshot) {
         setSnapshot(res.snapshot);
         setIsReusedSnapshot(Boolean(res.reused));
       } else if (res?.message) {
         setSnapshotError(res.message);
       }
-    } catch {
-      setSnapshotError('Unable to generate learning snapshot at this moment. Please try again later.');
+    } catch (err: any) {
+      const errorMsg = err?.data?.message || err?.message || 'Unable to generate learning snapshot at this moment. Please try again later.';
+      setSnapshotError(errorMsg);
     } finally {
       setIsLoadingSnapshot(false);
     }
@@ -177,11 +244,12 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
     isLoading,
     refreshHistory,
   } = useStudentHistory({
-    studentUid,
+    studentUid: effectiveStudentUid || undefined,
     studentEmail,
     weekId,
     weeklyCycle,
     nativeFriendUid: teacherUid,
+    nativeFriendEmail: teacherEmail,
   });
 
   const displayName = studentName || studentEmail.split('@')[0] || 'Student';
@@ -191,19 +259,19 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
   const [journalEntries, setJournalEntries] = useState<StudentJournalEntry[]>([]);
 
   useEffect(() => {
-    if (!studentUid && !studentEmail) return;
-    fetchStudentJournalActivitiesFromFirestore(studentUid, studentEmail).then((items) => {
+    if (!effectiveStudentUid && !studentEmail) return;
+    fetchStudentJournalActivitiesFromFirestore(effectiveStudentUid, studentEmail).then((items) => {
       if (Array.isArray(items) && items.length > 0) {
         setJournalEntries(items);
       }
     });
-    const unsub = subscribeToStudentJournal(studentUid, studentEmail, (items) => {
+    const unsub = subscribeToStudentJournal(effectiveStudentUid, studentEmail, (items) => {
       if (Array.isArray(items)) {
         setJournalEntries(items);
       }
     });
     return () => unsub();
-  }, [studentUid, studentEmail]);
+  }, [effectiveStudentUid, studentEmail]);
 
   // Extract consumed media from studentJournal (Single Source of Truth) + weeklyHistory
   const consumedVideos = useMemo(() => {
@@ -939,8 +1007,8 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
 
         {/* Footer info pill */}
         <div className="flex items-center justify-between pt-2 text-[11px] text-slate-400 border-t border-slate-100">
-          <span>Student UID: <span className="font-mono text-slate-600">{studentUid.slice(0, 14)}...</span></span>
-          <span>Assigned Native Friend UID: <span className="font-mono text-slate-600">{teacherUid.slice(0, 14)}...</span></span>
+          <span>Student UID: <span className="font-mono text-slate-600">{effectiveStudentUid ? (effectiveStudentUid.length > 14 ? `${effectiveStudentUid.slice(0, 14)}...` : effectiveStudentUid) : (studentEmail || 'Resolving...')}</span></span>
+          <span>Assigned Native Friend UID: <span className="font-mono text-slate-600">{teacherUid ? (teacherUid.length > 14 ? `${teacherUid.slice(0, 14)}...` : teacherUid) : 'Resolving...'}</span></span>
         </div>
       </div>
     </div>

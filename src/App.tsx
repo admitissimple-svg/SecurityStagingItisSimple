@@ -146,7 +146,11 @@ import {
 } from './utils/studentPersistence';
 import { buildConsolidatedActiveDictionary } from './utils/studentDictionaryLibrary';
 import { clearDictionaryMemoryCache } from './utils/dictionaryService';
-import { isGenericTutorId, normalizeTutorName } from './utils/tutorConsolidation';
+import {
+  isGenericTutorId,
+  normalizeTutorName,
+  toDeterministicCanonicalStudentUid,
+} from './utils/tutorConsolidation';
 import { FirestoreSchemaAlertBanner } from './components/FirestoreSchemaAlertBanner';
 import { StudentJournalEntry } from './types';
 import { ManageSubscriptionModal } from './components/ManageSubscriptionModal';
@@ -5884,9 +5888,21 @@ export default function App() {
         if (!isMatchingTeacher(sTeacher, sTeacherUid, sTeacherName)) return;
       }
 
+      // Check if any lesson or record has canonical UID for this student
+      const lessonWithUid = (lessons || []).find(
+        (l) => (l.studentEmail || '').toLowerCase().trim() === email && l.studentUid && isValidCanonicalUid(l.studentUid) && l.studentUid !== teacherUid && l.studentUid !== sTeacherUid
+      );
+      const studentCanonicalUid =
+        (s.uid && isValidCanonicalUid(s.uid) && s.uid !== teacherUid && s.uid !== sTeacherUid ? s.uid : null) ||
+        (lessonWithUid?.studentUid ? lessonWithUid.studentUid : null) ||
+        ((s as any).studentUid && isValidCanonicalUid((s as any).studentUid) && (s as any).studentUid !== teacherUid && (s as any).studentUid !== sTeacherUid ? (s as any).studentUid : null) ||
+        (s.id && isValidCanonicalUid(s.id) && s.id !== teacherUid && s.id !== sTeacherUid ? s.id : null);
+
       studentMap.set(email, {
         ...s,
-        id: s.id || (s as any).uid || `st-${email}`,
+        id: studentCanonicalUid || (s.id && s.id !== teacherUid ? s.id : (s as any).uid || `st-${email}`),
+        uid: studentCanonicalUid || (s as any).uid && (s as any).uid !== teacherUid ? (s as any).uid : undefined,
+        studentUid: studentCanonicalUid || (s as any).studentUid && (s as any).studentUid !== teacherUid ? (s as any).studentUid : undefined,
         name: s.name || s.studentName || email.split('@')[0],
         studentName: s.name || s.studentName || email.split('@')[0],
         email,
@@ -5949,9 +5965,12 @@ export default function App() {
       }
 
       const existing = studentMap.get(email) || ({} as GoogleAccount);
+      const lessonStudentUid = (l.studentUid && isValidCanonicalUid(l.studentUid) && l.studentUid !== teacherUid) ? l.studentUid : undefined;
       studentMap.set(email, {
         ...existing,
-        id: existing.id || l.studentUid || `st-${email}`,
+        id: (existing.id && !existing.id.startsWith('st-') && existing.id !== teacherUid) ? existing.id : (lessonStudentUid || existing.id || `st-${email}`),
+        uid: existing.uid && existing.uid !== teacherUid ? existing.uid : lessonStudentUid,
+        studentUid: (existing as any).studentUid && (existing as any).studentUid !== teacherUid ? (existing as any).studentUid : lessonStudentUid,
         name: existing.name || l.studentName || email.split('@')[0],
         studentName: (existing as any).studentName || l.studentName || email.split('@')[0],
         email,
@@ -6281,7 +6300,6 @@ export default function App() {
                         s.uid === selectedStudentFilter ||
                         s.id === selectedStudentFilter)
                   );
-                  const stUid = found?.uid || found?.id || selectedStudentFilter;
                   const stEmail = found?.email || selectedStudentFilter || '';
                   const stCleanEmail = (stEmail || '').toLowerCase().trim();
                   const stName = found?.name || (found as any)?.studentName || (found as any)?.fullName || (stEmail ? stEmail.split('@')[0] : 'Student');
@@ -6301,6 +6319,19 @@ export default function App() {
                     const lEmail = (l.studentEmail || '').toLowerCase().trim();
                     return Boolean(stCleanEmail && lEmail === stCleanEmail);
                   });
+
+                  // Resolve canonical student UID from all verified available sources (strictly excluding teacher UID)
+                  const lessonWithUid = studentLessons.find((l) => l.studentUid && isValidCanonicalUid(l.studentUid) && l.studentUid !== teacherUidVal) ||
+                    (lessons || []).find((l) => (l.studentEmail || '').toLowerCase().trim() === stCleanEmail && l.studentUid && isValidCanonicalUid(l.studentUid) && l.studentUid !== teacherUidVal);
+
+                  const canonicalUidCandidate =
+                    (found?.uid && isValidCanonicalUid(found.uid) && found.uid !== teacherUidVal ? found.uid : '') ||
+                    (lessonWithUid?.studentUid ? lessonWithUid.studentUid : '') ||
+                    ((found as any)?.studentUid && isValidCanonicalUid((found as any).studentUid) && (found as any).studentUid !== teacherUidVal ? (found as any).studentUid : '') ||
+                    (isValidCanonicalUid(selectedStudentFilter) && selectedStudentFilter !== teacherUidVal ? selectedStudentFilter : '') ||
+                    (found?.id && isValidCanonicalUid(found.id) && found.id !== teacherUidVal ? found.id : '');
+
+                  const stUid = canonicalUidCandidate || (stCleanEmail ? toDeterministicCanonicalStudentUid(stCleanEmail) : '') || (found?.uid && found.uid !== teacherUidVal ? found.uid : '') || (found?.id && !found.id.startsWith('tutor-') && found.id !== teacherUidVal ? found.id : '') || '';
 
                   return (
                     <div className="space-y-5 animate-in fade-in duration-200" id="filtered-student-workspace">
@@ -6418,6 +6449,7 @@ export default function App() {
                             studentName={stName}
                             studentLevel={stLevel}
                             teacherUid={teacherUidVal}
+                            teacherEmail={teacherEmailVal}
                             teacherName={teacherNameVal}
                             weekId={`week-${stWeeklyCycle}`}
                             weeklyCycle={stWeeklyCycle}

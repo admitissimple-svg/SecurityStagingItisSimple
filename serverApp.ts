@@ -108,6 +108,7 @@ import {
   consolidateTutorsList,
   resolveTeacherCanonicalIdentity,
   isValidCanonicalUid,
+  toDeterministicCanonicalStudentUid,
   isGenericTutorId,
   normalizeTutorName,
   scheduleLessonAtomicServer,
@@ -122,6 +123,7 @@ import {
   saveLessonInsightsToFirestoreServer,
   verifyTeacherLessonAccessServer,
   getStudentActivitiesBetweenLessonsServer,
+  registerDbReader,
 } from './src/serverFirestore';
 import { normalizeDictionaryWord } from './src/utils/studentDictionaryLibrary';
 import { DEFAULT_CURATED_PLAYLISTS } from './src/utils/youtubeService';
@@ -895,9 +897,11 @@ if (!isDiagnosticMode()) {
   }
 }
 
-function readDb(): AppDb {
+export function readDb(): AppDb {
   return inMemoryDb;
 }
+
+registerDbReader(readDb);
 
 let syncTimeout: any = null;
 let isCloudHydrated = false;
@@ -9787,35 +9791,132 @@ app.get('/api/lesson-insights', firebaseAuthMiddleware, async (req, res) => {
   }
 
   const lessonId = ((req.query.lessonId as string) || '').trim();
-  const studentUid = ((req.query.studentUid as string) || (req.query.uid as string) || '').trim();
+  const rawStudentUid = ((req.query.studentUid as string) || (req.query.uid as string) || '').trim();
+  const rawStudentEmail = ((req.query.studentEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
 
   if (!lessonId) {
     return res.status(400).json({ error: 'Bad Request', message: 'Missing required lessonId query param.' });
   }
 
-  if (caller.role !== 'teacher' && caller.role !== 'admin') {
+  const db = readDb();
+  const callerUid = caller.uid.trim();
+  const callerEmail = (caller.email || '').toLowerCase().trim();
+  const isTeacherOrAdmin =
+    caller.role === 'teacher' ||
+    caller.role === 'admin' ||
+    (db.tutorsList || []).some((t: any) => (t.uid && t.uid === callerUid) || (t.id && (t.id === callerUid || t.id === `tutor-${callerUid}`)) || (t.authUid && t.authUid === callerUid) || (callerEmail && t.email && t.email.toLowerCase().trim() === callerEmail)) ||
+    (db.teachers || []).some((t: any) => (t.uid && t.uid === callerUid) || (t.id && (t.id === callerUid || t.id === `tutor-${callerUid}`)) || (t.authUid && t.authUid === callerUid) || (callerEmail && t.email && t.email.toLowerCase().trim() === callerEmail));
+
+  if (!isTeacherOrAdmin) {
     return res.status(403).json({ error: 'Forbidden', message: 'Access denied: Teacher or administrator privileges required.' });
   }
 
-  if (caller.role === 'teacher') {
-    const isAuthorized = await verifyTeacherLessonAccessServer(
-      caller.uid,
-      caller.email,
-      studentUid,
-      lessonId,
-      caller.role
-    );
-    if (!isAuthorized) {
-      return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to this lesson.' });
+  const effectiveCallerRole: 'admin' | 'teacher' | 'student' = caller.role === 'admin' ? 'admin' : (isTeacherOrAdmin ? 'teacher' : (caller.role as 'student'));
+  const callerForIdentity = { ...caller, role: effectiveCallerRole };
+
+  // Never allow teacher's own UID to masquerade as the student's UID
+  let canonicalStudentUid = (rawStudentUid && isValidCanonicalUid(rawStudentUid) && rawStudentUid !== callerUid && !rawStudentUid.startsWith('tutor-')) ? rawStudentUid : '';
+  let canonicalStudentEmail = rawStudentEmail || (rawStudentUid.includes('@') ? rawStudentUid.toLowerCase() : '');
+
+  if (!canonicalStudentUid && canonicalStudentEmail) {
+    canonicalStudentUid = toDeterministicCanonicalStudentUid(canonicalStudentEmail);
+  }
+
+  if (effectiveCallerRole !== 'admin') {
+    const identityRes = await resolveCanonicalStudentIdentity({
+      caller: callerForIdentity,
+      studentEmail: canonicalStudentEmail || undefined,
+      studentUid: canonicalStudentUid || undefined,
+      lessonId: lessonId || undefined,
+    });
+
+    if (identityRes.authorized) {
+      if (identityRes.canonicalStudentUid && isValidCanonicalUid(identityRes.canonicalStudentUid) && identityRes.canonicalStudentUid !== callerUid) {
+        canonicalStudentUid = identityRes.canonicalStudentUid;
+      }
+      if (identityRes.studentEmail) {
+        canonicalStudentEmail = identityRes.studentEmail;
+      }
+    } else {
+      const isAuthorized = await verifyTeacherLessonAccessServer(
+        caller.uid,
+        caller.email,
+        canonicalStudentUid,
+        lessonId,
+        effectiveCallerRole,
+        canonicalStudentEmail
+      );
+      if (!isAuthorized) {
+        return res.status(403).json({ error: 'Forbidden', message: identityRes.error || 'Unauthorized access to this lesson.' });
+      }
+    }
+  }
+
+  // Attempt resolution from all authoritative server sources if not yet resolved
+  if (!canonicalStudentUid && canonicalStudentEmail) {
+    try {
+      const fsDb = getFirestoreDb();
+      if (fsDb) {
+        const uSnap = await fsDb.collection('users').where('email', '==', canonicalStudentEmail).limit(1).get();
+        if (!uSnap.empty) {
+          const docId = uSnap.docs[0].id;
+          if (docId && docId !== callerUid && isValidCanonicalUid(docId)) {
+            canonicalStudentUid = docId;
+          }
+        }
+      }
+    } catch {}
+
+    if (!canonicalStudentUid) {
+      try {
+        const { getFirebaseAdminAuth } = await import('./src/serverFirebaseAdmin');
+        const adminAuth = getFirebaseAdminAuth();
+        if (adminAuth) {
+          const rec = await adminAuth.getUserByEmail(canonicalStudentEmail);
+          if (rec?.uid && isValidCanonicalUid(rec.uid) && rec.uid !== callerUid) {
+            canonicalStudentUid = rec.uid;
+          }
+        }
+      } catch {}
+    }
+
+    if (!canonicalStudentUid) {
+      const profile = db.userProfiles?.[canonicalStudentEmail];
+      const student = (db.students || []).find((s: any) => (s.email || s.studentEmail || '').toLowerCase().trim() === canonicalStudentEmail);
+      const lesson = (db.liveLessons || []).find((l: any) => (l.studentEmail || '').toLowerCase().trim() === canonicalStudentEmail && l.studentUid && isValidCanonicalUid(l.studentUid) && l.studentUid !== callerUid);
+      const lUid = (profile?.uid && isValidCanonicalUid(profile.uid) && profile.uid !== callerUid ? profile.uid : '') ||
+        (student?.uid && isValidCanonicalUid(student.uid) && student.uid !== callerUid ? student.uid : '') ||
+        (student?.studentUid && isValidCanonicalUid(student.studentUid) && student.studentUid !== callerUid ? student.studentUid : '') ||
+        (lesson?.studentUid && isValidCanonicalUid(lesson.studentUid) && lesson.studentUid !== callerUid ? lesson.studentUid : '');
+      if (lUid) {
+        canonicalStudentUid = lUid;
+      } else {
+        const altId = student?.uid || student?.studentUid || student?.id || profile?.uid || profile?.id;
+        if (altId && altId !== callerUid && !String(altId).startsWith('tutor-')) {
+          canonicalStudentUid = String(altId);
+        } else {
+          canonicalStudentUid = `stu_${canonicalStudentEmail.replace(/[^a-zA-Z0-9]/g, '')}`;
+        }
+      }
     }
   }
 
   try {
     const cached = await fetchLessonInsightsFromFirestoreServer(lessonId);
     if (cached) {
-      return res.json({ exists: true, snapshot: cached });
+      return res.json({
+        exists: true,
+        snapshot: cached,
+        canonicalStudentUid: canonicalStudentUid || cached.studentUid,
+        studentEmail: canonicalStudentEmail,
+      });
     }
-    return res.json({ exists: false, snapshot: null });
+    return res.json({
+      exists: false,
+      snapshot: null,
+      canonicalStudentUid,
+      studentEmail: canonicalStudentEmail,
+    });
   } catch (err: any) {
     return res.status(500).json({ error: 'Internal Server Error', message: err?.message || 'Failed to fetch insights.' });
   }
@@ -9829,31 +9930,124 @@ app.post('/api/lesson-insights/generate', firebaseAuthMiddleware, async (req, re
     return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required' });
   }
 
-  if (caller.role !== 'teacher' && caller.role !== 'admin') {
+  const db = readDb();
+  const callerUid = caller.uid.trim();
+  const callerEmail = (caller.email || '').toLowerCase().trim();
+  const isTeacherOrAdmin =
+    caller.role === 'teacher' ||
+    caller.role === 'admin' ||
+    (db.tutorsList || []).some((t: any) => (t.uid && t.uid === callerUid) || (t.id && (t.id === callerUid || t.id === `tutor-${callerUid}`)) || (t.authUid && t.authUid === callerUid) || (callerEmail && t.email && t.email.toLowerCase().trim() === callerEmail)) ||
+    (db.teachers || []).some((t: any) => (t.uid && t.uid === callerUid) || (t.id && (t.id === callerUid || t.id === `tutor-${callerUid}`)) || (t.authUid && t.authUid === callerUid) || (callerEmail && t.email && t.email.toLowerCase().trim() === callerEmail));
+
+  if (!isTeacherOrAdmin) {
     return res.status(403).json({ error: 'Forbidden', message: 'Access denied: Teacher or administrator privileges required.' });
   }
 
   const body = req.body || {};
   const lessonId = (body.lessonId || '').trim();
-  const studentUid = (body.studentUid || '').trim();
-  const studentEmail = (body.studentEmail || '').toLowerCase().trim();
+  const rawStudentUid = (body.studentUid || '').trim();
+  const rawStudentEmail = (body.studentEmail || '').toLowerCase().trim();
 
-  if (!lessonId || !studentUid) {
-    return res.status(400).json({ error: 'Bad Request', message: 'Missing required lessonId or studentUid.' });
+  if (!lessonId || (!rawStudentUid && !rawStudentEmail)) {
+    return res.status(400).json({ error: 'Bad Request', message: 'Missing required lessonId or student identifier.' });
   }
 
-  if (caller.role === 'teacher') {
-    const isAuthorized = await verifyTeacherLessonAccessServer(
-      caller.uid,
-      caller.email,
-      studentUid,
-      lessonId,
-      caller.role
-    );
-    if (!isAuthorized) {
-      return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access: you may only generate insights for your assigned students.' });
+  const effectiveCallerRole: 'admin' | 'teacher' | 'student' = caller.role === 'admin' ? 'admin' : (isTeacherOrAdmin ? 'teacher' : (caller.role as 'student'));
+  const callerForIdentity = { ...caller, role: effectiveCallerRole };
+
+  // Never allow teacher's own UID to masquerade as the student's UID
+  let canonicalStudentUid = (rawStudentUid && isValidCanonicalUid(rawStudentUid) && rawStudentUid !== callerUid && !rawStudentUid.startsWith('tutor-')) ? rawStudentUid : '';
+  let canonicalStudentEmail = rawStudentEmail || (rawStudentUid.includes('@') ? rawStudentUid.toLowerCase() : '');
+
+  if (!canonicalStudentUid && canonicalStudentEmail) {
+    canonicalStudentUid = toDeterministicCanonicalStudentUid(canonicalStudentEmail);
+  }
+
+  if (effectiveCallerRole !== 'admin') {
+    const identityRes = await resolveCanonicalStudentIdentity({
+      caller: callerForIdentity,
+      studentEmail: canonicalStudentEmail || undefined,
+      studentUid: canonicalStudentUid || undefined,
+      lessonId: lessonId || undefined,
+    });
+
+    if (identityRes.authorized) {
+      if (identityRes.canonicalStudentUid && isValidCanonicalUid(identityRes.canonicalStudentUid) && identityRes.canonicalStudentUid !== callerUid) {
+        canonicalStudentUid = identityRes.canonicalStudentUid;
+      }
+      if (identityRes.studentEmail) {
+        canonicalStudentEmail = identityRes.studentEmail;
+      }
+    } else {
+      const isAuthorized = await verifyTeacherLessonAccessServer(
+        caller.uid,
+        caller.email,
+        canonicalStudentUid,
+        lessonId,
+        effectiveCallerRole,
+        canonicalStudentEmail
+      );
+      if (!isAuthorized) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: identityRes.error || 'Unauthorized access: you may only generate insights for your assigned students.',
+        });
+      }
     }
   }
+
+  // Attempt resolution from all authoritative server sources if not yet resolved
+  if (!canonicalStudentUid && canonicalStudentEmail) {
+    try {
+      const fsDb = getFirestoreDb();
+      if (fsDb) {
+        const uSnap = await fsDb.collection('users').where('email', '==', canonicalStudentEmail).limit(1).get();
+        if (!uSnap.empty) {
+          const docId = uSnap.docs[0].id;
+          if (docId && docId !== callerUid && isValidCanonicalUid(docId)) {
+            canonicalStudentUid = docId;
+          }
+        }
+      }
+    } catch {}
+
+    if (!canonicalStudentUid) {
+      try {
+        const { getFirebaseAdminAuth } = await import('./src/serverFirebaseAdmin');
+        const adminAuth = getFirebaseAdminAuth();
+        if (adminAuth) {
+          const rec = await adminAuth.getUserByEmail(canonicalStudentEmail);
+          if (rec?.uid && isValidCanonicalUid(rec.uid) && rec.uid !== callerUid) {
+            canonicalStudentUid = rec.uid;
+          }
+        }
+      } catch {}
+    }
+
+    if (!canonicalStudentUid) {
+      const profile = db.userProfiles?.[canonicalStudentEmail];
+      const student = (db.students || []).find((s: any) => (s.email || s.studentEmail || '').toLowerCase().trim() === canonicalStudentEmail);
+      const lesson = (db.liveLessons || []).find((l: any) => (l.studentEmail || '').toLowerCase().trim() === canonicalStudentEmail && l.studentUid && isValidCanonicalUid(l.studentUid) && l.studentUid !== callerUid);
+      const lUid = (profile?.uid && isValidCanonicalUid(profile.uid) && profile.uid !== callerUid ? profile.uid : '') ||
+        (student?.uid && isValidCanonicalUid(student.uid) && student.uid !== callerUid ? student.uid : '') ||
+        (student?.studentUid && isValidCanonicalUid(student.studentUid) && student.studentUid !== callerUid ? student.studentUid : '') ||
+        (lesson?.studentUid && isValidCanonicalUid(lesson.studentUid) && lesson.studentUid !== callerUid ? lesson.studentUid : '');
+      if (lUid) {
+        canonicalStudentUid = lUid;
+      } else {
+        const altId = student?.uid || student?.studentUid || student?.id || profile?.uid || profile?.id;
+        if (altId && altId !== callerUid && !String(altId).startsWith('tutor-')) {
+          canonicalStudentUid = String(altId);
+        } else {
+          canonicalStudentUid = `stu_${canonicalStudentEmail.replace(/[^a-zA-Z0-9]/g, '')}`;
+        }
+      }
+    }
+  }
+
+  const effectiveStudentUid = (canonicalStudentUid && canonicalStudentUid !== callerUid)
+    ? canonicalStudentUid
+    : (isValidCanonicalUid(rawStudentUid) && rawStudentUid !== callerUid ? rawStudentUid : (canonicalStudentEmail ? `stu_${canonicalStudentEmail.replace(/[^a-zA-Z0-9]/g, '')}` : ''));
 
   try {
     // A. Recheck Firestore cache: if already saved, return immediately with ZERO AI calls!
@@ -9863,13 +10057,15 @@ app.post('/api/lesson-insights/generate', firebaseAuthMiddleware, async (req, re
         success: true,
         reused: true,
         snapshot: cached,
+        canonicalStudentUid: effectiveStudentUid,
+        studentEmail: canonicalStudentEmail,
       });
     }
 
     // B. Fetch student's real completed activities between previous lesson and current lesson
     const activities = await getStudentActivitiesBetweenLessonsServer(
-      studentUid,
-      studentEmail,
+      effectiveStudentUid,
+      canonicalStudentEmail,
       lessonId,
       caller.uid
     );
@@ -9877,27 +10073,30 @@ app.post('/api/lesson-insights/generate', firebaseAuthMiddleware, async (req, re
     // C. If student has no activities logged, show discreet English message with ZERO AI calls!
     if (!activities.hasActivities || (activities.videos.length === 0 && activities.vocabulary.length === 0)) {
       const emptyMessage = 'No routine activities or 5 Words logged by the student since the last lesson.';
+      const emptySnapshot = {
+        lessonId,
+        studentUid: effectiveStudentUid,
+        teacherUid: caller.uid,
+        summary: `Weekly Learning Snapshot\n- Videos & Topics: None logged yet\n- Key Vocabulary: None logged yet\n- Conversation Starters:\n  1. How was your week, and did you have time to practice English?\n  2. What topic would you like to explore together today?`,
+        videoTopics: [],
+        keyVocabulary: [],
+        conversationStarters: [
+          'How was your week, and did you have time to practice English?',
+          'What topic would you like to explore together today?',
+        ],
+        wordCount: 36,
+        isAiGenerated: false,
+        isNoActivityNotice: true,
+        createdAt: new Date().toISOString(),
+      };
       return res.json({
         success: true,
         hasActivities: false,
         reused: false,
         message: emptyMessage,
-        snapshot: {
-          lessonId,
-          studentUid,
-          teacherUid: caller.uid,
-          summary: `Weekly Learning Snapshot\n- Videos & Topics: None logged yet\n- Key Vocabulary: None logged yet\n- Conversation Starters:\n  1. How was your week, and did you have time to practice English?\n  2. What topic would you like to explore together today?`,
-          videoTopics: [],
-          keyVocabulary: [],
-          conversationStarters: [
-            'How was your week, and did you have time to practice English?',
-            'What topic would you like to explore together today?',
-          ],
-          wordCount: 36,
-          isAiGenerated: false,
-          isNoActivityNotice: true,
-          createdAt: new Date().toISOString(),
-        },
+        snapshot: emptySnapshot,
+        canonicalStudentUid: effectiveStudentUid,
+        studentEmail: canonicalStudentEmail,
       });
     }
 
@@ -9908,7 +10107,13 @@ app.post('/api/lesson-insights/generate', firebaseAuthMiddleware, async (req, re
       await new Promise((r) => setTimeout(r, 1200));
       const newlyCached = await fetchLessonInsightsFromFirestoreServer(lessonId);
       if (newlyCached) {
-        return res.json({ success: true, reused: true, snapshot: newlyCached });
+        return res.json({
+          success: true,
+          reused: true,
+          snapshot: newlyCached,
+          canonicalStudentUid: effectiveStudentUid,
+          studentEmail: canonicalStudentEmail,
+        });
       }
       return res.status(429).json({ error: 'RateLimited', message: 'An insights request for this lesson is already processing. Please wait.' });
     }
@@ -9972,7 +10177,7 @@ STRICT CONSTRAINTS:
 
       const snapshotPayload = {
         lessonId,
-        studentUid,
+        studentUid: effectiveStudentUid,
         teacherUid: caller.uid,
         summary: summaryText,
         videoTopics: Array.isArray(parsed.videoTopics) ? parsed.videoTopics : activities.videos.map((v) => v.title),
@@ -9994,6 +10199,8 @@ STRICT CONSTRAINTS:
         success: true,
         reused: false,
         snapshot: snapshotPayload,
+        canonicalStudentUid: effectiveStudentUid,
+        studentEmail: canonicalStudentEmail,
       });
     } finally {
       await lock.release();
@@ -10693,8 +10900,8 @@ app.get('/api/students/verify-link', async (req, res) => {
 
   const isTeacherAdmin = (db.teachers || []).some(
     (t: any) => t.role === 'admin' && (
-      (teacherUid && (t.uid === teacherUid || t.id === teacherUid)) ||
-      (teacherEmail && t.email?.toLowerCase() === teacherEmail)
+      (teacherUid && (t.uid === teacherUid || t.id === teacherUid || t.authUid === teacherUid || t.id === `tutor-${teacherUid}`)) ||
+      (teacherEmail && t.email?.toLowerCase().trim() === teacherEmail)
     )
   );
 
@@ -10706,23 +10913,41 @@ app.get('/api/students/verify-link', async (req, res) => {
     return res.json({ isLinked: true, reason: 'self' });
   }
 
-  // Find student in db.students
+  // Find student in db.students or db.userProfiles
   const student = (db.students || []).find((s: any) => {
     const sUid = (s.uid || s.id || '').trim();
     const sEmail = (s.email || s.studentEmail || '').toLowerCase().trim();
     return (studentUid && sUid === studentUid) || (studentEmail && sEmail === studentEmail);
   });
 
-  if (student) {
-    const sTeacherUid = (student.teacherUid || (student as any).assignedTeacherId || '').trim();
-    const sTeacherEmail = (student.teacherEmail || '').toLowerCase().trim();
-    if (
-      (teacherUid && sTeacherUid && teacherUid === sTeacherUid) ||
-      (teacherEmail && sTeacherEmail && teacherEmail === sTeacherEmail) ||
-      (teacherUid && sTeacherEmail && teacherUid.toLowerCase().includes(sTeacherEmail))
-    ) {
-      return res.json({ isLinked: true, reason: 'assigned_student' });
-    }
+  const profile = (studentEmail && db.userProfiles?.[studentEmail]) ||
+    Object.values(db.userProfiles || {}).find((p: any) => {
+      const pEmail = (p.email || '').toLowerCase().trim();
+      const pUid = (p.uid || p.id || '').trim();
+      return (studentUid && pUid === studentUid) || (studentEmail && pEmail === studentEmail);
+    });
+
+  const isApprovedTutor = (db.teachers || []).some((t: any) =>
+    (teacherUid && (t.uid === teacherUid || t.id === teacherUid || t.authUid === teacherUid || t.id === `tutor-${teacherUid}`)) ||
+    (teacherEmail && t.email?.toLowerCase().trim() === teacherEmail)
+  ) || (db.tutorsList || []).some((t: any) =>
+    (teacherUid && (t.uid === teacherUid || t.id === teacherUid || t.authUid === teacherUid || t.id === `tutor-${teacherUid}`)) ||
+    (teacherEmail && t.email?.toLowerCase().trim() === teacherEmail)
+  );
+
+  const sTeacherUid = (student?.teacherUid || (student as any)?.assignedTeacherId || (student as any)?.assignedNativeFriendUID || profile?.teacherUid || (profile as any)?.assignedNativeFriendUID || '').trim();
+  const sTeacherEmail = (student?.teacherEmail || profile?.teacherEmail || '').toLowerCase().trim();
+  const isDirectMatch =
+    (teacherUid && sTeacherUid && (teacherUid === sTeacherUid || teacherUid === `tutor-${sTeacherUid}` || sTeacherUid === `tutor-${teacherUid}`)) ||
+    (teacherEmail && sTeacherEmail && teacherEmail === sTeacherEmail) ||
+    (teacherUid && sTeacherEmail && teacherUid.toLowerCase().includes(sTeacherEmail));
+  const isConflict = Boolean(
+    sTeacherEmail && teacherEmail && sTeacherEmail !== teacherEmail &&
+    sTeacherUid && teacherUid && sTeacherUid !== teacherUid && sTeacherUid !== `tutor-${teacherUid}`
+  );
+
+  if (isDirectMatch || (isApprovedTutor && !isConflict && (studentEmail || studentUid))) {
+    return res.json({ isLinked: true, reason: 'assigned_student' });
   }
 
   // Check scheduled lessons
@@ -10733,7 +10958,9 @@ app.get('/api/students/verify-link', async (req, res) => {
     const lTeacherUid = (l.teacherUid || (l as any).tutorUid || '').trim();
 
     const studentMatches = (studentEmail && lStudentEmail === studentEmail) || (studentUid && lStudentUid === studentUid);
-    const teacherMatches = (teacherEmail && lTeacherEmail === teacherEmail) || (teacherUid && lTeacherUid === teacherUid);
+    const teacherMatches =
+      (teacherEmail && lTeacherEmail === teacherEmail) ||
+      (teacherUid && (lTeacherUid === teacherUid || lTeacherUid === `tutor-${teacherUid}` || teacherUid === `tutor-${lTeacherUid}`));
     return studentMatches && teacherMatches && l.status !== 'cancelled';
   });
 
