@@ -20,22 +20,52 @@ import crypto from 'crypto';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { getFirestoreDb } from './serverFirestore';
 
-export const DEFAULT_GEMINI_MODEL: string = 'gemini-3.8-flash';
+export const DEFAULT_GEMINI_MODEL: string = 'gemini-3.5-flash';
 
 /**
- * Resolves the Gemini model from the environment variable GEMINI_MODEL.
+ * Resolves the primary Gemini model from the environment variable GEMINI_MODEL.
  * Sanitizes input (stripping 'models/' prefix), ignores deprecated/legacy staging values ('gemini-2.5-flash'),
- * and safely defaults to the confirmed Flash model 'gemini-3.8-flash'.
+ * and safely defaults to 'gemini-3.5-flash'.
  */
 export function resolveGeminiModel(): string {
   const envModel = (process.env.GEMINI_MODEL || '').trim().replace(/^models\//, '');
-  if (envModel && envModel !== 'gemini-2.5-flash' && envModel !== 'gemini-3.5-flash') {
+  if (envModel && envModel !== 'gemini-2.5-flash') {
     return envModel;
   }
   return DEFAULT_GEMINI_MODEL;
 }
 
 export const GEMINI_FIXED_MODEL = resolveGeminiModel();
+
+/**
+ * Validated 3-model contingency pool.
+ * Verified available in project: gemini-3.5-flash, gemini-3.8-flash, gemini-3.1-flash-lite.
+ */
+export const GEMINI_CONTINGENCY_MODELS: readonly string[] = [
+  'gemini-3.5-flash',
+  'gemini-3.8-flash',
+  'gemini-3.1-flash-lite',
+] as const;
+
+/**
+ * Resolves the ordered list of up to three contingency models.
+ * If GEMINI_MODEL is set, it becomes the primary model, followed by the remaining contingency models.
+ * If GEMINI_CONTINGENCY_MODELS is explicitly configured, it sanitizes and uses that list.
+ */
+export function resolveGeminiContingencyModels(): string[] {
+  const envContingency = (process.env.GEMINI_CONTINGENCY_MODELS || '').trim();
+  if (envContingency) {
+    const list = envContingency
+      .split(',')
+      .map((m) => m.trim().replace(/^models\//, ''))
+      .filter((m) => Boolean(m) && m !== 'gemini-2.5-flash');
+    if (list.length > 0) return list.slice(0, 3);
+  }
+  const primary = resolveGeminiModel();
+  const pool = ['gemini-3.5-flash', 'gemini-3.8-flash', 'gemini-3.1-flash-lite'];
+  const ordered = [primary, ...pool.filter((m) => m !== primary)];
+  return ordered.slice(0, 3);
+}
 
 export type GeminiFeature =
   | 'pedagogical_transform'
@@ -86,11 +116,11 @@ export const GEMINI_POLICIES: Record<GeminiFeature, FeaturePolicy> = {
     timeoutMs: 5500,
   },
   check_writing: {
-    maxOutputTokens: 1000,
+    maxOutputTokens: 600,
     rateLimitWindowSeconds: 60,
     rateLimitMaxRequests: 15,
     maxInputLengthChars: 500,
-    timeoutMs: 10000,
+    timeoutMs: 6000,
   },
   homework_evaluate: {
     maxOutputTokens: 1200,
@@ -100,11 +130,11 @@ export const GEMINI_POLICIES: Record<GeminiFeature, FeaturePolicy> = {
     timeoutMs: 15000,
   },
   dictionary_define: {
-    maxOutputTokens: 800,
+    maxOutputTokens: 400,
     rateLimitWindowSeconds: 60,
-    rateLimitMaxRequests: 30,
+    rateLimitMaxRequests: 20,
     maxInputLengthChars: 100,
-    timeoutMs: 15000,
+    timeoutMs: 5000,
   },
   vocab_generate: {
     maxOutputTokens: 800,
@@ -189,7 +219,7 @@ export function sendGeminiCostControlUnavailable(res: any, retryAfterSeconds: nu
  */
 export function logGeminiAudited(event: {
   feature: GeminiFeature;
-  status: 'SUCCESS' | 'RATE_LIMITED' | 'INFLIGHT_LOCKED' | 'PAYLOAD_INVALID' | 'GEMINI_ERROR' | 'FALLBACK';
+  status: 'SUCCESS' | 'RATE_LIMITED' | 'INFLIGHT_LOCKED' | 'PAYLOAD_INVALID' | 'GEMINI_ERROR' | 'FALLBACK' | 'CONTINGENCY_FAILOVER';
   callerRole?: string;
   durationMs?: number;
   tokensEstimated?: number;
@@ -494,6 +524,7 @@ export async function executeGeminiSingleAttempt(params: {
   temperature?: number;
   apiKey?: string;
   callerRole?: string;
+  model?: string;
 }): Promise<GeminiSingleAttemptResponse | null> {
   const { feature, systemInstruction, untrustedUserDataPrompt, temperature = 0.35, callerRole = 'student' } = params;
   const policy = GEMINI_POLICIES[feature];
@@ -504,7 +535,7 @@ export async function executeGeminiSingleAttempt(params: {
       feature,
       status: 'FALLBACK',
       callerRole,
-      detail: 'No API key configured; activating deterministic fallback.',
+      detail: 'No API key configured; activating fallback/error.',
     });
     return {
       text: undefined,
@@ -519,6 +550,7 @@ export async function executeGeminiSingleAttempt(params: {
   }
 
   const startTime = Date.now();
+  const modelToUse = (params.model || resolveGeminiModel()).trim().replace(/^models\//, '');
 
   try {
     const ai = new GoogleGenAI({
@@ -541,9 +573,6 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
 
     const contents = `[DATA_BLOCK_START]\n${untrustedUserDataPrompt.trim()}\n[DATA_BLOCK_END]`;
 
-    // Config for Gemini model:
-    // For Gemini 3/4 series models (gemini-3.8-flash), configure thinkingBudget: 0
-    // to minimize latency, protect token budget, and ensure instant structured JSON adherence without reasoning token delays.
     const config: any = {
       systemInstruction: hardenedSystemInstruction,
       responseMimeType: 'application/json',
@@ -551,7 +580,6 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
       temperature,
     };
 
-    const modelToUse = resolveGeminiModel();
     if (modelToUse.startsWith('gemini-3') || modelToUse.startsWith('gemini-4')) {
       config.thinkingConfig = { thinkingBudget: 0 };
     }
@@ -579,6 +607,7 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
         status: 'GEMINI_ERROR',
         callerRole,
         durationMs,
+        model: modelToUse,
         detail: 'Model returned empty response text.',
       });
       return {
@@ -587,6 +616,7 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
           statusCode: 502,
           category: 'INVALID_RESPONSE',
           safeReason: 'Model returned empty response text.',
+          rawMessage: 'EMPTY_RESPONSE',
         },
       };
     }
@@ -609,6 +639,7 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
         status: 'GEMINI_ERROR',
         callerRole,
         durationMs,
+        model: modelToUse,
         detail: 'Model response was not valid JSON.',
       });
       return {
@@ -617,6 +648,7 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
           statusCode: 502,
           category: 'INVALID_RESPONSE',
           safeReason: 'Model response was not valid JSON.',
+          rawMessage: 'MALFORMED_JSON',
         },
       };
     }
@@ -626,6 +658,7 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
       status: 'SUCCESS',
       callerRole,
       durationMs,
+      model: modelToUse,
       tokensEstimated: Math.ceil(cleanJson.length / 4),
     });
 
@@ -646,11 +679,12 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
 
     const statusCode = isServiceUnavailable
       ? 503
-      : rawStatus || (errMsg.includes('429') ? 429 : errMsg.includes('403') ? 403 : 500);
+      : rawStatus || (errMsg.includes('429') ? 429 : errMsg.includes('403') ? 403 : errMsg.includes('401') ? 401 : errMsg.includes('400') ? 400 : 500);
 
     const isQuota = !isServiceUnavailable && (statusCode === 429 || errMsg.toLowerCase().includes('quota') || errMsg.toLowerCase().includes('resource_exhausted'));
     const isAuth = !isServiceUnavailable && (statusCode === 401 || statusCode === 403 || errMsg.toLowerCase().includes('permission_denied') || errMsg.toLowerCase().includes('api_key'));
     const isTimeout = !isServiceUnavailable && (errMsg.toLowerCase().includes('timeout') || statusCode === 408);
+    const isPolicyOrBadReq = statusCode === 400 || errMsg.toLowerCase().includes('invalid_argument') || errMsg.toLowerCase().includes('safety');
 
     const category: GeminiFailureCategory = isServiceUnavailable
       ? 'SERVICE_UNAVAILABLE'
@@ -660,6 +694,8 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
       ? 'AUTH_ERROR'
       : isTimeout
       ? 'TIMEOUT'
+      : isPolicyOrBadReq
+      ? 'POLICY_VIOLATION'
       : 'INVALID_RESPONSE';
 
     const safeReason = isServiceUnavailable
@@ -670,6 +706,8 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
       ? 'Gemini authentication failed or invalid credentials.'
       : isTimeout
       ? 'Request timed out waiting for model response.'
+      : isPolicyOrBadReq
+      ? 'Request could not be processed due to invalid parameters or policy.'
       : 'Gemini service encountered an internal error.';
 
     logGeminiAudited({
@@ -677,20 +715,237 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
       status: 'GEMINI_ERROR',
       callerRole,
       durationMs,
+      model: modelToUse,
       detail: errMsg.slice(0, 100),
     });
 
-    // Zero retries! Return structured error so caller immediately uses deterministic fallback tagged as provisional
     return {
       parsedJson: null,
       error: {
         statusCode,
         category,
         safeReason,
-        rawMessage: errMsg.slice(0, 100),
+        rawMessage: errMsg.slice(0, 150),
       },
     };
   }
+}
+
+/**
+ * Checks whether an error is non-recoverable (authentication, authorization, or shared/project-wide quota).
+ * If non-recoverable, all contingency models must be aborted immediately.
+ */
+export function isNonRecoverableGeminiError(error?: {
+  statusCode?: number;
+  category?: GeminiFailureCategory;
+  rawMessage?: string;
+} | Error | null): boolean {
+  if (!error) return false;
+
+  let statusCode: number | undefined;
+  let category: GeminiFailureCategory | undefined;
+  let rawMessage = '';
+
+  if (error instanceof Error) {
+    rawMessage = error.message || '';
+    if ((error as any).status || (error as any).statusCode) {
+      statusCode = (error as any).status || (error as any).statusCode;
+    }
+  } else {
+    statusCode = error.statusCode;
+    category = error.category;
+    rawMessage = error.rawMessage || '';
+  }
+
+  if (category === 'AUTH_ERROR') return true;
+  if (category === 'POLICY_VIOLATION') return true;
+  if (statusCode === 401 || statusCode === 403 || statusCode === 400) return true;
+
+  const raw = rawMessage.toLowerCase();
+  if (
+    raw.includes('billing') ||
+    raw.includes('account_disabled') ||
+    raw.includes('api_key_invalid') ||
+    raw.includes('apikey not found') ||
+    raw.includes('api key not valid') ||
+    raw.includes('permission denied') ||
+    raw.includes('user location is not supported') ||
+    raw.includes('disabled on project') ||
+    raw.includes('project has been deleted') ||
+    raw.includes('project_quota_exceeded') ||
+    raw.includes('shared_quota')
+  ) {
+    return true;
+  }
+
+  // Quota evaluation:
+  // If quota is shared/project-wide (e.g. daily limit for project): non-recoverable.
+  // If quota is per-model (e.g. GenerateRequestsPerDayPerProjectPerModel): recoverable on next model in contingency pool.
+  if (category === 'QUOTA_EXCEEDED' || raw.includes('quota')) {
+    if (raw.includes('perprojectpermodel') || raw.includes('free_tier_requests')) {
+      return false; // Per-model quota: next model in contingency can be attempted
+    }
+    if (raw.includes('project') && (raw.includes('perday') || raw.includes('limit_exceeded') || raw.includes('billable'))) {
+      return true; // Project-level quota exhausted
+    }
+  }
+
+  return false;
+}
+
+export interface GeminiContingencyResult {
+  success: boolean;
+  text?: string;
+  parsedJson: any | null;
+  modelUsed?: string;
+  attemptsCount: number;
+  modelsAttempted: string[];
+  error?: {
+    statusCode?: number;
+    category: GeminiFailureCategory;
+    safeReason: string;
+    rawMessage?: string;
+    nonRecoverable?: boolean;
+  };
+}
+
+/**
+ * Shared Contingency Executor for the 8 pedagogical AI flows:
+ * - Sequentially attempts up to three verified Gemini models (gemini-3.5-flash, gemini-3.8-flash, gemini-3.1-flash-lite).
+ * - Fails over ONLY on recoverable failures (HTTP 503, timeout, or invalid JSON response).
+ * - Aborts IMMEDIATELY on non-recoverable errors (auth, forbidden, bad argument, shared quota).
+ * - Zero artificial fallback responses: returns transparent error when all models are exhausted.
+ */
+export async function executeGeminiWithContingency(
+  params: {
+    feature: GeminiFeature;
+    systemInstruction: string;
+    untrustedUserDataPrompt: string;
+    temperature?: number;
+    apiKey?: string;
+    callerRole?: string;
+    validator?: (json: any) => boolean;
+    jsonValidator?: (json: any) => boolean;
+    modelsOverride?: string[];
+  },
+  attemptExecutor?: (model: string, params: any) => Promise<any>
+): Promise<GeminiContingencyResult> {
+  const models = params.modelsOverride && params.modelsOverride.length > 0
+    ? params.modelsOverride.slice(0, 3)
+    : resolveGeminiContingencyModels();
+
+  const modelsAttempted: string[] = [];
+  let lastError: any = null;
+
+  for (let i = 0; i < models.length; i++) {
+    const currentModel = models[i];
+    modelsAttempted.push(currentModel);
+
+    let attempt: any = null;
+    try {
+      if (attemptExecutor) {
+        attempt = await attemptExecutor(currentModel, params);
+      } else {
+        attempt = await executeGeminiSingleAttempt({
+          ...params,
+          model: currentModel,
+        });
+      }
+    } catch (err: any) {
+      attempt = {
+        text: '',
+        parsedJson: null,
+        error: {
+          statusCode: err?.status || err?.statusCode || 500,
+          category: isNonRecoverableGeminiError(err) ? 'AUTH_ERROR' : 'SERVICE_UNAVAILABLE',
+          safeReason: err?.message || 'Execution failed',
+          rawMessage: err?.message || String(err),
+        },
+      };
+    }
+
+    if (attempt?.parsedJson) {
+      const validatorFn = params.jsonValidator || params.validator;
+      const isValid = validatorFn ? validatorFn(attempt.parsedJson) : true;
+      if (isValid) {
+        logGeminiAudited({
+          feature: params.feature,
+          status: 'SUCCESS',
+          callerRole: params.callerRole,
+          model: currentModel,
+          detail: `Contingency success on model ${currentModel} (attempt ${i + 1}/${models.length})`,
+        });
+        return {
+          success: true,
+          text: attempt.text,
+          parsedJson: attempt.parsedJson,
+          modelUsed: currentModel,
+          attemptsCount: i + 1,
+          modelsAttempted,
+        };
+      } else {
+        attempt.error = {
+          statusCode: 502,
+          category: 'INVALID_RESPONSE',
+          safeReason: `Model ${currentModel} output did not conform to pedagogical schema contract.`,
+          rawMessage: 'VALIDATION_FAILED',
+        };
+      }
+    }
+
+    lastError = attempt?.error || {
+      statusCode: 502,
+      category: 'INVALID_RESPONSE',
+      safeReason: `Model ${currentModel} returned an empty or invalid response.`,
+    };
+
+    // Rule 3: Stop immediately on non-recoverable errors (auth, policy, shared quota)
+    if (isNonRecoverableGeminiError(lastError)) {
+      lastError.nonRecoverable = true;
+      logGeminiAudited({
+        feature: params.feature,
+        status: 'GEMINI_ERROR',
+        callerRole: params.callerRole,
+        model: currentModel,
+        detail: `Non-recoverable error (${lastError.category}: ${lastError.rawMessage?.slice(0, 80)}). Aborting contingency sequence immediately.`,
+      });
+      return {
+        success: false,
+        parsedJson: null,
+        modelUsed: currentModel,
+        attemptsCount: i + 1,
+        modelsAttempted,
+        error: lastError,
+      };
+    }
+
+    // Recoverable error: failover to next model if available
+    if (i + 1 < models.length) {
+      logGeminiAudited({
+        feature: params.feature,
+        status: 'CONTINGENCY_FAILOVER',
+        callerRole: params.callerRole,
+        model: currentModel,
+        detail: `Recoverable error on ${currentModel} (${lastError.category}). Falling over to contingency model ${models[i + 1]}.`,
+      });
+    }
+  }
+
+  // All contingency models exhausted
+  logGeminiAudited({
+    feature: params.feature,
+    status: 'GEMINI_ERROR',
+    callerRole: params.callerRole,
+    detail: `All ${models.length} contingency models exhausted (${modelsAttempted.join(', ')}). Returning transparent error without synthetic fallbacks.`,
+  });
+
+  return {
+    success: false,
+    parsedJson: null,
+    attemptsCount: modelsAttempted.length,
+    modelsAttempted,
+    error: lastError,
+  };
 }
 
 /**

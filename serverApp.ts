@@ -201,6 +201,8 @@ import {
   acquireSingleFlightLock,
   validatePayloadBounds,
   executeGeminiSingleAttempt,
+  executeGeminiWithContingency,
+  resolveGeminiContingencyModels,
   logGeminiAudited,
   resetGeminiSecurityStateForTesting,
   sendGeminiCostControlUnavailable,
@@ -4211,17 +4213,18 @@ Respond strictly with a JSON object:
   "register": "..."
 }`;
 
-    // Security Hotfix (Etapa 2): Single attempt with gemini-2.5-flash, zero cascade, exact token bound
-    const singleAttempt = await executeGeminiSingleAttempt({
+    // Gemini 3-Model Contingency: Up to 3 sequential attempts across verified models on recoverable failures
+    const contingencyResult = await executeGeminiWithContingency({
       feature: 'dictionary_define',
       systemInstruction: 'You are the master Native Friend Notes Pedagogical AI Engine. Provide accurate, crystal-clear lexical analyses for ESL learners in strict JSON.',
       untrustedUserDataPrompt: prompt,
       callerRole,
       apiKey,
       temperature: 0.2,
+      jsonValidator: (val) => Boolean(val && val.definitionEn && val.exampleSentenceEn),
     });
 
-    const parsed = singleAttempt?.parsedJson;
+    const parsed = contingencyResult?.parsedJson;
     if (parsed && parsed.definitionEn && parsed.exampleSentenceEn) {
       return {
         word: parsed.word || cleanWord,
@@ -9273,18 +9276,19 @@ ${rawNotes}
 
 Please synthesize and transform these notes according to the Alt+N, Alt+W, and Alt+P routing rules, adapting deeply to CEFR ${cefr}, and ensuring ALL items are included in the Quick Review. Provide all explanations and pedagogical rules in ${targetLang.nameEn} (${targetLang.nameNative}).`;
 
-      // Security Hotfix (Etapa 2): Single attempt with gemini-2.5-flash, zero cascade, exact token bounds
-      const singleAttempt = await executeGeminiSingleAttempt({
+      // HOTFIX 3-MODEL CONTINGENCY: Sequential failover across up to 3 verified models on recoverable errors
+      const contingencyResult = await executeGeminiWithContingency({
         feature: 'pedagogical_transform',
         systemInstruction,
         untrustedUserDataPrompt: prompt,
         callerRole: caller.role,
         apiKey,
         temperature: 0.35,
+        validator: (json) => Array.isArray(json?.mistakesAnalysis),
       });
 
-      if (singleAttempt?.parsedJson) {
-        const parsed = singleAttempt.parsedJson;
+      if (contingencyResult.success && contingencyResult.parsedJson) {
+        const parsed = contingencyResult.parsedJson;
 
         if (parsed && Array.isArray(parsed.mistakesAnalysis)) {
           // Process mistakes directly preserving AI native corrections
@@ -9616,7 +9620,7 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
             isFallback: false,
             isProvisional: false,
             source: 'gemini' as const,
-            modelUsed: GEMINI_FIXED_MODEL,
+            modelUsed: contingencyResult.modelUsed || GEMINI_FIXED_MODEL,
             mistakesAnalysis: validatedMistakes,
             grammarPoints: validatedGrammar,
             vocabularyAndExpressions: validatedVocab,
@@ -9683,51 +9687,25 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
             journalEntry: recordedJournalEntry,
           });
         }
-      } else if (singleAttempt?.error) {
-        lastFailureCategory = singleAttempt.error.category as GeminiFailureCategory;
-        if (singleAttempt.error.statusCode === 429 || lastFailureCategory === 'QUOTA_EXCEEDED') {
+      } else if (contingencyResult?.error) {
+        lastFailureCategory = contingencyResult.error.category as GeminiFailureCategory;
+        if (contingencyResult.error.statusCode === 429 || lastFailureCategory === 'QUOTA_EXCEEDED') {
           geminiQuotaCooldownUntil = Date.now() + GEMINI_QUOTA_COOLDOWN_MS;
         }
       }
     }
 
-    // Graceful deterministic fallback strictly faithful to notes — clearly identified as provisional
-    const fallbackTransformation = generateServerPedagogicalFallback({
-      rawNotes,
-      topic,
-      sessionDate,
-      teacherName,
-      studentLevel: authoritativeLevel,
-      studentUid: cleanUid || studentUid,
-      studentEmail: cleanEmail,
-      lessonId,
-      sessionKey: canonicalSessionKey,
-      language,
-    });
-
-    fallbackTransformation.isAiGenerated = false;
-    fallbackTransformation.isFallback = true;
-    fallbackTransformation.isProvisional = true;
-    fallbackTransformation.source = 'fallback';
-    fallbackTransformation.fallbackReason = lastFailureCategory || (isCooldownActive ? 'QUOTA_EXCEEDED' : 'AI_UNAVAILABLE');
-    if (lastFailureCategory === 'SERVICE_UNAVAILABLE') {
-      fallbackTransformation.aiNotice =
-        language === 'pt'
-          ? 'O modelo Gemini está temporariamente indisponível devido à alta demanda (HTTP 503). Suas notas originais foram preservadas e você pode tentar novamente a qualquer momento.'
-          : 'The Gemini model is temporarily experiencing high demand (HTTP 503). Original teacher notes are preserved and you can retry at any time.';
-    } else {
-      fallbackTransformation.aiNotice = getAiUnavailableNoticeText(language);
-    }
-    if (isCooldownActive || lastFailureCategory === 'QUOTA_EXCEEDED') {
-      fallbackTransformation.cooldownSecondsRemaining = Math.max(1, Math.ceil((geminiQuotaCooldownUntil - Date.now()) / 1000));
-    }
-
-    // FASE 4B.8: Do NOT persist provisional fallback as definitive cache!
-    // "Não reutilizar resultados provisórios como se fossem definitivos. Se a IA falhar, manter as notas originais e estado pendente, permitindo nova tentativa controlada. Não persistir conteúdo genérico como definitivo."
-    return res.json({
-      success: true,
-      cached: false,
-      transformation: fallbackTransformation,
+    // Fail transparently: zero invented/synthetic pedagogical feedback when contingency models fail!
+    const statusCode = contingencyResult?.error?.statusCode === 429 ? 429 : 503;
+    return res.status(statusCode).json({
+      success: false,
+      error: 'AiUnavailable',
+      category: lastFailureCategory || 'SERVICE_UNAVAILABLE',
+      message: language === 'pt'
+        ? 'O serviço pedagógico de IA está temporariamente indisponível após tentativa com os modelos de contingência. As anotações originais do professor foram preservadas intactas.'
+        : 'The pedagogical AI service is temporarily unavailable after trying contingency models. Original teacher notes have been preserved.',
+      attemptsCount: contingencyResult?.attemptsCount || 1,
+      modelsAttempted: contingencyResult?.modelsAttempted || resolveGeminiContingencyModels(),
     });
   } finally {
     await flightLock.release();
@@ -10202,11 +10180,12 @@ STRICT CONSTRAINTS:
 3. NEVER invent activities, videos, or words. Ground yourself strictly in the provided data.
 4. No filler, no apologies, no conversational greetings in JSON.`;
 
-      const geminiResult = await executeGeminiSingleAttempt({
+      const geminiResult = await executeGeminiWithContingency({
         feature: 'lesson_insights',
         callerRole: caller.role,
         systemInstruction,
         untrustedUserDataPrompt: promptData,
+        jsonValidator: (val) => Boolean(val && typeof val.summary === 'string' && val.summary.trim().length > 0),
       });
 
       if (!geminiResult || !geminiResult.parsedJson) {
@@ -14584,18 +14563,19 @@ MANDATORY RULES:
 3. All questions must test factual events, decisions, and turning points in this narrative.
 Return strict JSON only.`;
 
-  // Security Hotfix (Etapa 2): Single attempt with gemini-2.5-flash, exact token bounds, zero cascades
-  const singleAttempt = await executeGeminiSingleAttempt({
+  // HOTFIX 3-MODEL CONTINGENCY: Sequential failover across up to 3 verified models on recoverable errors
+  const contingencyResult = await executeGeminiWithContingency({
     feature: 'homework_part4',
     systemInstruction,
     untrustedUserDataPrompt: userPrompt,
     callerRole: 'student',
     apiKey,
     temperature: 0.7,
+    validator: (json) => Boolean(json && json.title && json.text && !isBadStoryText(json.text) && Array.isArray(json.questions)),
   });
 
-  if (singleAttempt?.parsedJson) {
-    const parsed = singleAttempt.parsedJson;
+  if (contingencyResult.success && contingencyResult.parsedJson) {
+    const parsed = contingencyResult.parsedJson;
     if (
       parsed &&
       parsed.title &&
@@ -14745,18 +14725,19 @@ Required JSON Structure:
   }
 }`;
 
-  // Security Hotfix (Etapa 2): Single attempt with gemini-2.5-flash, exact token bounds, zero cascade
-  const singleAttempt = await executeGeminiSingleAttempt({
+  // HOTFIX 3-MODEL CONTINGENCY: Sequential failover across up to 3 verified models on recoverable errors
+  const contingencyResult = await executeGeminiWithContingency({
     feature: 'homework_generate',
     systemInstruction,
     untrustedUserDataPrompt: userPrompt,
     callerRole: 'student',
     apiKey,
     temperature: 0.65,
+    validator: (json) => Array.isArray(json?.matchingPairs) && Array.isArray(json?.fillInBlanks) && Array.isArray(json?.sentenceWritingPrompts),
   });
 
-  if (singleAttempt?.parsedJson) {
-    const parsed = singleAttempt.parsedJson;
+  if (contingencyResult.success && contingencyResult.parsedJson) {
+    const parsed = contingencyResult.parsedJson;
     if (
       parsed &&
       Array.isArray(parsed.matchingPairs) &&
@@ -14952,95 +14933,20 @@ app.post('/api/homework/generate-ai', firebaseAuthMiddleware, async (req, res) =
       await flightLock.release();
     }
 
-    const wasAiGenerated = Boolean(aiResult && !hasGenericBoilerplate(aiResult));
-
-    // Assemble the 4 parts
-    let matchingPairs: any[] = [];
-    let fillInBlanks: any[] = [];
-    let sentenceWritingPrompts: any[] = [];
-    let readingPassage: any = null;
-
-    if (
-      aiResult &&
-      Array.isArray(aiResult.matchingPairs) &&
-      aiResult.matchingPairs.length > 0 &&
-      Array.isArray(aiResult.fillInBlanks) &&
-      aiResult.fillInBlanks.length > 0 &&
-      !hasGenericBoilerplate(aiResult)
-    ) {
-      matchingPairs = aiResult.matchingPairs;
-      fillInBlanks = aiResult.fillInBlanks;
-      sentenceWritingPrompts = aiResult.sentenceWritingPrompts || [];
-
-      if (aiResult.readingPassage?.text && !isBadStoryText(aiResult.readingPassage.text)) {
-        readingPassage = aiResult.readingPassage;
-      } else {
-        readingPassage = synthesizeCohesiveStoryAndQuestions({
-          words: cleanWords,
-          studentLevel,
-          studentName: 'Alex',
-          wordDetails,
-        });
-      }
-    }
-
-    // Dynamic, contextual fallback without any boilerplate
-    if (!matchingPairs || matchingPairs.length === 0) {
-      matchingPairs = cleanWords.map((w, idx) => {
-        const detail = wordDetails.find((d: any) => d.word?.toLowerCase().trim() === w.toLowerCase().trim());
-        const prof = profileWord(w, detail);
-        return {
-          id: `match-${idx}-${w}`,
-          word: w,
-          definition: prof.definitionEn,
-          translation: prof.translationPt,
-        };
-      }).sort(() => 0.5 - Math.random());
-    }
-
-    if (!fillInBlanks || fillInBlanks.length === 0) {
-      fillInBlanks = synthesizeFillInBlanks(cleanWords, wordDetails);
-    }
-
-    if (!sentenceWritingPrompts || sentenceWritingPrompts.length === 0) {
-      sentenceWritingPrompts = cleanWords.map((w, idx) => {
-        const detail = wordDetails.find((d: any) => d.word?.toLowerCase().trim() === w.toLowerCase().trim());
-        const prof = profileWord(w, detail);
-        let hintEn = '';
-        let hintPt = '';
-        if (levelMeta.key === 'advanced') {
-          hintEn = `Formulate an advanced sentence using "${w}" analyzing a strategic goal, project challenge, or complex decision.`;
-          hintPt = `Formule uma frase em nível avançado usando "${w}" (${prof.translationPt}) analisando uma decisão complexa ou meta de carreira.`;
-        } else if (levelMeta.key === 'intermediate') {
-          hintEn = `Write an authentic compound sentence with "${w}" connecting two related actions or explaining a key reason in your daily routine.`;
-          hintPt = `Escreva uma frase intermediária autêntica com "${w}" (${prof.translationPt}) conectando duas ações ou explicando uma razão da rotina.`;
-        } else {
-          hintEn = `Write a clear, direct English sentence about your daily routine using "${w}".`;
-          hintPt = `Escreva uma frase simples e direta sobre sua rotina usando "${w}" (${prof.translationPt}).`;
-        }
-        return {
-          word: w,
-          hint: hintEn,
-          hintPt,
-          hintEn,
-          levelInstruction: levelMeta.key === 'advanced'
-            ? 'Use complex clauses, conditionals (if/would), or executive phrasing.'
-            : levelMeta.key === 'intermediate'
-            ? 'Connect two ideas using a connector like "because", "although", "since", or "while".'
-            : 'Use a clear Subject + Verb + Object structure.',
-        };
+    if (!aiResult) {
+      return res.status(503).json({
+        success: false,
+        error: 'AiUnavailable',
+        message: 'Não foi possível gerar a Atividade de Memorização no momento devido à indisponibilidade do serviço de IA. Suas palavras da semana foram preservadas.',
       });
     }
 
-
-    if (!readingPassage || isBadStoryText(readingPassage.text)) {
-      readingPassage = synthesizeCohesiveStoryAndQuestions({
-        words: cleanWords,
-        studentLevel,
-        studentName,
-        wordDetails,
-      });
-    }
+    // Assemble the 4 genuine AI-generated parts
+    const matchingPairs = aiResult.matchingPairs;
+    const fillInBlanks = aiResult.fillInBlanks;
+    const sentenceWritingPrompts = aiResult.sentenceWritingPrompts || [];
+    const readingPassage = aiResult.readingPassage;
+    const wasAiGenerated = true;
 
     // Build unified vocabulary list populated directly with contextual definitions and sentences
     const vocabularyList = cleanWords.map((word) => {
@@ -15299,17 +15205,18 @@ Daily Words: ${JSON.stringify(cleanDailyWords)}
 Return strict JSON:
 {"hasAnyError":boolean,"isCorrect":boolean,"usedWords":[string],"missingWords":[string],"correctedSentence":string,"explanationPt":string,"explanationEn":string,"wordFeedbacks":[{"original":string,"hasError":boolean,"corrected":string,"explanationPt":string,"explanationEn":string}]}`;
 
-    // Security Hotfix (Etapa 2): Single attempt with gemini-2.5-flash, exact token bounds, zero cascade
-    const singleAttempt = await executeGeminiSingleAttempt({
+    // HOTFIX 3-MODEL CONTINGENCY: Sequential failover across up to 3 verified models on recoverable errors
+    const contingencyResult = await executeGeminiWithContingency({
       feature: 'check_daily_sentence',
       systemInstruction: 'You are an ultra-rigorous English grammar checker for Sentence of the Day. Respond strictly in valid JSON.',
       untrustedUserDataPrompt: concisePrompt,
       callerRole: 'student',
       apiKey,
       temperature: 0.1,
+      validator: (json) => typeof json === 'object' && ('hasAnyError' in json || 'isCorrect' in json),
     });
 
-    const parsed = singleAttempt?.parsedJson;
+    const parsed = contingencyResult?.parsedJson;
     if (parsed && typeof parsed === 'object') {
       // Ensure Gemini's correctedSentence also passes deterministic capitalization/tense rules
       const rawAiCorrected =
@@ -15426,47 +15333,8 @@ Return strict JSON:
     }
   }
 
-  const targetWordFeedback = hasWordConstraint
-    ? usedTargetWord
-      ? missingWords.length > 0
-        ? `Palavras utilizadas (${usedWords.length}/${cleanDailyWords.length}): ${usedWords.join(', ')}. Não incluída(s): ${missingWords.join(', ')}.`
-        : `Palavras da rotina utilizadas (${usedWords.length}/${cleanDailyWords.length}): ${usedWords.join(', ')}.`
-      : `Inclua pelo menos uma palavra da sua rotina na frase (${cleanDailyWords.slice(0, 5).join(', ')}).`
-    : '';
-
-  const fallbackExplPt = hasProgrammaticError
-    ? programmaticErrorsPt.join(' ')
-    : 'Sua frase está gramaticalmente correta e bem estruturada.';
-  const fallbackExplEn = hasProgrammaticError
-    ? programmaticErrorsEn.join(' ')
-    : 'Your sentence is grammatically sound and well structured.';
-
-  const fallbackPayload = {
-    hasAnyError: hasProgrammaticError,
-    isCorrect: !hasProgrammaticError,
-    usedTargetWord,
-    usedWords,
-    missingWords,
-    targetWordFeedback,
-    wordFeedbacks,
-    sentenceFeedback: {
-      original: rawClean,
-      hasError: hasProgrammaticError,
-      corrected: programmaticFixed,
-      explanationPt: fallbackExplPt,
-      explanationEn: fallbackExplEn,
-    },
-    correctedSentence: programmaticFixed,
-    explanation: fallbackExplPt,
-    overallSummaryPt: fallbackExplPt,
-    overallSummaryEn: fallbackExplEn,
-  };
-
-  dailySentenceEvaluationCache.set(cacheKey, {
-    data: fallbackPayload,
-    expiry: Date.now() + 10 * 60 * 1000,
-  });
-  return fallbackPayload;
+  // Transparent failure: do NOT invent synthetic passes or fake grammar evaluations
+  return null;
 }
 
 app.post('/api/check-daily-sentence', firebaseAuthMiddleware, async (req, res) => {
@@ -15544,17 +15412,19 @@ app.post('/api/check-daily-sentence', firebaseAuthMiddleware, async (req, res) =
     } finally {
       await flightLock.release();
     }
+    if (!result) {
+      return res.status(503).json({
+        success: false,
+        error: 'AiUnavailable',
+        message: 'Serviço de verificação da Frase do Dia temporariamente indisponível. Sua frase foi preservada.',
+      });
+    }
     return res.json(result);
   } catch (err: any) {
-    return res.status(200).json({
-      hasAnyError: false,
-      isCorrect: true,
-      usedTargetWord: true,
-      usedWords: Array.isArray(req.body?.dailyWords) ? req.body.dailyWords : [],
-      missingWords: [],
-      correctedSentence: req.body?.sentence || '',
-      explanation: 'Frase verificada com sucesso.',
-      isFallback: true,
+    return res.status(503).json({
+      success: false,
+      error: 'AiUnavailable',
+      message: 'Não foi possível verificar a frase no momento devido à indisponibilidade do serviço.',
     });
   }
 });
@@ -15834,8 +15704,15 @@ app.post('/api/check-writing', firebaseAuthMiddleware, async (req, res) => {
   }
 
   const apiKey = process.env.GEMINI_API_KEY;
-  if (apiKey) {
-    const prompt = `YOU ARE A METICULOUS, STRICT SENIOR PROFESSOR OF ENGLISH AND GRAMMAR SPECIALIST AT "IT'S SIMPLE".
+  if (!apiKey) {
+    return res.status(503).json({
+      success: false,
+      error: 'AiUnavailable',
+      message: 'Serviço de avaliação de escrita temporariamente indisponível. Sua resposta foi preservada.',
+    });
+  }
+
+  const prompt = `YOU ARE A METICULOUS, STRICT SENIOR PROFESSOR OF ENGLISH AND GRAMMAR SPECIALIST AT "IT'S SIMPLE".
 YOUR TASK: Perform an EXTREMELY RIGOROUS, ZERO-TOLERANCE grammatical, orthographical, and linguistic evaluation of an English sentence written by a student for the "Sentence of the Day".
 
 EVALUATION PARAMETERS:
@@ -15890,12 +15767,20 @@ OUTPUT STRICT JSON matching this schema:
   "levelTipsEn": "string"
 }`;
 
-    let parsed: any = null;
+    let contingencyRes: any = null;
     try {
-      parsed = await callGeminiSafeJson(prompt, 6000, 'check_writing', caller.role);
+      contingencyRes = await executeGeminiWithContingency({
+        feature: 'check_writing',
+        systemInstruction: 'You are an expert English language evaluation engine. Provide rigorous, helpful, and accurate feedback strictly in valid JSON format.',
+        untrustedUserDataPrompt: prompt,
+        callerRole: caller.role,
+        validator: (json) => typeof json === 'object' && ('hasAnyError' in json || 'isCorrect' in json || 'sentenceFeedback' in json),
+      });
     } finally {
       await flightLock.release();
     }
+
+    const parsed = contingencyRes?.parsedJson;
     if (parsed && typeof parsed === 'object') {
       const normalizedOriginal = rawClean.trim().replace(/[.!?\s]+$/, '').toLowerCase();
       const normalizedCorrected = (parsed.correctedSentence || '').trim().replace(/[.!?\s]+$/, '').toLowerCase();
@@ -15954,133 +15839,15 @@ OUTPUT STRICT JSON matching this schema:
 
       return res.json(parsed);
     }
-  }
 
-  // Fallback heuristic with level tips, trigger detection, and absolute rigor
-  let usedTrigger = true;
-  let triggerFeedback = '';
-  if (levelInstruction && levelInstruction.trim()) {
-    const triggerLower = levelInstruction.toLowerCase();
-    if (triggerLower.includes('because') || triggerLower.includes('since')) {
-      usedTrigger = /\b(because|since)\b/i.test(lowerSentence);
-      triggerFeedback = usedTrigger
-        ? 'Gatilho cumprido: você usou "because" ou "since" para justificar o motivo.'
-        : 'Desafio: lembre-se de usar "because" ou "since" para explicar a sua razão.';
-    } else if (triggerLower.includes('whenever')) {
-      usedTrigger = /\bwhenever\b/i.test(lowerSentence);
-      triggerFeedback = usedTrigger
-        ? 'Gatilho cumprido: você aplicou "whenever" para descrever um hábito.'
-        : 'Desafio: inclua o conectivo "whenever" para indicar frequência ou hábito.';
-    } else if (triggerLower.includes('modal') || triggerLower.includes('might') || triggerLower.includes('should')) {
-      usedTrigger = /\b(might|should|could|would|can|must)\b/i.test(lowerSentence);
-      triggerFeedback = usedTrigger
-        ? 'Gatilho cumprido: verbo modal aplicado adequadamente.'
-        : 'Desafio: use um verbo modal como "might", "should" ou "could".';
-    } else if (triggerLower.includes('conditional') || triggerLower.includes('if')) {
-      usedTrigger = /\b(if|unless)\b/i.test(lowerSentence);
-      triggerFeedback = usedTrigger
-        ? 'Gatilho cumprido: oração condicional aplicada.'
-        : 'Desafio: formule uma condição usando "if" ou "unless".';
-    }
-  }
-
-  const wordFeedbacks: any[] = [];
-  // Add any misspelled sentence words caught by server spelling fixes
-  Object.entries(SERVER_SPELLING_FIXES).forEach(([wrong, data]) => {
-    const rx = new RegExp(`\\b${wrong}\\b`, 'gi');
-    if (rx.test(rawClean)) {
-      wordFeedbacks.push({
-        original: wrong,
-        hasError: true,
-        corrected: data.correct,
-        explanationPt: data.explPt,
-        explanationEn: data.explEn,
-      });
-    }
-  });
-
-  allTargetWords.forEach((w: string) => {
-    const isIncluded = usedWords.includes(w);
-    wordFeedbacks.push({
-      original: w,
-      hasError: false,
-      corrected: w,
-      explanationPt: isIncluded ? 'Palavra incorporada na frase.' : 'Ortografia válida.',
-      explanationEn: isIncluded ? 'Word used in sentence.' : 'Valid spelling.',
+    // Fail transparently: zero invented writing corrections when contingency models are unavailable
+    return res.status(503).json({
+      success: false,
+      error: 'AiUnavailable',
+      message: 'Serviço de avaliação de escrita temporariamente indisponível após tentativa com os modelos de contingência. Sua resposta foi preservada.',
+      attemptsCount: contingencyRes?.attemptsCount || 1,
+      modelsAttempted: contingencyRes?.modelsAttempted || resolveGeminiContingencyModels(),
     });
-  });
-
-  const isBeg = levelMeta.key === 'beginner';
-  const isAdv = levelMeta.key === 'advanced';
-
-  let hasSentenceError = hasProgrammaticError;
-  let correctedSentence = programmaticFixed;
-
-  const targetWordFeedback = hasWordConstraint
-    ? usedTargetWord
-      ? `Palavras da rotina utilizadas: ${usedWords.join(', ')}.`
-      : `Inclua pelo menos uma palavra da sua rotina na frase (${allTargetWords.slice(0, 3).join(', ')}...).`
-    : '';
-
-  const explanationPt = hasSentenceError
-    ? programmaticErrorsPt.join(' ')
-    : !usedTargetWord && hasWordConstraint
-    ? `Por favor, inclua palavras da sua rotina de hoje (${allTargetWords.slice(0, 3).join(', ')}...).`
-    : 'Frase correta e bem estruturada.';
-
-  const explanationEn = hasSentenceError
-    ? programmaticErrorsEn.join(' ')
-    : !usedTargetWord && hasWordConstraint
-    ? `Please include words from today's routine (${allTargetWords.slice(0, 3).join(', ')}...).`
-    : 'Correct and well-structured sentence.';
-
-  const hasAnyError = hasSentenceError || !usedTargetWord || !usedTrigger;
-
-  res.json({
-    hasAnyError,
-    isCorrect: !hasAnyError,
-    usedTargetWord,
-    usedWords,
-    missingWords,
-    targetWordFeedback,
-    triggerFeedback,
-    wordFeedbacks,
-    sentenceFeedback: sentence
-      ? {
-          original: sentence,
-          hasError: hasAnyError,
-          corrected: correctedSentence,
-          explanationPt,
-          explanationEn,
-        }
-      : undefined,
-    correctedSentence,
-    explanation: explanationPt,
-    overallSummaryPt: !hasAnyError
-      ? `Excelente! Frase natural, com o vocabulário da sua rotina (${usedWords.join(', ') || 'palavras de hoje'}) e gramática correta.`
-      : !usedTargetWord
-      ? `Por favor, inclua palavras da sua rotina (${allTargetWords.slice(0, 4).join(', ')}) na sua frase.`
-      : !usedTrigger
-      ? triggerFeedback || 'Ajuste o gatilho solicitado na instrução.'
-      : 'Atenção: sua frase contém incorreções gramaticais que precisam ser corrigidas antes da aprovação.',
-    overallSummaryEn: !hasAnyError
-      ? `Outstanding! Your sentence is grammatically correct and natural.`
-      : !usedTargetWord
-      ? `Please incorporate routine words (${allTargetWords.slice(0, 4).join(', ')}) into your sentence.`
-      : !usedTrigger
-      ? 'Review the challenge trigger specified in the prompt.'
-      : 'Needs revision: please review the grammar corrections below to perfect your sentence.',
-    levelTipsPt: isBeg
-      ? 'Dica Iniciante: Lembre-se sempre de manter Sujeito + Verbo + Complemento.'
-      : isAdv
-      ? 'Dica Avançada: Explore construções complexas, conectivos e linguagem idiomática.'
-      : 'Dica Intermediária: Pratique o uso de conectivos como "because", "while" ou "although" para unir duas ações.',
-    levelTipsEn: isBeg
-      ? 'Beginner Tip: Keep practicing the core Subject + Verb + Object structure.'
-      : isAdv
-      ? 'Advanced Tip: Explore complex clauses and idiomatic collocations.'
-      : 'Intermediate Tip: Try linking ideas with connectors like "because" or "while".',
-  });
 });
 
 // In-memory cache for evaluated homework to prevent redundant evaluations and duplicate cost
@@ -16348,60 +16115,36 @@ Output STRICT JSON matching this schema:
   "levelNextStepsEn": "string"
 }`;
 
-        // Explicitly apply homework_evaluate policy! Single bounded attempt, zero cascade
-        const aiRes = await callGeminiSafeJson(prompt, 15000, 'homework_evaluate', caller.role);
-        if (aiRes && Array.isArray(aiRes.sentenceFeedback)) {
-          sentenceEvaluationResults = aiRes.sentenceFeedback;
-          tutorSummaryPt = aiRes.tutorFeedbackSummaryPt || '';
-          tutorSummaryEn = aiRes.tutorFeedbackSummaryEn || '';
-          levelStrengthsPt = aiRes.levelStrengthsPt || '';
-          levelStrengthsEn = aiRes.levelStrengthsEn || '';
-          levelNextStepsPt = aiRes.levelNextStepsPt || '';
-          levelNextStepsEn = aiRes.levelNextStepsEn || '';
+        // HOTFIX 3-MODEL CONTINGENCY: Sequential failover across up to 3 verified models on recoverable errors
+        const contingencyRes = await executeGeminiWithContingency({
+          feature: 'homework_evaluate',
+          systemInstruction: 'You are a warm, inspiring Native English teacher at "It\'s Simple". Evaluate student written sentences and provide feedback in valid JSON format.',
+          untrustedUserDataPrompt: prompt,
+          callerRole: caller.role,
+          validator: (json) => Array.isArray(json?.sentenceFeedback),
+        });
+
+        if (contingencyRes.success && contingencyRes.parsedJson && Array.isArray(contingencyRes.parsedJson.sentenceFeedback)) {
+          sentenceEvaluationResults = contingencyRes.parsedJson.sentenceFeedback;
+          tutorSummaryPt = contingencyRes.parsedJson.tutorFeedbackSummaryPt || '';
+          tutorSummaryEn = contingencyRes.parsedJson.tutorFeedbackSummaryEn || '';
+          levelStrengthsPt = contingencyRes.parsedJson.levelStrengthsPt || '';
+          levelStrengthsEn = contingencyRes.parsedJson.levelStrengthsEn || '';
+          levelNextStepsPt = contingencyRes.parsedJson.levelNextStepsPt || '';
+          levelNextStepsEn = contingencyRes.parsedJson.levelNextStepsEn || '';
         }
       }
     } finally {
       await flightLock.release();
     }
 
-    // Fallback sentence evaluation if AI was offline
+    // Fail transparently: zero invented teacher evaluations when contingency models fail
     if (sentenceEvaluationResults.length === 0) {
-      sentenceEvaluationResults = (homework.sentenceWritingPrompts || []).map((p: any) => {
-        const raw = (sentences[p.word] || '').trim();
-        const hasText = raw.length >= 6;
-        const containsWord = raw.toLowerCase().includes(p.word.toLowerCase());
-        const isOk = hasText && containsWord;
-
-        return {
-          word: p.word,
-          originalSentence: raw || '(nenhuma frase escrita)',
-          isCorrect: isOk,
-          correctedSentence: raw || `I practice using ${p.word} every day.`,
-          explanationPt: isOk
-            ? `Parabéns! Você utilizou a palavra "${p.word}" com contexto correto.`
-            : `Lembre-se de incluir a palavra "${p.word}" em uma frase completa sobre sua rotina.`,
-          explanationEn: isOk
-            ? `Great job! You incorporated "${p.word}" with natural context.`
-            : `Remember to include the target word "${p.word}" in a full routine sentence.`,
-          levelAdvicePt: levelMeta.key === 'beginner'
-            ? 'Continue praticando frases curtas com Sujeito + Verbo.'
-            : levelMeta.key === 'advanced'
-            ? 'Excelente! Experimente aplicar conectivos avançados e expressões idiomáticas.'
-            : 'Muito bom! Tente conectar duas ideias usando conectivos como "because" ou "although".',
-          levelAdviceEn: levelMeta.key === 'beginner'
-            ? 'Keep practicing clear, simple sentences with Subject + Verb.'
-            : levelMeta.key === 'advanced'
-            ? 'Great! Experiment with advanced transition clauses and rich collocations.'
-            : 'Good job! Try linking ideas with connectors like "because" or "while".',
-        };
+      return res.status(503).json({
+        success: false,
+        error: 'AiUnavailable',
+        message: 'Serviço de avaliação pedagógica temporariamente indisponível após tentativa com os modelos de contingência. Suas respostas foram preservadas.',
       });
-
-      tutorSummaryPt = `Parabéns pela dedicação na Atividade de Memorização! Você consolidou o vocabulário real da sua semana com foco no nível ${levelMeta.labelPt}. Continue vivendo o inglês na sua rotina diária.`;
-      tutorSummaryEn = `Congratulations on completing your Weekly Memorization Activity! You practiced your real weekly vocabulary tailored to your ${levelMeta.labelEn} level. Keep living English in your daily routine.`;
-      levelStrengthsPt = `Boa capacidade de identificação de termos no contexto diário e dedicação na resolução dos desafios interativos.`;
-      levelStrengthsEn = `Strong ability to recognize routine vocabulary and dedication in active recall practice.`;
-      levelNextStepsPt = `Na sua próxima aula com seu Amigo Nativo, use as palavras desta semana em conversas espontâneas.`;
-      levelNextStepsEn = `In your next live session with your Native Friend, use these words naturally in casual conversation.`;
     }
 
     // Sentence score: up to 25 points
@@ -16532,10 +16275,17 @@ Return a JSON array of objects with the exact schema:
   }
 ]`;
 
-      // Explicitly apply vocab_generate policy! Single bounded attempt, zero cascade
-      const parsed = await callGeminiSafeJson(prompt, 8000, 'vocab_generate', caller.role);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        generatedEntries = parsed;
+      // Gemini 3-Model Contingency: Up to 3 sequential attempts across verified models on recoverable failures
+      const contingencyResult = await executeGeminiWithContingency({
+        feature: 'vocab_generate',
+        systemInstruction: 'You are a native English language teacher creating personalized vocabulary study notes for a live conversation lesson. Respond strictly with a JSON array.',
+        untrustedUserDataPrompt: prompt,
+        callerRole: caller.role,
+        jsonValidator: (val) => Array.isArray(val) && val.length > 0,
+      });
+
+      if (contingencyResult && Array.isArray(contingencyResult.parsedJson) && contingencyResult.parsedJson.length > 0) {
+        generatedEntries = contingencyResult.parsedJson;
       }
     }
   } finally {
@@ -16547,18 +16297,12 @@ Return a JSON array of objects with the exact schema:
     return res.json({ success: true, entries: generatedEntries });
   }
 
-  // Fallback linguistic generator for each word
-  const fallbackEntries = cleanWords.map((word) => {
-    return {
-      word,
-      definitionEn: `A practical English term denoting "${word}", used naturally when communicating about ${topic || 'daily life'}.`,
-      exampleSentenceEn: `During our conversation about ${topic || 'our routines'}, we practiced using "${word}" naturally.`,
-      translationPt: `Vocabulário prático em inglês`,
-    };
+  // Non-negotiable Rule 6 & 7: Do not invent generic definitions or synthetic pedagogical entries.
+  return res.status(503).json({
+    success: false,
+    error: 'AiUnavailable',
+    message: 'Serviço de geração de vocabulário temporariamente indisponível após tentativa com os modelos de contingência. Os termos originais foram preservados.',
   });
-
-  lessonVocabCache.set(vocabCacheKey, fallbackEntries);
-  res.json({ success: true, entries: fallbackEntries, isFallback: true });
 });
 
 // Explicit route for Privacy Policy (Google verification & direct access)
