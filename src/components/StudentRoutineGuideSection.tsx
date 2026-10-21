@@ -378,28 +378,30 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
       if (wordsToLookup.length === 0) return;
 
       (async () => {
-        for (const { word, idx } of wordsToLookup) {
-          try {
-            const res = await lookupWord(
-              word,
-              undefined,
-              studentLevel,
-              userProfile?.uid,
-              userProfile?.email,
-              dictionaryEntries
-            );
-            if (res) {
-              setWordDefinitions((prev) => {
-                if (words[idx]?.trim().toLowerCase() === word.toLowerCase()) {
-                  return { ...prev, [idx]: res };
-                }
-                return prev;
-              });
+        await Promise.allSettled(
+          wordsToLookup.map(async ({ word, idx }) => {
+            try {
+              const res = await lookupWord(
+                word,
+                undefined,
+                studentLevel,
+                userProfile?.uid,
+                userProfile?.email,
+                dictionaryEntries
+              );
+              if (res && res.definitionEn) {
+                setWordDefinitions((prev) => {
+                  if (words[idx]?.trim().toLowerCase() === word.toLowerCase()) {
+                    return { ...prev, [idx]: res };
+                  }
+                  return prev;
+                });
+              }
+            } catch {
+              // Handled gracefully
             }
-          } catch {
-            // Handled gracefully
-          }
-        }
+          })
+        );
       })();
     }, 600);
 
@@ -462,14 +464,18 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
   }, [persistedRoutinesByDay]);
 
   // Reset day-specific ephemeral input state only when student identity actually switches
+  const prevStudentUidRef = useRef<string>(effectiveStudentUid);
   useEffect(() => {
-    setSelectedTopicByDay({});
-    setCustomSuggestionActivities({});
-    setSuggestingUrlValues({});
-    setSavedTopicsBeforeRepeat({});
-    setSentenceInput('');
-    setSentenceSavedSuccess(false);
-    setSentenceEvaluation(null);
+    if (prevStudentUidRef.current && prevStudentUidRef.current !== effectiveStudentUid) {
+      setSelectedTopicByDay({});
+      setCustomSuggestionActivities({});
+      setSuggestingUrlValues({});
+      setSavedTopicsBeforeRepeat({});
+      setSentenceInput('');
+      setSentenceSavedSuccess(false);
+      setSentenceEvaluation(null);
+    }
+    prevStudentUidRef.current = effectiveStudentUid;
   }, [effectiveStudentUid]);
 
   // Quick jump helpers

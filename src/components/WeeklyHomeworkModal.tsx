@@ -510,6 +510,21 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     }
   }, [activeTab, isMatchingComplete, isFillComplete, isWritingComplete, isReadingComplete]);
 
+  const getDayForPart = useCallback(
+    (partKey: string): DayOfWeek => {
+      const activeList =
+        Array.isArray(activeStudyDays) && activeStudyDays.length > 0
+          ? activeStudyDays
+          : (['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'] as DayOfWeek[]);
+      for (const d of activeList) {
+        const sched = getDailyMemorizationSchedule(d, activeStudyDays, weeklyCycle || 1);
+        if (sched.partKey === partKey) return d;
+      }
+      return targetDay;
+    },
+    [activeStudyDays, weeklyCycle, targetDay]
+  );
+
   // Event-driven helper to synchronously mark S-Path completed and persist to state/DB
   const markSPathCompleted = useCallback(
     (day: DayOfWeek, partKey: string) => {
@@ -536,38 +551,42 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     [homework, matchingAnswers, fillAnswers, sentenceAnswers, quizAnswers, onSaveProgress, onCompleteTodayPart]
   );
 
-  // Strict Automated S-Path Tracking: triggers instantly upon activity completion with zero user click
-  const autoCompletedDayRef = React.useRef<string>('');
+  // Strict Automated S-Path Tracking for each of the 4 parts independently
+  const completedPartsReportedRef = React.useRef<Set<string>>(new Set());
+
   useEffect(() => {
     if (!isOpen || !homework) return;
-    const isCompletedNow = isPartAnswersComplete || (activeTab !== 'results' && isCurrentActiveTabComplete) || homework.isCompleted;
-    const completionKey = `${targetDay}_${activeTab}_${dailySchedule.partKey}`;
 
-    if (isCompletedNow && !isTodayPartCompleted && autoCompletedDayRef.current !== completionKey) {
-      autoCompletedDayRef.current = completionKey;
+    const partsState: Array<{ key: string; isComplete: boolean; partNum: number }> = [
+      { key: 'matching', isComplete: isMatchingComplete, partNum: 1 },
+      { key: 'fill', isComplete: isFillComplete, partNum: 2 },
+      { key: 'writing', isComplete: isWritingComplete, partNum: 3 },
+      { key: 'reading', isComplete: isReadingComplete, partNum: 4 },
+    ];
 
-      const partToComplete = (activeTab !== 'results' && isCurrentActiveTabComplete) ? activeTab : dailySchedule.partKey;
-      markSPathCompleted(targetDay, partToComplete);
-
-      setSubmittedFeedbackToast(
-        isEn
-          ? `🎉 Part ${dailySchedule.partNumber} completed! Automatically marked on your S-Path progression.`
-          : `🎉 Parte ${dailySchedule.partNumber} concluída! Marcada automaticamente no seu Gráfico S-Path.`
-      );
-      setTimeout(() => setSubmittedFeedbackToast(null), 5000);
-    }
+    partsState.forEach(({ key, isComplete, partNum }) => {
+      if (isComplete && !completedPartsReportedRef.current.has(key)) {
+        completedPartsReportedRef.current.add(key);
+        const dayForPart = getDayForPart(key);
+        markSPathCompleted(dayForPart, key);
+        setSubmittedFeedbackToast(
+          isEn
+            ? `🎉 Part ${partNum} completed! Automatically marked on your S-Path progression.`
+            : `🎉 Parte ${partNum} concluída! Marcada automaticamente no seu Gráfico S-Path.`
+        );
+        setTimeout(() => setSubmittedFeedbackToast(null), 4000);
+      }
+    });
   }, [
     isOpen,
-    isPartAnswersComplete,
-    isCurrentActiveTabComplete,
-    isTodayPartCompleted,
-    targetDay,
-    activeTab,
-    dailySchedule.partKey,
-    dailySchedule.partNumber,
-    isEn,
     homework,
+    isMatchingComplete,
+    isFillComplete,
+    isWritingComplete,
+    isReadingComplete,
+    getDayForPart,
     markSPathCompleted,
+    isEn,
   ]);
 
   const handleCheckSentence = async (prompt: SentenceWritingPrompt, textOverride?: string) => {
@@ -784,6 +803,18 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
     onSaveProgress(updated);
     if (onCompleteTodayPart) {
+      const partsToReport: Array<{ key: string; isComplete: boolean }> = [
+        { key: 'matching', isComplete: isMatchingComplete },
+        { key: 'fill', isComplete: isFillComplete },
+        { key: 'writing', isComplete: isWritingComplete },
+        { key: 'reading', isComplete: isReadingComplete },
+      ];
+      partsToReport.forEach(({ key, isComplete }) => {
+        if (isComplete) {
+          const d = getDayForPart(key);
+          onCompleteTodayPart(key as any, d);
+        }
+      });
       onCompleteTodayPart(dailySchedule.partKey, targetDay);
     }
     setActiveTab('results');
@@ -1237,7 +1268,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
                   {/* Footer */}
                   <div className="pt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100">
-                    {isTodayPartCompleted ? (
+                    {isMatchingComplete || (dailySchedule.partKey === 'matching' && isTodayPartCompleted) ? (
                       <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 px-3 py-1.5 rounded-xl border border-emerald-200">
                         <CheckCircle className="w-4 h-4 text-emerald-600" />
                         <span>{isEn ? 'Recorded on S-Path' : 'Gravado no S-Path automaticamente'}</span>
@@ -1254,7 +1285,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                       type="button"
                       onClick={() => {
                         if (isMatchingComplete) {
-                          markSPathCompleted(targetDay, 'matching');
+                          markSPathCompleted(getDayForPart('matching'), 'matching');
                         }
                         setActiveTab('fill');
                       }}
@@ -1352,7 +1383,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                     >
                       {memT.part2.backBtn}
                     </button>
-                    {isTodayPartCompleted && (
+                    {(isFillComplete || (dailySchedule.partKey === 'fill' && isTodayPartCompleted)) && (
                       <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 px-3 py-1.5 rounded-xl border border-emerald-200">
                         <CheckCircle className="w-4 h-4 text-emerald-600" />
                         <span>{isEn ? 'Recorded on S-Path' : 'Gravado no S-Path automaticamente'}</span>
@@ -1362,7 +1393,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                       type="button"
                       onClick={() => {
                         if (isFillComplete) {
-                          markSPathCompleted(targetDay, 'fill');
+                          markSPathCompleted(getDayForPart('fill'), 'fill');
                         }
                         setActiveTab('writing');
                       }}
@@ -1607,7 +1638,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                     >
                       {memT.part3.backBtn}
                     </button>
-                    {isTodayPartCompleted && (
+                    {(isWritingComplete || (dailySchedule.partKey === 'writing' && isTodayPartCompleted)) && (
                       <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 px-3 py-1.5 rounded-xl border border-emerald-200">
                         <CheckCircle className="w-4 h-4 text-emerald-600" />
                         <span>{isEn ? 'Recorded on S-Path' : 'Gravado no S-Path automaticamente'}</span>
@@ -1617,7 +1648,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                       type="button"
                       onClick={() => {
                         if (isWritingComplete) {
-                          markSPathCompleted(targetDay, 'writing');
+                          markSPathCompleted(getDayForPart('writing'), 'writing');
                         }
                         setActiveTab('reading');
                       }}
@@ -1726,7 +1757,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                       {memT.part4.backBtn}
                     </button>
                     <div className="flex items-center gap-2">
-                      {isTodayPartCompleted && (
+                      {(isReadingComplete || (dailySchedule.partKey === 'reading' && isTodayPartCompleted)) && (
                         <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 px-3 py-1.5 rounded-xl border border-emerald-200">
                           <CheckCircle className="w-4 h-4 text-emerald-600" />
                           <span>{isEn ? 'Recorded on S-Path' : 'Gravado no S-Path automaticamente'}</span>

@@ -829,9 +829,7 @@ export async function fetchPedagogicalTransformation(params: {
             (typeof m.corrected === 'string' && (m.corrected.includes('Pending confirmation') || m.corrected.includes('Pendente de confirmação')))
           );
           if (!hasLegacyPending && cachedData && typeof cachedData === 'object' && !Array.isArray(cachedData) && cachedData.sessionKey && cachedData.isAiGenerated && !cachedData.isProvisional) {
-            if (!cachedData.contentHash || cachedData.contentHash === contentHash) {
-              return cachedData;
-            }
+            return cachedData;
           }
         }
       } catch (cacheErr) {

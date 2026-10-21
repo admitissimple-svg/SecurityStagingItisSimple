@@ -100,11 +100,11 @@ export const GEMINI_POLICIES: Record<GeminiFeature, FeaturePolicy> = {
     timeoutMs: 15000,
   },
   dictionary_define: {
-    maxOutputTokens: 400,
+    maxOutputTokens: 800,
     rateLimitWindowSeconds: 60,
     rateLimitMaxRequests: 30,
     maxInputLengthChars: 100,
-    timeoutMs: 12000,
+    timeoutMs: 15000,
   },
   vocab_generate: {
     maxOutputTokens: 800,
@@ -591,7 +591,15 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
       };
     }
 
-    const cleanJson = rawText.replace(/^```json/i, '').replace(/```$/i, '').trim();
+    let cleanJson = rawText.trim();
+    if (cleanJson.startsWith('```')) {
+      cleanJson = cleanJson.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+    }
+    const firstBrace = cleanJson.indexOf('{');
+    const lastBrace = cleanJson.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+      cleanJson = cleanJson.substring(firstBrace, lastBrace + 1);
+    }
     let parsed: any = null;
     try {
       parsed = JSON.parse(cleanJson);

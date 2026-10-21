@@ -9048,9 +9048,27 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
     db.pedagogicalTransformationsMap[compositeCacheKey] ||
     (language === 'pt' ? db.pedagogicalTransformationsMap[canonicalSessionKey] : undefined);
 
-  if ((!cached || cached.isProvisional) && canonicalSessionKey) {
+  if (!cached || cached.isProvisional) {
+    const candidates = [canonicalSessionKey, customSessionKey, lessonId].filter(Boolean);
+    for (const cand of candidates) {
+      if (db.pedagogicalTransformationsMap[cand] && db.pedagogicalTransformationsMap[cand].isAiGenerated && !db.pedagogicalTransformationsMap[cand].isProvisional) {
+        cached = db.pedagogicalTransformationsMap[cand];
+        break;
+      }
+      const prefixMatch = Object.entries(db.pedagogicalTransformationsMap || {}).find(([k, v]: [string, any]) => {
+        return (k.startsWith(`${cand}__`) || k === cand) && v?.isAiGenerated && !v?.isProvisional;
+      });
+      if (prefixMatch) {
+        cached = prefixMatch[1];
+        break;
+      }
+    }
+  }
+
+  if ((!cached || cached.isProvisional) && (canonicalSessionKey || customSessionKey)) {
+    const sessionToSearch = canonicalSessionKey || customSessionKey;
     try {
-      const fsCached = await fetchPedagogicalTransformationFromFirestoreServer(compositeCacheKey);
+      const fsCached = await fetchPedagogicalTransformationFromFirestoreServer(sessionToSearch, { language });
       if (fsCached && fsCached.isAiGenerated && !fsCached.isProvisional) {
         cached = fsCached;
         db.pedagogicalTransformationsMap[compositeCacheKey] = cached;
@@ -9058,7 +9076,7 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
     } catch {}
     if ((!cached || cached.isProvisional) && cleanUid) {
       try {
-        const reconstructed = await reconstructTransformationFromJournalAndDictionaryServer(cleanUid, canonicalSessionKey);
+        const reconstructed = await reconstructTransformationFromJournalAndDictionaryServer(cleanUid, sessionToSearch);
         if (reconstructed) {
           cached = reconstructed;
           db.pedagogicalTransformationsMap[compositeCacheKey] = cached;
@@ -9720,62 +9738,70 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
   }
 
   if (sessionKey) {
+    const canonicalKey = getCanonicalSessionKey({
+      lessonId: sessionKey,
+      sessionKey,
+      studentUid: caller.uid,
+      studentEmail: caller.email,
+    });
+    const candidateKeys = Array.from(new Set([sessionKey, canonicalKey, sessionKey.replace(/^session_/, '').replace(/^lesson_/, '')].filter(Boolean)));
+
     let transformation: any = null;
-    if (language) {
+    // 1. Check in-memory pedagogicalTransformationsMap across candidate keys
+    for (const key of candidateKeys) {
+      if (db.pedagogicalTransformationsMap?.[key]) {
+        const candidate = db.pedagogicalTransformationsMap[key];
+        if (candidate && candidate.isAiGenerated && !candidate.isProvisional) {
+          transformation = candidate;
+          break;
+        }
+      }
       const match = Object.entries(db.pedagogicalTransformationsMap || {}).find(([k, v]: [string, any]) => {
-        const matchKey = k === sessionKey || k.startsWith(`${sessionKey}__`);
-        const matchLang = v?.language === language;
-        const matchHash = !contentHash || v?.contentHash === contentHash;
-        return matchKey && matchLang && matchHash;
+        const matchKey = k === key || k.startsWith(`${key}__`);
+        const matchLang = !language || v?.language === language;
+        return matchKey && matchLang && v?.isAiGenerated && !v?.isProvisional;
       });
-      if (match) transformation = match[1];
-    }
-    if (!transformation && db.pedagogicalTransformationsMap?.[sessionKey]) {
-      const candidate = db.pedagogicalTransformationsMap[sessionKey];
-      if (!contentHash || candidate.contentHash === contentHash) {
-        transformation = candidate;
+      if (match) {
+        transformation = match[1];
+        break;
       }
     }
-    if (!transformation) {
-      const found = Object.entries(db.pedagogicalTransformationsMap || {}).find(([k, v]: [string, any]) => {
-        const matchKey = k === sessionKey || k.startsWith(`${sessionKey}__`);
-        const matchHash = !contentHash || v?.contentHash === contentHash;
-        return matchKey && matchHash;
-      });
-      if (found) transformation = found[1];
-    }
 
-    // Firestore fallback lookup if in-memory cache misses
+    // 2. Firestore fallback lookup if in-memory cache misses
     if (!transformation) {
-      try {
-        const fsMatch = await fetchPedagogicalTransformationFromFirestoreServer(sessionKey, { language, contentHash });
-        if (fsMatch && fsMatch.isAiGenerated && !fsMatch.isProvisional) {
-          transformation = fsMatch;
-          const storeKey = fsMatch.cacheKey || `${sessionKey}__hash_${fsMatch.contentHash || 'any'}__lang_${fsMatch.language || language || 'pt'}`;
-          if (!db.pedagogicalTransformationsMap) db.pedagogicalTransformationsMap = {};
-          db.pedagogicalTransformationsMap[storeKey] = fsMatch;
-          if (fsMatch.language === 'pt') {
+      for (const key of candidateKeys) {
+        try {
+          const fsMatch = await fetchPedagogicalTransformationFromFirestoreServer(key, { language });
+          if (fsMatch && fsMatch.isAiGenerated && !fsMatch.isProvisional) {
+            transformation = fsMatch;
+            const storeKey = fsMatch.cacheKey || `${sessionKey}__hash_${fsMatch.contentHash || 'any'}__lang_${fsMatch.language || language || 'pt'}`;
+            if (!db.pedagogicalTransformationsMap) db.pedagogicalTransformationsMap = {};
+            db.pedagogicalTransformationsMap[storeKey] = fsMatch;
             db.pedagogicalTransformationsMap[sessionKey] = fsMatch;
+            break;
           }
+        } catch (fsErr) {
+          console.warn('GET /api/pedagogical-notes Firestore lookup notice:', fsErr);
         }
-      } catch (fsErr) {
-        console.warn('GET /api/pedagogical-notes Firestore lookup notice:', fsErr);
       }
     }
 
-    // View Journal & My Dictionary fallback: recognize already fed definitions
+    // 3. View Journal & My Dictionary fallback: recognize already fed definitions
     if (!transformation && caller.role === 'student') {
-      try {
-        const reconstructed = await reconstructTransformationFromJournalAndDictionaryServer(caller.uid, sessionKey);
-        if (reconstructed) {
-          transformation = reconstructed;
-          const storeKey = `${sessionKey}__reconstructed__lang_${language || 'pt'}`;
-          if (!db.pedagogicalTransformationsMap) db.pedagogicalTransformationsMap = {};
-          db.pedagogicalTransformationsMap[storeKey] = reconstructed;
-          db.pedagogicalTransformationsMap[sessionKey] = reconstructed;
+      for (const key of candidateKeys) {
+        try {
+          const reconstructed = await reconstructTransformationFromJournalAndDictionaryServer(caller.uid, key);
+          if (reconstructed && (reconstructed.vocabularyAndExpressions?.length > 0 || reconstructed.mistakesAnalysis?.length > 0 || reconstructed.grammarPoints?.length > 0)) {
+            transformation = reconstructed;
+            const storeKey = `${sessionKey}__reconstructed__lang_${language || 'pt'}`;
+            if (!db.pedagogicalTransformationsMap) db.pedagogicalTransformationsMap = {};
+            db.pedagogicalTransformationsMap[storeKey] = reconstructed;
+            db.pedagogicalTransformationsMap[sessionKey] = reconstructed;
+            break;
+          }
+        } catch (recErr) {
+          console.warn('GET /api/pedagogical-notes journal reconstruction notice:', recErr);
         }
-      } catch (recErr) {
-        console.warn('GET /api/pedagogical-notes journal reconstruction notice:', recErr);
       }
     }
 
@@ -13039,7 +13065,8 @@ app.post('/api/routines/daily-video', async (req, res) => {
     activityId,
     instructions,
     duration,
-  } = req.body;
+    weeklyCycle: bodyWeeklyCycle,
+  } = req.body || {};
 
   const targetDay = dayOfWeek || day;
   if ((!studentUid && !studentEmail && !callerUid) || !targetDay) {
@@ -13054,10 +13081,27 @@ app.post('/api/routines/daily-video', async (req, res) => {
   const cleanTitle = title || videoTitle || (cleanVidId ? 'Daily Video Practice' : 'Video of the Day');
   const cleanUrl = url || (cleanVidId ? `https://www.youtube.com/watch?v=${cleanVidId}` : '');
 
-  const currentCycle =
-    (effectiveUid && db.userProfiles?.[effectiveUid]?.weeklyCycle) ||
-    (resolved.email && db.userProfiles?.[resolved.email]?.weeklyCycle) ||
-    1;
+  let currentCycle = typeof bodyWeeklyCycle === 'number' && bodyWeeklyCycle > 0 ? bodyWeeklyCycle : undefined;
+  if (!currentCycle && effectiveUid) {
+    const fs = getFirestoreDb();
+    if (fs) {
+      try {
+        const uDoc = await fs.collection('users').doc(effectiveUid).get();
+        if (uDoc.exists) {
+          const uData = uDoc.data();
+          if (typeof uData?.weeklyCycle === 'number' && uData.weeklyCycle > 0) {
+            currentCycle = uData.weeklyCycle;
+          }
+        }
+      } catch {}
+    }
+  }
+  if (!currentCycle) {
+    currentCycle =
+      (effectiveUid && db.userProfiles?.[effectiveUid]?.weeklyCycle) ||
+      (resolved.email && db.userProfiles?.[resolved.email]?.weeklyCycle) ||
+      1;
+  }
 
   const videoObj = {
     id: cleanVidId || videoId || `vid-${targetDay}-${Date.now()}`,

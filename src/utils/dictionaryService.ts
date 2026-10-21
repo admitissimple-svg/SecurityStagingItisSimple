@@ -261,7 +261,7 @@ async function fetchFromBackendApi(
   try {
     let signal: AbortSignal | undefined;
     if (typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal) {
-      signal = AbortSignal.timeout(14000);
+      signal = AbortSignal.timeout(16000);
     }
 
     const token = await auth?.currentUser?.getIdToken().catch(() => null);

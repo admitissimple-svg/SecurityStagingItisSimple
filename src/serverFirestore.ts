@@ -1528,19 +1528,16 @@ export async function saveRoutineVideoSubcollection(
   if (!db || !uid || !dayOfWeek) return false;
   try {
     const userRef = db.collection('users').doc(uid);
-    let targetCycle = weeklyCycle;
-    if (typeof targetCycle !== 'number' || targetCycle <= 0) {
-      try {
-        const uSnap = await withTimeout(userRef.get(), 2500);
-        if (uSnap && uSnap.exists) {
-          const uData = uSnap.data();
-          if (typeof uData?.weeklyCycle === 'number' && uData.weeklyCycle > 0) {
-            targetCycle = uData.weeklyCycle;
-          }
+    let targetCycle = typeof weeklyCycle === 'number' && weeklyCycle > 0 ? weeklyCycle : 1;
+    try {
+      const uSnap = await withTimeout(userRef.get(), 2500);
+      if (uSnap && uSnap.exists) {
+        const uData = uSnap.data();
+        if (typeof uData?.weeklyCycle === 'number' && uData.weeklyCycle > 0) {
+          targetCycle = Math.max(targetCycle, uData.weeklyCycle);
         }
-      } catch {}
-    }
-    if (!targetCycle || targetCycle <= 0) targetCycle = 1;
+      }
+    } catch {}
 
     const cleanVidId = (data.videoId || '').trim();
     const cleanTitle = (data.title || data.videoTitle || (cleanVidId ? 'Daily Video Practice' : 'Video of the Day')).trim();
@@ -1646,7 +1643,8 @@ export async function fetchRoutineVideosFromFirestoreServer(
         Object.entries(uData.routinesByDay).forEach(([day, item]: [string, any]) => {
           if (item && typeof item === 'object') {
             const itemCycle = typeof item.weeklyCycle === 'number' ? item.weeklyCycle : activeCycle;
-            if (itemCycle === activeCycle) {
+            const hasConfiguredVideo = Boolean((item.videoId && item.videoId.trim() !== '') || (item.url && item.url.trim() !== ''));
+            if (itemCycle === activeCycle || hasConfiguredVideo) {
               result.routinesByDay[day] = item;
             }
           }
@@ -1661,7 +1659,8 @@ export async function fetchRoutineVideosFromFirestoreServer(
         if (data) {
           const day = docSnap.id;
           const itemCycle = typeof data.weeklyCycle === 'number' ? data.weeklyCycle : activeCycle;
-          if (itemCycle === activeCycle) {
+          const hasConfiguredVideo = Boolean((data.videoId && data.videoId.trim() !== '') || (data.url && data.url.trim() !== ''));
+          if (itemCycle === activeCycle || hasConfiguredVideo) {
             result.routinesByDay[day] = {
               ...data,
               dayOfWeek: day,
@@ -3189,9 +3188,7 @@ export async function fetchPedagogicalTransformationFromFirestoreServer(
       if (snap && snap.exists) {
         const data = snap.data();
         if (data && data.isAiGenerated && !data.isProvisional) {
-          if (!options?.contentHash || data.contentHash === options.contentHash) {
-            return data;
-          }
+          return data;
         }
       }
     }
@@ -3209,7 +3206,9 @@ export async function fetchPedagogicalTransformationFromFirestoreServer(
           if (matchLang && matchHash) {
             return data;
           }
-          if (matchHash && !candidate) {
+          if (matchLang && !candidate) {
+            candidate = data;
+          } else if (!candidate) {
             candidate = data;
           }
         }
@@ -3398,11 +3397,16 @@ export async function reconstructTransformationFromJournalAndDictionaryServer(
 
   try {
     const journalList = await fetchStudentDailyJournalFromServerFirestore(cleanUid);
+    const bareKey = cleanSessionKey.replace(/^session_/, '').replace(/^lesson_/, '');
+    const dateMatch = cleanSessionKey.match(/\d{4}-\d{2}-\d{2}/)?.[0];
+
     const matchingJournal = (journalList || []).find((entry: any) => {
       if (!entry) return false;
       if (entry.id === expectedEntryId) return true;
       if (entry.sessionKey === cleanSessionKey || entry.lessonId === cleanSessionKey) return true;
       if (typeof entry.id === 'string' && entry.id.includes(cleanSessionId)) return true;
+      if (bareKey && (entry.lessonId === bareKey || entry.sessionKey === bareKey || (typeof entry.id === 'string' && entry.id.includes(bareKey)))) return true;
+      if (dateMatch && entry.date === dateMatch && (entry.entryType === 'lesson_review' || entry.reviewSummary || entry.sentence?.includes('Quick Review'))) return true;
       return false;
     });
 
@@ -3416,7 +3420,15 @@ export async function reconstructTransformationFromJournalAndDictionaryServer(
       dictionaryVocab = await fetchStudentVocabularyFromFirestoreServer(cleanUid);
     } catch {}
 
-    const wordsUsed: string[] = Array.isArray(matchingJournal.wordsUsed) ? matchingJournal.wordsUsed : [];
+    const reviewVocab: string[] = Array.isArray(matchingJournal.reviewSummary?.mustKnowVocabulary)
+      ? matchingJournal.reviewSummary.mustKnowVocabulary
+      : [];
+    const wordsUsed: string[] = Array.from(
+      new Set([
+        ...(Array.isArray(matchingJournal.wordsUsed) ? matchingJournal.wordsUsed : []),
+        ...reviewVocab,
+      ])
+    );
     const pronunciationPoints: string[] = Array.isArray(matchingJournal.pronunciationPoints) ? matchingJournal.pronunciationPoints : [];
 
     const vocabItems: any[] = [];

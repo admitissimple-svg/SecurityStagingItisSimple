@@ -83,6 +83,7 @@ export async function saveRoutineVideoToFirestore(
     isRepeatVideo?: boolean;
     instructions?: string;
     duration?: string;
+    weeklyCycle?: number;
   }
 ): Promise<boolean> {
   const authUid = auth?.currentUser?.uid || '';
@@ -108,6 +109,7 @@ export async function saveRoutineVideoToFirestore(
     isRepeatVideo: Boolean(videoData.isRepeatVideo),
     instructions: videoData.instructions || '',
     duration: videoData.duration || '5-10 min',
+    weeklyCycle: videoData.weeklyCycle,
   };
 
   try {
@@ -534,6 +536,7 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek) {
         isRepeatVideo?: boolean;
         instructions?: string;
         duration?: string;
+        weeklyCycle?: number;
       }
     ): Promise<boolean> => {
       if (!effectiveUid || !day) return false;
@@ -554,11 +557,15 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek) {
         isRepeatVideo: Boolean(videoData.isRepeatVideo),
         instructions: videoData.instructions || '',
         duration: videoData.duration || '5-10 min',
+        weeklyCycle: videoData.weeklyCycle || weeklyCycle,
         updatedAt: new Date().toISOString(),
       };
 
       // Persist to backend and await confirmation before mutating React state
-      const confirmed = await saveRoutineVideoToFirestore(effectiveUid, day, videoData);
+      const confirmed = await saveRoutineVideoToFirestore(effectiveUid, day, {
+        ...videoData,
+        weeklyCycle: videoData.weeklyCycle || weeklyCycle,
+      });
 
       if (confirmed) {
         setRoutinesByDay((prev) => ({ ...prev, [day]: savedObj }));
