@@ -23,7 +23,6 @@ import {
   fetchStudentJournalActivitiesFromFirestore,
   isValidCanonicalUid,
 } from '../utils/studentPersistence';
-import { toDeterministicCanonicalStudentUid } from '../utils/tutorConsolidation';
 import { apiClient } from '../utils/apiClient';
 
 interface NativeFriendLessonInsightsProps {
@@ -71,7 +70,6 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
       (l: any) => l.studentUid && isValidCanonicalUid(l.studentUid) && l.studentUid !== teacherUid
     );
     if (fromLesson?.studentUid) return fromLesson.studentUid;
-    if (studentEmail) return toDeterministicCanonicalStudentUid(studentEmail);
     return '';
   });
 
@@ -84,8 +82,6 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
       );
       if (fromLesson?.studentUid) {
         setCanonicalStudentUid(fromLesson.studentUid);
-      } else if (studentEmail) {
-        setCanonicalStudentUid(toDeterministicCanonicalStudentUid(studentEmail));
       }
     }
   }, [studentUid, lessons, teacherUid, studentEmail]);
@@ -94,7 +90,7 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
     ? canonicalStudentUid
     : (studentUid && isValidCanonicalUid(studentUid) && studentUid !== teacherUid)
       ? studentUid
-      : (studentEmail ? toDeterministicCanonicalStudentUid(studentEmail) : '');
+      : '';
 
   const [selectedLessonId, setSelectedLessonId] = useState<string>(() => {
     if (activeLessonId) return activeLessonId;

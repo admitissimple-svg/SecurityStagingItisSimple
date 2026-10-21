@@ -647,7 +647,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           setRole(verifiedRole);
 
           const account: GoogleAccount = data.account || {
-            uid: firebaseUid || `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`,
+            uid: firebaseUid || '',
             email: cleanEmail,
             name: cleanEmail.split('@')[0],
             role: verifiedRole,

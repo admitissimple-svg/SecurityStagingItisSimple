@@ -140,7 +140,6 @@ import {
   mergeTutors,
   consolidateTutorsList,
   isValidCanonicalUid,
-  toDeterministicCanonicalStudentUid,
   isGenericTutorId,
   type CanonicalTutorRecord,
 } from './utils/tutorConsolidation';
@@ -151,7 +150,6 @@ export {
   mergeTutors,
   consolidateTutorsList,
   isValidCanonicalUid,
-  toDeterministicCanonicalStudentUid,
   isGenericTutorId,
   type CanonicalTutorRecord,
 };
@@ -2069,8 +2067,6 @@ export async function resolveCanonicalStudentIdentity(
             const foundUid = p?.uid || s?.uid || s?.studentUid;
             if ((!candidateUid || candidateUid.includes('@') || !isValidCanonicalUid(candidateUid)) && foundUid && isValidCanonicalUid(foundUid) && foundUid !== caller.uid) {
               candidateUid = foundUid;
-            } else if (!candidateUid || !isValidCanonicalUid(candidateUid)) {
-              candidateUid = toDeterministicCanonicalStudentUid(authorizedEmail);
             }
           }
         }
@@ -2180,46 +2176,7 @@ export async function resolveCanonicalStudentIdentity(
               studentEmail: authorizedEmail,
             };
           }
-
-          // Candidate 5b: Student ID from student record if not caller.uid
-          const altId = student?.uid || student?.studentUid || student?.id || profile?.uid || profile?.id;
-          if (altId && altId !== caller.uid && !String(altId).startsWith('tutor-')) {
-            return {
-              authorized: true,
-              canonicalStudentUid: String(altId),
-              studentEmail: authorizedEmail,
-            };
-          }
         } catch {}
-      }
-
-      // Candidate 6: Seamlessly create student in Firebase Auth if Admin Auth is active
-      if (adminAuth) {
-        try {
-          const createdUser = await adminAuth.createUser({
-            email: authorizedEmail,
-            emailVerified: false,
-          });
-          if (createdUser?.uid && isValidCanonicalUid(createdUser.uid) && createdUser.uid !== caller.uid) {
-            return {
-              authorized: true,
-              canonicalStudentUid: createdUser.uid,
-              studentEmail: authorizedEmail,
-            };
-          }
-        } catch {}
-      }
-
-      // Candidate 7: Deterministic canonical UID fallback for proven authorized link
-      const fallbackCanonicalUid = (candidateUid && isValidCanonicalUid(candidateUid) && candidateUid !== caller.uid ? candidateUid : '') ||
-        toDeterministicCanonicalStudentUid(authorizedEmail) ||
-        `stu_${authorizedEmail.replace(/[^a-zA-Z0-9]/g, '')}`;
-      if (fallbackCanonicalUid && fallbackCanonicalUid !== caller.uid) {
-        return {
-          authorized: true,
-          canonicalStudentUid: fallbackCanonicalUid,
-          studentEmail: authorizedEmail,
-        };
       }
     }
 

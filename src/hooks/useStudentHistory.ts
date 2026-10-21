@@ -23,7 +23,6 @@ import {
   extractVideoIdFromHistoryItem,
   extractVideoTitleFromHistoryItem,
 } from './useRoutine';
-import { toDeterministicCanonicalStudentUid } from '../utils/tutorConsolidation';
 
 export interface UseStudentHistoryParams {
   studentUid?: string;
@@ -541,7 +540,7 @@ export function useStudentHistory({
   nativeFriendUid,
   nativeFriendEmail,
 }: UseStudentHistoryParams): UseStudentHistoryReturn {
-  const effectiveUid = cleanDocId(studentUid) || (studentEmail ? toDeterministicCanonicalStudentUid(studentEmail) : '');
+  const effectiveUid = cleanDocId(studentUid);
   const effectiveWeekId = cleanDocId(weekId) || (weeklyCycle ? `week-${weeklyCycle}` : 'week-1');
   const cleanTeacherUid = cleanDocId(nativeFriendUid);
 

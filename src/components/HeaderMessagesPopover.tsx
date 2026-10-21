@@ -24,6 +24,7 @@ import {
   markDirectMessagesAsRead,
   normalizeUid,
 } from '../utils/directMessages';
+import { isValidCanonicalUid } from '../utils/tutorConsolidation';
 
 interface HeaderMessagesPopoverProps {
   isOpen: boolean;
@@ -60,14 +61,13 @@ export const HeaderMessagesPopover: React.FC<HeaderMessagesPopoverProps> = ({
 
   const studentUid = useMemo(() => {
     if (isTeacher) return '';
-    return normalizeUid(
+    const cand =
       (currentAccount as any)?.uid ||
-        currentAccount?.id ||
-        (userProfile as any)?.uid ||
-        userProfile?.id ||
-        (studentEmail ? `usr-${studentEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : 'student-default')
-    );
-  }, [isTeacher, currentAccount, userProfile, studentEmail]);
+      currentAccount?.id ||
+      (userProfile as any)?.uid ||
+      userProfile?.id;
+    return isValidCanonicalUid(cand) ? cand : '';
+  }, [isTeacher, currentAccount, userProfile]);
 
   // 2. Identify Active Native Friend (Tutor)
   const fallbackLessonTeacher = useMemo(() => {
@@ -87,36 +87,16 @@ export const HeaderMessagesPopover: React.FC<HeaderMessagesPopoverProps> = ({
       return tutors[0];
     }
 
-    if (targetEmail) {
-      return {
-        id: `tutor-${targetEmail.replace(/[^a-zA-Z0-9]/g, '-')}`,
-        uid: `tutor-${targetEmail.replace(/[^a-zA-Z0-9]/g, '-')}`,
-        name: userProfile?.teacherName || fallbackLessonTeacher?.teacherName || targetEmail.split('@')[0],
-        email: targetEmail,
-        avatar: '',
-        role: 'teacher',
-        approvalStatus: 'approved',
-      } as any;
-    }
-
     return null;
-  }, [isTeacher, userProfile?.teacherEmail, userProfile?.teacherName, fallbackLessonTeacher, tutors]);
+  }, [isTeacher, userProfile?.teacherEmail, fallbackLessonTeacher, tutors]);
 
   const activeNativeFriendUid = useMemo(() => {
     if (isTeacher) {
-      return normalizeUid(
-        (currentAccount as any)?.uid ||
-          currentAccount?.id ||
-          (currentAccount?.email ? `tutor-${currentAccount.email.replace(/[^a-zA-Z0-9]/g, '-')}` : '')
-      );
+      const cand = (currentAccount as any)?.uid || currentAccount?.id;
+      return isValidCanonicalUid(cand) ? cand : '';
     }
-    return normalizeUid(
-      activeNativeFriend?.uid ||
-        activeNativeFriend?.id ||
-        (activeNativeFriend?.email
-          ? `tutor-${activeNativeFriend.email.replace(/[^a-zA-Z0-9]/g, '-')}`
-          : '')
-    );
+    const cand = activeNativeFriend?.uid || activeNativeFriend?.id;
+    return isValidCanonicalUid(cand) ? cand : '';
   }, [isTeacher, currentAccount, activeNativeFriend]);
 
   // Teacher perspective: Pick which student to message
@@ -135,11 +115,8 @@ export const HeaderMessagesPopover: React.FC<HeaderMessagesPopoverProps> = ({
   // Effective Pair for Exclusive Direct Messages
   const effectiveStudentUid = useMemo(() => {
     if (isTeacher) {
-      return normalizeUid(
-        (activeStudentForTeacher as any)?.uid ||
-          activeStudentForTeacher?.id ||
-          (activeStudentForTeacher?.email ? `usr-${activeStudentForTeacher.email.replace(/[^a-zA-Z0-9]/g, '-')}` : '')
-      );
+      const cand = (activeStudentForTeacher as any)?.uid || activeStudentForTeacher?.id;
+      return isValidCanonicalUid(cand) ? cand : '';
     }
     return studentUid;
   }, [isTeacher, activeStudentForTeacher, studentUid]);

@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { UserProfile, EnglishLevel, Language, GoogleAccount } from '../types';
 import { ImageUploadInput } from './ImageUploadInput';
+import { isValidCanonicalUid } from '../utils/tutorConsolidation';
 
 interface StudentProfileModalProps {
   isOpen: boolean;
@@ -121,9 +122,11 @@ export const StudentProfileModal: React.FC<StudentProfileModalProps> = ({
     e.preventDefault();
     const cleanEmail = (currentAccount?.email || userProfile?.email || '').toLowerCase().trim();
     const cleanId =
-      currentAccount?.id ||
-      userProfile?.id ||
-      (cleanEmail ? `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : 'usr-default');
+      (currentAccount?.uid && isValidCanonicalUid(currentAccount.uid) ? currentAccount.uid : '') ||
+      (currentAccount?.id && isValidCanonicalUid(currentAccount.id) ? currentAccount.id : '') ||
+      (userProfile?.uid && isValidCanonicalUid(userProfile.uid) ? userProfile.uid : '') ||
+      (userProfile?.id && isValidCanonicalUid(userProfile.id) ? userProfile.id : '') ||
+      '';
     const cleanAvatar = avatar.trim();
     const cleanName = name.trim();
 

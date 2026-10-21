@@ -68,26 +68,10 @@ export function normalizeTutorName(name?: string): string {
  * Rejects empty values, non-strings, emails, slugs with hyphens,
  * synthetic prefixes ('usr-*', 'st-*', 'teacher-*', 'lesson-*'), and system placeholders.
  */
-export function toDeterministicCanonicalStudentUid(email?: string | null): string {
-  if (!email || typeof email !== 'string') return '';
-  const clean = email.toLowerCase().trim();
-  if (!clean || !clean.includes('@')) return '';
-  const cleanSlug = clean.replace(/[^a-zA-Z0-9]/g, '');
-  let hash = '';
-  try {
-    // Node.js environment
-    const crypto = require('crypto');
-    hash = crypto.createHash('sha256').update(clean).digest('hex');
-  } catch {
-    // Browser environment fallback
-    let h = 0;
-    for (let i = 0; i < clean.length; i++) {
-      h = ((h << 5) - h) + clean.charCodeAt(i);
-      h |= 0;
-    }
-    hash = Math.abs(h).toString(16).repeat(3).slice(0, 32);
-  }
-  return `stu_${(cleanSlug + hash).slice(0, 24)}`;
+export function toDeterministicCanonicalStudentUid(_email?: string | null): string {
+  // Directiva obrigatória: Firebase Auth é a única autoridade de identidade.
+  // Proibição absoluta: Nunca gerar UIDs a partir de e-mails ou hashes.
+  return '';
 }
 
 export function isValidCanonicalUid(uid?: string | null): boolean {
@@ -234,10 +218,8 @@ export function areSameTutor(a: any, b: any): boolean {
     return false;
   }
 
-  // If both records share the exact same verified email address
-  if (aEmail && bEmail && aEmail === bEmail) {
-    return true;
-  }
+  // Mandatory security rule: Nunca associar registros somente por coincidência de e-mail.
+  // Email equality alone is never sufficient to associate records without canonical UID or valid public ID link.
 
   // 3. Cross-match canonical UID with legacyId / legacyIds or raw ID
   if (aCanUid) {

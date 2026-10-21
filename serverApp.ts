@@ -108,7 +108,6 @@ import {
   consolidateTutorsList,
   resolveTeacherCanonicalIdentity,
   isValidCanonicalUid,
-  toDeterministicCanonicalStudentUid,
   isGenericTutorId,
   normalizeTutorName,
   scheduleLessonAtomicServer,
@@ -1885,7 +1884,9 @@ app.get('/api/auth/check-user', async (req, res) => {
           if (!db.authUsers) db.authUsers = {};
           if (!db.authUsers[email]) {
             db.authUsers[email] = {
-              uid: firestoreUser.uid || firestoreUser.id || `usr-${email.replace(/[^a-zA-Z0-9]/g, '-')}`,
+              uid: (firestoreUser.uid && isValidCanonicalUid(firestoreUser.uid))
+                ? firestoreUser.uid
+                : (firestoreUser.id && isValidCanonicalUid(firestoreUser.id) ? firestoreUser.id : ''),
               email,
               name: firestoreUser.name || email.split('@')[0],
               role: existingRole || 'student',
@@ -2014,7 +2015,11 @@ const handleRegistration = async (req: any, res: any) => {
       });
     }
 
-    const tutorId = verifiedUid || (req.body.uid && isValidCanonicalUid(req.body.uid) ? req.body.uid : null) || req.body.id || `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}-${Date.now()}`;
+    const tutorUid = verifiedUid || (req.body.uid && isValidCanonicalUid(req.body.uid) ? req.body.uid : null) || (req.body.id && isValidCanonicalUid(req.body.id) ? req.body.id : null);
+    if (!tutorUid) {
+      return res.status(400).json({ error: 'UID de autenticação do Firebase obrigatório e inválido para Amigo Nativo.' });
+    }
+    const tutorId = tutorUid;
     // Zero-leakage: never use stock mock photos. If user provided an avatar use it, otherwise empty string.
     const tutorAvatar = req.body.avatar || req.body.picture || '';
 
@@ -2216,7 +2221,10 @@ const handleRegistration = async (req: any, res: any) => {
   }
 
   // Authoritative UID: verified Firebase UID strictly takes precedence; client cannot override it
-  const userUid = verifiedUid || (req.body.uid && isValidCanonicalUid(req.body.uid) ? req.body.uid : null) || req.body.id || `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}-${Date.now()}`;
+  const userUid = verifiedUid || (req.body.uid && isValidCanonicalUid(req.body.uid) ? req.body.uid : null) || (req.body.id && isValidCanonicalUid(req.body.id) ? req.body.id : null);
+  if (!userUid) {
+    return res.status(400).json({ error: 'UID de autenticação do Firebase obrigatório e inválido.' });
+  }
   const userAvatar = req.body.avatar || req.body.picture || '';
 
   // Save student auth record (NO PASSWORDS)
@@ -2729,7 +2737,7 @@ app.post('/api/auth/google', async (req, res) => {
   const effectiveUid =
     (targetUid && isValidCanonicalUid(targetUid))
       ? targetUid
-      : (uid || db.authUsers?.[cleanEmail]?.uid || `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`);
+      : ((uid && isValidCanonicalUid(uid)) ? uid : (db.authUsers?.[cleanEmail]?.uid && isValidCanonicalUid(db.authUsers[cleanEmail].uid) ? db.authUsers[cleanEmail].uid : ''));
 
   const account = {
     uid: effectiveUid,
@@ -7655,8 +7663,12 @@ app.post(['/api/lessons', '/api/live-lessons'], async (req, res) => {
       const allProfiles = Object.values(db.userProfiles || {});
       const foundUser = (allUsers as any[]).find((u: any) => (u.email || '').toLowerCase().trim() === sEmail)
         || (allProfiles as any[]).find((p: any) => (p.email || '').toLowerCase().trim() === sEmail)
-        || (db.students || []).find((s: any) => (s.email || '').toLowerCase().trim() === sEmail);
-      newLesson.studentUid = foundUser?.uid || foundUser?.id || `usr-${sEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
+      const resolvedStudentUid = (foundUser?.uid && isValidCanonicalUid(foundUser.uid))
+        ? foundUser.uid
+        : (foundUser?.id && isValidCanonicalUid(foundUser.id) ? foundUser.id : '');
+      if (resolvedStudentUid) {
+        newLesson.studentUid = resolvedStudentUid;
+      }
     }
     if (!newLesson.teacherUid || !isValidCanonicalUid(newLesson.teacherUid)) {
       const tTarget = newLesson.teacherId || newLesson.teacherUid || newLesson.teacherEmail || newLesson.tutorEmail;
@@ -7771,7 +7783,9 @@ app.post(['/api/lessons', '/api/live-lessons'], async (req, res) => {
       if (db.userProfiles) {
         if (!db.userProfiles[cleanStudentEmail]) {
           db.userProfiles[cleanStudentEmail] = {
-            id: newLesson.studentUid || `usr-${cleanStudentEmail.replace(/[^a-zA-Z0-9]/g, '-')}`,
+            id: (newLesson.studentUid && isValidCanonicalUid(newLesson.studentUid))
+              ? newLesson.studentUid
+              : (db.authUsers?.[cleanStudentEmail]?.uid && isValidCanonicalUid(db.authUsers[cleanStudentEmail].uid) ? db.authUsers[cleanStudentEmail].uid : ''),
             name: newLesson.studentName || cleanStudentEmail.split('@')[0],
             email: cleanStudentEmail,
             teacherEmail: cleanTeacherEmail,
@@ -7811,12 +7825,10 @@ async function syncLessonUpdateToFirestore(lessonId: string, updates: Record<str
 
     // 2. Resolve student and teacher doc IDs
     const studentUid = (lessonMeta?.studentUid || '').trim();
-    const studentEmail = (lessonMeta?.studentEmail || '').toLowerCase().trim();
     const teacherUid = (lessonMeta?.teacherUid || lessonMeta?.tutorUid || '').trim();
-    const teacherEmail = (lessonMeta?.teacherEmail || lessonMeta?.tutorEmail || '').toLowerCase().trim();
 
-    const studentDocs = [studentUid, studentEmail ? `usr-${studentEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : ''].filter(Boolean);
-    const teacherDocs = [teacherUid, teacherEmail ? `usr-${teacherEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : ''].filter(Boolean);
+    const studentDocs = [studentUid && isValidCanonicalUid(studentUid) ? studentUid : ''].filter(Boolean);
+    const teacherDocs = [teacherUid && isValidCanonicalUid(teacherUid) ? teacherUid : ''].filter(Boolean);
 
     for (const sId of studentDocs) {
       try {
@@ -9879,10 +9891,6 @@ app.get('/api/lesson-insights', firebaseAuthMiddleware, async (req, res) => {
   let canonicalStudentUid = (rawStudentUid && isValidCanonicalUid(rawStudentUid) && rawStudentUid !== callerUid && !rawStudentUid.startsWith('tutor-')) ? rawStudentUid : '';
   let canonicalStudentEmail = rawStudentEmail || (rawStudentUid.includes('@') ? rawStudentUid.toLowerCase() : '');
 
-  if (!canonicalStudentUid && canonicalStudentEmail) {
-    canonicalStudentUid = toDeterministicCanonicalStudentUid(canonicalStudentEmail);
-  }
-
   if (effectiveCallerRole !== 'admin') {
     const identityRes = await resolveCanonicalStudentIdentity({
       caller: callerForIdentity,
@@ -9951,13 +9959,6 @@ app.get('/api/lesson-insights', firebaseAuthMiddleware, async (req, res) => {
         (lesson?.studentUid && isValidCanonicalUid(lesson.studentUid) && lesson.studentUid !== callerUid ? lesson.studentUid : '');
       if (lUid) {
         canonicalStudentUid = lUid;
-      } else {
-        const altId = student?.uid || student?.studentUid || student?.id || profile?.uid || profile?.id;
-        if (altId && altId !== callerUid && !String(altId).startsWith('tutor-')) {
-          canonicalStudentUid = String(altId);
-        } else {
-          canonicalStudentUid = `stu_${canonicalStudentEmail.replace(/[^a-zA-Z0-9]/g, '')}`;
-        }
       }
     }
   }
@@ -10019,10 +10020,6 @@ app.post('/api/lesson-insights/generate', firebaseAuthMiddleware, async (req, re
   // Never allow teacher's own UID to masquerade as the student's UID
   let canonicalStudentUid = (rawStudentUid && isValidCanonicalUid(rawStudentUid) && rawStudentUid !== callerUid && !rawStudentUid.startsWith('tutor-')) ? rawStudentUid : '';
   let canonicalStudentEmail = rawStudentEmail || (rawStudentUid.includes('@') ? rawStudentUid.toLowerCase() : '');
-
-  if (!canonicalStudentUid && canonicalStudentEmail) {
-    canonicalStudentUid = toDeterministicCanonicalStudentUid(canonicalStudentEmail);
-  }
 
   if (effectiveCallerRole !== 'admin') {
     const identityRes = await resolveCanonicalStudentIdentity({
@@ -10095,20 +10092,13 @@ app.post('/api/lesson-insights/generate', firebaseAuthMiddleware, async (req, re
         (lesson?.studentUid && isValidCanonicalUid(lesson.studentUid) && lesson.studentUid !== callerUid ? lesson.studentUid : '');
       if (lUid) {
         canonicalStudentUid = lUid;
-      } else {
-        const altId = student?.uid || student?.studentUid || student?.id || profile?.uid || profile?.id;
-        if (altId && altId !== callerUid && !String(altId).startsWith('tutor-')) {
-          canonicalStudentUid = String(altId);
-        } else {
-          canonicalStudentUid = `stu_${canonicalStudentEmail.replace(/[^a-zA-Z0-9]/g, '')}`;
-        }
       }
     }
   }
 
-  const effectiveStudentUid = (canonicalStudentUid && canonicalStudentUid !== callerUid)
+  const effectiveStudentUid = (canonicalStudentUid && isValidCanonicalUid(canonicalStudentUid) && canonicalStudentUid !== callerUid)
     ? canonicalStudentUid
-    : (isValidCanonicalUid(rawStudentUid) && rawStudentUid !== callerUid ? rawStudentUid : (canonicalStudentEmail ? `stu_${canonicalStudentEmail.replace(/[^a-zA-Z0-9]/g, '')}` : ''));
+    : (isValidCanonicalUid(rawStudentUid) && rawStudentUid !== callerUid ? rawStudentUid : '');
 
   try {
     // A. Recheck Firestore cache: if already saved, return immediately with ZERO AI calls!

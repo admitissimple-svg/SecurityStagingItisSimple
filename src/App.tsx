@@ -149,7 +149,6 @@ import { clearDictionaryMemoryCache } from './utils/dictionaryService';
 import {
   isGenericTutorId,
   normalizeTutorName,
-  toDeterministicCanonicalStudentUid,
 } from './utils/tutorConsolidation';
 import { FirestoreSchemaAlertBanner } from './components/FirestoreSchemaAlertBanner';
 import { StudentJournalEntry } from './types';
@@ -1322,7 +1321,9 @@ export default function App() {
             avatar: cleanPic,
             teacherEmail: effectiveTeacherEmail,
             teacherName: effectiveTeacherName,
-            teacherUid: fsProfile?.teacherUid || apiProfileData?.teacherUid || (effectiveTeacherEmail ? `usr-${effectiveTeacherEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : null),
+            teacherUid: (fsProfile?.teacherUid && isValidCanonicalUid(fsProfile.teacherUid))
+              ? fsProfile.teacherUid
+              : ((apiProfileData?.teacherUid && isValidCanonicalUid(apiProfileData.teacherUid)) ? apiProfileData.teacherUid : null),
             assignedNativeFriendUID: fsProfile?.assignedNativeFriendUID || fsProfile?.nativeFriendUID || apiProfileData?.assignedNativeFriendUID || null,
             nativeFriendUID: fsProfile?.nativeFriendUID || fsProfile?.assignedNativeFriendUID || apiProfileData?.nativeFriendUID || null,
             enrollmentStatus: effectiveEnrollment,
@@ -2777,8 +2778,8 @@ export default function App() {
       const freshProfile: UserProfile = {
         ...createDefaultStudentProfile(safeAccount),
         ...(initialProfile || {}),
-        id: effectiveAuthUid || `usr-${account.email.replace(/[^a-zA-Z0-9]/g, '-')}`,
-        uid: effectiveAuthUid || `usr-${account.email.replace(/[^a-zA-Z0-9]/g, '-')}`,
+        id: (effectiveAuthUid && isValidCanonicalUid(effectiveAuthUid)) ? effectiveAuthUid : ((account.uid && isValidCanonicalUid(account.uid)) ? account.uid : ''),
+        uid: (effectiveAuthUid && isValidCanonicalUid(effectiveAuthUid)) ? effectiveAuthUid : ((account.uid && isValidCanonicalUid(account.uid)) ? account.uid : ''),
         name: initialProfile?.name || account.name || '',
         email: account.email,
         picture: cleanPic,
@@ -5615,8 +5616,8 @@ export default function App() {
       }
 
       return {
-        id: (isValidCanonicalUid(accountUid) ? accountUid : null) || `tutor-${(currentAccount.email || currentAccount.id || 'current').replace(/[^a-zA-Z0-9]/g, '-')}`,
-        uid: isValidCanonicalUid(accountUid) ? accountUid : undefined,
+        id: (isValidCanonicalUid(accountUid) ? accountUid : null) || (currentAccount.id && isValidCanonicalUid(currentAccount.id) ? currentAccount.id : 'native-friend'),
+        uid: isValidCanonicalUid(accountUid) ? accountUid : (currentAccount.id && isValidCanonicalUid(currentAccount.id) ? currentAccount.id : undefined),
         name: currentAccount.name,
         email: currentAccount.email || '',
         avatar: currentAccount.picture || '',
@@ -6345,7 +6346,7 @@ export default function App() {
                     (isValidCanonicalUid(selectedStudentFilter) && selectedStudentFilter !== teacherUidVal ? selectedStudentFilter : '') ||
                     (found?.id && isValidCanonicalUid(found.id) && found.id !== teacherUidVal ? found.id : '');
 
-                  const stUid = canonicalUidCandidate || (stCleanEmail ? toDeterministicCanonicalStudentUid(stCleanEmail) : '') || (found?.uid && found.uid !== teacherUidVal ? found.uid : '') || (found?.id && !found.id.startsWith('tutor-') && found.id !== teacherUidVal ? found.id : '') || '';
+                  const stUid = canonicalUidCandidate || (found?.uid && isValidCanonicalUid(found.uid) && found.uid !== teacherUidVal ? found.uid : '') || '';
 
                   return (
                     <div className="space-y-5 animate-in fade-in duration-200" id="filtered-student-workspace">
