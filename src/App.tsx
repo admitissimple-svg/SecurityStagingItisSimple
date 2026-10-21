@@ -43,7 +43,7 @@ import {
 } from './hooks/useRoutine';
 import { recordConsumedVideo, recordConsumedTrack } from './hooks/useStudentHistory';
 import { extractYouTubeVideoId, getYouTubeWatchUrl } from './utils/youtube';
-import { getInstantOrCachedWord, lookupWord } from './utils/dictionaryService';
+import { getInstantOrCachedWord, lookupWord, isGenericPedagogicalDefinition, isGenericPedagogicalExample } from './utils/dictionaryService';
 import { auth, getDb, getAllFirestoreDbs } from './firebase';
 import { getAccessToken, getAdminAccessToken, waitForAuthUser, firebaseSignUpWithEmail, firebaseSignInWithEmail } from './utils/auth';
 import { useNativeFriends, isTutorApproved, isTeacherRole } from './hooks/useNativeFriends';
@@ -2920,13 +2920,16 @@ export default function App() {
         const actVideoTitle = (currentAct as any)?.title || actName;
         const todayIso = new Date().toISOString();
 
+        const validDef = cached.definitionEn && !isGenericPedagogicalDefinition(cached.definitionEn) ? cached.definitionEn : '';
+        const validEx = cached.exampleSentenceEn && !isGenericPedagogicalExample(cached.exampleSentenceEn) ? cached.exampleSentenceEn : '';
+
         return {
           id: `routine_${normKey.replace(/[^a-zA-Z0-9_-]/g, '_')}_${Date.now()}`,
           word: cleanW,
           originalWord: cleanW,
           normalizedWord: normKey,
-          definitionEn: cached.definitionEn || '',
-          exampleSentenceEn: cached.exampleSentenceEn || '',
+          definitionEn: validDef,
+          exampleSentenceEn: validEx,
           partOfSpeech: cached.partOfSpeech || '',
           translationPt: cached.translationPt || '',
           cefrLevel: cached.cefrLevel || 'B1',
@@ -2958,8 +2961,8 @@ export default function App() {
     if (dictEntries.length > 0) {
       handleAddWordsToDictionary(dictEntries);
 
-      // Asynchronously enrich any words that did not have cached definitions adhering to Native Friend Notes standard
-      const wordsNeedingEnrichment = dictEntries.filter((e) => !e.definitionEn || e.definitionEn.trim().length === 0);
+      // Asynchronously enrich any words that did not have valid pedagogical definitions adhering to Native Friend Notes standard
+      const wordsNeedingEnrichment = dictEntries.filter((e) => !e.definitionEn || e.definitionEn.trim().length === 0 || isGenericPedagogicalDefinition(e.definitionEn));
       if (wordsNeedingEnrichment.length > 0) {
         Promise.all(
           wordsNeedingEnrichment.map(async (entry) => {
@@ -2972,11 +2975,11 @@ export default function App() {
                 userProfile?.email,
                 studentDictionaryEntries
               );
-              if (enriched && enriched.definitionEn) {
+              if (enriched && enriched.definitionEn && !isGenericPedagogicalDefinition(enriched.definitionEn)) {
                 return {
                   ...entry,
                   definitionEn: enriched.definitionEn,
-                  exampleSentenceEn: enriched.exampleSentenceEn || entry.exampleSentenceEn,
+                  exampleSentenceEn: (enriched.exampleSentenceEn && !isGenericPedagogicalExample(enriched.exampleSentenceEn)) ? enriched.exampleSentenceEn : entry.exampleSentenceEn,
                   partOfSpeech: enriched.partOfSpeech || entry.partOfSpeech,
                   translationPt: enriched.translationPt || entry.translationPt,
                   cefrLevel: enriched.cefrLevel || entry.cefrLevel,

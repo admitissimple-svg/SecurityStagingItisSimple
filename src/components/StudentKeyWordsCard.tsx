@@ -122,7 +122,12 @@ export const StudentKeyWordsCard: React.FC<StudentKeyWordsCardProps> = ({
                           : 'Passe o mouse ou clique para ver definição completa e exemplos'
                       }
                     >
-                      {def.notFound ? (
+                      {def.unavailable ? (
+                        <span className="text-xs text-amber-700 font-medium italic truncate flex items-center gap-1">
+                          <span className="text-xs">⏳</span>
+                          <span>{isEn ? 'Definition temporarily unavailable. Word preserved.' : 'Definição temporariamente indisponível. Palavra preservada.'}</span>
+                        </span>
+                      ) : def.notFound ? (
                         <span className="text-xs text-amber-600 font-medium italic truncate flex items-center gap-1">
                           <span className="text-xs">⚠️</span>
                           <span>{isEn ? 'Word not found in standard dictionary.' : 'Palavra não localizada no dicionário padrão.'}</span>

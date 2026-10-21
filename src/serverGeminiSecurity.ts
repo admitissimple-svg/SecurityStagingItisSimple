@@ -130,11 +130,11 @@ export const GEMINI_POLICIES: Record<GeminiFeature, FeaturePolicy> = {
     timeoutMs: 15000,
   },
   dictionary_define: {
-    maxOutputTokens: 400,
+    maxOutputTokens: 600,
     rateLimitWindowSeconds: 60,
     rateLimitMaxRequests: 20,
-    maxInputLengthChars: 100,
-    timeoutMs: 5000,
+    maxInputLengthChars: 1500,
+    timeoutMs: 12000,
   },
   vocab_generate: {
     maxOutputTokens: 800,
@@ -762,8 +762,31 @@ export function isNonRecoverableGeminiError(error?: {
   if (statusCode === 401 || statusCode === 403 || statusCode === 400) return true;
 
   const raw = rawMessage.toLowerCase();
+
+  // Quota evaluation:
+  // If quota is per-model (e.g. GenerateRequestsPerDayPerProjectPerModel, free_tier_requests): recoverable on next model in contingency pool.
+  // If quota is shared/project-wide (e.g. daily limit for project): non-recoverable.
+  if (category === 'QUOTA_EXCEEDED' || statusCode === 429 || raw.includes('quota') || raw.includes('resource_exhausted')) {
+    if (
+      raw.includes('perprojectpermodel') ||
+      raw.includes('free_tier_requests') ||
+      raw.includes('generate_content_free_tier_requests') ||
+      raw.includes('generativelanguage.googleapis.com')
+    ) {
+      return false; // Per-model quota: next model in contingency can be attempted
+    }
+    if (raw.includes('project') && (raw.includes('perday') || raw.includes('limit_exceeded') || raw.includes('billable'))) {
+      return true; // Project-level quota exhausted
+    }
+    // Default for 429: per-model quota in free-tier allows trying next model
+    return false;
+  }
+
+  // Non-recoverable account & billing directives (must not false-positive on standard quota advice "check your plan and billing details")
   if (
-    raw.includes('billing') ||
+    raw.includes('billing is not enabled') ||
+    raw.includes('billing_not_enabled') ||
+    raw.includes('enable billing') ||
     raw.includes('account_disabled') ||
     raw.includes('api_key_invalid') ||
     raw.includes('apikey not found') ||
@@ -778,16 +801,58 @@ export function isNonRecoverableGeminiError(error?: {
     return true;
   }
 
-  // Quota evaluation:
-  // If quota is shared/project-wide (e.g. daily limit for project): non-recoverable.
-  // If quota is per-model (e.g. GenerateRequestsPerDayPerProjectPerModel): recoverable on next model in contingency pool.
-  if (category === 'QUOTA_EXCEEDED' || raw.includes('quota')) {
-    if (raw.includes('perprojectpermodel') || raw.includes('free_tier_requests')) {
-      return false; // Per-model quota: next model in contingency can be attempted
-    }
-    if (raw.includes('project') && (raw.includes('perday') || raw.includes('limit_exceeded') || raw.includes('billable'))) {
-      return true; // Project-level quota exhausted
-    }
+  return false;
+}
+
+/**
+ * Detects whether a definition string is a generic synthetic placeholder template
+ * instead of an authentic pedagogical definition tailored to the word.
+ */
+export function isGenericPedagogicalDefinition(def: string | undefined | null): boolean {
+  if (!def || typeof def !== 'string') return true;
+  const trimmed = def.trim();
+  if (trimmed.length === 0) return true;
+  const lower = trimmed.toLowerCase();
+
+  if (
+    lower.includes('a fundamental word for level') ||
+    lower.includes('practice using "') ||
+    lower.includes("practice using '") ||
+    lower.includes('conversational expression to enrich') ||
+    lower.includes('speaking flow and vocabulary range') ||
+    lower.includes('elevate your expressive nuance') ||
+    lower.includes('practical vocabulary term (') ||
+    lower.includes('practical english term (') ||
+    lower.includes('key communicative expression') ||
+    lower.startsWith('a fundamental word') ||
+    lower.startsWith('a natural conversational expression') ||
+    lower.startsWith('an advanced lexical item')
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Detects whether an example sentence is a generic synthetic placeholder template
+ * instead of an authentic conversational sentence tailored to the word.
+ */
+export function isGenericPedagogicalExample(example: string | undefined | null): boolean {
+  if (!example || typeof example !== 'string') return true;
+  const trimmed = example.trim();
+  if (trimmed.length === 0) return true;
+  const lower = trimmed.toLowerCase();
+
+  if (
+    lower.includes('with confidence in our routine') ||
+    lower.includes('during our daily conversation routine') ||
+    lower.includes('makes your daily english sound much more expressive') ||
+    lower.includes('during our live conversation practice today') ||
+    lower.includes('helps you follow native english conversations easily') ||
+    lower.includes('frequently used by native speakers in everyday chats')
+  ) {
+    return true;
   }
 
   return false;

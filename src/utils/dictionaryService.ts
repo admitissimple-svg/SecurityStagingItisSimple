@@ -12,13 +12,68 @@ export interface DictionaryLookupResult {
   phonetic?: string;
   audio?: string;
   translationPt?: string;
-  source: 'native_notes_standard' | 'api' | 'not_found' | 'pending' | 'offline_dict' | 'fallback' | string;
+  source: 'native_notes_standard' | 'api' | 'not_found' | 'pending' | 'offline_dict' | 'fallback' | 'unavailable' | string;
   notFound?: boolean;
+  unavailable?: boolean;
   errorMessage?: string;
   cefrLevel?: 'A1' | 'A2' | 'B1' | 'B2' | 'C1' | 'C2';
   collocations?: string[];
   synonyms?: string[];
   register?: 'informal' | 'neutral' | 'formal' | 'idiomatic';
+}
+
+/**
+ * Detects whether a definition string is a generic synthetic placeholder template
+ * instead of an authentic pedagogical definition tailored to the word.
+ */
+export function isGenericPedagogicalDefinition(def: string | undefined | null): boolean {
+  if (!def || typeof def !== 'string') return true;
+  const trimmed = def.trim();
+  if (trimmed.length === 0) return true;
+  const lower = trimmed.toLowerCase();
+
+  if (
+    lower.includes('a fundamental word for level') ||
+    lower.includes('practice using "') ||
+    lower.includes("practice using '") ||
+    lower.includes('conversational expression to enrich') ||
+    lower.includes('speaking flow and vocabulary range') ||
+    lower.includes('elevate your expressive nuance') ||
+    lower.includes('practical vocabulary term (') ||
+    lower.includes('practical english term (') ||
+    lower.includes('key communicative expression') ||
+    lower.startsWith('a fundamental word') ||
+    lower.startsWith('a natural conversational expression') ||
+    lower.startsWith('an advanced lexical item')
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Detects whether an example sentence is a generic synthetic placeholder template
+ * instead of an authentic conversational sentence tailored to the word.
+ */
+export function isGenericPedagogicalExample(example: string | undefined | null): boolean {
+  if (!example || typeof example !== 'string') return true;
+  const trimmed = example.trim();
+  if (trimmed.length === 0) return true;
+  const lower = trimmed.toLowerCase();
+
+  if (
+    lower.includes('with confidence in our routine') ||
+    lower.includes('during our daily conversation routine') ||
+    lower.includes('makes your daily english sound much more expressive') ||
+    lower.includes('during our live conversation practice today') ||
+    lower.includes('helps you follow native english conversations easily') ||
+    lower.includes('frequently used by native speakers in everyday chats')
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 interface FreeDictionaryDefinition {
@@ -290,10 +345,36 @@ async function fetchFromBackendApi(
       return null;
     }
 
+    if (res.status === 503) {
+      return {
+        word: cleanWord,
+        partOfSpeech: '',
+        definitionEn: '',
+        exampleSentenceEn: '',
+        source: 'unavailable',
+        notFound: false,
+        unavailable: true,
+        errorMessage: 'Definição temporariamente indisponível. Palavra preservada.',
+      };
+    }
+
     if (!res.ok) return null;
 
     const data = await res.json();
-    if (data && (data.definitionEn || data.notFound)) {
+    if (data && (data.definitionEn || data.notFound || data.unavailable)) {
+      if (data.unavailable) {
+        return {
+          word: cleanWord,
+          partOfSpeech: data.partOfSpeech || '',
+          definitionEn: '',
+          exampleSentenceEn: '',
+          source: 'unavailable',
+          notFound: false,
+          unavailable: true,
+          errorMessage: 'Definição temporariamente indisponível. Palavra preservada.',
+        };
+      }
+
       if (data.notFound) {
         return {
           word: cleanWord,
@@ -304,6 +385,10 @@ async function fetchFromBackendApi(
           notFound: true,
           errorMessage: 'Palavra não localizada no padrão unificado.',
         };
+      }
+
+      if (data.definitionEn && isGenericPedagogicalDefinition(data.definitionEn)) {
+        return null;
       }
 
       return {
@@ -368,7 +453,7 @@ export async function lookupWord(
     const existing = activeDictionary.find(
       (e) =>
         normalizeDictionaryWord(e.normalizedWord || e.word) === norm &&
-        Boolean(e.definitionEn && e.definitionEn.trim().length > 0)
+        Boolean(e.definitionEn && e.definitionEn.trim().length > 0 && !isGenericPedagogicalDefinition(e.definitionEn))
     );
     if (existing) {
       const myDictResult: DictionaryLookupResult = {
@@ -396,7 +481,7 @@ export async function lookupWord(
     const existing = localVocab.find(
       (e) =>
         normalizeDictionaryWord(e.normalizedWord || e.word) === norm &&
-        Boolean(e.definitionEn && e.definitionEn.trim().length > 0)
+        Boolean(e.definitionEn && e.definitionEn.trim().length > 0 && !isGenericPedagogicalDefinition(e.definitionEn))
     );
     if (existing) {
       const myDictResult: DictionaryLookupResult = {
@@ -419,7 +504,10 @@ export async function lookupWord(
   // 2. Check session memory cache
   const cached = memoryCache.get(cacheKey);
   if (cached && !cached.notFound) {
-    return cached;
+    if (cached.definitionEn && !isGenericPedagogicalDefinition(cached.definitionEn)) {
+      return cached;
+    }
+    memoryCache.delete(cacheKey);
   }
 
   // 3. Check Native Friend Notes validated database for instant match
@@ -448,42 +536,34 @@ export async function lookupWord(
 
   // 4. Query backend dictionary endpoint (/api/dictionary/define)
   const backendResult = await fetchFromBackendApi(cleanWord, context, studentLevel);
-  if (backendResult && !backendResult.notFound && backendResult.definitionEn) {
+  if (backendResult && !backendResult.notFound && backendResult.definitionEn && !isGenericPedagogicalDefinition(backendResult.definitionEn)) {
     memoryCache.set(cacheKey, backendResult);
+    return backendResult;
+  }
+  if (backendResult && backendResult.unavailable) {
     return backendResult;
   }
 
   // 5. Query Free Dictionary API with Native Friend Notes pedagogical adaptation
   const apiResult = await fetchFromFreeDictionaryApi(cleanWord, studentLevel);
-  if (apiResult && !apiResult.notFound && apiResult.definitionEn) {
+  if (apiResult && !apiResult.notFound && apiResult.definitionEn && !isGenericPedagogicalDefinition(apiResult.definitionEn)) {
     memoryCache.set(cacheKey, apiResult);
     return apiResult;
   }
 
-  // 6. Native Friend Notes standard pedagogical fallback for words without direct external entry
+  // 6. When external and AI services fail, return transparent unavailability preserving typed words
   const isMultiWord = cleanWord.includes(' ');
   const fallbackPos = isMultiWord ? 'Idiomatic Expression' : 'Vocabulary Item';
-  const fallbackDef =
-    cefrMeta.cefr === 'A1' || cefrMeta.cefr === 'A2'
-      ? `A fundamental word for level ${cefrMeta.cefr}: practice using "${cleanWord}" in simple daily conversations.`
-      : cefrMeta.cefr === 'B1' || cefrMeta.cefr === 'B2'
-      ? `A natural conversational expression to enrich your speaking flow and vocabulary range.`
-      : `An advanced lexical item to elevate your expressive nuance and natural delivery.`;
-
-  const fallbackExample = generateRealConversationalExample(cleanWord, fallbackPos);
-
-  const pedagogicalFallbackResult: DictionaryLookupResult = {
+  return {
     word: cleanWord,
     partOfSpeech: fallbackPos,
-    definitionEn: fallbackDef,
-    exampleSentenceEn: fallbackExample,
+    definitionEn: '',
+    exampleSentenceEn: '',
     cefrLevel: cefrMeta.cefr,
-    source: 'native_notes_standard',
+    source: 'unavailable',
     notFound: false,
+    unavailable: true,
   };
-
-  // Transient fallback: do NOT store generic placeholder in memoryCache so real definitions can be retrieved on subsequent requests
-  return pedagogicalFallbackResult;
 }
 
 /**
@@ -518,7 +598,7 @@ export function getInstantOrCachedWord(
     const existing = activeDictionary.find(
       (e) =>
         normalizeDictionaryWord(e.normalizedWord || e.word) === norm &&
-        Boolean(e.definitionEn && e.definitionEn.trim().length > 0)
+        Boolean(e.definitionEn && e.definitionEn.trim().length > 0 && !isGenericPedagogicalDefinition(e.definitionEn))
     );
     if (existing) {
       return {
@@ -543,7 +623,7 @@ export function getInstantOrCachedWord(
     const existing = localVocab.find(
       (e) =>
         normalizeDictionaryWord(e.normalizedWord || e.word) === norm &&
-        Boolean(e.definitionEn && e.definitionEn.trim().length > 0)
+        Boolean(e.definitionEn && e.definitionEn.trim().length > 0 && !isGenericPedagogicalDefinition(e.definitionEn))
     );
     if (existing) {
       return {
@@ -563,7 +643,10 @@ export function getInstantOrCachedWord(
 
   const cached = memoryCache.get(cacheKey);
   if (cached) {
-    return cached;
+    if (!cached.definitionEn || !isGenericPedagogicalDefinition(cached.definitionEn)) {
+      return cached;
+    }
+    memoryCache.delete(cacheKey);
   }
 
   const lowerKey = cleanWord.toLowerCase();

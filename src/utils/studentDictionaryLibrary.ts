@@ -12,7 +12,12 @@ import {
   getCachedExcludedDictionaryWords,
   normalizeUid,
 } from './studentPersistence';
-import { lookupWord, getInstantOrCachedWord } from './dictionaryService';
+import {
+  lookupWord,
+  getInstantOrCachedWord,
+  isGenericPedagogicalDefinition,
+  isGenericPedagogicalExample,
+} from './dictionaryService';
 
 /**
  * Normalizes a vocabulary word or expression for deterministic indexing and deduplication.
@@ -44,15 +49,16 @@ export function isDefinitionRicher(existingDef?: string, newDef?: string): boole
   if (!ex) return false;
   if (!nw) return true;
 
-  // Generic fallback patterns that should NOT overwrite concrete definitions
-  const genericFallbackRegex = /A (fundamental word|natural conversational expression|practical English term|Key communicative expression)/i;
-  const isNewGeneric = genericFallbackRegex.test(nw);
-  const isExistingGeneric = genericFallbackRegex.test(ex);
+  const isNewGeneric = isGenericPedagogicalDefinition(nw);
+  const isExistingGeneric = isGenericPedagogicalDefinition(ex);
 
   if (isNewGeneric && !isExistingGeneric) {
-    return true;
+    return true; // Keep existing non-generic
   }
   if (!isNewGeneric && isExistingGeneric) {
+    return false; // Incoming non-generic replaces existing generic
+  }
+  if (isNewGeneric && isExistingGeneric) {
     return false;
   }
 
@@ -146,17 +152,21 @@ export function consolidateDictionaryEntries(
           ]
         : [];
 
-      const isIncomingProvisional = Boolean(incoming.isProvisional || (incoming as any).isFallback || incoming.enrichmentStatus === 'pending');
+      const isIncomingGeneric = isGenericPedagogicalDefinition(incoming.definitionEn);
+      const isIncomingExampleGeneric = isGenericPedagogicalExample(incoming.exampleSentenceEn);
+      const isIncomingProvisional = Boolean(incoming.isProvisional || (incoming as any).isFallback || incoming.enrichmentStatus === 'pending' || isIncomingGeneric);
       masterMap.set(norm, {
         ...incoming,
         id: incoming.id || `dict_${norm.replace(/[^a-zA-Z0-9_-]/g, '_')}_${Date.now()}`,
         word: cleanWord,
         originalWord: incoming.originalWord || cleanWord,
         normalizedWord: norm,
+        definitionEn: isIncomingGeneric ? '' : incoming.definitionEn,
+        exampleSentenceEn: isIncomingExampleGeneric ? '' : incoming.exampleSentenceEn,
         origins: initialOrigins,
         firstSeenAt: incoming.firstSeenAt || incoming.learnedAt || new Date().toISOString(),
         practiceCount: typeof incoming.practiceCount === 'number' ? incoming.practiceCount : 0,
-        enrichmentStatus: incoming.enrichmentStatus === 'enriched' && !isIncomingProvisional ? 'enriched' : 'pending',
+        enrichmentStatus: (incoming.enrichmentStatus === 'enriched' && !isIncomingProvisional && !isIncomingGeneric) ? 'enriched' : 'pending',
         isProvisional: isIncomingProvisional,
       });
       return;
@@ -164,17 +174,30 @@ export function consolidateDictionaryEntries(
 
     // Merging into existing record:
     // A. Definitions & Examples: Keep richer definition & protect against provisional overwrites (HOTFIX 4B.8.1)
-    const isIncomingProvisional = Boolean(incoming.isProvisional || (incoming as any).isFallback || incoming.enrichmentStatus === 'pending');
-    const isExistingEnriched = Boolean(existing.enrichmentStatus === 'enriched' || (existing.definitionEn && !existing.isProvisional));
+    const isIncomingGeneric = isGenericPedagogicalDefinition(incoming.definitionEn);
+    const isExistingGeneric = isGenericPedagogicalDefinition(existing.definitionEn);
+    const isIncomingExampleGeneric = isGenericPedagogicalExample(incoming.exampleSentenceEn);
+    const isExistingExampleGeneric = isGenericPedagogicalExample(existing.exampleSentenceEn);
+    const isIncomingProvisional = Boolean(incoming.isProvisional || (incoming as any).isFallback || incoming.enrichmentStatus === 'pending' || isIncomingGeneric);
+    const isExistingEnriched = Boolean(existing.enrichmentStatus === 'enriched' || (existing.definitionEn && !existing.isProvisional && !isExistingGeneric));
 
-    const keepExistingDef = isDefinitionRicher(existing.definitionEn, incoming.definitionEn) || (isExistingEnriched && isIncomingProvisional);
-    const resolvedDefinition = keepExistingDef
-      ? existing.definitionEn
-      : (incoming.definitionEn || existing.definitionEn || '');
+    let resolvedDefinition = '';
+    if (!isExistingGeneric && isIncomingGeneric) {
+      resolvedDefinition = existing.definitionEn;
+    } else if (!isIncomingGeneric) {
+      resolvedDefinition = incoming.definitionEn;
+    } else {
+      resolvedDefinition = '';
+    }
 
-    const resolvedExample = existing.exampleSentenceEn && (!incoming.exampleSentenceEn || incoming.exampleSentenceEn.length < existing.exampleSentenceEn.length)
-      ? existing.exampleSentenceEn
-      : (incoming.exampleSentenceEn || existing.exampleSentenceEn || '');
+    let resolvedExample = '';
+    if (!isIncomingExampleGeneric && incoming.exampleSentenceEn) {
+      resolvedExample = incoming.exampleSentenceEn;
+    } else if (!isExistingExampleGeneric && existing.exampleSentenceEn) {
+      resolvedExample = existing.exampleSentenceEn;
+    } else {
+      resolvedExample = '';
+    }
 
     // B. Translations
     const mergedTranslations: Record<string, string> = {
@@ -295,7 +318,9 @@ export function consolidateDictionaryEntries(
       normalizedWord: norm,
       definitionEn: resolvedDefinition,
       exampleSentenceEn: resolvedExample,
-      partOfSpeech: existing.partOfSpeech || incoming.partOfSpeech || '',
+      partOfSpeech: (incoming.partOfSpeech && incoming.partOfSpeech !== 'Vocabulary Item')
+        ? incoming.partOfSpeech
+        : (existing.partOfSpeech || incoming.partOfSpeech || ''),
       phonetic: incoming.phonetic || existing.phonetic,
       audio: incoming.audio || existing.audio || incoming.audioUrl || existing.audioUrl,
       audioUrl: incoming.audioUrl || existing.audioUrl || incoming.audio || existing.audio,

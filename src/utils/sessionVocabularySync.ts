@@ -189,7 +189,7 @@ export async function syncSessionVocabularyToStudentDictionary(
       const rawSimpleDef = typeof v.simpleDefinition === 'string' ? v.simpleDefinition.trim() : '';
 
       // Generic fallback patterns that indicate un-enriched or provisional synthesis
-      const isGenericFallback = /A (fundamental word|natural conversational expression|practical English term|Key communicative expression)/i.test(rawDefEn);
+      const isGenericFallback = /A (fundamental word|natural conversational expression|practical English term|practical vocabulary term|Key communicative expression|advanced lexical item)|practice using ["']/i.test(rawDefEn);
 
       const hasValidAiDefEn = Boolean(
         isDefinitiveAi &&
@@ -202,7 +202,8 @@ export async function syncSessionVocabularyToStudentDictionary(
 
       // Rule: Do NOT overwrite valid existing definition!
       const existingDefEn = existing?.definitionEn?.trim() || '';
-      const existingIsEnriched = Boolean(existing?.existingEnriched || (existingDefEn && !isGenericFallback));
+      const existingIsGeneric = !existingDefEn || /A (fundamental word|natural conversational expression|practical English term|practical vocabulary term|Key communicative expression|advanced lexical item)|practice using ["']/i.test(existingDefEn);
+      const existingIsEnriched = Boolean(existing?.existingEnriched || (existingDefEn && !existingIsGeneric));
 
       let finalDefEn = '';
       let isValidAiEnglish = false;

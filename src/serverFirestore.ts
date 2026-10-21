@@ -1,6 +1,7 @@
 import { getFirestore, Firestore, FieldValue } from 'firebase-admin/firestore';
 import { getFirebaseAdminApp, ALLOWED_STAGING_PROJECT_ID } from './serverFirebaseAdmin';
 import { normalizeDictionaryWord } from './utils/studentDictionaryLibrary';
+import { isGenericPedagogicalDefinition } from './serverGeminiSecurity';
 
 /**
  * Active identifiers for staging persistence.
@@ -2386,26 +2387,22 @@ function consolidateServerEntries(existingEntries: any[], newEntries: any[]): an
     const isItemProvisional = Boolean(item.isProvisional || item.isFallback || item.enrichmentStatus === 'pending');
     const isExistingEnriched = Boolean(existing.enrichmentStatus === 'enriched' || (existingDef && !existing.isProvisional));
 
-    const genericFallbackRegex = /A (fundamental word|natural conversational expression|practical English term|Key communicative expression)/i;
-    const isNewGeneric = genericFallbackRegex.test(newDef);
-    const isExistingGeneric = genericFallbackRegex.test(existingDef);
+    const isNewGeneric = !newDef || isGenericPedagogicalDefinition(newDef);
+    const isExistingGeneric = !existingDef || isGenericPedagogicalDefinition(existingDef);
 
-    // Rule: Provisional or fallback definitions must NEVER overwrite an existing legitimate definition
-    const keepExistingDef = Boolean(
-      existingDef && (
-        !newDef ||
-        (isItemProvisional && isExistingEnriched) ||
-        (isNewGeneric && !isExistingGeneric) ||
-        (existingDef.length > 20 && newDef.length < 15)
-      )
-    );
+    // Rule: Legitimate definitions always replace generic placeholders; generic definitions never overwrite legitimate ones
+    let resolvedDef = '';
+    if (!isExistingGeneric && isNewGeneric) {
+      resolvedDef = existingDef;
+    } else if (!isNewGeneric) {
+      resolvedDef = newDef;
+    } else {
+      resolvedDef = ''; // both are generic, do not persist generic text
+    }
 
-    const resolvedDef = keepExistingDef ? existingDef : (newDef || existingDef || '');
-    const resolvedEnrichmentStatus = (isExistingEnriched && isItemProvisional)
+    const resolvedEnrichmentStatus = Boolean(resolvedDef) && !isGenericPedagogicalDefinition(resolvedDef)
       ? 'enriched'
-      : (item.enrichmentStatus === 'enriched' && !isItemProvisional && Boolean(newDef) && !isNewGeneric)
-      ? 'enriched'
-      : (existing.enrichmentStatus === 'enriched' ? 'enriched' : (item.enrichmentStatus || existing.enrichmentStatus || 'pending'));
+      : 'pending';
     const resolvedExample = existing.exampleSentenceEn && (!item.exampleSentenceEn || item.exampleSentenceEn.length < existing.exampleSentenceEn.length)
       ? existing.exampleSentenceEn
       : (item.exampleSentenceEn || item.exampleSentence || existing.exampleSentenceEn || '');

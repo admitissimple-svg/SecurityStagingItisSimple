@@ -69,7 +69,7 @@ import { useBehavioralVideoTracker, useBehavioralAudioTracker } from '../hooks/u
 import { CurrentSpotifyTrack } from '../utils/routineSync';
 import { speakText } from '../utils/audio';
 import { checkDailySentenceAi } from '../utils/writingChecker';
-import { getInstantOrCachedWord, lookupWord, DictionaryLookupResult } from '../utils/dictionaryService';
+import { getInstantOrCachedWord, lookupWord, DictionaryLookupResult, isGenericPedagogicalDefinition } from '../utils/dictionaryService';
 import {
   DAYS_OF_WEEK,
   getDayLabel,
@@ -334,7 +334,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
         const existingInMyDict = (dictionaryEntries || []).find(
           (d) =>
             (d.word || '').trim().toLowerCase() === norm &&
-            Boolean(d.definitionEn && d.definitionEn.trim().length > 0)
+            Boolean(d.definitionEn && d.definitionEn.trim().length > 0 && !isGenericPedagogicalDefinition(d.definitionEn))
         );
         if (existingInMyDict) {
           initialDefs[idx] = {
@@ -372,6 +372,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
             word.length >= 2 &&
             (!initialDefs[idx] ||
               !initialDefs[idx].definitionEn ||
+              isGenericPedagogicalDefinition(initialDefs[idx].definitionEn) ||
               initialDefs[idx].source === 'pending')
         );
 
@@ -389,7 +390,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
                 userProfile?.email,
                 dictionaryEntries
               );
-              if (res && res.definitionEn) {
+              if (res) {
                 setWordDefinitions((prev) => {
                   if (words[idx]?.trim().toLowerCase() === word.toLowerCase()) {
                     return { ...prev, [idx]: res };

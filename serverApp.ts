@@ -207,6 +207,8 @@ import {
   resetGeminiSecurityStateForTesting,
   sendGeminiCostControlUnavailable,
   GeminiFeature,
+  isGenericPedagogicalDefinition,
+  isGenericPedagogicalExample,
 } from './src/serverGeminiSecurity';
 
 export const LANGUAGE_NAMES: Record<string, { nameEn: string; nameNative: string }> = {
@@ -4221,11 +4223,22 @@ Respond strictly with a JSON object:
       callerRole,
       apiKey,
       temperature: 0.2,
-      jsonValidator: (val) => Boolean(val && val.definitionEn && val.exampleSentenceEn),
+      jsonValidator: (val) => Boolean(
+        val &&
+        val.definitionEn &&
+        val.exampleSentenceEn &&
+        !isGenericPedagogicalDefinition(val.definitionEn) &&
+        !isGenericPedagogicalExample(val.exampleSentenceEn)
+      ),
     });
 
     const parsed = contingencyResult?.parsedJson;
-    if (parsed && parsed.definitionEn && parsed.exampleSentenceEn) {
+    if (
+      parsed &&
+      parsed.definitionEn &&
+      parsed.exampleSentenceEn &&
+      !isGenericPedagogicalDefinition(parsed.definitionEn)
+    ) {
       return {
         word: parsed.word || cleanWord,
         partOfSpeech: parsed.partOfSpeech || (cleanWord.includes(' ') ? 'Idiomatic Expression' : 'Noun'),
@@ -4284,7 +4297,12 @@ app.all('/api/dictionary/define', firebaseAuthMiddleware, async (req, res) => {
   const cacheKey = `${lowerWord}_${cefr}`;
 
   if (pedagogicalDictCache.has(cacheKey)) {
-    return res.json(pedagogicalDictCache.get(cacheKey));
+    const cached = pedagogicalDictCache.get(cacheKey);
+    if (cached && !cached.notFound && !cached.unavailable && !isGenericPedagogicalDefinition(cached.definitionEn)) {
+      return res.json(cached);
+    }
+    pedagogicalDictCache.delete(cacheKey);
+    pedagogicalDictCache.delete(lowerWord);
   }
 
   // 1. Curated repository check adhering to Native Friend Notes (Instant 0ms)
@@ -4473,29 +4491,14 @@ app.all('/api/dictionary/define', firebaseAuthMiddleware, async (req, res) => {
     // Secondary fallback handling
   }
 
-  // 5. Fallback adhering strictly to Native Friend Notes pedagogical standard
-  const isMultiWord = cleanWord.includes(' ');
-  const fallbackPos = isMultiWord ? 'Idiomatic Expression' : 'Vocabulary Item';
-  const fallbackDef =
-    cefr === 'A1' || cefr === 'A2'
-      ? `A fundamental word for level ${cefr}: practice using "${cleanWord}" in simple daily conversations.`
-      : cefr === 'B1' || cefr === 'B2'
-      ? `A natural conversational expression to enrich your speaking flow and vocabulary range.`
-      : `An advanced lexical item to elevate your expressive nuance and natural delivery.`;
-
-  const fallbackResult = {
+  // 5. If all sources fail, return transparent unavailability while preserving the word
+  return res.status(503).json({
     word: cleanWord,
-    partOfSpeech: fallbackPos,
-    cefrLevel: cefr,
-    definitionEn: fallbackDef,
-    exampleSentenceEn: generateNativeNotesExample(cleanWord, fallbackPos),
-    source: 'native_notes_standard',
+    unavailable: true,
     notFound: false,
-  };
-
-  pedagogicalDictCache.set(cacheKey, fallbackResult);
-  pedagogicalDictCache.set(lowerWord, fallbackResult);
-  return res.json(fallbackResult);
+    message: 'Pedagogical definition temporarily unavailable. Your word is preserved.',
+    source: 'ai_unavailable',
+  });
 });
 
 // Internal helper to lookup word definition & examples for pedagogical engine
@@ -4515,7 +4518,7 @@ async function lookupServerDictionaryWord(cleanWord: string, studentLevel?: stri
   const cacheKey = `${lower}_${cefr}`;
   if (pedagogicalDictCache.has(cacheKey)) {
     const cached = pedagogicalDictCache.get(cacheKey);
-    if (cached && !cached.notFound && cached.definitionEn) {
+    if (cached && !cached.notFound && cached.definitionEn && !isGenericPedagogicalDefinition(cached.definitionEn)) {
       return {
         word: trimmed,
         definitionEn: cached.definitionEn,
@@ -4525,6 +4528,7 @@ async function lookupServerDictionaryWord(cleanWord: string, studentLevel?: stri
         partOfSpeech: cached.partOfSpeech || 'Vocabulary Item',
       };
     }
+    pedagogicalDictCache.delete(cacheKey);
   }
 
   // 2. Offline curated routine dictionary
@@ -4608,13 +4612,13 @@ async function lookupServerDictionaryWord(cleanWord: string, studentLevel?: stri
     }
   } catch {}
 
-  // 5. Default structured vocabulary entry following Native Friend Notes
+  // 5. Unavailability fallback: return empty definition instead of synthetic placeholder
   const isMultiWord = trimmed.includes(' ');
   const fallbackPos = isMultiWord ? 'Idiomatic Expression' : 'Vocabulary Item';
   return {
     word: trimmed,
-    definitionEn: `A practical vocabulary term (${cefr}) to enrich your conversational flow and clarity.`,
-    exampleSentenceEn: generateNativeNotesExample(trimmed, fallbackPos),
+    definitionEn: '',
+    exampleSentenceEn: '',
     translationPt: trimmed,
     cefrLevel: cefr,
     partOfSpeech: fallbackPos,
