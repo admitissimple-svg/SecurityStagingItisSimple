@@ -113,21 +113,11 @@ export function getAuthoritativeDb(): any | null {
       return authoritativeDbReader();
     } catch {}
   }
-  try {
-    const fs = require('fs');
-    const path = require('path');
-    const candidates = [
-      path.resolve(process.cwd(), 'src/data/app_db.json'),
-      path.resolve(__dirname, 'data/app_db.json'),
-    ];
-    for (const p of candidates) {
-      if (fs.existsSync(p)) {
-        return JSON.parse(fs.readFileSync(p, 'utf8'));
-      }
-    }
-  } catch {}
+  // HOTFIX PONTUAL: Remoção de dependência e fallback para app_db.json.
+  // app_db.json não é utilizado como fonte de dados, identidade ou fallback.
   return null;
 }
+
 
 // Timeout helper so remote Firestore never blocks an Express API response indefinitely
 function withTimeout<T>(promise: Promise<T>, ms: number = 1500): Promise<T | null> {
@@ -330,16 +320,9 @@ export async function resolveTeacherCanonicalIdentity(
       const dbState = (target && typeof target === 'object' && (target as any).dbState) || null;
       let localTutors = dbState?.tutorsList || [];
       let localTeachers = dbState?.teachers || [];
-      if ((!localTutors || localTutors.length === 0) && (!localTeachers || localTeachers.length === 0)) {
-        const fs = await import('fs');
-        const path = await import('path');
-        const dbPath = path.resolve(process.cwd(), 'src/data/app_db.json');
-        if (fs.existsSync(dbPath)) {
-          const parsed = JSON.parse(fs.readFileSync(dbPath, 'utf-8'));
-          localTutors = parsed.tutorsList || [];
-          localTeachers = parsed.teachers || [];
-        }
-      }
+      // HOTFIX PONTUAL: Remoção da dependência e fallback para src/data/app_db.json.
+      // Apenas dbState em memória explicitamente fornecido (ex: testes isolados) é consultado.
+      // O arquivo legado src/data/app_db.json nunca é lido no runtime.
       const allLocal = [...localTutors, ...localTeachers];
       for (const item of allLocal) {
         if (!item) continue;
@@ -980,9 +963,22 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
       updatedAt: new Date().toISOString(),
     };
 
+    // HOTFIX PONTUAL: Isolamento do JSON de Testes — impedir que registros originados do JSON local sejam gravados no Firestore
+    const isLocalJsonOrTestRecord = (item: any): boolean => {
+      if (!item || typeof item !== 'object') return false;
+      if (item.isLocalJsonRecord || item.origin === 'local_json' || item.source === 'app_db.json') return true;
+      const email = String(item.email || item.studentEmail || item.teacherEmail || '').toLowerCase().trim();
+      if (email.endsWith('@example.com') || email.endsWith('@test.com')) return true;
+      const uid = String(item.authUid || item.uid || item.studentUid || item.id || '').trim();
+      if (uid && !isValidCanonicalUid(uid) && !uid.includes('@')) {
+        return true;
+      }
+      return false;
+    };
+
     const tutorsData = {
-      tutorsList: sanitized.tutorsList || [],
-      teachers: sanitized.teachers || [],
+      tutorsList: (sanitized.tutorsList || []).filter((t: any) => !isLocalJsonOrTestRecord(t)),
+      teachers: (sanitized.teachers || []).filter((t: any) => !isLocalJsonOrTestRecord(t)),
       deletedTutorEmails: sanitized.deletedTutorEmails || [],
       deletedTutorIds: sanitized.deletedTutorIds || [],
       updatedAt: new Date().toISOString(),
@@ -1000,8 +996,8 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
     };
 
     const lessonsData = {
-      liveLessons: sanitized.liveLessons || [],
-      contractedLessons: sanitized.contractedLessons || [],
+      liveLessons: (sanitized.liveLessons || []).filter((l: any) => !isLocalJsonOrTestRecord(l)),
+      contractedLessons: sanitized.contractedLessons || {},
       weeklyHomework: sanitized.weeklyHomework || {},
       studentHomeworkMap: sanitized.studentHomeworkMap || {},
       updatedAt: new Date().toISOString(),
@@ -1030,25 +1026,42 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
     delete mainData.studentHomeworkMap;
     mainData.updatedAt = new Date().toISOString();
 
-    // Security Hardening 4B.17B: Eliminate plaintext password persistence from all state trees
+    // Security Hardening 4B.17B & Isolamento do JSON de Testes: Eliminate plaintext passwords & local JSON from state trees
     if (mainData.authUsers && typeof mainData.authUsers === 'object') {
-      for (const k of Object.keys(mainData.authUsers)) {
-        if (mainData.authUsers[k]) {
-          delete mainData.authUsers[k].password;
+      const cleanAuthUsers: Record<string, any> = {};
+      for (const [k, v] of Object.entries(mainData.authUsers)) {
+        if (v && typeof v === 'object' && !isLocalJsonOrTestRecord(v)) {
+          const userObj = { ...(v as any) };
+          delete userObj.password;
+          const uUid = userObj.uid || userObj.id;
+          if (uUid && isValidCanonicalUid(uUid)) {
+            cleanAuthUsers[k] = userObj;
+          }
         }
       }
+      mainData.authUsers = cleanAuthUsers;
     }
     if (mainData.userProfiles && typeof mainData.userProfiles === 'object') {
-      for (const k of Object.keys(mainData.userProfiles)) {
-        if (mainData.userProfiles[k]) {
-          delete mainData.userProfiles[k].password;
+      const cleanProfiles: Record<string, any> = {};
+      for (const [k, v] of Object.entries(mainData.userProfiles)) {
+        if (v && typeof v === 'object' && !isLocalJsonOrTestRecord(v)) {
+          const profObj = { ...(v as any) };
+          delete profObj.password;
+          const pUid = profObj.uid || profObj.id;
+          if (pUid && isValidCanonicalUid(pUid)) {
+            cleanProfiles[k] = profObj;
+          }
         }
       }
+      mainData.userProfiles = cleanProfiles;
     }
     if (Array.isArray(mainData.students)) {
-      for (const s of mainData.students) {
-        if (s) delete s.password;
-      }
+      mainData.students = mainData.students
+        .filter((s: any) => !isLocalJsonOrTestRecord(s))
+        .map((s: any) => {
+          if (s) delete s.password;
+          return s;
+        });
     }
     if (Array.isArray(tutorsData.tutorsList)) {
       for (const t of tutorsData.tutorsList) {

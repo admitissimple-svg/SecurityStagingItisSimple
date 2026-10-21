@@ -766,29 +766,17 @@ export function scrubPasswords(db: any): any {
 }
 
 function saveToDiskSync(db: AppDb) {
-  try {
-    scrubPasswords(db);
-    const dir = path.dirname(LOCAL_DB_PATH);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    fs.writeFileSync(LOCAL_DB_PATH, JSON.stringify(db, null, 2), 'utf-8');
-  } catch (err) {
-    console.warn('Could not write local db backup to disk:', err);
-  }
+  // HOTFIX PONTUAL: Isolamento de app_db.json
+  // app_db.json permanece intacto exclusivamente como arquivo legado de testes.
+  // Nenhuma operação de gravação do backend em execução real altera o arquivo local.
+  return;
 }
 
 function loadFromDisk(): AppDb | null {
-  try {
-    if (fs.existsSync(LOCAL_DB_PATH)) {
-      const content = fs.readFileSync(LOCAL_DB_PATH, 'utf-8');
-      if (content && content.trim()) {
-        return JSON.parse(content);
-      }
-    }
-  } catch (err) {
-    console.warn('Could not read local db backup from disk:', err);
-  }
+  // HOTFIX PONTUAL: Isolamento do JSON de Testes (src/data/app_db.json).
+  // O backend real não lê src/data/app_db.json como fonte de dados, identidade ou fallback.
+  // app_db.json não é carregado nem mesclado aos dados reais de alunos, professores, perfis ou agendamentos.
+  // Firebase Auth e Firestore '(default)' são as únicas fontes autoritativas dos dados reais.
   return null;
 }
 
