@@ -3383,6 +3383,151 @@ export async function saveStudentJournalToFirestore(docId: string, journal: any[
 }
 
 /**
+ * Reconstructs a full pedagogical transformation object from a student's recorded journal review
+ * and dictionary vocabulary entries when cached transformation is missing or provisional.
+ */
+export async function reconstructTransformationFromJournalAndDictionaryServer(
+  studentUid: string,
+  sessionKey: string
+): Promise<any | null> {
+  if (!studentUid || !sessionKey) return null;
+  const cleanUid = studentUid.trim();
+  const cleanSessionKey = sessionKey.trim();
+  const cleanSessionId = cleanSessionKey.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const expectedEntryId = `journal_lesson_${cleanSessionId}_${cleanUid.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+
+  try {
+    const journalList = await fetchStudentDailyJournalFromServerFirestore(cleanUid);
+    const matchingJournal = (journalList || []).find((entry: any) => {
+      if (!entry) return false;
+      if (entry.id === expectedEntryId) return true;
+      if (entry.sessionKey === cleanSessionKey || entry.lessonId === cleanSessionKey) return true;
+      if (typeof entry.id === 'string' && entry.id.includes(cleanSessionId)) return true;
+      return false;
+    });
+
+    if (!matchingJournal) {
+      return null;
+    }
+
+    // Attempt to enrich vocabulary items from student's dictionary
+    let dictionaryVocab: any[] = [];
+    try {
+      dictionaryVocab = await fetchStudentVocabularyFromFirestoreServer(cleanUid);
+    } catch {}
+
+    const wordsUsed: string[] = Array.isArray(matchingJournal.wordsUsed) ? matchingJournal.wordsUsed : [];
+    const pronunciationPoints: string[] = Array.isArray(matchingJournal.pronunciationPoints) ? matchingJournal.pronunciationPoints : [];
+
+    const vocabItems: any[] = [];
+    const seenWords = new Set<string>();
+
+    // 1. Check for dictionary entries linked to this session
+    (dictionaryVocab || []).forEach((dictItem: any) => {
+      if (!dictItem || !dictItem.word) return;
+      const wLower = dictItem.word.toLowerCase().trim();
+      const isSessionMatch =
+        dictItem.lessonRefId === cleanSessionKey ||
+        (Array.isArray(dictItem.origins) && dictItem.origins.some((orig: any) => orig?.lessonId === cleanSessionKey)) ||
+        wordsUsed.some((w) => w.toLowerCase().trim() === wLower);
+
+      if (isSessionMatch && !seenWords.has(wLower)) {
+        seenWords.add(wLower);
+        vocabItems.push({
+          id: dictItem.id || `vocab_${wLower.replace(/[^a-zA-Z0-9_-]/g, '_')}`,
+          term: dictItem.word,
+          partOfSpeech: dictItem.partOfSpeech || (pronunciationPoints.some((p) => p.toLowerCase().trim() === wLower) ? 'Pronunciation Focus' : 'Vocabulary'),
+          definitionEn: dictItem.definitionEn || dictItem.meaningOrTip || '',
+          simpleDefinition: dictItem.simpleDefinition || dictItem.definitionEn || '',
+          collocations: Array.isArray(dictItem.collocations) ? dictItem.collocations : [],
+          realExamples: dictItem.exampleSentenceEn ? [dictItem.exampleSentenceEn] : (Array.isArray(dictItem.realExamples) ? dictItem.realExamples : []),
+          synonyms: Array.isArray(dictItem.synonyms) ? dictItem.synonyms : [],
+          register: dictItem.register || 'neutral',
+          category: dictItem.category || (pronunciationPoints.some((p) => p.toLowerCase().trim() === wLower) ? 'Pronunciation & Phonetics (Alt+P)' : 'New Words & Expressions (Alt+W)'),
+          phoneticGuide: dictItem.phoneticGuide || '',
+          isPronunciationFocus: Boolean(dictItem.isPronunciationFocus || pronunciationPoints.some((p) => p.toLowerCase().trim() === wLower)),
+          isNewWord: true,
+        });
+      }
+    });
+
+    // 2. Add any words from wordsUsed that were not found in dictionary
+    wordsUsed.forEach((term) => {
+      const wLower = (term || '').toLowerCase().trim();
+      if (wLower && !seenWords.has(wLower)) {
+        seenWords.add(wLower);
+        const isPron = pronunciationPoints.some((p) => p.toLowerCase().trim() === wLower);
+        vocabItems.push({
+          id: `vocab_${wLower.replace(/[^a-zA-Z0-9_-]/g, '_')}`,
+          term,
+          partOfSpeech: isPron ? 'Pronunciation Focus' : 'Vocabulary',
+          definitionEn: '',
+          simpleDefinition: '',
+          collocations: [],
+          realExamples: [],
+          synonyms: [],
+          register: 'neutral',
+          category: isPron ? 'Pronunciation & Phonetics (Alt+P)' : 'New Words & Expressions (Alt+W)',
+          phoneticGuide: '',
+          isPronunciationFocus: isPron,
+          isNewWord: true,
+        });
+      }
+    });
+
+    const mistakesAnalysis = (matchingJournal.keyCorrections || matchingJournal.reviewSummary?.essentialCorrections || []).map((c: any, idx: number) => ({
+      id: `mistake-${idx + 1}`,
+      original: c.original || '',
+      corrected: c.corrected || '',
+      category: 'grammar',
+      explanation: c.explanation || c.rule || '',
+      twoExamples: [c.corrected].filter(Boolean),
+      commonPitfalls: '',
+    }));
+
+    const grammarPoints = (matchingJournal.grammarRules || matchingJournal.reviewSummary?.keyRules || []).map((rule: string, idx: number) => ({
+      id: `grammar-${idx + 1}`,
+      topic: rule.split(':')[0] || `Grammar Rule ${idx + 1}`,
+      rule,
+      form: '',
+      usage: rule,
+      examples: [],
+      commonMistakes: '',
+      comparisons: '',
+    }));
+
+    const reviewSummary = matchingJournal.reviewSummary || {
+      rememberThis: matchingJournal.sentence || '',
+      keyRules: matchingJournal.grammarRules || [],
+      mustKnowVocabulary: matchingJournal.wordsUsed || [],
+      essentialCorrections: matchingJournal.keyCorrections || [],
+      estimatedMinutes: '5–10 min',
+    };
+
+    return {
+      sessionKey: cleanSessionKey,
+      lessonId: matchingJournal.lessonId || cleanSessionKey,
+      topic: matchingJournal.topic || (matchingJournal.sentence?.includes('Quick Review (') ? matchingJournal.sentence.split('Quick Review (')[1]?.replace(')', '') : 'Live Coaching Session'),
+      teacherName: matchingJournal.teacherName || 'Native Friend',
+      sessionDate: matchingJournal.date || new Date().toISOString().split('T')[0],
+      isAiGenerated: true,
+      isProvisional: false,
+      reviewSummary,
+      mistakesAnalysis,
+      grammarPoints,
+      vocabularyAndExpressions: vocabItems,
+      generatedAt: matchingJournal.createdAt || matchingJournal.updatedAt || new Date().toISOString(),
+      studentUid: cleanUid,
+      studentEmail: matchingJournal.studentEmail || '',
+      language: 'pt',
+    };
+  } catch (err) {
+    console.warn('[serverFirestore] reconstructTransformationFromJournalAndDictionaryServer error:', err);
+    return null;
+  }
+}
+
+/**
  * Fetch student daily journal entries directly from Cloud Firestore (users/{docId}/journal and doc.dailyJournalEntries)
  */
 export async function fetchStudentDailyJournalFromServerFirestore(docId: string): Promise<any[]> {

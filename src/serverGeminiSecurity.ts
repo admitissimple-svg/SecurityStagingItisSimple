@@ -20,7 +20,7 @@ import crypto from 'crypto';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { getFirestoreDb } from './serverFirestore';
 
-export const DEFAULT_GEMINI_MODEL = 'gemini-3.8-flash';
+export const DEFAULT_GEMINI_MODEL: string = 'gemini-3.8-flash';
 
 /**
  * Resolves the Gemini model from the environment variable GEMINI_MODEL.
@@ -102,9 +102,9 @@ export const GEMINI_POLICIES: Record<GeminiFeature, FeaturePolicy> = {
   dictionary_define: {
     maxOutputTokens: 400,
     rateLimitWindowSeconds: 60,
-    rateLimitMaxRequests: 20,
+    rateLimitMaxRequests: 30,
     maxInputLengthChars: 100,
-    timeoutMs: 5000,
+    timeoutMs: 12000,
   },
   vocab_generate: {
     maxOutputTokens: 800,

@@ -117,6 +117,7 @@ import {
   savePedagogicalTransformationToFirestoreServer,
   fetchPedagogicalTransformationFromFirestoreServer,
   recordLessonReviewInStudentJournalServer,
+  reconstructTransformationFromJournalAndDictionaryServer,
   fetchStudentDailyJournalFromServerFirestore,
   removeUndefinedFields,
   fetchLessonInsightsFromFirestoreServer,
@@ -4372,67 +4373,88 @@ app.all('/api/dictionary/define', firebaseAuthMiddleware, async (req, res) => {
 
   // 4. Secondary query to Free Dictionary API with Native Friend Notes pedagogical adaptation
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3500);
-    const apiRes = await fetch(
-      `https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(lowerWord)}`,
-      {
-        headers: { Accept: 'application/json' },
-        signal: controller.signal,
-      }
-    );
-    clearTimeout(timeout);
+    const candidateTerms = [lowerWord];
+    if (lowerWord.endsWith('pped') || lowerWord.endsWith('tted') || lowerWord.endsWith('gged') || lowerWord.endsWith('nned')) {
+      candidateTerms.push(lowerWord.slice(0, -3)); // trapped -> trap
+    } else if (lowerWord.endsWith('ied')) {
+      candidateTerms.push(lowerWord.slice(0, -3) + 'y'); // tried -> try
+    } else if (lowerWord.endsWith('ed')) {
+      candidateTerms.push(lowerWord.slice(0, -2)); // learned -> learn
+      candidateTerms.push(lowerWord.slice(0, -1)); // compelled -> compel
+    } else if (lowerWord.endsWith('ing')) {
+      candidateTerms.push(lowerWord.slice(0, -3));
+      candidateTerms.push(lowerWord.slice(0, -3) + 'e');
+    } else if (lowerWord.endsWith('es')) {
+      candidateTerms.push(lowerWord.slice(0, -2));
+      candidateTerms.push(lowerWord.slice(0, -1));
+    } else if (lowerWord.endsWith('s')) {
+      candidateTerms.push(lowerWord.slice(0, -1));
+    }
 
-    if (apiRes.ok) {
-      const data = (await apiRes.json()) as any[];
-      if (Array.isArray(data) && data.length > 0 && Array.isArray(data[0].meanings) && data[0].meanings.length > 0) {
-        const entry = data[0];
-        const firstMeaning = entry.meanings[0];
-        const rawPos = firstMeaning.partOfSpeech || '';
-        const pos = normalizePosForNativeNotes(rawPos, cleanWord);
-        const firstDefObj = firstMeaning.definitions?.[0];
-        let def = firstDefObj?.definition?.trim() || '';
-
-        let example = firstDefObj?.example?.trim() || '';
-        if (!example && Array.isArray(firstMeaning.definitions)) {
-          const defWithEx = firstMeaning.definitions.find((d: any) => d.example && d.example.trim());
-          if (defWithEx) example = defWithEx.example.trim();
+    for (const term of candidateTerms) {
+      if (!term || term.length < 2) continue;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3500);
+      const apiRes = await fetch(
+        `https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(term)}`,
+        {
+          headers: { Accept: 'application/json' },
+          signal: controller.signal,
         }
-        if (!example) {
-          for (const m of entry.meanings) {
-            if (Array.isArray(m.definitions)) {
-              const dEx = m.definitions.find((d: any) => d.example && d.example.trim());
-              if (dEx) {
-                example = dEx.example.trim();
-                break;
+      ).catch(() => null);
+      clearTimeout(timeout);
+
+      if (apiRes && apiRes.ok) {
+        const data = (await apiRes.json()) as any[];
+        if (Array.isArray(data) && data.length > 0 && Array.isArray(data[0].meanings) && data[0].meanings.length > 0) {
+          const entry = data[0];
+          const firstMeaning = entry.meanings[0];
+          const rawPos = firstMeaning.partOfSpeech || '';
+          const pos = normalizePosForNativeNotes(rawPos, cleanWord);
+          const firstDefObj = firstMeaning.definitions?.[0];
+          let def = firstDefObj?.definition?.trim() || '';
+
+          let example = firstDefObj?.example?.trim() || '';
+          if (!example && Array.isArray(firstMeaning.definitions)) {
+            const defWithEx = firstMeaning.definitions.find((d: any) => d.example && d.example.trim());
+            if (defWithEx) example = defWithEx.example.trim();
+          }
+          if (!example) {
+            for (const m of entry.meanings) {
+              if (Array.isArray(m.definitions)) {
+                const dEx = m.definitions.find((d: any) => d.example && d.example.trim());
+                if (dEx) {
+                  example = dEx.example.trim();
+                  break;
+                }
               }
             }
           }
-        }
 
-        if (def) {
-          let cleanDef = def.replace(/^[:\s\-—]+/, '').trim();
-          if (cleanDef.length > 0) {
-            cleanDef = cleanDef.charAt(0).toUpperCase() + cleanDef.slice(1);
-            if (!/[.!?]$/.test(cleanDef)) {
-              cleanDef += '.';
+          if (def) {
+            let cleanDef = def.replace(/^[:\s\-—]+/, '').trim();
+            if (cleanDef.length > 0) {
+              cleanDef = cleanDef.charAt(0).toUpperCase() + cleanDef.slice(1);
+              if (!/[.!?]$/.test(cleanDef)) {
+                cleanDef += '.';
+              }
             }
-          }
 
-          const result = {
-            word: entry.word || cleanWord,
-            partOfSpeech: pos,
-            cefrLevel: cefr,
-            definitionEn: cleanDef,
-            exampleSentenceEn: example ? formatPedagogicalSentence(example) : generateNativeNotesExample(cleanWord, pos),
-            phonetic: entry.phonetic || entry.phonetics?.find((p: any) => p.text)?.text,
-            audio: entry.phonetics?.find((p: any) => p.audio && p.audio.startsWith('http'))?.audio,
-            source: 'native_notes_standard',
-            notFound: false,
-          };
-          pedagogicalDictCache.set(cacheKey, result);
-          pedagogicalDictCache.set(lowerWord, result);
-          return res.json(result);
+            const result = {
+              word: cleanWord,
+              partOfSpeech: pos,
+              cefrLevel: cefr,
+              definitionEn: cleanDef,
+              exampleSentenceEn: example ? formatPedagogicalSentence(example) : generateNativeNotesExample(cleanWord, pos),
+              phonetic: entry.phonetic || entry.phonetics?.find((p: any) => p.text)?.text,
+              audio: entry.phonetics?.find((p: any) => p.audio && p.audio.startsWith('http'))?.audio,
+              source: 'native_notes_standard',
+              notFound: false,
+            };
+            pedagogicalDictCache.set(cacheKey, result);
+            pedagogicalDictCache.set(lowerWord, result);
+            return res.json(result);
+          }
         }
       }
     }
@@ -9029,21 +9051,30 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
   if ((!cached || cached.isProvisional) && canonicalSessionKey) {
     try {
       const fsCached = await fetchPedagogicalTransformationFromFirestoreServer(compositeCacheKey);
-      if (fsCached && fsCached.contentHash === contentHash && fsCached.isAiGenerated && !fsCached.isProvisional) {
+      if (fsCached && fsCached.isAiGenerated && !fsCached.isProvisional) {
         cached = fsCached;
         db.pedagogicalTransformationsMap[compositeCacheKey] = cached;
       }
     } catch {}
+    if ((!cached || cached.isProvisional) && cleanUid) {
+      try {
+        const reconstructed = await reconstructTransformationFromJournalAndDictionaryServer(cleanUid, canonicalSessionKey);
+        if (reconstructed) {
+          cached = reconstructed;
+          db.pedagogicalTransformationsMap[compositeCacheKey] = cached;
+        }
+      } catch {}
+    }
   }
 
-  // FASE 4B.8 & 4B.9: If a valid, non-provisional AI-generated transformation exists for this contentHash, REUSE IT,
+  // FASE 4B.8 & 4B.9: If a valid, non-provisional AI-generated transformation exists for this session, REUSE IT,
   // EXCEPT when the user explicitly triggers forceRegenerate (Refresh Analysis) or when cache contains a legacy pending placeholder!
   const hasLegacyPendingPlaceholder = Array.isArray(cached?.mistakesAnalysis) && cached.mistakesAnalysis.some((m: any) =>
     m.isPendingConfirmation === true ||
     (typeof m.corrected === 'string' && (m.corrected.includes('Pending confirmation') || m.corrected.includes('Pendente de confirmação')))
   );
 
-  if (!forceRegenerate && !hasLegacyPendingPlaceholder && cached && !cached.isProvisional && cached.contentHash === contentHash && cached.isAiGenerated) {
+  if (!forceRegenerate && !hasLegacyPendingPlaceholder && cached && !cached.isProvisional && cached.isAiGenerated) {
     // FASE 4B.9: Guarantee single idempotent journal entry for the session without repeated Gemini calls
     recordLessonReviewInStudentJournalServer({
       studentUid: cleanUid,
@@ -9729,6 +9760,22 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
         }
       } catch (fsErr) {
         console.warn('GET /api/pedagogical-notes Firestore lookup notice:', fsErr);
+      }
+    }
+
+    // View Journal & My Dictionary fallback: recognize already fed definitions
+    if (!transformation && caller.role === 'student') {
+      try {
+        const reconstructed = await reconstructTransformationFromJournalAndDictionaryServer(caller.uid, sessionKey);
+        if (reconstructed) {
+          transformation = reconstructed;
+          const storeKey = `${sessionKey}__reconstructed__lang_${language || 'pt'}`;
+          if (!db.pedagogicalTransformationsMap) db.pedagogicalTransformationsMap = {};
+          db.pedagogicalTransformationsMap[storeKey] = reconstructed;
+          db.pedagogicalTransformationsMap[sessionKey] = reconstructed;
+        }
+      } catch (recErr) {
+        console.warn('GET /api/pedagogical-notes journal reconstruction notice:', recErr);
       }
     }
 

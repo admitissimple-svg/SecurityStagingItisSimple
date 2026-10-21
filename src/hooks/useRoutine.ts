@@ -3,6 +3,7 @@ import { auth } from '../firebase';
 import { DayOfWeek, TeacherOverrideTrack } from '../types';
 import { normalizeStudentIdForPath } from '../utils/routineSync';
 import { extractYouTubeVideoId } from '../utils/youtube';
+import { isValidCanonicalUid } from '../utils/tutorConsolidation';
 
 export interface SavedRoutineVideo {
   videoId: string;
@@ -84,7 +85,8 @@ export async function saveRoutineVideoToFirestore(
     duration?: string;
   }
 ): Promise<boolean> {
-  const cleanUid = normalizeStudentIdForPath(studentUid);
+  const authUid = auth?.currentUser?.uid || '';
+  const cleanUid = normalizeStudentIdForPath(studentUid) || (isValidCanonicalUid(authUid) ? authUid : studentUid || '');
   if (!cleanUid || !dayOfWeek) return false;
 
   const rawVidId = videoData.videoId || videoData.url || '';
@@ -446,9 +448,12 @@ export function selectNextUnwatchedVideo<T extends { videoId?: string; id?: stri
  * 3. Week with saved video (video persisted and restored on refresh/login)
  */
 export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek) {
-  const effectiveUid = studentUid
-    ? normalizeStudentIdForPath(studentUid)
-    : (auth?.currentUser?.uid || '');
+  const authUid = auth?.currentUser?.uid || '';
+  const effectiveUid =
+    (isValidCanonicalUid(authUid) ? authUid : '') ||
+    (studentUid ? normalizeStudentIdForPath(studentUid) : '') ||
+    authUid ||
+    (studentUid && isValidCanonicalUid(studentUid) ? studentUid : '');
 
   const [routinesByDay, setRoutinesByDay] = useState<Partial<Record<DayOfWeek, SavedRoutineVideo>>>({});
   const [watchedHistory, setWatchedHistory] = useState<string[]>([]);

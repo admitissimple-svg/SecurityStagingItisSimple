@@ -261,7 +261,7 @@ async function fetchFromBackendApi(
   try {
     let signal: AbortSignal | undefined;
     if (typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal) {
-      signal = AbortSignal.timeout(6000);
+      signal = AbortSignal.timeout(14000);
     }
 
     const token = await auth?.currentUser?.getIdToken().catch(() => null);
@@ -481,7 +481,7 @@ export async function lookupWord(
     notFound: false,
   };
 
-  memoryCache.set(cacheKey, pedagogicalFallbackResult);
+  // Transient fallback: do NOT store generic placeholder in memoryCache so real definitions can be retrieved on subsequent requests
   return pedagogicalFallbackResult;
 }
 

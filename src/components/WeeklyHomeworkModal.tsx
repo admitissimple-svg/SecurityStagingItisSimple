@@ -1253,7 +1253,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                     <button
                       type="button"
                       onClick={() => {
-                        if (isMatchingComplete && !isTodayPartCompleted) {
+                        if (isMatchingComplete) {
                           markSPathCompleted(targetDay, 'matching');
                         }
                         setActiveTab('fill');
@@ -1361,7 +1361,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                     <button
                       type="button"
                       onClick={() => {
-                        if (isFillComplete && !isTodayPartCompleted) {
+                        if (isFillComplete) {
                           markSPathCompleted(targetDay, 'fill');
                         }
                         setActiveTab('writing');
@@ -1616,7 +1616,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                     <button
                       type="button"
                       onClick={() => {
-                        if (isWritingComplete && !isTodayPartCompleted) {
+                        if (isWritingComplete) {
                           markSPathCompleted(targetDay, 'writing');
                         }
                         setActiveTab('reading');

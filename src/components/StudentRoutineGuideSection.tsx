@@ -61,6 +61,8 @@ import {
   getCachedPlaylistTracks,
   SpotifyDailyTrack,
 } from '../utils/spotify';
+import { auth } from '../firebase';
+import { isValidCanonicalUid } from '../utils/tutorConsolidation';
 import { useStudentSpotifySync } from '../hooks/useStudentSpotifySync';
 import { useRoutine } from '../hooks/useRoutine';
 import { useBehavioralVideoTracker, useBehavioralAudioTracker } from '../hooks/useBehavioralMediaTracker';
@@ -375,28 +377,30 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
 
       if (wordsToLookup.length === 0) return;
 
-      wordsToLookup.forEach(async ({ word, idx }) => {
-        try {
-          const res = await lookupWord(
-            word,
-            undefined,
-            studentLevel,
-            userProfile?.uid,
-            userProfile?.email,
-            dictionaryEntries
-          );
-          if (res) {
-            setWordDefinitions((prev) => {
-              if (words[idx]?.trim().toLowerCase() === word.toLowerCase()) {
-                return { ...prev, [idx]: res };
-              }
-              return prev;
-            });
+      (async () => {
+        for (const { word, idx } of wordsToLookup) {
+          try {
+            const res = await lookupWord(
+              word,
+              undefined,
+              studentLevel,
+              userProfile?.uid,
+              userProfile?.email,
+              dictionaryEntries
+            );
+            if (res) {
+              setWordDefinitions((prev) => {
+                if (words[idx]?.trim().toLowerCase() === word.toLowerCase()) {
+                  return { ...prev, [idx]: res };
+                }
+                return prev;
+              });
+            }
+          } catch {
+            // Handled gracefully
           }
-        } catch {
-          // Handled gracefully
         }
-      });
+      })();
     }, 600);
 
     return () => clearTimeout(timer);
@@ -416,7 +420,14 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
   // Strictly neutral initial state: topics start as "" until user voluntarily selects
   const [selectedTopicByDay, setSelectedTopicByDay] = useState<Partial<Record<DayOfWeek, string>>>({});
 
-  const effectiveStudentUid = userProfile?.id || (userProfile as any)?.uid || userProfile?.email || '';
+  const authUid = auth?.currentUser?.uid || '';
+  const effectiveStudentUid =
+    (isValidCanonicalUid(authUid) ? authUid : '') ||
+    (isValidCanonicalUid((userProfile as any)?.uid) ? (userProfile as any).uid : '') ||
+    (isValidCanonicalUid(userProfile?.id) ? userProfile.id : '') ||
+    userProfile?.email ||
+    auth?.currentUser?.email ||
+    '';
   const {
     routinesByDay: persistedRoutinesByDay,
     watchedHistory,

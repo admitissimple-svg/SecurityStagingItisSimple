@@ -3394,7 +3394,6 @@ export default function App() {
 
       const checkKey = `${stepId}_${dayKey}`;
       const previousChecked = Boolean(weeklyChecks[checkKey]);
-      if (previousChecked === isCompleted) return;
 
       setWeeklyChecks((prev) => ({ ...prev, [checkKey]: isCompleted }));
 
@@ -3402,7 +3401,6 @@ export default function App() {
         setWeeklyHomework((prev) => {
           if (!prev) return prev;
           const currentParts = prev.completedPartsByDay || {};
-          if (currentParts[dayKey] === isCompleted) return prev;
           const updatedParts = { ...currentParts, [dayKey]: isCompleted };
           const updatedHw = {
             ...prev,
@@ -3415,6 +3413,8 @@ export default function App() {
           return updatedHw;
         });
       }
+
+      if (previousChecked === isCompleted) return;
 
       if (uid) {
         const targetType = mapStepIdToJournalType(stepId);

@@ -73,6 +73,9 @@ interface SessionOption {
   timestamp: number;
 }
 
+// Module-level in-memory cache for open/close modal transitions (Zero localStorage)
+const sessionNotesModalMemoryCache = new Map<string, PedagogicalLessonTransformation>();
+
 export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = ({
   isOpen,
   onClose,
@@ -415,6 +418,14 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
         return;
       }
 
+      const cacheKey = `${activeSession.key}__${currentLanguage}`;
+      if (!forceRegenerate && sessionNotesModalMemoryCache.has(cacheKey)) {
+        const cached = sessionNotesModalMemoryCache.get(cacheKey)!;
+        setTransformation(cached);
+        setIsLoadingTransformation(false);
+        return;
+      }
+
       setIsLoadingTransformation(true);
       try {
         const result = await fetchPedagogicalTransformation({
@@ -433,6 +444,9 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
         });
 
         setTransformation(result);
+        if (result && result.isAiGenerated && !result.isProvisional) {
+          sessionNotesModalMemoryCache.set(cacheKey, result);
+        }
 
         // Automatically sync session vocabulary (proven Alt + W only) into student's My Dictionary in Firestore via backend
         // FASE 4B.8.2: Require valid canonical authentication prior to persisting
