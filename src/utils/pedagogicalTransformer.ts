@@ -1,9 +1,10 @@
 import { EnglishLevel, LiveLesson } from '../types';
 import { NATIVE_FRIENDS_DICTIONARY_DATABASE } from '../data/dictionaryDatabase';
 import { parseNotesHtml, ParsedNotesResult } from './notesHtmlParser';
+import { isGenericPedagogicalDefinition, isGenericPedagogicalExample } from './dictionaryService';
 import { auth } from '../firebase';
 
-export { parseNotesHtml };
+export { parseNotesHtml, isGenericPedagogicalDefinition, isGenericPedagogicalExample };
 export type { ParsedNotesResult };
 
 export interface PedagogicalMistakeAnalysis {
@@ -226,6 +227,285 @@ export function getAiUnavailableNoticeText(lang: string = 'pt'): string {
     default:
       return 'O enriquecimento pedagógico por IA está temporariamente indisponível. Exibindo as anotações verificadas do professor e marcações padrão.';
   }
+}
+
+/**
+ * Strict pedagogical validation function following 5 Words functional quality standards:
+ * - Checks items in Alt+N, Alt+W, and Alt+P.
+ * - Does NOT require categories that were not in the teacher's notes.
+ * - Rejects responses omitting requested items or containing generic definitions/examples.
+ * - Rejects responses injecting synthetic mistakes or vocabulary when none was in the notes.
+ */
+export function validatePedagogicalAiResponse(
+  parsed: any,
+  markings: ParsedNotesResult,
+  cefr: string = 'B1',
+  language: string = 'pt'
+): { valid: boolean; reason?: string } {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { valid: false, reason: 'Response is not a valid JSON object' };
+  }
+
+  // 1. Validate Alt+N (Errors / Mistakes)
+  const hasErrors = Array.isArray(markings.errors) && markings.errors.length > 0;
+  const mistakes = Array.isArray(parsed.mistakesAnalysis) ? parsed.mistakesAnalysis : [];
+
+  if (hasErrors) {
+    if (mistakes.length === 0) {
+      return { valid: false, reason: 'AI omitted mistakesAnalysis although teacher marked Alt+N errors' };
+    }
+
+    // Check that every error marked by the teacher is accounted for
+    for (const rawErr of markings.errors) {
+      const origTarget = rawErr.original.toLowerCase().trim();
+      const found = mistakes.find((m: any) => {
+        const mOrig = String(m?.original || '').toLowerCase().trim();
+        return mOrig.includes(origTarget) || origTarget.includes(mOrig);
+      });
+
+      if (!found) {
+        return { valid: false, reason: `AI response missed teacher Alt+N error: "${rawErr.original}"` };
+      }
+
+      if (!found.corrected || typeof found.corrected !== 'string' || !found.corrected.trim()) {
+        return { valid: false, reason: `AI response omitted correction for: "${rawErr.original}"` };
+      }
+
+      // Must not be a placeholder like "Pending confirmation" or "Pendente de confirmação"
+      const corrLower = found.corrected.toLowerCase();
+      if (corrLower.includes('pending confirmation') || corrLower.includes('pendente de confirmação')) {
+        return { valid: false, reason: `AI returned pending placeholder for: "${rawErr.original}"` };
+      }
+
+      if (!found.explanation || typeof found.explanation !== 'string' || found.explanation.trim().length < 8) {
+        return { valid: false, reason: `AI explanation too short or missing for: "${rawErr.original}"` };
+      }
+
+      // Check examples
+      if (!Array.isArray(found.twoExamples) || found.twoExamples.length === 0) {
+        return { valid: false, reason: `AI omitted examples for mistake: "${rawErr.original}"` };
+      }
+      for (const ex of found.twoExamples) {
+        if (typeof ex !== 'string' || isGenericPedagogicalExample(ex)) {
+          return { valid: false, reason: `AI provided generic example for mistake: "${rawErr.original}"` };
+        }
+      }
+    }
+  } else {
+    // If teacher did NOT mark any errors, mistakesAnalysis must be empty or contain NO synthetic errors
+    for (const m of mistakes) {
+      const origLower = String(m?.original || '').toLowerCase();
+      if (
+        origLower.includes('i have 28 years old') ||
+        origLower.includes("i'm agree") ||
+        origLower.includes('it depends of') ||
+        origLower.includes('make a question')
+      ) {
+        return { valid: false, reason: 'AI inserted synthetic mistake when notes had no errors' };
+      }
+    }
+  }
+
+  // 2. Validate Alt+W (New Words & Expressions)
+  const hasNewWords = Array.isArray(markings.newWords) && markings.newWords.length > 0;
+  const vocabList = Array.isArray(parsed.vocabularyAndExpressions) ? parsed.vocabularyAndExpressions : [];
+
+  if (hasNewWords) {
+    if (vocabList.length === 0) {
+      return { valid: false, reason: 'AI omitted vocabularyAndExpressions although teacher marked Alt+W words' };
+    }
+
+    for (const newWord of markings.newWords) {
+      const cleanTarget = newWord.toLowerCase().trim();
+      const found = vocabList.find((v: any) => {
+        const vTerm = String(v?.term || '').toLowerCase().trim();
+        return vTerm === cleanTarget || vTerm.includes(cleanTarget) || cleanTarget.includes(vTerm);
+      });
+
+      if (!found) {
+        return { valid: false, reason: `AI response missed teacher Alt+W word: "${newWord}"` };
+      }
+
+      // Validate definitionEn
+      if (!found.definitionEn || typeof found.definitionEn !== 'string' || isGenericPedagogicalDefinition(found.definitionEn)) {
+        return { valid: false, reason: `AI provided generic or missing definitionEn for: "${newWord}"` };
+      }
+
+      // Validate simpleDefinition
+      if (!found.simpleDefinition || typeof found.simpleDefinition !== 'string' || isGenericPedagogicalDefinition(found.simpleDefinition)) {
+        return { valid: false, reason: `AI provided generic or missing simpleDefinition for: "${newWord}"` };
+      }
+
+      // Validate realExamples
+      if (!Array.isArray(found.realExamples) || found.realExamples.length === 0) {
+        return { valid: false, reason: `AI omitted realExamples for: "${newWord}"` };
+      }
+
+      for (const ex of found.realExamples) {
+        if (typeof ex !== 'string' || isGenericPedagogicalExample(ex)) {
+          return { valid: false, reason: `AI provided generic example for: "${newWord}"` };
+        }
+      }
+    }
+  }
+
+  // 3. Validate Alt+P (Pronunciation)
+  const hasPronounce = Array.isArray(markings.pronounceItems) && markings.pronounceItems.length > 0;
+  if (hasPronounce) {
+    if (vocabList.length === 0) {
+      return { valid: false, reason: 'AI omitted vocabularyAndExpressions although teacher marked Alt+P pronunciation items' };
+    }
+
+    for (const pItem of markings.pronounceItems) {
+      const cleanTarget = pItem.toLowerCase().trim();
+      const found = vocabList.find((v: any) => {
+        const vTerm = String(v?.term || '').toLowerCase().trim();
+        return vTerm === cleanTarget || vTerm.includes(cleanTarget) || cleanTarget.includes(vTerm);
+      });
+
+      if (!found) {
+        return { valid: false, reason: `AI response missed teacher Alt+P item: "${pItem}"` };
+      }
+
+      const isPronounceCategory = Boolean(
+        found.isPronunciationFocus ||
+        (found.partOfSpeech && found.partOfSpeech.toLowerCase().includes('pronunciation')) ||
+        (found.category && found.category.toLowerCase().includes('pronunciation'))
+      );
+
+      if (!isPronounceCategory) {
+        return { valid: false, reason: `AI failed to set pronunciation focus on Alt+P item: "${pItem}"` };
+      }
+
+      const hasPhoneticOrStress = Boolean(
+        (found.phoneticGuide && String(found.phoneticGuide).trim().length > 3) ||
+        (found.simpleDefinition && String(found.simpleDefinition).trim().length > 3)
+      );
+
+      if (!hasPhoneticOrStress) {
+        return { valid: false, reason: `AI omitted phonetic or syllable guide for Alt+P item: "${pItem}"` };
+      }
+    }
+  }
+
+  // If teacher had NEITHER Alt+W NOR Alt+P, check that vocabList does not contain synthetic words
+  if (!hasNewWords && !hasPronounce) {
+    for (const v of vocabList) {
+      const termLower = String(v?.term || '').toLowerCase().trim();
+      if (termLower === 'catch up' || termLower === 'workload' || termLower === 'streamline' || termLower === 'make sense') {
+        return { valid: false, reason: 'AI inserted synthetic vocabulary when notes had no vocabulary items' };
+      }
+    }
+  }
+
+  // 4. Validate Quick Review Summary
+  if (!parsed.reviewSummary || typeof parsed.reviewSummary !== 'object') {
+    return { valid: false, reason: 'AI response missing reviewSummary' };
+  }
+
+  if (typeof parsed.reviewSummary.rememberThis !== 'string' || parsed.reviewSummary.rememberThis.trim().length < 5) {
+    return { valid: false, reason: 'AI response missing rememberThis in reviewSummary' };
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Detects whether a transformation contains legacy synthetic/generic content,
+ * artificial placeholders, or fabricated items not present in the teacher notes.
+ */
+export function isLegacyGenericTransformation(
+  transformation: any,
+  rawNotesOrMarkings?: string | ParsedNotesResult
+): boolean {
+  if (!transformation || typeof transformation !== 'object') return true;
+
+  // 1. Explicit provisional/fallback flags
+  if (transformation.isFallback || transformation.isProvisional || !transformation.isAiGenerated) {
+    return true;
+  }
+
+  // 2. Check mistakesAnalysis for synthetic boilerplate
+  const mistakes = Array.isArray(transformation.mistakesAnalysis) ? transformation.mistakesAnalysis : [];
+  for (const m of mistakes) {
+    if (m?.isPendingConfirmation) return true;
+    const orig = String(m?.original || '').toLowerCase();
+    const corr = String(m?.corrected || '').toLowerCase();
+    if (
+      corr.includes('pending confirmation') ||
+      corr.includes('pendente de confirmação')
+    ) {
+      return true;
+    }
+    if (
+      orig === 'i have 28 years old' ||
+      orig === "i'm agree with you" ||
+      orig === 'it depends of the day' ||
+      orig === 'it depends of the weather' ||
+      orig === 'can i make a question?' ||
+      orig === 'can i make a question'
+    ) {
+      if (rawNotesOrMarkings) {
+        const rawText = typeof rawNotesOrMarkings === 'string'
+          ? rawNotesOrMarkings.toLowerCase()
+          : rawNotesOrMarkings.cleanText.toLowerCase();
+        if (!rawText.includes(orig)) {
+          return true;
+        }
+      } else {
+        return true;
+      }
+    }
+  }
+
+  // 3. Check vocabularyAndExpressions for generic definitions and examples
+  const vocab = Array.isArray(transformation.vocabularyAndExpressions) ? transformation.vocabularyAndExpressions : [];
+  for (const v of vocab) {
+    const term = String(v?.term || '').toLowerCase();
+    if (term === 'catch up' || term === 'workload' || term === 'streamline' || term === 'make sense' || term === 'get the hang of') {
+      if (rawNotesOrMarkings) {
+        const rawText = typeof rawNotesOrMarkings === 'string'
+          ? rawNotesOrMarkings.toLowerCase()
+          : rawNotesOrMarkings.cleanText.toLowerCase();
+        if (!rawText.includes(term)) {
+          return true;
+        }
+      } else {
+        return true;
+      }
+    }
+
+    if (v.definitionEn && isGenericPedagogicalDefinition(v.definitionEn)) {
+      return true;
+    }
+    if (v.simpleDefinition && isGenericPedagogicalDefinition(v.simpleDefinition)) {
+      return true;
+    }
+    const examples = Array.isArray(v.realExamples) ? v.realExamples : [];
+    for (const ex of examples) {
+      if (isGenericPedagogicalExample(ex)) {
+        return true;
+      }
+    }
+  }
+
+  // 4. Check grammarPoints: if rawNotes had no errors, but grammarPoints has synthetic points
+  const grammar = Array.isArray(transformation.grammarPoints) ? transformation.grammarPoints : [];
+  if (rawNotesOrMarkings) {
+    const markings = typeof rawNotesOrMarkings === 'string'
+      ? parseNotesHtml(rawNotesOrMarkings)
+      : rawNotesOrMarkings;
+    if (markings.errors.length === 0 && grammar.length > 0) {
+      const hasAgree = grammar.some((g: any) => /agree/i.test(g?.topic || ''));
+      const hasAge = grammar.some((g: any) => /age/i.test(g?.topic || '') || /to be/i.test(g?.topic || ''));
+      const hasPrep = grammar.some((g: any) => /preposition/i.test(g?.topic || ''));
+      if (hasAgree || hasAge || hasPrep) {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -467,53 +747,6 @@ export function generateLocalPedagogicalTransformation(params: {
     }
   }
 
-  // If no explicit errors found and notes are empty, add foundational coaching points
-  if (mistakesAnalysis.length === 0 && !markings.cleanText.trim()) {
-    if (cefrMeta.cefr === 'A1' || cefrMeta.cefr === 'A2') {
-      mistakesAnalysis.push({
-        id: 'mistake-foundational-1',
-        original: 'I have 28 years old',
-        corrected: 'I am 28 years old',
-        category: 'grammar',
-        explanation: 'In English, age is expressed with the verb "to be" (am/is/are), not with "to have".',
-        twoExamples: ['I am 28 years old.', 'My friend is 30 years old.'],
-        commonPitfalls: 'Translating Portuguese "Eu tenho 28 anos" directly as "I have 28 years".',
-        isPendingConfirmation: false,
-      });
-      mistakesAnalysis.push({
-        id: 'mistake-foundational-2',
-        original: 'It depends of the day',
-        corrected: 'It depends on the day',
-        category: 'preposition',
-        explanation: 'The verb "depend" always pairs with the preposition "ON", never "of".',
-        twoExamples: ['It depends on the traffic.', 'Our schedule depends on the weather.'],
-        commonPitfalls: 'Saying "depend of" because of Portuguese "depender de".',
-        isPendingConfirmation: false,
-      });
-    } else {
-      mistakesAnalysis.push({
-        id: 'mistake-foundational-1',
-        original: "I'm agree with you",
-        corrected: 'I agree with you',
-        category: 'grammar',
-        explanation: '"Agree" is an active verb, not an adjective. We say "I agree", without "am".',
-        twoExamples: ['I agree with your suggestion.', 'I don\'t agree with that strategy.'],
-        commonPitfalls: 'Saying "I am agree" or negative "I am not agree".',
-        isPendingConfirmation: false,
-      });
-      mistakesAnalysis.push({
-        id: 'mistake-foundational-2',
-        original: 'Can I make a question?',
-        corrected: 'Can I ask a question?',
-        category: 'collocation',
-        explanation: 'In natural English, you "ask a question", not "make a question".',
-        twoExamples: ['May I ask a quick question?', 'He asked an interesting question.'],
-        commonPitfalls: 'Translating "fazer uma pergunta" literally as "make a question".',
-        isPendingConfirmation: false,
-      });
-    }
-  }
-
   // 2. Build Section 2: Teach Grammar Points (Strictly when systemic evidence exists)
   const grammarPoints: PedagogicalGrammarPoint[] = [];
 
@@ -582,9 +815,6 @@ export function generateLocalPedagogicalTransformation(params: {
 
   // Combine Alt+W (New Word), Alt+P (Pronounce), and general vocab markings
   const candidateVocab = [...markings.newWords, ...markings.pronounceItems, ...markings.vocabItems];
-  if (candidateVocab.length === 0 && !markings.cleanText.trim()) {
-    candidateVocab.push('catch up', 'workload', 'streamline', 'make sense', 'get the hang of');
-  }
 
   const VOCAB_DATABASE: Record<string, Omit<PedagogicalVocabularyItem, 'id' | 'term'>> = {
     ...Object.fromEntries(
@@ -637,14 +867,11 @@ export function generateLocalPedagogicalTransformation(params: {
         ? 'Idiomatic Expression'
         : 'Vocabulary Item',
       simpleDefinition: isPronounce
-        ? `Phonetic articulation and syllable stress focus for "${rawTrimmed}".`
-        : `Authentic lexical expression (${cefrMeta.cefr}) for natural spoken English.`,
-      collocations: [`express "${rawTrimmed}" accurately`, `frequently used with "${rawTrimmed}"`],
-      realExamples: [
-        `She focused on expressing "${rawTrimmed}" accurately in context.`,
-        `Daily usage: practicing "${rawTrimmed}" builds natural speaking fluency.`,
-      ],
-      synonyms: ['natural expression', 'target phrase'],
+        ? (cleanLang === 'pt' ? `Foco em pronúncia da aula para "${rawTrimmed}".` : `Session pronunciation note for "${rawTrimmed}".`)
+        : (cleanLang === 'pt' ? `Vocabulário anotado pelo professor na sessão: "${rawTrimmed}".` : `Teacher session vocabulary: "${rawTrimmed}".`),
+      collocations: [],
+      realExamples: [],
+      synonyms: [],
       register: 'neutral' as const,
       category: isPronounce ? 'Pronunciation & Phonetics (Alt+P)' : isNewWord ? 'New Words & Expressions (Alt+W)' : 'Core Session Vocabulary',
     });
@@ -824,11 +1051,15 @@ export async function fetchPedagogicalTransformation(params: {
 
         if (cacheRes.ok) {
           const cachedData = await cacheRes.json();
-          const hasLegacyPending = Array.isArray(cachedData?.mistakesAnalysis) && cachedData.mistakesAnalysis.some((m: any) =>
-            m.isPendingConfirmation === true ||
-            (typeof m.corrected === 'string' && (m.corrected.includes('Pending confirmation') || m.corrected.includes('Pendente de confirmação')))
-          );
-          if (!hasLegacyPending && cachedData && typeof cachedData === 'object' && !Array.isArray(cachedData) && cachedData.sessionKey && cachedData.isAiGenerated && !cachedData.isProvisional) {
+          if (
+            cachedData &&
+            typeof cachedData === 'object' &&
+            !Array.isArray(cachedData) &&
+            cachedData.sessionKey &&
+            cachedData.isAiGenerated &&
+            !cachedData.isProvisional &&
+            !isLegacyGenericTransformation(cachedData, rawNotes)
+          ) {
             return cachedData;
           }
         }
@@ -917,7 +1148,9 @@ export async function fetchPedagogicalTransformation(params: {
     if (res.ok) {
       const data = await res.json();
       if (data && data.transformation && Array.isArray(data.transformation.mistakesAnalysis)) {
-        return data.transformation;
+        if (!isLegacyGenericTransformation(data.transformation, rawNotes)) {
+          return data.transformation;
+        }
       }
     }
   } catch (err) {

@@ -2,6 +2,7 @@ import { getFirestore, Firestore, FieldValue } from 'firebase-admin/firestore';
 import { getFirebaseAdminApp, ALLOWED_STAGING_PROJECT_ID } from './serverFirebaseAdmin';
 import { normalizeDictionaryWord } from './utils/studentDictionaryLibrary';
 import { isGenericPedagogicalDefinition } from './serverGeminiSecurity';
+import { isLegacyGenericTransformation } from './utils/pedagogicalTransformer';
 
 /**
  * Active identifiers for staging persistence.
@@ -3116,6 +3117,18 @@ export async function savePedagogicalTransformationToFirestoreServer(
   if (isCloudWriteDisabled) return false;
   const db = getFirestoreDb();
   if (!db || !compositeCacheKey || !transformation) return false;
+
+  // HOTFIX 2.1 — Persist ONLY valid pedagogical transformations (zero provisional, zero fallback, zero generic)
+  if (
+    !transformation.isAiGenerated ||
+    transformation.isFallback ||
+    transformation.isProvisional ||
+    isLegacyGenericTransformation(transformation)
+  ) {
+    console.info('[serverFirestore] Refusing to persist invalid or generic transformation to Firestore');
+    return false;
+  }
+
   try {
     const sanitized = JSON.parse(JSON.stringify(transformation));
     const sessionKey = transformation.sessionKey || compositeCacheKey.split('__')[0];
@@ -3140,7 +3153,7 @@ export async function savePedagogicalTransformationToFirestoreServer(
  */
 export async function fetchPedagogicalTransformationFromFirestoreServer(
   compositeCacheKeyOrSessionKey: string,
-  options?: { language?: string; contentHash?: string }
+  options?: { language?: string; contentHash?: string; rawNotes?: string }
 ): Promise<any | null> {
   const db = getFirestoreDb();
   if (!db || !compositeCacheKeyOrSessionKey) return null;
@@ -3154,7 +3167,7 @@ export async function fetchPedagogicalTransformationFromFirestoreServer(
       const snap = await sessionRef.collection('pedagogical_cache').doc(rawKey).get();
       if (snap && snap.exists) {
         const data = snap.data();
-        if (data && data.isAiGenerated && !data.isProvisional) {
+        if (data && data.isAiGenerated && !data.isProvisional && !isLegacyGenericTransformation(data, options?.rawNotes)) {
           return data;
         }
       }
@@ -3167,7 +3180,7 @@ export async function fetchPedagogicalTransformationFromFirestoreServer(
       let candidate: any = null;
       for (const d of colSnap.docs) {
         const data = d.data();
-        if (data && data.isAiGenerated && !data.isProvisional) {
+        if (data && data.isAiGenerated && !data.isProvisional && !isLegacyGenericTransformation(data, options?.rawNotes)) {
           const matchLang = !options?.language || data.language === options.language;
           const matchHash = !options?.contentHash || data.contentHash === options.contentHash;
           if (matchLang && matchHash) {

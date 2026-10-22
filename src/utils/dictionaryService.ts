@@ -42,6 +42,10 @@ export function isGenericPedagogicalDefinition(def: string | undefined | null): 
     lower.includes('practical vocabulary term (') ||
     lower.includes('practical english term (') ||
     lower.includes('key communicative expression') ||
+    lower.includes('a natural conversational expression used by native speakers to articulate') ||
+    lower.includes('utilizado em inglês autêntico para expressar a ideia de') ||
+    lower.includes('used in authentic english to convey') ||
+    lower.includes('authentic lexical expression (') ||
     lower.startsWith('a fundamental word') ||
     lower.startsWith('a natural conversational expression') ||
     lower.startsWith('an advanced lexical item')
@@ -68,7 +72,12 @@ export function isGenericPedagogicalExample(example: string | undefined | null):
     lower.includes('makes your daily english sound much more expressive') ||
     lower.includes('during our live conversation practice today') ||
     lower.includes('helps you follow native english conversations easily') ||
-    lower.includes('frequently used by native speakers in everyday chats')
+    lower.includes('frequently used by native speakers in everyday chats') ||
+    lower.includes('in relevant conversational contexts') ||
+    lower.includes('helps incorporate it into active speaking') ||
+    (lower.includes('i prefer saying') && lower.includes('to sound natural and clear')) ||
+    (lower.includes('ensures clarity') && lower.includes('saying')) ||
+    lower.includes('didactic example (hypothetical)')
   ) {
     return true;
   }

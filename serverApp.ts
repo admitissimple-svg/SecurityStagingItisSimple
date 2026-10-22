@@ -178,6 +178,8 @@ import {
   getPendingPitfallsText,
   getAiUnavailableNoticeText,
   resolveCefrLevel,
+  validatePedagogicalAiResponse,
+  isLegacyGenericTransformation,
 } from './src/utils/pedagogicalTransformer';
 import {
   firebaseAuthMiddleware,
@@ -8987,6 +8989,29 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
   let cleanUid = callerUid;
   let effectiveEmail = callerEmail;
 
+  // Look up lesson metadata from canonical Firestore database first, then fallback
+  let foundLesson: any = null;
+  if (lessonId) {
+    const firestore = getFirestoreDb();
+    if (firestore) {
+      try {
+        const lSnap1 = await firestore.collection('liveLessons').doc(lessonId).get();
+        if (lSnap1.exists) {
+          foundLesson = lSnap1.data();
+        } else {
+          const lSnap2 = await firestore.collection('lessons').doc(lessonId).get();
+          if (lSnap2.exists) {
+            foundLesson = lSnap2.data();
+          }
+        }
+      } catch {}
+    }
+
+    if (!foundLesson && Array.isArray(db.liveLessons)) {
+      foundLesson = db.liveLessons.find((l: any) => l.id === lessonId);
+    }
+  }
+
   if (caller.role === 'student') {
     // Verify student ownership of requested student identifiers
     if (studentUid && studentUid !== callerUid) {
@@ -9002,37 +9027,14 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
       });
     }
 
-    // Verify student ownership of lesson via canonical Firestore database first, then fallback
-    if (lessonId) {
-      let lesson: any = null;
-      const firestore = getFirestoreDb();
-      if (firestore) {
-        try {
-          const lSnap1 = await firestore.collection('liveLessons').doc(lessonId).get();
-          if (lSnap1.exists) {
-            lesson = lSnap1.data();
-          } else {
-            const lSnap2 = await firestore.collection('lessons').doc(lessonId).get();
-            if (lSnap2.exists) {
-              lesson = lSnap2.data();
-            }
-          }
-        } catch {}
-      }
-
-      if (!lesson && Array.isArray(db.liveLessons)) {
-        lesson = db.liveLessons.find((l: any) => l.id === lessonId);
-      }
-
-      if (lesson) {
-        const lEmail = (lesson.studentEmail || '').toLowerCase().trim();
-        const lUid = lesson.studentUid || '';
-        if ((lUid && lUid !== callerUid) || (lEmail && lEmail !== callerEmail)) {
-          return res.status(403).json({
-            error: 'Forbidden',
-            message: 'Unauthorized access: you may only transform pedagogical notes for your own lessons.',
-          });
-        }
+    if (foundLesson) {
+      const lEmail = (foundLesson.studentEmail || '').toLowerCase().trim();
+      const lUid = foundLesson.studentUid || '';
+      if ((lUid && lUid !== callerUid) || (lEmail && lEmail !== callerEmail)) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Unauthorized access: you may only transform pedagogical notes for your own lessons.',
+        });
       }
     }
 
@@ -9043,6 +9045,9 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
     cleanUid = studentUid || callerUid;
     effectiveEmail = cleanEmail || callerEmail;
   }
+
+  const effectiveTeacherUid = (caller.role === 'teacher' ? caller.uid : '') || foundLesson?.teacherUid || foundLesson?.tutorUid || '';
+  const effectiveTeacherEmail = (caller.role === 'teacher' ? callerEmail : '') || foundLesson?.teacherEmail || foundLesson?.tutorEmail || '';
 
   // Authoritative student CEFR level from registered user document (prevents client spoofing)
   const registeredStudent = (db.students || []).find((s: any) =>
@@ -9067,15 +9072,16 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
     db.pedagogicalTransformationsMap[compositeCacheKey] ||
     (language === 'pt' ? db.pedagogicalTransformationsMap[canonicalSessionKey] : undefined);
 
-  if (!cached || cached.isProvisional) {
+  if (!cached || cached.isProvisional || isLegacyGenericTransformation(cached, rawNotes)) {
+    cached = null;
     const candidates = [canonicalSessionKey, customSessionKey, lessonId].filter(Boolean);
     for (const cand of candidates) {
-      if (db.pedagogicalTransformationsMap[cand] && db.pedagogicalTransformationsMap[cand].isAiGenerated && !db.pedagogicalTransformationsMap[cand].isProvisional) {
+      if (db.pedagogicalTransformationsMap[cand] && db.pedagogicalTransformationsMap[cand].isAiGenerated && !db.pedagogicalTransformationsMap[cand].isProvisional && !isLegacyGenericTransformation(db.pedagogicalTransformationsMap[cand], rawNotes)) {
         cached = db.pedagogicalTransformationsMap[cand];
         break;
       }
       const prefixMatch = Object.entries(db.pedagogicalTransformationsMap || {}).find(([k, v]: [string, any]) => {
-        return (k.startsWith(`${cand}__`) || k === cand) && v?.isAiGenerated && !v?.isProvisional;
+        return (k.startsWith(`${cand}__`) || k === cand) && v?.isAiGenerated && !v?.isProvisional && !isLegacyGenericTransformation(v, rawNotes);
       });
       if (prefixMatch) {
         cached = prefixMatch[1];
@@ -9084,19 +9090,19 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
     }
   }
 
-  if ((!cached || cached.isProvisional) && (canonicalSessionKey || customSessionKey)) {
+  if ((!cached || cached.isProvisional || isLegacyGenericTransformation(cached, rawNotes)) && (canonicalSessionKey || customSessionKey)) {
     const sessionToSearch = canonicalSessionKey || customSessionKey;
     try {
-      const fsCached = await fetchPedagogicalTransformationFromFirestoreServer(sessionToSearch, { language });
-      if (fsCached && fsCached.isAiGenerated && !fsCached.isProvisional) {
+      const fsCached = await fetchPedagogicalTransformationFromFirestoreServer(sessionToSearch, { language, rawNotes });
+      if (fsCached && fsCached.isAiGenerated && !fsCached.isProvisional && !isLegacyGenericTransformation(fsCached, rawNotes)) {
         cached = fsCached;
         db.pedagogicalTransformationsMap[compositeCacheKey] = cached;
       }
     } catch {}
-    if ((!cached || cached.isProvisional) && cleanUid) {
+    if ((!cached || cached.isProvisional || isLegacyGenericTransformation(cached, rawNotes)) && cleanUid) {
       try {
         const reconstructed = await reconstructTransformationFromJournalAndDictionaryServer(cleanUid, sessionToSearch);
-        if (reconstructed) {
+        if (reconstructed && !isLegacyGenericTransformation(reconstructed, rawNotes)) {
           cached = reconstructed;
           db.pedagogicalTransformationsMap[compositeCacheKey] = cached;
         }
@@ -9105,13 +9111,10 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
   }
 
   // FASE 4B.8 & 4B.9: If a valid, non-provisional AI-generated transformation exists for this session, REUSE IT,
-  // EXCEPT when the user explicitly triggers forceRegenerate (Refresh Analysis) or when cache contains a legacy pending placeholder!
-  const hasLegacyPendingPlaceholder = Array.isArray(cached?.mistakesAnalysis) && cached.mistakesAnalysis.some((m: any) =>
-    m.isPendingConfirmation === true ||
-    (typeof m.corrected === 'string' && (m.corrected.includes('Pending confirmation') || m.corrected.includes('Pendente de confirmação')))
-  );
+  // EXCEPT when the user explicitly triggers forceRegenerate (Refresh Analysis) or when cache contains legacy generic content!
+  const isGenericCached = isLegacyGenericTransformation(cached, rawNotes);
 
-  if (!forceRegenerate && !hasLegacyPendingPlaceholder && cached && !cached.isProvisional && cached.isAiGenerated) {
+  if (!forceRegenerate && !isGenericCached && cached && !cached.isProvisional && cached.isAiGenerated) {
     // FASE 4B.9: Guarantee single idempotent journal entry for the session without repeated Gemini calls
     recordLessonReviewInStudentJournalServer({
       studentUid: cleanUid,
@@ -9178,6 +9181,7 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
     const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || '';
     const isCooldownActive = Date.now() < geminiQuotaCooldownUntil;
     let lastFailureCategory: GeminiFailureCategory | null = isCooldownActive ? 'QUOTA_EXCEEDED' : null;
+    let contingencyResult: any = null;
 
     if (apiKey && rawNotes.trim().length > 15 && !isCooldownActive) {
       const targetLang = LANGUAGE_NAMES[language] || { nameEn: 'Portuguese', nameNative: 'Português' };
@@ -9281,113 +9285,49 @@ ${rawNotes}
 Please synthesize and transform these notes according to the Alt+N, Alt+W, and Alt+P routing rules, adapting deeply to CEFR ${cefr}, and ensuring ALL items are included in the Quick Review. Provide all explanations and pedagogical rules in ${targetLang.nameEn} (${targetLang.nameNative}).`;
 
       // HOTFIX 3-MODEL CONTINGENCY: Sequential failover across up to 3 verified models on recoverable errors
-      const contingencyResult = await executeGeminiWithContingency({
+      contingencyResult = await executeGeminiWithContingency({
         feature: 'pedagogical_transform',
         systemInstruction,
         untrustedUserDataPrompt: prompt,
         callerRole: caller.role,
         apiKey,
         temperature: 0.35,
-        validator: (json) => Array.isArray(json?.mistakesAnalysis),
+        validator: (json) => validatePedagogicalAiResponse(json, markings, cefr, language).valid,
       });
 
       if (contingencyResult.success && contingencyResult.parsedJson) {
         const parsed = contingencyResult.parsedJson;
 
-        if (parsed && Array.isArray(parsed.mistakesAnalysis)) {
+        if (parsed && (Array.isArray(parsed.mistakesAnalysis) || Array.isArray(parsed.vocabularyAndExpressions))) {
           // Process mistakes directly preserving AI native corrections
           const rawErrMap = new Map<string, typeof markings.errors[0]>();
           markings.errors.forEach((e) => rawErrMap.set(e.original.toLowerCase().trim(), e));
 
           const validatedMistakes: any[] = [];
-          (parsed.mistakesAnalysis || []).forEach((m: any) => {
-            const origKey = String(m?.original || '').toLowerCase().trim();
-            const rawErr = rawErrMap.get(origKey);
-            const originalText = rawErr ? rawErr.original : (m.original || 'Mistake');
-            // Prioritize teacher explicit correction if provided, otherwise model native correction
-            const correctedText = (rawErr && rawErr.corrected) ? rawErr.corrected : (m.corrected || originalText);
+          if (markings.errors.length > 0) {
+            (parsed.mistakesAnalysis || []).forEach((m: any) => {
+              const origKey = String(m?.original || '').toLowerCase().trim();
+              const rawErr = Array.from(rawErrMap.values()).find(
+                (e) => origKey.includes(e.original.toLowerCase().trim()) || e.original.toLowerCase().trim().includes(origKey)
+              );
+              const originalText = rawErr ? rawErr.original : (m.original || 'Mistake');
+              // Prioritize teacher explicit correction if provided, otherwise model native correction
+              const correctedText = (rawErr && rawErr.corrected) ? rawErr.corrected : (m.corrected || originalText);
 
-            validatedMistakes.push({
-              id: `mistake-${validatedMistakes.length + 1}`,
-              original: originalText,
-              corrected: correctedText,
-              category: m.category || 'grammar',
-              explanation: m.explanation || `In natural spoken English, phrasing this structure as "${correctedText}" is the native formulation.`,
-              twoExamples: Array.isArray(m.twoExamples) && m.twoExamples.length > 0
-                ? m.twoExamples
-                : [
-                    `In everyday conversation: "${correctedText}".`,
-                    `Alternative formulation: "I prefer saying ${correctedText} to sound natural and clear."`,
-                  ],
-              commonPitfalls: m.commonPitfalls || `Reverting to literal native language syntax instead of adopting natural English phraseology.`,
-              isPendingConfirmation: false,
+              validatedMistakes.push({
+                id: `mistake-${validatedMistakes.length + 1}`,
+                original: originalText,
+                corrected: correctedText,
+                category: m.category || 'grammar',
+                explanation: m.explanation || `In natural spoken English, phrasing this structure as "${correctedText}" is the native formulation.`,
+                twoExamples: Array.isArray(m.twoExamples) ? m.twoExamples : [],
+                commonPitfalls: m.commonPitfalls || '',
+                isPendingConfirmation: false,
+              });
+              if (rawErr) {
+                rawErrMap.delete(rawErr.original.toLowerCase().trim());
+              }
             });
-            rawErrMap.delete(origKey);
-          });
-
-          // Any raw error that the model missed
-          rawErrMap.forEach((rawErr) => {
-            const correctedText = rawErr.corrected || rawErr.original;
-            validatedMistakes.push({
-              id: `mistake-${validatedMistakes.length + 1}`,
-              original: rawErr.original,
-              corrected: correctedText,
-              category: 'grammar',
-              explanation: `In natural spoken English, phrasing this structure as "${correctedText}" is the native formulation.`,
-              twoExamples: [
-                `In everyday conversation: "${correctedText}".`,
-                `Example: "Saying ${correctedText} ensures clarity."`,
-              ],
-              commonPitfalls: `Reverting to literal native language syntax instead of adopting natural English phraseology.`,
-              isPendingConfirmation: false,
-            });
-          });
-
-          // If few or no mistakes found, provide foundational coaching points
-          if (validatedMistakes.length === 0) {
-            if (cefr === 'A1' || cefr === 'A2') {
-              validatedMistakes.push({
-                id: 'mistake-foundational-1',
-                original: 'I have 28 years old',
-                corrected: 'I am 28 years old',
-                category: 'grammar',
-                explanation: 'In English, age is expressed with the verb "to be" (am/is/are), not with "to have".',
-                twoExamples: ['I am 28 years old.', 'My friend is 30 years old.'],
-                commonPitfalls: 'Translating Portuguese "Eu tenho 28 anos" directly as "I have 28 years".',
-                isPendingConfirmation: false,
-              });
-              validatedMistakes.push({
-                id: 'mistake-foundational-2',
-                original: 'It depends of the day',
-                corrected: 'It depends on the day',
-                category: 'preposition',
-                explanation: 'The verb "depend" always pairs with the preposition "ON", never "of".',
-                twoExamples: ['It depends on the traffic.', 'Our schedule depends on the weather.'],
-                commonPitfalls: 'Saying "depend of" because of Portuguese "depender de".',
-                isPendingConfirmation: false,
-              });
-            } else {
-              validatedMistakes.push({
-                id: 'mistake-foundational-1',
-                original: "I'm agree with you",
-                corrected: 'I agree with you',
-                category: 'grammar',
-                explanation: '"Agree" is an active verb, not an adjective. We say "I agree", without "am".',
-                twoExamples: ['I agree with your suggestion.', 'I don\'t agree with that strategy.'],
-                commonPitfalls: 'Saying "I am agree" or negative "I am not agree".',
-                isPendingConfirmation: false,
-              });
-              validatedMistakes.push({
-                id: 'mistake-foundational-2',
-                original: 'Can I make a question?',
-                corrected: 'Can I ask a question?',
-                category: 'collocation',
-                explanation: 'In natural English, you "ask a question", not "make a question".',
-                twoExamples: ['May I ask a quick question?', 'He asked an interesting question.'],
-                commonPitfalls: 'Translating "fazer uma pergunta" literally as "make a question".',
-                isPendingConfirmation: false,
-              });
-            }
           }
 
           // Strict validation of vocabulary: terms MUST be in markings.newWords or markings.pronounceItems
@@ -9397,172 +9337,61 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
           ]);
 
           const validatedVocab: any[] = [];
-          (parsed.vocabularyAndExpressions || []).forEach((v: any) => {
-            const termKey = String(v?.term || '').toLowerCase().trim();
-            if (validTermsSet.has(termKey)) {
-              const isPronounce = markings.pronounceItems.some((p) => p.toLowerCase().trim() === termKey);
-              const isNewWord = markings.newWords.some((w) => w.toLowerCase().trim() === termKey);
-              
-              const rawExamples = Array.isArray(v.realExamples) ? v.realExamples : [];
-              const formattedExamples = rawExamples
-                .map((ex: any) => String(ex || '').trim().replace(/^["']|["']$/g, ''))
-                .filter(Boolean);
+          if (validTermsSet.size > 0) {
+            (parsed.vocabularyAndExpressions || []).forEach((v: any) => {
+              const termKey = String(v?.term || '').toLowerCase().trim();
+              const matchedTarget = Array.from(validTermsSet).find(
+                (target) => termKey === target || termKey.includes(target) || target.includes(termKey)
+              );
+              if (matchedTarget) {
+                const isPronounce = markings.pronounceItems.some(
+                  (p) => matchedTarget.includes(p.toLowerCase().trim()) || p.toLowerCase().trim().includes(matchedTarget)
+                );
+                const isNewWord = markings.newWords.some(
+                  (w) => matchedTarget.includes(w.toLowerCase().trim()) || w.toLowerCase().trim().includes(matchedTarget)
+                );
 
-              validatedVocab.push({
-                ...v,
-                id: `vocab-${validatedVocab.length + 1}`,
-                partOfSpeech: v.partOfSpeech || (isPronounce ? 'Pronunciation Focus' : 'Expression'),
-                realExamples: formattedExamples.length > 0 ? formattedExamples : (
-                  isPronounce
-                    ? [`Pay careful attention to the syllable stress on '${v.term}'.`]
-                    : [`Native speakers use '${v.term}' in spontaneous conversation.`]
-                ),
-                category: isNewWord && isPronounce
-                  ? 'New Word & Pronunciation (Alt+W + Alt+P)'
-                  : isPronounce
-                  ? 'Pronunciation & Phonetics (Alt+P)'
-                  : 'New Words & Expressions (Alt+W)',
-                isPronunciationFocus: isPronounce,
-                isNewWord: isNewWord,
-              });
-              validTermsSet.delete(termKey);
-            }
-          });
+                const rawExamples = Array.isArray(v.realExamples) ? v.realExamples : [];
+                const formattedExamples = rawExamples
+                  .map((ex: any) => String(ex || '').trim().replace(/^["']|["']$/g, ''))
+                  .filter(Boolean);
 
-          // Recover any marked term missed by the model using authentic dictionary or non-generic content
-          validTermsSet.forEach((missedKey) => {
-            const isPronounce = markings.pronounceItems.some((p) => p.toLowerCase().trim() === missedKey);
-            const isNewWord = markings.newWords.some((w) => w.toLowerCase().trim() === missedKey);
-            const originalTerm =
-              markings.pronounceItems.find((p) => p.toLowerCase().trim() === missedKey) ||
-              markings.newWords.find((w) => w.toLowerCase().trim() === missedKey) ||
-              missedKey;
-
-            const normalizedLookup = missedKey.replace(/[_\-]+/g, ' ');
-            const dbMatch = NATIVE_FRIENDS_DICTIONARY_DATABASE[missedKey] || NATIVE_FRIENDS_DICTIONARY_DATABASE[normalizedLookup];
-
-            if (dbMatch) {
-              validatedVocab.push({
-                id: `vocab-${validatedVocab.length + 1}`,
-                term: originalTerm,
-                partOfSpeech: isPronounce ? 'Pronunciation Focus' : dbMatch.partOfSpeech,
-                definitionEn: isPronounce
-                  ? `Pronunciation focus: Pay careful attention to syllable stress and sound articulation on "${originalTerm}".`
-                  : dbMatch.definitionEn,
-                simpleDefinition: isPronounce
-                  ? (language === 'pt'
-                      ? `Foco em pronúncia: Preste atenção à tonicidade da sílaba e articulação de "${originalTerm}".`
-                      : `Pronunciation focus: Pay careful attention to syllable stress on "${originalTerm}".`)
-                  : (language === 'pt'
-                      ? (dbMatch.explanationPt || `Termo comunicativo (${cefr}): utilizado em inglês autêntico para expressar "${originalTerm}"${dbMatch.translationPt ? ` (${dbMatch.translationPt})` : ''} com clareza e naturalidade.`)
-                      : dbMatch.definitionEn),
-                collocations: (dbMatch.collocations && dbMatch.collocations.length > 0)
-                  ? dbMatch.collocations
-                  : [`in the context of "${originalTerm}"`, `spoken usage of "${originalTerm}"`],
-                realExamples: (dbMatch.realExamples || [dbMatch.exampleSentenceEn]).map((ex: string) =>
-                  String(ex || '').trim().replace(/^["']|["']$/g, '')
-                ),
-                synonyms: (dbMatch.synonyms && dbMatch.synonyms.length > 0) ? dbMatch.synonyms : ['target expression'],
-                register: dbMatch.register || 'neutral',
-                category: isNewWord && isPronounce
-                  ? 'New Word & Pronunciation (Alt+W + Alt+P)'
-                  : isPronounce
-                  ? 'Pronunciation & Phonetics (Alt+P)'
-                  : 'New Words & Expressions (Alt+W)',
-                phoneticGuide: isPronounce
-                  ? `🎯 Pronunciation focus: practice clean syllable stress on "${originalTerm}" without adding Portuguese final vowels.`
-                  : dbMatch.phonetic,
-                isPronunciationFocus: isPronounce,
-                isNewWord,
-              });
-            } else {
-              validatedVocab.push({
-                id: `vocab-${validatedVocab.length + 1}`,
-                term: originalTerm,
-                partOfSpeech: isPronounce
-                  ? 'Pronunciation Focus'
-                  : originalTerm.includes(' ')
-                  ? 'Idiomatic Expression'
-                  : 'Conversational Vocabulary',
-                definitionEn: isPronounce
-                  ? `Target pronunciation focus: Practice clean sound articulation, syllable stress, and connected speech rhythm for "${originalTerm}".`
-                  : `A natural conversational expression used by native speakers to articulate "${originalTerm}" in context.`,
-                simpleDefinition: isPronounce
-                  ? (language === 'pt'
-                      ? `Foco em pronúncia: Preste atenção à tonicidade correta e evite acrescentar vogais de apoio ao pronunciar "${originalTerm}".`
-                      : `Pronunciation focus: Pay attention to syllable stress and vowel reduction when pronouncing "${originalTerm}".`)
-                  : (language === 'pt'
-                      ? `Termo comunicativo (${cefr}): utilizado em inglês autêntico para expressar a ideia de "${originalTerm}".`
-                      : `Communicative term (${cefr}): used in authentic English to convey "${originalTerm}".`),
-                collocations: isPronounce
-                  ? [`pronounce "${originalTerm}" clearly`, `syllable stress on "${originalTerm}"`]
-                  : [`common usage of "${originalTerm}"`, `conversational context with "${originalTerm}"`],
-                realExamples: isPronounce
-                  ? [
-                      `In connected speech, place clear syllable stress on '${originalTerm}' without vowel lengthening.`,
-                      `Listen closely to reproduce the natural rhythm and intonation of '${originalTerm}'.`,
-                    ]
-                  : [
-                      `Native speakers employ '${originalTerm}' in relevant conversational contexts.`,
-                      `Reviewing '${originalTerm}' in context helps incorporate it into active speaking.`,
-                    ],
-                synonyms: isPronounce ? ['phonetic focus', 'pronunciation target'] : ['conversational expression', 'target vocabulary'],
-                register: 'neutral',
-                category: isNewWord && isPronounce
-                  ? 'New Word & Pronunciation (Alt+W + Alt+P)'
-                  : isPronounce
-                  ? 'Pronunciation & Phonetics (Alt+P)'
-                  : 'New Words & Expressions (Alt+W)',
-                phoneticGuide: isPronounce
-                  ? `🎯 Pronunciation focus: practice clean syllable stress on "${originalTerm}" without adding Portuguese final vowels.`
-                  : `🎯 Pronounce "${originalTerm}" with natural English rhythm and syllable emphasis.`,
-                isPronunciationFocus: isPronounce,
-                isNewWord,
-              });
-            }
-          });
-
-          // Validation of grammar: ensure at least 2 grammar points are available for student (original rule)
-          let validatedGrammar: any[] = [];
-          const rawGrammarList = Array.isArray(parsed.grammarPoints) ? parsed.grammarPoints : [];
-          validatedGrammar = rawGrammarList
-            .filter((g: any) => g && g.topic && g.rule)
-            .map((g: any, idx: number) => ({
-              id: g.id || `grammar-${idx + 1}`,
-              topic: String(g.topic).trim(),
-              rule: String(g.rule).trim(),
-              form: String(g.form || '').trim(),
-              usage: String(g.usage || '').trim(),
-              examples: Array.isArray(g.examples)
-                ? g.examples.map((ex: any) => String(ex || '').trim().replace(/^["']|["']$/g, '')).filter(Boolean)
-                : [],
-              commonMistakes: String(g.commonMistakes || '').trim(),
-              comparisons: String(g.comparisons || '').trim(),
-            }));
-
-          if (validatedGrammar.length < 2) {
-            const fallbackGp = generateLocalPedagogicalTransformation({
-              rawNotes,
-              topic,
-              sessionDate,
-              teacherName,
-              studentLevel: authoritativeLevel,
-              language,
-            }).grammarPoints;
-            fallbackGp.forEach((fgp) => {
-              if (validatedGrammar.length < 2 && !validatedGrammar.some((vg) => vg.topic.toLowerCase() === fgp.topic.toLowerCase())) {
-                validatedGrammar.push({
-                  id: `grammar-${validatedGrammar.length + 1}`,
-                  topic: fgp.topic,
-                  rule: fgp.rule,
-                  form: fgp.form,
-                  usage: fgp.usage,
-                  examples: fgp.examples,
-                  commonMistakes: fgp.commonMistakes,
-                  comparisons: fgp.comparisons,
+                validatedVocab.push({
+                  ...v,
+                  id: `vocab-${validatedVocab.length + 1}`,
+                  partOfSpeech: v.partOfSpeech || (isPronounce ? 'Pronunciation Focus' : 'Vocabulary Item'),
+                  realExamples: formattedExamples,
+                  category: isNewWord && isPronounce
+                    ? 'New Word & Pronunciation (Alt+W + Alt+P)'
+                    : isPronounce
+                    ? 'Pronunciation & Phonetics (Alt+P)'
+                    : 'New Words & Expressions (Alt+W)',
+                  isPronunciationFocus: isPronounce,
+                  isNewWord: isNewWord,
                 });
+                validTermsSet.delete(matchedTarget);
               }
             });
+          }
+
+          // Authentic grammar points generated by the model (strictly when present, zero forced padding)
+          let validatedGrammar: any[] = [];
+          if (markings.errors.length > 0) {
+            const rawGrammarList = Array.isArray(parsed.grammarPoints) ? parsed.grammarPoints : [];
+            validatedGrammar = rawGrammarList
+              .filter((g: any) => g && g.topic && g.rule)
+              .map((g: any, idx: number) => ({
+                id: g.id || `grammar-${idx + 1}`,
+                topic: String(g.topic).trim(),
+                rule: String(g.rule).trim(),
+                form: String(g.form || '').trim(),
+                usage: String(g.usage || '').trim(),
+                examples: Array.isArray(g.examples)
+                  ? g.examples.map((ex: any) => String(ex || '').trim().replace(/^["']|["']$/g, '')).filter(Boolean)
+                  : [],
+                commonMistakes: String(g.commonMistakes || '').trim(),
+                comparisons: String(g.comparisons || '').trim(),
+              }));
           }
 
           const allCorrections = validatedMistakes.map((m: any) => ({
@@ -9613,6 +9442,8 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
             sessionDate,
             topic,
             teacherName,
+            teacherUid: effectiveTeacherUid || undefined,
+            teacherEmail: effectiveTeacherEmail || undefined,
             studentUid: cleanUid || studentUid,
             studentEmail: cleanEmail,
             studentLevel: String(authoritativeLevel),
@@ -9745,7 +9576,7 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
     for (const key of candidateKeys) {
       if (db.pedagogicalTransformationsMap?.[key]) {
         const candidate = db.pedagogicalTransformationsMap[key];
-        if (candidate && candidate.isAiGenerated && !candidate.isProvisional) {
+        if (candidate && candidate.isAiGenerated && !candidate.isProvisional && !isLegacyGenericTransformation(candidate)) {
           transformation = candidate;
           break;
         }
@@ -9753,7 +9584,8 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
       const match = Object.entries(db.pedagogicalTransformationsMap || {}).find(([k, v]: [string, any]) => {
         const matchKey = k === key || k.startsWith(`${key}__`);
         const matchLang = !language || v?.language === language;
-        return matchKey && matchLang && v?.isAiGenerated && !v?.isProvisional;
+        const matchHash = !contentHash || v?.contentHash === contentHash;
+        return matchKey && matchLang && matchHash && v?.isAiGenerated && !v?.isProvisional && !isLegacyGenericTransformation(v);
       });
       if (match) {
         transformation = match[1];
@@ -9765,8 +9597,8 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
     if (!transformation) {
       for (const key of candidateKeys) {
         try {
-          const fsMatch = await fetchPedagogicalTransformationFromFirestoreServer(key, { language });
-          if (fsMatch && fsMatch.isAiGenerated && !fsMatch.isProvisional) {
+          const fsMatch = await fetchPedagogicalTransformationFromFirestoreServer(key, { language, contentHash });
+          if (fsMatch && fsMatch.isAiGenerated && !fsMatch.isProvisional && !isLegacyGenericTransformation(fsMatch)) {
             transformation = fsMatch;
             const storeKey = fsMatch.cacheKey || `${sessionKey}__hash_${fsMatch.contentHash || 'any'}__lang_${fsMatch.language || language || 'pt'}`;
             if (!db.pedagogicalTransformationsMap) db.pedagogicalTransformationsMap = {};
