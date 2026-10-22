@@ -4501,6 +4501,10 @@ export function mergeHomeworkRecords(primary: any, fallback: any): any {
       ...(fallback.completedPartsByDay || {}),
       ...(primary.completedPartsByDay || {}),
     },
+    dailyActivities: {
+      ...(fallback.dailyActivities || {}),
+      ...(primary.dailyActivities || {}),
+    },
     studentAnswers: mergedAnswers,
     partsProgress: mergedPartsProgress,
     aiEvaluation: finalAiEvaluation,
@@ -4701,6 +4705,11 @@ export async function saveStudentHomeworkProgressToFirestore(
       ? existingHomework.readingPassage
       : sanitizedHomework.readingPassage;
 
+    const mergedDailyActivities = {
+      ...(existingHomework?.dailyActivities || {}),
+      ...(sanitizedHomework?.dailyActivities || {}),
+    };
+
     const payload = stampSchemaVersion({
       ...existingHomework,
       ...sanitizedHomework,
@@ -4714,6 +4723,7 @@ export async function saveStudentHomeworkProgressToFirestore(
       sentenceWritingPrompts: finalPrompts,
       readingPassage: finalReadingPassage,
       completedPartsByDay: mergedCompletedParts,
+      dailyActivities: mergedDailyActivities,
       studentAnswers: mergedStudentAnswers,
       aiEvaluation: finalAiEvaluation,
       score: finalScore,

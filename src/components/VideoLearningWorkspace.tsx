@@ -1345,7 +1345,6 @@ export const VideoLearningWorkspace: React.FC<VideoLearningWorkspaceProps> = ({
             {showSpotifyEmbed && (
               <div
                 className="rounded-2xl overflow-hidden border border-[#1DB954]/40 bg-[#000035] shadow-inner p-1"
-                onClick={() => triggerAudioCompletion()}
               >
                 <iframe
                   src={getSpotifyEmbedUrl(activity.teacherSpotify.url) || undefined}

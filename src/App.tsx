@@ -13,6 +13,7 @@ import {
   UserProfile,
   UserRole,
   WeeklyHomeworkData,
+  DailyHomeworkActivity,
   Language,
   AdminLandingContent,
   NativeFriendTutor,
@@ -940,9 +941,10 @@ export default function App() {
       weeklyCycle: userProfile?.weeklyCycle || 1,
       userProfile,
       excludedWords: excludedDictionaryWords,
+      existingDailyActivities: weeklyHomework?.dailyActivities,
     });
 
-    // If we already have an AI-generated homework and the collected words haven't changed, preserve it (unless it was generated with old template)!
+    // HOTFIX 2.3.5 (Etapa 3 & 5): Manage independent daily activities per targetDay
     setWeeklyHomework((prev) => {
       const prevCycle = parseWeekCycleNumber(prev?.weeklyCycle ?? prev?.weekId ?? prev?.id);
       const genCycle = parseWeekCycleNumber(generated?.weeklyCycle ?? generated?.weekId ?? generated?.id);
@@ -952,94 +954,151 @@ export default function App() {
           (prev.weekId && generated.weekId && prev.weekId === generated.weekId))
       );
 
-      const hasValidEvaluation = Boolean(
-        prev?.aiEvaluation &&
-        isValidHomeworkEvaluation(prev.aiEvaluation) &&
-        !isSyntheticHomeworkEvaluation(prev.aiEvaluation)
-      );
+      // Snapshot active day of prev before switching or merging
+      const combinedDaily: Record<string, DailyHomeworkActivity> = {
+        ...(prev?.dailyActivities || {}),
+        ...(generated?.dailyActivities || {}),
+      };
 
-      const hasStudentAnswers = Boolean(
-        prev?.studentAnswers &&
-        (Object.keys(prev.studentAnswers.matching || {}).length > 0 ||
-          Object.keys(prev.studentAnswers.fillInBlanks || {}).length > 0 ||
-          Object.keys(prev.studentAnswers.sentences || {}).length > 0 ||
-          Object.keys(prev.studentAnswers.quizAnswers || {}).length > 0)
-      );
-
-      // HOTFIX 2.3.1: If we already have authentic evaluation, answered parts, or completed homework for this week,
-      if (prev && isSameWeek && (hasValidEvaluation || hasStudentAnswers || prev.isCompleted || (typeof prev.score === 'number' && prev.score > 0))) {
-        return {
-          ...generated,
-          ...prev,
-          matchingPairs: (Array.isArray(prev.matchingPairs) && prev.matchingPairs.length > 0) ? prev.matchingPairs : generated.matchingPairs,
-          fillInBlanks: (Array.isArray(prev.fillInBlanks) && prev.fillInBlanks.length > 0) ? prev.fillInBlanks : generated.fillInBlanks,
-          sentenceWritingPrompts: (Array.isArray(prev.sentenceWritingPrompts) && prev.sentenceWritingPrompts.length > 0) ? prev.sentenceWritingPrompts : generated.sentenceWritingPrompts,
-          readingPassage: (prev.readingPassage?.text) ? prev.readingPassage : generated.readingPassage,
-          isCompleted: Boolean(prev.isCompleted || generated.isCompleted),
-          isDayPartCompleted: Boolean(prev.isDayPartCompleted || generated.isDayPartCompleted),
-          completedPartsByDay: {
-            ...(generated.completedPartsByDay || {}),
-            ...(prev.completedPartsByDay || {}),
-          },
-          studentAnswers: {
-            matching: { ...(generated.studentAnswers?.matching || {}), ...(prev.studentAnswers?.matching || {}) },
-            fillInBlanks: { ...(generated.studentAnswers?.fillInBlanks || {}), ...(prev.studentAnswers?.fillInBlanks || {}) },
-            sentences: { ...(generated.studentAnswers?.sentences || {}), ...(prev.studentAnswers?.sentences || {}) },
-            quizAnswers: { ...(generated.studentAnswers?.quizAnswers || {}), ...(prev.studentAnswers?.quizAnswers || {}) },
-          },
-          partsProgress: prev.partsProgress || generated.partsProgress,
-          aiEvaluation: prev.aiEvaluation,
-          score: typeof prev.score === 'number' ? prev.score : generated.score,
+      if (prev?.targetDay) {
+        const pDay = prev.targetDay;
+        const currentSnap = combinedDaily[pDay] || {};
+        const hasPrevAnswers = Boolean(
+          prev.studentAnswers &&
+          (Object.keys(prev.studentAnswers.matching || {}).length > 0 ||
+            Object.keys(prev.studentAnswers.fillInBlanks || {}).length > 0 ||
+            Object.keys(prev.studentAnswers.sentences || {}).length > 0 ||
+            Object.keys(prev.studentAnswers.quizAnswers || {}).length > 0)
+        );
+        combinedDaily[pDay] = {
+          ...currentSnap,
+          id: currentSnap.id || `hw-${pDay}-${prev.weeklyCycle || 1}`,
+          day: pDay,
+          weeklyCycle: prev.weeklyCycle || 1,
+          studentUid: prev.studentUid || userProfile?.id || (userProfile as any)?.uid || '',
+          selectedWords: (Array.isArray(prev.vocabularyList) && prev.vocabularyList.length > 0)
+            ? prev.vocabularyList
+            : (currentSnap.selectedWords || []),
+          wordOrigins: currentSnap.wordOrigins || [],
+          matchingPairs: (Array.isArray(prev.matchingPairs) && prev.matchingPairs.length > 0)
+            ? prev.matchingPairs
+            : (currentSnap.matchingPairs || []),
+          fillInBlanks: (Array.isArray(prev.fillInBlanks) && prev.fillInBlanks.length > 0)
+            ? prev.fillInBlanks
+            : (currentSnap.fillInBlanks || []),
+          sentenceWritingPrompts: (Array.isArray(prev.sentenceWritingPrompts) && prev.sentenceWritingPrompts.length > 0)
+            ? prev.sentenceWritingPrompts
+            : (currentSnap.sentenceWritingPrompts || []),
+          readingPassage: prev.readingPassage?.text ? prev.readingPassage : currentSnap.readingPassage,
+          studentAnswers: hasPrevAnswers ? prev.studentAnswers : (currentSnap.studentAnswers || prev.studentAnswers),
+          partsProgress: prev.partsProgress || currentSnap.partsProgress,
+          aiEvaluation: prev.aiEvaluation || currentSnap.aiEvaluation,
+          score: typeof prev.score === 'number' ? prev.score : currentSnap.score,
+          isCompleted: Boolean(prev.completedPartsByDay?.[pDay] || prev.isCompleted || currentSnap.isCompleted),
+          isStarted: Boolean(currentSnap.isStarted || hasPrevAnswers || prev.partsProgress || prev.isCompleted),
+          updatedAt: new Date().toISOString(),
         };
       }
 
-      if (isSameWeek && prev?.isAiGenerated && !prev.isEmpty && prev.totalWordsCollected > 0 && prev.targetDay === homeworkTargetDay) {
-        const prevText = prev.readingPassage?.text || '';
-        const prevTextLower = prevText.toLowerCase();
-        const hasBadOldStoryOrBoilerplate =
-          prevText.includes('to make sure everything stayed aligned') ||
-          prevText.includes('quick to ') ||
-          prevText.includes('refreshing weather') ||
-          prevText.includes('storm terms') ||
-          prevTextLower.includes('the day began with great purpose as') ||
-          prevTextLower.includes('reviewed key plans regarding') ||
-          prevTextLower.includes('a productive day of focus and growth') ||
-          prevTextLower.includes('address **') ||
-          prevTextLower.includes('managing **') ||
-          prevTextLower.includes('progress made on **') ||
-          prevText.length < 80 ||
-          prev.fillInBlanks?.some((f: any) =>
-            f.sentenceWithBlank?.includes('Understanding how to optimize') ||
-            f.sentenceWithBlank?.includes('The team established a') ||
-            f.hintEn?.includes('Key concept representing') ||
-            f.hintEn?.includes('Descriptive term characterizing')
-          );
+      // If user is switching to homeworkTargetDay:
+      // If we already have a snapshot for homeworkTargetDay, restore that day's questions, words, and answers!
+      const targetSnapshot = combinedDaily[homeworkTargetDay];
 
-        if (!hasBadOldStoryOrBoilerplate) {
-          const prevWords = prev.vocabularyList.map((w) => w.word.toLowerCase()).sort().join('|');
-          const nextWords = generated.vocabularyList.map((w) => w.word.toLowerCase()).sort().join('|');
-          if (prevWords === nextWords) {
-            return prev;
-          }
+      // If same day as prev, keep prev active state
+      if (prev && isSameWeek && prev.targetDay === homeworkTargetDay) {
+        const hasValidEvaluation = Boolean(
+          prev?.aiEvaluation &&
+          isValidHomeworkEvaluation(prev.aiEvaluation) &&
+          !isSyntheticHomeworkEvaluation(prev.aiEvaluation)
+        );
+
+        const hasStudentAnswers = Boolean(
+          prev?.studentAnswers &&
+          (Object.keys(prev.studentAnswers.matching || {}).length > 0 ||
+            Object.keys(prev.studentAnswers.fillInBlanks || {}).length > 0 ||
+            Object.keys(prev.studentAnswers.sentences || {}).length > 0 ||
+            Object.keys(prev.studentAnswers.quizAnswers || {}).length > 0)
+        );
+
+        if (hasValidEvaluation || hasStudentAnswers || prev.isCompleted || (typeof prev.score === 'number' && prev.score > 0)) {
+          return {
+            ...generated,
+            ...prev,
+            dailyActivities: combinedDaily,
+            matchingPairs: (Array.isArray(prev.matchingPairs) && prev.matchingPairs.length > 0) ? prev.matchingPairs : generated.matchingPairs,
+            fillInBlanks: (Array.isArray(prev.fillInBlanks) && prev.fillInBlanks.length > 0) ? prev.fillInBlanks : generated.fillInBlanks,
+            sentenceWritingPrompts: (Array.isArray(prev.sentenceWritingPrompts) && prev.sentenceWritingPrompts.length > 0) ? prev.sentenceWritingPrompts : generated.sentenceWritingPrompts,
+            readingPassage: (prev.readingPassage?.text) ? prev.readingPassage : generated.readingPassage,
+            isCompleted: Boolean(prev.isCompleted || generated.isCompleted),
+            isDayPartCompleted: Boolean(prev.isDayPartCompleted || generated.isDayPartCompleted),
+            completedPartsByDay: {
+              ...(generated.completedPartsByDay || {}),
+              ...(prev.completedPartsByDay || {}),
+            },
+            studentAnswers: {
+              matching: { ...(generated.studentAnswers?.matching || {}), ...(prev.studentAnswers?.matching || {}) },
+              fillInBlanks: { ...(generated.studentAnswers?.fillInBlanks || {}), ...(prev.studentAnswers?.fillInBlanks || {}) },
+              sentences: { ...(generated.studentAnswers?.sentences || {}), ...(prev.studentAnswers?.sentences || {}) },
+              quizAnswers: { ...(generated.studentAnswers?.quizAnswers || {}), ...(prev.studentAnswers?.quizAnswers || {}) },
+            },
+            partsProgress: prev.partsProgress || generated.partsProgress,
+            aiEvaluation: prev.aiEvaluation,
+            score: typeof prev.score === 'number' ? prev.score : generated.score,
+          };
         }
       }
+
+      // If switching to a different day or initializing homeworkTargetDay:
+      if (targetSnapshot && targetSnapshot.selectedWords && targetSnapshot.selectedWords.length > 0) {
+        return {
+          ...generated,
+          targetDay: homeworkTargetDay,
+          totalWordsCollected: targetSnapshot.selectedWords.length,
+          vocabularyList: targetSnapshot.selectedWords,
+          allRoutineWords: targetSnapshot.selectedWords,
+          matchingPairs: targetSnapshot.matchingPairs || generated.matchingPairs,
+          fillInBlanks: targetSnapshot.fillInBlanks || generated.fillInBlanks,
+          sentenceWritingPrompts: targetSnapshot.sentenceWritingPrompts || generated.sentenceWritingPrompts,
+          readingPassage: targetSnapshot.readingPassage || generated.readingPassage,
+          studentAnswers: targetSnapshot.studentAnswers || {
+            matching: {},
+            fillInBlanks: {},
+            sentences: {},
+            quizAnswers: {},
+          },
+          partsProgress: targetSnapshot.partsProgress || {},
+          aiEvaluation: targetSnapshot.aiEvaluation,
+          score: typeof targetSnapshot.score === 'number' ? targetSnapshot.score : 0,
+          isCompleted: Boolean(targetSnapshot.isCompleted || prev?.completedPartsByDay?.[homeworkTargetDay]),
+          isDayPartCompleted: Boolean(targetSnapshot.isCompleted || prev?.completedPartsByDay?.[homeworkTargetDay]),
+          completedPartsByDay: {
+            ...((isSameWeek && prev?.completedPartsByDay) || {}),
+            ...(generated.completedPartsByDay || {}),
+            ...(targetSnapshot.isCompleted ? { [homeworkTargetDay]: true } : {}),
+          },
+          dailyActivities: combinedDaily,
+        };
+      }
+
       return {
         ...generated,
-        isCompleted: (isSameWeek && prev?.isCompleted) || generated.isCompleted,
-        isDayPartCompleted: (isSameWeek && prev?.isDayPartCompleted) || generated.isDayPartCompleted,
+        targetDay: homeworkTargetDay,
+        isCompleted: (isSameWeek && prev?.completedPartsByDay?.[homeworkTargetDay]) || false,
+        isDayPartCompleted: (isSameWeek && prev?.completedPartsByDay?.[homeworkTargetDay]) || false,
         completedPartsByDay: {
           ...((isSameWeek && prev?.completedPartsByDay) || {}),
           ...(generated.completedPartsByDay || {}),
         },
-        partsProgress: (isSameWeek && prev?.partsProgress) || generated.partsProgress,
+        partsProgress: {},
         studentAnswers: {
-          matching: { ...((isSameWeek && prev?.studentAnswers?.matching) || {}), ...(generated.studentAnswers?.matching || {}) },
-          fillInBlanks: { ...((isSameWeek && prev?.studentAnswers?.fillInBlanks) || {}), ...(generated.studentAnswers?.fillInBlanks || {}) },
-          sentences: { ...((isSameWeek && prev?.studentAnswers?.sentences) || {}), ...(generated.studentAnswers?.sentences || {}) },
-          quizAnswers: { ...((isSameWeek && prev?.studentAnswers?.quizAnswers) || {}), ...(generated.studentAnswers?.quizAnswers || {}) },
+          matching: {},
+          fillInBlanks: {},
+          sentences: {},
+          quizAnswers: {},
         },
-        aiEvaluation: isSameWeek ? (prev?.aiEvaluation || generated.aiEvaluation) : generated.aiEvaluation,
-        score: (isSameWeek && typeof prev?.score === 'number') ? prev.score : generated.score,
+        aiEvaluation: undefined,
+        score: 0,
+        dailyActivities: combinedDaily,
       };
     });
   }, [routinesByDay, userProfile.name, userProfile.level, studentDictionaryEntries, excludedDictionaryWords, homeworkTargetDay, userProfile?.weeklyStudyDays, userProfile?.weeklyCycle]);
@@ -3270,23 +3329,29 @@ export default function App() {
             }
           });
 
-          // Routines subcollection update for daily routine tracking
+          // Routines subcollection update for daily routine tracking with separate video and audio flags
           const db = getDb();
           if (db && uid) {
+            const routineData: Record<string, any> = {
+              updatedAt: new Date().toISOString(),
+            };
+            if (params.type === 'video') {
+              routineData.completedVideoToday = true;
+              routineData.completedToday = true;
+              routineData.completed = true;
+            } else if (params.type === 'audio') {
+              routineData.completedAudioToday = true;
+            }
             setDoc(
               doc(db, 'users', uid, 'routines', targetDay),
-              {
-                completedToday: true,
-                completed: true,
-                updatedAt: new Date().toISOString(),
-              },
+              routineData,
               { merge: true }
             ).catch(() => {});
           }
         }
       }
 
-      // 2. Update routine item state to completedToday = true
+      // 2. Update routine item state to completedToday = true (strictly mutually exclusive between video and audio)
       setRoutinesByDay((prev) => {
         const dayList = prev[targetDay] || [];
         let matched = false;
@@ -3295,21 +3360,31 @@ export default function App() {
           const isTarget =
             params.activityId === item.id ||
             (params.type === 'video' &&
-              ((item.teacherVideos && item.teacherVideos.length > 0) ||
-                actName.includes('video') ||
-                actName.includes('vídeo') ||
-                item.id.endsWith('1'))) ||
+              (item.id.endsWith('1') ||
+                item.id === 'act-1' ||
+                (!item.id.endsWith('2') &&
+                  ((item.teacherVideos && item.teacherVideos.length > 0) ||
+                    actName.includes('video') ||
+                    actName.includes('vídeo'))))) ||
             (params.type === 'audio' &&
-              (Boolean(item.teacherSpotify) ||
-                actName.includes('audio') ||
-                actName.includes('áudio') ||
-                actName.includes('som') ||
-                actName.includes('ouvir') ||
-                item.id.endsWith('2')));
+              (item.id.endsWith('2') ||
+                item.id === 'act-2' ||
+                (!item.id.endsWith('1') &&
+                  (Boolean(item.teacherSpotify) ||
+                    actName.includes('audio') ||
+                    actName.includes('áudio') ||
+                    actName.includes('som') ||
+                    actName.includes('ouvir')))));
 
           if (isTarget && !matched) {
             matched = true;
-            return { ...item, completedToday: true, completed: true };
+            return {
+              ...item,
+              completedToday: true,
+              completed: true,
+              ...(params.type === 'video' ? { completedVideoToday: true } : {}),
+              ...(params.type === 'audio' ? { completedAudioToday: true } : {}),
+            };
           }
           return item;
         });
@@ -3713,29 +3788,39 @@ export default function App() {
       addVideoToWatchedHistoryInFirestore(studentUid, videoIdToArchive).catch(() => {});
     }
 
-    // Automatic S-Path (Gráfico S) marking based on activity type
+    // Automatic S-Path (Gráfico S) marking based on activity type (strictly mutually exclusive)
     const actName = (currentActivity?.activityName || '').toLowerCase();
-    const isVideoActivity = Boolean(
-      (currentActivity?.teacherVideos && currentActivity.teacherVideos.length > 0) ||
-      actName.includes('video') ||
-      actName.includes('vídeo') ||
-      actName.includes('assistir') ||
-      actName.includes('watch') ||
-      activityId.endsWith('1')
-    );
+    const isExplicitVideoId = activityId.endsWith('1') || activityId === 'act-1' || activityId.startsWith('video_');
+    const isExplicitAudioId = activityId.endsWith('2') || activityId === 'act-2' || activityId.startsWith('audio_');
 
-    const isAudioActivity = Boolean(
-      currentActivity?.teacherSpotify ||
-      actName.includes('áudio') ||
-      actName.includes('audio') ||
-      actName.includes('som') ||
-      actName.includes('ouvir') ||
-      actName.includes('listen') ||
-      actName.includes('podcast') ||
-      actName.includes('música') ||
-      actName.includes('music') ||
-      activityId.endsWith('2')
-    );
+    let isVideoActivity = false;
+    let isAudioActivity = false;
+
+    if (isExplicitVideoId) {
+      isVideoActivity = true;
+      isAudioActivity = false;
+    } else if (isExplicitAudioId) {
+      isVideoActivity = false;
+      isAudioActivity = true;
+    } else {
+      isVideoActivity = Boolean(
+        actName.includes('video') ||
+        actName.includes('vídeo') ||
+        actName.includes('assistir') ||
+        actName.includes('watch')
+      );
+      isAudioActivity = !isVideoActivity && Boolean(
+        currentActivity?.teacherSpotify ||
+        actName.includes('áudio') ||
+        actName.includes('audio') ||
+        actName.includes('som') ||
+        actName.includes('ouvir') ||
+        actName.includes('listen') ||
+        actName.includes('podcast') ||
+        actName.includes('música') ||
+        actName.includes('music')
+      );
+    }
 
     if (isVideoActivity) {
       handleUpdateSPathCheck('video_day', selectedDay, nowCompleted);
@@ -3744,16 +3829,22 @@ export default function App() {
       handleUpdateSPathCheck('audio_day', selectedDay, nowCompleted);
     }
 
-    // Direct atomic write to Firestore routines subcollection
+    // Direct atomic write to Firestore routines subcollection with dedicated flags
     const db = getDb();
     if (db && studentUid) {
+      const routineUpdates: Record<string, any> = {
+        updatedAt: new Date().toISOString(),
+      };
+      if (isVideoActivity) {
+        routineUpdates.completedVideoToday = nowCompleted;
+        routineUpdates.completedToday = nowCompleted;
+      }
+      if (isAudioActivity) {
+        routineUpdates.completedAudioToday = nowCompleted;
+      }
       setDoc(
         doc(db, 'users', studentUid, 'routines', selectedDay),
-        {
-          completedToday: nowCompleted,
-          completed: nowCompleted,
-          updatedAt: new Date().toISOString(),
-        },
+        routineUpdates,
         { merge: true }
       ).catch(() => {});
     }
@@ -6998,13 +7089,42 @@ export default function App() {
       weeklyChecks={weeklyChecks}
       onChangeDay={(day) => setHomeworkTargetDay(day)}
       onSaveProgress={(updated) => {
-        setWeeklyHomework(updated);
+        const activeDay = homeworkTargetDay;
+        const currentDaily = { ...(updated.dailyActivities || weeklyHomework?.dailyActivities || {}) };
+        const resolvedUid = (currentAccount?.uid || userProfile?.id || (userProfile as any)?.uid || '').trim();
+        if (activeDay) {
+          currentDaily[activeDay] = {
+            ...(currentDaily[activeDay] || {}),
+            id: currentDaily[activeDay]?.id || `hw-${activeDay}-${userProfile?.weeklyCycle || 1}`,
+            day: activeDay,
+            weeklyCycle: userProfile?.weeklyCycle || 1,
+            studentUid: resolvedUid,
+            selectedWords: updated.vocabularyList || currentDaily[activeDay]?.selectedWords || [],
+            wordOrigins: currentDaily[activeDay]?.wordOrigins || [],
+            matchingPairs: updated.matchingPairs || currentDaily[activeDay]?.matchingPairs || [],
+            fillInBlanks: updated.fillInBlanks || currentDaily[activeDay]?.fillInBlanks || [],
+            sentenceWritingPrompts: updated.sentenceWritingPrompts || currentDaily[activeDay]?.sentenceWritingPrompts || [],
+            readingPassage: updated.readingPassage || currentDaily[activeDay]?.readingPassage,
+            studentAnswers: updated.studentAnswers,
+            partsProgress: updated.partsProgress,
+            aiEvaluation: updated.aiEvaluation,
+            score: updated.score,
+            isCompleted: Boolean(updated.completedPartsByDay?.[activeDay] || updated.isCompleted),
+            isStarted: true,
+            updatedAt: new Date().toISOString(),
+          };
+        }
+        const fullyUpdated: WeeklyHomeworkData = {
+          ...updated,
+          dailyActivities: currentDaily,
+        };
+        setWeeklyHomework(fullyUpdated);
         const uid = currentAccount?.uid || userProfile?.id || (userProfile as any)?.uid || '';
         const email = currentAccount?.email || userProfile?.email || '';
         const currentActiveCycle = parseWeekCycleNumber(userProfile?.weeklyCycle);
         const currentActiveWeekId = normalizeWeekId(currentActiveCycle);
         if (uid || email) {
-          saveStudentHomeworkProgressToFirestore(uid, email, updated, currentActiveWeekId || undefined);
+          saveStudentHomeworkProgressToFirestore(uid, email, fullyUpdated, currentActiveWeekId || undefined);
         }
       }}
       onRegenerateWithAi={handleRegenerateHomeworkWithAi}
@@ -7017,13 +7137,42 @@ export default function App() {
         }
       }}
       onSubmitToTeacher={(updated) => {
-        setWeeklyHomework(updated);
+        const activeDay = homeworkTargetDay;
+        const currentDaily = { ...(updated.dailyActivities || weeklyHomework?.dailyActivities || {}) };
+        const resolvedUid = (currentAccount?.uid || userProfile?.id || (userProfile as any)?.uid || '').trim();
+        if (activeDay) {
+          currentDaily[activeDay] = {
+            ...(currentDaily[activeDay] || {}),
+            id: currentDaily[activeDay]?.id || `hw-${activeDay}-${userProfile?.weeklyCycle || 1}`,
+            day: activeDay,
+            weeklyCycle: userProfile?.weeklyCycle || 1,
+            studentUid: resolvedUid,
+            selectedWords: updated.vocabularyList || currentDaily[activeDay]?.selectedWords || [],
+            wordOrigins: currentDaily[activeDay]?.wordOrigins || [],
+            matchingPairs: updated.matchingPairs || currentDaily[activeDay]?.matchingPairs || [],
+            fillInBlanks: updated.fillInBlanks || currentDaily[activeDay]?.fillInBlanks || [],
+            sentenceWritingPrompts: updated.sentenceWritingPrompts || currentDaily[activeDay]?.sentenceWritingPrompts || [],
+            readingPassage: updated.readingPassage || currentDaily[activeDay]?.readingPassage,
+            studentAnswers: updated.studentAnswers,
+            partsProgress: updated.partsProgress,
+            aiEvaluation: updated.aiEvaluation,
+            score: updated.score,
+            isCompleted: Boolean(updated.completedPartsByDay?.[activeDay] || updated.isCompleted),
+            isStarted: true,
+            updatedAt: new Date().toISOString(),
+          };
+        }
+        const fullyUpdated: WeeklyHomeworkData = {
+          ...updated,
+          dailyActivities: currentDaily,
+        };
+        setWeeklyHomework(fullyUpdated);
         const uid = currentAccount?.uid || userProfile?.id || (userProfile as any)?.uid || '';
         const email = currentAccount?.email || userProfile?.email || '';
         const currentActiveCycle = parseWeekCycleNumber(userProfile?.weeklyCycle);
         const currentActiveWeekId = normalizeWeekId(currentActiveCycle);
         if (uid || email) {
-          saveStudentHomeworkProgressToFirestore(uid, email, updated, currentActiveWeekId || undefined);
+          saveStudentHomeworkProgressToFirestore(uid, email, fullyUpdated, currentActiveWeekId || undefined);
         }
         const wordsUsed = updated?.vocabularyList?.map((w) => w.word) || [];
         if (wordsUsed.length > 0) {

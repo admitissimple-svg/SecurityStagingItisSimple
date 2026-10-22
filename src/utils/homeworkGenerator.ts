@@ -9,6 +9,8 @@ import {
   SentenceWritingPrompt,
   ReadingQuestion,
   ReadingPassage,
+  DailyHomeworkActivity,
+  WordOriginSnapshot,
 } from '../types';
 import { getActivityDisplayName } from './i18n';
 import {
@@ -491,6 +493,181 @@ export function buildDailyMemorizationQueue(
   return queue;
 }
 
+/**
+ * HOTFIX 2.3.5 — Daily Vocabulary Queue (Etapa 2)
+ *
+ * Each day possesses its own queue of up to 5 words/expressions:
+ *
+ * Priority 1 — Native Friend:
+ * Words and expressions recorded by the Native Friend in notes associated with the student and this specific day.
+ * If there are 5 or more legitimate words, select the 5 most recent from that day.
+ *
+ * Priority 2 — Student's 5 Words Vocabulary:
+ * When there are fewer than 5 Native Friend words for that day, complete the remaining slots
+ * with the most recent words recorded by the student in 5 Words (from that day, or recent student routine words),
+ * strictly respecting chronological order (newest first).
+ *
+ * Examples:
+ * - Native Friend: 5 words -> use the 5.
+ * - Native Friend: 2 words -> complete with 3 from student.
+ * - Native Friend: 0 words -> use the 5 most recent from student.
+ *
+ * Deduplication: eliminates duplicates without inventing words.
+ * If fewer than 5 legitimate words exist, use only what exists and report actual count.
+ * Never mix data from other students.
+ */
+export function buildDailyVocabularyQueueForDay(
+  targetDay: DayOfWeek,
+  candidates: HomeworkVocabItem[],
+  studentUid?: string,
+  studentEmail?: string
+): HomeworkVocabItem[] {
+  const normUid = (studentUid || '').trim();
+  const normEmail = (studentEmail || '').toLowerCase().trim();
+
+  // 1. Isolate strictly to the target student if candidate has student identifier
+  const isolatedCandidates = candidates.filter((item: any) => {
+    if (!item || !item.word || !item.word.trim()) return false;
+    const itemUid = (item.studentUid || (item as any).uid || '').trim();
+    const itemEmail = (item.studentEmail || (item as any).email || '').toLowerCase().trim();
+    if (normUid && itemUid && itemUid !== normUid) return false;
+    if (normEmail && itemEmail && itemEmail !== normEmail) return false;
+    return true;
+  });
+
+  const parseTimestamp = (iso?: string | number): number => {
+    if (!iso) return 0;
+    if (typeof iso === 'number') return iso;
+    const t = new Date(iso).getTime();
+    return isNaN(t) ? 0 : t;
+  };
+
+  const matchesDay = (item: HomeworkVocabItem, day: DayOfWeek): boolean => {
+    const dLower = day.toLowerCase();
+    if (item.sourceDay && item.sourceDay.toLowerCase() === dLower) return true;
+    if ((item as any).originDay && (item as any).originDay.toLowerCase() === dLower) return true;
+    if (Array.isArray((item as any).origins)) {
+      if ((item as any).origins.some((o: any) => o.dayOfWeek && o.dayOfWeek.toLowerCase() === dLower)) {
+        return true;
+      }
+    }
+    const act = (item.sourceActivityName || '').toLowerCase();
+    if (act.includes(`(${dLower})`)) return true;
+    return false;
+  };
+
+  const isNf = (item: HomeworkVocabItem): boolean => isNativeFriendVocabulary(item);
+
+  // Split into buckets
+  const nfDayWords: HomeworkVocabItem[] = [];
+  const nfOtherWords: HomeworkVocabItem[] = [];
+  const studentDayWords: HomeworkVocabItem[] = [];
+  const studentOtherWords: HomeworkVocabItem[] = [];
+
+  // Sort candidates newest first
+  const sorted = [...isolatedCandidates].sort((a, b) => {
+    const tA = parseTimestamp(a.learnedAt || (a as any).timestamp || (a as any).date);
+    const tB = parseTimestamp(b.learnedAt || (b as any).timestamp || (b as any).date);
+    if (tA !== tB) return tB - tA; // newest first
+    return a.word.localeCompare(b.word);
+  });
+
+  for (const item of sorted) {
+    const norm = normalizeDictionaryWord(item.word);
+    if (!norm) continue;
+    const dayMatch = matchesDay(item, targetDay);
+
+    if (isNf(item)) {
+      if (dayMatch) {
+        nfDayWords.push({ ...item, origin: 'native_friend' as const });
+      } else {
+        nfOtherWords.push({ ...item, origin: 'native_friend' as const });
+      }
+    } else {
+      if (dayMatch) {
+        studentDayWords.push({ ...item, origin: 'student_5words' as const });
+      } else {
+        studentOtherWords.push({ ...item, origin: 'student_5words' as const });
+      }
+    }
+  }
+
+  const queue: HomeworkVocabItem[] = [];
+  const seenNorm = new Set<string>();
+
+  // Priority 1 — Native Friend words for targetDay (most recent first, up to 5)
+  for (const item of nfDayWords) {
+    if (queue.length >= 5) break;
+    const norm = normalizeDictionaryWord(item.word);
+    if (!seenNorm.has(norm)) {
+      seenNorm.add(norm);
+      queue.push({
+        ...item,
+        word: item.word.trim(),
+        origin: 'native_friend',
+        sourceActivityName: item.sourceActivityName || `Native Friend Notes (${targetDay})`,
+        sourceDay: targetDay,
+      });
+    }
+  }
+
+  // Priority 2 — Student's 5 Words for targetDay (most recent first)
+  if (queue.length < 5) {
+    for (const item of studentDayWords) {
+      if (queue.length >= 5) break;
+      const norm = normalizeDictionaryWord(item.word);
+      if (!seenNorm.has(norm)) {
+        seenNorm.add(norm);
+        queue.push({
+          ...item,
+          word: item.word.trim(),
+          origin: 'student_5words',
+          sourceActivityName: item.sourceActivityName || `5 Words (${targetDay})`,
+          sourceDay: targetDay,
+        });
+      }
+    }
+  }
+
+  // Priority 2 fallback — Student's other recent 5 Words (most recent first)
+  if (queue.length < 5) {
+    for (const item of studentOtherWords) {
+      if (queue.length >= 5) break;
+      const norm = normalizeDictionaryWord(item.word);
+      if (!seenNorm.has(norm)) {
+        seenNorm.add(norm);
+        queue.push({
+          ...item,
+          word: item.word.trim(),
+          origin: 'student_5words',
+          sourceActivityName: item.sourceActivityName || '5 Words',
+          sourceDay: item.sourceDay || targetDay,
+        });
+      }
+    }
+  }
+
+  // Priority 1 fallback — Any other Native Friend words if still under 5
+  if (queue.length < 5) {
+    for (const item of nfOtherWords) {
+      if (queue.length >= 5) break;
+      const norm = normalizeDictionaryWord(item.word);
+      if (!seenNorm.has(norm)) {
+        seenNorm.add(norm);
+        queue.push({
+          ...item,
+          word: item.word.trim(),
+          origin: 'native_friend',
+          sourceActivityName: item.sourceActivityName || 'Native Friend Notes',
+          sourceDay: item.sourceDay || targetDay,
+        });
+      }
+    }
+  }
+
+  return queue;
+}
+
 export function generateWeeklyHomework(
   routinesByDay: Record<DayOfWeek, RoutineItem[]>,
   userProfile?: UserProfile,
@@ -499,7 +676,8 @@ export function generateWeeklyHomework(
   customWords?: Array<Partial<HomeworkVocabItem> & { word: string }>,
   studentLevel?: string,
   targetDay?: DayOfWeek,
-  excludedWords?: string[] | Set<string>
+  excludedWords?: string[] | Set<string>,
+  existingDailyActivities?: Record<string, DailyHomeworkActivity>
 ): WeeklyHomeworkData {
   const email = studentEmail || userProfile?.email || '';
   const name = studentName || userProfile?.name || (email ? email.split('@')[0] : 'Student');
@@ -601,9 +779,6 @@ export function generateWeeklyHomework(
     }
   }
 
-  // Phase 1B: Deterministic selection of <= 5 words according to priority rule
-  const rawWords: HomeworkVocabItem[] = buildDailyMemorizationQueue(candidateItems);
-
   const dayNamePt = targetDay ? DAY_LABELS_PT[targetDay] : '';
   const dayNameEn = targetDay ? DAY_LABELS_EN[targetDay] : '';
   const partInfoPt = schedule ? ` (${schedule.partTitlePt})` : '';
@@ -614,6 +789,45 @@ export function generateWeeklyHomework(
     : `Semana de ${new Date().toLocaleDateString('pt-BR', { day: 'numeric', month: 'short' })}`;
 
   const canonicalHwId = `hw-${targetDay || 'week'}-${userProfile?.weeklyCycle || 1}`;
+
+  // HOTFIX 2.3.5: If an activity for targetDay already exists,
+  // restore it verbatim to guarantee strict independence between days (ETAPA 3 & 5)
+  if (targetDay && existingDailyActivities && existingDailyActivities[targetDay]) {
+    const existing = existingDailyActivities[targetDay];
+    if (existing.selectedWords && existing.selectedWords.length > 0) {
+      return {
+        id: existing.id || canonicalHwId,
+        targetDay,
+        assignedPart: existing.assignedPart || schedule?.partNumber,
+        assignedPartKey: existing.assignedPartKey || schedule?.partKey,
+        weekLabel,
+        studentEmail: email,
+        studentName: name,
+        studentLevel: levelLabel,
+        createdAt: existing.createdAt || new Date().toISOString(),
+        updatedAt: existing.updatedAt || new Date().toISOString(),
+        totalWordsCollected: existing.selectedWords.length,
+        vocabularyList: existing.selectedWords,
+        allRoutineWords: existing.selectedWords,
+        matchingPairs: existing.matchingPairs || [],
+        fillInBlanks: existing.fillInBlanks || [],
+        sentenceWritingPrompts: existing.sentenceWritingPrompts || [],
+        readingPassage: existing.readingPassage || { title: '', text: '', questions: [] },
+        studentAnswers: existing.studentAnswers,
+        partsProgress: existing.partsProgress,
+        aiEvaluation: existing.aiEvaluation,
+        score: existing.score,
+        isCompleted: Boolean(existing.isCompleted),
+        dailyActivities: existingDailyActivities,
+        isEmpty: false,
+      };
+    }
+  }
+
+  // Phase 1B / HOTFIX 2.3.5: Deterministic selection of <= 5 words according to daily priority rule
+  const rawWords: HomeworkVocabItem[] = targetDay
+    ? buildDailyVocabularyQueueForDay(targetDay, candidateItems, userProfile?.uid, email)
+    : buildDailyMemorizationQueue(candidateItems);
 
   // REGRA DE OURO ANTI-GENÉRICO: Se não houver palavras cadastradas, retorna aviso estruturado
   if (rawWords.length === 0) {
@@ -638,6 +852,7 @@ export function generateWeeklyHomework(
         text: '',
         questions: [],
       },
+      dailyActivities: existingDailyActivities,
       isEmpty: true,
       emptyWarning: targetDay
         ? `Nenhum vocabulário registrado para ${dayNamePt} ainda. Para realizar a ${schedule?.partTitlePt || 'Atividade de Memorização de hoje'}, registre palavras nas atividades de hoje (Vídeo do Dia ou Áudio do Spotify) ou participe da conversa ao vivo.`
@@ -719,6 +934,46 @@ export function generateWeeklyHomework(
   const passageText = synthesizedStory.text;
   const readingQuestions = synthesizedStory.questions;
 
+  const wordOrigins: WordOriginSnapshot[] = rawWords.map((item) => ({
+    word: item.word,
+    origin: (item.origin || (isNativeFriendVocabulary(item) ? 'native_friend' : 'student_5words')) as any,
+    sourceActivityName: item.sourceActivityName,
+    sourceDay: item.sourceDay || targetDay,
+    learnedAt: item.learnedAt,
+  }));
+
+  const updatedDailyActivities: Record<string, DailyHomeworkActivity> = {
+    ...(existingDailyActivities || {}),
+  };
+
+  if (targetDay) {
+    updatedDailyActivities[targetDay] = {
+      id: canonicalHwId,
+      day: targetDay,
+      weeklyCycle: userProfile?.weeklyCycle || 1,
+      studentUid: (userProfile?.uid || userProfile?.id || email || '').trim(),
+      selectedWords: rawWords,
+      wordOrigins,
+      matchingPairs,
+      fillInBlanks,
+      sentenceWritingPrompts,
+      readingPassage: {
+        title: passageTitle,
+        text: passageText,
+        questions: readingQuestions,
+      },
+      assignedPart: schedule?.partNumber,
+      assignedPartKey: schedule?.partKey,
+      studentAnswers: {},
+      partsProgress: {},
+      isCompleted: false,
+      score: 0,
+      isStarted: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
   return {
     id: canonicalHwId,
     targetDay,
@@ -740,6 +995,7 @@ export function generateWeeklyHomework(
       text: passageText,
       questions: readingQuestions,
     },
+    dailyActivities: updatedDailyActivities,
     isEmpty: false,
     isCompleted: false,
     score: 0,
@@ -757,6 +1013,8 @@ export function generateWeeklyHomeworkFromRoutines(params: {
   weeklyCycle?: number;
   userProfile?: UserProfile;
   excludedWords?: string[] | Set<string>;
+  existingDailyActivities?: Record<string, DailyHomeworkActivity>;
+  existingHomework?: WeeklyHomeworkData;
 }): WeeklyHomeworkData {
   const profile = params.userProfile || ({
     weeklyStudyDays: params.activeStudyDays,
@@ -766,6 +1024,11 @@ export function generateWeeklyHomeworkFromRoutines(params: {
     email: params.studentEmail,
   } as any);
 
+  const existingDaily =
+    params.existingDailyActivities ||
+    params.existingHomework?.dailyActivities ||
+    (params.userProfile as any)?.weeklyHomework?.dailyActivities;
+
   return generateWeeklyHomework(
     params.routinesByDay,
     profile,
@@ -774,7 +1037,8 @@ export function generateWeeklyHomeworkFromRoutines(params: {
     params.customWords,
     params.studentLevel,
     params.targetDay,
-    params.excludedWords
+    params.excludedWords,
+    existingDaily
   );
 }
 

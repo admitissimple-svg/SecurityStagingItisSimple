@@ -211,11 +211,16 @@ export function useBehavioralAudioTracker({
     }
   }, [trackId, trackTitle, artist, onCompleted]);
 
+  const [isPlaying, setIsPlaying] = useState(false);
+
   const handleAudioInteraction = useCallback(() => {
-    triggerCompletion();
-  }, [triggerCompletion]);
+    // Starting or interacting with audio registers player activity,
+    // but selecting or starting a media does NOT mark it completed.
+    setIsPlaying(true);
+  }, []);
 
   return {
+    isPlaying,
     hasCompleted,
     handleAudioInteraction,
     triggerCompletion,

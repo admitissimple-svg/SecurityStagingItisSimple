@@ -401,23 +401,32 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
   const [isEvaluatingAll, setIsEvaluatingAll] = useState(false);
   const [evalError, setEvalError] = useState<string | null>(null);
 
+  const activeDayActivity = homework?.dailyActivities?.[targetDay];
+
   React.useEffect(() => {
-    if (homework?.studentAnswers) {
-      setMatchingAnswers((prev) => ({ ...(homework.studentAnswers?.matching || {}), ...prev }));
-      setFillAnswers((prev) => ({ ...(homework.studentAnswers?.fillInBlanks || {}), ...prev }));
-      setSentenceAnswers((prev) => ({ ...(homework.studentAnswers?.sentences || {}), ...prev }));
-      setQuizAnswers((prev) => ({ ...(homework.studentAnswers?.quizAnswers || {}), ...prev }));
-    }
-    if (homework?.partsProgress) {
-      setPartsProgress((prev) => ({ ...(homework.partsProgress || {}), ...prev }));
-    }
-    if (
-      homework?.aiEvaluation &&
-      isValidHomeworkEvaluation(homework.aiEvaluation) &&
-      !isSyntheticHomeworkEvaluation(homework.aiEvaluation)
-    ) {
-      setAiEvaluation(homework.aiEvaluation);
-      const feedbackList = homework.aiEvaluation.sentenceFeedback;
+    const dayAnswers =
+      activeDayActivity?.studentAnswers ||
+      (homework?.targetDay === targetDay ? homework?.studentAnswers : undefined) ||
+      {};
+
+    setMatchingAnswers(dayAnswers.matching || {});
+    setFillAnswers(dayAnswers.fillInBlanks || {});
+    setSentenceAnswers(dayAnswers.sentences || {});
+    setQuizAnswers(dayAnswers.quizAnswers || {});
+
+    const dayParts =
+      activeDayActivity?.partsProgress ||
+      (homework?.targetDay === targetDay ? homework?.partsProgress : undefined) ||
+      {};
+    setPartsProgress(dayParts);
+
+    const dayEval =
+      activeDayActivity?.aiEvaluation ||
+      (homework?.targetDay === targetDay ? homework?.aiEvaluation : undefined);
+
+    if (dayEval && isValidHomeworkEvaluation(dayEval) && !isSyntheticHomeworkEvaluation(dayEval)) {
+      setAiEvaluation(dayEval);
+      const feedbackList = dayEval.sentenceFeedback;
       // Restore sentence answers from sentenceFeedback if not already present
       if (Array.isArray(feedbackList) && feedbackList.length > 0) {
         setSentenceAnswers((prev) => {
@@ -430,8 +439,10 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
           return next;
         });
       }
+    } else {
+      setAiEvaluation(undefined);
     }
-  }, [homework?.id, homework?.studentAnswers, homework?.aiEvaluation, homework?.partsProgress]);
+  }, [targetDay, homework?.id, activeDayActivity?.updatedAt]);
 
   // Synchronize student answers with parent state and Cloud Firestore
   const lastSavedJsonRef = React.useRef<string>('');
@@ -452,8 +463,36 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     const effectiveScore = (effectiveEvaluation ? effectiveEvaluation.overallScore : homework?.score) ?? 0;
     const effectiveIsCompleted = Boolean((effectiveEvaluation && effectiveScore > 0) || homework?.isCompleted);
 
+    const currentDaily = { ...(homework.dailyActivities || {}) };
+    currentDaily[targetDay] = {
+      ...(currentDaily[targetDay] || {}),
+      id: currentDaily[targetDay]?.id || `hw-${targetDay}-${weeklyCycle || 1}`,
+      day: targetDay,
+      weeklyCycle: weeklyCycle || 1,
+      studentUid: homework.studentUid || '',
+      selectedWords: activeDayActivity?.selectedWords || homework.vocabularyList || [],
+      wordOrigins: activeDayActivity?.wordOrigins || [],
+      matchingPairs: activeDayActivity?.matchingPairs || homework.matchingPairs || [],
+      fillInBlanks: activeDayActivity?.fillInBlanks || homework.fillInBlanks || [],
+      sentenceWritingPrompts: activeDayActivity?.sentenceWritingPrompts || homework.sentenceWritingPrompts || [],
+      readingPassage: activeDayActivity?.readingPassage || homework.readingPassage,
+      studentAnswers: {
+        matching: matchingAnswers,
+        fillInBlanks: fillAnswers,
+        sentences: sentenceAnswers,
+        quizAnswers: quizAnswers,
+      },
+      partsProgress,
+      aiEvaluation: effectiveEvaluation,
+      score: effectiveScore,
+      isCompleted: Boolean(effectiveIsCompleted || homework?.completedPartsByDay?.[targetDay]),
+      isStarted: true,
+      updatedAt: new Date().toISOString(),
+    };
+
     const updatedHw: WeeklyHomeworkData = {
       ...homework,
+      targetDay,
       studentAnswers: {
         matching: matchingAnswers,
         fillInBlanks: fillAnswers,
@@ -464,9 +503,10 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       aiEvaluation: effectiveEvaluation,
       score: effectiveScore,
       isCompleted: effectiveIsCompleted,
+      dailyActivities: currentDaily,
     };
 
-    const currentJson = JSON.stringify(updatedHw.studentAnswers);
+    const currentJson = JSON.stringify({ targetDay, answers: updatedHw.studentAnswers });
     if (currentJson === lastSavedJsonRef.current) return;
 
     const timer = setTimeout(() => {
@@ -475,7 +515,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     }, 500);
 
     return () => clearTimeout(timer);
-  }, [matchingAnswers, fillAnswers, sentenceAnswers, quizAnswers, partsProgress, isOpen, homework, onSaveProgress, aiEvaluation]);
+  }, [matchingAnswers, fillAnswers, sentenceAnswers, quizAnswers, partsProgress, isOpen, homework, onSaveProgress, aiEvaluation, targetDay, weeklyCycle]);
 
   // Track initial tab selection when modal opens
   const wasOpenRef = React.useRef(false);

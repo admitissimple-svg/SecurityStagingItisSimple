@@ -659,6 +659,7 @@ export interface HomeworkVocabItem {
   sourceActivityName?: string;
   sourceDay?: DayOfWeek;
   source?: string;
+  origin?: 'native_friend' | 'student_5words' | 'routine' | 'personal_dictionary';
   learnedAt?: string;
   practiceCount?: number;
   lastPracticedAt?: string;
@@ -801,6 +802,48 @@ export interface WeeklyHomeworkData {
   isGenerating?: boolean;
   status?: string;
   answers?: Record<string, any>;
+  dailyActivities?: Record<string, DailyHomeworkActivity>;
+}
+
+export interface WordOriginSnapshot {
+  word: string;
+  origin: 'native_friend' | 'student_5words' | 'routine' | 'personal_dictionary';
+  sourceActivityName?: string;
+  sourceDay?: DayOfWeek;
+  learnedAt?: string;
+}
+
+export interface DailyHomeworkActivity {
+  id: string;
+  day: DayOfWeek;
+  weeklyCycle: number;
+  studentUid: string;
+  selectedWords: HomeworkVocabItem[];
+  wordOrigins: WordOriginSnapshot[];
+  matchingPairs: MatchingPair[];
+  fillInBlanks: FillInBlankItem[];
+  sentenceWritingPrompts: SentenceWritingPrompt[];
+  readingPassage: ReadingPassage;
+  assignedPart?: 1 | 2 | 3 | 4;
+  assignedPartKey?: 'matching' | 'fill' | 'writing' | 'reading';
+  studentAnswers?: {
+    matching?: Record<string, string>;
+    fillInBlanks?: Record<string, string>;
+    sentences?: Record<string, string>;
+    quizAnswers?: Record<string, number>;
+  };
+  partsProgress?: {
+    matching?: HomeworkPartProgress;
+    fill?: HomeworkPartProgress;
+    writing?: HomeworkPartProgress;
+    reading?: HomeworkPartProgress;
+  };
+  aiEvaluation?: HomeworkAiEvaluation;
+  isCompleted?: boolean;
+  score?: number;
+  isStarted?: boolean;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface WordFeedback {

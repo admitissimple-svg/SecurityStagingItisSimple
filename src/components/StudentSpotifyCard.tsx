@@ -130,7 +130,7 @@ export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
           </p>
         </div>
       ) : spotifyPlayerMode === 'app' ? (
-        <div className="space-y-1.5" onClick={() => triggerAudioCompletion()}>
+        <div className="space-y-1.5">
           <div className="rounded-xl overflow-hidden border border-[#1DB954]/40 shadow-xs h-[80px] sm:h-[152px] bg-black">
             <iframe
               src={sanitizedEmbedUrl}

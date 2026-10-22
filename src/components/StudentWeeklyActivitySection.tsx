@@ -514,17 +514,26 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
           return true;
         }
 
-        // Check if completed in routinesByDay
+        // Check if completed in routinesByDay strictly for video
         const dayList = routinesByDay?.[dayKey] || [];
         const hasCompletedRoutineVideo = dayList.some((act) => {
           if (!act) return false;
+          if ((act as any).completedVideoToday) return true;
           const actName = (act.activityName || '').toLowerCase();
-          const isVideo =
+          const isDedicatedVideo =
             (act.teacherVideos && act.teacherVideos.length > 0) ||
             act.id?.endsWith('1') ||
             actName.includes('video') ||
             actName.includes('vídeo');
-          return isVideo && Boolean(act.completedToday || act.completed);
+          const isDedicatedAudio =
+            act.id?.endsWith('2') ||
+            actName.includes('audio') ||
+            actName.includes('áudio') ||
+            actName.includes('podcast');
+          if (isDedicatedVideo && !isDedicatedAudio) {
+            return Boolean(act.completedToday || act.completed);
+          }
+          return false;
         });
         if (hasCompletedRoutineVideo) return true;
 
@@ -560,23 +569,28 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
 
         if (weeklyChecks && Boolean(weeklyChecks[checkKey])) return true;
 
-        // Check if completed in routinesByDay
+        // Check if completed in routinesByDay strictly for audio
         const dayList = routinesByDay?.[dayKey] || [];
         const hasCompletedRoutineAudio = dayList.some((act) => {
           if (!act) return false;
+          if ((act as any).completedAudioToday) return true;
           const actName = (act.activityName || '').toLowerCase();
-          const isAudio =
-            Boolean(act.teacherSpotify) ||
+          const isDedicatedAudio =
             act.id?.endsWith('2') ||
             actName.includes('audio') ||
             actName.includes('áudio') ||
             actName.includes('som') ||
             actName.includes('ouvir') ||
             actName.includes('listen') ||
-            actName.includes('podcast') ||
-            actName.includes('música') ||
-            actName.includes('music');
-          return isAudio && Boolean(act.completedToday || act.completed);
+            actName.includes('podcast');
+          const isDedicatedVideo =
+            act.id?.endsWith('1') ||
+            actName.includes('video') ||
+            actName.includes('vídeo');
+          if (isDedicatedAudio && !isDedicatedVideo) {
+            return Boolean(act.completedToday || act.completed);
+          }
+          return false;
         });
         if (hasCompletedRoutineAudio) return true;
 
