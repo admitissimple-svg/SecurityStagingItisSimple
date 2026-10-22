@@ -987,6 +987,7 @@ export default function App() {
             sentences: { ...(generated.studentAnswers?.sentences || {}), ...(prev.studentAnswers?.sentences || {}) },
             quizAnswers: { ...(generated.studentAnswers?.quizAnswers || {}), ...(prev.studentAnswers?.quizAnswers || {}) },
           },
+          partsProgress: prev.partsProgress || generated.partsProgress,
           aiEvaluation: prev.aiEvaluation,
           score: typeof prev.score === 'number' ? prev.score : generated.score,
         };
@@ -1030,6 +1031,7 @@ export default function App() {
           ...((isSameWeek && prev?.completedPartsByDay) || {}),
           ...(generated.completedPartsByDay || {}),
         },
+        partsProgress: (isSameWeek && prev?.partsProgress) || generated.partsProgress,
         studentAnswers: {
           matching: { ...((isSameWeek && prev?.studentAnswers?.matching) || {}), ...(generated.studentAnswers?.matching || {}) },
           fillInBlanks: { ...((isSameWeek && prev?.studentAnswers?.fillInBlanks) || {}), ...(generated.studentAnswers?.fillInBlanks || {}) },
@@ -1575,6 +1577,7 @@ export default function App() {
                       sentences: { ...(prev.studentAnswers?.sentences || {}), ...(cloudHw.studentAnswers?.sentences || {}) },
                       quizAnswers: { ...(prev.studentAnswers?.quizAnswers || {}), ...(cloudHw.studentAnswers?.quizAnswers || {}) },
                     },
+                    partsProgress: cloudHw.partsProgress || prev.partsProgress,
                     aiEvaluation: cloudHw.aiEvaluation || prev.aiEvaluation,
                     score: (typeof cloudHw.score === 'number' && cloudHw.score > 0)
                       ? cloudHw.score
@@ -1655,6 +1658,7 @@ export default function App() {
                           sentences: { ...(prev.studentAnswers?.sentences || {}), ...(savedHw.studentAnswers?.sentences || {}) },
                           quizAnswers: { ...(prev.studentAnswers?.quizAnswers || {}), ...(savedHw.studentAnswers?.quizAnswers || {}) },
                         },
+                        partsProgress: savedHw.partsProgress || prev.partsProgress,
                         aiEvaluation: savedHw.aiEvaluation || prev.aiEvaluation,
                         score: (typeof savedHw.score === 'number' && savedHw.score > 0)
                           ? savedHw.score

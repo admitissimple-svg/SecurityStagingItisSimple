@@ -20,6 +20,7 @@ export function analyzeSentenceGrammarDeterministic(
 ): {
   fixedSentence: string;
   hasGrammarError: boolean;
+  isCorrect: boolean;
   usedWords: string[];
   missingWords: string[];
   usedTargetWord: boolean;
@@ -626,15 +627,59 @@ export function analyzeSentenceGrammarDeterministic(
       sFixed = sFixed.replace(/\b(the|a|an)\s+(anyone|anybody|someone|somebody|everyone|everybody|no\s*one|nobody)\b/gi, '$2');
       hasGrammarError = true;
       pushWordFeedback('the anyone', 'anyone', 'Pronomes indefinidos como "anyone" não admitem artigo ("the").', 'Indefinite pronouns like "anyone" cannot take the article "the".');
-      errorsPt.push('Erro gramatical de artigo: pronomes indefinidos como "anyone" não admitem "the" (ex: "Does anyone know about...?").');
-      errorsEn.push('Article error with indefinite pronoun: pronouns like "anyone" cannot take "the" (e.g. "Does anyone know about...?").');
+      errorsPt.push('Erro gramatical de artigo: pronomes indefinidos como "anyone" não admitem "the" (ex: "Does anyone know about this?").');
+      errorsEn.push('Article error with indefinite pronoun: pronouns like "anyone" cannot take "the" (e.g. "Does anyone know about this?").');
     }
 
-    if (/\banyone\s+know\s+about\b/i.test(sFixed) && !/\b(does|did|if|whether|can|could|will)\s+anyone\s+know\s+about\b/i.test(sFixed)) {
+    // 11c. Incomplete question structure and dangling prepositions (e.g. "Anyone know about")
+    if (/\banyone\s+know\s+about\s*[.?!]*$/i.test(sFixed)) {
+      sFixed = 'Does anyone know about this?';
+      hasGrammarError = true;
+      pushWordFeedback('anyone know about', 'Does anyone know about this?', 'Estrutura incompleta: inicie com o auxiliar "Does" e complete a preposição "about" com um objeto.', 'Incomplete structure: start with auxiliary "Does" and complete preposition "about" with an object.');
+      errorsPt.push('Estrutura de pergunta incompleta: inicie com "Does" e forneça um complemento para "about" (ex: "Does anyone know about this?").');
+      errorsEn.push('Incomplete question structure: start with "Does" and provide an object for "about" (e.g., "Does anyone know about this?").');
+    } else if (/\banyone\s+know\s+about\b/i.test(sFixed) && !/\b(does|did|if|whether|can|could|will)\s+anyone\s+know\s+about\b/i.test(sFixed)) {
       sFixed = sFixed.replace(/\banyone\s+know\s+about\b/gi, 'Does anyone know about');
       hasGrammarError = true;
-      errorsPt.push('Estrutura de pergunta incompleta: use o auxiliar "Does" (ex: "Does anyone know about...?").');
-      errorsEn.push('Incomplete question structure: use the auxiliary "Does" (e.g. "Does anyone know about...?").');
+      errorsPt.push('Estrutura de pergunta incompleta: use o auxiliar "Does" (ex: "Does anyone know about this?").');
+      errorsEn.push('Incomplete question structure: use the auxiliary "Does" (e.g. "Does anyone know about this?").');
+    } else if (/\b(anyone|anybody)\s+know\b/i.test(sFixed) && !/\b(does|did|if|whether|can|could|will)\s+(anyone|anybody)\s+know\b/i.test(sFixed)) {
+      hasGrammarError = true;
+      pushWordFeedback('anyone know', 'Does anyone know', 'Para perguntas no presente com "anyone", use o auxiliar "Does" ("Does anyone know...?").', 'For present questions with "anyone", use the auxiliary "Does" ("Does anyone know...?").');
+      errorsPt.push('Estrutura de pergunta incompleta: use o auxiliar "Does" com "anyone" (ex: "Does anyone know...?").');
+      errorsEn.push('Incomplete question structure: use auxiliary "Does" with "anyone" (e.g. "Does anyone know...?").');
+    }
+
+    // 11d. Dangling trailing preposition without complement (e.g., "... about", "... between", "... during")
+    if (/\b(about|between|among|during|into|onto)\s*[.?!]*$/i.test(sFixed)) {
+      hasGrammarError = true;
+      const danglingPrepMatch = sFixed.match(/\b(about|between|among|during|into|onto)\b/i);
+      const danglingPrep = danglingPrepMatch ? danglingPrepMatch[0] : 'about';
+      pushWordFeedback(danglingPrep, `${danglingPrep} this`, `Preposição incompleta: a frase termina na preposição "${danglingPrep}" sem um complemento.`, `Dangling preposition: sentence ends with "${danglingPrep}" without an object.`);
+      errorsPt.push(`Frase incompleta: a preposição "${danglingPrep}" exige um complemento ou objeto.`);
+      errorsEn.push(`Incomplete sentence: the preposition "${danglingPrep}" requires an object.`);
+      if (!sFixed.includes('Does anyone know about this?')) {
+        sFixed = sFixed.replace(/[.?!]*$/, '') + ' this.';
+      }
+    }
+
+    // 11e. Transitive verbs ending sentence without an object (e.g., "Nobody told", "She brought", "I made")
+    if (/\b(nobody|no\s*one|somebody|someone|anybody|anyone|everybody|everyone|I|you|he|she|they|we)\s+(told|tell|tells|bring|brings|brought|give|gives|gave|sent|send|sends|buy|buys|bought|make|makes|made|take|takes|took|inform|informed|informs)\s*[.?!]*$/i.test(sFixed)) {
+      hasGrammarError = true;
+      const transVerbMatch = sFixed.match(/\b(told|tell|tells|bring|brings|brought|give|gives|gave|sent|send|sends|buy|buys|bought|make|makes|made|take|takes|took|inform|informed|informs)\b/i);
+      const transVerb = transVerbMatch ? transVerbMatch[0] : 'told';
+      pushWordFeedback(transVerb, `${transVerb} me about it`, `Frase incompleta: o verbo "${transVerb}" é transitivo e exige um objeto (ex: "Nobody told me about it").`, `Incomplete sentence: the verb "${transVerb}" is transitive and requires an object (e.g. "Nobody told me about it").`);
+      errorsPt.push(`Frase incompleta: o verbo "${transVerb}" exige um objeto ou complemento (ex: "Nobody told me about it", "Nobody told us").`);
+      errorsEn.push(`Incomplete sentence: the verb "${transVerb}" requires an object (e.g., "Nobody told me about it").`);
+      sFixed = sFixed.replace(/[.?!]*$/, '') + ' me about it.';
+    }
+
+    // 11f. Short incomplete fragment check (< 3 words lacking full predicate)
+    const rawTokens = sClean.split(/\s+/).filter(Boolean);
+    if (rawTokens.length < 3 && !hasGrammarError) {
+      hasGrammarError = true;
+      errorsPt.push('Frase muito curta ou incompleta: elabore uma sentença completa contendo Sujeito, Verbo e Complemento.');
+      errorsEn.push('Incomplete sentence: please write a complete sentence with a Subject, Verb, and Object.');
     }
 
     if (/\bin the end of the day\b/i.test(sFixed)) {
@@ -781,6 +826,7 @@ export function analyzeSentenceGrammarDeterministic(
   return {
     fixedSentence: sFixed,
     hasGrammarError,
+    isCorrect: !hasGrammarError,
     usedWords,
     missingWords,
     usedTargetWord,
@@ -1236,7 +1282,9 @@ export function isValidHomeworkEvaluation(evaluation: any, requireOverallScore =
 export function validateHomeworkAiEvaluationResponse(
   json: any,
   expectedPrompts: any[] = [],
-  studentSentences: Record<string, string> = {}
+  studentSentences: Record<string, string> = {},
+  expectedQuestions: any[] = [],
+  studentQuizAnswers: Record<string, any> = {}
 ): boolean {
   if (!json || typeof json !== 'object') return false;
   // Raw Gemini response might not have overallScore yet (calculated by server)
@@ -1286,7 +1334,7 @@ export function validateHomeworkAiEvaluationResponse(
         return false;
       }
 
-      // HOTFIX 2.3: An evaluation is INVALID if it approved a sentence with severe deterministic grammar errors
+      // HOTFIX 2.3.4B: An evaluation is INVALID if it approved a sentence with severe deterministic grammar errors or incomplete fragment
       const detAnalysis = analyzeSentenceGrammarDeterministic(studentAns, [targetWord], targetWord);
       if (detAnalysis.hasGrammarError && item.isCorrect === true) {
         return false;
@@ -1301,6 +1349,22 @@ export function validateHomeworkAiEvaluationResponse(
           lowerAns.includes(lowerOrig.slice(0, 8));
         if (wordsInAns.length > 0 && !hasOverlap) {
           return false;
+        }
+      }
+    }
+  }
+
+  // Validate Part 4 reading comprehension feedback if questions are provided
+  if (Array.isArray(expectedQuestions) && expectedQuestions.length > 0 && Array.isArray(json.readingFeedback)) {
+    for (const q of expectedQuestions) {
+      const qId = q.id;
+      const rfItem = json.readingFeedback.find((rf: any) => rf.id === qId || rf.id === `q-${expectedQuestions.indexOf(q) + 1}`);
+      if (rfItem) {
+        if (typeof rfItem.isCorrect !== 'boolean') return false;
+        const studentAns = studentQuizAnswers[qId] !== undefined ? studentQuizAnswers[qId] : studentQuizAnswers[String(expectedQuestions.indexOf(q))];
+        const hasAnswer = studentAns !== undefined && studentAns !== null && String(studentAns).trim() !== '';
+        if (!hasAnswer && rfItem.isCorrect === true) {
+          return false; // Cannot approve unprovided answer
         }
       }
     }

@@ -711,6 +711,7 @@ export interface HomeworkItemFeedback {
   correctAnswer: string;
   explanationPt: string;
   explanationEn: string;
+  isModified?: boolean;
 }
 
 export interface SentenceEvaluationItem {
@@ -722,6 +723,7 @@ export interface SentenceEvaluationItem {
   explanationEn: string;
   levelAdvicePt: string;
   levelAdviceEn: string;
+  isModified?: boolean;
 }
 
 export interface HomeworkAiEvaluation {

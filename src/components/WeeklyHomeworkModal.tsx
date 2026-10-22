@@ -900,57 +900,150 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     }
 
     setIsSavingPart((prev) => ({ ...prev, reading: true }));
-    try {
-      const total = homework.readingPassage.questions.length;
-      const correct = homework.readingPassage.questions.filter((q, idx) => {
-        const chosen = quizAnswers[q.id] !== undefined ? quizAnswers[q.id] : quizAnswers[String(idx)];
-        return chosen === q.correctAnswer;
-      }).length;
-      const score = total > 0 ? Math.round((correct / total) * 100) : 100;
+    setEvalError(null);
 
-      const updatedPart: HomeworkPartProgress = {
+    // 1. Immediately persist typed student answers to Firestore so they are never lost
+    const inProgressPart: HomeworkPartProgress = {
+      partKey: 'reading',
+      partNumber: 4,
+      status: 'pending_evaluation',
+      answers: quizAnswers,
+      updatedAt: new Date().toISOString(),
+    };
+    const inProgressParts = {
+      ...partsProgress,
+      reading: inProgressPart,
+    };
+    setPartsProgress(inProgressParts);
+
+    const inProgressUpdate: WeeklyHomeworkData = {
+      ...homework,
+      studentAnswers: {
+        ...(homework.studentAnswers || {}),
+        matching: matchingAnswers,
+        fillInBlanks: fillAnswers,
+        sentences: sentenceAnswers,
+        quizAnswers: quizAnswers,
+      },
+      partsProgress: inProgressParts,
+    };
+    onSaveProgress(inProgressUpdate);
+
+    // 2. Check if an authentic, genuine evaluation already exists matching current answers
+    const activeEval = aiEvaluation || homework?.aiEvaluation;
+    const existingReadingMatches = Boolean(
+      activeEval &&
+      isValidHomeworkEvaluation(activeEval) &&
+      !isSyntheticHomeworkEvaluation(activeEval) &&
+      Array.isArray(activeEval.readingFeedback) &&
+      activeEval.readingFeedback.length === homework.readingPassage.questions.length &&
+      (homework.readingPassage.questions || []).every((q: any, idx: number) => {
+        const chosen = quizAnswers[q.id] !== undefined ? quizAnswers[q.id] : quizAnswers[String(idx)];
+        return chosen !== undefined && chosen !== null;
+      })
+    );
+
+    if (existingReadingMatches && activeEval) {
+      setAiEvaluation(activeEval);
+      const totalQ = Math.max(1, homework.readingPassage.questions.length);
+      const readingScore = activeEval.readingFeedback
+        ? Math.round((activeEval.readingFeedback.filter((r: any) => r.isCorrect).length / totalQ) * 100)
+        : 100;
+
+      const completedPart: HomeworkPartProgress = {
         partKey: 'reading',
         partNumber: 4,
         status: 'completed',
         answers: quizAnswers,
-        score,
+        evaluation: activeEval,
+        score: readingScore,
+        completedAt: activeEval.evaluatedAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      const finalParts = { ...partsProgress, reading: completedPart };
+      setPartsProgress(finalParts);
+
+      const dayForPart = getDayForPart('reading');
+      markSPathCompleted(dayForPart, 'reading', finalParts);
+
+      setSubmittedFeedbackToast(
+        isEn
+          ? '🎉 Part 4 evaluation verified and recorded on S-Path!'
+          : '🎉 Avaliação da Parte 4 verificada e gravada no S-Path!'
+      );
+      setTimeout(() => setSubmittedFeedbackToast(null), 3500);
+      setIsSavingPart((prev) => ({ ...prev, reading: false }));
+      return;
+    }
+
+    // 3. Request genuine AI evaluation from server endpoint (Gemini 3-model contingency)
+    try {
+      const currentAnswers = {
+        matching: matchingAnswers,
+        fillInBlanks: fillAnswers,
+        sentences: sentenceAnswers,
+        quizAnswers: quizAnswers,
+      };
+
+      const evalResult = await evaluateWeeklyHomeworkApi({
+        homework,
+        studentAnswers: currentAnswers,
+        studentLevel: homework.studentLevel || 'Beginner',
+        studentName: homework.studentName || 'Student',
+        currentLanguage,
+      });
+
+      if (!evalResult || !isValidHomeworkEvaluation(evalResult) || isSyntheticHomeworkEvaluation(evalResult)) {
+        throw new Error(
+          isEn
+            ? 'The pedagogical evaluation could not be completed at this moment. No synthetic scores have been created.'
+            : 'A correção pedagógica não pôde ser concluída neste momento. Nenhuma pontuação sintética foi gerada.'
+        );
+      }
+
+      setAiEvaluation(evalResult);
+
+      const totalQ = Math.max(1, homework.readingPassage.questions.length);
+      const readingScore = Array.isArray(evalResult.readingFeedback) && totalQ > 0
+        ? Math.round((evalResult.readingFeedback.filter((r: any) => r.isCorrect).length / totalQ) * 100)
+        : 100;
+
+      const completedPart: HomeworkPartProgress = {
+        partKey: 'reading',
+        partNumber: 4,
+        status: 'completed',
+        answers: quizAnswers,
+        evaluation: evalResult,
+        score: readingScore,
         completedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
-
-      const nextPartsProgress = {
-        ...partsProgress,
-        reading: updatedPart,
-      };
-      setPartsProgress(nextPartsProgress);
+      const finalParts = { ...partsProgress, reading: completedPart };
+      setPartsProgress(finalParts);
 
       const dayForPart = getDayForPart('reading');
-      markSPathCompleted(dayForPart, 'reading', nextPartsProgress);
+      markSPathCompleted(dayForPart, 'reading', finalParts);
 
       // Check if all 4 parts are now completed
       const allPartsCompleted = Boolean(
-        nextPartsProgress.matching?.status === 'completed' &&
-        nextPartsProgress.fill?.status === 'completed' &&
-        nextPartsProgress.writing?.status === 'completed' &&
-        nextPartsProgress.reading?.status === 'completed'
+        finalParts.matching?.status === 'completed' &&
+        finalParts.fill?.status === 'completed' &&
+        finalParts.writing?.status === 'completed' &&
+        finalParts.reading?.status === 'completed'
       );
 
       if (allPartsCompleted) {
-        const s1 = nextPartsProgress.matching?.score ?? 100;
-        const s2 = nextPartsProgress.fill?.score ?? 100;
-        const s3 = nextPartsProgress.writing?.score ?? (aiEvaluation?.overallScore ?? 100);
-        const s4 = score;
+        const s1 = finalParts.matching?.score ?? 100;
+        const s2 = finalParts.fill?.score ?? 100;
+        const s3 = finalParts.writing?.score ?? (evalResult.overallScore ?? 100);
+        const s4 = readingScore;
         const overallScore = Math.round((s1 * 0.2) + (s2 * 0.25) + (s3 * 0.35) + (s4 * 0.2));
 
         const fullHw: WeeklyHomeworkData = {
           ...homework,
-          partsProgress: nextPartsProgress,
-          studentAnswers: {
-            matching: matchingAnswers,
-            fillInBlanks: fillAnswers,
-            sentences: sentenceAnswers,
-            quizAnswers: quizAnswers,
-          },
+          partsProgress: finalParts,
+          studentAnswers: currentAnswers,
+          aiEvaluation: evalResult,
           isCompleted: true,
           score: overallScore,
           submittedAt: homework.submittedAt || new Date().toISOString(),
@@ -960,10 +1053,18 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
       setSubmittedFeedbackToast(
         isEn
-          ? '🎉 Part 4 saved and recorded on S-Path!'
-          : '🎉 Parte 4 salva e gravada no S-Path com sucesso!'
+          ? '🎉 Part 4 evaluated by AI and recorded on S-Path!'
+          : '🎉 Parte 4 corrigida pela IA e gravada no S-Path com sucesso!'
       );
       setTimeout(() => setSubmittedFeedbackToast(null), 3500);
+    } catch (err: any) {
+      console.warn('AI evaluation error in Part 4, preserving answers in Firestore with status pending_evaluation:', err);
+      const friendlyMsg =
+        err?.message ||
+        (isEn
+          ? 'The pedagogical grading AI is temporarily unavailable after checking contingency models. Your answers have been safely preserved in Firestore. Please click "Retry Evaluation" to try again.'
+          : 'A IA de correção pedagógica está temporariamente indisponível após verificação dos modelos de contingência. Suas respostas foram salvas no Firestore. Por favor, clique em "Tentar Novamente".');
+      setEvalError(friendlyMsg);
     } finally {
       setIsSavingPart((prev) => ({ ...prev, reading: false }));
     }
@@ -1163,7 +1264,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
         </div>
 
         {/* S-Path Rhythm 7-Day Timeline Bar */}
-        <div className="px-4 sm:px-6 py-2.5 bg-[#000035]/95 border-b border-[#1C4C96]/60 flex flex-wrap items-center justify-between gap-3 text-white print:hidden">
+        <div className="px-4 sm:px-6 py-2.5 bg-[#000035]/95 border-b border-[#1C4C96]/60 flex flex-wrap items-center justify-between gap-3 text-white print:hidden shrink-0">
           <div className="flex items-center gap-2">
             <span className="text-[11px] font-bold text-[#BFDBFE]">
               {isEn ? 'S-Path Rhythm (1 Part / Day):' : 'Ritmo S-Path (1 Parte / Dia):'}
@@ -1303,8 +1404,8 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
           </div>
         ) : (
           <>
-            {/* Navigation Tabs */}
-            <div className="px-4 sm:px-6 py-2 bg-slate-50 border-b border-slate-200 overflow-x-auto [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden print:hidden">
+            {/* Navigation Tabs (Permanently Sticky & Fully Visible) */}
+            <div className="px-4 sm:px-6 py-2.5 bg-slate-50/95 backdrop-blur-xs border-b border-slate-200 overflow-x-auto [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden print:hidden shrink-0 sticky top-0 z-20 shadow-xs">
               <div className="flex items-center gap-2 min-w-max">
                 <button
                   type="button"
@@ -1381,8 +1482,8 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
               </div>
             )}
 
-            {/* Tab Contents */}
-            <div className="p-4 sm:p-6 overflow-y-auto flex-1 space-y-5">
+            {/* Tab Contents (Scrollable Viewport with zero occlusion) */}
+            <div className="p-4 sm:p-6 overflow-y-auto flex-1 min-h-0 space-y-5">
               {internalGenerating ? (
                 <MemorizationAiLoadingSkeleton
                   isEn={isEn}
@@ -1909,6 +2010,28 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                                 ...prev,
                                 [prompt.word]: newVal,
                               }));
+                              // Invalidate ONLY the evaluation for this altered sentence
+                              setSentenceFeedbacks((prev) => {
+                                if (!prev[prompt.word] && !prev[prompt.word.toLowerCase()]) return prev;
+                                const next = { ...prev };
+                                delete next[prompt.word];
+                                delete next[prompt.word.toLowerCase()];
+                                delete next[prompt.word.toUpperCase()];
+                                return next;
+                              });
+                              if (aiEvaluation?.sentenceFeedback) {
+                                setAiEvaluation((prev) => {
+                                  if (!prev || !prev.sentenceFeedback) return prev;
+                                  return {
+                                    ...prev,
+                                    sentenceFeedback: prev.sentenceFeedback.map((sf: any) =>
+                                      (sf.word || '').toLowerCase() === prompt.word.toLowerCase()
+                                        ? { ...sf, isModified: true, isCorrect: false }
+                                        : sf
+                                    ),
+                                  };
+                                });
+                              }
                               if (partsProgress.writing?.status === 'completed') {
                                 setPartsProgress((prev) => ({
                                   ...prev,
@@ -2169,7 +2292,12 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                           );
                           const actName = wordToActivityMap[prompt.word.toLowerCase()];
 
-                          const isSentenceOk = evalItem?.isCorrect ?? (userSentence.length >= 8 && (!feedback || !feedback.hasAnyError));
+                          const isEvaluated = Boolean((evalItem && !evalItem.isModified) || feedback);
+                          const isSentenceOk = evalItem && !evalItem.isModified
+                            ? Boolean(evalItem.isCorrect)
+                            : feedback
+                            ? Boolean(feedback.isCorrect && !feedback.hasAnyError)
+                            : false;
                           const corrected = evalItem?.correctedSentence || feedback?.correctedSentence;
                           const explanation = isEn
                             ? (evalItem?.explanationEn || feedback?.overallSummaryEn)
@@ -2181,6 +2309,8 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                               className={`p-3 rounded-xl border text-xs space-y-1.5 transition ${
                                 !userSentence
                                   ? 'bg-slate-50/70 border-slate-200'
+                                  : !isEvaluated
+                                  ? 'bg-blue-50/50 border-blue-200'
                                   : isSentenceOk
                                   ? 'bg-emerald-50/60 border-emerald-200'
                                   : 'bg-amber-50/60 border-amber-200'
@@ -2197,9 +2327,19 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                                     </span>
                                   )}
                                 </div>
-                                <span className={`text-[11px] font-bold ${!userSentence ? 'text-slate-500' : isSentenceOk ? 'text-emerald-700' : 'text-amber-700'}`}>
+                                <span className={`text-[11px] font-bold ${
+                                  !userSentence
+                                    ? 'text-slate-500'
+                                    : !isEvaluated
+                                    ? 'text-blue-700'
+                                    : isSentenceOk
+                                    ? 'text-emerald-700'
+                                    : 'text-amber-700'
+                                }`}>
                                   {!userSentence
                                     ? `⏳ ${isEn ? 'Pending / Not answered' : 'Pendente / Não respondido'}`
+                                    : !isEvaluated
+                                    ? `⏳ ${isEn ? 'Pending AI Evaluation' : 'Aguardando Avaliação da IA'}`
                                     : isSentenceOk
                                     ? (isEn ? '✓ Well Structured' : '✓ Bem Estruturada')
                                     : (isEn ? '⚠ Needs Review' : '⚠ Revisão Recomendada')}
@@ -2300,12 +2440,36 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                               return (
                                 <div
                                   key={optIdx}
-                                  onClick={() =>
+                                  onClick={() => {
                                     setQuizAnswers((prev) => ({
                                       ...prev,
                                       [q.id]: optIdx,
-                                    }))
-                                  }
+                                    }));
+                                    if (aiEvaluation?.readingFeedback) {
+                                      setAiEvaluation((prev) => {
+                                        if (!prev || !prev.readingFeedback) return prev;
+                                        return {
+                                          ...prev,
+                                          readingFeedback: prev.readingFeedback.map((rf: any) =>
+                                            (rf.id === q.id || rf.id === `q-${qIdx + 1}`)
+                                              ? { ...rf, isModified: true }
+                                              : rf
+                                          ),
+                                        };
+                                      });
+                                    }
+                                    if (partsProgress.reading?.status === 'completed') {
+                                      setPartsProgress((prev) => ({
+                                        ...prev,
+                                        reading: {
+                                          ...prev.reading!,
+                                          status: 'draft',
+                                          answers: { ...quizAnswers, [q.id]: optIdx },
+                                          updatedAt: new Date().toISOString(),
+                                        },
+                                      }));
+                                    }
+                                  }}
                                   className={`py-2 px-3 rounded-lg border text-xs font-medium transition cursor-pointer flex items-center gap-2 ${
                                     isSelected
                                       ? 'bg-[#000035] border-[#000035] text-white shadow-2xs font-semibold'
@@ -2329,7 +2493,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                   {evalError && (
                     <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-3 text-amber-900 text-xs">
                       <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                      <div className="flex-1">
+                      <div className="flex-1 space-y-1.5">
                         <p className="font-bold text-amber-950">
                           {isEn ? 'Pedagogical Evaluation Unavailable' : 'Correção Pedagógica Temporariamente Indisponível'}
                         </p>
@@ -2339,6 +2503,17 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                             ? 'Your answers have been safely preserved in Firestore. You can try again below.'
                             : 'Suas respostas digitadas foram salvas com segurança no banco de dados. Você pode tentar novamente no botão abaixo.'}
                         </p>
+                        <div className="pt-1">
+                          <button
+                            type="button"
+                            onClick={handleSavePart4}
+                            disabled={isSavingPart.reading}
+                            className="px-3.5 py-1.5 bg-[#000035] hover:bg-[#062863] text-white rounded-lg text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer shadow-xs transition disabled:opacity-50"
+                          >
+                            <RefreshCw className={`w-3.5 h-3.5 text-[#9AB4FF] ${isSavingPart.reading ? 'animate-spin' : ''}`} />
+                            <span>{isEn ? 'Retry AI Evaluation' : 'Tentar Novamente Avaliação da IA'}</span>
+                          </button>
+                        </div>
                       </div>
                     </div>
                   )}
@@ -2418,13 +2593,25 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                         {homework.readingPassage.questions.map((q, idx) => {
                           const chosenIdx = quizAnswers[q.id] !== undefined ? quizAnswers[q.id] : quizAnswers[String(idx)];
                           const isAnswered = chosenIdx !== undefined && chosenIdx !== null && typeof chosenIdx === 'number';
-                          const isQuizCorrect = isAnswered && chosenIdx === q.correctAnswer;
+                          const rfItem = aiEvaluation?.readingFeedback?.find((rf: any) => rf.id === q.id || rf.id === `q-${idx + 1}`);
+                          const isEvaluated = Boolean(rfItem && !rfItem.isModified);
+                          const isQuizCorrect = isEvaluated
+                            ? Boolean(rfItem?.isCorrect)
+                            : (isAnswered && chosenIdx === q.correctAnswer);
+                          const chosenText = isAnswered && q.options?.[chosenIdx] ? q.options[chosenIdx] : (isAnswered ? String(chosenIdx) : '');
+                          const correctText = q.options?.[q.correctAnswer] || '';
+                          const explanation = isEn
+                            ? (rfItem?.explanationEn || q.explanation)
+                            : (rfItem?.explanationPt || q.explanation);
+
                           return (
                             <div
                               key={q.id}
                               className={`p-3 rounded-xl border text-xs space-y-1.5 transition ${
                                 !isAnswered
                                   ? 'bg-slate-50/70 border-slate-200'
+                                  : !isEvaluated
+                                  ? 'bg-blue-50/50 border-blue-200'
                                   : isQuizCorrect
                                   ? 'bg-emerald-50/60 border-emerald-200'
                                   : 'bg-amber-50/60 border-amber-200'
@@ -2438,17 +2625,21 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                                   <span className="text-[11px] font-semibold text-slate-500">
                                     ⏳ {isEn ? 'Pending / Not answered' : 'Pendente / Não respondido'}
                                   </span>
+                                ) : !isEvaluated ? (
+                                  <span className="text-[11px] font-semibold text-blue-700 bg-blue-50 px-2 py-0.5 rounded border border-blue-200">
+                                    ⏳ {isEn ? 'Pending AI Evaluation' : 'Aguardando Avaliação da IA'}
+                                  </span>
                                 ) : (
                                   <span className={isQuizCorrect ? 'text-emerald-700 font-bold' : 'text-amber-700 font-bold'}>
                                     {isQuizCorrect
-                                      ? `✓ ${isEn ? 'Correct Answer' : 'Resposta Correta'}: ${q.options[chosenIdx]}`
-                                      : `✗ ${isEn ? 'Your choice' : 'Sua escolha'}: ${q.options[chosenIdx]} → ${isEn ? 'Correct' : 'Correta'}: ${q.options[q.correctAnswer]}`}
+                                      ? `✓ ${isEn ? 'Correct Answer' : 'Resposta Correta'}: ${chosenText}`
+                                      : `✗ ${isEn ? 'Your choice' : 'Sua escolha'}: ${chosenText} → ${isEn ? 'Correct' : 'Correta'}: ${correctText}`}
                                   </span>
                                 )}
                               </div>
-                              {q.explanation && (
+                              {explanation && (
                                 <p className="text-[11px] text-slate-600 italic">
-                                  {q.explanation}
+                                  {explanation}
                                 </p>
                               )}
                             </div>

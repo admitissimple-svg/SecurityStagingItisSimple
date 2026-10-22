@@ -15716,12 +15716,47 @@ app.post('/api/check-writing', firebaseAuthMiddleware, async (req, res) => {
     programmaticErrorsEn.push("Article error: do not use 'the', 'a', or 'an' before indefinite pronouns like 'anyone' or 'someone'.");
   }
 
-  // 7c. Rigorous Check: Incomplete question structure with "anyone know about"
-  if (/\banyone\s+know\s+about\b/i.test(programmaticFixed) && !/\b(does|did|if|whether|can|could|will)\s+anyone\s+know\s+about\b/i.test(programmaticFixed)) {
+  // 7c. Rigorous Check: Incomplete question structure with "anyone know about" / dangling prepositions
+  if (/\banyone\s+know\s+about\s*[.?!]*$/i.test(programmaticFixed)) {
+    programmaticFixed = 'Does anyone know about this?';
+    hasProgrammaticError = true;
+    programmaticErrorsPt.push("Estrutura incompleta: inicie com 'Does' e forneça um complemento para a preposição 'about' (ex: 'Does anyone know about this?').");
+    programmaticErrorsEn.push("Incomplete question structure: start with 'Does' and provide an object for 'about' (e.g., 'Does anyone know about this?').");
+  } else if (/\banyone\s+know\s+about\b/i.test(programmaticFixed) && !/\b(does|did|if|whether|can|could|will)\s+anyone\s+know\s+about\b/i.test(programmaticFixed)) {
     programmaticFixed = programmaticFixed.replace(/\banyone\s+know\s+about\b/gi, 'Does anyone know about');
     hasProgrammaticError = true;
-    programmaticErrorsPt.push("Estrutura de pergunta incompleta: inicie com 'Does' para fazer perguntas no presente (ex: 'Does anyone know about...?').");
-    programmaticErrorsEn.push("Incomplete question structure: start with 'Does' for present tense questions (e.g., 'Does anyone know about...?').");
+    programmaticErrorsPt.push("Estrutura de pergunta incompleta: inicie com 'Does' para fazer perguntas no presente (ex: 'Does anyone know about this?').");
+    programmaticErrorsEn.push("Incomplete question structure: start with 'Does' for present tense questions (e.g., 'Does anyone know about this?').");
+  }
+
+  // 7d. Dangling preposition check
+  if (/\b(about|between|among|during|into|onto)\s*[.?!]*$/i.test(programmaticFixed)) {
+    hasProgrammaticError = true;
+    const danglingMatch = programmaticFixed.match(/\b(about|between|among|during|into|onto)\b/i);
+    const dangling = danglingMatch ? danglingMatch[0] : 'about';
+    programmaticErrorsPt.push(`Frase incompleta: a preposição "${dangling}" exige um complemento ou objeto.`);
+    programmaticErrorsEn.push(`Incomplete sentence: the preposition "${dangling}" requires an object.`);
+    if (!programmaticFixed.includes('Does anyone know about this?')) {
+      programmaticFixed = programmaticFixed.replace(/[.?!]*$/, '') + ' this.';
+    }
+  }
+
+  // 7e. Transitive verbs ending sentence without an object (e.g., "Nobody told")
+  if (/\b(nobody|no\s*one|somebody|someone|anybody|anyone|everybody|everyone|I|you|he|she|they|we)\s+(told|tell|tells|bring|brings|brought|give|gives|gave|sent|send|sends|buy|buys|bought|make|makes|made|take|takes|took|inform|informed|informs)\s*[.?!]*$/i.test(programmaticFixed)) {
+    hasProgrammaticError = true;
+    const transMatch = programmaticFixed.match(/\b(told|tell|tells|bring|brings|brought|give|gives|gave|sent|send|sends|buy|buys|bought|make|makes|made|take|takes|took|inform|informed|informs)\b/i);
+    const verb = transMatch ? transMatch[0] : 'told';
+    programmaticErrorsPt.push(`Frase incompleta: o verbo transitivo "${verb}" exige um objeto ou complemento (ex: "Nobody told me about it", "Nobody told us").`);
+    programmaticErrorsEn.push(`Incomplete sentence: the transitive verb "${verb}" requires an object (e.g., "Nobody told me about it").`);
+    programmaticFixed = programmaticFixed.replace(/[.?!]*$/, '') + ' me about it.';
+  }
+
+  // 7f. Short incomplete fragment check (< 3 words)
+  const rawWordsInSentence = rawClean.split(/\s+/).filter(Boolean);
+  if (rawWordsInSentence.length < 3 && !hasProgrammaticError) {
+    hasProgrammaticError = true;
+    programmaticErrorsPt.push('Frase muito curta ou incompleta: elabore uma sentença completa contendo Sujeito, Verbo e Complemento.');
+    programmaticErrorsEn.push('Incomplete sentence: please write a complete sentence with a Subject, Verb, and Object.');
   }
 
   // 8. Rigorous Check: Common spelling mistakes
@@ -15988,8 +16023,8 @@ app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
     const { matching = {}, fillInBlanks = {}, sentences = {}, quizAnswers = {} } = studentAnswers;
 
     // Check in-memory cache to preserve previously evaluated content and prevent duplicate costs
-    const sentencesContent = JSON.stringify(sentences || {});
-    const contentHash = crypto.createHash('sha256').update(sentencesContent).digest('hex').slice(0, 16);
+    const evaluatedContent = JSON.stringify({ sentences: sentences || {}, quizAnswers: quizAnswers || {} });
+    const contentHash = crypto.createHash('sha256').update(evaluatedContent).digest('hex').slice(0, 16);
     const evalCacheKey = `${callerUid}_${homework.id || 'hw'}_${contentHash}`;
     const cachedEval = homeworkEvalCache.get(evalCacheKey);
     if (cachedEval && Date.now() < cachedEval.expiry) {
@@ -15998,7 +16033,7 @@ app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
       }
     }
 
-    // Check if student already has a valid persisted evaluation in Firestore for this exact week and sentences
+    // Check if student already has a valid persisted evaluation in Firestore for this exact week, sentences, and quiz answers
     const rawWeek = homework.weekId || homework.id || 'week-1';
     const cycle = extractPositiveIntegerCycle(rawWeek) || 1;
     const canonicalWeekId = `week-${cycle}`;
@@ -16011,19 +16046,25 @@ app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
       !isSyntheticHomeworkEvaluation(existingHw.aiEvaluation)
     ) {
       const existingSentences = existingHw.studentAnswers?.sentences || {};
+      const existingQuiz = existingHw.studentAnswers?.quizAnswers || {};
       const sentencesMatch = (homework.sentenceWritingPrompts || []).every((p: any) => {
         const curAns = (sentences[p.word] || sentences[p.word?.toLowerCase()] || sentences[p.word?.toUpperCase()] || '').trim();
         const prevAns = (existingSentences[p.word] || existingSentences[p.word?.toLowerCase()] || existingSentences[p.word?.toUpperCase()] || '').trim();
         return curAns === prevAns;
       });
-      if (sentencesMatch) {
+      const quizMatch = (homework.readingPassage?.questions || []).every((q: any, idx: number) => {
+        const curChoice = quizAnswers[q.id] !== undefined ? quizAnswers[q.id] : quizAnswers[String(idx)];
+        const prevChoice = existingQuiz[q.id] !== undefined ? existingQuiz[q.id] : existingQuiz[String(idx)];
+        return String(curChoice ?? '') === String(prevChoice ?? '');
+      });
+      if (sentencesMatch && quizMatch) {
         homeworkEvalCache.set(evalCacheKey, { data: existingHw.aiEvaluation, expiry: Date.now() + 600000 });
         return res.json({ success: true, evaluation: existingHw.aiEvaluation, cached: true });
       }
     }
 
     // Security Hotfix (Etapa 2 & Residuals): Payload bounds validation
-    const bounds = validatePayloadBounds('homework_evaluate', { text: sentencesContent });
+    const bounds = validatePayloadBounds('homework_evaluate', { text: evaluatedContent });
     if (!bounds.valid) {
       return res.status(400).json({ error: 'Payload bounds exceeded', message: bounds.error });
     }
@@ -16130,19 +16171,19 @@ app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
       };
     });
 
-    // Score calculation
+    // Baseline score calculation
     const totalMatching = Math.max(1, homework.matchingPairs?.length || 1);
     const totalFill = Math.max(1, homework.fillInBlanks?.length || 1);
     const totalQuiz = Math.max(1, homework.readingPassage?.questions?.length || 1);
     const totalSentences = Math.max(1, homework.sentenceWritingPrompts?.length || 1);
 
-    const matchScore = (matchingCorrect / totalMatching) * 25;
-    const fillScore = (fillCorrect / totalFill) * 30;
-    const quizScore = (quizCorrect / totalQuiz) * 20;
+    const matchScore = (matchingCorrect / totalMatching) * 20;
+    const fillScore = (fillCorrect / totalFill) * 25;
 
-    // AI evaluation of sentences with Gemini (single attempt with explicit homework_evaluate policy)
+    // AI evaluation of sentences and reading comprehension with Gemini 3-model contingency
     const apiKey = process.env.GEMINI_API_KEY;
     let sentenceEvaluationResults: any[] = [];
+    let readingEvaluationResults: any[] = [];
     let tutorSummaryPt = '';
     let tutorSummaryEn = '';
     let levelStrengthsPt = '';
@@ -16152,6 +16193,21 @@ app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
 
     try {
       if (apiKey) {
+        const passageQuestions = (homework.readingPassage?.questions || []).map((q: any, idx: number) => {
+          const userAnsIdx = quizAnswers[q.id] !== undefined ? quizAnswers[q.id] : quizAnswers[String(idx)];
+          const answered = userAnsIdx !== undefined && userAnsIdx !== null && userAnsIdx !== '';
+          const userAnsText = answered && q.options?.[userAnsIdx] ? q.options[userAnsIdx] : (answered ? String(userAnsIdx) : '(no answer provided)');
+          return {
+            id: q.id || `q-${idx + 1}`,
+            question: q.question,
+            options: q.options || [],
+            correctOptionIndex: q.correctAnswer,
+            correctOptionText: q.options?.[q.correctAnswer] || '',
+            studentChosenIndex: answered ? userAnsIdx : null,
+            studentChosenText: userAnsText,
+          };
+        });
+
         const prompt = `You are a warm, inspiring Native English teacher at "It's Simple".
 Evaluate this student's completed Weekly Memorization Activity.
 
@@ -16160,7 +16216,7 @@ Name: ${studentName}
 Level: ${levelMeta.labelEn} (${levelMeta.labelPt} - CEFR ${levelMeta.cefr})
 Level Goals: ${levelMeta.grammarFocusEn}
 
-STUDENT WRITTEN SENTENCES IN PART 3:
+PART 3: STUDENT WRITTEN SENTENCES:
 ${JSON.stringify(
   (homework.sentenceWritingPrompts || []).map((p: any) => ({
     targetWord: p.word,
@@ -16171,22 +16227,35 @@ ${JSON.stringify(
   2
 )}
 
-STATS OF OTHER SECTIONS:
+PART 4: MINI-STORY READING PASSAGE & COMPREHENSION QUESTIONS:
+Title: "${homework.readingPassage?.title || 'Story'}"
+Story Text:
+${homework.readingPassage?.text || '(no passage text)'}
+
+Student Comprehension Answers:
+${JSON.stringify(passageQuestions, null, 2)}
+
+OTHER SECTIONS STATS:
 - Matching (Part 1): ${matchingCorrect}/${totalMatching} correct
 - Fill in Blanks (Part 2): ${fillCorrect}/${totalFill} correct
-- Reading Comprehension (Part 4): ${quizCorrect}/${totalQuiz} correct
 
-EVALUATION INSTRUCTIONS:
-1. For each written sentence:
-   - Check grammar, spelling, natural phrasing, and appropriate use of target word.
-   - Align praise and constructive corrections to the student's level (${levelMeta.labelEn}).
-   - If Beginner: celebrate simple sentences, gently fix mechanics.
-   - If Intermediate: suggest natural connectors and verb forms.
-   - If Advanced: refine style, collocation elegance, and tone.
-2. Provide a personalized, encouraging summary note from the tutor:
+CRITICAL EVALUATION INSTRUCTIONS:
+1. FOR PART 3 SENTENCES (MANDATORY PEDAGOGICAL RIGOR):
+   - Each sentence must be complete, grammatically sound, and use the target word properly.
+   - ZERO SYNTHETIC APPROVALS: Incomplete fragments, missing subjects, transitive verbs ending without direct or indirect objects (e.g. 'nobody told'), dangling trailing prepositions (e.g. 'anyone know about'), or short fragments (< 3 words) MUST NEVER be marked isCorrect: true.
+   - If incomplete or incorrect, set isCorrect: false and provide a genuine, natural correctedSentence along with clear pedagogical explanation in explanationPt and explanationEn.
+   - For complete, correct sentences matching the student's level (${levelMeta.labelEn}), set isCorrect: true with constructive praise.
+
+2. FOR PART 4 READING COMPREHENSION:
+   - Evaluate each answer against the actual story text provided above.
+   - Accept semantically correct choices that accurately interpret the events and details in the story.
+   - Identify incorrect or unanswered choices with clear explanations grounded in the passage text.
+   - Output an entry in "readingFeedback" for each question with its id, isCorrect, explanationPt, and explanationEn.
+
+3. Provide a personalized summary note from the tutor:
    - "tutorFeedbackSummaryPt" (in Portuguese) and "tutorFeedbackSummaryEn" (in English).
-3. Provide level-specific strengths ("levelStrengthsPt", "levelStrengthsEn").
-4. Provide actionable next steps for their English routine ("levelNextStepsPt", "levelNextStepsEn").
+4. Provide level-specific strengths ("levelStrengthsPt", "levelStrengthsEn").
+5. Provide actionable next steps for their English routine ("levelNextStepsPt", "levelNextStepsEn").
 
 Output STRICT JSON matching this schema:
 {
@@ -16202,6 +16271,14 @@ Output STRICT JSON matching this schema:
       "levelAdviceEn": "string"
     }
   ],
+  "readingFeedback": [
+    {
+      "id": "string",
+      "isCorrect": boolean,
+      "explanationPt": "string",
+      "explanationEn": "string"
+    }
+  ],
   "tutorFeedbackSummaryPt": "string",
   "tutorFeedbackSummaryEn": "string",
   "levelStrengthsPt": "string",
@@ -16213,16 +16290,28 @@ Output STRICT JSON matching this schema:
         // HOTFIX 3-MODEL CONTINGENCY: Sequential failover across up to 3 verified models on recoverable errors
         const contingencyRes = await executeGeminiWithContingency({
           feature: 'homework_evaluate',
-          systemInstruction: 'You are a warm, inspiring Native English teacher at "It\'s Simple". Evaluate student written sentences and provide feedback in valid JSON format.',
+          systemInstruction: 'You are a warm, inspiring Native English teacher at "It\'s Simple". Evaluate student written sentences and reading comprehension, providing accurate feedback in valid JSON format.',
           untrustedUserDataPrompt: prompt,
           callerRole: caller.role,
-          validator: (json) => validateHomeworkAiEvaluationResponse(json, homework.sentenceWritingPrompts || [], sentences || {}),
+          validator: (json) => validateHomeworkAiEvaluationResponse(
+            json,
+            homework.sentenceWritingPrompts || [],
+            sentences || {},
+            homework.readingPassage?.questions || [],
+            quizAnswers || {}
+          ),
         });
 
         if (
           contingencyRes.success &&
           contingencyRes.parsedJson &&
-          validateHomeworkAiEvaluationResponse(contingencyRes.parsedJson, homework.sentenceWritingPrompts || [], sentences || {})
+          validateHomeworkAiEvaluationResponse(
+            contingencyRes.parsedJson,
+            homework.sentenceWritingPrompts || [],
+            sentences || {},
+            homework.readingPassage?.questions || [],
+            quizAnswers || {}
+          )
         ) {
           sentenceEvaluationResults = contingencyRes.parsedJson.sentenceFeedback.map((item: any) => {
             const matchingPrompt = (homework.sentenceWritingPrompts || []).find(
@@ -16262,6 +16351,36 @@ Output STRICT JSON matching this schema:
                 : item.explanationEn || '',
             };
           });
+
+          // Process Part 4 readingFeedback from Gemini with exact comparison backup
+          const geminiReadingMap = new Map<string, any>();
+          if (Array.isArray(contingencyRes.parsedJson.readingFeedback)) {
+            for (const rf of contingencyRes.parsedJson.readingFeedback) {
+              if (rf && rf.id) geminiReadingMap.set(String(rf.id), rf);
+            }
+          }
+
+          readingEvaluationResults = (homework.readingPassage?.questions || []).map((q: any, qIdx: number) => {
+            const userAnsIdx = quizAnswers[q.id] !== undefined ? quizAnswers[q.id] : quizAnswers[String(qIdx)];
+            const answered = userAnsIdx !== undefined && userAnsIdx !== null && userAnsIdx !== '';
+            const userAnsText = answered && q.options?.[userAnsIdx] ? q.options[userAnsIdx] : (answered ? String(userAnsIdx) : '(sem resposta)');
+            const correctAnsText = q.options?.[q.correctAnswer] || '';
+            const isExactCorrect = answered && userAnsIdx === q.correctAnswer;
+
+            const gRf = geminiReadingMap.get(String(q.id)) || geminiReadingMap.get(`q-${qIdx + 1}`);
+            const isSemanticCorrect = gRf && typeof gRf.isCorrect === 'boolean' ? gRf.isCorrect : isExactCorrect;
+            const isFinalCorrect = !answered ? false : (isExactCorrect || isSemanticCorrect);
+
+            return {
+              id: q.id || `q-${qIdx + 1}`,
+              isCorrect: isFinalCorrect,
+              userAnswer: userAnsText,
+              correctAnswer: correctAnsText,
+              explanationPt: gRf?.explanationPt || q.explanation || (isFinalCorrect ? 'Resposta correta com base no texto!' : `Opção correta: ${correctAnsText}.`),
+              explanationEn: gRf?.explanationEn || q.explanation || (isFinalCorrect ? 'Correct interpretation based on the passage!' : `Correct option: ${correctAnsText}.`),
+            };
+          });
+
           tutorSummaryPt = contingencyRes.parsedJson.tutorFeedbackSummaryPt || '';
           tutorSummaryEn = contingencyRes.parsedJson.tutorFeedbackSummaryEn || '';
           levelStrengthsPt = contingencyRes.parsedJson.levelStrengthsPt || '';
@@ -16283,12 +16402,19 @@ Output STRICT JSON matching this schema:
       });
     }
 
-    // Sentence score: up to 25 points
+    // Standardized scores: Matching 20%, Fill 25%, Sentences 35%, Reading 20%
     let sentenceCorrectCount = 0;
     sentenceEvaluationResults.forEach((s) => {
       if (s.isCorrect) sentenceCorrectCount++;
     });
-    const sentenceScore = (sentenceCorrectCount / totalSentences) * 25;
+    const sentenceScore = (sentenceCorrectCount / totalSentences) * 35;
+
+    let readingCorrectCount = 0;
+    const finalReadingFeedback = readingEvaluationResults.length > 0 ? readingEvaluationResults : readingFeedback;
+    finalReadingFeedback.forEach((r: any) => {
+      if (r.isCorrect) readingCorrectCount++;
+    });
+    const quizScore = (readingCorrectCount / totalQuiz) * 20;
 
     const overallScore = Math.min(100, Math.round(matchScore + fillScore + quizScore + sentenceScore));
 
@@ -16305,7 +16431,7 @@ Output STRICT JSON matching this schema:
       matchingFeedback,
       fillFeedback,
       sentenceFeedback: sentenceEvaluationResults,
-      readingFeedback,
+      readingFeedback: finalReadingFeedback,
     };
 
     // Cache evaluated result only if validated and non-synthetic
