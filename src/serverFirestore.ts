@@ -3631,7 +3631,73 @@ export async function saveWeeklyChecksToFirestore(
 }
 
 /**
- * Subcollection-scoped persistence for homework
+ * Merges two homework objects ensuring student answers, genuine evaluations,
+ * scores, and question lists are never wiped by empty fields or autosaves.
+ */
+export function mergeHomeworkRecords(primary: any, fallback: any): any {
+  if (!primary && !fallback) return null;
+  if (!primary) return fallback;
+  if (!fallback) return primary;
+
+  const mergedAnswers = {
+    matching: { ...(fallback.studentAnswers?.matching || {}), ...(primary.studentAnswers?.matching || {}) },
+    fillInBlanks: { ...(fallback.studentAnswers?.fillInBlanks || {}), ...(primary.studentAnswers?.fillInBlanks || {}) },
+    sentences: { ...(fallback.studentAnswers?.sentences || {}), ...(primary.studentAnswers?.sentences || {}) },
+    quizAnswers: { ...(fallback.studentAnswers?.quizAnswers || {}), ...(primary.studentAnswers?.quizAnswers || {}) },
+  };
+
+  const finalAiEvaluation = primary.aiEvaluation || fallback.aiEvaluation;
+  const finalScore =
+    typeof primary.score === 'number' && primary.score > 0
+      ? primary.score
+      : typeof fallback.score === 'number' && fallback.score > 0
+      ? fallback.score
+      : typeof primary.score === 'number'
+      ? primary.score
+      : fallback.score ?? 0;
+  const finalIsCompleted = Boolean(
+    primary.isCompleted || fallback.isCompleted || (finalAiEvaluation && finalScore > 0)
+  );
+
+  return {
+    ...fallback,
+    ...primary,
+    matchingPairs:
+      Array.isArray(primary.matchingPairs) && primary.matchingPairs.length > 0
+        ? primary.matchingPairs
+        : Array.isArray(fallback.matchingPairs) && fallback.matchingPairs.length > 0
+        ? fallback.matchingPairs
+        : [],
+    fillInBlanks:
+      Array.isArray(primary.fillInBlanks) && primary.fillInBlanks.length > 0
+        ? primary.fillInBlanks
+        : Array.isArray(fallback.fillInBlanks) && fallback.fillInBlanks.length > 0
+        ? fallback.fillInBlanks
+        : [],
+    sentenceWritingPrompts:
+      Array.isArray(primary.sentenceWritingPrompts) && primary.sentenceWritingPrompts.length > 0
+        ? primary.sentenceWritingPrompts
+        : Array.isArray(fallback.sentenceWritingPrompts) && fallback.sentenceWritingPrompts.length > 0
+        ? fallback.sentenceWritingPrompts
+        : [],
+    readingPassage: primary.readingPassage?.text
+      ? primary.readingPassage
+      : fallback.readingPassage?.text
+      ? fallback.readingPassage
+      : primary.readingPassage,
+    completedPartsByDay: {
+      ...(fallback.completedPartsByDay || {}),
+      ...(primary.completedPartsByDay || {}),
+    },
+    studentAnswers: mergedAnswers,
+    aiEvaluation: finalAiEvaluation,
+    score: finalScore,
+    isCompleted: finalIsCompleted,
+  };
+}
+
+/**
+ * Subcollection-scoped persistence for homework with student_homework collection support
  */
 export async function fetchHomeworkFromFirestore(
   docIds: string[],
@@ -3641,11 +3707,35 @@ export async function fetchHomeworkFromFirestore(
   const db = getFirestoreDb();
   if (!db || !docIds.length) return null;
 
+  let mergedResult: any = null;
+
   for (const dId of docIds.filter(Boolean)) {
+    // 1. Check canonical subcollection users/{dId}/homework/{canonicalWeekId}
     try {
       const hwSnap = await db.collection('users').doc(dId).collection('homework').doc(canonicalWeekId).get();
       if (hwSnap.exists) {
-        return hwSnap.data();
+        mergedResult = mergeHomeworkRecords(hwSnap.data(), mergedResult);
+      }
+    } catch {}
+
+    // 2. Authoritative check on student_homework/{dId} (HOTFIX 2.3.2)
+    try {
+      const topSnap = await db.collection('student_homework').doc(dId).get();
+      if (topSnap.exists) {
+        const topData = topSnap.data();
+        if (topData) {
+          const topCycle =
+            topData.weeklyCycle !== undefined
+              ? Number(topData.weeklyCycle)
+              : typeof topData.weekId === 'string'
+              ? parseInt(topData.weekId.replace(/\D/g, ''), 10)
+              : cycle === 1
+              ? 1
+              : null;
+          if (topCycle === cycle || (cycle === 1 && !topCycle)) {
+            mergedResult = mergeHomeworkRecords(topData, mergedResult);
+          }
+        }
       }
     } catch {}
   }
@@ -3656,17 +3746,17 @@ export async function fetchHomeworkFromFirestore(
       try {
         const hwSubSnap = await db.collection('users').doc(dId).collection('homework').doc('current_week').get();
         if (hwSubSnap.exists) {
-          return hwSubSnap.data();
+          mergedResult = mergeHomeworkRecords(hwSubSnap.data(), mergedResult);
         }
         const userSnap = await db.collection('users').doc(dId).get();
         if (userSnap.exists && userSnap.data()?.weeklyHomework) {
-          return userSnap.data()?.weeklyHomework;
+          mergedResult = mergeHomeworkRecords(userSnap.data()?.weeklyHomework, mergedResult);
         }
       } catch {}
     }
   }
 
-  return null;
+  return mergedResult;
 }
 
 export async function saveHomeworkToFirestore(
@@ -3683,6 +3773,7 @@ export async function saveHomeworkToFirestore(
     const userRef = db.collection('users').doc(docId);
     const promises: Promise<any>[] = [
       userRef.collection('homework').doc(canonicalWeekId).set(sanitized, { merge: true }),
+      db.collection('student_homework').doc(docId).set(sanitized, { merge: true }),
     ];
     if (cycle === 1) {
       promises.push(
@@ -3696,9 +3787,6 @@ export async function saveHomeworkToFirestore(
       );
       promises.push(
         userRef.collection('homework').doc('current_week').set(sanitized, { merge: true })
-      );
-      promises.push(
-        db.collection('student_homework').doc(docId).set(sanitized, { merge: true })
       );
     }
     await Promise.all(promises);

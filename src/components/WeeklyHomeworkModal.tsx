@@ -385,10 +385,10 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
   React.useEffect(() => {
     if (homework?.studentAnswers) {
-      setMatchingAnswers((prev) => ({ ...prev, ...(homework.studentAnswers?.matching || {}) }));
-      setFillAnswers((prev) => ({ ...prev, ...(homework.studentAnswers?.fillInBlanks || {}) }));
-      setSentenceAnswers((prev) => ({ ...prev, ...(homework.studentAnswers?.sentences || {}) }));
-      setQuizAnswers((prev) => ({ ...prev, ...(homework.studentAnswers?.quizAnswers || {}) }));
+      setMatchingAnswers((prev) => ({ ...(homework.studentAnswers?.matching || {}), ...prev }));
+      setFillAnswers((prev) => ({ ...(homework.studentAnswers?.fillInBlanks || {}), ...prev }));
+      setSentenceAnswers((prev) => ({ ...(homework.studentAnswers?.sentences || {}), ...prev }));
+      setQuizAnswers((prev) => ({ ...(homework.studentAnswers?.quizAnswers || {}), ...prev }));
     }
     if (
       homework?.aiEvaluation &&
@@ -396,6 +396,19 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       !isSyntheticHomeworkEvaluation(homework.aiEvaluation)
     ) {
       setAiEvaluation(homework.aiEvaluation);
+      const feedbackList = homework.aiEvaluation.sentenceFeedback;
+      // Restore sentence answers from sentenceFeedback if not already present
+      if (Array.isArray(feedbackList) && feedbackList.length > 0) {
+        setSentenceAnswers((prev) => {
+          const next = { ...prev };
+          feedbackList.forEach((sf: any) => {
+            if (sf?.word && sf?.originalSentence && !next[sf.word]) {
+              next[sf.word] = sf.originalSentence;
+            }
+          });
+          return next;
+        });
+      }
     }
   }, [homework?.id, homework?.studentAnswers, homework?.aiEvaluation]);
 
@@ -465,17 +478,17 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
   // Check if each individual part has all questions answered
   const isMatchingComplete = useMemo(() => {
-    if (!homework.matchingPairs || homework.matchingPairs.length === 0) return true;
+    if (!homework.matchingPairs || homework.matchingPairs.length === 0) return false;
     return homework.matchingPairs.every((pair) => Boolean(matchingAnswers[pair.id]));
   }, [homework.matchingPairs, matchingAnswers]);
 
   const isFillComplete = useMemo(() => {
-    if (!homework.fillInBlanks || homework.fillInBlanks.length === 0) return true;
+    if (!homework.fillInBlanks || homework.fillInBlanks.length === 0) return false;
     return homework.fillInBlanks.every((item) => Boolean(fillAnswers[item.id]));
   }, [homework.fillInBlanks, fillAnswers]);
 
   const isWritingComplete = useMemo(() => {
-    if (!homework.sentenceWritingPrompts || homework.sentenceWritingPrompts.length === 0) return true;
+    if (!homework.sentenceWritingPrompts || homework.sentenceWritingPrompts.length === 0) return false;
     return homework.sentenceWritingPrompts.every((p) => {
       const val =
         sentenceAnswers[p.word] ||
@@ -493,7 +506,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
   }, [homework.sentenceWritingPrompts, sentenceAnswers, sentenceFeedbacks]);
 
   const isReadingComplete = useMemo(() => {
-    if (!homework.readingPassage?.questions || homework.readingPassage.questions.length === 0) return true;
+    if (!homework.readingPassage?.questions || homework.readingPassage.questions.length === 0) return false;
     return homework.readingPassage.questions.every((q) => quizAnswers[q.id] !== undefined);
   }, [homework.readingPassage?.questions, quizAnswers]);
 
@@ -547,6 +560,10 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
   // Event-driven helper to synchronously mark S-Path completed and persist to state/DB
   const markSPathCompleted = useCallback(
     (day: DayOfWeek, partKey: string) => {
+      const effectiveEvaluation = aiEvaluation || homework?.aiEvaluation;
+      const effectiveScore = (effectiveEvaluation ? effectiveEvaluation.overallScore : homework?.score) ?? 0;
+      const effectiveIsCompleted = Boolean((effectiveEvaluation && effectiveScore > 0) || homework?.isCompleted);
+
       const updated: WeeklyHomeworkData = {
         ...homework,
         isDayPartCompleted: true,
@@ -555,11 +572,14 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
           [day]: true,
         },
         studentAnswers: {
-          matching: matchingAnswers,
-          fillInBlanks: fillAnswers,
-          sentences: sentenceAnswers,
-          quizAnswers: quizAnswers,
+          matching: { ...(homework?.studentAnswers?.matching || {}), ...matchingAnswers },
+          fillInBlanks: { ...(homework?.studentAnswers?.fillInBlanks || {}), ...fillAnswers },
+          sentences: { ...(homework?.studentAnswers?.sentences || {}), ...sentenceAnswers },
+          quizAnswers: { ...(homework?.studentAnswers?.quizAnswers || {}), ...quizAnswers },
         },
+        aiEvaluation: effectiveEvaluation,
+        score: effectiveScore,
+        isCompleted: effectiveIsCompleted,
       };
 
       onSaveProgress(updated);
@@ -567,7 +587,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
         onCompleteTodayPart(partKey as any, day);
       }
     },
-    [homework, matchingAnswers, fillAnswers, sentenceAnswers, quizAnswers, onSaveProgress, onCompleteTodayPart]
+    [homework, matchingAnswers, fillAnswers, sentenceAnswers, quizAnswers, onSaveProgress, onCompleteTodayPart, aiEvaluation]
   );
 
   // Strict Automated S-Path Tracking for each of the 4 parts independently
@@ -727,17 +747,6 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       quizAnswers: quizAnswers,
     };
 
-    // 1. Immediately persist typed student answers to Firestore so they are never lost
-    const inProgressUpdate: WeeklyHomeworkData = {
-      ...homework,
-      studentAnswers: currentAnswers,
-      completedPartsByDay: {
-        ...(homework?.completedPartsByDay || {}),
-        [targetDay]: true,
-      },
-    };
-    onSaveProgress(inProgressUpdate);
-
     // 2. Check if an authentic, genuine evaluation already exists and matches current student sentences
     const activeEval = aiEvaluation || homework?.aiEvaluation;
     const existingIsLegitimate = Boolean(
@@ -745,16 +754,34 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       isValidHomeworkEvaluation(activeEval) &&
       !isSyntheticHomeworkEvaluation(activeEval) &&
       (homework.sentenceWritingPrompts || []).every((p) => {
-        const studentSentence = (sentenceAnswers[p.word] || '').trim().toLowerCase();
-        const sentencesList = activeEval?.sentenceFeedback || (activeEval as any)?.sentenceEvaluationResults || [];
-        const evaluatedSentence = (
-          sentencesList.find(
-            (r: any) => (r.word || '').toLowerCase() === p.word.toLowerCase()
-          )?.originalSentence || ''
+        const studentSentence = (
+          sentenceAnswers[p.word] ||
+          sentenceAnswers[p.word.trim()] ||
+          sentenceAnswers[p.word.toLowerCase()] ||
+          ''
         ).trim().toLowerCase();
-        return studentSentence === evaluatedSentence;
+        const sentencesList = activeEval?.sentenceFeedback || (activeEval as any)?.sentenceEvaluationResults || [];
+        const evaluatedItem = sentencesList.find(
+          (r: any) => (r.word || '').toLowerCase() === p.word.toLowerCase()
+        );
+        const evaluatedSentence = (evaluatedItem?.originalSentence || '').trim().toLowerCase();
+        return studentSentence === evaluatedSentence || (!studentSentence && Boolean(evaluatedSentence));
       })
     );
+
+    // 1. Immediately persist typed student answers to Firestore so they are never lost
+    const inProgressUpdate: WeeklyHomeworkData = {
+      ...homework,
+      studentAnswers: currentAnswers,
+      aiEvaluation: activeEval,
+      score: (activeEval ? activeEval.overallScore : homework?.score) ?? 0,
+      isCompleted: Boolean((activeEval && activeEval.overallScore > 0) || homework?.isCompleted),
+      completedPartsByDay: {
+        ...(homework?.completedPartsByDay || {}),
+        [targetDay]: true,
+      },
+    };
+    onSaveProgress(inProgressUpdate);
 
     if (existingIsLegitimate && activeEval) {
       setAiEvaluation(activeEval);

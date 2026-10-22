@@ -104,6 +104,7 @@ import {
   saveWeeklyChecksToFirestore,
   fetchHomeworkFromFirestore,
   saveHomeworkToFirestore,
+  mergeHomeworkRecords,
   isPermissionError,
   consolidateTutorsList,
   resolveTeacherCanonicalIdentity,
@@ -14087,12 +14088,22 @@ app.get('/api/homework', firebaseAuthMiddleware, async (req, res) => {
   let hwData =
     (db.studentHomeworkMap && (db.studentHomeworkMap[hwScopedKey] || (emailScopedKey ? db.studentHomeworkMap[emailScopedKey] : undefined))) || null;
 
-  // If not found in-memory, query Firestore week subcollection
-  if (!hwData) {
+  // Check if in-memory data has complete answers and evaluation
+  const hasCompleteData = Boolean(
+    hwData?.studentAnswers &&
+    (Object.keys(hwData.studentAnswers.matching || {}).length > 0 ||
+     Object.keys(hwData.studentAnswers.fillInBlanks || {}).length > 0 ||
+     Object.keys(hwData.studentAnswers.sentences || {}).length > 0 ||
+     Object.keys(hwData.studentAnswers.quizAnswers || {}).length > 0) &&
+    hwData?.aiEvaluation
+  );
+
+  // If not found in-memory or in-memory data lacks answers/evaluation, query Firestore
+  if (!hwData || !hasCompleteData) {
     const docIds = [cleanUid, cleanEmail].filter(Boolean);
     const fsHw = await fetchHomeworkFromFirestore(docIds, canonicalWeekId, cycle);
     if (fsHw) {
-      hwData = fsHw;
+      hwData = hwData ? mergeHomeworkRecords(hwData, fsHw) : fsHw;
       if (!db.studentHomeworkMap) db.studentHomeworkMap = {};
       db.studentHomeworkMap[hwScopedKey] = hwData;
     }

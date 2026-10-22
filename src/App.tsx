@@ -944,10 +944,13 @@ export default function App() {
 
     // If we already have an AI-generated homework and the collected words haven't changed, preserve it (unless it was generated with old template)!
     setWeeklyHomework((prev) => {
-      const isSameWeek =
+      const prevCycle = parseWeekCycleNumber(prev?.weeklyCycle ?? prev?.weekId ?? prev?.id);
+      const genCycle = parseWeekCycleNumber(generated?.weeklyCycle ?? generated?.weekId ?? generated?.id);
+      const isSameWeek = Boolean(
         prev &&
-        ((prev.weeklyCycle && generated.weeklyCycle && prev.weeklyCycle === generated.weeklyCycle) ||
-          (prev.weekId && generated.weekId && prev.weekId === generated.weekId));
+        ((prevCycle !== null && genCycle !== null && prevCycle === genCycle) ||
+          (prev.weekId && generated.weekId && prev.weekId === generated.weekId))
+      );
 
       const hasValidEvaluation = Boolean(
         prev?.aiEvaluation &&
@@ -964,8 +967,7 @@ export default function App() {
       );
 
       // HOTFIX 2.3.1: If we already have authentic evaluation, answered parts, or completed homework for this week,
-      // PRESERVE IT COMPLETELY - do not wipe it or replace questions/gabaritos!
-      if (isSameWeek && (hasValidEvaluation || hasStudentAnswers || prev?.isCompleted || (typeof prev?.score === 'number' && prev.score > 0))) {
+      if (prev && isSameWeek && (hasValidEvaluation || hasStudentAnswers || prev.isCompleted || (typeof prev.score === 'number' && prev.score > 0))) {
         return {
           ...generated,
           ...prev,
@@ -1542,18 +1544,33 @@ export default function App() {
                   return {
                     ...prev,
                     ...cloudHw,
+                    matchingPairs: (Array.isArray(cloudHw.matchingPairs) && cloudHw.matchingPairs.length > 0)
+                      ? cloudHw.matchingPairs
+                      : prev.matchingPairs,
+                    fillInBlanks: (Array.isArray(cloudHw.fillInBlanks) && cloudHw.fillInBlanks.length > 0)
+                      ? cloudHw.fillInBlanks
+                      : prev.fillInBlanks,
+                    sentenceWritingPrompts: (Array.isArray(cloudHw.sentenceWritingPrompts) && cloudHw.sentenceWritingPrompts.length > 0)
+                      ? cloudHw.sentenceWritingPrompts
+                      : prev.sentenceWritingPrompts,
+                    readingPassage: cloudHw.readingPassage?.text
+                      ? cloudHw.readingPassage
+                      : prev.readingPassage,
                     completedPartsByDay: {
+                      ...(prev.completedPartsByDay || {}),
                       ...(cloudHw.completedPartsByDay || {}),
                     },
                     studentAnswers: {
-                      matching: { ...(cloudHw.studentAnswers?.matching || {}) },
-                      fillInBlanks: { ...(cloudHw.studentAnswers?.fillInBlanks || {}) },
-                      sentences: { ...(cloudHw.studentAnswers?.sentences || {}) },
-                      quizAnswers: { ...(cloudHw.studentAnswers?.quizAnswers || {}) },
+                      matching: { ...(prev.studentAnswers?.matching || {}), ...(cloudHw.studentAnswers?.matching || {}) },
+                      fillInBlanks: { ...(prev.studentAnswers?.fillInBlanks || {}), ...(cloudHw.studentAnswers?.fillInBlanks || {}) },
+                      sentences: { ...(prev.studentAnswers?.sentences || {}), ...(cloudHw.studentAnswers?.sentences || {}) },
+                      quizAnswers: { ...(prev.studentAnswers?.quizAnswers || {}), ...(cloudHw.studentAnswers?.quizAnswers || {}) },
                     },
                     aiEvaluation: cloudHw.aiEvaluation || prev.aiEvaluation,
-                    score: typeof cloudHw.score === 'number' ? cloudHw.score : prev.score,
-                    isCompleted: typeof cloudHw.isCompleted === 'boolean' ? cloudHw.isCompleted : prev.isCompleted,
+                    score: (typeof cloudHw.score === 'number' && cloudHw.score > 0)
+                      ? cloudHw.score
+                      : typeof prev.score === 'number' ? prev.score : cloudHw.score,
+                    isCompleted: Boolean(cloudHw.isCompleted || prev.isCompleted || (cloudHw.aiEvaluation && typeof cloudHw.score === 'number' && cloudHw.score > 0)),
                   };
                 });
               }
@@ -1607,18 +1624,33 @@ export default function App() {
                       return {
                         ...prev,
                         ...savedHw,
+                        matchingPairs: (Array.isArray(savedHw.matchingPairs) && savedHw.matchingPairs.length > 0)
+                          ? savedHw.matchingPairs
+                          : prev.matchingPairs,
+                        fillInBlanks: (Array.isArray(savedHw.fillInBlanks) && savedHw.fillInBlanks.length > 0)
+                          ? savedHw.fillInBlanks
+                          : prev.fillInBlanks,
+                        sentenceWritingPrompts: (Array.isArray(savedHw.sentenceWritingPrompts) && savedHw.sentenceWritingPrompts.length > 0)
+                          ? savedHw.sentenceWritingPrompts
+                          : prev.sentenceWritingPrompts,
+                        readingPassage: savedHw.readingPassage?.text
+                          ? savedHw.readingPassage
+                          : prev.readingPassage,
                         completedPartsByDay: {
+                          ...(prev.completedPartsByDay || {}),
                           ...(savedHw.completedPartsByDay || {}),
                         },
                         studentAnswers: {
-                          matching: { ...(savedHw.studentAnswers?.matching || {}) },
-                          fillInBlanks: { ...(savedHw.studentAnswers?.fillInBlanks || {}) },
-                          sentences: { ...(savedHw.studentAnswers?.sentences || {}) },
-                          quizAnswers: { ...(savedHw.studentAnswers?.quizAnswers || {}) },
+                          matching: { ...(prev.studentAnswers?.matching || {}), ...(savedHw.studentAnswers?.matching || {}) },
+                          fillInBlanks: { ...(prev.studentAnswers?.fillInBlanks || {}), ...(savedHw.studentAnswers?.fillInBlanks || {}) },
+                          sentences: { ...(prev.studentAnswers?.sentences || {}), ...(savedHw.studentAnswers?.sentences || {}) },
+                          quizAnswers: { ...(prev.studentAnswers?.quizAnswers || {}), ...(savedHw.studentAnswers?.quizAnswers || {}) },
                         },
                         aiEvaluation: savedHw.aiEvaluation || prev.aiEvaluation,
-                        score: typeof savedHw.score === 'number' ? savedHw.score : prev.score,
-                        isCompleted: typeof savedHw.isCompleted === 'boolean' ? savedHw.isCompleted : prev.isCompleted,
+                        score: (typeof savedHw.score === 'number' && savedHw.score > 0)
+                          ? savedHw.score
+                          : typeof prev.score === 'number' ? prev.score : savedHw.score,
+                        isCompleted: Boolean(savedHw.isCompleted || prev.isCompleted || (savedHw.aiEvaluation && typeof savedHw.score === 'number' && savedHw.score > 0)),
                       };
                     });
                   }

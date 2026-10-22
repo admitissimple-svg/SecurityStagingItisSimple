@@ -4412,6 +4412,72 @@ export function subscribeToStudentJournal(
 }
 
 /**
+ * Merges two homework objects ensuring student answers, genuine evaluations,
+ * scores, and question lists are never wiped by empty fields or autosaves.
+ */
+export function mergeHomeworkRecords(primary: any, fallback: any): any {
+  if (!primary && !fallback) return null;
+  if (!primary) return fallback;
+  if (!fallback) return primary;
+
+  const mergedAnswers = {
+    matching: { ...(fallback.studentAnswers?.matching || {}), ...(primary.studentAnswers?.matching || {}) },
+    fillInBlanks: { ...(fallback.studentAnswers?.fillInBlanks || {}), ...(primary.studentAnswers?.fillInBlanks || {}) },
+    sentences: { ...(fallback.studentAnswers?.sentences || {}), ...(primary.studentAnswers?.sentences || {}) },
+    quizAnswers: { ...(fallback.studentAnswers?.quizAnswers || {}), ...(primary.studentAnswers?.quizAnswers || {}) },
+  };
+
+  const finalAiEvaluation = primary.aiEvaluation || fallback.aiEvaluation;
+  const finalScore =
+    typeof primary.score === 'number' && primary.score > 0
+      ? primary.score
+      : typeof fallback.score === 'number' && fallback.score > 0
+      ? fallback.score
+      : typeof primary.score === 'number'
+      ? primary.score
+      : fallback.score ?? 0;
+  const finalIsCompleted = Boolean(
+    primary.isCompleted || fallback.isCompleted || (finalAiEvaluation && finalScore > 0)
+  );
+
+  return {
+    ...fallback,
+    ...primary,
+    matchingPairs:
+      Array.isArray(primary.matchingPairs) && primary.matchingPairs.length > 0
+        ? primary.matchingPairs
+        : Array.isArray(fallback.matchingPairs) && fallback.matchingPairs.length > 0
+        ? fallback.matchingPairs
+        : [],
+    fillInBlanks:
+      Array.isArray(primary.fillInBlanks) && primary.fillInBlanks.length > 0
+        ? primary.fillInBlanks
+        : Array.isArray(fallback.fillInBlanks) && fallback.fillInBlanks.length > 0
+        ? fallback.fillInBlanks
+        : [],
+    sentenceWritingPrompts:
+      Array.isArray(primary.sentenceWritingPrompts) && primary.sentenceWritingPrompts.length > 0
+        ? primary.sentenceWritingPrompts
+        : Array.isArray(fallback.sentenceWritingPrompts) && fallback.sentenceWritingPrompts.length > 0
+        ? fallback.sentenceWritingPrompts
+        : [],
+    readingPassage: primary.readingPassage?.text
+      ? primary.readingPassage
+      : fallback.readingPassage?.text
+      ? fallback.readingPassage
+      : primary.readingPassage,
+    completedPartsByDay: {
+      ...(fallback.completedPartsByDay || {}),
+      ...(primary.completedPartsByDay || {}),
+    },
+    studentAnswers: mergedAnswers,
+    aiEvaluation: finalAiEvaluation,
+    score: finalScore,
+    isCompleted: finalIsCompleted,
+  };
+}
+
+/**
  * Sanitizes loaded homework data so that legacy synthetic evaluations are never
  * treated as valid evaluations, while preserving student answers, words, and history.
  */
@@ -4503,12 +4569,33 @@ export async function saveStudentHomeworkProgressToFirestore(
       }
     }
 
-    // For existing homework, also check week-specific doc
+    // For existing homework, check week-specific doc
     if (db && cleanUid) {
       try {
         const hwSnap = await withFirestoreTimeout(getDoc(doc(db, 'users', cleanUid, 'homework', targetWeekId)), 1500, null);
         if (hwSnap && hwSnap.exists()) {
           existingHomework = hwSnap.data() || existingHomework;
+        }
+      } catch {}
+
+      // Also check student_homework collection (HOTFIX 2.3.2)
+      try {
+        const topSnap = await withFirestoreTimeout(getDoc(doc(db, 'student_homework', cleanUid)), 1500, null);
+        if (topSnap && topSnap.exists()) {
+          const topData = topSnap.data();
+          if (topData) {
+            const topCycle =
+              topData.weeklyCycle !== undefined
+                ? Number(topData.weeklyCycle)
+                : typeof topData.weekId === 'string'
+                ? parseInt(topData.weekId.replace(/\D/g, ''), 10)
+                : targetCycle === 1
+                ? 1
+                : null;
+            if (topCycle === targetCycle || (targetCycle === 1 && !topCycle)) {
+              existingHomework = mergeHomeworkRecords(topData, existingHomework);
+            }
+          }
         }
       } catch {}
     }
@@ -4613,6 +4700,14 @@ export async function saveStudentHomeworkProgressToFirestore(
         null
       );
 
+      // Top-level student_homework partition for fast cross-device queries and evaluation persistence
+      const topLevelRef = doc(db, 'student_homework', cleanUid);
+      await withFirestoreTimeout(
+        setDoc(topLevelRef, payload, { merge: true }),
+        3000,
+        null
+      );
+
       // 2. Week 1 backward compatibility only:
       if (targetCycle === 1) {
         const userRef = doc(db, 'users', cleanUid);
@@ -4626,13 +4721,6 @@ export async function saveStudentHomeworkProgressToFirestore(
         await withFirestoreTimeout(
           setDoc(currentWeekRef, payload, { merge: true }),
           2500,
-          null
-        );
-
-        const topLevelRef = doc(db, 'student_homework', cleanUid);
-        await withFirestoreTimeout(
-          setDoc(topLevelRef, payload, { merge: true }),
-          3000,
           null
         );
       }
@@ -4721,46 +4809,73 @@ export async function fetchStudentHomeworkProgressFromFirestore(
 
   try {
     // 1. Fetch from canonical subcollection users/{cleanUid}/homework/week-${cycle}
+    let combinedData: any = null;
     const hwDocRef = doc(db, 'users', cleanUid, 'homework', targetWeekId);
     const hwSnap = await withFirestoreTimeout(getDoc(hwDocRef), 2500, null);
     if (hwSnap && hwSnap.exists()) {
-      // Requirement 2: If canonical document exists, return its data even when empty or unanswered.
-      // Never consult legacy Week 1 storage when the canonical document exists.
-      const data = hwSnap.data();
-      return sanitizeLoadedHomeworkData((data || {}) as WeeklyHomeworkData);
+      combinedData = hwSnap.data();
     }
 
-    // 2. Week 1 backward compatibility only (consulted ONLY when canonical document does NOT exist):
-    if (targetCycle === 1) {
-      // Check legacy subcollection document 'current_week'
-      const legacyHwRef = doc(db, 'users', cleanUid, 'homework', 'current_week');
-      const legacySnap = await withFirestoreTimeout(getDoc(legacyHwRef), 2000, null);
-      if (legacySnap && legacySnap.exists()) {
-        const lData = legacySnap.data();
-        if (lData && (lData.completedPartsByDay || lData.studentAnswers || lData.matchingPairs)) {
-          return sanitizeLoadedHomeworkData(lData as WeeklyHomeworkData);
-        }
-      }
-
-      // Check users/{cleanUid} document
-      const userRef = doc(db, 'users', cleanUid);
-      const userSnap = await withFirestoreTimeout(getDoc(userRef), 2500, null);
-      if (userSnap && userSnap.exists()) {
-        const data = userSnap.data();
-        if (data?.weeklyHomework && (data.weeklyHomework.completedPartsByDay || data.weeklyHomework.studentAnswers)) {
-          return sanitizeLoadedHomeworkData(data.weeklyHomework as WeeklyHomeworkData);
-        }
-      }
-
-      // Check top-level student_homework/{cleanUid}
+    // 2. Authoritative check on student_homework/{cleanUid} (HOTFIX 2.3.2)
+    // Ensures genuine evaluation, score, and student answers recorded in student_homework are always restored
+    try {
       const topRef = doc(db, 'student_homework', cleanUid);
-      const topSnap = await withFirestoreTimeout(getDoc(topRef), 2000, null);
+      const topSnap = await withFirestoreTimeout(getDoc(topRef), 2500, null);
       if (topSnap && topSnap.exists()) {
-        const data = topSnap.data();
-        if (data && (data.completedPartsByDay || data.studentAnswers || data.matchingPairs)) {
-          return sanitizeLoadedHomeworkData(data as WeeklyHomeworkData);
+        const topData = topSnap.data();
+        if (topData) {
+          const topCycle =
+            topData.weeklyCycle !== undefined
+              ? Number(topData.weeklyCycle)
+              : typeof topData.weekId === 'string'
+              ? parseInt(topData.weekId.replace(/\D/g, ''), 10)
+              : targetCycle === 1
+              ? 1
+              : null;
+          if (topCycle === targetCycle || (targetCycle === 1 && !topCycle)) {
+            combinedData = mergeHomeworkRecords(topData, combinedData);
+          }
         }
       }
+    } catch {}
+
+    // 3. Week 1 backward compatibility only (consulted when answers/evaluation are not yet complete):
+    if (targetCycle === 1) {
+      const hasAnswersOrEval = Boolean(
+        combinedData?.aiEvaluation ||
+        (combinedData?.studentAnswers &&
+          (Object.keys(combinedData.studentAnswers.matching || {}).length > 0 ||
+           Object.keys(combinedData.studentAnswers.fillInBlanks || {}).length > 0 ||
+           Object.keys(combinedData.studentAnswers.sentences || {}).length > 0 ||
+           Object.keys(combinedData.studentAnswers.quizAnswers || {}).length > 0))
+      );
+
+      if (!hasAnswersOrEval) {
+        // Check legacy subcollection document 'current_week'
+        try {
+          const legacyHwRef = doc(db, 'users', cleanUid, 'homework', 'current_week');
+          const legacySnap = await withFirestoreTimeout(getDoc(legacyHwRef), 2000, null);
+          if (legacySnap && legacySnap.exists()) {
+            combinedData = mergeHomeworkRecords(legacySnap.data(), combinedData);
+          }
+        } catch {}
+
+        // Check users/{cleanUid} document
+        try {
+          const userRef = doc(db, 'users', cleanUid);
+          const userSnap = await withFirestoreTimeout(getDoc(userRef), 2500, null);
+          if (userSnap && userSnap.exists()) {
+            const data = userSnap.data();
+            if (data?.weeklyHomework) {
+              combinedData = mergeHomeworkRecords(data.weeklyHomework, combinedData);
+            }
+          }
+        } catch {}
+      }
+    }
+
+    if (combinedData) {
+      return sanitizeLoadedHomeworkData(combinedData as WeeklyHomeworkData);
     }
 
     // 3. Server API fallback: strictly request targetWeekId & targetCycle
