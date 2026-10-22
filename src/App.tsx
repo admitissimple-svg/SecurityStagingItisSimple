@@ -1399,7 +1399,13 @@ export default function App() {
                 if (cleanVidId && v) {
                   const dayList = baseRoutines[day] || defaultRoutinesByDay[day] || [];
                   baseRoutines[day] = dayList.map((item, idx) => {
-                    if (idx === 0 || item.activityName?.toLowerCase().includes('video') || item.activityName?.toLowerCase().includes('vídeo')) {
+                    if (
+                      idx === 0 ||
+                      item.id.endsWith('1') ||
+                      item.activityName?.toLowerCase().includes('video') ||
+                      item.activityName?.toLowerCase().includes('vídeo') ||
+                      (item.teacherVideos && item.teacherVideos.length > 0)
+                    ) {
                       return {
                         ...item,
                         activityName: v.playlistTitle || v.title || v.videoTitle || item.activityName,
@@ -1411,17 +1417,20 @@ export default function App() {
                           title: v.title || v.videoTitle || 'Daily Video Practice',
                           url: v.url || `https://www.youtube.com/watch?v=${cleanVidId}`,
                           playlistId: v.playlistId || '',
+                          playlistTitle: v.playlistTitle || '',
                           isRepeatVideo: Boolean(v.isRepeatVideo),
+                          instructions: v.instructions || '',
+                          duration: v.duration || '5-10 min',
                         }],
                         completedToday: v.completedToday !== undefined ? v.completedToday : item.completedToday,
                       };
                     }
                     return item;
                   });
-                } else if (v && v.videoId === '') {
+                } else if (v && v.videoId === '' && v.playlistId === '') {
                   const dayList = baseRoutines[day] || defaultRoutinesByDay[day] || [];
                   baseRoutines[day] = dayList.map((item, idx) => {
-                    if (idx === 0 || item.activityName?.toLowerCase().includes('video') || item.activityName?.toLowerCase().includes('vídeo')) {
+                    if (idx === 0 || item.id.endsWith('1') || item.activityName?.toLowerCase().includes('video') || item.activityName?.toLowerCase().includes('vídeo')) {
                       return {
                         ...item,
                         activityName: 'Video of the Day',
@@ -1889,33 +1898,54 @@ export default function App() {
                 merged[day] = dayData;
               } else {
                 const dayList = merged[day] || defaultRoutinesByDay[day] || [];
+                const hasVideoField = dayData.videoId !== undefined || dayData.isRepeatVideo !== undefined;
                 const cleanVidId = dayData.videoId ? dayData.videoId.trim() : '';
                 merged[day] = dayList.map((item, idx) => {
                   if (
                     idx === 0 ||
                     item.id.endsWith('1') ||
                     item.activityName?.toLowerCase().includes('vídeo') ||
-                    item.activityName?.toLowerCase().includes('video')
+                    item.activityName?.toLowerCase().includes('video') ||
+                    (item.teacherVideos && item.teacherVideos.length > 0)
                   ) {
+                    const resolvedActivityName = hasVideoField
+                      ? (cleanVidId
+                          ? (dayData.playlistTitle || dayData.title || dayData.videoTitle || item.activityName)
+                          : (dayData.playlistTitle || 'Video of the Day'))
+                      : item.activityName;
+
+                    const resolvedPlaylistId = hasVideoField
+                      ? (dayData.playlistId || '')
+                      : item.playlistId;
+
+                    const resolvedPlaylistTitle = hasVideoField
+                      ? (dayData.playlistTitle || '')
+                      : item.playlistTitle;
+
+                    const resolvedVideos = hasVideoField
+                      ? (cleanVidId
+                          ? [
+                              {
+                                id: cleanVidId,
+                                videoId: cleanVidId,
+                                title: dayData.title || dayData.videoTitle || 'Daily Video Practice',
+                                url: dayData.url || `https://www.youtube.com/watch?v=${cleanVidId}`,
+                                playlistId: dayData.playlistId || '',
+                                playlistTitle: dayData.playlistTitle || '',
+                                isRepeatVideo: Boolean(dayData.isRepeatVideo),
+                                instructions: dayData.instructions || item.teacherVideos?.[0]?.instructions || '',
+                                duration: dayData.duration || item.teacherVideos?.[0]?.duration || '5-10 min',
+                              },
+                            ]
+                          : [])
+                      : item.teacherVideos;
+
                     return {
                       ...item,
-                      activityName: cleanVidId
-                        ? (dayData.playlistTitle || dayData.title || dayData.videoTitle || item.activityName)
-                        : (dayData.playlistTitle || 'Video of the Day'),
-                      playlistId: dayData.playlistId || '',
-                      playlistTitle: dayData.playlistTitle || '',
-                      teacherVideos: cleanVidId
-                        ? [
-                            {
-                              id: cleanVidId,
-                              videoId: cleanVidId,
-                              title: dayData.title || dayData.videoTitle || 'Daily Video Practice',
-                              url: dayData.url || `https://www.youtube.com/watch?v=${cleanVidId}`,
-                              playlistId: dayData.playlistId || '',
-                              isRepeatVideo: Boolean(dayData.isRepeatVideo),
-                            },
-                          ]
-                        : [],
+                      activityName: resolvedActivityName,
+                      playlistId: resolvedPlaylistId,
+                      playlistTitle: resolvedPlaylistTitle,
+                      teacherVideos: resolvedVideos,
                       teacherSpotify: dayData.teacherOverrideTrack
                         ? {
                             id: dayData.teacherOverrideTrack.url || 'track',
@@ -3979,6 +4009,7 @@ export default function App() {
   // Handler: Assign video from playlist topic to activity
   const handleAssignVideoToActivity = (activityId: string, video: TeacherAssignedVideo, day: DayOfWeek) => {
     const playlistTopic = (video as any).playlistTitle;
+    const cleanVidId = extractYouTubeVideoId(video.videoId || video.url || '') || video.videoId;
     setRoutinesByDay((prev) => {
       const updated = { ...prev };
       updated[day] = (updated[day] || []).map((item) => {
@@ -3986,6 +4017,8 @@ export default function App() {
           return {
             ...item,
             activityName: playlistTopic || item.activityName,
+            playlistId: (video as any).playlistId || item.playlistId || '',
+            playlistTitle: playlistTopic || item.playlistTitle || '',
             teacherVideos: [video],
             teacherNotes: video.instructions || item.teacherNotes,
           };
@@ -3998,6 +4031,30 @@ export default function App() {
     const activeEmail = currentAccount?.email || userProfile?.email;
     const activeUid = currentAccount?.uid || (currentAccount as any)?.id || userProfile?.id;
     if (activeEmail || activeUid) {
+      // 1. Direct daily-video persistence endpoint (backed by Firestore users/{uid}/routines/{day})
+      fetch('/api/routines/daily-video', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          studentUid: activeUid,
+          studentEmail: activeEmail,
+          day,
+          dayOfWeek: day,
+          videoId: cleanVidId,
+          title: video.title,
+          videoTitle: video.title,
+          url: video.url,
+          playlistId: (video as any).playlistId || '',
+          playlistTitle: playlistTopic || '',
+          isRepeatVideo: Boolean((video as any).isRepeatVideo),
+          activityId,
+          instructions: video.instructions,
+          duration: video.duration,
+          weeklyCycle: userProfile?.weeklyCycle || 1,
+        }),
+      }).catch(() => {});
+
+      // 2. Legacy teacher-video routine endpoint
       fetch('/api/routines/teacher-video', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -4005,6 +4062,7 @@ export default function App() {
           activityId,
           activityName: playlistTopic,
           playlistTitle: playlistTopic,
+          playlistId: (video as any).playlistId || '',
           videos: [video],
           teacherNotes: video.instructions,
           days: [day],

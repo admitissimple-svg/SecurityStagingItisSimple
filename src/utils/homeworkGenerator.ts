@@ -835,6 +835,8 @@ export async function generateWeeklyHomeworkWithAi(params: {
         studentEmail: currentEmail,
         studentUid: currentUid,
         weekLabel: localBaseline.weekLabel,
+        targetDay: params.targetDay,
+        weeklyCycle: params.weeklyCycle,
       }),
     });
     clearTimeout(abortTimeout);
@@ -894,6 +896,8 @@ export async function generatePart4StoryWithAi(params: {
   studentUid?: string;
   studentEmail?: string;
   wordDetails?: any[];
+  targetDay?: DayOfWeek | string;
+  weeklyCycle?: number;
 }): Promise<ReadingPassage | null> {
   const cleanWords = Array.from(new Set(params.words.filter(Boolean)));
   if (cleanWords.length === 0) return null;
@@ -921,6 +925,8 @@ export async function generatePart4StoryWithAi(params: {
         studentUid: currentUid,
         studentEmail: currentEmail,
         wordDetails: params.wordDetails || [],
+        targetDay: params.targetDay,
+        weeklyCycle: params.weeklyCycle,
       }),
     });
     clearTimeout(abortTimeout);

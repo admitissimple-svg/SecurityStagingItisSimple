@@ -1656,9 +1656,9 @@ export async function fetchRoutineVideosFromFirestoreServer(
         Object.entries(uData.routinesByDay).forEach(([day, item]: [string, any]) => {
           if (item && typeof item === 'object') {
             const itemCycle = typeof item.weeklyCycle === 'number' ? item.weeklyCycle : activeCycle;
-            const hasConfiguredVideo = Boolean((item.videoId && item.videoId.trim() !== '') || (item.url && item.url.trim() !== ''));
-            if (itemCycle === activeCycle || hasConfiguredVideo) {
-              result.routinesByDay[day] = item;
+            // Strict weekly cycle matching to prevent cross-cycle bleeding
+            if (itemCycle === activeCycle) {
+              result.routinesByDay[day] = { ...item, dayOfWeek: day, weeklyCycle: activeCycle };
             }
           }
         });
@@ -1672,12 +1672,23 @@ export async function fetchRoutineVideosFromFirestoreServer(
         if (data) {
           const day = docSnap.id;
           const itemCycle = typeof data.weeklyCycle === 'number' ? data.weeklyCycle : activeCycle;
-          const hasConfiguredVideo = Boolean((data.videoId && data.videoId.trim() !== '') || (data.url && data.url.trim() !== ''));
-          if (itemCycle === activeCycle || hasConfiguredVideo) {
-            result.routinesByDay[day] = {
-              ...data,
-              dayOfWeek: day,
-            };
+          // Strict weekly cycle matching
+          if (itemCycle === activeCycle) {
+            const hasVideoField = data.videoId !== undefined || data.url !== undefined || data.isRepeatVideo !== undefined;
+            if (hasVideoField) {
+              result.routinesByDay[day] = {
+                ...(result.routinesByDay[day] || {}),
+                ...data,
+                dayOfWeek: day,
+                weeklyCycle: activeCycle,
+              };
+            } else if (!result.routinesByDay[day]) {
+              result.routinesByDay[day] = {
+                ...data,
+                dayOfWeek: day,
+                weeklyCycle: activeCycle,
+              };
+            }
           }
         }
       });
@@ -1689,6 +1700,163 @@ export async function fetchRoutineVideosFromFirestoreServer(
       console.warn('[serverFirestore] Error in fetchRoutineVideosFromFirestoreServer:', err);
     }
     return result;
+  }
+}
+
+export interface VideoContextForPart4 {
+  studentUid: string;
+  weeklyCycle: number;
+  referenceDay: string;
+  hasVideo: boolean;
+  videoId?: string;
+  videoUrl?: string;
+  videoTitle?: string;
+  themeOrCategory?: string;
+  isWatched: boolean;
+  fiveWordsVocab?: string[];
+  legitimateWeeklyVocab?: string[];
+}
+
+function extractYouTubeIdInternal(urlOrId: string | null | undefined): string | null {
+  if (!urlOrId) return null;
+  const clean = urlOrId.trim();
+  if (/^[a-zA-Z0-9_-]{11}$/.test(clean)) return clean;
+  const match = clean.match(
+    /(?:youtube(?:-nocookie)?\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?|shorts)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/i
+  );
+  return match && match[1] && match[1].length === 11 ? match[1] : null;
+}
+
+/**
+ * Resolves verified, structured video and vocabulary context from Firestore
+ * for grounding Part 4 (Mini-Story & Comprehension Questions).
+ *
+ * Strict requirements:
+ * 1. Uses canonical student Firebase Auth UID.
+ * 2. Cycle-isolated: only matches routines from the student's active weekly cycle.
+ * 3. Never asserts a video was watched unless proven by watchedVideosHistory or studentJournal.
+ * 4. Gathers genuine 5 Words / routine vocabulary recorded for this day/video.
+ */
+export async function resolveStudentVideoContextForPart4(
+  studentUid: string,
+  referenceDay?: string,
+  targetWeeklyCycle?: number
+): Promise<VideoContextForPart4> {
+  const defaultResult: VideoContextForPart4 = {
+    studentUid: studentUid || '',
+    weeklyCycle: targetWeeklyCycle || 1,
+    referenceDay: (referenceDay || 'monday').toLowerCase(),
+    hasVideo: false,
+    isWatched: false,
+    fiveWordsVocab: [],
+    legitimateWeeklyVocab: [],
+  };
+
+  if (!studentUid || typeof studentUid !== 'string' || !isValidCanonicalUid(studentUid)) {
+    return defaultResult;
+  }
+
+  try {
+    const routineData = await fetchRoutineVideosFromFirestoreServer(studentUid, targetWeeklyCycle);
+    const activeCycle = routineData.weeklyCycle || targetWeeklyCycle || 1;
+    defaultResult.weeklyCycle = activeCycle;
+
+    const requestedDay = (referenceDay || '').toLowerCase().trim();
+    const candidateDays = requestedDay
+      ? [requestedDay, 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+      : ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+
+    let matchedDay = requestedDay || 'monday';
+    let matchedRoutine: any = null;
+
+    if (requestedDay && routineData.routinesByDay[requestedDay]?.videoId) {
+      matchedDay = requestedDay;
+      matchedRoutine = routineData.routinesByDay[requestedDay];
+    } else {
+      // Find the first configured day in current cycle
+      for (const d of candidateDays) {
+        if (routineData.routinesByDay[d]?.videoId) {
+          matchedDay = d;
+          matchedRoutine = routineData.routinesByDay[d];
+          break;
+        }
+      }
+    }
+
+    // Retrieve legitimate vocabulary from Firestore
+    let allVocab: any[] = [];
+    try {
+      allVocab = await fetchStudentVocabularyFromFirestoreServer(studentUid);
+    } catch {}
+
+    const legitimateWeeklyVocab = Array.from(
+      new Set(
+        allVocab
+          .map((v: any) => (v?.word || '').trim())
+          .filter((w: string) => Boolean(w))
+      )
+    ).slice(0, 30);
+
+    if (!matchedRoutine || !matchedRoutine.videoId) {
+      return {
+        ...defaultResult,
+        weeklyCycle: activeCycle,
+        referenceDay: matchedDay,
+        hasVideo: false,
+        isWatched: false,
+        legitimateWeeklyVocab,
+      };
+    }
+
+    const rawVidId = matchedRoutine.videoId || '';
+    const cleanVidId = extractYouTubeIdInternal(rawVidId || matchedRoutine.url) || rawVidId;
+    const title = (matchedRoutine.videoTitle || matchedRoutine.title || '').trim();
+    const theme = (matchedRoutine.playlistTitle || matchedRoutine.theme || matchedRoutine.category || '').trim();
+    const url = matchedRoutine.url || (cleanVidId ? `https://www.youtube.com/watch?v=${cleanVidId}` : '');
+
+    // Watch status: ONLY true if proven in watchedVideosHistory
+    const isWatched = Boolean(
+      cleanVidId &&
+      Array.isArray(routineData.watchedVideosHistory) &&
+      routineData.watchedVideosHistory.includes(cleanVidId)
+    );
+
+    // 5 Words vocabulary linked specifically to this day, activity, or video
+    const fiveWordsVocab = Array.from(
+      new Set(
+        allVocab
+          .filter((item: any) => {
+            if (!item) return false;
+            const itemDay = (item.sourceDay || item.routineRef?.day || '').toLowerCase().trim();
+            const itemVid = item.routineRef?.videoId || '';
+            const matchesVideo = cleanVidId && itemVid === cleanVidId;
+            const matchesDay = itemDay === matchedDay;
+            const hasRoutineOrigin = Array.isArray(item.origins) && item.origins.some((o: any) =>
+              (cleanVidId && o.videoId === cleanVidId) || (o.dayOfWeek && o.dayOfWeek.toLowerCase() === matchedDay)
+            );
+            return matchesVideo || matchesDay || hasRoutineOrigin;
+          })
+          .map((item: any) => (item.word || '').trim())
+          .filter(Boolean)
+      )
+    ).slice(0, 15);
+
+    return {
+      studentUid,
+      weeklyCycle: activeCycle,
+      referenceDay: matchedDay,
+      hasVideo: Boolean(cleanVidId),
+      videoId: cleanVidId,
+      videoUrl: url,
+      videoTitle: title,
+      themeOrCategory: theme,
+      isWatched,
+      fiveWordsVocab,
+      legitimateWeeklyVocab,
+    };
+  } catch (err) {
+    console.warn('[serverFirestore] Error in resolveStudentVideoContextForPart4:', err);
+    return defaultResult;
   }
 }
 

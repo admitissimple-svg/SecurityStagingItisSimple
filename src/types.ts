@@ -251,6 +251,8 @@ export interface RoutineItem {
   completedToday?: boolean;
   completed?: boolean;
   isRepeatVideo?: boolean;
+  playlistId?: string;
+  playlistTitle?: string;
 }
 
 export interface DailyJournalEntry {

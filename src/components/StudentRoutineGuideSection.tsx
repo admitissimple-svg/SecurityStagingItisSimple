@@ -1885,16 +1885,26 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
                   : 'bg-slate-100 text-slate-600';
 
                 // Find currently active playlist ID for this activity
-                const assignedVid = act.teacherVideos?.[0];
+                const persistedDay = persistedRoutinesByDay[selectedDay];
+                const assignedVid = act.teacherVideos?.[0] || (persistedDay?.videoId ? {
+                  id: persistedDay.videoId,
+                  videoId: persistedDay.videoId,
+                  title: persistedDay.videoTitle || persistedDay.title || 'Daily Video Practice',
+                  url: persistedDay.url || `https://www.youtube.com/watch?v=${persistedDay.videoId}`,
+                  playlistId: persistedDay.playlistId,
+                  playlistTitle: persistedDay.playlistTitle,
+                  isRepeatVideo: Boolean(persistedDay.isRepeatVideo),
+                } as any : null);
+
                 const isRepeatVideo =
                   (assignedVid as any)?.playlistId === 'repeat_previous_video' ||
                   (assignedVid as any)?.playlistTitle === 'Repeat Previous Video' ||
                   (assignedVid as any)?.playlistTitle === 'Repetir Vídeo Anterior' ||
+                  (assignedVid as any)?.isRepeatVideo === true ||
                   act.activityName === 'Repeat Previous Video' ||
                   act.activityName === 'Repetir Vídeo Anterior';
 
                 const dayTopicSelection = selectedTopicByDay[selectedDay] || '';
-                const persistedDay = persistedRoutinesByDay[selectedDay];
                 let currentPlaylistId = '';
 
                 if (isRepeatVideo || persistedDay?.isRepeatVideo) {

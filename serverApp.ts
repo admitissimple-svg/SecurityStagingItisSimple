@@ -76,6 +76,8 @@ import {
   fetchTeacherAvailabilityFromFirestore,
   saveRoutineVideoSubcollection,
   fetchRoutineVideosFromFirestoreServer,
+  resolveStudentVideoContextForPart4,
+  VideoContextForPart4,
   resetDailyRoutinesForNewWeekInFirestoreServer,
   resetRepeatFlagsSubcollection,
   addWatchedVideoToUserDoc,
@@ -6469,7 +6471,15 @@ app.get('/api/student-routines', (req, res) => {
   const uniqueVideoIds = new Set(
     videoAssigns.map((a) => extractServerYouTubeId(a.videoId || a.videoUrl)).filter(Boolean)
   );
-  const hasRepeatingVideoBug = videoAssigns.length > 1 && uniqueVideoIds.size === 1;
+  const hasExplicitRepeatVideo = videoAssigns.some(
+    (a) => a.isRepeatVideo || a.playlistId === 'repeat_previous_video' || (a.playlistTitle && a.playlistTitle.toLowerCase().includes('repeat'))
+  );
+  // Never treat user-selected repeat videos or voluntary video assignments as a repeating bug
+  const hasRepeatingVideoBug =
+    videoAssigns.length > 1 &&
+    uniqueVideoIds.size === 1 &&
+    !hasExplicitRepeatVideo &&
+    !videoAssigns.some((a) => a.playlistId && a.playlistId !== 'curriculum-default');
 
   const uniqueTrackIds = new Set(
     spotifyAssigns.map((a) => extractSpotifyTrackId(a.trackId || a.url || a.trackUrl)).filter(Boolean)
@@ -12795,10 +12805,10 @@ app.get('/api/routines/daily-video', async (req, res) => {
 
   const queryUid = ((req.query.studentUid as string) || (req.query.uid as string) || '').trim();
   const queryEmail = ((req.query.studentEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
-  const targetUid = callerUid || queryUid;
+  const targetUid = queryUid || callerUid;
 
   const resolved = resolveStudentIdentifiers(db, queryEmail, targetUid);
-  const effectiveUid = callerUid || resolved.uid || targetUid;
+  const effectiveUid = queryUid || callerUid || resolved.uid || targetUid;
 
   if (!effectiveUid && !resolved.email) {
     return res.status(400).json({ error: 'studentUid or studentEmail is required' });
@@ -12884,8 +12894,8 @@ app.post('/api/routines/daily-video', async (req, res) => {
     return res.status(400).json({ error: 'studentUid/studentEmail and day are required' });
   }
 
-  const resolved = resolveStudentIdentifiers(db, studentEmail, callerUid || studentUid);
-  const effectiveUid = callerUid || resolved.uid || studentUid;
+  const resolved = resolveStudentIdentifiers(db, studentEmail, studentUid || callerUid);
+  const effectiveUid = studentUid || callerUid || resolved.uid;
   const targetKeys = Array.from(new Set([resolved.email, effectiveUid, studentUid, studentEmail].filter(Boolean) as string[]));
 
   const cleanVidId = extractServerYouTubeId(videoId || url);
@@ -14422,13 +14432,29 @@ export function validateDirectMemorizationAiResponse(json: any, targetWords?: st
 async function generatePart4StoryWithGemini(
   words: string[],
   studentLevel: string,
-  studentName: string = 'Student'
+  studentName: string = 'Student',
+  videoContext?: VideoContextForPart4 | null
 ): Promise<any | null> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey || !Array.isArray(words) || words.length === 0) return null;
 
   const levelMeta = normalizeStudentLevel(studentLevel);
   const protagonist = (studentName && studentName !== 'Student' ? studentName.split(' ')[0] : 'Student').trim();
+
+  const videoInstruction = videoContext && videoContext.hasVideo && videoContext.videoTitle ? `
+5. CONTEXTUAL VIDEO THEMATIC INSPIRATION (OPTIONAL GROUNDING):
+   - Daily Routine Video Title: "${videoContext.videoTitle}"
+   ${videoContext.themeOrCategory ? `- Category / Playlist Theme: "${videoContext.themeOrCategory}"` : ''}
+   - Student Watch Status: ${videoContext.isWatched ? 'Confirmed watched by student' : 'Selected in weekly routine (not confirmed watched)'}
+   ${Array.isArray(videoContext.fiveWordsVocab) && videoContext.fiveWordsVocab.length > 0 ? `- 5 Words Recorded for this Routine: [${videoContext.fiveWordsVocab.join(', ')}]` : ''}
+
+   STRICT ANTI-HALLUCINATION & COHERENCE MANDATE:
+   * Ground the setting, domain, premise, or scenario of the story in the overarching theme or subject matter of this video title (e.g., barista skills, business presentation, scientific research, travel adventure).
+   * ABSOLUTE PROHIBITION ON HALLUCINATING VIDEO DETAILS: NEVER invent, simulate, or fabricate transcripts, spoken dialogue, specific scene events, or quotes from the video.
+   * NEVER state or assert that the student watched the video unless watch status is confirmed above.
+   * The mini-story must be an original 4-paragraph narrative centered on the student's active words of the day: [${words.join(', ')}]. It must NOT pretend to summarize the video.
+   * All reading comprehension questions must test concrete events in the story you write, NOT external YouTube facts.
+` : '';
 
   const systemInstruction = `You are a distinguished literary author, linguistic stylist, and senior English Language Teaching (ELT) instructional designer for "It's Simple - Learn English by Living Your Life".
 Your mission is to craft a 100% ORIGINAL, INÉDITA, and COMPELLING short story (Part 4: Routine Reading & Interpretation) and dynamic, narrative-grounded reading comprehension questions tailored to the student's proficiency level (${levelMeta.labelEn} - CEFR ${levelMeta.cefr}).
@@ -14473,7 +14499,7 @@ CRITICAL MANDATORY RULES (STRICTLY ENFORCED):
    - 4 Narrative-specific options: Exactly 4 options per question ([Option A, Option B, Option C, Option D]). 1 option must be unambiguously correct based on the story, and 3 must be plausible narrative distractors derived from the story context.
    - Accurate zero-based correctAnswer index (0, 1, 2, or 3).
    - Clear explanation directly referencing the story sentence that proves the answer.
-
+${videoInstruction}
 Output format must be a strict JSON object:
 {
   "title": "A captivating, story-specific title",
@@ -14489,12 +14515,19 @@ Output format must be a strict JSON object:
   ]
 }`;
 
+  const videoPromptSnippet = videoContext && videoContext.hasVideo && videoContext.videoTitle ? `
+Daily Video Thematic Inspiration:
+- Title: "${videoContext.videoTitle}"
+${videoContext.themeOrCategory ? `- Theme/Category: "${videoContext.themeOrCategory}"\n` : ''}- Watch status: ${videoContext.isWatched ? 'Confirmed watched' : 'Selected in routine'}
+Note: Use this solely as realistic thematic inspiration for the setting/premise. Do NOT invent false video dialogues or scenes.
+` : '';
+
   const userPrompt = `Generate a 100% INÉDITA mini-story and 2-3 coherent comprehension questions for:
 Protagonist: "Alex"
 Proficiency Level: ${levelMeta.labelEn} (${levelMeta.labelPt} - CEFR ${levelMeta.cefr})
 Target Words of the Day to weave in organically with **word**:
 ${words.map((w, i) => `${i + 1}. "${w}"`).join('\n')}
-
+${videoPromptSnippet}
 MANDATORY RULES:
 1. Plot must be 100% original, lively, and engaging. Absolutely ZERO formulaic templates!
 2. All target words must be used with grammatical precision and highlighted as **word**.
@@ -14550,12 +14583,14 @@ Return strict JSON only.`;
 async function generateDirectMemorizationAi(
   words: string[],
   studentLevel: string,
-  studentName: string = 'Student'
+  studentName: string = 'Student',
+  videoContext?: VideoContextForPart4 | null
 ): Promise<any | null> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey || !Array.isArray(words) || words.length === 0) return null;
 
-  const cacheKey = `${words.map((w) => w.toLowerCase().trim()).sort().join('|')}_${studentLevel.toLowerCase()}`;
+  const vidKey = videoContext?.videoId ? `_vid_${videoContext.videoId}` : '';
+  const cacheKey = `${words.map((w) => w.toLowerCase().trim()).sort().join('|')}_${studentLevel.toLowerCase()}${vidKey}`;
   const cached = aiMemorizationCache.get(cacheKey);
   if (cached && Date.now() < cached.expiry) {
     const cachedStory = cached.data?.readingPassage?.text || '';
@@ -14566,6 +14601,9 @@ async function generateDirectMemorizationAi(
   }
 
   const levelMeta = normalizeStudentLevel(studentLevel);
+
+  const videoInstruction = videoContext && videoContext.hasVideo && videoContext.videoTitle ? `
+     * CONTEXTUAL VIDEO THEMATIC INSPIRATION: The student is working with the daily routine video "${videoContext.videoTitle}"${videoContext.themeOrCategory ? ` (${videoContext.themeOrCategory})` : ''}. Status: ${videoContext.isWatched ? 'Watched by student' : 'Selected in routine'}. Use this theme solely as creative inspiration for the setting/domain of the mini-story. NEVER invent, fake, or pretend to transcribe video scenes, dialogues, or specific video events.` : '';
 
   const systemInstruction = `You are a world-class English Language Teaching (ELT) Instructional Designer and Expert Native English Teacher for "It's Simple - Learn English by Living Your Life".
 Your mission is to generate 100% authentic, personalized, native, and engaging educational content for the 4-part "Weekly Memorization Activity", strictly and exclusively utilizing the student's active target vocabulary words assigned for today's session:
@@ -14606,14 +14644,22 @@ STRICT SYSTEM PROMPT CONSTRAINTS & RULES (ENFORCED 100%):
       * Compose a cohesive, lively, and 100% original short story consisting of exactly 4 cohesive paragraphs separated by double newlines (\n\n) featuring a relatable protagonist navigating a concrete situation that seamlessly and organically embeds ALL target words in context, highlighted with **word**.
       * Accompany with 2 to 3 multiple-choice reading comprehension questions that strictly test concrete plot events, decisions, and outcomes in this narrative. ZERO generic questions about English study methods.
       * Each question has 4 options, a "correctAnswer" index (0, 1, 2, or 3), and an "explanation" citing the story.
+${videoInstruction}
 
 You MUST respond with a strict, valid JSON object matching the requested schema.`;
 
   // Security Hotfix (Etapa 2): Privacy enforcement — student personal name removed from prompts
+  const videoPromptSnippet = videoContext && videoContext.hasVideo && videoContext.videoTitle ? `
+Daily Video Thematic Inspiration for Part 4 Story:
+- Video Title: "${videoContext.videoTitle}"
+${videoContext.themeOrCategory ? `- Category / Theme: "${videoContext.themeOrCategory}"\n` : ''}- Watch status: ${videoContext.isWatched ? 'Confirmed watched' : 'Selected in routine'}
+(Use purely as thematic inspiration for the story setting. Do not invent false video dialogues or scenes.)
+` : '';
+
   const userPrompt = `Generate the complete, customized 4-part Memorization Activity:
 - Target Learner Level: ${levelMeta.labelEn} (${levelMeta.labelPt} - CEFR ${levelMeta.cefr})
 - Pedagogical Grammar Focus: ${levelMeta.grammarFocusEn}
-
+${videoPromptSnippet}
 TARGET VOCABULARY WORDS FOR TODAY (MUST GENERATE COMPLETE CUSTOM CONTENT FOR EACH ONE):
 ${words.map((w, i) => `${i + 1}. "${w}"`).join('\n')}
 
@@ -14736,6 +14782,10 @@ app.post('/api/homework/generate-ai', firebaseAuthMiddleware, async (req, res) =
       studentEmail = '',
       studentUid = '',
       weekLabel = '',
+      targetDay = '',
+      day = '',
+      referenceDay = '',
+      weeklyCycle: bodyWeeklyCycle,
     } = req.body || {};
 
     let effectiveLevel = studentLevel;
@@ -14807,7 +14857,21 @@ app.post('/api/homework/generate-ai', firebaseAuthMiddleware, async (req, res) =
       });
     }
 
-    const cacheKey = `${cleanWords.map((w: string) => w.toLowerCase().trim()).sort().join('|')}_${studentLevel.toLowerCase()}`;
+    // Resolve verified student video context from Firestore
+    const effectiveDay = (targetDay || day || referenceDay || '').toString();
+    const effectiveWeeklyCycle = typeof bodyWeeklyCycle === 'number' && bodyWeeklyCycle > 0 ? bodyWeeklyCycle : undefined;
+    let videoContext: VideoContextForPart4 | null = null;
+    const targetStudentUid = caller.role === 'student' ? callerUid : (studentUid || callerUid);
+    if (targetStudentUid) {
+      try {
+        videoContext = await resolveStudentVideoContextForPart4(targetStudentUid, effectiveDay, effectiveWeeklyCycle);
+      } catch (vcErr) {
+        console.warn('[serverApp] Error resolving videoContext in generate-ai:', vcErr);
+      }
+    }
+
+    const vidKey = videoContext?.videoId ? `_vid_${videoContext.videoId}` : '';
+    const cacheKey = `${cleanWords.map((w: string) => w.toLowerCase().trim()).sort().join('|')}_${studentLevel.toLowerCase()}${vidKey}`;
     const cachedResponse = aiMemorizationCache.get(cacheKey);
     if (cachedResponse && Date.now() < cachedResponse.expiry) {
       const cachedText = cachedResponse.data?.homework?.readingPassage?.text || '';
@@ -14860,7 +14924,7 @@ app.post('/api/homework/generate-ai', firebaseAuthMiddleware, async (req, res) =
     let aiResult: any = null;
     try {
       // 2. Direct Gemini AI generation with Specialized Native Teacher & Instructional Designer System Prompt
-      aiResult = await generateDirectMemorizationAi(cleanWords, studentLevel, studentName);
+      aiResult = await generateDirectMemorizationAi(cleanWords, studentLevel, studentName, videoContext);
     } finally {
       await flightLock.release();
     }
@@ -14948,7 +15012,7 @@ app.post('/api/homework/generate-ai', firebaseAuthMiddleware, async (req, res) =
       score: 0,
     };
 
-    const payload = { success: true, homework: finalHomeworkData };
+    const payload = { success: true, homework: finalHomeworkData, videoContext: videoContext || undefined };
     if (!hasGenericBoilerplate(finalHomeworkData) && wasAiGenerated) {
       aiMemorizationCache.set(cacheKey, { data: payload, expiry: Date.now() + 60 * 60 * 1000 });
     }
@@ -14973,6 +15037,10 @@ app.post(['/api/homework/generate-part4', '/api/homework/generate-story'], fireb
       studentUid = '',
       studentEmail = '',
       wordDetails = [],
+      targetDay = '',
+      day = '',
+      referenceDay = '',
+      weeklyCycle: bodyWeeklyCycle,
     } = req.body || {};
 
     let effectiveLevel = studentLevel;
@@ -15041,8 +15109,22 @@ app.post(['/api/homework/generate-part4', '/api/homework/generate-story'], fireb
       });
     }
 
+    // Resolve verified student video context from Firestore
+    const effectiveDay = (targetDay || day || referenceDay || '').toString();
+    const effectiveWeeklyCycle = typeof bodyWeeklyCycle === 'number' && bodyWeeklyCycle > 0 ? bodyWeeklyCycle : undefined;
+    let videoContext: VideoContextForPart4 | null = null;
+    const targetStudentUid = caller.role === 'student' ? callerUid : (studentUid || callerUid);
+    if (targetStudentUid) {
+      try {
+        videoContext = await resolveStudentVideoContextForPart4(targetStudentUid, effectiveDay, effectiveWeeklyCycle);
+      } catch (vcErr) {
+        console.warn('[serverApp] Error resolving videoContext for Part 4:', vcErr);
+      }
+    }
+
     // Security Hotfix (Etapa 2 & Residuals): Single-flight lock
-    const part4LockKey = `homework_part4:${cleanWords.sort().join('|')}_${effectiveLevel}`;
+    const vidKey = videoContext?.videoId ? `_v_${videoContext.videoId}` : '';
+    const part4LockKey = `homework_part4:${cleanWords.sort().join('|')}_${effectiveLevel}${vidKey}`;
     const flightLock = await acquireSingleFlightLock(part4LockKey);
     if (!flightLock.acquired) {
       if (flightLock.unavailable) {
@@ -15065,13 +15147,19 @@ app.post(['/api/homework/generate-part4', '/api/homework/generate-story'], fireb
     let aiStory: any = null;
     try {
       // Direct generation via dedicated Gemini Prompt Architecture
-      aiStory = await generatePart4StoryWithGemini(cleanWords, effectiveLevel, effectiveName);
+      aiStory = await generatePart4StoryWithGemini(cleanWords, effectiveLevel, effectiveName, videoContext);
     } finally {
       await flightLock.release();
     }
 
     if (aiStory && !isBadStoryText(aiStory.text)) {
-      return res.json({ success: true, readingPassage: aiStory, isAiGenerated: true, isFallback: false });
+      return res.json({
+        success: true,
+        readingPassage: aiStory,
+        videoContext: videoContext || undefined,
+        isAiGenerated: true,
+        isFallback: false,
+      });
     }
 
     return res.status(503).json({
