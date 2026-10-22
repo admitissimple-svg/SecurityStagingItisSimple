@@ -311,7 +311,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
 
   // Synchronize 5 words when active activity changes or learnedWords are loaded
   useEffect(() => {
-    if (activeActivity && activeActivity.learnedWords && activeActivity.learnedWords.length > 0) {
+    if (activeActivity && Array.isArray(activeActivity.learnedWords) && activeActivity.learnedWords.length > 0) {
       const padded = [...activeActivity.learnedWords];
       while (padded.length < 5) padded.push('');
       setWords(padded.slice(0, 5));
@@ -319,7 +319,26 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
       setWords(['', '', '', '', '']);
     }
     setWordsSaveFeedback(false);
-  }, [activeActivity?.id, activeActivity?.learnedWords?.join(',')]);
+  }, [activeActivity?.id, selectedDay, weeklyCycle, activeActivity?.learnedWords?.join(',')]);
+
+  // HOTFIX 2.3.5C: Immediate UI reset of all active 5 words & sentence inputs upon cycle advance
+  const prevCycleTrackerRef = useRef<number>(weeklyCycle || userProfile?.weeklyCycle || 1);
+  useEffect(() => {
+    const curCycle = weeklyCycle || userProfile?.weeklyCycle || 1;
+    if (prevCycleTrackerRef.current !== curCycle) {
+      setWords(['', '', '', '', '']);
+      setWordDefinitions({});
+      setWordsSaveFeedback(false);
+      setSentenceInput('');
+      setSentenceSavedSuccess(false);
+      setSentenceEvaluation(null);
+      setSelectedTopicByDay({});
+      setCustomSuggestionActivities({});
+      setSuggestingUrlValues({});
+      setSavedTopicsBeforeRepeat({});
+      prevCycleTrackerRef.current = curCycle;
+    }
+  }, [weeklyCycle, userProfile?.weeklyCycle]);
 
   // Keep English definitions synchronized using Native Friend Notes unified pedagogical standard
   // Reuses My Dictionary definitions (2.2B.2)
@@ -2543,32 +2562,25 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
           }
           setIsStartingNewWeek(true);
           try {
-            setSelectedTopicByDay({});
-            setCustomSuggestionActivities({});
-            setSuggestingUrlValues({});
-            setSavedTopicsBeforeRepeat({});
-            try {
-              if (resetRoutinesForNewWeek) {
-                await resetRoutinesForNewWeek(selectedDays);
-              }
-            } catch (routineErr) {
-              console.warn('Notice resetting routines for new week:', routineErr);
+            const success = await onStartNewWeek(studyDaysTarget, selectedDays);
+            if (success) {
+              // HOTFIX 2.3.5C: Immediately clear the 5 words panel and derived states for the new cycle
+              setWords(['', '', '', '', '']);
+              setWordDefinitions({});
+              setWordsSaveFeedback(false);
+              setSentenceInput('');
+              setSentenceSavedSuccess(false);
+              setSentenceEvaluation(null);
+              setSelectedTopicByDay({});
+              setCustomSuggestionActivities({});
+              setSuggestingUrlValues({});
+              setSavedTopicsBeforeRepeat({});
+              setIsNewWeekModalOpen(false);
             }
-            try {
-              await resetRepeatFlags();
-            } catch (flagErr) {
-              console.warn('Notice resetting repeat flags:', flagErr);
-            }
-            await onStartNewWeek(studyDaysTarget, selectedDays);
           } catch (err) {
             console.warn('Error starting new week in routine guide:', err);
           } finally {
-            setSelectedTopicByDay({});
-            setCustomSuggestionActivities({});
-            setSuggestingUrlValues({});
-            setSavedTopicsBeforeRepeat({});
             setIsStartingNewWeek(false);
-            setIsNewWeekModalOpen(false);
           }
         }}
         currentCycle={weeklyCycle || userProfile?.weeklyCycle || 1}

@@ -1894,6 +1894,7 @@ export async function resetDailyRoutinesForNewWeekInFirestoreServer(
         duration: '',
         completed: false,
         completedToday: false,
+        learnedWords: [],
         weeklyCycle: targetCycle,
         updatedAt: new Date().toISOString(),
       };

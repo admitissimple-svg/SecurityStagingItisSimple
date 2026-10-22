@@ -645,6 +645,11 @@ export default function App() {
   useEffect(() => {
     excludedDictionaryWordsRef.current = excludedDictionaryWords;
   }, [excludedDictionaryWords]);
+  // HOTFIX 2.3.5C: Active weekly cycle reference to discard stale async routine updates from past cycles
+  const activeCycleRef = useRef<number>(1);
+  useEffect(() => {
+    activeCycleRef.current = parseWeekCycleNumber(userProfile?.weeklyCycle) || 1;
+  }, [userProfile?.weeklyCycle]);
   const [dailyJournalEntries, setDailyJournalEntries] = useState<DailyJournalEntry[]>([]);
   const [isJournalModalOpen, setIsJournalModalOpen] = useState<boolean>(false);
   const [isManageSubscriptionOpen, setIsManageSubscriptionOpen] = useState<boolean>(false);
@@ -1959,11 +1964,16 @@ export default function App() {
 
     const unsub = subscribeToStudentDailyRoutines(uid, (cloudRoutines) => {
       if (cloudRoutines && typeof cloudRoutines === 'object' && Object.keys(cloudRoutines).length > 0) {
+        const currentActiveCycle = activeCycleRef.current;
         setRoutinesByDay((prev) => {
           const merged = { ...prev };
           (Object.keys(cloudRoutines) as DayOfWeek[]).forEach((day) => {
             const dayData = cloudRoutines[day];
             if (dayData && typeof dayData === 'object') {
+              // HOTFIX 2.3.5C: Discard stale documents from prior weekly cycles to prevent resurrecting old words
+              if (typeof dayData.weeklyCycle === 'number' && dayData.weeklyCycle < currentActiveCycle) {
+                return;
+              }
               if (Array.isArray(dayData)) {
                 merged[day] = dayData;
               } else {
@@ -2010,12 +2020,18 @@ export default function App() {
                           : [])
                       : item.teacherVideos;
 
+                    // HOTFIX 2.3.5C: Properly resolve learnedWords for the new cycle
+                    const resolvedWords = Array.isArray(dayData.learnedWords)
+                      ? dayData.learnedWords
+                      : (cleanVidId === '' && (!dayData.playlistId || dayData.playlistId === '') ? [] : item.learnedWords || []);
+
                     return {
                       ...item,
                       activityName: resolvedActivityName,
                       playlistId: resolvedPlaylistId,
                       playlistTitle: resolvedPlaylistTitle,
                       teacherVideos: resolvedVideos,
+                      learnedWords: resolvedWords,
                       teacherSpotify: dayData.teacherOverrideTrack
                         ? {
                             id: dayData.teacherOverrideTrack.url || 'track',
@@ -3904,6 +3920,8 @@ export default function App() {
         const effectiveStudyTarget = result.weeklyStudyDaysTarget;
         const effectiveStudyDays = result.weeklyStudyDays;
 
+        activeCycleRef.current = effectiveCycle;
+
         setUserProfile((prev) => ({
           ...prev,
           weeklyCycle: effectiveCycle,
@@ -3979,9 +3997,37 @@ export default function App() {
           ...prev,
         ]);
         return true;
+      } else {
+        setNotifications((prev) => [
+          {
+            id: `new-week-err-${Date.now()}`,
+            title: currentLanguage === 'en' ? '⚠️ Could not start new week' : '⚠️ Não foi possível iniciar nova semana',
+            message: currentLanguage === 'en'
+              ? (result?.message || 'Failed to initialize new week on the server. Please try again.')
+              : (result?.message || 'Falha ao inicializar nova semana no servidor. Tente novamente.'),
+            type: 'error',
+            timestamp: new Date().toISOString(),
+            read: false,
+          },
+          ...prev,
+        ]);
+        return false;
       }
     } catch (err) {
       console.warn('Could not start new week:', err);
+      setNotifications((prev) => [
+        {
+          id: `new-week-err-${Date.now()}`,
+          title: currentLanguage === 'en' ? '⚠️ Could not start new week' : '⚠️ Não foi possível iniciar nova semana',
+          message: currentLanguage === 'en'
+            ? 'An unexpected error occurred while starting a new week.'
+            : 'Ocorreu um erro inesperado ao iniciar a nova semana.',
+          type: 'error',
+          timestamp: new Date().toISOString(),
+          read: false,
+        },
+        ...prev,
+      ]);
     } finally {
       setIsStartingNewWeek(false);
     }

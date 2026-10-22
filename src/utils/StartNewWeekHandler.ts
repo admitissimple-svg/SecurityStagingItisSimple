@@ -21,6 +21,7 @@ import {
   isGenericPedagogicalExample,
 } from '../utils/dictionaryService';
 import { normalizeDictionaryWord } from '../utils/studentDictionaryLibrary';
+import { defaultRoutinesByDay } from '../data/defaultRoutines';
 
 export interface StartNewWeekParams {
   studentEmail: string;
@@ -362,9 +363,27 @@ export async function executeStartNewWeek(
       const res = await withFirestoreTimeout(fetchPromise, 4500, null as any);
       if (res && res.ok) {
         data = await res.json();
+      } else {
+        console.error('Backend start-new-week call returned error status or timed out:', res?.status);
+        return {
+          success: false,
+          weeklyCycle: params.currentCycle || 1,
+          weeklyStudyDaysTarget: targetDays,
+          weeklyStudyDays: chosenDays,
+          routines: params.currentRoutines || ({} as any),
+          message: 'Backend synchronization failed while starting new week.',
+        };
       }
     } catch (netErr) {
       console.warn('Notice during backend sync in executeStartNewWeek:', netErr);
+      return {
+        success: false,
+        weeklyCycle: params.currentCycle || 1,
+        weeklyStudyDaysTarget: targetDays,
+        weeklyStudyDays: chosenDays,
+        routines: params.currentRoutines || ({} as any),
+        message: 'Network error communicating with backend.',
+      };
     }
 
     // Step 5: Construct clean, sanitized routines:
@@ -373,7 +392,8 @@ export async function executeStartNewWeek(
     const rawRoutines = data?.routines || params.currentRoutines || {};
     const sanitizedRoutines: Record<DayOfWeek, RoutineItem[]> = {} as any;
     ALL_DAYS.forEach((day) => {
-      const dayList = rawRoutines[day] || [];
+      const candidateList = rawRoutines[day] || defaultRoutinesByDay[day] || [];
+      const dayList = candidateList.length > 0 ? candidateList : (defaultRoutinesByDay[day] || []);
       sanitizedRoutines[day] = dayList.map((act: any) => {
         const isVideoAct =
           act.id?.endsWith('1') ||
@@ -434,50 +454,15 @@ export async function executeStartNewWeek(
       message: data?.message || 'New week cycle started successfully with all days ready for Choose a Topic.',
     };
   } catch (unexpectedError) {
-    console.error('Critical error in executeStartNewWeek, applying safe fallback:', unexpectedError);
-
-    // Construct safe fallback routines so UI is never left in broken or loading state
-    const rawRoutines: Partial<Record<DayOfWeek, RoutineItem[]>> = params.currentRoutines || {};
-    const fallbackRoutines: Record<DayOfWeek, RoutineItem[]> = {} as any;
-    ALL_DAYS.forEach((day) => {
-      const dayList = rawRoutines[day] || [];
-      fallbackRoutines[day] = dayList.map((act: any) => {
-        const isVideoAct =
-          act.id?.endsWith('1') ||
-          act.activityName?.toLowerCase().includes('vídeo') ||
-          act.activityName?.toLowerCase().includes('video');
-        if (isVideoAct) {
-          return {
-            ...act,
-            activityName: 'Video of the Day',
-            playlistId: '',
-            playlistTitle: '',
-            teacherVideos: [],
-            learnedWords: [],
-            completed: false,
-            completedToday: false,
-            isRepeatVideo: false,
-            repeatVideo: false,
-          };
-        }
-        return {
-          ...act,
-          learnedWords: [],
-          completed: false,
-          completedToday: false,
-          isRepeatVideo: false,
-          repeatVideo: false,
-        };
-      });
-    });
+    console.error('Critical error in executeStartNewWeek, reporting backend failure:', unexpectedError);
 
     return {
-      success: true,
-      weeklyCycle: fallbackCycle,
+      success: false,
+      weeklyCycle: params.currentCycle || 1,
       weeklyStudyDaysTarget: targetDays,
       weeklyStudyDays: chosenDays,
-      routines: fallbackRoutines,
-      message: 'New week cycle initiated with local safe recovery.',
+      routines: params.currentRoutines || ({} as any),
+      message: 'Critical error starting new week cycle.',
     };
   }
 }
