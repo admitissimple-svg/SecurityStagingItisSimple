@@ -21,8 +21,16 @@ import {
   Compass,
   CheckSquare,
   ChevronRight,
+  Save,
 } from 'lucide-react';
-import { WeeklyHomeworkData, Language, HomeworkAiEvaluation, SentenceWritingPrompt, DayOfWeek } from '../types';
+import {
+  WeeklyHomeworkData,
+  Language,
+  HomeworkAiEvaluation,
+  SentenceWritingPrompt,
+  DayOfWeek,
+  HomeworkPartProgress,
+} from '../types';
 import {
   checkStudentWritingApi,
   evaluateWeeklyHomeworkApi,
@@ -360,8 +368,8 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     !isSyntheticHomeworkEvaluation(homework.aiEvaluation)
   );
 
-  const [activeTab, setActiveTab] = useState<'matching' | 'fill' | 'writing' | 'reading' | 'results'>(
-    homework?.isCompleted && hasGenuineEvaluation ? 'results' : dailySchedule.partKey
+  const [activeTab, setActiveTab] = useState<'matching' | 'fill' | 'writing' | 'reading'>(
+    dailySchedule.partKey
   );
 
   const [matchingAnswers, setMatchingAnswers] = useState<Record<string, string>>(
@@ -377,6 +385,16 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     homework?.studentAnswers?.quizAnswers || {}
   );
 
+  const [partsProgress, setPartsProgress] = useState<NonNullable<WeeklyHomeworkData['partsProgress']>>(() => {
+    return homework?.partsProgress || {};
+  });
+  const [isSavingPart, setIsSavingPart] = useState<Record<string, boolean>>({
+    matching: false,
+    fill: false,
+    writing: false,
+    reading: false,
+  });
+
   const [aiEvaluation, setAiEvaluation] = useState<HomeworkAiEvaluation | undefined>(
     hasGenuineEvaluation ? homework?.aiEvaluation : undefined
   );
@@ -389,6 +407,9 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       setFillAnswers((prev) => ({ ...(homework.studentAnswers?.fillInBlanks || {}), ...prev }));
       setSentenceAnswers((prev) => ({ ...(homework.studentAnswers?.sentences || {}), ...prev }));
       setQuizAnswers((prev) => ({ ...(homework.studentAnswers?.quizAnswers || {}), ...prev }));
+    }
+    if (homework?.partsProgress) {
+      setPartsProgress((prev) => ({ ...(homework.partsProgress || {}), ...prev }));
     }
     if (
       homework?.aiEvaluation &&
@@ -410,7 +431,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
         });
       }
     }
-  }, [homework?.id, homework?.studentAnswers, homework?.aiEvaluation]);
+  }, [homework?.id, homework?.studentAnswers, homework?.aiEvaluation, homework?.partsProgress]);
 
   // Synchronize student answers with parent state and Cloud Firestore
   const lastSavedJsonRef = React.useRef<string>('');
@@ -439,6 +460,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
         sentences: sentenceAnswers,
         quizAnswers: quizAnswers,
       },
+      partsProgress,
       aiEvaluation: effectiveEvaluation,
       score: effectiveScore,
       isCompleted: effectiveIsCompleted,
@@ -453,20 +475,14 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     }, 500);
 
     return () => clearTimeout(timer);
-  }, [matchingAnswers, fillAnswers, sentenceAnswers, quizAnswers, isOpen, homework, onSaveProgress, aiEvaluation]);
+  }, [matchingAnswers, fillAnswers, sentenceAnswers, quizAnswers, partsProgress, isOpen, homework, onSaveProgress, aiEvaluation]);
 
-  // Track initial tab selection when modal opens without locking user into results
+  // Track initial tab selection when modal opens
   const wasOpenRef = React.useRef(false);
   React.useEffect(() => {
     if (isOpen && !wasOpenRef.current) {
       wasOpenRef.current = true;
-      if (selectedDay) {
-        setActiveTab(dailySchedule.partKey);
-      } else if (homework?.isCompleted && hasGenuineEvaluation) {
-        setActiveTab('results');
-      } else {
-        setActiveTab(dailySchedule.partKey);
-      }
+      setActiveTab(dailySchedule.partKey);
     } else if (!isOpen) {
       wasOpenRef.current = false;
     }
@@ -557,12 +573,37 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     [activeStudyDays, weeklyCycle, targetDay]
   );
 
+  // Per-part completion indicators
+  const isPart1Completed = Boolean(
+    partsProgress.matching?.status === 'completed' ||
+    homework?.completedPartsByDay?.[getDayForPart('matching')]
+  );
+  const isPart2Completed = Boolean(
+    partsProgress.fill?.status === 'completed' ||
+    homework?.completedPartsByDay?.[getDayForPart('fill')]
+  );
+  const isPart3Completed = Boolean(
+    partsProgress.writing?.status === 'completed' ||
+    (hasGenuineEvaluation && isWritingComplete)
+  );
+  const isPart4Completed = Boolean(
+    partsProgress.reading?.status === 'completed' ||
+    homework?.completedPartsByDay?.[getDayForPart('reading')]
+  );
+
   // Event-driven helper to synchronously mark S-Path completed and persist to state/DB
   const markSPathCompleted = useCallback(
-    (day: DayOfWeek, partKey: string) => {
+    (day: DayOfWeek, partKey: string, updatedPartsProgress?: WeeklyHomeworkData['partsProgress']) => {
       const effectiveEvaluation = aiEvaluation || homework?.aiEvaluation;
       const effectiveScore = (effectiveEvaluation ? effectiveEvaluation.overallScore : homework?.score) ?? 0;
-      const effectiveIsCompleted = Boolean((effectiveEvaluation && effectiveScore > 0) || homework?.isCompleted);
+      const effectivePartsProgress = updatedPartsProgress || partsProgress || homework?.partsProgress || {};
+
+      const allFourDone = Boolean(
+        effectivePartsProgress.matching?.status === 'completed' &&
+        effectivePartsProgress.fill?.status === 'completed' &&
+        effectivePartsProgress.writing?.status === 'completed' &&
+        effectivePartsProgress.reading?.status === 'completed'
+      );
 
       const updated: WeeklyHomeworkData = {
         ...homework,
@@ -577,9 +618,10 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
           sentences: { ...(homework?.studentAnswers?.sentences || {}), ...sentenceAnswers },
           quizAnswers: { ...(homework?.studentAnswers?.quizAnswers || {}), ...quizAnswers },
         },
+        partsProgress: effectivePartsProgress,
         aiEvaluation: effectiveEvaluation,
         score: effectiveScore,
-        isCompleted: effectiveIsCompleted,
+        isCompleted: allFourDone || Boolean(homework?.isCompleted),
       };
 
       onSaveProgress(updated);
@@ -587,46 +629,345 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
         onCompleteTodayPart(partKey as any, day);
       }
     },
-    [homework, matchingAnswers, fillAnswers, sentenceAnswers, quizAnswers, onSaveProgress, onCompleteTodayPart, aiEvaluation]
+    [homework, matchingAnswers, fillAnswers, sentenceAnswers, quizAnswers, onSaveProgress, onCompleteTodayPart, aiEvaluation, partsProgress]
   );
 
-  // Strict Automated S-Path Tracking for each of the 4 parts independently
-  const completedPartsReportedRef = React.useRef<Set<string>>(new Set());
+  // Dedicated Save Handlers per part
+  const handleSavePart1 = async () => {
+    if (!isMatchingComplete) {
+      setSubmittedFeedbackToast(
+        isEn
+          ? `Please match all ${homework.matchingPairs.length} words before saving Part 1.`
+          : `Por favor, associe todas as ${homework.matchingPairs.length} palavras antes de salvar a Parte 1.`
+      );
+      setTimeout(() => setSubmittedFeedbackToast(null), 3500);
+      return;
+    }
 
-  useEffect(() => {
-    if (!isOpen || !homework) return;
+    setIsSavingPart((prev) => ({ ...prev, matching: true }));
+    try {
+      const total = homework.matchingPairs.length;
+      const correct = homework.matchingPairs.filter((pair) => {
+        const safeKey = pair.word ? pair.word.toLowerCase().replace(/[^a-z0-9]/g, '_') : '';
+        const userAns = matchingAnswers[pair.id] || (safeKey ? matchingAnswers[`match-${safeKey}`] : '') || matchingAnswers[pair.word] || '';
+        return userAns.trim().toLowerCase() === pair.word.toLowerCase();
+      }).length;
+      const score = total > 0 ? Math.round((correct / total) * 100) : 100;
 
-    const partsState: Array<{ key: string; isComplete: boolean; partNum: number }> = [
-      { key: 'matching', isComplete: isMatchingComplete, partNum: 1 },
-      { key: 'fill', isComplete: isFillComplete, partNum: 2 },
-      { key: 'writing', isComplete: isWritingComplete, partNum: 3 },
-      { key: 'reading', isComplete: isReadingComplete, partNum: 4 },
-    ];
+      const updatedPart: HomeworkPartProgress = {
+        partKey: 'matching',
+        partNumber: 1,
+        status: 'completed',
+        answers: matchingAnswers,
+        score,
+        completedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
 
-    partsState.forEach(({ key, isComplete, partNum }) => {
-      if (isComplete && !completedPartsReportedRef.current.has(key)) {
-        completedPartsReportedRef.current.add(key);
-        const dayForPart = getDayForPart(key);
-        markSPathCompleted(dayForPart, key);
-        setSubmittedFeedbackToast(
-          isEn
-            ? `🎉 Part ${partNum} completed! Automatically marked on your S-Path progression.`
-            : `🎉 Parte ${partNum} concluída! Marcada automaticamente no seu Gráfico S-Path.`
+      const nextPartsProgress = {
+        ...partsProgress,
+        matching: updatedPart,
+      };
+      setPartsProgress(nextPartsProgress);
+
+      const dayForPart = getDayForPart('matching');
+      markSPathCompleted(dayForPart, 'matching', nextPartsProgress);
+
+      setSubmittedFeedbackToast(
+        isEn
+          ? '🎉 Part 1 saved and recorded on S-Path!'
+          : '🎉 Parte 1 salva e gravada no S-Path com sucesso!'
+      );
+      setTimeout(() => setSubmittedFeedbackToast(null), 3500);
+    } finally {
+      setIsSavingPart((prev) => ({ ...prev, matching: false }));
+    }
+  };
+
+  const handleSavePart2 = async () => {
+    if (!isFillComplete) {
+      setSubmittedFeedbackToast(
+        isEn
+          ? `Please answer all ${homework.fillInBlanks.length} blank questions before saving Part 2.`
+          : `Por favor, preencha todas as ${homework.fillInBlanks.length} lacunas antes de salvar a Parte 2.`
+      );
+      setTimeout(() => setSubmittedFeedbackToast(null), 3500);
+      return;
+    }
+
+    setIsSavingPart((prev) => ({ ...prev, fill: true }));
+    try {
+      const total = homework.fillInBlanks.length;
+      const correct = homework.fillInBlanks.filter((fill) => {
+        const safeKey = fill.correctWord ? fill.correctWord.toLowerCase().replace(/[^a-z0-9]/g, '_') : '';
+        const userAns = fillAnswers[fill.id] || (safeKey ? fillAnswers[`fill-${safeKey}`] : '') || fillAnswers[fill.correctWord] || '';
+        return userAns.trim().toLowerCase() === fill.correctWord.toLowerCase();
+      }).length;
+      const score = total > 0 ? Math.round((correct / total) * 100) : 100;
+
+      const updatedPart: HomeworkPartProgress = {
+        partKey: 'fill',
+        partNumber: 2,
+        status: 'completed',
+        answers: fillAnswers,
+        score,
+        completedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+      const nextPartsProgress = {
+        ...partsProgress,
+        fill: updatedPart,
+      };
+      setPartsProgress(nextPartsProgress);
+
+      const dayForPart = getDayForPart('fill');
+      markSPathCompleted(dayForPart, 'fill', nextPartsProgress);
+
+      setSubmittedFeedbackToast(
+        isEn
+          ? '🎉 Part 2 saved and recorded on S-Path!'
+          : '🎉 Parte 2 salva e gravada no S-Path com sucesso!'
+      );
+      setTimeout(() => setSubmittedFeedbackToast(null), 3500);
+    } finally {
+      setIsSavingPart((prev) => ({ ...prev, fill: false }));
+    }
+  };
+
+  const handleSavePart3 = async () => {
+    if (!isWritingComplete) {
+      setSubmittedFeedbackToast(
+        isEn
+          ? `Please write your sentences for all ${homework.sentenceWritingPrompts.length} words before saving Part 3.`
+          : `Por favor, escreva suas frases para todas as ${homework.sentenceWritingPrompts.length} palavras antes de salvar a Parte 3.`
+      );
+      setTimeout(() => setSubmittedFeedbackToast(null), 3500);
+      return;
+    }
+
+    setIsSavingPart((prev) => ({ ...prev, writing: true }));
+    setEvalError(null);
+
+    // 1. Immediately persist typed student answers to Firestore so they are never lost
+    const inProgressPart: HomeworkPartProgress = {
+      partKey: 'writing',
+      partNumber: 3,
+      status: 'pending_evaluation',
+      answers: sentenceAnswers,
+      updatedAt: new Date().toISOString(),
+    };
+    const inProgressParts = {
+      ...partsProgress,
+      writing: inProgressPart,
+    };
+    setPartsProgress(inProgressParts);
+
+    const inProgressUpdate: WeeklyHomeworkData = {
+      ...homework,
+      studentAnswers: {
+        ...(homework.studentAnswers || {}),
+        matching: matchingAnswers,
+        fillInBlanks: fillAnswers,
+        sentences: sentenceAnswers,
+        quizAnswers: quizAnswers,
+      },
+      partsProgress: inProgressParts,
+    };
+    onSaveProgress(inProgressUpdate);
+
+    // 2. Check if an authentic, genuine evaluation already exists and matches current student sentences
+    const activeEval = aiEvaluation || homework?.aiEvaluation;
+    const existingIsLegitimate = Boolean(
+      activeEval &&
+      isValidHomeworkEvaluation(activeEval) &&
+      !isSyntheticHomeworkEvaluation(activeEval) &&
+      (homework.sentenceWritingPrompts || []).every((p) => {
+        const studentSentence = (
+          sentenceAnswers[p.word] ||
+          sentenceAnswers[p.word.trim()] ||
+          sentenceAnswers[p.word.toLowerCase()] ||
+          ''
+        ).trim().toLowerCase();
+        const sentencesList = activeEval?.sentenceFeedback || (activeEval as any)?.sentenceEvaluationResults || [];
+        const evaluatedItem = sentencesList.find(
+          (r: any) => (r.word || '').toLowerCase() === p.word.toLowerCase()
         );
-        setTimeout(() => setSubmittedFeedbackToast(null), 4000);
+        const evaluatedSentence = (evaluatedItem?.originalSentence || '').trim().toLowerCase();
+        return studentSentence === evaluatedSentence || (!studentSentence && Boolean(evaluatedSentence));
+      })
+    );
+
+    if (existingIsLegitimate && activeEval) {
+      setAiEvaluation(activeEval);
+      const completedPart: HomeworkPartProgress = {
+        partKey: 'writing',
+        partNumber: 3,
+        status: 'completed',
+        answers: sentenceAnswers,
+        evaluation: activeEval,
+        score: activeEval.overallScore,
+        completedAt: activeEval.evaluatedAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      const finalParts = { ...partsProgress, writing: completedPart };
+      setPartsProgress(finalParts);
+
+      const dayForPart = getDayForPart('writing');
+      markSPathCompleted(dayForPart, 'writing', finalParts);
+
+      setSubmittedFeedbackToast(
+        isEn
+          ? '🎉 Part 3 evaluation verified and recorded on S-Path!'
+          : '🎉 Avaliação da Parte 3 verificada e gravada no S-Path!'
+      );
+      setTimeout(() => setSubmittedFeedbackToast(null), 3500);
+      setIsSavingPart((prev) => ({ ...prev, writing: false }));
+      return;
+    }
+
+    // 3. Request genuine AI evaluation from server endpoint (which runs 3-model Gemini contingency)
+    try {
+      const currentAnswers = {
+        matching: matchingAnswers,
+        fillInBlanks: fillAnswers,
+        sentences: sentenceAnswers,
+        quizAnswers: quizAnswers,
+      };
+
+      const evalResult = await evaluateWeeklyHomeworkApi({
+        homework,
+        studentAnswers: currentAnswers,
+        studentLevel: homework.studentLevel || 'Beginner',
+        studentName: homework.studentName || 'Student',
+        currentLanguage,
+      });
+
+      if (!evalResult || !isValidHomeworkEvaluation(evalResult) || isSyntheticHomeworkEvaluation(evalResult)) {
+        throw new Error(
+          isEn
+            ? 'The pedagogical evaluation could not be completed at this moment. No synthetic scores have been created.'
+            : 'A correção pedagógica não pôde ser concluída neste momento. Nenhuma pontuação sintética foi gerada.'
+        );
       }
-    });
-  }, [
-    isOpen,
-    homework,
-    isMatchingComplete,
-    isFillComplete,
-    isWritingComplete,
-    isReadingComplete,
-    getDayForPart,
-    markSPathCompleted,
-    isEn,
-  ]);
+
+      setAiEvaluation(evalResult);
+
+      const completedPart: HomeworkPartProgress = {
+        partKey: 'writing',
+        partNumber: 3,
+        status: 'completed',
+        answers: sentenceAnswers,
+        evaluation: evalResult,
+        score: evalResult.overallScore,
+        completedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      const finalParts = { ...partsProgress, writing: completedPart };
+      setPartsProgress(finalParts);
+
+      const dayForPart = getDayForPart('writing');
+      markSPathCompleted(dayForPart, 'writing', finalParts);
+
+      setSubmittedFeedbackToast(
+        isEn
+          ? '🎉 Part 3 evaluated by AI and recorded on S-Path!'
+          : '🎉 Parte 3 corrigida pela IA e gravada no S-Path com sucesso!'
+      );
+      setTimeout(() => setSubmittedFeedbackToast(null), 3500);
+    } catch (err: any) {
+      console.warn('AI evaluation error in Part 3, preserving sentences in Firestore with status pending_evaluation:', err);
+      const friendlyMsg =
+        err?.message ||
+        (isEn
+          ? 'The pedagogical grading AI is temporarily unavailable after checking contingency models. Your sentences have been safely preserved in Firestore. Please click "Retry Evaluation" to try again.'
+          : 'A IA de correção pedagógica está temporariamente indisponível após verificação dos modelos de contingência. Suas frases foram salvas no Firestore. Por favor, clique em "Tentar Novamente".');
+      setEvalError(friendlyMsg);
+    } finally {
+      setIsSavingPart((prev) => ({ ...prev, writing: false }));
+    }
+  };
+
+  const handleSavePart4 = async () => {
+    if (!isReadingComplete) {
+      setSubmittedFeedbackToast(
+        isEn
+          ? `Please answer all ${homework.readingPassage.questions.length} comprehension questions before saving Part 4.`
+          : `Por favor, responda todas as ${homework.readingPassage.questions.length} perguntas de compreensão antes de salvar a Parte 4.`
+      );
+      setTimeout(() => setSubmittedFeedbackToast(null), 3500);
+      return;
+    }
+
+    setIsSavingPart((prev) => ({ ...prev, reading: true }));
+    try {
+      const total = homework.readingPassage.questions.length;
+      const correct = homework.readingPassage.questions.filter((q, idx) => {
+        const chosen = quizAnswers[q.id] !== undefined ? quizAnswers[q.id] : quizAnswers[String(idx)];
+        return chosen === q.correctAnswer;
+      }).length;
+      const score = total > 0 ? Math.round((correct / total) * 100) : 100;
+
+      const updatedPart: HomeworkPartProgress = {
+        partKey: 'reading',
+        partNumber: 4,
+        status: 'completed',
+        answers: quizAnswers,
+        score,
+        completedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+      const nextPartsProgress = {
+        ...partsProgress,
+        reading: updatedPart,
+      };
+      setPartsProgress(nextPartsProgress);
+
+      const dayForPart = getDayForPart('reading');
+      markSPathCompleted(dayForPart, 'reading', nextPartsProgress);
+
+      // Check if all 4 parts are now completed
+      const allPartsCompleted = Boolean(
+        nextPartsProgress.matching?.status === 'completed' &&
+        nextPartsProgress.fill?.status === 'completed' &&
+        nextPartsProgress.writing?.status === 'completed' &&
+        nextPartsProgress.reading?.status === 'completed'
+      );
+
+      if (allPartsCompleted) {
+        const s1 = nextPartsProgress.matching?.score ?? 100;
+        const s2 = nextPartsProgress.fill?.score ?? 100;
+        const s3 = nextPartsProgress.writing?.score ?? (aiEvaluation?.overallScore ?? 100);
+        const s4 = score;
+        const overallScore = Math.round((s1 * 0.2) + (s2 * 0.25) + (s3 * 0.35) + (s4 * 0.2));
+
+        const fullHw: WeeklyHomeworkData = {
+          ...homework,
+          partsProgress: nextPartsProgress,
+          studentAnswers: {
+            matching: matchingAnswers,
+            fillInBlanks: fillAnswers,
+            sentences: sentenceAnswers,
+            quizAnswers: quizAnswers,
+          },
+          isCompleted: true,
+          score: overallScore,
+          submittedAt: homework.submittedAt || new Date().toISOString(),
+        };
+        onSaveProgress(fullHw);
+      }
+
+      setSubmittedFeedbackToast(
+        isEn
+          ? '🎉 Part 4 saved and recorded on S-Path!'
+          : '🎉 Parte 4 salva e gravada no S-Path com sucesso!'
+      );
+      setTimeout(() => setSubmittedFeedbackToast(null), 3500);
+    } finally {
+      setIsSavingPart((prev) => ({ ...prev, reading: false }));
+    }
+  };
 
   const handleCheckSentence = async (prompt: SentenceWritingPrompt, textOverride?: string) => {
     const wordKey = prompt.word;
@@ -733,139 +1074,6 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
         [wordKey.toUpperCase()]: false,
         [wordKey.toLowerCase()]: false,
       }));
-    }
-  };
-
-  const handleCalculateScore = async () => {
-    setIsEvaluatingAll(true);
-    setEvalError(null);
-
-    const currentAnswers = {
-      matching: matchingAnswers,
-      fillInBlanks: fillAnswers,
-      sentences: sentenceAnswers,
-      quizAnswers: quizAnswers,
-    };
-
-    // 2. Check if an authentic, genuine evaluation already exists and matches current student sentences
-    const activeEval = aiEvaluation || homework?.aiEvaluation;
-    const existingIsLegitimate = Boolean(
-      activeEval &&
-      isValidHomeworkEvaluation(activeEval) &&
-      !isSyntheticHomeworkEvaluation(activeEval) &&
-      (homework.sentenceWritingPrompts || []).every((p) => {
-        const studentSentence = (
-          sentenceAnswers[p.word] ||
-          sentenceAnswers[p.word.trim()] ||
-          sentenceAnswers[p.word.toLowerCase()] ||
-          ''
-        ).trim().toLowerCase();
-        const sentencesList = activeEval?.sentenceFeedback || (activeEval as any)?.sentenceEvaluationResults || [];
-        const evaluatedItem = sentencesList.find(
-          (r: any) => (r.word || '').toLowerCase() === p.word.toLowerCase()
-        );
-        const evaluatedSentence = (evaluatedItem?.originalSentence || '').trim().toLowerCase();
-        return studentSentence === evaluatedSentence || (!studentSentence && Boolean(evaluatedSentence));
-      })
-    );
-
-    // 1. Immediately persist typed student answers to Firestore so they are never lost
-    const inProgressUpdate: WeeklyHomeworkData = {
-      ...homework,
-      studentAnswers: currentAnswers,
-      aiEvaluation: activeEval,
-      score: (activeEval ? activeEval.overallScore : homework?.score) ?? 0,
-      isCompleted: Boolean((activeEval && activeEval.overallScore > 0) || homework?.isCompleted),
-      completedPartsByDay: {
-        ...(homework?.completedPartsByDay || {}),
-        [targetDay]: true,
-      },
-    };
-    onSaveProgress(inProgressUpdate);
-
-    if (existingIsLegitimate && activeEval) {
-      setAiEvaluation(activeEval);
-      // Re-use legitimate evaluation without triggering duplicate Gemini calls
-      const updated: WeeklyHomeworkData = {
-        ...homework,
-        isCompleted: true,
-        score: activeEval.overallScore,
-        submittedAt: homework.submittedAt || new Date().toISOString(),
-        studentAnswers: currentAnswers,
-        aiEvaluation: activeEval,
-        completedPartsByDay: {
-          ...(homework?.completedPartsByDay || {}),
-          [targetDay]: true,
-        },
-        isDayPartCompleted: true,
-      };
-      onSaveProgress(updated);
-      setIsEvaluatingAll(false);
-      setActiveTab('results');
-      return;
-    }
-
-    // 3. Request genuine AI evaluation from server endpoint (which runs 3-model Gemini contingency)
-    try {
-      const evalResult = await evaluateWeeklyHomeworkApi({
-        homework,
-        studentAnswers: currentAnswers,
-        studentLevel: homework.studentLevel || 'Beginner',
-        studentName: homework.studentName || 'Student',
-        currentLanguage,
-      });
-
-      if (!evalResult || !isValidHomeworkEvaluation(evalResult) || isSyntheticHomeworkEvaluation(evalResult)) {
-        throw new Error(
-          isEn
-            ? 'The pedagogical evaluation could not be completed at this moment. No synthetic scores have been created.'
-            : 'A correção pedagógica não pôde ser concluída neste momento. Nenhuma pontuação sintética foi gerada.'
-        );
-      }
-
-      setAiEvaluation(evalResult);
-
-      const updated: WeeklyHomeworkData = {
-        ...homework,
-        isCompleted: true,
-        score: evalResult.overallScore,
-        submittedAt: new Date().toISOString(),
-        studentAnswers: currentAnswers,
-        aiEvaluation: evalResult,
-        completedPartsByDay: {
-          ...(homework?.completedPartsByDay || {}),
-          [targetDay]: true,
-        },
-        isDayPartCompleted: true,
-      };
-
-      onSaveProgress(updated);
-      if (onCompleteTodayPart) {
-        const partsToReport: Array<{ key: string; isComplete: boolean }> = [
-          { key: 'matching', isComplete: isMatchingComplete },
-          { key: 'fill', isComplete: isFillComplete },
-          { key: 'writing', isComplete: isWritingComplete },
-          { key: 'reading', isComplete: isReadingComplete },
-        ];
-        partsToReport.forEach(({ key, isComplete }) => {
-          if (isComplete) {
-            const d = getDayForPart(key);
-            onCompleteTodayPart(key as any, d);
-          }
-        });
-        onCompleteTodayPart(dailySchedule.partKey, targetDay);
-      }
-      setActiveTab('results');
-    } catch (err: any) {
-      console.warn('AI evaluation error, transparently reporting unavailability without creating artificial score:', err);
-      const friendlyMsg =
-        err?.message ||
-        (isEn
-          ? 'The pedagogical grading AI is temporarily unavailable. Your answers have been safely preserved. Please try again in a moment.'
-          : 'A IA de correção pedagógica está temporariamente indisponível. Suas respostas foram salvas com segurança. Por favor, tente novamente em instantes.');
-      setEvalError(friendlyMsg);
-    } finally {
-      setIsEvaluatingAll(false);
     }
   };
 
@@ -1162,17 +1370,6 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                     </span>
                   )}
                 </button>
-                <button
-                  type="button"
-                  onClick={() => setActiveTab('results')}
-                  className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition shrink-0 cursor-pointer flex items-center gap-1.5 ${
-                    activeTab === 'results'
-                      ? 'bg-[#000035] text-white shadow-2xs'
-                      : 'text-slate-600 hover:text-[#000035] hover:bg-slate-200/60'
-                  }`}
-                >
-                  {memT.tabs.results}
-                </button>
               </div>
             </div>
 
@@ -1315,34 +1512,112 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                     })}
                   </div>
 
-                  {/* Footer */}
-                  <div className="pt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100">
-                    {isMatchingComplete || (dailySchedule.partKey === 'matching' && isTodayPartCompleted) ? (
-                      <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 px-3 py-1.5 rounded-xl border border-emerald-200">
-                        <CheckCircle className="w-4 h-4 text-emerald-600" />
-                        <span>{isEn ? 'Recorded on S-Path' : 'Gravado no S-Path automaticamente'}</span>
+                  {/* Action Bar & Save Part 1 */}
+                  <div className="pt-3 flex flex-wrap items-center justify-between gap-3 border-t border-slate-200">
+                    <div className="flex items-center gap-2">
+                      {isPart1Completed ? (
+                        <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 px-3 py-1.5 rounded-xl border border-emerald-200">
+                          <CheckCircle className="w-4 h-4 text-emerald-600" />
+                          <span>{isEn ? 'Recorded on S-Path' : 'Gravado no S-Path'}</span>
+                        </div>
+                      ) : (
+                        <span className="text-[11px] text-slate-500 font-medium">
+                          {memT.part1.answeredCount(
+                            Object.values(matchingAnswers).filter(Boolean).length,
+                            homework.matchingPairs.length
+                          )} • {isEn ? 'Answer all to record on S-Path' : 'Responda todas para gravar no S-Path'}
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-2.5">
+                      <button
+                        type="button"
+                        onClick={handleSavePart1}
+                        disabled={isSavingPart.matching}
+                        className="px-5 py-2.5 bg-[#000035] hover:bg-[#062863] text-white rounded-xl font-bold text-xs flex items-center gap-2 shadow-xs cursor-pointer transition disabled:opacity-50"
+                      >
+                        <Save className="w-4 h-4 text-[#9AB4FF]" />
+                        <span>{isEn ? 'Save Part 1' : 'Salvar Parte 1'}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab('fill')}
+                        className="px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-[#000035] rounded-xl font-bold text-xs flex items-center gap-1.5 transition cursor-pointer"
+                      >
+                        <span>{memT.part1.nextBtn}</span>
+                        <ArrowRight className="w-4 h-4 text-[#1C4C96]" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* STAGE-BY-STAGE PEDAGOGICAL CORRECTIONS (Part 1) */}
+                  <div className="pt-4 border-t border-slate-200 space-y-3">
+                    <h4 className="font-bold text-xs uppercase tracking-wider text-slate-700 flex items-center gap-1.5">
+                      <CheckSquare className="w-4 h-4 text-[#1C4C96]" />
+                      <span>{isEn ? 'STAGE-BY-STAGE PEDAGOGICAL CORRECTIONS' : 'CORREÇÃO PEDAGÓGICA PASSO A PASSO'}</span>
+                    </h4>
+
+                    <div className="p-4 bg-white rounded-2xl border border-slate-200 space-y-3 shadow-xs">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-[#000035]">
+                          {isEn ? 'Part 1: Meaning Association' : 'Parte 1: Associação de Palavras'}
+                        </span>
+                        <span className="text-[11px] text-slate-500 font-semibold">
+                          {homework.matchingPairs.length} {isEn ? 'items' : 'itens'}
+                        </span>
                       </div>
-                    ) : (
-                      <span className="text-[11px] text-slate-500 font-medium">
-                        {memT.part1.answeredCount(
-                          Object.values(matchingAnswers).filter(Boolean).length,
-                          homework.matchingPairs.length
-                        )} • {isEn ? 'Answer all to record on S-Path' : 'Responda todas para gravar no S-Path'}
-                      </span>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (isMatchingComplete) {
-                          markSPathCompleted(getDayForPart('matching'), 'matching');
-                        }
-                        setActiveTab('fill');
-                      }}
-                      className="px-5 py-2 bg-[#000035] hover:bg-[#062863] text-white rounded-xl font-bold text-xs flex items-center gap-2 shadow-2xs cursor-pointer transition ml-auto"
-                    >
-                      <span>{memT.part1.nextBtn}</span>
-                      <ArrowRight className="w-4 h-4 text-[#9AB4FF]" />
-                    </button>
+
+                      <div className="space-y-2">
+                        {homework.matchingPairs.map((pair) => {
+                          const safeKey = pair.word ? pair.word.toLowerCase().replace(/[^a-z0-9]/g, '_') : '';
+                          const userAns = matchingAnswers[pair.id] || (safeKey ? matchingAnswers[`match-${safeKey}`] : '') || matchingAnswers[pair.word] || '';
+                          const isAnswered = Boolean(userAns.trim());
+                          const isMatchCorrect = isAnswered && userAns.toLowerCase() === pair.word.toLowerCase();
+                          const actName = wordToActivityMap[pair.word.toLowerCase()];
+
+                          return (
+                            <div
+                              key={pair.id}
+                              className={`p-3 rounded-xl border text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 transition ${
+                                !isAnswered
+                                  ? 'bg-slate-50/70 border-slate-200'
+                                  : isMatchCorrect
+                                  ? 'bg-emerald-50/60 border-emerald-200'
+                                  : 'bg-amber-50/60 border-amber-200'
+                              }`}
+                            >
+                              <div className="space-y-1">
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <p className="font-bold text-slate-900 capitalize text-xs">{pair.word}</p>
+                                  {actName && (
+                                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-blue-100 text-[#000035] border border-blue-200">
+                                      {isEn ? 'Activity:' : 'Atividade:'} {actName}
+                                    </span>
+                                  )}
+                                </div>
+                                <p className="text-[11px] text-slate-600">{pair.definition}</p>
+                              </div>
+
+                              <div className="text-right shrink-0">
+                                {!isAnswered ? (
+                                  <span className="text-[11px] font-semibold text-slate-500">
+                                    ⏳ {isEn ? 'Pending / Not answered' : 'Pendente / Não respondido'}
+                                  </span>
+                                ) : (
+                                  <span className={`text-[11px] font-bold ${isMatchCorrect ? 'text-emerald-700' : 'text-amber-700'}`}>
+                                    {isMatchCorrect
+                                      ? `✓ ${isEn ? 'Matched' : 'Associado'}: ${userAns}`
+                                      : `✗ ${isEn ? 'Chosen' : 'Escolhido'}: ${userAns} → ${isEn ? 'Correct' : 'Correto'}: ${pair.word}`}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
                   </div>
                 </div>
               )}
@@ -1423,34 +1698,122 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                     })}
                   </div>
 
-                  {/* Footer */}
-                  <div className="pt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100">
-                    <button
-                      type="button"
-                      onClick={() => setActiveTab('matching')}
-                      className="px-3.5 py-2 text-slate-600 hover:text-slate-900 hover:bg-slate-100 rounded-xl text-xs font-bold transition cursor-pointer"
-                    >
-                      {memT.part2.backBtn}
-                    </button>
-                    {(isFillComplete || (dailySchedule.partKey === 'fill' && isTodayPartCompleted)) && (
-                      <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 px-3 py-1.5 rounded-xl border border-emerald-200">
-                        <CheckCircle className="w-4 h-4 text-emerald-600" />
-                        <span>{isEn ? 'Recorded on S-Path' : 'Gravado no S-Path automaticamente'}</span>
+                  {/* Action Bar & Save Part 2 */}
+                  <div className="pt-3 flex flex-wrap items-center justify-between gap-3 border-t border-slate-200">
+                    <div className="flex items-center gap-2.5">
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab('matching')}
+                        className="px-3.5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition cursor-pointer flex items-center gap-1.5"
+                      >
+                        <ArrowLeft className="w-4 h-4 text-[#1C4C96]" />
+                        <span>{memT.part2.backBtn}</span>
+                      </button>
+
+                      {isPart2Completed ? (
+                        <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 px-3 py-1.5 rounded-xl border border-emerald-200">
+                          <CheckCircle className="w-4 h-4 text-emerald-600" />
+                          <span>{isEn ? 'Recorded on S-Path' : 'Gravado no S-Path'}</span>
+                        </div>
+                      ) : (
+                        <span className="text-[11px] text-slate-500 font-medium">
+                          {memT.part2.completedCount(
+                            Object.values(fillAnswers).filter(Boolean).length,
+                            homework.fillInBlanks.length
+                          )} • {isEn ? 'Answer all to record on S-Path' : 'Responda todas para gravar no S-Path'}
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-2.5">
+                      <button
+                        type="button"
+                        onClick={handleSavePart2}
+                        disabled={isSavingPart.fill}
+                        className="px-5 py-2.5 bg-[#000035] hover:bg-[#062863] text-white rounded-xl font-bold text-xs flex items-center gap-2 shadow-xs cursor-pointer transition disabled:opacity-50"
+                      >
+                        <Save className="w-4 h-4 text-[#9AB4FF]" />
+                        <span>{isEn ? 'Save Part 2' : 'Salvar Parte 2'}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab('writing')}
+                        className="px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-[#000035] rounded-xl font-bold text-xs flex items-center gap-1.5 transition cursor-pointer"
+                      >
+                        <span>{memT.part2.nextBtn}</span>
+                        <ArrowRight className="w-4 h-4 text-[#1C4C96]" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* STAGE-BY-STAGE PEDAGOGICAL CORRECTIONS (Part 2) */}
+                  <div className="pt-4 border-t border-slate-200 space-y-3">
+                    <h4 className="font-bold text-xs uppercase tracking-wider text-slate-700 flex items-center gap-1.5">
+                      <CheckSquare className="w-4 h-4 text-[#1C4C96]" />
+                      <span>{isEn ? 'STAGE-BY-STAGE PEDAGOGICAL CORRECTIONS' : 'CORREÇÃO PEDAGÓGICA PASSO A PASSO'}</span>
+                    </h4>
+
+                    <div className="p-4 bg-white rounded-2xl border border-slate-200 space-y-3 shadow-xs">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-[#000035]">
+                          {isEn ? 'Part 2: Fill in the Blanks' : 'Parte 2: Lacunas da Rotina'}
+                        </span>
+                        <span className="text-[11px] text-slate-500 font-semibold">
+                          {homework.fillInBlanks.length} {isEn ? 'items' : 'itens'}
+                        </span>
                       </div>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (isFillComplete) {
-                          markSPathCompleted(getDayForPart('fill'), 'fill');
-                        }
-                        setActiveTab('writing');
-                      }}
-                      className="px-5 py-2 bg-[#000035] hover:bg-[#062863] text-white rounded-xl font-bold text-xs flex items-center gap-2 shadow-2xs cursor-pointer transition ml-auto"
-                    >
-                      <span>{memT.part2.nextBtn}</span>
-                      <ArrowRight className="w-4 h-4 text-[#9AB4FF]" />
-                    </button>
+
+                      <div className="space-y-2">
+                        {homework.fillInBlanks.map((fill) => {
+                          const safeKey = fill.correctWord ? fill.correctWord.toLowerCase().replace(/[^a-z0-9]/g, '_') : '';
+                          const userAns = fillAnswers[fill.id] || (safeKey ? fillAnswers[`fill-${safeKey}`] : '') || fillAnswers[fill.correctWord] || '';
+                          const isAnswered = Boolean(userAns.trim());
+                          const isFillCorrect = isAnswered && userAns.toLowerCase() === fill.correctWord.toLowerCase();
+                          const actName = wordToActivityMap[fill.correctWord.toLowerCase()];
+
+                          return (
+                            <div
+                              key={fill.id}
+                              className={`p-3 rounded-xl border text-xs space-y-1.5 transition ${
+                                !isAnswered
+                                  ? 'bg-slate-50/70 border-slate-200'
+                                  : isFillCorrect
+                                  ? 'bg-emerald-50/60 border-emerald-200'
+                                  : 'bg-amber-50/60 border-amber-200'
+                              }`}
+                            >
+                              <div className="flex flex-wrap items-center justify-between gap-1.5">
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="font-semibold text-slate-900">{fill.sentenceWithBlank}</span>
+                                  {actName && (
+                                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-blue-100 text-[#000035] border border-blue-200">
+                                      {isEn ? 'Activity:' : 'Atividade:'} {actName}
+                                    </span>
+                                  )}
+                                </div>
+                                {!isAnswered ? (
+                                  <span className="text-[11px] font-semibold text-slate-500">
+                                    ⏳ {isEn ? 'Pending / Not answered' : 'Pendente / Não respondido'}
+                                  </span>
+                                ) : (
+                                  <span className={`text-[11px] font-bold ${isFillCorrect ? 'text-emerald-700' : 'text-amber-700'}`}>
+                                    {isFillCorrect
+                                      ? `✓ ${userAns}`
+                                      : `✗ ${userAns} → ${isEn ? 'Target' : 'Correto'}: ${fill.correctWord}`}
+                                  </span>
+                                )}
+                              </div>
+                              <p className="text-[11px] text-slate-600">
+                                {isEn
+                                  ? (fill.explanationEn || fill.hintEn || `Correct word is "${fill.correctWord}".`)
+                                  : (fill.explanationPt || fill.hintPt || `A palavra correta é "${fill.correctWord}".`)}
+                              </p>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
                   </div>
                 </div>
               )}
@@ -1546,6 +1909,17 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                                 ...prev,
                                 [prompt.word]: newVal,
                               }));
+                              if (partsProgress.writing?.status === 'completed') {
+                                setPartsProgress((prev) => ({
+                                  ...prev,
+                                  writing: {
+                                    ...prev.writing!,
+                                    status: 'draft',
+                                    answers: { ...sentenceAnswers, [prompt.word]: newVal },
+                                    updatedAt: new Date().toISOString(),
+                                  },
+                                }));
+                              }
                             }}
                             placeholder={memT.part3.placeholder(prompt.word)}
                             className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs font-medium text-slate-900 focus:bg-white focus:outline-none focus:ring-1 focus:ring-[#1C4C96] focus:border-[#1C4C96] transition"
@@ -1678,34 +2052,189 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                     })}
                   </div>
 
-                  {/* Footer */}
-                  <div className="pt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100">
-                    <button
-                      type="button"
-                      onClick={() => setActiveTab('fill')}
-                      className="px-3.5 py-2 text-slate-600 hover:text-slate-900 hover:bg-slate-100 rounded-xl text-xs font-bold transition cursor-pointer"
-                    >
-                      {memT.part3.backBtn}
-                    </button>
-                    {(isWritingComplete || (dailySchedule.partKey === 'writing' && isTodayPartCompleted)) && (
-                      <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 px-3 py-1.5 rounded-xl border border-emerald-200">
-                        <CheckCircle className="w-4 h-4 text-emerald-600" />
-                        <span>{isEn ? 'Recorded on S-Path' : 'Gravado no S-Path automaticamente'}</span>
+                  {/* Action Bar & Save Part 3 */}
+                  <div className="pt-3 flex flex-wrap items-center justify-between gap-3 border-t border-slate-200">
+                    <div className="flex items-center gap-2.5">
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab('fill')}
+                        className="px-3.5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition cursor-pointer flex items-center gap-1.5"
+                      >
+                        <ArrowLeft className="w-4 h-4 text-[#1C4C96]" />
+                        <span>{memT.part3.backBtn}</span>
+                      </button>
+
+                      {isPart3Completed ? (
+                        <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 px-3 py-1.5 rounded-xl border border-emerald-200">
+                          <CheckCircle className="w-4 h-4 text-emerald-600" />
+                          <span>{isEn ? 'Recorded on S-Path' : 'Gravado no S-Path'}</span>
+                        </div>
+                      ) : (
+                        <span className="text-[11px] text-slate-500 font-medium">
+                          {Object.values(sentenceAnswers).filter((s) => (s || '').trim().length >= 3).length} / {homework.sentenceWritingPrompts.length} {isEn ? 'written' : 'escritas'} • {isEn ? 'Write all to record on S-Path' : 'Escreva todas para gravar no S-Path'}
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-2.5">
+                      <button
+                        type="button"
+                        onClick={handleSavePart3}
+                        disabled={isSavingPart.writing}
+                        className="px-5 py-2.5 bg-[#000035] hover:bg-[#062863] text-white rounded-xl font-bold text-xs flex items-center gap-2 shadow-xs cursor-pointer transition disabled:opacity-50"
+                      >
+                        {isSavingPart.writing ? (
+                          <>
+                            <Sparkles className="w-4 h-4 text-[#9AB4FF] animate-spin" />
+                            <span>{isEn ? 'Evaluating with AI...' : 'Avaliando com IA...'}</span>
+                          </>
+                        ) : evalError ? (
+                          <>
+                            <RefreshCw className="w-4 h-4 text-[#9AB4FF]" />
+                            <span>{isEn ? 'Retry Evaluation' : 'Tentar Avaliação Novamente'}</span>
+                          </>
+                        ) : (
+                          <>
+                            <Save className="w-4 h-4 text-[#9AB4FF]" />
+                            <span>{isEn ? 'Save Part 3' : 'Salvar Parte 3'}</span>
+                          </>
+                        )}
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab('reading')}
+                        className="px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-[#000035] rounded-xl font-bold text-xs flex items-center gap-1.5 transition cursor-pointer"
+                      >
+                        <span>{memT.part3.nextBtn}</span>
+                        <ArrowRight className="w-4 h-4 text-[#1C4C96]" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* AI Evaluation Error Banner if unavailable (Transparent Contingency Reporting) */}
+                  {evalError && (
+                    <div className="p-4 bg-amber-50 border border-amber-300 rounded-2xl flex items-start gap-3 text-amber-950 text-xs shadow-xs animate-in fade-in duration-200">
+                      <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                      <div className="flex-1 space-y-1.5">
+                        <p className="font-bold text-amber-900">
+                          {isEn ? 'AI Pedagogical Evaluation Unavailable' : 'Avaliação Pedagógica da IA Indisponível'}
+                        </p>
+                        <p className="text-amber-800 leading-relaxed font-medium">
+                          {evalError}
+                        </p>
+                        <p className="text-[11px] text-amber-700">
+                          {isEn
+                            ? 'Your written sentences have been safely preserved in Firestore. No synthetic or artificial grades were created.'
+                            : 'Suas frases escritas foram salvas com segurança no Firestore. Nenhuma nota fictícia foi gerada.'}
+                        </p>
+                        <div className="pt-1">
+                          <button
+                            type="button"
+                            onClick={handleSavePart3}
+                            disabled={isSavingPart.writing}
+                            className="px-3.5 py-1.5 bg-[#000035] hover:bg-[#062863] text-white rounded-lg text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer shadow-xs transition disabled:opacity-50"
+                          >
+                            <RefreshCw className={`w-3.5 h-3.5 text-[#9AB4FF] ${isSavingPart.writing ? 'animate-spin' : ''}`} />
+                            <span>{isEn ? 'Retry AI Evaluation' : 'Tentar Novamente Avaliação da IA'}</span>
+                          </button>
+                        </div>
                       </div>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (isWritingComplete) {
-                          markSPathCompleted(getDayForPart('writing'), 'writing');
-                        }
-                        setActiveTab('reading');
-                      }}
-                      className="px-5 py-2 bg-[#000035] hover:bg-[#062863] text-white rounded-xl font-bold text-xs flex items-center gap-2 shadow-2xs cursor-pointer transition ml-auto"
-                    >
-                      <span>{memT.part3.nextBtn}</span>
-                      <ArrowRight className="w-4 h-4 text-[#9AB4FF]" />
-                    </button>
+                    </div>
+                  )}
+
+                  {/* STAGE-BY-STAGE PEDAGOGICAL CORRECTIONS (Part 3) */}
+                  <div className="pt-4 border-t border-slate-200 space-y-3">
+                    <h4 className="font-bold text-xs uppercase tracking-wider text-slate-700 flex items-center gap-1.5">
+                      <CheckSquare className="w-4 h-4 text-[#1C4C96]" />
+                      <span>{isEn ? 'STAGE-BY-STAGE PEDAGOGICAL CORRECTIONS' : 'CORREÇÃO PEDAGÓGICA PASSO A PASSO'}</span>
+                    </h4>
+
+                    <div className="p-4 bg-white rounded-2xl border border-slate-200 space-y-3 shadow-xs">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-[#000035]">
+                          {isEn ? 'Part 3: Sentence Writing' : 'Parte 3: Construção de Frases Ativas'}
+                        </span>
+                        <span className="text-[11px] text-slate-500 font-semibold">
+                          {homework.sentenceWritingPrompts.length} {isEn ? 'sentences' : 'frases'}
+                        </span>
+                      </div>
+
+                      <div className="space-y-2.5">
+                        {homework.sentenceWritingPrompts.map((prompt) => {
+                          const userSentence = (sentenceAnswers[prompt.word] || '').trim();
+                          const feedback = sentenceFeedbacks[prompt.word];
+                          const evalItem = aiEvaluation?.sentenceFeedback?.find(
+                            (s) => s.word.toLowerCase() === prompt.word.toLowerCase()
+                          );
+                          const actName = wordToActivityMap[prompt.word.toLowerCase()];
+
+                          const isSentenceOk = evalItem?.isCorrect ?? (userSentence.length >= 8 && (!feedback || !feedback.hasAnyError));
+                          const corrected = evalItem?.correctedSentence || feedback?.correctedSentence;
+                          const explanation = isEn
+                            ? (evalItem?.explanationEn || feedback?.overallSummaryEn)
+                            : (evalItem?.explanationPt || feedback?.overallSummaryPt);
+
+                          return (
+                            <div
+                              key={prompt.word}
+                              className={`p-3 rounded-xl border text-xs space-y-1.5 transition ${
+                                !userSentence
+                                  ? 'bg-slate-50/70 border-slate-200'
+                                  : isSentenceOk
+                                  ? 'bg-emerald-50/60 border-emerald-200'
+                                  : 'bg-amber-50/60 border-amber-200'
+                              }`}
+                            >
+                              <div className="flex items-center justify-between gap-2 flex-wrap">
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="font-bold text-[#000035] uppercase tracking-wide bg-[#9AB4FF]/20 px-2 py-0.5 rounded text-[10px]">
+                                    {prompt.word}
+                                  </span>
+                                  {actName && (
+                                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-blue-100 text-[#000035] border border-blue-200">
+                                      {isEn ? 'Activity:' : 'Atividade:'} {actName}
+                                    </span>
+                                  )}
+                                </div>
+                                <span className={`text-[11px] font-bold ${!userSentence ? 'text-slate-500' : isSentenceOk ? 'text-emerald-700' : 'text-amber-700'}`}>
+                                  {!userSentence
+                                    ? `⏳ ${isEn ? 'Pending / Not answered' : 'Pendente / Não respondido'}`
+                                    : isSentenceOk
+                                    ? (isEn ? '✓ Well Structured' : '✓ Bem Estruturada')
+                                    : (isEn ? '⚠ Needs Review' : '⚠ Revisão Recomendada')}
+                                </span>
+                              </div>
+
+                              <p className="text-[11px] text-slate-800 italic">
+                                <span className="text-slate-500 font-normal mr-1">{isEn ? 'Your sentence:' : 'Sua frase:'}</span>
+                                "{userSentence || (isEn ? '(no sentence provided yet)' : '(nenhuma frase enviada ainda)')}"
+                              </p>
+
+                              {corrected && corrected !== userSentence && (
+                                <p className="text-[11px] text-[#000035] bg-white/80 p-2 rounded-md border border-slate-200 font-medium">
+                                  <span className="text-slate-500 mr-1 font-normal">{isEn ? 'Recommended form:' : 'Forma recomendada:'}</span>
+                                  "{corrected}"
+                                </p>
+                              )}
+
+                              {explanation && (
+                                <p className="text-[11px] text-slate-600">
+                                  {explanation}
+                                </p>
+                              )}
+
+                              {evalItem && (evalItem.levelAdvicePt || evalItem.levelAdviceEn) && (
+                                <p className="text-[10px] text-[#1C4C96] font-medium flex items-center gap-1">
+                                  <Compass className="w-3 h-3 shrink-0" />
+                                  <span>{isEn ? evalItem.levelAdviceEn : evalItem.levelAdvicePt}</span>
+                                </p>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
                   </div>
                 </div>
               )}
@@ -1814,399 +2343,77 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                     </div>
                   )}
 
-                  {/* Footer */}
-                  <div className="pt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100">
-                    <button
-                      type="button"
-                      onClick={() => setActiveTab('writing')}
-                      className="px-3.5 py-2 text-slate-600 hover:text-slate-900 hover:bg-slate-100 rounded-xl text-xs font-bold transition cursor-pointer"
-                    >
-                      {memT.part4.backBtn}
-                    </button>
-                    <div className="flex items-center gap-2">
-                      {(isReadingComplete || (dailySchedule.partKey === 'reading' && isTodayPartCompleted)) && (
-                        <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 px-3 py-1.5 rounded-xl border border-emerald-200">
-                          <CheckCircle className="w-4 h-4 text-emerald-600" />
-                          <span>{isEn ? 'Recorded on S-Path' : 'Gravado no S-Path automaticamente'}</span>
-                        </div>
-                      )}
+                  {/* Action Bar & Save Part 4 */}
+                  <div className="pt-3 flex flex-wrap items-center justify-between gap-3 border-t border-slate-200">
+                    <div className="flex items-center gap-2.5">
                       <button
                         type="button"
-                        onClick={handleCalculateScore}
-                        disabled={isEvaluatingAll}
-                        className="px-5 py-2 bg-[#000035] hover:bg-[#062863] text-white rounded-xl font-bold text-xs flex items-center gap-2 shadow-2xs cursor-pointer transition disabled:opacity-50"
-                      >
-                        {isEvaluatingAll ? (
-                          <>
-                            <Sparkles className="w-4 h-4 text-[#9AB4FF] animate-spin" />
-                            <span>{isEn ? 'Grading with AI...' : 'Corrigindo com IA...'}</span>
-                          </>
-                        ) : evalError ? (
-                          <>
-                            <RefreshCw className="w-4 h-4 text-[#9AB4FF]" />
-                            <span>{isEn ? 'Try AI Evaluation Again' : 'Tentar Avaliação Novamente'}</span>
-                          </>
-                        ) : (
-                          <>
-                            <Award className="w-4 h-4 text-[#9AB4FF]" />
-                            <span>{memT.part4.submitBtn}</span>
-                          </>
-                        )}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {/* TAB 5: RESULTS & DETAILED FEEDBACK */}
-              {activeTab === 'results' && (
-                <div className="space-y-5">
-                  {/* Top Navigation & Return to Part 4 Bar */}
-                  <div className="p-3.5 bg-gradient-to-r from-blue-50 to-indigo-50 rounded-2xl border border-blue-200/80 flex flex-wrap items-center justify-between gap-3 shadow-xs">
-                    <button
-                      type="button"
-                      onClick={() => setActiveTab('reading')}
-                      className="px-4 py-2 bg-[#000035] hover:bg-[#062863] text-white rounded-xl text-xs font-bold flex items-center gap-2 cursor-pointer shadow-xs transition"
-                    >
-                      <ArrowLeft className="w-4 h-4 text-[#9AB4FF]" />
-                      <span>{isEn ? 'Return to Part 4: Story & Questions' : 'Voltar para a Parte 4: História e Perguntas'}</span>
-                    </button>
-                    <span className="text-xs font-bold text-[#1C4C96] bg-white px-3 py-1 rounded-lg border border-blue-200">
-                      {isEn ? 'Evaluation & Corrections' : 'Resultado da Correção da IA'}
-                    </span>
-                  </div>
-
-                  {/* Top Score & Level Banner */}
-                  <div className="p-6 bg-[#000035] text-white rounded-2xl text-center space-y-3 shadow-sm border border-[#1C4C96]">
-                    <div className="w-12 h-12 bg-[#062863] text-[#9AB4FF] rounded-xl mx-auto flex items-center justify-center border border-[#607EC9]/40">
-                      <Award className="w-6 h-6" />
-                    </div>
-                    <div>
-                      <div className="flex items-center justify-center gap-2">
-                        <span className="text-[11px] font-bold uppercase tracking-wider text-[#9AB4FF]">
-                          {memT.results.scoreTitle}
-                        </span>
-                        <span className="text-[10px] font-black px-2.5 py-0.5 rounded-full bg-emerald-400 text-slate-950">
-                          {studentLevelDisplay}
-                        </span>
-                      </div>
-                      <h3 className="text-4xl font-black text-white mt-1">
-                        {homework.score || 100}%
-                      </h3>
-                    </div>
-                    <p className="text-xs text-[#9AB4FF]/80 max-w-md mx-auto">
-                      {memT.results.congrats}
-                    </p>
-
-                    <div className="pt-2 flex justify-center">
-                      <button
-                        type="button"
-                        onClick={() => setActiveTab('reading')}
-                        className="px-5 py-2.5 bg-white text-[#000035] hover:bg-slate-100 rounded-xl text-xs font-black flex items-center gap-2 shadow-xs cursor-pointer transition"
+                        onClick={() => setActiveTab('writing')}
+                        className="px-3.5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition cursor-pointer flex items-center gap-1.5"
                       >
                         <ArrowLeft className="w-4 h-4 text-[#1C4C96]" />
-                        <span>{isEn ? 'Return to Part 4' : 'Voltar para a Parte 4'}</span>
+                        <span>{memT.part4.backBtn}</span>
+                      </button>
+
+                      {isPart4Completed ? (
+                        <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 px-3 py-1.5 rounded-xl border border-emerald-200">
+                          <CheckCircle className="w-4 h-4 text-emerald-600" />
+                          <span>{isEn ? 'Recorded on S-Path' : 'Gravado no S-Path'}</span>
+                        </div>
+                      ) : (
+                        <span className="text-[11px] text-slate-500 font-medium">
+                          {Object.keys(quizAnswers).length} / {homework.readingPassage.questions.length} {isEn ? 'answered' : 'respondidas'} • {isEn ? 'Answer all to record on S-Path' : 'Responda todas para gravar no S-Path'}
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-2.5">
+                      <button
+                        type="button"
+                        onClick={handleSavePart4}
+                        disabled={isSavingPart.reading}
+                        className="px-5 py-2.5 bg-[#000035] hover:bg-[#062863] text-white rounded-xl font-bold text-xs flex items-center gap-2 shadow-xs cursor-pointer transition disabled:opacity-50"
+                      >
+                        <Save className="w-4 h-4 text-[#9AB4FF]" />
+                        <span>{isEn ? 'Save Part 4' : 'Salvar Parte 4'}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleSubmit}
+                        className="px-5 py-2.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl font-bold text-xs flex items-center gap-2 shadow-xs cursor-pointer transition"
+                      >
+                        <Send className="w-4 h-4 text-emerald-200" />
+                        <span>{isEn ? 'Submit to Teacher' : 'Enviar ao Professor'}</span>
                       </button>
                     </div>
                   </div>
 
-                  {/* Routine Activities Practiced Banner */}
-                  {routineActivityNames.length > 0 && (
-                    <div className="p-4 bg-blue-50/90 rounded-2xl border border-blue-200 space-y-2 shadow-xs">
-                      <div className="flex items-center gap-2 text-xs font-bold text-[#000035]">
-                        <Layers className="w-4 h-4 text-[#1C4C96]" />
-                        <span>
-                          {isEn ? 'Routine Activities Practiced This Week:' : 'Atividades da Rotina Praticadas Nesta Semana:'}
-                        </span>
-                      </div>
-                      <div className="flex flex-wrap gap-2 pt-0.5">
-                        {routineActivityNames.map((actName, idx) => (
-                          <span
-                            key={idx}
-                            className="px-3 py-1 rounded-xl bg-white border border-blue-200 text-xs font-bold text-[#000035] shadow-2xs flex items-center gap-1.5"
-                          >
-                            <span className="w-2 h-2 rounded-full bg-[#1C4C96]" />
-                            {actName}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* AI Tutor Pedagogical Feedback Summary */}
-                  {aiEvaluation && (
-                    <div className="p-4 bg-gradient-to-br from-indigo-50/60 to-blue-50/60 rounded-2xl border border-indigo-100 space-y-3">
-                      <div className="flex items-center gap-2 text-xs font-bold text-[#000035]">
-                        <MessageSquare className="w-4 h-4 text-[#1C4C96]" />
-                        <span>
-                          {isEn
-                            ? `Native Friend AI Tutor Feedback (${aiEvaluation.studentLevel || homework.studentLevel || 'Calibrated'})`
-                            : `Feedback do Amigo Nativo IA (${aiEvaluation.studentLevel || homework.studentLevel || 'Calibrado'})`}
-                        </span>
-                      </div>
-                      <p className="text-xs text-slate-700 leading-relaxed font-medium">
-                        {isEn
-                          ? (aiEvaluation.tutorFeedbackSummaryEn || aiEvaluation.tutorFeedbackSummaryPt)
-                          : (aiEvaluation.tutorFeedbackSummaryPt || aiEvaluation.tutorFeedbackSummaryEn)}
-                      </p>
-
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-1">
-                        {Boolean(aiEvaluation.levelStrengthsPt || aiEvaluation.levelStrengthsEn) && (
-                          <div className="p-3 bg-white/90 rounded-xl border border-emerald-100 space-y-1">
-                            <span className="text-[11px] font-bold text-emerald-800 flex items-center gap-1">
-                              <CheckCircle className="w-3.5 h-3.5 text-emerald-600" />
-                              {isEn ? 'Demonstrated Strengths' : 'Pontos Fortes'}
-                            </span>
-                            <p className="text-[11px] text-slate-600 leading-normal">
-                              {isEn
-                                ? (aiEvaluation.levelStrengthsEn || aiEvaluation.levelStrengthsPt)
-                                : (aiEvaluation.levelStrengthsPt || aiEvaluation.levelStrengthsEn)}
-                            </p>
-                          </div>
-                        )}
-
-                        {Boolean(aiEvaluation.levelNextStepsPt || aiEvaluation.levelNextStepsEn) && (
-                          <div className="p-3 bg-white/90 rounded-xl border border-blue-100 space-y-1">
-                            <span className="text-[11px] font-bold text-[#1C4C96] flex items-center gap-1">
-                              <Compass className="w-3.5 h-3.5 text-[#1C4C96]" />
-                              {isEn ? 'Next Step Focus' : 'Próximos Passos'}
-                            </span>
-                            <p className="text-[11px] text-slate-600 leading-normal">
-                              {isEn
-                                ? (aiEvaluation.levelNextStepsEn || aiEvaluation.levelNextStepsPt)
-                                : (aiEvaluation.levelNextStepsPt || aiEvaluation.levelNextStepsEn)}
-                            </p>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Stage-by-Stage Detailed Corrections */}
-                  <div className="space-y-4">
+                  {/* STAGE-BY-STAGE PEDAGOGICAL CORRECTIONS (Part 4) */}
+                  <div className="pt-4 border-t border-slate-200 space-y-4">
                     <h4 className="font-bold text-xs uppercase tracking-wider text-slate-700 flex items-center gap-1.5">
                       <CheckSquare className="w-4 h-4 text-[#1C4C96]" />
-                      <span>{isEn ? 'Stage-by-Stage Pedagogical Corrections' : 'Correção Pedagógica Passo a Passo'}</span>
+                      <span>{isEn ? 'STAGE-BY-STAGE PEDAGOGICAL CORRECTIONS' : 'CORREÇÃO PEDAGÓGICA PASSO A PASSO'}</span>
                     </h4>
 
-                    {/* Part 1 Corrections */}
-                    <div className="p-4 bg-white rounded-xl border border-slate-200 space-y-2.5">
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs font-bold text-[#000035]">
-                          {isEn ? 'Part 1: Meaning Association' : 'Parte 1: Associação de Palavras'}
-                        </span>
-                        <span className="text-[11px] text-slate-500">
-                          {homework.matchingPairs.length} {isEn ? 'items' : 'itens'}
-                        </span>
-                      </div>
-                      <div className="space-y-2">
-                        {homework.matchingPairs.map((pair) => {
-                          const safeKey = pair.word ? pair.word.toLowerCase().replace(/[^a-z0-9]/g, '_') : '';
-                          const userAns = matchingAnswers[pair.id] || (safeKey ? matchingAnswers[`match-${safeKey}`] : '') || matchingAnswers[pair.word] || '';
-                          const isAnswered = Boolean(userAns.trim());
-                          const isMatchCorrect = isAnswered && userAns.toLowerCase() === pair.word.toLowerCase();
-                          const actName = wordToActivityMap[pair.word.toLowerCase()];
-                          return (
-                            <div
-                              key={pair.id}
-                              className={`p-2.5 rounded-lg border text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 ${
-                                !isAnswered
-                                  ? 'bg-slate-50/70 border-slate-200'
-                                  : isMatchCorrect
-                                  ? 'bg-emerald-50/50 border-emerald-200'
-                                  : 'bg-amber-50/50 border-amber-200'
-                              }`}
-                            >
-                              <div className="space-y-0.5">
-                                <div className="flex items-center gap-2 flex-wrap">
-                                  <p className="font-bold text-slate-900 capitalize">{pair.word}</p>
-                                  {actName && (
-                                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-blue-100 text-[#000035] border border-blue-200">
-                                      {isEn ? 'Activity:' : 'Atividade:'} {actName}
-                                    </span>
-                                  )}
-                                </div>
-                                <p className="text-[11px] text-slate-600">{pair.definition}</p>
-                              </div>
-                              <div className="text-right shrink-0">
-                                {!isAnswered ? (
-                                  <span className="text-[11px] font-semibold text-slate-500">
-                                    ⏳ {isEn ? 'Pending / Not answered' : 'Pendente / Não respondido'}
-                                  </span>
-                                ) : (
-                                  <span className={`text-[11px] font-bold ${isMatchCorrect ? 'text-emerald-700' : 'text-amber-700'}`}>
-                                    {isMatchCorrect
-                                      ? `✓ ${isEn ? 'Matched' : 'Associado'}: ${userAns}`
-                                      : `✗ ${isEn ? 'Chosen' : 'Escolhido'}: ${userAns} → ${isEn ? 'Correct' : 'Correto'}: ${pair.word}`}
-                                  </span>
-                                )}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    {/* Part 2 Corrections */}
-                    <div className="p-4 bg-white rounded-xl border border-slate-200 space-y-2.5">
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs font-bold text-[#000035]">
-                          {isEn ? 'Part 2: Fill in the Blanks' : 'Parte 2: Lacunas da Rotina'}
-                        </span>
-                        <span className="text-[11px] text-slate-500">
-                          {homework.fillInBlanks.length} {isEn ? 'items' : 'itens'}
-                        </span>
-                      </div>
-                      <div className="space-y-2">
-                        {homework.fillInBlanks.map((fill) => {
-                          const safeKey = fill.correctWord ? fill.correctWord.toLowerCase().replace(/[^a-z0-9]/g, '_') : '';
-                          const userAns = fillAnswers[fill.id] || (safeKey ? fillAnswers[`fill-${safeKey}`] : '') || fillAnswers[fill.correctWord] || '';
-                          const isAnswered = Boolean(userAns.trim());
-                          const isFillCorrect = isAnswered && userAns.toLowerCase() === fill.correctWord.toLowerCase();
-                          const actName = wordToActivityMap[fill.correctWord.toLowerCase()];
-                          return (
-                            <div
-                              key={fill.id}
-                              className={`p-2.5 rounded-lg border text-xs space-y-1 ${
-                                !isAnswered
-                                  ? 'bg-slate-50/70 border-slate-200'
-                                  : isFillCorrect
-                                  ? 'bg-emerald-50/50 border-emerald-200'
-                                  : 'bg-amber-50/50 border-amber-200'
-                              }`}
-                            >
-                              <div className="flex flex-wrap items-center justify-between gap-1">
-                                <div className="flex items-center gap-2 flex-wrap">
-                                  <span className="font-semibold text-slate-900">{fill.sentenceWithBlank}</span>
-                                  {actName && (
-                                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-blue-100 text-[#000035] border border-blue-200">
-                                      {isEn ? 'Activity:' : 'Atividade:'} {actName}
-                                    </span>
-                                  )}
-                                </div>
-                                {!isAnswered ? (
-                                  <span className="text-[11px] font-semibold text-slate-500">
-                                    ⏳ {isEn ? 'Pending / Not answered' : 'Pendente / Não respondido'}
-                                  </span>
-                                ) : (
-                                  <span className={`text-[11px] font-bold ${isFillCorrect ? 'text-emerald-700' : 'text-amber-700'}`}>
-                                    {isFillCorrect
-                                      ? `✓ ${userAns}`
-                                      : `✗ ${userAns} → ${isEn ? 'Target' : 'Correto'}: ${fill.correctWord}`}
-                                  </span>
-                                )}
-                              </div>
-                              <p className="text-[11px] text-slate-600">
-                                {isEn
-                                  ? (fill.explanationEn || fill.hintEn || `Correct word is "${fill.correctWord}".`)
-                                  : (fill.explanationPt || fill.hintPt || `A palavra correta é "${fill.correctWord}".`)}
-                              </p>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    {/* Part 3 Corrections */}
-                    <div className="p-4 bg-white rounded-xl border border-slate-200 space-y-2.5">
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs font-bold text-[#000035]">
-                          {isEn ? 'Part 3: Sentence Writing' : 'Parte 3: Construção de Frases Ativas'}
-                        </span>
-                        <span className="text-[11px] text-slate-500">
-                          {homework.sentenceWritingPrompts.length} {isEn ? 'sentences' : 'frases'}
-                        </span>
-                      </div>
-                      <div className="space-y-2.5">
-                        {homework.sentenceWritingPrompts.map((prompt) => {
-                          const userSentence = (sentenceAnswers[prompt.word] || '').trim();
-                          const feedback = sentenceFeedbacks[prompt.word];
-                          const evalItem = aiEvaluation?.sentenceFeedback?.find((s) => s.word.toLowerCase() === prompt.word.toLowerCase());
-                          const actName = wordToActivityMap[prompt.word.toLowerCase()];
-
-                          const isSentenceOk = evalItem?.isCorrect ?? (userSentence.length >= 8 && (!feedback || !feedback.hasAnyError));
-                          const corrected = evalItem?.correctedSentence || feedback?.correctedSentence;
-                          const explanation = isEn
-                            ? (evalItem?.explanationEn || feedback?.overallSummaryEn)
-                            : (evalItem?.explanationPt || feedback?.overallSummaryPt);
-
-                          return (
-                            <div
-                              key={prompt.word}
-                              className={`p-3 rounded-xl border text-xs space-y-1.5 ${
-                                !userSentence
-                                  ? 'bg-slate-50/70 border-slate-200'
-                                  : isSentenceOk
-                                  ? 'bg-emerald-50/50 border-emerald-200'
-                                  : 'bg-amber-50/50 border-amber-200'
-                              }`}
-                            >
-                              <div className="flex items-center justify-between gap-2 flex-wrap">
-                                <div className="flex items-center gap-2 flex-wrap">
-                                  <span className="font-bold text-[#000035] uppercase tracking-wide bg-[#9AB4FF]/20 px-2 py-0.5 rounded text-[10px]">
-                                    {prompt.word}
-                                  </span>
-                                  {actName && (
-                                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-blue-100 text-[#000035] border border-blue-200">
-                                      {isEn ? 'Activity:' : 'Atividade:'} {actName}
-                                    </span>
-                                  )}
-                                </div>
-                                <span className={`text-[11px] font-bold ${!userSentence ? 'text-slate-500' : isSentenceOk ? 'text-emerald-700' : 'text-amber-700'}`}>
-                                  {!userSentence
-                                    ? `⏳ ${isEn ? 'Pending / Not answered' : 'Pendente / Não respondido'}`
-                                    : isSentenceOk
-                                    ? (isEn ? '✓ Well Structured' : '✓ Bem Estruturada')
-                                    : (isEn ? '⚠ Needs Review' : '⚠ Revisão Recomendada')}
-                                </span>
-                              </div>
-
-                              <p className="text-[11px] text-slate-800 italic">
-                                <span className="text-slate-500 font-normal mr-1">{isEn ? 'Your sentence:' : 'Sua frase:'}</span>
-                                "{userSentence || (isEn ? '(no sentence provided yet)' : '(nenhuma frase enviada ainda)')}"
-                              </p>
-
-                              {corrected && corrected !== userSentence && (
-                                <p className="text-[11px] text-[#000035] bg-white/80 p-2 rounded-md border border-slate-200 font-medium">
-                                  <span className="text-slate-500 mr-1 font-normal">{isEn ? 'Recommended form:' : 'Forma recomendada:'}</span>
-                                  "{corrected}"
-                                </p>
-                              )}
-
-                              {explanation && (
-                                <p className="text-[11px] text-slate-600">
-                                  {explanation}
-                                </p>
-                              )}
-
-                              {evalItem && (evalItem.levelAdvicePt || evalItem.levelAdviceEn) && (
-                                <p className="text-[10px] text-[#1C4C96] font-medium flex items-center gap-1">
-                                  <Compass className="w-3 h-3 shrink-0" />
-                                  <span>{isEn ? evalItem.levelAdviceEn : evalItem.levelAdvicePt}</span>
-                                </p>
-                              )}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    {/* Part 4 Corrections */}
-                    <div className="p-4 bg-white rounded-xl border border-slate-200 space-y-2.5">
+                    {/* Part 4 Questions Feedback Card */}
+                    <div className="p-4 bg-white rounded-2xl border border-slate-200 space-y-3 shadow-xs">
                       <div className="flex items-center justify-between flex-wrap gap-2">
                         <span className="text-xs font-bold text-[#000035]">
                           {isEn ? 'Part 4: Mini-Story Reading' : 'Parte 4: Interpretação de Texto'}
                         </span>
-                        <span className="text-[11px] text-slate-500">
+                        <span className="text-[11px] text-slate-500 font-semibold">
                           {homework.readingPassage.questions.length} {isEn ? 'questions' : 'perguntas'}
                         </span>
                       </div>
+
                       {routineActivityNames.length > 0 && (
                         <div className="text-[11px] text-[#1C4C96] bg-blue-50/90 p-2.5 rounded-lg border border-blue-200 font-medium">
                           <span className="font-bold text-[#000035] mr-1.5">{isEn ? 'Story Context:' : 'Contexto das Atividades:'}</span>
                           {routineActivityNames.join(' • ')}
                         </div>
                       )}
+
                       <div className="space-y-2">
                         {homework.readingPassage.questions.map((q, idx) => {
                           const chosenIdx = quizAnswers[q.id] !== undefined ? quizAnswers[q.id] : quizAnswers[String(idx)];
@@ -2215,12 +2422,12 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                           return (
                             <div
                               key={q.id}
-                              className={`p-2.5 rounded-lg border text-xs space-y-1 ${
+                              className={`p-3 rounded-xl border text-xs space-y-1.5 transition ${
                                 !isAnswered
                                   ? 'bg-slate-50/70 border-slate-200'
                                   : isQuizCorrect
-                                  ? 'bg-emerald-50/50 border-emerald-200'
-                                  : 'bg-amber-50/50 border-amber-200'
+                                  ? 'bg-emerald-50/60 border-emerald-200'
+                                  : 'bg-amber-50/60 border-amber-200'
                               }`}
                             >
                               <p className="font-semibold text-slate-900">
@@ -2249,56 +2456,109 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                         })}
                       </div>
                     </div>
-                  </div>
 
-                  {/* Vocabulary Key */}
-                  <div className="p-4 bg-slate-50 rounded-xl border border-slate-200 space-y-2 text-xs">
-                    <span className="font-bold text-[#000035] uppercase text-[11px] block">
-                      {memT.results.vocabKeyLabel}
-                    </span>
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                      {homework.matchingPairs.map((item, idx) => {
-                        const actName = wordToActivityMap[item.word.toLowerCase()];
-                        return (
-                          <div key={idx} className="flex flex-col sm:flex-row sm:items-center justify-between border-b border-slate-200 pb-1.5 pt-1 text-xs gap-1.5">
-                            <div className="flex items-center gap-1.5 flex-wrap">
-                              <span className="font-bold text-slate-800 capitalize">{item.word}</span>
-                              {actName && (
-                                <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-blue-100/90 text-[#000035] border border-blue-200">
-                                  {actName}
-                                </span>
-                              )}
+                    {/* AI Tutor Pedagogical Feedback Summary */}
+                    {aiEvaluation && (
+                      <div className="p-4 bg-gradient-to-br from-indigo-50/60 to-blue-50/60 rounded-2xl border border-indigo-100 space-y-3">
+                        <div className="flex items-center gap-2 text-xs font-bold text-[#000035]">
+                          <MessageSquare className="w-4 h-4 text-[#1C4C96]" />
+                          <span>
+                            {isEn
+                              ? `Native Friend AI Tutor Feedback (${aiEvaluation.studentLevel || homework.studentLevel || 'Calibrated'})`
+                              : `Feedback do Amigo Nativo IA (${aiEvaluation.studentLevel || homework.studentLevel || 'Calibrado'})`}
+                          </span>
+                        </div>
+                        <p className="text-xs text-slate-700 leading-relaxed font-medium">
+                          {isEn
+                            ? (aiEvaluation.tutorFeedbackSummaryEn || aiEvaluation.tutorFeedbackSummaryPt)
+                            : (aiEvaluation.tutorFeedbackSummaryPt || aiEvaluation.tutorFeedbackSummaryEn)}
+                        </p>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-1">
+                          {Boolean(aiEvaluation.levelStrengthsPt || aiEvaluation.levelStrengthsEn) && (
+                            <div className="p-3 bg-white/90 rounded-xl border border-emerald-100 space-y-1">
+                              <span className="text-[11px] font-bold text-emerald-800 flex items-center gap-1">
+                                <CheckCircle className="w-3.5 h-3.5 text-emerald-600" />
+                                {isEn ? 'Demonstrated Strengths' : 'Pontos Fortes'}
+                              </span>
+                              <p className="text-[11px] text-slate-600 leading-normal">
+                                {isEn
+                                  ? (aiEvaluation.levelStrengthsEn || aiEvaluation.levelStrengthsPt)
+                                  : (aiEvaluation.levelStrengthsPt || aiEvaluation.levelStrengthsEn)}
+                              </p>
                             </div>
-                            <span className="text-slate-500 italic text-[11px]">
-                              {currentLanguage === 'en'
-                                ? item.definition
-                                : item.translation
-                                  ? `${item.translation} (${item.definition})`
-                                  : item.definition}
-                            </span>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
+                          )}
 
-                  {/* Footer */}
-                  <div className="pt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100">
-                    <button
-                      type="button"
-                      onClick={() => setActiveTab('reading')}
-                      className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-[#000035] font-bold text-xs rounded-xl transition cursor-pointer flex items-center gap-1.5"
-                    >
-                      <ArrowLeft className="w-3.5 h-3.5 text-[#1C4C96]" />
-                      <span>{isEn ? 'Return to Part 4' : 'Voltar para a Parte 4'}</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={onClose}
-                      className="px-5 py-2 bg-[#000035] text-white font-bold text-xs rounded-xl hover:bg-[#062863] transition cursor-pointer shadow-2xs"
-                    >
-                      {memT.results.doneBtn}
-                    </button>
+                          {Boolean(aiEvaluation.levelNextStepsPt || aiEvaluation.levelNextStepsEn) && (
+                            <div className="p-3 bg-white/90 rounded-xl border border-blue-100 space-y-1">
+                              <span className="text-[11px] font-bold text-[#1C4C96] flex items-center gap-1">
+                                <Compass className="w-3.5 h-3.5 text-[#1C4C96]" />
+                                {isEn ? 'Next Step Focus' : 'Próximos Passos'}
+                              </span>
+                              <p className="text-[11px] text-slate-600 leading-normal">
+                                {isEn
+                                  ? (aiEvaluation.levelNextStepsEn || aiEvaluation.levelNextStepsPt)
+                                  : (aiEvaluation.levelNextStepsPt || aiEvaluation.levelNextStepsEn)}
+                              </p>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Routine Activities Practiced Banner */}
+                    {routineActivityNames.length > 0 && (
+                      <div className="p-4 bg-blue-50/90 rounded-2xl border border-blue-200 space-y-2 shadow-xs">
+                        <div className="flex items-center gap-2 text-xs font-bold text-[#000035]">
+                          <Layers className="w-4 h-4 text-[#1C4C96]" />
+                          <span>
+                            {isEn ? 'Routine Activities Practiced This Week:' : 'Atividades da Rotina Praticadas Nesta Semana:'}
+                          </span>
+                        </div>
+                        <div className="flex flex-wrap gap-2 pt-0.5">
+                          {routineActivityNames.map((actName, idx) => (
+                            <span
+                              key={idx}
+                              className="px-3 py-1 rounded-xl bg-white border border-blue-200 text-xs font-bold text-[#000035] shadow-2xs flex items-center gap-1.5"
+                            >
+                              <span className="w-2 h-2 rounded-full bg-[#1C4C96]" />
+                              {actName}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Vocabulary Key */}
+                    <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 space-y-2 text-xs">
+                      <span className="font-bold text-[#000035] uppercase text-[11px] block">
+                        {memT.results.vocabKeyLabel}
+                      </span>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        {homework.matchingPairs.map((item, idx) => {
+                          const actName = wordToActivityMap[item.word.toLowerCase()];
+                          return (
+                            <div key={idx} className="flex flex-col sm:flex-row sm:items-center justify-between border-b border-slate-200 pb-1.5 pt-1 text-xs gap-1.5">
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <span className="font-bold text-slate-800 capitalize">{item.word}</span>
+                                {actName && (
+                                  <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-blue-100/90 text-[#000035] border border-blue-200">
+                                    {actName}
+                                  </span>
+                                )}
+                              </div>
+                              <span className="text-slate-500 italic text-[11px]">
+                                {currentLanguage === 'en'
+                                  ? item.definition
+                                  : item.translation
+                                    ? `${item.translation} (${item.definition})`
+                                    : item.definition}
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
                   </div>
                 </div>
               )}

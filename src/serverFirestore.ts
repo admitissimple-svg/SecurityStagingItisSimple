@@ -3632,7 +3632,7 @@ export async function saveWeeklyChecksToFirestore(
 
 /**
  * Merges two homework objects ensuring student answers, genuine evaluations,
- * scores, and question lists are never wiped by empty fields or autosaves.
+ * scores, per-part progress, and question lists are never wiped by empty fields or autosaves.
  */
 export function mergeHomeworkRecords(primary: any, fallback: any): any {
   if (!primary && !fallback) return null;
@@ -3644,6 +3644,37 @@ export function mergeHomeworkRecords(primary: any, fallback: any): any {
     fillInBlanks: { ...(fallback.studentAnswers?.fillInBlanks || {}), ...(primary.studentAnswers?.fillInBlanks || {}) },
     sentences: { ...(fallback.studentAnswers?.sentences || {}), ...(primary.studentAnswers?.sentences || {}) },
     quizAnswers: { ...(fallback.studentAnswers?.quizAnswers || {}), ...(primary.studentAnswers?.quizAnswers || {}) },
+  };
+
+  // Merge per-part progress (HOTFIX 2.3.3)
+  const fallbackParts = fallback.partsProgress || {};
+  const primaryParts = primary.partsProgress || {};
+  const mergePart = (key: 'matching' | 'fill' | 'writing' | 'reading', num: 1 | 2 | 3 | 4) => {
+    const fPart = fallbackParts[key];
+    const pPart = primaryParts[key];
+    if (!fPart && !pPart) return undefined;
+    if (!fPart) return pPart;
+    if (!pPart) return fPart;
+    const isCompleted = pPart.status === 'completed' || fPart.status === 'completed';
+    const isPending = !isCompleted && (pPart.status === 'pending_evaluation' || fPart.status === 'pending_evaluation');
+    const status = isCompleted ? 'completed' : isPending ? 'pending_evaluation' : (pPart.status || fPart.status || 'draft');
+    return {
+      partKey: key,
+      partNumber: num,
+      status,
+      answers: { ...(fPart.answers || {}), ...(pPart.answers || {}) },
+      evaluation: pPart.evaluation || fPart.evaluation,
+      score: pPart.score ?? fPart.score,
+      completedAt: pPart.completedAt || fPart.completedAt,
+      updatedAt: pPart.updatedAt || fPart.updatedAt || new Date().toISOString(),
+    };
+  };
+
+  const mergedPartsProgress = {
+    matching: mergePart('matching', 1),
+    fill: mergePart('fill', 2),
+    writing: mergePart('writing', 3),
+    reading: mergePart('reading', 4),
   };
 
   const finalAiEvaluation = primary.aiEvaluation || fallback.aiEvaluation;
@@ -3690,6 +3721,7 @@ export function mergeHomeworkRecords(primary: any, fallback: any): any {
       ...(primary.completedPartsByDay || {}),
     },
     studentAnswers: mergedAnswers,
+    partsProgress: mergedPartsProgress,
     aiEvaluation: finalAiEvaluation,
     score: finalScore,
     isCompleted: finalIsCompleted,
@@ -3700,16 +3732,17 @@ export function mergeHomeworkRecords(primary: any, fallback: any): any {
  * Subcollection-scoped persistence for homework with student_homework collection support
  */
 export async function fetchHomeworkFromFirestore(
-  docIds: string[],
+  docIds: string | string[],
   canonicalWeekId: string,
-  cycle: number
+  cycle: number = 1
 ): Promise<any | null> {
   const db = getFirestoreDb();
-  if (!db || !docIds.length) return null;
+  const idList = Array.isArray(docIds) ? docIds : [docIds];
+  if (!db || !idList.length) return null;
 
   let mergedResult: any = null;
 
-  for (const dId of docIds.filter(Boolean)) {
+  for (const dId of idList.filter(Boolean)) {
     // 1. Check canonical subcollection users/{dId}/homework/{canonicalWeekId}
     try {
       const hwSnap = await db.collection('users').doc(dId).collection('homework').doc(canonicalWeekId).get();
@@ -3718,12 +3751,21 @@ export async function fetchHomeworkFromFirestore(
       }
     } catch {}
 
-    // 2. Authoritative check on student_homework/{dId} (HOTFIX 2.3.2)
+    // 2. Authoritative check on student_homework (HOTFIX 2.3.2 & HOTFIX 2.3.3)
     try {
+      // Check week-specific document first
+      const weekSpecificSnap = await db.collection('student_homework').doc(`${dId}_${canonicalWeekId}`).get().catch(() => null);
+      if (weekSpecificSnap && weekSpecificSnap.exists) {
+        mergedResult = mergeHomeworkRecords(weekSpecificSnap.data(), mergedResult);
+      }
+
       const topSnap = await db.collection('student_homework').doc(dId).get();
       if (topSnap.exists) {
         const topData = topSnap.data();
         if (topData) {
+          if (topData.cycles && topData.cycles[canonicalWeekId]) {
+            mergedResult = mergeHomeworkRecords(topData.cycles[canonicalWeekId], mergedResult);
+          }
           const topCycle =
             topData.weeklyCycle !== undefined
               ? Number(topData.weeklyCycle)
@@ -3742,7 +3784,7 @@ export async function fetchHomeworkFromFirestore(
 
   // Week 1 legacy backward compatibility only
   if (cycle === 1) {
-    for (const dId of docIds.filter(Boolean)) {
+    for (const dId of idList.filter(Boolean)) {
       try {
         const hwSubSnap = await db.collection('users').doc(dId).collection('homework').doc('current_week').get();
         if (hwSubSnap.exists) {
@@ -3773,8 +3815,38 @@ export async function saveHomeworkToFirestore(
     const userRef = db.collection('users').doc(docId);
     const promises: Promise<any>[] = [
       userRef.collection('homework').doc(canonicalWeekId).set(sanitized, { merge: true }),
-      db.collection('student_homework').doc(docId).set(sanitized, { merge: true }),
+      db.collection('student_homework').doc(`${docId}_${canonicalWeekId}`).set(sanitized, { merge: true }),
     ];
+
+    // Safely update student_homework/{docId} with per-cycle isolation map
+    try {
+      const topDocRef = db.collection('student_homework').doc(docId);
+      const topDocSnap = await topDocRef.get().catch(() => null);
+      const topData = topDocSnap && topDocSnap.exists ? topDocSnap.data() : null;
+      const topCycle = topData?.weeklyCycle !== undefined ? Number(topData.weeklyCycle) : (cycle === 1 ? 1 : null);
+
+      if (!topData || topCycle === cycle) {
+        promises.push(
+          topDocRef.set({
+            ...sanitized,
+            cycles: {
+              ...(topData?.cycles || {}),
+              [canonicalWeekId]: sanitized,
+            },
+          }, { merge: true })
+        );
+      } else {
+        promises.push(
+          topDocRef.set({
+            cycles: {
+              ...(topData?.cycles || {}),
+              [canonicalWeekId]: sanitized,
+            },
+          }, { merge: true })
+        );
+      }
+    } catch {}
+
     if (cycle === 1) {
       promises.push(
         userRef.set(

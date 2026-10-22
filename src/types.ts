@@ -738,6 +738,19 @@ export interface HomeworkAiEvaluation {
   levelNextStepsEn?: string;
 }
 
+export type HomeworkPartStatus = 'draft' | 'pending_evaluation' | 'completed';
+
+export interface HomeworkPartProgress {
+  partKey: 'matching' | 'fill' | 'writing' | 'reading';
+  partNumber: 1 | 2 | 3 | 4;
+  status: HomeworkPartStatus;
+  answers: Record<string, any>;
+  evaluation?: any;
+  score?: number;
+  completedAt?: string;
+  updatedAt: string;
+}
+
 export interface WeeklyHomeworkData {
   id: string;
   weekId?: string;
@@ -769,6 +782,12 @@ export interface WeeklyHomeworkData {
     fillInBlanks?: Record<string, string>;
     sentences?: Record<string, string>;
     quizAnswers?: Record<string, number>;
+  };
+  partsProgress?: {
+    matching?: HomeworkPartProgress;
+    fill?: HomeworkPartProgress;
+    writing?: HomeworkPartProgress;
+    reading?: HomeworkPartProgress;
   };
   aiEvaluation?: HomeworkAiEvaluation;
   isEmpty?: boolean;

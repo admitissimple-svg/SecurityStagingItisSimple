@@ -4413,7 +4413,7 @@ export function subscribeToStudentJournal(
 
 /**
  * Merges two homework objects ensuring student answers, genuine evaluations,
- * scores, and question lists are never wiped by empty fields or autosaves.
+ * scores, per-part progress, and question lists are never wiped by empty fields or autosaves.
  */
 export function mergeHomeworkRecords(primary: any, fallback: any): any {
   if (!primary && !fallback) return null;
@@ -4425,6 +4425,37 @@ export function mergeHomeworkRecords(primary: any, fallback: any): any {
     fillInBlanks: { ...(fallback.studentAnswers?.fillInBlanks || {}), ...(primary.studentAnswers?.fillInBlanks || {}) },
     sentences: { ...(fallback.studentAnswers?.sentences || {}), ...(primary.studentAnswers?.sentences || {}) },
     quizAnswers: { ...(fallback.studentAnswers?.quizAnswers || {}), ...(primary.studentAnswers?.quizAnswers || {}) },
+  };
+
+  // Merge per-part progress (HOTFIX 2.3.3)
+  const fallbackParts = fallback.partsProgress || {};
+  const primaryParts = primary.partsProgress || {};
+  const mergePart = (key: 'matching' | 'fill' | 'writing' | 'reading', num: 1 | 2 | 3 | 4) => {
+    const fPart = fallbackParts[key];
+    const pPart = primaryParts[key];
+    if (!fPart && !pPart) return undefined;
+    if (!fPart) return pPart;
+    if (!pPart) return fPart;
+    const isCompleted = pPart.status === 'completed' || fPart.status === 'completed';
+    const isPending = !isCompleted && (pPart.status === 'pending_evaluation' || fPart.status === 'pending_evaluation');
+    const status = isCompleted ? 'completed' : isPending ? 'pending_evaluation' : (pPart.status || fPart.status || 'draft');
+    return {
+      partKey: key,
+      partNumber: num,
+      status,
+      answers: { ...(fPart.answers || {}), ...(pPart.answers || {}) },
+      evaluation: pPart.evaluation || fPart.evaluation,
+      score: pPart.score ?? fPart.score,
+      completedAt: pPart.completedAt || fPart.completedAt,
+      updatedAt: pPart.updatedAt || fPart.updatedAt || new Date().toISOString(),
+    };
+  };
+
+  const mergedPartsProgress = {
+    matching: mergePart('matching', 1),
+    fill: mergePart('fill', 2),
+    writing: mergePart('writing', 3),
+    reading: mergePart('reading', 4),
   };
 
   const finalAiEvaluation = primary.aiEvaluation || fallback.aiEvaluation;
@@ -4471,6 +4502,7 @@ export function mergeHomeworkRecords(primary: any, fallback: any): any {
       ...(primary.completedPartsByDay || {}),
     },
     studentAnswers: mergedAnswers,
+    partsProgress: mergedPartsProgress,
     aiEvaluation: finalAiEvaluation,
     score: finalScore,
     isCompleted: finalIsCompleted,
@@ -4700,13 +4732,44 @@ export async function saveStudentHomeworkProgressToFirestore(
         null
       );
 
-      // Top-level student_homework partition for fast cross-device queries and evaluation persistence
-      const topLevelRef = doc(db, 'student_homework', cleanUid);
+      // Dedicated week partition in student_homework to prevent cross-week collision
+      const cycleDocRef = doc(db, 'student_homework', `${cleanUid}_${targetWeekId}`);
       await withFirestoreTimeout(
-        setDoc(topLevelRef, payload, { merge: true }),
+        setDoc(cycleDocRef, payload, { merge: true }),
         3000,
         null
       );
+
+      // Top-level student_homework partition with cycle map preservation
+      const topLevelRef = doc(db, 'student_homework', cleanUid);
+      const topSnap = await withFirestoreTimeout(getDoc(topLevelRef), 2000, null).catch(() => null);
+      const topData = topSnap && topSnap.exists() ? topSnap.data() : null;
+      const topCycle = topData?.weeklyCycle !== undefined ? Number(topData.weeklyCycle) : (targetCycle === 1 ? 1 : null);
+
+      if (!topData || topCycle === targetCycle) {
+        await withFirestoreTimeout(
+          setDoc(topLevelRef, {
+            ...payload,
+            cycles: {
+              ...(topData?.cycles || {}),
+              [targetWeekId]: payload,
+            },
+          }, { merge: true }),
+          3000,
+          null
+        );
+      } else {
+        await withFirestoreTimeout(
+          setDoc(topLevelRef, {
+            cycles: {
+              ...(topData?.cycles || {}),
+              [targetWeekId]: payload,
+            },
+          }, { merge: true }),
+          3000,
+          null
+        );
+      }
 
       // 2. Week 1 backward compatibility only:
       if (targetCycle === 1) {
@@ -4816,14 +4879,23 @@ export async function fetchStudentHomeworkProgressFromFirestore(
       combinedData = hwSnap.data();
     }
 
-    // 2. Authoritative check on student_homework/{cleanUid} (HOTFIX 2.3.2)
-    // Ensures genuine evaluation, score, and student answers recorded in student_homework are always restored
+    // 2. Authoritative check on student_homework (HOTFIX 2.3.2 & HOTFIX 2.3.3)
+    // Ensures genuine evaluation, score, and student answers recorded in student_homework are always restored without cycle mixing
     try {
+      const weekSpecificRef = doc(db, 'student_homework', `${cleanUid}_${targetWeekId}`);
+      const weekSpecificSnap = await withFirestoreTimeout(getDoc(weekSpecificRef), 2000, null);
+      if (weekSpecificSnap && weekSpecificSnap.exists()) {
+        combinedData = mergeHomeworkRecords(weekSpecificSnap.data(), combinedData);
+      }
+
       const topRef = doc(db, 'student_homework', cleanUid);
       const topSnap = await withFirestoreTimeout(getDoc(topRef), 2500, null);
       if (topSnap && topSnap.exists()) {
         const topData = topSnap.data();
         if (topData) {
+          if (topData.cycles && topData.cycles[targetWeekId]) {
+            combinedData = mergeHomeworkRecords(topData.cycles[targetWeekId], combinedData);
+          }
           const topCycle =
             topData.weeklyCycle !== undefined
               ? Number(topData.weeklyCycle)
