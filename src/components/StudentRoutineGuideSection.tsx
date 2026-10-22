@@ -459,7 +459,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     resetRoutinesForNewWeek,
     selectNextUnwatchedVideo: pickNextUnwatched,
     isLoading: isRoutineLoading,
-  } = useRoutine(effectiveStudentUid, selectedDay);
+  } = useRoutine(effectiveStudentUid, selectedDay, userProfile?.weeklyCycle || weeklyCycle || 1);
 
   // Sync saved topic and video from Firestore so refreshing the page preserves the selection
   useEffect(() => {
@@ -791,6 +791,10 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
           playlistTitle: persistedVideo!.playlistTitle,
           isRepeatVideo: persistedVideo!.isRepeatVideo,
         } as any)
+      : !isPersistedClean && activeActivity?.teacherVideos?.[0]
+      ? activeActivity.teacherVideos[0]
+      : !isPersistedClean && currentDayActivities.find((a) => a.teacherVideos && a.teacherVideos.length > 0)?.teacherVideos?.[0]
+      ? (currentDayActivities.find((a) => a.teacherVideos && a.teacherVideos.length > 0)!.teacherVideos![0] as any)
       : null;
 
   const userChosenTopicForDay =
@@ -807,9 +811,9 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     (rawAssignedVideo as any)?.isRepeatVideo === true ||
     userChosenTopicForDay === 'repeat_previous_video';
 
-  const hasPersistedOrAssignedVideo = hasPersistedVideoId;
+  const hasPersistedOrAssignedVideo = hasPersistedVideoId || Boolean(rawAssignedVideo?.videoId);
 
-  const isTopicVoluntarilyChosen = hasPersistedVideoId || Boolean(userChosenTopicForDay);
+  const isTopicVoluntarilyChosen = hasPersistedVideoId || Boolean(userChosenTopicForDay) || Boolean(rawAssignedVideo?.videoId);
 
   const assignedVideo: TeacherAssignedVideo | null = isTopicVoluntarilyChosen ? rawAssignedVideo : null;
 
@@ -1216,6 +1220,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
             isRepeatVideo: true,
             instructions: repeatedWithMeta.instructions,
             duration: repeatedWithMeta.duration,
+            weeklyCycle: userProfile?.weeklyCycle || weeklyCycle || 1,
           });
           if (!saveOk) {
             console.warn('[StudentRoutineGuideSection] Failed to persist repeated video to Firestore');
@@ -1330,11 +1335,10 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
             isRepeatVideo: false,
             instructions: data.video.instructions,
             duration: data.video.duration,
+            weeklyCycle: userProfile?.weeklyCycle || weeklyCycle || 1,
           });
 
-          if (saveOk && data.video.videoId) {
-            markVideoAsWatched(data.video.videoId).catch(() => {});
-          } else if (!saveOk) {
+          if (!saveOk) {
             console.warn('[StudentRoutineGuideSection] Failed to persist assigned playlist video to Firestore');
           }
         }
@@ -1510,11 +1514,10 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
           isRepeatVideo: false,
           instructions: customVideo.instructions,
           duration: customVideo.duration,
+          weeklyCycle: userProfile?.weeklyCycle || weeklyCycle || 1,
         });
 
-        if (saveOk && customVideo.videoId) {
-          markVideoAsWatched(customVideo.videoId).catch(() => {});
-        } else if (!saveOk) {
+        if (!saveOk) {
           console.warn('[StudentRoutineGuideSection] Failed to persist custom video suggestion to Firestore');
         }
       }

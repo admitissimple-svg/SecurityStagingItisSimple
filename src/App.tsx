@@ -2020,10 +2020,11 @@ export default function App() {
                           : [])
                       : item.teacherVideos;
 
-                    // HOTFIX 2.3.5C: Properly resolve learnedWords for the new cycle
-                    const resolvedWords = Array.isArray(dayData.learnedWords)
+                    // HOTFIX 2.3.5D: learnedWords must NEVER be reset by regular routine sync/snapshots or cleanVidId
+                    // Reset exclusively occurs inside StartNewWeekHandler
+                    const resolvedWords = Array.isArray(dayData.learnedWords) && dayData.learnedWords.length > 0
                       ? dayData.learnedWords
-                      : (cleanVidId === '' && (!dayData.playlistId || dayData.playlistId === '') ? [] : item.learnedWords || []);
+                      : (item.learnedWords || []);
 
                     return {
                       ...item,
@@ -3209,6 +3210,21 @@ export default function App() {
     } catch {
       // local fallback
     }
+
+    // Direct Cloud Firestore users/{cleanUid}/routines/{day} persistence
+    try {
+      const cleanUid = (effectiveStudentUid && isValidCanonicalUid(effectiveStudentUid) ? effectiveStudentUid : '') ||
+        (auth?.currentUser?.uid && isValidCanonicalUid(auth.currentUser.uid) ? auth.currentUser.uid : '');
+      const firestoreDb = getDb();
+      if (firestoreDb && cleanUid && selectedDay) {
+        const rRef = doc(firestoreDb, 'users', cleanUid, 'routines', selectedDay);
+        setDoc(rRef, {
+          dayOfWeek: selectedDay,
+          learnedWords: words,
+          updatedAt: new Date().toISOString(),
+        }, { merge: true }).catch(() => {});
+      }
+    } catch {}
   };
 
   // Unified single source of truth for 100% automatic behavioral activity completion

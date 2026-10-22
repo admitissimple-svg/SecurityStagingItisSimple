@@ -449,7 +449,7 @@ export function selectNextUnwatchedVideo<T extends { videoId?: string; id?: stri
  * 2. Unselected video (first access or after Start a New Week: displays "Choose a Video")
  * 3. Week with saved video (video persisted and restored on refresh/login)
  */
-export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek) {
+export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeWeeklyCycle?: number) {
   const authUid = auth?.currentUser?.uid || '';
   const effectiveUid =
     (isValidCanonicalUid(authUid) ? authUid : '') ||
@@ -459,13 +459,19 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek) {
 
   const [routinesByDay, setRoutinesByDay] = useState<Partial<Record<DayOfWeek, SavedRoutineVideo>>>({});
   const [watchedHistory, setWatchedHistory] = useState<string[]>([]);
-  const [weeklyCycle, setWeeklyCycle] = useState<number>(1);
+  const [weeklyCycle, setWeeklyCycle] = useState<number>(() => activeWeeklyCycle || 1);
   const [loadedUid, setLoadedUid] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(() => Boolean(effectiveUid));
   const [isInitialized, setIsInitialized] = useState<boolean>(false);
   const [lastSavedDay, setLastSavedDay] = useState<DayOfWeek | null>(null);
 
   const isRoutineLoading = Boolean(effectiveUid && loadedUid !== effectiveUid) || isLoading;
+
+  useEffect(() => {
+    if (activeWeeklyCycle && activeWeeklyCycle > 0) {
+      setWeeklyCycle(activeWeeklyCycle);
+    }
+  }, [activeWeeklyCycle]);
 
   const loadData = useCallback(async (uid: string) => {
     if (!uid) {
@@ -544,6 +550,7 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek) {
       const cleanVidId = extractYouTubeVideoId(videoData.videoId || videoData.url || '') || videoData.videoId;
       const cleanTitle = videoData.title || videoData.videoTitle || 'Daily Video Practice';
       const cleanUrl = videoData.url || (cleanVidId ? `https://www.youtube.com/watch?v=${cleanVidId}` : '');
+      const targetCycle = videoData.weeklyCycle || activeWeeklyCycle || weeklyCycle || 1;
 
       const savedObj: SavedRoutineVideo = {
         videoId: cleanVidId,
@@ -557,21 +564,18 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek) {
         isRepeatVideo: Boolean(videoData.isRepeatVideo),
         instructions: videoData.instructions || '',
         duration: videoData.duration || '5-10 min',
-        weeklyCycle: videoData.weeklyCycle || weeklyCycle,
+        weeklyCycle: targetCycle,
         updatedAt: new Date().toISOString(),
       };
 
       // Persist to backend and await confirmation before mutating React state
       const confirmed = await saveRoutineVideoToFirestore(effectiveUid, day, {
         ...videoData,
-        weeklyCycle: videoData.weeklyCycle || weeklyCycle,
+        weeklyCycle: targetCycle,
       });
 
       if (confirmed) {
         setRoutinesByDay((prev) => ({ ...prev, [day]: savedObj }));
-        if (cleanVidId && !watchedHistory.includes(cleanVidId)) {
-          setWatchedHistory((prev) => [...prev, cleanVidId]);
-        }
         setLastSavedDay(day);
         return true;
       }
@@ -579,7 +583,7 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek) {
       console.error(`[useRoutine] Routine video persistence failed for day ${day}`);
       return false;
     },
-    [effectiveUid, watchedHistory]
+    [effectiveUid, activeWeeklyCycle, weeklyCycle]
   );
 
   const markVideoAsWatched = useCallback(

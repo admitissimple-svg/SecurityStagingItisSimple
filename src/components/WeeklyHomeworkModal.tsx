@@ -674,11 +674,12 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
   // Dedicated Save Handlers per part
   const handleSavePart1 = async () => {
+    const pairsList = homework.matchingPairs || [];
     if (!isMatchingComplete) {
       setSubmittedFeedbackToast(
         isEn
-          ? `Please match all ${homework.matchingPairs.length} words before saving Part 1.`
-          : `Por favor, associe todas as ${homework.matchingPairs.length} palavras antes de salvar a Parte 1.`
+          ? `Please match all ${pairsList.length} words before saving Part 1.`
+          : `Por favor, associe todas as ${pairsList.length} palavras antes de salvar a Parte 1.`
       );
       setTimeout(() => setSubmittedFeedbackToast(null), 3500);
       return;
@@ -686,8 +687,8 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
     setIsSavingPart((prev) => ({ ...prev, matching: true }));
     try {
-      const total = homework.matchingPairs.length;
-      const correct = homework.matchingPairs.filter((pair) => {
+      const total = pairsList.length;
+      const correct = pairsList.filter((pair) => {
         const safeKey = pair.word ? pair.word.toLowerCase().replace(/[^a-z0-9]/g, '_') : '';
         const userAns = matchingAnswers[pair.id] || (safeKey ? matchingAnswers[`match-${safeKey}`] : '') || matchingAnswers[pair.word] || '';
         return userAns.trim().toLowerCase() === pair.word.toLowerCase();
@@ -725,11 +726,12 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
   };
 
   const handleSavePart2 = async () => {
+    const fillList = homework.fillInBlanks || [];
     if (!isFillComplete) {
       setSubmittedFeedbackToast(
         isEn
-          ? `Please answer all ${homework.fillInBlanks.length} blank questions before saving Part 2.`
-          : `Por favor, preencha todas as ${homework.fillInBlanks.length} lacunas antes de salvar a Parte 2.`
+          ? `Please answer all ${fillList.length} blank questions before saving Part 2.`
+          : `Por favor, preencha todas as ${fillList.length} lacunas antes de salvar a Parte 2.`
       );
       setTimeout(() => setSubmittedFeedbackToast(null), 3500);
       return;
@@ -737,8 +739,8 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
     setIsSavingPart((prev) => ({ ...prev, fill: true }));
     try {
-      const total = homework.fillInBlanks.length;
-      const correct = homework.fillInBlanks.filter((fill) => {
+      const total = fillList.length;
+      const correct = fillList.filter((fill) => {
         const safeKey = fill.correctWord ? fill.correctWord.toLowerCase().replace(/[^a-z0-9]/g, '_') : '';
         const userAns = fillAnswers[fill.id] || (safeKey ? fillAnswers[`fill-${safeKey}`] : '') || fillAnswers[fill.correctWord] || '';
         return userAns.trim().toLowerCase() === fill.correctWord.toLowerCase();
@@ -774,13 +776,13 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       setIsSavingPart((prev) => ({ ...prev, fill: false }));
     }
   };
-
   const handleSavePart3 = async () => {
+    const promptList = homework.sentenceWritingPrompts || [];
     if (!isWritingComplete) {
       setSubmittedFeedbackToast(
         isEn
-          ? `Please write your sentences for all ${homework.sentenceWritingPrompts.length} words before saving Part 3.`
-          : `Por favor, escreva suas frases para todas as ${homework.sentenceWritingPrompts.length} palavras antes de salvar a Parte 3.`
+          ? `Please write your sentences for all ${promptList.length} words before saving Part 3.`
+          : `Por favor, escreva suas frases para todas as ${promptList.length} palavras antes de salvar a Parte 3.`
       );
       setTimeout(() => setSubmittedFeedbackToast(null), 3500);
       return;
@@ -929,11 +931,12 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
   };
 
   const handleSavePart4 = async () => {
+    const questionsList = homework.readingPassage?.questions || [];
     if (!isReadingComplete) {
       setSubmittedFeedbackToast(
         isEn
-          ? `Please answer all ${homework.readingPassage.questions.length} comprehension questions before saving Part 4.`
-          : `Por favor, responda todas as ${homework.readingPassage.questions.length} perguntas de compreensão antes de salvar a Parte 4.`
+          ? `Please answer all ${questionsList.length} comprehension questions before saving Part 4.`
+          : `Por favor, responda todas as ${questionsList.length} perguntas de compreensão antes de salvar a Parte 4.`
       );
       setTimeout(() => setSubmittedFeedbackToast(null), 3500);
       return;
@@ -976,8 +979,8 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       isValidHomeworkEvaluation(activeEval) &&
       !isSyntheticHomeworkEvaluation(activeEval) &&
       Array.isArray(activeEval.readingFeedback) &&
-      activeEval.readingFeedback.length === homework.readingPassage.questions.length &&
-      (homework.readingPassage.questions || []).every((q: any, idx: number) => {
+      activeEval.readingFeedback.length === questionsList.length &&
+      questionsList.every((q: any, idx: number) => {
         const chosen = quizAnswers[q.id] !== undefined ? quizAnswers[q.id] : quizAnswers[String(idx)];
         return chosen !== undefined && chosen !== null;
       })
@@ -985,7 +988,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
     if (existingReadingMatches && activeEval) {
       setAiEvaluation(activeEval);
-      const totalQ = Math.max(1, homework.readingPassage.questions.length);
+      const totalQ = Math.max(1, questionsList.length);
       const readingScore = activeEval.readingFeedback
         ? Math.round((activeEval.readingFeedback.filter((r: any) => r.isCorrect).length / totalQ) * 100)
         : 100;
@@ -1043,7 +1046,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
       setAiEvaluation(evalResult);
 
-      const totalQ = Math.max(1, homework.readingPassage.questions.length);
+      const totalQ = Math.max(1, questionsList.length);
       const readingScore = Array.isArray(evalResult.readingFeedback) && totalQ > 0
         ? Math.round((evalResult.readingFeedback.filter((r: any) => r.isCorrect).length / totalQ) * 100)
         : 100;
@@ -2439,28 +2442,57 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                   </div>
 
                   {/* Reading passage */}
-                  <div className="p-4 bg-slate-50 rounded-xl border border-slate-200 space-y-2">
-                    <div className="flex items-center justify-between">
-                      <h5 className="font-bold text-xs sm:text-sm text-[#000035]">
-                        {homework.readingPassage.title}
-                      </h5>
-                      <button
-                        type="button"
-                        onClick={() => speakText(homework.readingPassage.text)}
-                        className="px-2.5 py-1 bg-white text-[#000035] hover:bg-slate-100 rounded-lg border border-slate-200 transition flex items-center gap-1 text-[11px] font-bold cursor-pointer"
-                      >
-                        <Volume2 className="w-3.5 h-3.5 text-[#1C4C96]" />
-                        <span>{memT.part4.listenBtn}</span>
-                      </button>
+                  {!homework.readingPassage || (!homework.readingPassage.text && (!homework.readingPassage.questions || homework.readingPassage.questions.length === 0)) ? (
+                    <div className="p-8 bg-slate-50 rounded-2xl border border-dashed border-slate-300 text-center space-y-3">
+                      <BookOpen className="w-10 h-10 text-[#1C4C96]/60 mx-auto" />
+                      <div className="space-y-1">
+                        <h5 className="font-bold text-sm text-[#000035]">
+                          {isEn ? 'Reading Passage Pending' : 'Texto de Leitura em Preparação'}
+                        </h5>
+                        <p className="text-xs text-slate-500 max-w-sm mx-auto">
+                          {isEn
+                            ? 'The mini-story reading comprehension exercise for this week will appear here once configured or generated from your weekly vocabulary.'
+                            : 'O exercício de interpretação de texto desta semana aparecerá aqui assim que configurado ou gerado a partir do seu vocabulário semanal.'}
+                        </p>
+                      </div>
+                      {onRegenerateWithAi && (
+                        <button
+                          type="button"
+                          onClick={handleRegenerateClick}
+                          disabled={internalGenerating}
+                          className="px-4 py-2 bg-[#000035] hover:bg-[#062863] text-white text-xs font-bold rounded-xl transition cursor-pointer inline-flex items-center gap-2"
+                        >
+                          <Sparkles className="w-4 h-4 text-[#9AB4FF]" />
+                          <span>{isEn ? 'Generate Reading Story' : 'Gerar Texto de Leitura'}</span>
+                        </button>
+                      )}
                     </div>
-                    <p className="text-xs sm:text-sm text-slate-700 leading-relaxed whitespace-pre-wrap font-normal">
-                      {renderHighlightedPassage(homework.readingPassage.text)}
-                    </p>
-                  </div>
+                  ) : (
+                    <>
+                      <div className="p-4 bg-slate-50 rounded-xl border border-slate-200 space-y-2">
+                        <div className="flex items-center justify-between">
+                          <h5 className="font-bold text-xs sm:text-sm text-[#000035]">
+                            {homework.readingPassage?.title || (isEn ? 'Mini-Story Reading' : 'Interpretação de Texto')}
+                          </h5>
+                          {homework.readingPassage?.text && (
+                            <button
+                              type="button"
+                              onClick={() => speakText(homework.readingPassage?.text || '')}
+                              className="px-2.5 py-1 bg-white text-[#000035] hover:bg-slate-100 rounded-lg border border-slate-200 transition flex items-center gap-1 text-[11px] font-bold cursor-pointer"
+                            >
+                              <Volume2 className="w-3.5 h-3.5 text-[#1C4C96]" />
+                              <span>{memT.part4.listenBtn}</span>
+                            </button>
+                          )}
+                        </div>
+                        <p className="text-xs sm:text-sm text-slate-700 leading-relaxed whitespace-pre-wrap font-normal">
+                          {renderHighlightedPassage(homework.readingPassage?.text || '')}
+                        </p>
+                      </div>
 
-                  {/* Questions */}
-                  <div className="space-y-3">
-                    {homework.readingPassage.questions.map((q, qIdx) => {
+                      {/* Questions */}
+                      <div className="space-y-3">
+                        {(homework.readingPassage?.questions || []).map((q, qIdx) => {
                       const selectedChoice = quizAnswers[q.id];
                       return (
                         <div
@@ -2528,6 +2560,8 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                       );
                     })}
                   </div>
+                    </>
+                  )}
 
                   {/* Evaluation error / transparent unavailability notice */}
                   {evalError && (
@@ -2577,7 +2611,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                         </div>
                       ) : (
                         <span className="text-[11px] text-slate-500 font-medium">
-                          {Object.keys(quizAnswers).length} / {homework.readingPassage.questions.length} {isEn ? 'answered' : 'respondidas'} • {isEn ? 'Answer all to record on S-Path' : 'Responda todas para gravar no S-Path'}
+                          {Object.keys(quizAnswers).length} / {(homework.readingPassage?.questions || []).length} {isEn ? 'answered' : 'respondidas'} • {isEn ? 'Answer all to record on S-Path' : 'Responda todas para gravar no S-Path'}
                         </span>
                       )}
                     </div>
@@ -2618,7 +2652,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                           {isEn ? 'Part 4: Mini-Story Reading' : 'Parte 4: Interpretação de Texto'}
                         </span>
                         <span className="text-[11px] text-slate-500 font-semibold">
-                          {homework.readingPassage.questions.length} {isEn ? 'questions' : 'perguntas'}
+                          {(homework.readingPassage?.questions || []).length} {isEn ? 'questions' : 'perguntas'}
                         </span>
                       </div>
 
@@ -2630,7 +2664,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                       )}
 
                       <div className="space-y-2">
-                        {homework.readingPassage.questions.map((q, idx) => {
+                        {(homework.readingPassage?.questions || []).map((q, idx) => {
                           const chosenIdx = quizAnswers[q.id] !== undefined ? quizAnswers[q.id] : quizAnswers[String(idx)];
                           const isAnswered = chosenIdx !== undefined && chosenIdx !== null && typeof chosenIdx === 'number';
                           const rfItem = aiEvaluation?.readingFeedback?.find((rf: any) => rf.id === q.id || rf.id === `q-${idx + 1}`);

@@ -10921,7 +10921,7 @@ app.post('/api/routines', (req, res) => {
   res.json(db.routinesByDay);
 });
 
-app.post('/api/routines/words', (req, res) => {
+app.post('/api/routines/words', async (req, res) => {
   const db = readDb();
   const { day, activityId, words, studentEmail, studentUid } = req.body;
   const { email, uid } = resolveStudentIdentifiers(db, studentEmail, studentUid);
@@ -10948,6 +10948,26 @@ app.post('/api/routines/words', (req, res) => {
   }
 
   writeDb(db);
+
+  // Direct persistence to Cloud Firestore users/{effectiveUid}/routines/{day}
+  try {
+    const fs = getFirestoreDb();
+    const effectiveUid = uid || studentUid;
+    if (fs && effectiveUid && day) {
+      const routineDocRef = fs.collection('users').doc(effectiveUid).collection('routines').doc(day);
+      await routineDocRef.set(
+        {
+          dayOfWeek: day,
+          learnedWords: Array.isArray(words) ? words : [],
+          updatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+    }
+  } catch (err) {
+    console.warn('[serverApp] Error saving learnedWords to Firestore:', err);
+  }
+
   res.json({ success: true, learnedWords: words });
 });
 

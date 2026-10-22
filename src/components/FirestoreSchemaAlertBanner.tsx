@@ -33,7 +33,7 @@ export const FirestoreSchemaAlertBanner: React.FC<FirestoreSchemaAlertBannerProp
   }, []);
 
   // Only render if there are alerts and either admin or in local/dev environment
-  const isDev = Boolean(import.meta.env.DEV) || window.location.hostname === 'localhost' || isAdmin;
+  const isDev = Boolean(typeof import.meta !== 'undefined' && import.meta?.env?.DEV) || (typeof window !== 'undefined' && window.location?.hostname === 'localhost') || isAdmin;
   if (!isDev || alerts.length === 0 || isDismissed) {
     return null;
   }
