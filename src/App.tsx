@@ -46,6 +46,7 @@ import { extractYouTubeVideoId, getYouTubeWatchUrl } from './utils/youtube';
 import { getInstantOrCachedWord, lookupWord, isGenericPedagogicalDefinition, isGenericPedagogicalExample } from './utils/dictionaryService';
 import { auth, getDb, getAllFirestoreDbs } from './firebase';
 import { getAccessToken, getAdminAccessToken, waitForAuthUser, firebaseSignUpWithEmail, firebaseSignInWithEmail } from './utils/auth';
+import { isValidHomeworkEvaluation, isSyntheticHomeworkEvaluation } from './utils/writingChecker';
 import { useNativeFriends, isTutorApproved, isTeacherRole } from './hooks/useNativeFriends';
 import { onAuthStateChanged, signOut as firebaseSignOutAuth } from 'firebase/auth';
 import { doc, getDoc, collection, getDocs, onSnapshot, setDoc, deleteDoc, query, where } from 'firebase/firestore';
@@ -948,6 +949,47 @@ export default function App() {
         ((prev.weeklyCycle && generated.weeklyCycle && prev.weeklyCycle === generated.weeklyCycle) ||
           (prev.weekId && generated.weekId && prev.weekId === generated.weekId));
 
+      const hasValidEvaluation = Boolean(
+        prev?.aiEvaluation &&
+        isValidHomeworkEvaluation(prev.aiEvaluation) &&
+        !isSyntheticHomeworkEvaluation(prev.aiEvaluation)
+      );
+
+      const hasStudentAnswers = Boolean(
+        prev?.studentAnswers &&
+        (Object.keys(prev.studentAnswers.matching || {}).length > 0 ||
+          Object.keys(prev.studentAnswers.fillInBlanks || {}).length > 0 ||
+          Object.keys(prev.studentAnswers.sentences || {}).length > 0 ||
+          Object.keys(prev.studentAnswers.quizAnswers || {}).length > 0)
+      );
+
+      // HOTFIX 2.3.1: If we already have authentic evaluation, answered parts, or completed homework for this week,
+      // PRESERVE IT COMPLETELY - do not wipe it or replace questions/gabaritos!
+      if (isSameWeek && (hasValidEvaluation || hasStudentAnswers || prev?.isCompleted || (typeof prev?.score === 'number' && prev.score > 0))) {
+        return {
+          ...generated,
+          ...prev,
+          matchingPairs: (Array.isArray(prev.matchingPairs) && prev.matchingPairs.length > 0) ? prev.matchingPairs : generated.matchingPairs,
+          fillInBlanks: (Array.isArray(prev.fillInBlanks) && prev.fillInBlanks.length > 0) ? prev.fillInBlanks : generated.fillInBlanks,
+          sentenceWritingPrompts: (Array.isArray(prev.sentenceWritingPrompts) && prev.sentenceWritingPrompts.length > 0) ? prev.sentenceWritingPrompts : generated.sentenceWritingPrompts,
+          readingPassage: (prev.readingPassage?.text) ? prev.readingPassage : generated.readingPassage,
+          isCompleted: Boolean(prev.isCompleted || generated.isCompleted),
+          isDayPartCompleted: Boolean(prev.isDayPartCompleted || generated.isDayPartCompleted),
+          completedPartsByDay: {
+            ...(generated.completedPartsByDay || {}),
+            ...(prev.completedPartsByDay || {}),
+          },
+          studentAnswers: {
+            matching: { ...(generated.studentAnswers?.matching || {}), ...(prev.studentAnswers?.matching || {}) },
+            fillInBlanks: { ...(generated.studentAnswers?.fillInBlanks || {}), ...(prev.studentAnswers?.fillInBlanks || {}) },
+            sentences: { ...(generated.studentAnswers?.sentences || {}), ...(prev.studentAnswers?.sentences || {}) },
+            quizAnswers: { ...(generated.studentAnswers?.quizAnswers || {}), ...(prev.studentAnswers?.quizAnswers || {}) },
+          },
+          aiEvaluation: prev.aiEvaluation,
+          score: typeof prev.score === 'number' ? prev.score : generated.score,
+        };
+      }
+
       if (isSameWeek && prev?.isAiGenerated && !prev.isEmpty && prev.totalWordsCollected > 0 && prev.targetDay === homeworkTargetDay) {
         const prevText = prev.readingPassage?.text || '';
         const prevTextLower = prevText.toLowerCase();
@@ -992,6 +1034,8 @@ export default function App() {
           sentences: { ...((isSameWeek && prev?.studentAnswers?.sentences) || {}), ...(generated.studentAnswers?.sentences || {}) },
           quizAnswers: { ...((isSameWeek && prev?.studentAnswers?.quizAnswers) || {}), ...(generated.studentAnswers?.quizAnswers || {}) },
         },
+        aiEvaluation: isSameWeek ? (prev?.aiEvaluation || generated.aiEvaluation) : generated.aiEvaluation,
+        score: (isSameWeek && typeof prev?.score === 'number') ? prev.score : generated.score,
       };
     });
   }, [routinesByDay, userProfile.name, userProfile.level, studentDictionaryEntries, excludedDictionaryWords, homeworkTargetDay, userProfile?.weeklyStudyDays, userProfile?.weeklyCycle]);

@@ -31,6 +31,7 @@ import {
 } from '../utils/writingChecker';
 import { getMemorizationTranslations } from '../utils/i18n/memorizationActivity';
 import { getDailyMemorizationSchedule, generatePart4StoryWithAi } from '../utils/homeworkGenerator';
+import { speakText } from '../utils/audio';
 
 interface WeeklyHomeworkModalProps {
   isOpen: boolean;
@@ -384,15 +385,10 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
   React.useEffect(() => {
     if (homework?.studentAnswers) {
-      setMatchingAnswers((prev) => ({ ...(homework.studentAnswers?.matching || {}), ...prev }));
-      setFillAnswers((prev) => ({ ...(homework.studentAnswers?.fillInBlanks || {}), ...prev }));
-      setSentenceAnswers((prev) => ({ ...(homework.studentAnswers?.sentences || {}), ...prev }));
-      setQuizAnswers((prev) => ({ ...(homework.studentAnswers?.quizAnswers || {}), ...prev }));
-    } else {
-      setMatchingAnswers(homework?.studentAnswers?.matching || {});
-      setFillAnswers(homework?.studentAnswers?.fillInBlanks || {});
-      setSentenceAnswers(homework?.studentAnswers?.sentences || {});
-      setQuizAnswers(homework?.studentAnswers?.quizAnswers || {});
+      setMatchingAnswers((prev) => ({ ...prev, ...(homework.studentAnswers?.matching || {}) }));
+      setFillAnswers((prev) => ({ ...prev, ...(homework.studentAnswers?.fillInBlanks || {}) }));
+      setSentenceAnswers((prev) => ({ ...prev, ...(homework.studentAnswers?.sentences || {}) }));
+      setQuizAnswers((prev) => ({ ...prev, ...(homework.studentAnswers?.quizAnswers || {}) }));
     }
     if (
       homework?.aiEvaluation &&
@@ -400,8 +396,6 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       !isSyntheticHomeworkEvaluation(homework.aiEvaluation)
     ) {
       setAiEvaluation(homework.aiEvaluation);
-    } else {
-      setAiEvaluation(undefined);
     }
   }, [homework?.id, homework?.studentAnswers, homework?.aiEvaluation]);
 
@@ -419,6 +413,11 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
     if (!hasAnyAnswers) return;
 
+    // HOTFIX 2.3.1: Always preserve existing evaluation, score, and completed status in autosave!
+    const effectiveEvaluation = aiEvaluation || homework?.aiEvaluation;
+    const effectiveScore = (effectiveEvaluation ? effectiveEvaluation.overallScore : homework?.score) ?? 0;
+    const effectiveIsCompleted = Boolean((effectiveEvaluation && effectiveScore > 0) || homework?.isCompleted);
+
     const updatedHw: WeeklyHomeworkData = {
       ...homework,
       studentAnswers: {
@@ -427,6 +426,9 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
         sentences: sentenceAnswers,
         quizAnswers: quizAnswers,
       },
+      aiEvaluation: effectiveEvaluation,
+      score: effectiveScore,
+      isCompleted: effectiveIsCompleted,
     };
 
     const currentJson = JSON.stringify(updatedHw.studentAnswers);
@@ -438,7 +440,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     }, 500);
 
     return () => clearTimeout(timer);
-  }, [matchingAnswers, fillAnswers, sentenceAnswers, quizAnswers, isOpen, homework, onSaveProgress]);
+  }, [matchingAnswers, fillAnswers, sentenceAnswers, quizAnswers, isOpen, homework, onSaveProgress, aiEvaluation]);
 
   // Track initial tab selection when modal opens without locking user into results
   const wasOpenRef = React.useRef(false);
@@ -737,13 +739,14 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     onSaveProgress(inProgressUpdate);
 
     // 2. Check if an authentic, genuine evaluation already exists and matches current student sentences
+    const activeEval = aiEvaluation || homework?.aiEvaluation;
     const existingIsLegitimate = Boolean(
-      aiEvaluation &&
-      isValidHomeworkEvaluation(aiEvaluation) &&
-      !isSyntheticHomeworkEvaluation(aiEvaluation) &&
+      activeEval &&
+      isValidHomeworkEvaluation(activeEval) &&
+      !isSyntheticHomeworkEvaluation(activeEval) &&
       (homework.sentenceWritingPrompts || []).every((p) => {
         const studentSentence = (sentenceAnswers[p.word] || '').trim().toLowerCase();
-        const sentencesList = aiEvaluation?.sentenceFeedback || (aiEvaluation as any)?.sentenceEvaluationResults || [];
+        const sentencesList = activeEval?.sentenceFeedback || (activeEval as any)?.sentenceEvaluationResults || [];
         const evaluatedSentence = (
           sentencesList.find(
             (r: any) => (r.word || '').toLowerCase() === p.word.toLowerCase()
@@ -753,15 +756,16 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       })
     );
 
-    if (existingIsLegitimate && aiEvaluation) {
+    if (existingIsLegitimate && activeEval) {
+      setAiEvaluation(activeEval);
       // Re-use legitimate evaluation without triggering duplicate Gemini calls
       const updated: WeeklyHomeworkData = {
         ...homework,
         isCompleted: true,
-        score: aiEvaluation.overallScore,
+        score: activeEval.overallScore,
         submittedAt: homework.submittedAt || new Date().toISOString(),
         studentAnswers: currentAnswers,
-        aiEvaluation: aiEvaluation,
+        aiEvaluation: activeEval,
         completedPartsByDay: {
           ...(homework?.completedPartsByDay || {}),
           [targetDay]: true,
@@ -1970,14 +1974,18 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                       </div>
                       <div className="space-y-2">
                         {homework.matchingPairs.map((pair) => {
-                          const userAns = matchingAnswers[pair.id] || '';
-                          const isMatchCorrect = userAns.toLowerCase() === pair.word.toLowerCase();
+                          const safeKey = pair.word ? pair.word.toLowerCase().replace(/[^a-z0-9]/g, '_') : '';
+                          const userAns = matchingAnswers[pair.id] || (safeKey ? matchingAnswers[`match-${safeKey}`] : '') || matchingAnswers[pair.word] || '';
+                          const isAnswered = Boolean(userAns.trim());
+                          const isMatchCorrect = isAnswered && userAns.toLowerCase() === pair.word.toLowerCase();
                           const actName = wordToActivityMap[pair.word.toLowerCase()];
                           return (
                             <div
                               key={pair.id}
                               className={`p-2.5 rounded-lg border text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 ${
-                                isMatchCorrect
+                                !isAnswered
+                                  ? 'bg-slate-50/70 border-slate-200'
+                                  : isMatchCorrect
                                   ? 'bg-emerald-50/50 border-emerald-200'
                                   : 'bg-amber-50/50 border-amber-200'
                               }`}
@@ -1994,11 +2002,17 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                                 <p className="text-[11px] text-slate-600">{pair.definition}</p>
                               </div>
                               <div className="text-right shrink-0">
-                                <span className={`text-[11px] font-bold ${isMatchCorrect ? 'text-emerald-700' : 'text-amber-700'}`}>
-                                  {isMatchCorrect
-                                    ? `✓ ${isEn ? 'Matched' : 'Associado'}: ${userAns}`
-                                    : `✗ ${isEn ? 'Chosen' : 'Escolhido'}: ${userAns || '(vazio)'} → ${isEn ? 'Correct' : 'Correto'}: ${pair.word}`}
-                                </span>
+                                {!isAnswered ? (
+                                  <span className="text-[11px] font-semibold text-slate-500">
+                                    ⏳ {isEn ? 'Pending / Not answered' : 'Pendente / Não respondido'}
+                                  </span>
+                                ) : (
+                                  <span className={`text-[11px] font-bold ${isMatchCorrect ? 'text-emerald-700' : 'text-amber-700'}`}>
+                                    {isMatchCorrect
+                                      ? `✓ ${isEn ? 'Matched' : 'Associado'}: ${userAns}`
+                                      : `✗ ${isEn ? 'Chosen' : 'Escolhido'}: ${userAns} → ${isEn ? 'Correct' : 'Correto'}: ${pair.word}`}
+                                  </span>
+                                )}
                               </div>
                             </div>
                           );
@@ -2018,14 +2032,18 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                       </div>
                       <div className="space-y-2">
                         {homework.fillInBlanks.map((fill) => {
-                          const userAns = fillAnswers[fill.id] || '';
-                          const isFillCorrect = userAns.toLowerCase() === fill.correctWord.toLowerCase();
+                          const safeKey = fill.correctWord ? fill.correctWord.toLowerCase().replace(/[^a-z0-9]/g, '_') : '';
+                          const userAns = fillAnswers[fill.id] || (safeKey ? fillAnswers[`fill-${safeKey}`] : '') || fillAnswers[fill.correctWord] || '';
+                          const isAnswered = Boolean(userAns.trim());
+                          const isFillCorrect = isAnswered && userAns.toLowerCase() === fill.correctWord.toLowerCase();
                           const actName = wordToActivityMap[fill.correctWord.toLowerCase()];
                           return (
                             <div
                               key={fill.id}
                               className={`p-2.5 rounded-lg border text-xs space-y-1 ${
-                                isFillCorrect
+                                !isAnswered
+                                  ? 'bg-slate-50/70 border-slate-200'
+                                  : isFillCorrect
                                   ? 'bg-emerald-50/50 border-emerald-200'
                                   : 'bg-amber-50/50 border-amber-200'
                               }`}
@@ -2039,11 +2057,17 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                                     </span>
                                   )}
                                 </div>
-                                <span className={`text-[11px] font-bold ${isFillCorrect ? 'text-emerald-700' : 'text-amber-700'}`}>
-                                  {isFillCorrect
-                                    ? `✓ ${userAns}`
-                                    : `✗ ${userAns || '(vazio)'} → ${isEn ? 'Target' : 'Correto'}: ${fill.correctWord}`}
-                                </span>
+                                {!isAnswered ? (
+                                  <span className="text-[11px] font-semibold text-slate-500">
+                                    ⏳ {isEn ? 'Pending / Not answered' : 'Pendente / Não respondido'}
+                                  </span>
+                                ) : (
+                                  <span className={`text-[11px] font-bold ${isFillCorrect ? 'text-emerald-700' : 'text-amber-700'}`}>
+                                    {isFillCorrect
+                                      ? `✓ ${userAns}`
+                                      : `✗ ${userAns} → ${isEn ? 'Target' : 'Correto'}: ${fill.correctWord}`}
+                                  </span>
+                                )}
                               </div>
                               <p className="text-[11px] text-slate-600">
                                 {isEn
@@ -2083,7 +2107,9 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                             <div
                               key={prompt.word}
                               className={`p-3 rounded-xl border text-xs space-y-1.5 ${
-                                isSentenceOk
+                                !userSentence
+                                  ? 'bg-slate-50/70 border-slate-200'
+                                  : isSentenceOk
                                   ? 'bg-emerald-50/50 border-emerald-200'
                                   : 'bg-amber-50/50 border-amber-200'
                               }`}
@@ -2099,14 +2125,18 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                                     </span>
                                   )}
                                 </div>
-                                <span className={`text-[11px] font-bold ${isSentenceOk ? 'text-emerald-700' : 'text-amber-700'}`}>
-                                  {isSentenceOk ? (isEn ? '✓ Well Structured' : '✓ Bem Estruturada') : (isEn ? '⚠ Needs Review' : '⚠ Revisão Recomendada')}
+                                <span className={`text-[11px] font-bold ${!userSentence ? 'text-slate-500' : isSentenceOk ? 'text-emerald-700' : 'text-amber-700'}`}>
+                                  {!userSentence
+                                    ? `⏳ ${isEn ? 'Pending / Not answered' : 'Pendente / Não respondido'}`
+                                    : isSentenceOk
+                                    ? (isEn ? '✓ Well Structured' : '✓ Bem Estruturada')
+                                    : (isEn ? '⚠ Needs Review' : '⚠ Revisão Recomendada')}
                                 </span>
                               </div>
 
                               <p className="text-[11px] text-slate-800 italic">
                                 <span className="text-slate-500 font-normal mr-1">{isEn ? 'Your sentence:' : 'Sua frase:'}</span>
-                                "{userSentence || '(nenhuma frase enviada)'}"
+                                "{userSentence || (isEn ? '(no sentence provided yet)' : '(nenhuma frase enviada ainda)')}"
                               </p>
 
                               {corrected && corrected !== userSentence && (
@@ -2152,13 +2182,16 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                       )}
                       <div className="space-y-2">
                         {homework.readingPassage.questions.map((q, idx) => {
-                          const chosenIdx = quizAnswers[q.id];
-                          const isQuizCorrect = chosenIdx === q.correctAnswer;
+                          const chosenIdx = quizAnswers[q.id] !== undefined ? quizAnswers[q.id] : quizAnswers[String(idx)];
+                          const isAnswered = chosenIdx !== undefined && chosenIdx !== null && typeof chosenIdx === 'number';
+                          const isQuizCorrect = isAnswered && chosenIdx === q.correctAnswer;
                           return (
                             <div
                               key={q.id}
                               className={`p-2.5 rounded-lg border text-xs space-y-1 ${
-                                isQuizCorrect
+                                !isAnswered
+                                  ? 'bg-slate-50/70 border-slate-200'
+                                  : isQuizCorrect
                                   ? 'bg-emerald-50/50 border-emerald-200'
                                   : 'bg-amber-50/50 border-amber-200'
                               }`}
@@ -2167,11 +2200,17 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                                 {idx + 1}. {q.question}
                               </p>
                               <div className="flex flex-wrap items-center justify-between gap-1 text-[11px]">
-                                <span className={isQuizCorrect ? 'text-emerald-700 font-bold' : 'text-amber-700 font-bold'}>
-                                  {isQuizCorrect
-                                    ? `✓ ${isEn ? 'Correct Answer' : 'Resposta Correta'}: ${q.options[chosenIdx]}`
-                                    : `✗ ${isEn ? 'Your choice' : 'Sua escolha'}: ${q.options[chosenIdx] || '(vazio)'} → ${isEn ? 'Correct' : 'Correta'}: ${q.options[q.correctAnswer]}`}
-                                </span>
+                                {!isAnswered ? (
+                                  <span className="text-[11px] font-semibold text-slate-500">
+                                    ⏳ {isEn ? 'Pending / Not answered' : 'Pendente / Não respondido'}
+                                  </span>
+                                ) : (
+                                  <span className={isQuizCorrect ? 'text-emerald-700 font-bold' : 'text-amber-700 font-bold'}>
+                                    {isQuizCorrect
+                                      ? `✓ ${isEn ? 'Correct Answer' : 'Resposta Correta'}: ${q.options[chosenIdx]}`
+                                      : `✗ ${isEn ? 'Your choice' : 'Sua escolha'}: ${q.options[chosenIdx]} → ${isEn ? 'Correct' : 'Correta'}: ${q.options[q.correctAnswer]}`}
+                                  </span>
+                                )}
                               </div>
                               {q.explanation && (
                                 <p className="text-[11px] text-slate-600 italic">

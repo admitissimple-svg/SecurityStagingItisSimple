@@ -14310,6 +14310,12 @@ function hasGenericBoilerplate(data: any): boolean {
     str.includes('i practice using \\"______\\"') ||
     str.includes('i practice using "') ||
     str.includes('i practice using \\"') ||
+    str.includes('practicing with "______"') ||
+    str.includes('practicing with \\"______\\"') ||
+    str.includes('practicing with "') ||
+    str.includes('practicing with \\"') ||
+    str.includes('builds natural fluency and confidence') ||
+    str.includes('plays an indispensable role in maintaining team morale') ||
     str.includes('focus on the sentence context to identify') ||
     str.includes('describe a specific task, plan, or event in your daily life using') ||
     str.includes('write about a conversation with a colleague or friend that involves') ||
@@ -14376,10 +14382,15 @@ export function validateDirectMemorizationAiResponse(json: any, targetWords?: st
     if (isGenericPedagogicalDefinition(item.definition)) return false;
   }
 
-  // Check fillInBlanks for valid blanks and options
+  // Check fillInBlanks for valid blanks, plausible distractors, and zero generic boilerplate
   for (const item of json.fillInBlanks) {
     if (!item?.sentenceWithBlank || !item?.correctWord) return false;
     if (!Array.isArray(item.options) || item.options.length < 4) return false;
+    const sent = item.sentenceWithBlank.toLowerCase();
+    if (!item.sentenceWithBlank.includes('______') && !item.sentenceWithBlank.includes('___')) return false;
+    if (sent.includes('practicing with') || sent.includes('builds natural fluency') || sent.includes('indispensable role')) return false;
+    const cleanCorrect = item.correctWord.toLowerCase().trim();
+    if (!item.options.some((opt: string) => opt.toLowerCase().trim() === cleanCorrect)) return false;
   }
 
   // Check readingPassage
@@ -14895,8 +14906,17 @@ app.post('/api/homework/generate-ai', firebaseAuthMiddleware, async (req, res) =
       };
     });
 
+    const stableMatchingPairs = matchingPairs.map((m: any) => ({
+      ...m,
+      id: m.id || `match-${(m.word || '').toLowerCase().replace(/[^a-z0-9]/g, '_')}`,
+    }));
+    const stableFillInBlanks = fillInBlanks.map((f: any) => ({
+      ...f,
+      id: f.id || `fill-${(f.correctWord || '').toLowerCase().replace(/[^a-z0-9]/g, '_')}`,
+    }));
+
     const finalHomeworkData = {
-      id: `hw-ai-${Date.now()}`,
+      id: `hw-ai-${callerUid}`,
       weekLabel: weekLabel || `Semana de ${new Date().toLocaleDateString('pt-BR', { day: 'numeric', month: 'short' })}`,
       studentUid: callerUid,
       studentEmail: effectiveEmail || callerEmail || studentEmail || '',
@@ -14906,8 +14926,8 @@ app.post('/api/homework/generate-ai', firebaseAuthMiddleware, async (req, res) =
       totalWordsCollected: cleanWords.length,
       vocabularyList,
       allRoutineWords: vocabularyList,
-      matchingPairs,
-      fillInBlanks,
+      matchingPairs: stableMatchingPairs,
+      fillInBlanks: stableFillInBlanks,
       sentenceWritingPrompts,
       readingPassage,
       isEmpty: false,

@@ -613,10 +613,12 @@ export function generateWeeklyHomework(
     ? `${dayNamePt} • Semana ${userProfile?.weeklyCycle || 1}`
     : `Semana de ${new Date().toLocaleDateString('pt-BR', { day: 'numeric', month: 'short' })}`;
 
+  const canonicalHwId = `hw-${targetDay || 'week'}-${userProfile?.weeklyCycle || 1}`;
+
   // REGRA DE OURO ANTI-GENÉRICO: Se não houver palavras cadastradas, retorna aviso estruturado
   if (rawWords.length === 0) {
     return {
-      id: `hw-${targetDay || 'week'}-${Date.now()}`,
+      id: canonicalHwId,
       targetDay,
       assignedPart: schedule?.partNumber,
       assignedPartKey: schedule?.partKey,
@@ -648,15 +650,17 @@ export function generateWeeklyHomework(
     };
   }
 
-  // 2. Build Matching Pairs (Part 1 - Associação): Embaralha apenas a ordem para criar o desafio
-  const matchingPairs: MatchingPair[] = [...rawWords]
-    .sort(() => 0.5 - Math.random())
-    .map((item, idx) => ({
-      id: `match-${idx}-${item.word}`,
-      word: item.word,
+  // 2. Build Matching Pairs (Part 1 - Associação): Deterministic stable IDs keyed by word
+  const matchingPairs: MatchingPair[] = [...rawWords].map((item) => {
+    const cleanWord = item.word.trim();
+    const safeWordId = cleanWord.toLowerCase().replace(/[^a-z0-9]/g, '_');
+    return {
+      id: `match-${safeWordId}`,
+      word: cleanWord,
       definition: item.definitionEn,
       translation: item.translationPt,
-    }));
+    };
+  });
 
   // 3. Build Fill-in-the-Blanks (Part 2 - Lacunas): Sintetizado com precisão semântica e gramatical autêntica
   const fillInBlanks: FillInBlankItem[] = synthesizeFillInBlanks(
@@ -716,7 +720,7 @@ export function generateWeeklyHomework(
   const readingQuestions = synthesizedStory.questions;
 
   return {
-    id: `hw-${targetDay || 'week'}-${Date.now()}`,
+    id: canonicalHwId,
     targetDay,
     assignedPart: schedule?.partNumber,
     assignedPartKey: schedule?.partKey,

@@ -14,7 +14,42 @@ export interface LexicalWordProfile {
  * daily routine, interpersonal relationships, wellness, and environmental vocabulary.
  */
 export const COMPREHENSIVE_LEXICON: Record<string, Omit<LexicalWordProfile, 'word'>> = {
-  // People & Roles
+  // People, Roles & Pronouns
+  nobody: {
+    partOfSpeech: 'noun',
+    category: 'people',
+    translationPt: 'ninguém',
+    definitionEn: 'No person; not a single person in a group, room, or setting',
+    exampleSentenceEn: 'Nobody was in the meeting room when I arrived early this morning.',
+  },
+  everyone: {
+    partOfSpeech: 'noun',
+    category: 'people',
+    translationPt: 'todos / todo mundo',
+    definitionEn: 'Every person; all the members of a group, team, or audience',
+    exampleSentenceEn: 'Everyone agreed on the new schedule during our weekly team meeting.',
+  },
+  anyone: {
+    partOfSpeech: 'noun',
+    category: 'people',
+    translationPt: 'qualquer pessoa / alguém / ninguém (em perguntas ou negativas)',
+    definitionEn: 'Any person at all, especially used in questions and negative statements',
+    exampleSentenceEn: 'Did anyone remember to share the updated notes after the team presentation?',
+  },
+  somebody: {
+    partOfSpeech: 'noun',
+    category: 'people',
+    translationPt: 'alguém',
+    definitionEn: 'Some person; an unspecified or unknown individual',
+    exampleSentenceEn: 'Somebody left an umbrella by the office entrance before the rain started.',
+  },
+  someone: {
+    partOfSpeech: 'noun',
+    category: 'people',
+    translationPt: 'alguém',
+    definitionEn: 'An unspecified person; an individual in a group',
+    exampleSentenceEn: 'Someone suggested organizing a brief coffee break to recharge during the afternoon.',
+  },
   boss: {
     partOfSpeech: 'noun',
     category: 'people',
@@ -441,6 +476,29 @@ export const COMPREHENSIVE_LEXICON: Record<string, Omit<LexicalWordProfile, 'wor
     exampleSentenceEn: 'Tracking daily accomplishments highlights the steady progress you make each week.',
   },
 
+  // Descriptive & Idiomatic Vocabulary
+  awesome: {
+    partOfSpeech: 'adjective',
+    category: 'emotion',
+    translationPt: 'incrível / maravilhoso / sensacional',
+    definitionEn: 'Extremely impressive, enjoyable, or very good',
+    exampleSentenceEn: 'The team did an awesome job delivering the final project ahead of the deadline.',
+  },
+  'spot on': {
+    partOfSpeech: 'adjective',
+    category: 'general',
+    translationPt: 'certeiro / exato / na mosca',
+    definitionEn: 'Completely accurate, correct, or precisely right',
+    exampleSentenceEn: 'Her analysis of the project challenges was completely spot on.',
+  },
+  'spot-on': {
+    partOfSpeech: 'adjective',
+    category: 'general',
+    translationPt: 'certeiro / exato / na mosca',
+    definitionEn: 'Completely accurate, correct, or precisely right',
+    exampleSentenceEn: 'His timing for the presentation was spot-on and impressed everyone.',
+  },
+
   // Core Common Vocabulary & Action Terms
   app: {
     partOfSpeech: 'noun',
@@ -673,7 +731,11 @@ function isGenericText(text?: string): boolean {
     lower.includes('action term describing') ||
     lower.includes('modifying term highlighting') ||
     lower.includes('with clear intention creates noticeable progress') ||
-    lower.includes('focus on the sentence context to identify')
+    lower.includes('focus on the sentence context to identify') ||
+    lower.includes('practicing with') ||
+    lower.includes('builds natural fluency and confidence') ||
+    lower.includes('plays an indispensable role in maintaining team morale') ||
+    lower.includes('having a clear and structured')
   );
 }
 
@@ -743,15 +805,33 @@ export function profileWord(
         defaultEx = `She expressed her perspective ${clean}, ensuring that every participant understood the message.`;
         break;
       default:
-        defaultDef = `An important concept, role, or tool referring to ${clean} in everyday life and communication.`;
-        defaultEx = `Having a clear and structured ${clean} helps everyone stay organized and confident throughout the day.`;
+        defaultDef = `An important concept, role, or term referring to ${clean} in everyday life and communication.`;
+        defaultEx = `Our team focused on the importance of ${clean} during the planning session.`;
     }
   }
 
   if (providedDetails?.exampleSentence && !isGenericText(providedDetails.exampleSentence) && providedDetails.exampleSentence.toLowerCase().includes(lower)) {
     defaultEx = providedDetails.exampleSentence;
-  } else if (!defaultEx) {
-    defaultEx = `Practicing with "${clean}" in daily English conversations builds natural fluency and confidence.`;
+  } else if (!defaultEx || isGenericText(defaultEx)) {
+    if (lower === 'nobody') {
+      defaultEx = 'Nobody was in the meeting room when I arrived early this morning.';
+    } else if (lower === 'everyone') {
+      defaultEx = 'Everyone agreed on the new schedule during our weekly team meeting.';
+    } else if (lower === 'anyone') {
+      defaultEx = 'Did anyone remember to share the updated notes after the team presentation?';
+    } else if (lower === 'somebody' || lower === 'someone') {
+      defaultEx = 'Someone suggested organizing a brief coffee break to recharge during the afternoon.';
+    } else if (lower === 'awesome') {
+      defaultEx = 'The team did an awesome job delivering the final project ahead of the deadline.';
+    } else if (lower === 'spot on' || lower === 'spot-on') {
+      defaultEx = 'Her analysis of the project challenges was completely spot on.';
+    } else if (partOfSpeech === 'verb') {
+      defaultEx = `We coordinated our schedule to ${clean} the deliverables on time.`;
+    } else if (partOfSpeech === 'adjective') {
+      defaultEx = `The presentation received ${clean} feedback from our partners.`;
+    } else {
+      defaultEx = `Understanding how ${clean} applies in practice helps make communication clearer.`;
+    }
   }
 
   const defaultTrans = providedDetails?.translationPt || clean;
@@ -1171,97 +1251,139 @@ export function synthesizeFillInBlanks(
     profileMap.set(w.toLowerCase().trim(), profileWord(w, detail));
   });
 
+  const PRONOUN_WORDS = new Set(['nobody', 'everyone', 'anyone', 'somebody', 'someone', 'anybody', 'everybody']);
+
   return words.map((w, idx) => {
-    const profile = profileMap.get(w.toLowerCase().trim()) || profileWord(w);
+    const cleanW = w.trim();
+    const lowerW = cleanW.toLowerCase();
+    const profile = profileMap.get(lowerW) || profileWord(cleanW);
     const pos = profile.partOfSpeech;
 
     // 1. Pick distractors that strictly match the part of speech
-    // First, look for other student words that share the same POS
-    const samePosStudentWords = words
-      .filter((other) => {
-        if (other.toLowerCase().trim() === w.toLowerCase().trim()) return false;
-        const otherProf = profileMap.get(other.toLowerCase().trim());
-        return otherProf?.partOfSpeech === pos;
-      })
-      .slice(0, 3);
+    let options: string[] = [cleanW];
 
-    const options = [w, ...samePosStudentWords];
+    if (PRONOUN_WORDS.has(lowerW)) {
+      const pronounDistractors = ['everyone', 'nobody', 'anyone', 'someone', 'somebody'].filter(
+        (p) => p !== lowerW
+      );
+      options.push(...pronounDistractors.slice(0, 3));
+    } else if (lowerW === 'awesome') {
+      options.push('terrible', 'ordinary', 'average');
+    } else if (lowerW === 'spot on' || lowerW === 'spot-on') {
+      options.push('inaccurate', 'misguided', 'unclear');
+    } else {
+      // First, look for other student words that share the same POS
+      const samePosStudentWords = words
+        .filter((other) => {
+          if (other.toLowerCase().trim() === lowerW) return false;
+          const otherProf = profileMap.get(other.toLowerCase().trim());
+          return otherProf?.partOfSpeech === pos && !PRONOUN_WORDS.has(other.toLowerCase().trim());
+        })
+        .slice(0, 3);
 
-    // Fill remaining slots from high-frequency POS pool so distractors are always grammatically coherent
-    const pool = pos === 'verb'
-      ? VERB_DISTRACTORS
-      : pos === 'adjective'
-      ? ADJ_DISTRACTORS
-      : pos === 'adverb'
-      ? ADV_DISTRACTORS
-      : NOUN_DISTRACTORS;
+      options.push(...samePosStudentWords);
 
-    let poolIdx = 0;
-    while (options.length < 4 && poolIdx < pool.length * 2) {
-      const cand = pool[poolIdx++ % pool.length];
-      if (!options.some((opt) => opt.toLowerCase() === cand.toLowerCase()) && cand.toLowerCase() !== w.toLowerCase()) {
-        options.push(cand);
+      // Fill remaining slots from high-frequency POS pool so distractors are always grammatically coherent
+      const pool = pos === 'verb'
+        ? VERB_DISTRACTORS
+        : pos === 'adjective'
+        ? ADJ_DISTRACTORS
+        : pos === 'adverb'
+        ? ADV_DISTRACTORS
+        : NOUN_DISTRACTORS;
+
+      let poolIdx = 0;
+      while (options.length < 4 && poolIdx < pool.length * 2) {
+        const cand = pool[poolIdx++ % pool.length];
+        if (!options.some((opt) => opt.toLowerCase() === cand.toLowerCase()) && cand.toLowerCase() !== lowerW) {
+          options.push(cand);
+        }
       }
     }
 
     // Escape regex special characters
-    const escaped = w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const escaped = cleanW.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const wordRegex = new RegExp(`\\b${escaped}\\b`, 'i');
     let sentenceWithBlank = '';
 
-    if (profile.exampleSentenceEn && !isGenericText(profile.exampleSentenceEn) && wordRegex.test(profile.exampleSentenceEn)) {
+    if (lowerW === 'nobody') {
+      sentenceWithBlank = '______ was in the meeting room when I arrived early this morning.';
+    } else if (lowerW === 'everyone') {
+      sentenceWithBlank = '______ agreed on the new schedule during our weekly team meeting.';
+    } else if (lowerW === 'anyone') {
+      sentenceWithBlank = 'Did ______ remember to share the updated notes after the team presentation?';
+    } else if (lowerW === 'somebody' || lowerW === 'someone') {
+      sentenceWithBlank = '______ left an umbrella by the office entrance before the rain started.';
+    } else if (lowerW === 'awesome') {
+      sentenceWithBlank = 'The team did an ______ job delivering the final project ahead of the deadline.';
+    } else if (lowerW === 'spot on' || lowerW === 'spot-on') {
+      sentenceWithBlank = 'Her analysis of the project challenges was completely ______.';
+    } else if (profile.exampleSentenceEn && !isGenericText(profile.exampleSentenceEn) && wordRegex.test(profile.exampleSentenceEn)) {
       sentenceWithBlank = profile.exampleSentenceEn.replace(wordRegex, '______');
     } else {
       switch (profile.category) {
         case 'people':
-          sentenceWithBlank = `A dedicated ______ plays an indispensable role in maintaining team morale and momentum.`;
+          sentenceWithBlank = `Our team collaborated closely with the new ______ to organize the project deliverables.`;
           break;
         case 'relation':
-          sentenceWithBlank = `Fostering a healthy professional ______ with colleagues builds lasting trust across the company.`;
+          sentenceWithBlank = `Building a respectful working ______ with colleagues fosters trust and productive collaboration.`;
           break;
         case 'setting':
-          sentenceWithBlank = `Working in an organized, supportive ______ significantly enhances daily productivity and focus.`;
+          sentenceWithBlank = `Creating a calm, organized work ______ helps everyone stay focused throughout the day.`;
           break;
         case 'time':
-          sentenceWithBlank = `Taking a brief pause during a busy ______ helps restore energy before the next meeting.`;
+          sentenceWithBlank = `Taking a short break during a busy ______ helps restore focus and mental clarity.`;
           break;
         case 'weather':
-          sentenceWithBlank = `We adjusted our schedule because the sudden change in the ______ made traveling impractical.`;
+          sentenceWithBlank = `We adjusted our commute plan because the sudden change in the ______ made traveling slower.`;
           break;
         case 'fitness':
-          sentenceWithBlank = `Completing a steady ______ early in the morning sets a positive, energized tone for the day.`;
+          sentenceWithBlank = `Completing a steady ______ early in the morning energizes both body and mind for the day.`;
           break;
         case 'work':
-          sentenceWithBlank = `Meeting every milestone required disciplined focus on this critical ______ from start to finish.`;
+          sentenceWithBlank = `Completing every milestone on time required steady focus on this key ______ from the team.`;
           break;
         case 'communication':
-          sentenceWithBlank = `We had an insightful ______ to align on upcoming priorities before the client presentation.`;
+          sentenceWithBlank = `We scheduled a constructive ______ to align on client expectations before the deadline.`;
           break;
         case 'emotion':
-          sentenceWithBlank = `Consistent daily practice builds authentic ______ when communicating with international partners.`;
+          sentenceWithBlank = `Consistent daily speaking practice builds authentic ______ when talking with native speakers.`;
           break;
         default:
           if (profile.partOfSpeech === 'verb') {
             sentenceWithBlank = `Before finalizing the project deliverables, the team needs to ______ each detail carefully.`;
           } else if (profile.partOfSpeech === 'adjective') {
-            sentenceWithBlank = `Our department adopted a ______ strategy that simplified the entire workflow.`;
+            sentenceWithBlank = `Our department adopted a ______ approach that simplified the entire workflow.`;
           } else if (profile.partOfSpeech === 'adverb') {
-            sentenceWithBlank = `She had ______ delivered the executive summary when the stakeholders entered the room.`;
+            sentenceWithBlank = `She explained the core objectives ______ so that every participant understood clearly.`;
           } else {
-            sentenceWithBlank = `Having a clear and reliable ______ ensures that the team delivers high quality results on time.`;
+            sentenceWithBlank = `Having a clear and structured ______ helps the team deliver high quality results on time.`;
           }
       }
     }
 
+    // Deterministic sort for options so choices remain stable on every render and reload
+    const stableOptions = [...new Set(options.slice(0, 4))];
+    while (stableOptions.length < 4) {
+      stableOptions.push(`choice-${stableOptions.length + 1}`);
+    }
+    const sortedOptions = [...stableOptions].sort((a, b) => {
+      const hashA = (a + lowerW).split('').reduce((acc, c) => acc + c.charCodeAt(0), 0);
+      const hashB = (b + lowerW).split('').reduce((acc, c) => acc + c.charCodeAt(0), 0);
+      return hashA - hashB || a.localeCompare(b);
+    });
+
+    const stableId = `fill-${lowerW.replace(/[^a-z0-9]/g, '_')}`;
+
     return {
-      id: `fill-${idx}-${w}`,
+      id: stableId,
       sentenceWithBlank,
-      correctWord: w,
-      options: options.sort(() => 0.5 - Math.random()),
+      correctWord: cleanW,
+      options: sortedOptions,
       hintPt: `Dica contextual: Encaixa com o sentido de "${profile.translationPt}".`,
       hintEn: `Context clue: Choose the word that best expresses "${profile.definitionEn.slice(0, 65)}...".`,
-      explanationPt: `A palavra "${w}" (${profile.translationPt}) completa a frase com precisão semântica e gramatical.`,
-      explanationEn: `"${w}" is the only choice that logically and grammatically fits this specific context.`,
+      explanationPt: `A palavra "${cleanW}" (${profile.translationPt}) completa a frase com precisão semântica e gramatical.`,
+      explanationEn: `"${cleanW}" is the only choice that logically and grammatically fits this specific context.`,
     };
   });
 }

@@ -4535,6 +4535,53 @@ export async function saveStudentHomeworkProgressToFirestore(
       quizAnswers: { ...(existingHomework?.studentAnswers?.quizAnswers || {}), ...(sanitizedHomework?.studentAnswers?.quizAnswers || {}) },
     };
 
+    // HOTFIX 2.3.1: Strictly protect genuine aiEvaluation, score, and isCompleted against empty or autosave state
+    const finalAiEvaluation = (
+      sanitizedHomework.aiEvaluation && isValidHomeworkEvaluation(sanitizedHomework.aiEvaluation) && !isSyntheticHomeworkEvaluation(sanitizedHomework.aiEvaluation)
+    ) ? sanitizedHomework.aiEvaluation : (
+      existingHomework?.aiEvaluation && isValidHomeworkEvaluation(existingHomework.aiEvaluation) && !isSyntheticHomeworkEvaluation(existingHomework.aiEvaluation)
+    ) ? existingHomework.aiEvaluation : undefined;
+
+    const finalScore = (typeof sanitizedHomework.score === 'number' && sanitizedHomework.score > 0)
+      ? sanitizedHomework.score
+      : (typeof existingHomework?.score === 'number' && existingHomework.score > 0)
+      ? existingHomework.score
+      : (typeof sanitizedHomework.score === 'number')
+      ? sanitizedHomework.score
+      : (typeof existingHomework?.score === 'number')
+      ? existingHomework.score
+      : 0;
+
+    const finalIsCompleted = Boolean(
+      sanitizedHomework.isCompleted ||
+      existingHomework?.isCompleted ||
+      (finalAiEvaluation && finalScore > 0)
+    );
+
+    const finalMatchingPairs = (Array.isArray(sanitizedHomework.matchingPairs) && sanitizedHomework.matchingPairs.length > 0)
+      ? sanitizedHomework.matchingPairs
+      : (Array.isArray(existingHomework?.matchingPairs) && existingHomework.matchingPairs.length > 0)
+      ? existingHomework.matchingPairs
+      : [];
+
+    const finalFillInBlanks = (Array.isArray(sanitizedHomework.fillInBlanks) && sanitizedHomework.fillInBlanks.length > 0)
+      ? sanitizedHomework.fillInBlanks
+      : (Array.isArray(existingHomework?.fillInBlanks) && existingHomework.fillInBlanks.length > 0)
+      ? existingHomework.fillInBlanks
+      : [];
+
+    const finalPrompts = (Array.isArray(sanitizedHomework.sentenceWritingPrompts) && sanitizedHomework.sentenceWritingPrompts.length > 0)
+      ? sanitizedHomework.sentenceWritingPrompts
+      : (Array.isArray(existingHomework?.sentenceWritingPrompts) && existingHomework.sentenceWritingPrompts.length > 0)
+      ? existingHomework.sentenceWritingPrompts
+      : [];
+
+    const finalReadingPassage = (sanitizedHomework.readingPassage?.text)
+      ? sanitizedHomework.readingPassage
+      : (existingHomework?.readingPassage?.text)
+      ? existingHomework.readingPassage
+      : sanitizedHomework.readingPassage;
+
     const payload = stampSchemaVersion({
       ...existingHomework,
       ...sanitizedHomework,
@@ -4543,8 +4590,15 @@ export async function saveStudentHomeworkProgressToFirestore(
       weeklyCycle: targetCycle,
       studentUid: cleanUid,
       studentEmail: cleanEmail,
+      matchingPairs: finalMatchingPairs,
+      fillInBlanks: finalFillInBlanks,
+      sentenceWritingPrompts: finalPrompts,
+      readingPassage: finalReadingPassage,
       completedPartsByDay: mergedCompletedParts,
       studentAnswers: mergedStudentAnswers,
+      aiEvaluation: finalAiEvaluation,
+      score: finalScore,
+      isCompleted: finalIsCompleted,
       updatedAt: new Date().toISOString(),
     });
 

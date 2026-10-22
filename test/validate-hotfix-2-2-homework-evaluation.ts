@@ -15,7 +15,7 @@ console.log('🧪 Starting HOTFIX 2.2 — Homework Evaluation Automated Verifica
 // =========================================================================
 console.log('▶ Test 1: Detecting and rejecting synthetic heuristic evaluations...');
 
-const syntheticEval1: HomeworkAiEvaluation = {
+const syntheticEval1: any = {
   overallScore: 85,
   overallFeedback: 'Parabéns pela dedicação! Você concluiu as etapas de memorização do vocabulário desta semana. Continue praticando para fixar ainda mais as novas palavras.',
   detailedSentenceFeedback: 'Bom trabalho na construção de frases.',
@@ -46,7 +46,7 @@ assert.strictEqual(
   'Failed: isValidHomeworkEvaluation must reject synthetic evaluation'
 );
 
-const syntheticEval2: HomeworkAiEvaluation = {
+const syntheticEval2: any = {
   overallScore: 90,
   overallFeedback: 'Ótimo trabalho! Você completou suas frases com dedicação e demonstrou bom entendimento.',
   sentenceEvaluationResults: [],
@@ -68,7 +68,7 @@ console.log('  ✔ Successfully detects synthetic and heuristic evaluation patte
 // =========================================================================
 console.log('\n▶ Test 2: Validating genuine pedagogical evaluation...');
 
-const genuineEval: HomeworkAiEvaluation = {
+const genuineEval: any = {
   overallScore: 82,
   overallFeedback: 'Excelente aplicação do vocabulário semanal em frases com contexto claro e natural. Na frase com "breakthrough", note o uso do artigo indefinido.',
   detailedSentenceFeedback: 'Suas frases demonstram domínio contextual das palavras "challenge" e "achieve".',
@@ -133,7 +133,7 @@ console.log('  ✔ Genuine pedagogical evaluations are correctly validated and a
 // =========================================================================
 console.log('\n▶ Test 3: Rejecting AI responses that do not match student answers...');
 
-const hallucinatedEval: HomeworkAiEvaluation = {
+const hallucinatedEval: any = {
   overallScore: 80,
   overallFeedback: 'Bom trabalho com as frases apresentadas.',
   sentenceEvaluationResults: [
@@ -164,7 +164,7 @@ console.log('  ✔ Mismatched or hallucinated evaluations are strictly rejected.
 // =========================================================================
 console.log('\n▶ Test 4: Preserving student typed answers while sanitizing legacy synthetic evals...');
 
-const legacySavedHomework: WeeklyHomeworkData = {
+const legacySavedHomework: any = {
   id: 'hw-test-123',
   weekLabel: 'Semana de 20 de Outubro de 2026',
   createdAt: '2026-10-20T10:00:00.000Z',
