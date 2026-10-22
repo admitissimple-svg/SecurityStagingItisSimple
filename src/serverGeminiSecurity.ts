@@ -828,6 +828,10 @@ export function isGenericPedagogicalDefinition(def: string | undefined | null): 
     lower.includes('utilizado em inglês autêntico para expressar a ideia de') ||
     lower.includes('used in authentic english to convey') ||
     lower.includes('authentic lexical expression (') ||
+    lower.includes('an important concept, role, or tool referring to') ||
+    lower.includes('characterized by being') ||
+    lower.includes('in a distinct manner, degree, or timing characterized as') ||
+    lower.includes('to engage in, conduct, or carry out the action of') ||
     lower.startsWith('a fundamental word') ||
     lower.startsWith('a natural conversational expression') ||
     lower.startsWith('an advanced lexical item')
@@ -859,7 +863,8 @@ export function isGenericPedagogicalExample(example: string | undefined | null):
     lower.includes('helps incorporate it into active speaking') ||
     (lower.includes('i prefer saying') && lower.includes('to sound natural and clear')) ||
     (lower.includes('ensures clarity') && lower.includes('saying')) ||
-    lower.includes('didactic example (hypothetical)')
+    lower.includes('didactic example (hypothetical)') ||
+    lower.includes('practicing with "') && lower.includes('in daily english conversations builds natural fluency')
   ) {
     return true;
   }

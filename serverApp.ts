@@ -14326,8 +14326,15 @@ function hasGenericBoilerplate(data: any): boolean {
 }
 
 // Detection for stale, formulaic, or robotic story templates that should never be shown to students
-function isBadStoryText(text: string): boolean {
-  if (!text || typeof text !== 'string' || text.trim().length < 80) return true;
+export function isBadStoryText(text: string): boolean {
+  if (!text || typeof text !== 'string' || text.trim().length < 120) return true;
+  // HOTFIX 2.3: Enforce the pedagogical 4-paragraph narrative structure
+  const paragraphs = text
+    .split(/\n+/)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 25);
+  if (paragraphs.length < 4) return true;
+
   const t = text.toLowerCase();
   return (
     t.includes('the day began with great purpose as') ||
@@ -14342,6 +14349,50 @@ function isBadStoryText(text: string): boolean {
     t.includes('a productive day of focus and growth') ||
     t.includes('finishing the workday on schedule allowed everyone to celebrate')
   );
+}
+
+export function validatePart4StoryResponse(json: any, targetWords?: string[]): boolean {
+  if (!json || typeof json !== 'object') return false;
+  if (!json.title || typeof json.title !== 'string' || json.title.trim().length < 3) return false;
+  if (!json.text || typeof json.text !== 'string' || isBadStoryText(json.text)) return false;
+  if (!Array.isArray(json.questions) || json.questions.length < 2) return false;
+  for (const q of json.questions) {
+    if (!q || typeof q.question !== 'string' || q.question.trim().length < 8) return false;
+    if (!Array.isArray(q.options) || q.options.length < 4) return false;
+    if (typeof q.correctAnswer !== 'number' && typeof q.correctAnswer !== 'string') return false;
+  }
+  return true;
+}
+
+export function validateDirectMemorizationAiResponse(json: any, targetWords?: string[]): boolean {
+  if (!json || typeof json !== 'object') return false;
+  if (!Array.isArray(json.matchingPairs) || json.matchingPairs.length === 0) return false;
+  if (!Array.isArray(json.fillInBlanks) || json.fillInBlanks.length === 0) return false;
+  if (!Array.isArray(json.sentenceWritingPrompts) || json.sentenceWritingPrompts.length === 0) return false;
+
+  // Check matching pairs for boilerplate / generic definitions
+  for (const item of json.matchingPairs) {
+    if (!item?.word || !item?.definition) return false;
+    if (isGenericPedagogicalDefinition(item.definition)) return false;
+  }
+
+  // Check fillInBlanks for valid blanks and options
+  for (const item of json.fillInBlanks) {
+    if (!item?.sentenceWithBlank || !item?.correctWord) return false;
+    if (!Array.isArray(item.options) || item.options.length < 4) return false;
+  }
+
+  // Check readingPassage
+  if (!json.readingPassage?.text || isBadStoryText(json.readingPassage.text)) {
+    return false;
+  }
+  if (!Array.isArray(json.readingPassage?.questions) || json.readingPassage.questions.length < 2) {
+    return false;
+  }
+
+  if (hasGenericBoilerplate(json)) return false;
+
+  return true;
 }
 
 // Dedicated Generator for Part 4: Mini-Story / Routine Reading & Interpretation with Gemini API
@@ -14362,8 +14413,13 @@ Your mission is to craft a 100% ORIGINAL, INÉDITA, and COMPELLING short story (
 
 CRITICAL MANDATORY RULES (STRICTLY ENFORCED):
 
-1. GERAÇÃO DE CONTEÚDO 100% INÉDITO (ZERO TEMPLATES / ZERO REUSO):
+1. GERAÇÃO DE CONTEÚDO 100% INÉDITO COM ESTRUTURA DE 4 PARÁGRAFOS (ZERO TEMPLATES / ZERO REUSO):
    - You must construct a brand-new, vivid, and original storyline specifically customized to the provided words of the day.
+   - MANDATORY 4-PARAGRAPH FORMAT: The story MUST consist of exactly 4 cohesive paragraphs separated by double newlines (\`\n\n\`):
+     * Paragraph 1: Setup, protagonist context, and situation introduction.
+     * Paragraph 2: Challenge, conflict, tension, or pivotal incident.
+     * Paragraph 3: Decisive action, turning point, or resolution development.
+     * Paragraph 4: Outcome, reflection, and lasting takeaway.
    - ABSOLUTE PROHIBITION ON STATIC TEMPLATES: You are strictly forbidden from reusing formulaic slot templates where only the target words change.
    - Specifically NEVER write or mimic sentences like:
      * "The day began with great purpose as [Name] reviewed key plans regarding [word]..."
@@ -14399,7 +14455,7 @@ CRITICAL MANDATORY RULES (STRICTLY ENFORCED):
 Output format must be a strict JSON object:
 {
   "title": "A captivating, story-specific title",
-  "text": "The 100% original narrative (1 to 3 paragraphs) with each target word highlighted as **word**.",
+  "text": "The 100% original narrative (exactly 4 cohesive paragraphs separated by \\n\\n) with each target word highlighted as **word**.",
   "questions": [
     {
       "id": "q-1",
@@ -14431,7 +14487,7 @@ Return strict JSON only.`;
     callerRole: 'student',
     apiKey,
     temperature: 0.7,
-    validator: (json) => Boolean(json && json.title && json.text && !isBadStoryText(json.text) && Array.isArray(json.questions)),
+    validator: (json) => validatePart4StoryResponse(json, words),
   });
 
   if (contingencyResult.success && contingencyResult.parsedJson) {
@@ -14524,10 +14580,10 @@ STRICT SYSTEM PROMPT CONSTRAINTS & RULES (ENFORCED 100%):
      * Provide an engaging prompt challenging the learner to apply each target word to their personal goals, career, or daily routine.
      * Calibrate the prompt to ${levelMeta.labelEn} level.
      * Include practical challenge guidance in English ("hint" and "hintEn"), in Portuguese ("hintPt"), and a clear level grammar instruction ("levelInstruction").
-   - Part 4 (Mini-Story & Comprehension Questions):
-     * Compose a cohesive, lively, and 100% original short story featuring a relatable protagonist navigating a concrete situation that seamlessly and organically embeds ALL target words in context, highlighted with **word**.
-     * Accompany with 2 to 3 multiple-choice reading comprehension questions that strictly test concrete plot events, decisions, and outcomes in this narrative. ZERO generic questions about English study methods.
-     * Each question has 4 options, a "correctAnswer" index (0, 1, 2, or 3), and an "explanation" citing the story.
+    - Part 4 (Mini-Story & Comprehension Questions):
+      * Compose a cohesive, lively, and 100% original short story consisting of exactly 4 cohesive paragraphs separated by double newlines (\n\n) featuring a relatable protagonist navigating a concrete situation that seamlessly and organically embeds ALL target words in context, highlighted with **word**.
+      * Accompany with 2 to 3 multiple-choice reading comprehension questions that strictly test concrete plot events, decisions, and outcomes in this narrative. ZERO generic questions about English study methods.
+      * Each question has 4 options, a "correctAnswer" index (0, 1, 2, or 3), and an "explanation" citing the story.
 
 You MUST respond with a strict, valid JSON object matching the requested schema.`;
 
@@ -14572,7 +14628,7 @@ Required JSON Structure:
   ],
   "readingPassage": {
     "title": "Story Title",
-    "text": "Coherent short story that organically embeds ALL target words highlighted with **word**.",
+    "text": "Coherent short story (exactly 4 cohesive paragraphs separated by double newlines) that organically embeds ALL target words highlighted with **word**.",
     "questions": [
       {
         "id": "q-1",
@@ -14593,7 +14649,7 @@ Required JSON Structure:
     callerRole: 'student',
     apiKey,
     temperature: 0.65,
-    validator: (json) => Array.isArray(json?.matchingPairs) && Array.isArray(json?.fillInBlanks) && Array.isArray(json?.sentenceWritingPrompts),
+    validator: (json) => validateDirectMemorizationAiResponse(json, words),
   });
 
   if (contingencyResult.success && contingencyResult.parsedJson) {
@@ -14605,17 +14661,11 @@ Required JSON Structure:
       Array.isArray(parsed.fillInBlanks) &&
       parsed.fillInBlanks.length > 0 &&
       Array.isArray(parsed.sentenceWritingPrompts) &&
-      parsed.sentenceWritingPrompts.length > 0
+      parsed.sentenceWritingPrompts.length > 0 &&
+      parsed.readingPassage?.text &&
+      !isBadStoryText(parsed.readingPassage.text)
     ) {
       if (!hasGenericBoilerplate(parsed)) {
-        // If story was missing or formulaic, synthesize cohesive story deterministically (zero secondary cascade)
-        if (!parsed.readingPassage?.text || isBadStoryText(parsed.readingPassage.text)) {
-          parsed.readingPassage = synthesizeCohesiveStoryAndQuestions({
-            words,
-            studentLevel,
-            studentName: 'Student',
-          });
-        }
 
         // Normalize questions
         if (Array.isArray(parsed.readingPassage?.questions)) {
@@ -14802,7 +14852,21 @@ app.post('/api/homework/generate-ai', firebaseAuthMiddleware, async (req, res) =
     }
 
     // Assemble the 4 genuine AI-generated parts
-    const matchingPairs = aiResult.matchingPairs;
+    // HOTFIX 2.3: Reuse legitimate definitions already persisted in Firestore (e.g. from 5 Words / Native Friends Notes)
+    const matchingPairs = (aiResult.matchingPairs || []).map((m: any) => {
+      const existingDetail = Array.isArray(wordDetails)
+        ? wordDetails.find((d: any) => (d.word || '').toLowerCase().trim() === (m.word || '').toLowerCase().trim())
+        : null;
+      if (existingDetail && !isGenericPedagogicalDefinition(existingDetail.definitionEn || existingDetail.definition)) {
+        return {
+          ...m,
+          definition: existingDetail.definitionEn || existingDetail.definition,
+          translation: existingDetail.translationPt || existingDetail.translation || m.translation,
+        };
+      }
+      return m;
+    });
+
     const fillInBlanks = aiResult.fillInBlanks;
     const sentenceWritingPrompts = aiResult.sentenceWritingPrompts || [];
     const readingPassage = aiResult.readingPassage;
@@ -14812,11 +14876,19 @@ app.post('/api/homework/generate-ai', firebaseAuthMiddleware, async (req, res) =
     const vocabularyList = cleanWords.map((word) => {
       const matchPair = matchingPairs.find((m: any) => m.word?.toLowerCase() === word.toLowerCase());
       const fillItem = fillInBlanks.find((f: any) => f.correctWord?.toLowerCase() === word.toLowerCase());
+      const existingDetail = Array.isArray(wordDetails)
+        ? wordDetails.find((d: any) => (d.word || '').toLowerCase().trim() === word.toLowerCase().trim())
+        : null;
       const prof = profileWord(word);
+      const legitimateDef = existingDetail && !isGenericPedagogicalDefinition(existingDetail.definitionEn || existingDetail.definition)
+        ? (existingDetail.definitionEn || existingDetail.definition)
+        : matchPair?.definition || prof.definitionEn;
+      const legitimateTrans = existingDetail?.translationPt || existingDetail?.translation || matchPair?.translation || prof.translationPt;
+
       return {
         word,
-        definitionEn: matchPair?.definition || prof.definitionEn,
-        translationPt: matchPair?.translation || prof.translationPt,
+        definitionEn: legitimateDef,
+        translationPt: legitimateTrans,
         exampleSentence: fillItem?.sentenceWithBlank?.replace(/______/g, word) || prof.exampleSentenceEn,
         sourceActivityName: 'Weekly Vocabulary',
         sourceDay: 'monday' as const,
@@ -14971,14 +15043,11 @@ app.post(['/api/homework/generate-part4', '/api/homework/generate-story'], fireb
       return res.json({ success: true, readingPassage: aiStory, isAiGenerated: true, isFallback: false });
     }
 
-    // Dynamic fallback ensuring zero template-reuse
-    const fallbackStory = synthesizeCohesiveStoryAndQuestions({
-      words: cleanWords,
-      studentLevel,
-      studentName,
-      wordDetails,
+    return res.status(503).json({
+      success: false,
+      error: 'AiUnavailable',
+      message: 'Não foi possível gerar a história no momento devido à indisponibilidade do serviço de IA. Suas palavras da semana foram preservadas.',
     });
-    return res.json({ success: true, readingPassage: fallbackStory, isAiGenerated: false, isFallback: true });
   } catch (error: any) {
     console.error('Error in /api/homework/generate-part4:', error);
     res.status(500).json({ error: error.message || 'Failed to generate Part 4 story' });
@@ -15520,6 +15589,22 @@ app.post('/api/check-writing', firebaseAuthMiddleware, async (req, res) => {
     programmaticErrorsEn.push("Word confusion: use 'lose' (verb to lose) instead of 'loose' (adjective loose).");
   }
 
+  // 7b. Rigorous Check: Indefinite pronoun with article error ("the anyone", "the someone", etc.)
+  if (/\b(the|a|an)\s+(anyone|anybody|someone|somebody|everyone|everybody|no\s*one|nobody)\b/i.test(programmaticFixed)) {
+    programmaticFixed = programmaticFixed.replace(/\b(the|a|an)\s+(anyone|anybody|someone|somebody|everyone|everybody|no\s*one|nobody)\b/gi, '$2');
+    hasProgrammaticError = true;
+    programmaticErrorsPt.push("Erro de artigo: não use 'the', 'a' ou 'an' antes de pronomes indefinidos como 'anyone' ou 'someone'.");
+    programmaticErrorsEn.push("Article error: do not use 'the', 'a', or 'an' before indefinite pronouns like 'anyone' or 'someone'.");
+  }
+
+  // 7c. Rigorous Check: Incomplete question structure with "anyone know about"
+  if (/\banyone\s+know\s+about\b/i.test(programmaticFixed) && !/\b(does|did|if|whether|can|could|will)\s+anyone\s+know\s+about\b/i.test(programmaticFixed)) {
+    programmaticFixed = programmaticFixed.replace(/\banyone\s+know\s+about\b/gi, 'Does anyone know about');
+    hasProgrammaticError = true;
+    programmaticErrorsPt.push("Estrutura de pergunta incompleta: inicie com 'Does' para fazer perguntas no presente (ex: 'Does anyone know about...?').");
+    programmaticErrorsEn.push("Incomplete question structure: start with 'Does' for present tense questions (e.g., 'Does anyone know about...?').");
+  }
+
   // 8. Rigorous Check: Common spelling mistakes
   const SERVER_SPELLING_FIXES: Record<string, { correct: string; explPt: string; explEn: string }> = {
     'millestone': { correct: 'milestone', explPt: 'A grafia correta é "milestone" (com apenas um "l").', explEn: 'Correct spelling is "milestone" (single "l").' },
@@ -15888,7 +15973,12 @@ app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
     let fillCorrect = 0;
     const fillFeedback = (homework.fillInBlanks || []).map((f: any) => {
       const userAns = (fillInBlanks[f.id] || '').trim();
-      const isCorrect = userAns.toLowerCase() === f.correctWord.toLowerCase();
+      const userLower = userAns.toLowerCase();
+      const targetLower = (f.correctWord || '').toLowerCase().trim();
+      const validAlts = Array.isArray(f.validAlternatives)
+        ? f.validAlternatives.map((a: string) => (a || '').toLowerCase().trim())
+        : [];
+      const isCorrect = userLower === targetLower || (validAlts.length > 0 && validAlts.includes(userLower));
       if (isCorrect) fillCorrect++;
       return {
         id: f.id,
@@ -16021,10 +16111,36 @@ Output STRICT JSON matching this schema:
             );
             const promptWord = matchingPrompt ? matchingPrompt.word : item.word;
             const rawStudentText = (sentences[promptWord] || sentences[promptWord?.toLowerCase()] || sentences[item.word] || '').trim();
+
+            const cleanTarget = (promptWord || '').toLowerCase().trim();
+            const lowerAns = rawStudentText.toLowerCase();
+            const rootTarget = cleanTarget.replace(/(ing|ed|s|es|d)$/i, '');
+            const usedTarget = cleanTarget
+              ? lowerAns.includes(cleanTarget) || (rootTarget.length >= 4 && lowerAns.includes(rootTarget))
+              : true;
+            const detGrammar = analyzeSentenceGrammarDeterministic(rawStudentText, [promptWord], promptWord);
+
+            let finalIsCorrect = Boolean(item.isCorrect);
+            if (!rawStudentText || !usedTarget || detGrammar.hasGrammarError) {
+              finalIsCorrect = false;
+            }
+
             return {
               ...item,
               word: promptWord,
               originalSentence: rawStudentText || '(nenhuma frase enviada)',
+              isCorrect: finalIsCorrect,
+              correctedSentence: item.correctedSentence || detGrammar.fixedSentence || rawStudentText,
+              explanationPt: !usedTarget && cleanTarget
+                ? `A palavra-alvo "${promptWord}" não foi utilizada na frase. Inclua "${promptWord}" para validar o exercício.`
+                : detGrammar.hasGrammarError && !item.explanationPt
+                ? detGrammar.errorsPt.join(' ')
+                : item.explanationPt || '',
+              explanationEn: !usedTarget && cleanTarget
+                ? `The target word "${promptWord}" was not used in the sentence. Include "${promptWord}" to complete the exercise.`
+                : detGrammar.hasGrammarError && !item.explanationEn
+                ? detGrammar.errorsEn.join(' ')
+                : item.explanationEn || '',
             };
           });
           tutorSummaryPt = contingencyRes.parsedJson.tutorFeedbackSummaryPt || '';

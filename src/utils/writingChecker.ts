@@ -621,6 +621,22 @@ export function analyzeSentenceGrammarDeterministic(
       errorsEn.push("Word confusion: use 'lose' (verb) instead of 'loose' (adjective).");
     }
 
+    // 11b. Indefinite pronoun with article error ("the anyone", "the someone", "a nobody")
+    if (/\b(the|a|an)\s+(anyone|anybody|someone|somebody|everyone|everybody|no\s*one|nobody)\b/i.test(sFixed)) {
+      sFixed = sFixed.replace(/\b(the|a|an)\s+(anyone|anybody|someone|somebody|everyone|everybody|no\s*one|nobody)\b/gi, '$2');
+      hasGrammarError = true;
+      pushWordFeedback('the anyone', 'anyone', 'Pronomes indefinidos como "anyone" não admitem artigo ("the").', 'Indefinite pronouns like "anyone" cannot take the article "the".');
+      errorsPt.push('Erro gramatical de artigo: pronomes indefinidos como "anyone" não admitem "the" (ex: "Does anyone know about...?").');
+      errorsEn.push('Article error with indefinite pronoun: pronouns like "anyone" cannot take "the" (e.g. "Does anyone know about...?").');
+    }
+
+    if (/\banyone\s+know\s+about\b/i.test(sFixed) && !/\b(does|did|if|whether|can|could|will)\s+anyone\s+know\s+about\b/i.test(sFixed)) {
+      sFixed = sFixed.replace(/\banyone\s+know\s+about\b/gi, 'Does anyone know about');
+      hasGrammarError = true;
+      errorsPt.push('Estrutura de pergunta incompleta: use o auxiliar "Does" (ex: "Does anyone know about...?").');
+      errorsEn.push('Incomplete question structure: use the auxiliary "Does" (e.g. "Does anyone know about...?").');
+    }
+
     if (/\bin the end of the day\b/i.test(sFixed)) {
       sFixed = sFixed.replace(/\bin the end of the day\b/gi, 'At the end of the day');
       hasGrammarError = true;
@@ -971,8 +987,37 @@ export async function checkStudentWritingApi(
     });
 
     if (res.status === 401 || res.status === 403) {
-      console.warn(`Backend writing check rejected (${res.status}): unauthenticated or unauthorized. Running local evaluation.`);
-      return evaluateLocally(params);
+      console.warn(`Backend writing check rejected (${res.status}): unauthenticated or unauthorized.`);
+      const unauthResult = evaluateLocally(params);
+      return {
+        ...unauthResult,
+        isCorrect: false,
+        hasAnyError: true,
+      };
+    }
+
+    if (res.status === 503 || res.status === 429) {
+      const errJson = await res.json().catch(() => ({}));
+      const unavailableMsgPt = errJson?.message || 'Serviço de avaliação pedagógica temporariamente indisponível após tentativa com os modelos de contingência. Sua resposta foi preservada.';
+      const unavailableMsgEn = 'Pedagogical evaluation service temporarily unavailable after attempting contingency models. Your response was preserved.';
+      return {
+        hasAnyError: true,
+        isCorrect: false,
+        isAiUnavailable: true,
+        usedTargetWord: false,
+        wordFeedbacks: [],
+        sentenceFeedback: {
+          original: params.sentence || '',
+          hasError: true,
+          corrected: params.sentence || '',
+          explanationPt: unavailableMsgPt,
+          explanationEn: unavailableMsgEn,
+        },
+        correctedSentence: params.sentence || '',
+        explanation: unavailableMsgPt,
+        overallSummaryPt: unavailableMsgPt,
+        overallSummaryEn: unavailableMsgEn,
+      } as WritingEvaluationResult;
     }
 
     if (res.ok) {
@@ -1000,11 +1045,50 @@ export async function checkStudentWritingApi(
       }
     }
   } catch (err) {
-    console.warn('Backend writing check unavailable, running local evaluation:', err);
+    console.warn('Backend writing check network error:', err);
+    const unavailableMsgPt = 'Serviço de avaliação pedagógica temporariamente indisponível após tentativa com os modelos de contingência. Sua resposta foi preservada.';
+    const unavailableMsgEn = 'Pedagogical evaluation service temporarily unavailable after attempting contingency models. Your response was preserved.';
+    return {
+      hasAnyError: true,
+      isCorrect: false,
+      isAiUnavailable: true,
+      usedTargetWord: false,
+      wordFeedbacks: [],
+      sentenceFeedback: {
+        original: params.sentence || '',
+        hasError: true,
+        corrected: params.sentence || '',
+        explanationPt: unavailableMsgPt,
+        explanationEn: unavailableMsgEn,
+      },
+      correctedSentence: params.sentence || '',
+      explanation: unavailableMsgPt,
+      overallSummaryPt: unavailableMsgPt,
+      overallSummaryEn: unavailableMsgEn,
+    } as WritingEvaluationResult;
   }
 
-  // 2. Client-side heuristic fallback
-  return evaluateLocally(params);
+  // Fallback for unexpected status codes
+  const unavailableMsgPt = 'Serviço de avaliação pedagógica temporariamente indisponível após tentativa com os modelos de contingência. Sua resposta foi preservada.';
+  const unavailableMsgEn = 'Pedagogical evaluation service temporarily unavailable after attempting contingency models. Your response was preserved.';
+  return {
+    hasAnyError: true,
+    isCorrect: false,
+    isAiUnavailable: true,
+    usedTargetWord: false,
+    wordFeedbacks: [],
+    sentenceFeedback: {
+      original: params.sentence || '',
+      hasError: true,
+      corrected: params.sentence || '',
+      explanationPt: unavailableMsgPt,
+      explanationEn: unavailableMsgEn,
+    },
+    correctedSentence: params.sentence || '',
+    explanation: unavailableMsgPt,
+    overallSummaryPt: unavailableMsgPt,
+    overallSummaryEn: unavailableMsgEn,
+  } as WritingEvaluationResult;
 }
 
 export const SYNTHETIC_EVALUATION_PATTERNS: readonly string[] = [
@@ -1191,9 +1275,25 @@ export function validateHomeworkAiEvaluationResponse(
         return false;
       }
     } else {
+      // HOTFIX 2.3: An evaluation is INVALID if it approved (isCorrect: true) a sentence that does not use the target word
+      const cleanTarget = targetWord.toLowerCase().trim();
+      const lowerAns = studentAns.toLowerCase();
+      const rootTarget = cleanTarget.replace(/(ing|ed|s|es|d)$/i, '');
+      const usedTarget = cleanTarget
+        ? lowerAns.includes(cleanTarget) || (rootTarget.length >= 4 && lowerAns.includes(rootTarget))
+        : true;
+      if (!usedTarget && item.isCorrect === true) {
+        return false;
+      }
+
+      // HOTFIX 2.3: An evaluation is INVALID if it approved a sentence with severe deterministic grammar errors
+      const detAnalysis = analyzeSentenceGrammarDeterministic(studentAns, [targetWord], targetWord);
+      if (detAnalysis.hasGrammarError && item.isCorrect === true) {
+        return false;
+      }
+
       if (orig && orig !== '(nenhuma frase enviada)' && orig !== '(no sentence provided)') {
         const lowerOrig = orig.toLowerCase();
-        const lowerAns = studentAns.toLowerCase();
         const wordsInAns = lowerAns.split(/\s+/).filter((w) => w.length > 2);
         const hasOverlap =
           wordsInAns.some((w) => lowerOrig.includes(w)) ||

@@ -829,6 +829,7 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
   let p1 = '';
   let p2 = '';
   let p3 = '';
+  let p4 = '';
 
   const questions: ReadingQuestion[] = [];
 
@@ -846,7 +847,9 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
       p2 = `Throughout the morning, ${protagonist} collaborated with the team to ensure that every task was managed with clear expectations and mutual encouragement.`;
     }
 
-    p3 = `By the end of the day, fostering open communication and mutual respect proved that a supportive culture drives sustainable success, leaving the entire team energized for the week ahead.`;
+    p3 = `In the afternoon, the group tackled a complex project milestone together, applying constructive feedback to refine their strategic goals and streamline daily operations.`;
+
+    p4 = `By the end of the day, fostering open communication and mutual respect proved that a supportive culture drives sustainable success, leaving the entire team energized for the week ahead.`;
 
     // 100% Story-Grounded Questions
     questions.push({
@@ -906,27 +909,28 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
     const stretchWord = profiles.find((p) => p.word.toLowerCase() === 'stretch');
     const relaxWord = profiles.find((p) => ['relax', 'unwind'].includes(p.word.toLowerCase()));
 
+    p2 = `After warming up, settling into a focused routine brought noticeable calm and physical energy.`;
     if (treadmillWord) {
-      p1 += ` Setting a steady pace on the **${treadmillWord.word}** helped build cardiovascular stamina and clear the mind.`;
+      p2 += ` Setting a steady pace on the **${treadmillWord.word}** helped build cardiovascular stamina and clear the mind.`;
     }
 
     if (job && moment) {
-      p2 = `Later at their **${job.word}**, ${protagonist} met with colleagues to prioritize weekly deliverables. During a busy afternoon session, taking a quiet **${moment.word}** to reflect on current progress helped clarify the best path forward.`;
+      p3 = `Later at their **${job.word}**, ${protagonist} met with colleagues to prioritize weekly deliverables. During a busy afternoon session, taking a quiet **${moment.word}** to reflect on current progress helped clarify the best path forward.`;
     } else if (job) {
-      p2 = `Transitioning smoothly into the workday, ${protagonist} focused on the core responsibilities of their **${job.word}**, ensuring communication with colleagues remained clear and prompt.`;
+      p3 = `Transitioning smoothly into the workday, ${protagonist} focused on the core responsibilities of their **${job.word}**, ensuring communication with colleagues remained clear and prompt.`;
     } else {
-      p2 = `Throughout the afternoon, the team collaborated smoothly to review key assignments and align on upcoming goals.`;
+      p3 = `Throughout the afternoon, the team collaborated smoothly to review key assignments and align on upcoming goals.`;
     }
 
     if (stretchWord) {
-      p2 += ` Taking a brief pause between meetings to **${stretchWord.word}** relieved physical tension and restored focus.`;
+      p3 += ` Taking a brief pause between meetings to **${stretchWord.word}** relieved physical tension and restored focus.`;
     }
 
     const wrapWord = weather && weather !== storm ? weather.word : 'routine';
-    p3 = `By late afternoon, completing all scheduled tasks brought a genuine sense of accomplishment. Taking a moment to appreciate the changing **${wrapWord}** reminded everyone that consistent daily habits create lasting balance.`;
+    p4 = `By late afternoon, completing all scheduled tasks brought a genuine sense of accomplishment. Taking a moment to appreciate the changing **${wrapWord}** reminded everyone that consistent daily habits create lasting balance.`;
 
     if (relaxWord) {
-      p3 += ` As evening arrived, taking time to **${relaxWord.word}** provided the perfect conclusion to a healthy, productive day.`;
+      p4 += ` As evening arrived, taking time to **${relaxWord.word}** provided the perfect conclusion to a healthy, productive day.`;
     }
 
     questions.push({
@@ -983,7 +987,6 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
   }
   // SCENARIO 3: Dynamic Contextual Narrative Synthesizer (Zero Formulaic Templates)
   else {
-    // Dynamic themes to prevent any static repetition
     const themes = [
       {
         title: `The Project Breakthrough (${levelLabel})`,
@@ -1001,7 +1004,6 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
     const chosenTheme = themes[Math.abs(words.join('').length) % themes.length];
     title = chosenTheme.title;
 
-    // Helper to naturally integrate a word based on its part of speech
     const buildNaturalClause = (p: LexicalWordProfile, role: 'intro' | 'action' | 'pivot' | 'conclusion'): string => {
       const w = `**${p.word}**`;
       const pos = p.partOfSpeech;
@@ -1022,7 +1024,6 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
         if (role === 'action') return `working ${w} alongside the team prevented unnecessary misunderstandings`;
         return `moving forward ${w} ensured that all milestones were met on schedule`;
       }
-      // Noun / default
       if (role === 'intro') return `${protagonist} focused early attention on understanding the core ${w}`;
       if (role === 'action') return `maintaining transparent communication around each ${w} kept the momentum strong`;
       if (role === 'pivot') return `taking time to address the primary ${w} resolved pending questions`;
@@ -1030,46 +1031,50 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
     };
 
     const total = profiles.length;
-    const p1Words = profiles.slice(0, Math.min(2, total));
-    const p2Words = profiles.slice(2, Math.min(4, total));
-    const p3Words = profiles.slice(4);
+    const p1Words = profiles.slice(0, 1);
+    const p2Words = profiles.slice(1, Math.min(3, total));
+    const p3Words = profiles.slice(3, Math.min(4, total));
+    const p4Words = profiles.slice(4);
 
     const p1Parts: string[] = [];
     if (p1Words.length >= 1) {
       p1Parts.push(`The working session began with clear intention as ${buildNaturalClause(p1Words[0], 'intro')}.`);
-    }
-    if (p1Words.length >= 2) {
-      p1Parts.push(`By establishing open dialogue early in the morning, ${buildNaturalClause(p1Words[1], 'action')}.`);
     } else {
-      p1Parts.push(`Aligning on concrete objectives from the outset gave everyone confidence to move forward smoothly.`);
+      p1Parts.push(`The day commenced with clear focus as the team gathered to coordinate priorities.`);
     }
+    p1Parts.push(`Aligning on concrete objectives from the outset gave everyone confidence to move forward smoothly.`);
     p1 = p1Parts.join(' ');
 
     const p2Parts: string[] = [];
     if (p2Words.length >= 1) {
-      p2Parts.push(`As the afternoon progressed, ${buildNaturalClause(p2Words[0], 'pivot')}.`);
+      p2Parts.push(`During the morning collaboration, ${buildNaturalClause(p2Words[0], 'action')}.`);
     } else {
       p2Parts.push(`During the midday collaboration, team members shared actionable insights and coordinated their efforts.`);
     }
     if (p2Words.length >= 2) {
       p2Parts.push(`At the same time, ${buildNaturalClause(p2Words[1], 'action')}.`);
-    } else if (p2Words.length === 1) {
+    } else {
       p2Parts.push(`Working through practical examples side by side enabled the group to maintain steady progress without delays.`);
     }
     p2 = p2Parts.join(' ');
 
     const p3Parts: string[] = [];
     if (p3Words.length >= 1) {
-      p3Parts.push(`Before wrapping up the day, ${buildNaturalClause(p3Words[0], 'conclusion')}.`);
+      p3Parts.push(`As the afternoon progressed, ${buildNaturalClause(p3Words[0], 'pivot')}.`);
     } else {
-      p3Parts.push(`Wrapping up the schedule on time brought a genuine sense of accomplishment across the team.`);
+      p3Parts.push(`Navigating unexpected questions during the project review required creative problem-solving.`);
     }
-    p3Parts.push(`Finishing each milestone with care proved once again that thoughtful collaboration and steady habits create lasting professional success.`);
+    p3Parts.push(`Taking time to review feedback with colleagues clarified the best route to achieve top quality.`);
     p3 = p3Parts.join(' ');
 
-    // 100% story-coherent questions based directly on the narrative events
-    const firstWordProfile = p1Words[0] || profiles[0];
-    const secondWordProfile = p2Words[0] || profiles[1] || firstWordProfile;
+    const p4Parts: string[] = [];
+    if (p4Words.length >= 1) {
+      p4Parts.push(`Before wrapping up the day, ${buildNaturalClause(p4Words[0], 'conclusion')}.`);
+    } else {
+      p4Parts.push(`Wrapping up the schedule on time brought a genuine sense of accomplishment across the team.`);
+    }
+    p4Parts.push(`Finishing each milestone with care proved once again that thoughtful collaboration and steady habits create lasting professional success.`);
+    p4 = p4Parts.join(' ');
 
     questions.push({
       id: 'q-1',
@@ -1086,7 +1091,7 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
 
     questions.push({
       id: 'q-2',
-      question: `How did ${protagonist} and the team maintain productive momentum during the afternoon?`,
+      question: `How did ${protagonist} and the team maintain productive momentum during the collaboration?`,
       options: [
         `By addressing key deliverables proactively and collaborating transparently through practical steps.`,
         `By working in total isolation and declining to review ongoing assignments.`,
@@ -1094,7 +1099,7 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
         `By postponing their daily responsibilities until the following month.`,
       ],
       correctAnswer: 0,
-      explanation: `The middle section emphasizes that addressing key deliverables proactively and transparently kept momentum strong.`,
+      explanation: `The middle sections emphasize that addressing key deliverables proactively and transparently kept momentum strong.`,
     });
 
     questions.push({
@@ -1111,8 +1116,8 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
     });
   }
 
-  // Ensure all words are present in the final story text
-  let fullStoryText = [p1, p2, p3].filter(Boolean).join('\n\n');
+  // Ensure all words are present in the final story text across exactly 4 paragraphs
+  let fullStoryText = [p1, p2, p3, p4].filter(Boolean).join('\n\n');
 
   // Verify all words have been highlighted; if any missing, append naturally
   const missingWords = profiles.filter(

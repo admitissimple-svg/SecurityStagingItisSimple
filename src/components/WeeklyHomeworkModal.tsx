@@ -685,20 +685,23 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       setTimeout(() => setSubmittedFeedbackToast(null), 3500);
     } catch (err) {
       console.error(`Check error for ${wordKey}:`, err);
+      const unavailableMsgPt = 'Serviço de avaliação pedagógica temporariamente indisponível após tentativa com os modelos de contingência. Sua frase foi preservada.';
+      const unavailableMsgEn = 'Pedagogical evaluation service temporarily unavailable after attempting contingency models. Your sentence has been preserved.';
       const fallbackResult = {
-        hasAnyError: false,
-        isCorrect: true,
+        hasAnyError: true,
+        isCorrect: false,
+        isAiUnavailable: true,
         wordFeedbacks: [],
         sentenceFeedback: {
           original: cleanText,
-          hasError: false,
+          hasError: true,
           corrected: cleanText,
-          explanationPt: `Frase registrada para "${wordKey}".`,
-          explanationEn: `Sentence recorded for "${wordKey}".`,
+          explanationPt: currentLanguage === 'en' ? unavailableMsgEn : unavailableMsgPt,
+          explanationEn: unavailableMsgEn,
         },
         correctedSentence: cleanText,
-        overallSummaryPt: `Frase registrada com sucesso para "${wordKey}".`,
-        overallSummaryEn: `Sentence saved successfully for "${wordKey}".`,
+        overallSummaryPt: unavailableMsgPt,
+        overallSummaryEn: unavailableMsgEn,
       };
       setSentenceFeedbacks((prev) => ({ ...prev, [wordKey]: fallbackResult }));
     } finally {
