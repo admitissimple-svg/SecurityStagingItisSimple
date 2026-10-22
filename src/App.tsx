@@ -925,9 +925,12 @@ export default function App() {
       sourceActivityName: e.sourceActivityName || 'Personal Dictionary',
       sourceDay: (e as any).sourceDay,
       source: e.source,
-      learnedAt: e.learnedAt,
+      learnedAt: e.learnedAt || (e as any).firstSeenAt,
+      firstSeenAt: (e as any).firstSeenAt,
       practiceCount: e.practiceCount,
       lastPracticedAt: e.lastPracticedAt,
+      studentUid: currentAccount?.uid || userProfile?.id || (userProfile as any)?.uid,
+      studentEmail: currentAccount?.email || userProfile?.email,
     }));
 
     const generated = generateWeeklyHomeworkFromRoutines({
@@ -944,7 +947,7 @@ export default function App() {
       existingDailyActivities: weeklyHomework?.dailyActivities,
     });
 
-    // HOTFIX 2.3.5 (Etapa 3 & 5): Manage independent daily activities per targetDay
+    // HOTFIX 2.3.5 / 2.3.5B (Etapa 3 & 5): Manage independent daily activities per targetDay and cycle
     setWeeklyHomework((prev) => {
       const prevCycle = parseWeekCycleNumber(prev?.weeklyCycle ?? prev?.weekId ?? prev?.id);
       const genCycle = parseWeekCycleNumber(generated?.weeklyCycle ?? generated?.weekId ?? generated?.id);
@@ -954,11 +957,15 @@ export default function App() {
           (prev.weekId && generated.weekId && prev.weekId === generated.weekId))
       );
 
-      // Snapshot active day of prev before switching or merging
-      const combinedDaily: Record<string, DailyHomeworkActivity> = {
-        ...(prev?.dailyActivities || {}),
-        ...(generated?.dailyActivities || {}),
-      };
+      // Snapshot active day of prev before switching or merging (isolated strictly within the same cycle)
+      const combinedDaily: Record<string, DailyHomeworkActivity> = isSameWeek
+        ? {
+            ...(prev?.dailyActivities || {}),
+            ...(generated?.dailyActivities || {}),
+          }
+        : {
+            ...(generated?.dailyActivities || {}),
+          };
 
       if (prev?.targetDay) {
         const pDay = prev.targetDay;
@@ -3903,6 +3910,8 @@ export default function App() {
           weeklyStudyDaysTarget: effectiveStudyTarget,
           weeklyStudyDays: effectiveStudyDays,
         }));
+
+        setWeeklyHomework(null);
 
         // Reset S-Path checks for the new week in memory and Firestore users/{studentUID}
         setWeeklyChecks({});

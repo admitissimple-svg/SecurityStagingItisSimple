@@ -661,6 +661,9 @@ export interface HomeworkVocabItem {
   source?: string;
   origin?: 'native_friend' | 'student_5words' | 'routine' | 'personal_dictionary';
   learnedAt?: string;
+  firstSeenAt?: string;
+  studentUid?: string;
+  studentEmail?: string;
   practiceCount?: number;
   lastPracticedAt?: string;
 }

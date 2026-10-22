@@ -10,7 +10,17 @@ import { normalizeStudentIdForPath, withFirestoreTimeout } from '../utils/routin
 import { extractYouTubeVideoId } from '../utils/youtube';
 import { normalizeStudentLevel } from '../utils/spotify';
 import { fetchAllWeeklyHistories, saveWeeklyHistory } from '../hooks/useStudentHistory';
-import { fetchStudentJournalActivitiesFromFirestore } from '../utils/studentPersistence';
+import {
+  fetchStudentJournalActivitiesFromFirestore,
+  saveStudentVocabularyToFirestore,
+} from '../utils/studentPersistence';
+import { StudentDictionaryEntry } from '../types';
+import {
+  getInstantOrCachedWord,
+  isGenericPedagogicalDefinition,
+  isGenericPedagogicalExample,
+} from '../utils/dictionaryService';
+import { normalizeDictionaryWord } from '../utils/studentDictionaryLibrary';
 
 export interface StartNewWeekParams {
   studentEmail: string;
@@ -91,6 +101,9 @@ export async function executeStartNewWeek(
     // Step 2: Collect all video records displayed/assigned in the ending cycle to archive into watchedVideosHistory
     const videosToArchive: Array<{ videoId: string; videoTitle: string; watchedAt: string }> = [];
 
+    // Step 2b: Collect all legitimately registered words from the ending cycle to ensure permanent preservation in My Dictionary
+    const wordsToPreserve: Array<{ word: string; sourceDay: DayOfWeek; activityName: string; activityId?: string }> = [];
+
     // Check current in-memory routines
     if (params.currentRoutines) {
       ALL_DAYS.forEach((day) => {
@@ -108,8 +121,70 @@ export async function executeStartNewWeek(
               }
             });
           }
+          if (Array.isArray(act.learnedWords) && act.learnedWords.length > 0) {
+            act.learnedWords.forEach((w) => {
+              const trimmed = (w || '').trim();
+              if (trimmed) {
+                wordsToPreserve.push({
+                  word: trimmed,
+                  sourceDay: day,
+                  activityName: act.activityName || 'Daily Routine',
+                  activityId: act.id,
+                });
+              }
+            });
+          }
         });
       });
+    }
+
+    // Guarantee that all legitimately recorded words from current routines are persisted to My Dictionary
+    if (cleanUid && wordsToPreserve.length > 0) {
+      try {
+        const nowIso = new Date().toISOString();
+        const dictEntriesToSave: StudentDictionaryEntry[] = wordsToPreserve.map((item) => {
+          const cleanW = item.word;
+          const normKey = normalizeDictionaryWord(cleanW);
+          const cached = getInstantOrCachedWord(cleanW, item.activityName, params.studentLevel, cleanUid, !isPlaceholder ? params.studentEmail : undefined);
+          return {
+            id: `routine_${normKey.replace(/[^a-zA-Z0-9_-]/g, '_')}_${Date.now()}`,
+            word: cleanW,
+            originalWord: cleanW,
+            normalizedWord: normKey,
+            definitionEn: cached.definitionEn && !isGenericPedagogicalDefinition(cached.definitionEn) ? cached.definitionEn : '',
+            exampleSentenceEn: cached.exampleSentenceEn && !isGenericPedagogicalExample(cached.exampleSentenceEn) ? cached.exampleSentenceEn : '',
+            partOfSpeech: cached.partOfSpeech || (cleanW.includes(' ') ? 'Idiomatic Expression' : 'Noun'),
+            translationPt: cached.translationPt || '',
+            cefrLevel: cached.cefrLevel || 'B1',
+            learnedAt: nowIso,
+            source: 'routine',
+            sourceActivityName: `${item.activityName} (${item.sourceDay})`,
+            sourceDay: item.sourceDay,
+            origins: [
+              {
+                source: 'routine',
+                activityName: `${item.activityName} (${item.sourceDay})`,
+                dayOfWeek: item.sourceDay,
+                date: nowIso.slice(0, 10),
+                context: `5 Words routine activity: "${item.activityName}"`,
+              },
+            ],
+            routineRef: {
+              day: item.sourceDay,
+              activityName: item.activityName,
+              activityId: item.activityId,
+            },
+          };
+        });
+
+        await withFirestoreTimeout(
+          saveStudentVocabularyToFirestore(cleanUid, dictEntriesToSave, !isPlaceholder ? params.studentEmail : undefined),
+          3500,
+          false
+        );
+      } catch (dictErr) {
+        console.warn('Notice preserving outgoing 5 words into My Dictionary before reset:', dictErr);
+      }
     }
 
     // Check persisted Firestore routine videos for this student
@@ -212,7 +287,7 @@ export async function executeStartNewWeek(
     }
 
     // Archive the outgoing cycle into weeklyHistory with both videoId and videoTitle
-    if (cleanUid && videosToArchive.length > 0) {
+    if (cleanUid && (videosToArchive.length > 0 || wordsToPreserve.length > 0)) {
       const consumedVideos: ConsumedVideoItem[] = videosToArchive.map((v) => ({
         id: v.videoId,
         videoId: v.videoId,
@@ -229,6 +304,16 @@ export async function executeStartNewWeek(
             weekId: `week-${params.currentCycle || 1}`,
             weeklyCycle: params.currentCycle || 1,
             consumedVideoIds: consumedVideos,
+            weeklyVocabulary: wordsToPreserve.map((w) => {
+              const cached = getInstantOrCachedWord(w.word, w.activityName, params.studentLevel, cleanUid, !isPlaceholder ? params.studentEmail : undefined);
+              return {
+                word: w.word,
+                definitionEn: cached.definitionEn || '',
+                translationPt: cached.translationPt || '',
+                learnedAt: new Date().toISOString(),
+                sourceDay: w.sourceDay,
+              };
+            }),
             updatedAt: new Date().toISOString(),
           }),
           2500,
@@ -284,6 +369,7 @@ export async function executeStartNewWeek(
 
     // Step 5: Construct clean, sanitized routines:
     // ALL days start with "Choose a Topic" (teacherVideos: [], playlistId: '', isRepeatVideo: false)
+    // AND 5 Key Words for this Moment panel resets to empty 0/5 (learnedWords: [])
     const rawRoutines = data?.routines || params.currentRoutines || {};
     const sanitizedRoutines: Record<DayOfWeek, RoutineItem[]> = {} as any;
     ALL_DAYS.forEach((day) => {
@@ -302,6 +388,7 @@ export async function executeStartNewWeek(
             playlistId: '',
             playlistTitle: '',
             teacherVideos: [],
+            learnedWords: [],
             completed: false,
             completedToday: false,
             isRepeatVideo: false,
@@ -311,6 +398,7 @@ export async function executeStartNewWeek(
 
         return {
           ...act,
+          learnedWords: [],
           completed: false,
           completedToday: false,
           isRepeatVideo: false,
@@ -365,6 +453,7 @@ export async function executeStartNewWeek(
             playlistId: '',
             playlistTitle: '',
             teacherVideos: [],
+            learnedWords: [],
             completed: false,
             completedToday: false,
             isRepeatVideo: false,
@@ -373,6 +462,7 @@ export async function executeStartNewWeek(
         }
         return {
           ...act,
+          learnedWords: [],
           completed: false,
           completedToday: false,
           isRepeatVideo: false,

@@ -6684,6 +6684,7 @@ app.post(['/api/student-routines/start-new-week', '/api/student/reset-week'], as
         const dayActs = db.studentRoutinesMap[k][dayKey];
         if (Array.isArray(dayActs)) {
           dayActs.forEach((act: any) => {
+            act.learnedWords = [];
             act.completed = false;
             act.completedToday = false;
             act.isRepeatVideo = false;
@@ -6710,6 +6711,7 @@ app.post(['/api/student-routines/start-new-week', '/api/student/reset-week'], as
       const dayActs = db.routinesByDay[dayKey];
       if (Array.isArray(dayActs)) {
         dayActs.forEach((act: any) => {
+          act.learnedWords = [];
           act.completed = false;
           act.completedToday = false;
           act.isRepeatVideo = false;
@@ -6854,6 +6856,7 @@ app.post(['/api/student-routines/start-new-week', '/api/student/reset-week'], as
       const shouldResetVideo = isVideoAct && (!req.body.autoAssignVideos || req.body.resetTopicsToChooseTopic);
       return {
         ...act,
+        learnedWords: [],
         completed: false,
         completedToday: false,
         isRepeatVideo: false,

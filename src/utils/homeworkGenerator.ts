@@ -558,47 +558,72 @@ export function buildDailyVocabularyQueueForDay(
 
   const isNf = (item: HomeworkVocabItem): boolean => isNativeFriendVocabulary(item);
 
-  // Split into buckets
+  // Split into:
+  // 1. Native Friend words recorded for this specific targetDay (Priority 1)
+  // 2. All legitimate student words from My Dictionary and 5 Words history, sorted chronologically newest first (Priority 2)
+  // 3. Fallback: Native Friend words from other days (if queue is still < 5)
   const nfDayWords: HomeworkVocabItem[] = [];
   const nfOtherWords: HomeworkVocabItem[] = [];
-  const studentDayWords: HomeworkVocabItem[] = [];
-  const studentOtherWords: HomeworkVocabItem[] = [];
+  const studentWords: HomeworkVocabItem[] = [];
 
-  // Sort candidates newest first
-  const sorted = [...isolatedCandidates].sort((a, b) => {
-    const tA = parseTimestamp(a.learnedAt || (a as any).timestamp || (a as any).date);
-    const tB = parseTimestamp(b.learnedAt || (b as any).timestamp || (b as any).date);
-    if (tA !== tB) return tB - tA; // newest first
-    return a.word.localeCompare(b.word);
-  });
+  const getEntryTimestamp = (item: any): number => {
+    return parseTimestamp(item.learnedAt || item.firstSeenAt || item.timestamp || item.date);
+  };
 
-  for (const item of sorted) {
+  for (const item of isolatedCandidates) {
     const norm = normalizeDictionaryWord(item.word);
     if (!norm) continue;
-    const dayMatch = matchesDay(item, targetDay);
 
     if (isNf(item)) {
-      if (dayMatch) {
+      if (matchesDay(item, targetDay)) {
         nfDayWords.push({ ...item, origin: 'native_friend' as const });
       } else {
         nfOtherWords.push({ ...item, origin: 'native_friend' as const });
       }
     } else {
-      if (dayMatch) {
-        studentDayWords.push({ ...item, origin: 'student_5words' as const });
-      } else {
-        studentOtherWords.push({ ...item, origin: 'student_5words' as const });
-      }
+      studentWords.push({ ...item, origin: 'student_5words' as const });
     }
   }
+
+  // Sort NF day words newest first
+  nfDayWords.sort((a, b) => {
+    const tA = getEntryTimestamp(a);
+    const tB = getEntryTimestamp(b);
+    if (tA !== tB) return tB - tA; // newest first
+    return a.word.localeCompare(b.word);
+  });
+
+  // Sort Student words strictly by real inclusion date (newest first)
+  // CRITICAL: The 5 Key Words panel does NOT limit the queue; chronological history from My Dictionary is authoritative
+  studentWords.sort((a, b) => {
+    const tA = getEntryTimestamp(a);
+    const tB = getEntryTimestamp(b);
+    const hasA = tA > 0;
+    const hasB = tB > 0;
+    if (hasA && hasB && tA !== tB) {
+      return tB - tA; // newest first
+    }
+    if (hasA && !hasB) return -1;
+    if (!hasA && hasB) return 1;
+    return a.word.localeCompare(b.word);
+  });
+
+  // Sort NF other words newest first for fallback
+  nfOtherWords.sort((a, b) => {
+    const tA = getEntryTimestamp(a);
+    const tB = getEntryTimestamp(b);
+    if (tA !== tB) return tB - tA;
+    return a.word.localeCompare(b.word);
+  });
 
   const queue: HomeworkVocabItem[] = [];
   const seenNorm = new Set<string>();
 
-  // Priority 1 — Native Friend words for targetDay (most recent first, up to 5)
+  // Priority 1 — Words and expressions recorded by Native Friend for targetDay (up to 5, most recent first)
   for (const item of nfDayWords) {
     if (queue.length >= 5) break;
     const norm = normalizeDictionaryWord(item.word);
+    if (!norm) continue;
     if (!seenNorm.has(norm)) {
       seenNorm.add(norm);
       queue.push({
@@ -611,47 +636,31 @@ export function buildDailyVocabularyQueueForDay(
     }
   }
 
-  // Priority 2 — Student's 5 Words for targetDay (most recent first)
+  // Priority 2 — Most recent words and expressions effectively recorded by the student in My Dictionary / 5 Words history (newest first)
   if (queue.length < 5) {
-    for (const item of studentDayWords) {
+    for (const item of studentWords) {
       if (queue.length >= 5) break;
       const norm = normalizeDictionaryWord(item.word);
+      if (!norm) continue;
       if (!seenNorm.has(norm)) {
         seenNorm.add(norm);
         queue.push({
           ...item,
           word: item.word.trim(),
           origin: 'student_5words',
-          sourceActivityName: item.sourceActivityName || `5 Words (${targetDay})`,
-          sourceDay: targetDay,
-        });
-      }
-    }
-  }
-
-  // Priority 2 fallback — Student's other recent 5 Words (most recent first)
-  if (queue.length < 5) {
-    for (const item of studentOtherWords) {
-      if (queue.length >= 5) break;
-      const norm = normalizeDictionaryWord(item.word);
-      if (!seenNorm.has(norm)) {
-        seenNorm.add(norm);
-        queue.push({
-          ...item,
-          word: item.word.trim(),
-          origin: 'student_5words',
-          sourceActivityName: item.sourceActivityName || '5 Words',
+          sourceActivityName: item.sourceActivityName || 'Personal Dictionary',
           sourceDay: item.sourceDay || targetDay,
         });
       }
     }
   }
 
-  // Priority 1 fallback — Any other Native Friend words if still under 5
+  // Priority 1 Fallback — Any other Native Friend words if still under 5
   if (queue.length < 5) {
     for (const item of nfOtherWords) {
       if (queue.length >= 5) break;
       const norm = normalizeDictionaryWord(item.word);
+      if (!norm) continue;
       if (!seenNorm.has(norm)) {
         seenNorm.add(norm);
         queue.push({
@@ -719,12 +728,15 @@ export function generateWeeklyHomework(
           source: (cw as any).source,
           sourceActivityName: cw.sourceActivityName || 'Personal Dictionary',
           sourceDay: cw.sourceDay || targetDay || 'monday',
-          learnedAt: (cw as any).learnedAt,
+          learnedAt: (cw as any).learnedAt || (cw as any).firstSeenAt,
+          firstSeenAt: (cw as any).firstSeenAt,
           practiceCount: (cw as any).practiceCount,
           lastPracticedAt: (cw as any).lastPracticedAt,
           definitionEn: prof.definitionEn,
           translationPt: prof.translationPt,
           exampleSentence: prof.exampleSentenceEn,
+          studentUid: (cw as any).studentUid,
+          studentEmail: (cw as any).studentEmail,
         });
       }
     });
