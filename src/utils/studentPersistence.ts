@@ -35,6 +35,7 @@ import {
   CURRENT_SCHEMA_VERSION,
   migrateLegacyLocalStorageToFirestore,
 } from './firestoreSchemaValidator';
+import { isSyntheticHomeworkEvaluation, isValidHomeworkEvaluation } from './writingChecker';
 
 // Pure in-memory session caches to provide instant zero-delay UI rendering during active session
 // ZERO dependency on localStorage: 100% of persistent data is stored in Cloud Firestore
@@ -4411,6 +4412,25 @@ export function subscribeToStudentJournal(
 }
 
 /**
+ * Sanitizes loaded homework data so that legacy synthetic evaluations are never
+ * treated as valid evaluations, while preserving student answers, words, and history.
+ */
+export function sanitizeLoadedHomeworkData(hw: any): WeeklyHomeworkData {
+  if (!hw || typeof hw !== 'object') return hw;
+  const clean = { ...hw };
+  if (clean.aiEvaluation) {
+    if (isSyntheticHomeworkEvaluation(clean.aiEvaluation) || !isValidHomeworkEvaluation(clean.aiEvaluation)) {
+      delete clean.aiEvaluation;
+      if (clean.isCompleted) {
+        clean.isCompleted = false;
+        delete clean.score;
+      }
+    }
+  }
+  return clean as WeeklyHomeworkData;
+}
+
+/**
  * Persist student weekly homework and activity progress directly to Cloud Firestore.
  * Saves to:
  * 1. users/{studentUID}/homework/{weekId}
@@ -4472,6 +4492,17 @@ export async function saveStudentHomeworkProgressToFirestore(
   try {
     const sanitizedHomework = JSON.parse(JSON.stringify(homework));
 
+    // Strip synthetic or invalid evaluations before persisting (HOTFIX 2.2)
+    if (sanitizedHomework.aiEvaluation) {
+      if (isSyntheticHomeworkEvaluation(sanitizedHomework.aiEvaluation) || !isValidHomeworkEvaluation(sanitizedHomework.aiEvaluation)) {
+        delete sanitizedHomework.aiEvaluation;
+        if (sanitizedHomework.isCompleted) {
+          sanitizedHomework.isCompleted = false;
+          delete sanitizedHomework.score;
+        }
+      }
+    }
+
     // For existing homework, also check week-specific doc
     if (db && cleanUid) {
       try {
@@ -4480,6 +4511,16 @@ export async function saveStudentHomeworkProgressToFirestore(
           existingHomework = hwSnap.data() || existingHomework;
         }
       } catch {}
+    }
+
+    if (existingHomework?.aiEvaluation) {
+      if (isSyntheticHomeworkEvaluation(existingHomework.aiEvaluation) || !isValidHomeworkEvaluation(existingHomework.aiEvaluation)) {
+        delete existingHomework.aiEvaluation;
+        if (existingHomework.isCompleted) {
+          existingHomework.isCompleted = false;
+          delete existingHomework.score;
+        }
+      }
     }
 
     const mergedCompletedParts = {
@@ -4632,7 +4673,7 @@ export async function fetchStudentHomeworkProgressFromFirestore(
       // Requirement 2: If canonical document exists, return its data even when empty or unanswered.
       // Never consult legacy Week 1 storage when the canonical document exists.
       const data = hwSnap.data();
-      return (data || {}) as WeeklyHomeworkData;
+      return sanitizeLoadedHomeworkData((data || {}) as WeeklyHomeworkData);
     }
 
     // 2. Week 1 backward compatibility only (consulted ONLY when canonical document does NOT exist):
@@ -4643,7 +4684,7 @@ export async function fetchStudentHomeworkProgressFromFirestore(
       if (legacySnap && legacySnap.exists()) {
         const lData = legacySnap.data();
         if (lData && (lData.completedPartsByDay || lData.studentAnswers || lData.matchingPairs)) {
-          return lData as WeeklyHomeworkData;
+          return sanitizeLoadedHomeworkData(lData as WeeklyHomeworkData);
         }
       }
 
@@ -4653,7 +4694,7 @@ export async function fetchStudentHomeworkProgressFromFirestore(
       if (userSnap && userSnap.exists()) {
         const data = userSnap.data();
         if (data?.weeklyHomework && (data.weeklyHomework.completedPartsByDay || data.weeklyHomework.studentAnswers)) {
-          return data.weeklyHomework as WeeklyHomeworkData;
+          return sanitizeLoadedHomeworkData(data.weeklyHomework as WeeklyHomeworkData);
         }
       }
 
@@ -4663,7 +4704,7 @@ export async function fetchStudentHomeworkProgressFromFirestore(
       if (topSnap && topSnap.exists()) {
         const data = topSnap.data();
         if (data && (data.completedPartsByDay || data.studentAnswers || data.matchingPairs)) {
-          return data as WeeklyHomeworkData;
+          return sanitizeLoadedHomeworkData(data as WeeklyHomeworkData);
         }
       }
     }
@@ -4710,7 +4751,7 @@ export async function fetchStudentHomeworkProgressFromFirestore(
                 return null;
               }
             }
-            return apiData as WeeklyHomeworkData;
+            return sanitizeLoadedHomeworkData(apiData as WeeklyHomeworkData);
           }
         }
       } catch {}

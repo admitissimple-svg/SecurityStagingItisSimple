@@ -23,8 +23,12 @@ import {
   ChevronRight,
 } from 'lucide-react';
 import { WeeklyHomeworkData, Language, HomeworkAiEvaluation, SentenceWritingPrompt, DayOfWeek } from '../types';
-import { speakText } from '../utils/audio';
-import { checkStudentWritingApi, evaluateWeeklyHomeworkApi } from '../utils/writingChecker';
+import {
+  checkStudentWritingApi,
+  evaluateWeeklyHomeworkApi,
+  isSyntheticHomeworkEvaluation,
+  isValidHomeworkEvaluation,
+} from '../utils/writingChecker';
 import { getMemorizationTranslations } from '../utils/i18n/memorizationActivity';
 import { getDailyMemorizationSchedule, generatePart4StoryWithAi } from '../utils/homeworkGenerator';
 
@@ -349,8 +353,14 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     return map;
   }, [homework?.allRoutineWords, homework?.vocabularyList]);
 
+  const hasGenuineEvaluation = Boolean(
+    homework?.aiEvaluation &&
+    isValidHomeworkEvaluation(homework.aiEvaluation) &&
+    !isSyntheticHomeworkEvaluation(homework.aiEvaluation)
+  );
+
   const [activeTab, setActiveTab] = useState<'matching' | 'fill' | 'writing' | 'reading' | 'results'>(
-    homework?.isCompleted ? 'results' : dailySchedule.partKey
+    homework?.isCompleted && hasGenuineEvaluation ? 'results' : dailySchedule.partKey
   );
 
   const [matchingAnswers, setMatchingAnswers] = useState<Record<string, string>>(
@@ -367,9 +377,10 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
   );
 
   const [aiEvaluation, setAiEvaluation] = useState<HomeworkAiEvaluation | undefined>(
-    homework?.aiEvaluation
+    hasGenuineEvaluation ? homework?.aiEvaluation : undefined
   );
   const [isEvaluatingAll, setIsEvaluatingAll] = useState(false);
+  const [evalError, setEvalError] = useState<string | null>(null);
 
   React.useEffect(() => {
     if (homework?.studentAnswers) {
@@ -383,8 +394,14 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       setSentenceAnswers(homework?.studentAnswers?.sentences || {});
       setQuizAnswers(homework?.studentAnswers?.quizAnswers || {});
     }
-    if (homework?.aiEvaluation) {
+    if (
+      homework?.aiEvaluation &&
+      isValidHomeworkEvaluation(homework.aiEvaluation) &&
+      !isSyntheticHomeworkEvaluation(homework.aiEvaluation)
+    ) {
       setAiEvaluation(homework.aiEvaluation);
+    } else {
+      setAiEvaluation(undefined);
     }
   }, [homework?.id, homework?.studentAnswers, homework?.aiEvaluation]);
 
@@ -430,7 +447,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       wasOpenRef.current = true;
       if (selectedDay) {
         setActiveTab(dailySchedule.partKey);
-      } else if (homework?.isCompleted) {
+      } else if (homework?.isCompleted && hasGenuineEvaluation) {
         setActiveTab('results');
       } else {
         setActiveTab(dailySchedule.partKey);
@@ -438,7 +455,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     } else if (!isOpen) {
       wasOpenRef.current = false;
     }
-  }, [isOpen, homework?.id, dailySchedule.partKey, selectedDay, homework?.isCompleted]);
+  }, [isOpen, homework?.id, dailySchedule.partKey, selectedDay, homework?.isCompleted, hasGenuineEvaluation]);
 
   const [sentenceFeedbacks, setSentenceFeedbacks] = useState<Record<string, any>>({});
   const [isCheckingSentence, setIsCheckingSentence] = useState<Record<string, boolean>>({});
@@ -696,128 +713,126 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
   const handleCalculateScore = async () => {
     setIsEvaluatingAll(true);
+    setEvalError(null);
 
-    // Immediate baseline score
-    let totalPoints = 0;
-    let earnedPoints = 0;
+    const currentAnswers = {
+      matching: matchingAnswers,
+      fillInBlanks: fillAnswers,
+      sentences: sentenceAnswers,
+      quizAnswers: quizAnswers,
+    };
 
-    const matchingWeight = 25;
-    totalPoints += matchingWeight;
-    let correctMatches = 0;
-    for (const pair of homework.matchingPairs) {
-      if (matchingAnswers[pair.id]?.toLowerCase() === pair.word.toLowerCase()) {
-        correctMatches++;
-      }
-    }
-    const matchScore = homework.matchingPairs.length > 0
-      ? (correctMatches / homework.matchingPairs.length) * matchingWeight
-      : matchingWeight;
-    earnedPoints += matchScore;
+    // 1. Immediately persist typed student answers to Firestore so they are never lost
+    const inProgressUpdate: WeeklyHomeworkData = {
+      ...homework,
+      studentAnswers: currentAnswers,
+      completedPartsByDay: {
+        ...(homework?.completedPartsByDay || {}),
+        [targetDay]: true,
+      },
+    };
+    onSaveProgress(inProgressUpdate);
 
-    const fillWeight = 30;
-    totalPoints += fillWeight;
-    let correctFills = 0;
-    for (const item of homework.fillInBlanks) {
-      if (fillAnswers[item.id]?.toLowerCase() === item.correctWord.toLowerCase()) {
-        correctFills++;
-      }
-    }
-    const fillScore = homework.fillInBlanks.length > 0
-      ? (correctFills / homework.fillInBlanks.length) * fillWeight
-      : fillWeight;
-    earnedPoints += fillScore;
+    // 2. Check if an authentic, genuine evaluation already exists and matches current student sentences
+    const existingIsLegitimate = Boolean(
+      aiEvaluation &&
+      isValidHomeworkEvaluation(aiEvaluation) &&
+      !isSyntheticHomeworkEvaluation(aiEvaluation) &&
+      (homework.sentenceWritingPrompts || []).every((p) => {
+        const studentSentence = (sentenceAnswers[p.word] || '').trim().toLowerCase();
+        const sentencesList = aiEvaluation?.sentenceFeedback || (aiEvaluation as any)?.sentenceEvaluationResults || [];
+        const evaluatedSentence = (
+          sentencesList.find(
+            (r: any) => (r.word || '').toLowerCase() === p.word.toLowerCase()
+          )?.originalSentence || ''
+        ).trim().toLowerCase();
+        return studentSentence === evaluatedSentence;
+      })
+    );
 
-    const writingWeight = 25;
-    totalPoints += writingWeight;
-    let writtenCount = 0;
-    for (const prompt of homework.sentenceWritingPrompts) {
-      const s = sentenceAnswers[prompt.word];
-      if (s && s.trim().length >= 8) {
-        writtenCount++;
-      }
-    }
-    const writingScore = homework.sentenceWritingPrompts.length > 0
-      ? (writtenCount / homework.sentenceWritingPrompts.length) * writingWeight
-      : writingWeight;
-    earnedPoints += writingScore;
-
-    const quizWeight = 20;
-    totalPoints += quizWeight;
-    let correctQuiz = 0;
-    for (const q of homework.readingPassage.questions) {
-      if (quizAnswers[q.id] === q.correctAnswer) {
-        correctQuiz++;
-      }
-    }
-    const quizScore = homework.readingPassage.questions.length > 0
-      ? (correctQuiz / homework.readingPassage.questions.length) * quizWeight
-      : quizWeight;
-    earnedPoints += quizScore;
-
-    let finalScore = Math.min(100, Math.round((earnedPoints / totalPoints) * 100));
-
-    // Request intelligent AI evaluation from server endpoint
-    let evalResult: HomeworkAiEvaluation | undefined = undefined;
-    try {
-      evalResult = await evaluateWeeklyHomeworkApi({
-        homework,
-        studentAnswers: {
-          matching: matchingAnswers,
-          fillInBlanks: fillAnswers,
-          sentences: sentenceAnswers,
-          quizAnswers: quizAnswers,
+    if (existingIsLegitimate && aiEvaluation) {
+      // Re-use legitimate evaluation without triggering duplicate Gemini calls
+      const updated: WeeklyHomeworkData = {
+        ...homework,
+        isCompleted: true,
+        score: aiEvaluation.overallScore,
+        submittedAt: homework.submittedAt || new Date().toISOString(),
+        studentAnswers: currentAnswers,
+        aiEvaluation: aiEvaluation,
+        completedPartsByDay: {
+          ...(homework?.completedPartsByDay || {}),
+          [targetDay]: true,
         },
+        isDayPartCompleted: true,
+      };
+      onSaveProgress(updated);
+      setIsEvaluatingAll(false);
+      setActiveTab('results');
+      return;
+    }
+
+    // 3. Request genuine AI evaluation from server endpoint (which runs 3-model Gemini contingency)
+    try {
+      const evalResult = await evaluateWeeklyHomeworkApi({
+        homework,
+        studentAnswers: currentAnswers,
         studentLevel: homework.studentLevel || 'Beginner',
         studentName: homework.studentName || 'Student',
         currentLanguage,
       });
 
-      if (evalResult && typeof evalResult.overallScore === 'number') {
-        finalScore = evalResult.overallScore;
-        setAiEvaluation(evalResult);
+      if (!evalResult || !isValidHomeworkEvaluation(evalResult) || isSyntheticHomeworkEvaluation(evalResult)) {
+        throw new Error(
+          isEn
+            ? 'The pedagogical evaluation could not be completed at this moment. No synthetic scores have been created.'
+            : 'A correção pedagógica não pôde ser concluída neste momento. Nenhuma pontuação sintética foi gerada.'
+        );
       }
-    } catch (err) {
-      console.warn('AI evaluation error, proceeding with baseline score:', err);
+
+      setAiEvaluation(evalResult);
+
+      const updated: WeeklyHomeworkData = {
+        ...homework,
+        isCompleted: true,
+        score: evalResult.overallScore,
+        submittedAt: new Date().toISOString(),
+        studentAnswers: currentAnswers,
+        aiEvaluation: evalResult,
+        completedPartsByDay: {
+          ...(homework?.completedPartsByDay || {}),
+          [targetDay]: true,
+        },
+        isDayPartCompleted: true,
+      };
+
+      onSaveProgress(updated);
+      if (onCompleteTodayPart) {
+        const partsToReport: Array<{ key: string; isComplete: boolean }> = [
+          { key: 'matching', isComplete: isMatchingComplete },
+          { key: 'fill', isComplete: isFillComplete },
+          { key: 'writing', isComplete: isWritingComplete },
+          { key: 'reading', isComplete: isReadingComplete },
+        ];
+        partsToReport.forEach(({ key, isComplete }) => {
+          if (isComplete) {
+            const d = getDayForPart(key);
+            onCompleteTodayPart(key as any, d);
+          }
+        });
+        onCompleteTodayPart(dailySchedule.partKey, targetDay);
+      }
+      setActiveTab('results');
+    } catch (err: any) {
+      console.warn('AI evaluation error, transparently reporting unavailability without creating artificial score:', err);
+      const friendlyMsg =
+        err?.message ||
+        (isEn
+          ? 'The pedagogical grading AI is temporarily unavailable. Your answers have been safely preserved. Please try again in a moment.'
+          : 'A IA de correção pedagógica está temporariamente indisponível. Suas respostas foram salvas com segurança. Por favor, tente novamente em instantes.');
+      setEvalError(friendlyMsg);
     } finally {
       setIsEvaluatingAll(false);
     }
-
-    const updated: WeeklyHomeworkData = {
-      ...homework,
-      isCompleted: true,
-      score: finalScore,
-      submittedAt: new Date().toISOString(),
-      studentAnswers: {
-        matching: matchingAnswers,
-        fillInBlanks: fillAnswers,
-        sentences: sentenceAnswers,
-        quizAnswers: quizAnswers,
-      },
-      aiEvaluation: evalResult || aiEvaluation,
-      completedPartsByDay: {
-        ...(homework?.completedPartsByDay || {}),
-        [targetDay]: true,
-      },
-      isDayPartCompleted: true,
-    };
-
-    onSaveProgress(updated);
-    if (onCompleteTodayPart) {
-      const partsToReport: Array<{ key: string; isComplete: boolean }> = [
-        { key: 'matching', isComplete: isMatchingComplete },
-        { key: 'fill', isComplete: isFillComplete },
-        { key: 'writing', isComplete: isWritingComplete },
-        { key: 'reading', isComplete: isReadingComplete },
-      ];
-      partsToReport.forEach(({ key, isComplete }) => {
-        if (isComplete) {
-          const d = getDayForPart(key);
-          onCompleteTodayPart(key as any, d);
-        }
-      });
-      onCompleteTodayPart(dailySchedule.partKey, targetDay);
-    }
-    setActiveTab('results');
   };
 
   const handleSubmit = () => {
@@ -1747,6 +1762,24 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                     })}
                   </div>
 
+                  {/* Evaluation error / transparent unavailability notice */}
+                  {evalError && (
+                    <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-3 text-amber-900 text-xs">
+                      <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                      <div className="flex-1">
+                        <p className="font-bold text-amber-950">
+                          {isEn ? 'Pedagogical Evaluation Unavailable' : 'Correção Pedagógica Temporariamente Indisponível'}
+                        </p>
+                        <p className="mt-0.5 text-amber-800 leading-relaxed">{evalError}</p>
+                        <p className="mt-1 text-[11px] text-amber-700 font-medium">
+                          {isEn
+                            ? 'Your answers have been safely preserved in Firestore. You can try again below.'
+                            : 'Suas respostas digitadas foram salvas com segurança no banco de dados. Você pode tentar novamente no botão abaixo.'}
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
                   {/* Footer */}
                   <div className="pt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100">
                     <button
@@ -1773,6 +1806,11 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                           <>
                             <Sparkles className="w-4 h-4 text-[#9AB4FF] animate-spin" />
                             <span>{isEn ? 'Grading with AI...' : 'Corrigindo com IA...'}</span>
+                          </>
+                        ) : evalError ? (
+                          <>
+                            <RefreshCw className="w-4 h-4 text-[#9AB4FF]" />
+                            <span>{isEn ? 'Try AI Evaluation Again' : 'Tentar Avaliação Novamente'}</span>
                           </>
                         ) : (
                           <>

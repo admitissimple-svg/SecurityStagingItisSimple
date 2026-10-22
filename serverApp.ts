@@ -163,7 +163,12 @@ import {
   synthesizeFillInBlanks,
   profileWord,
 } from './src/utils/pedagogicalStorySynthesizer';
-import { analyzeSentenceGrammarDeterministic } from './src/utils/writingChecker';
+import {
+  analyzeSentenceGrammarDeterministic,
+  isSyntheticHomeworkEvaluation,
+  isValidHomeworkEvaluation,
+  validateHomeworkAiEvaluationResponse,
+} from './src/utils/writingChecker';
 import { sanitizeTimeZone } from './src/utils/timezone';
 import crypto from 'crypto';
 import { parseNotesHtml } from './src/utils/notesHtmlParser';
@@ -14095,6 +14100,15 @@ app.get('/api/homework', firebaseAuthMiddleware, async (req, res) => {
 
   // For Week 2+, NEVER return legacy root homework or global db.weeklyHomework!
   if (hwData) {
+    if (hwData.aiEvaluation) {
+      if (isSyntheticHomeworkEvaluation(hwData.aiEvaluation) || !isValidHomeworkEvaluation(hwData.aiEvaluation)) {
+        delete hwData.aiEvaluation;
+        if (hwData.isCompleted) {
+          hwData.isCompleted = false;
+          delete hwData.score;
+        }
+      }
+    }
     return res.json(hwData);
   }
 
@@ -14157,6 +14171,16 @@ app.post(['/api/homework', '/api/homework/submit'], firebaseAuthMiddleware, asyn
     studentEmail: cleanEmail || undefined,
     updatedAt: new Date().toISOString(),
   };
+
+  if (hwPayload.aiEvaluation) {
+    if (isSyntheticHomeworkEvaluation(hwPayload.aiEvaluation) || !isValidHomeworkEvaluation(hwPayload.aiEvaluation)) {
+      delete hwPayload.aiEvaluation;
+      if (hwPayload.isCompleted) {
+        hwPayload.isCompleted = false;
+        delete hwPayload.score;
+      }
+    }
+  }
 
   db.studentHomeworkMap[hwScopedKey] = hwPayload;
   if (cleanEmail && cleanEmail !== studentKey) {
@@ -15765,7 +15789,33 @@ app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
     const evalCacheKey = `${callerUid}_${homework.id || 'hw'}_${contentHash}`;
     const cachedEval = homeworkEvalCache.get(evalCacheKey);
     if (cachedEval && Date.now() < cachedEval.expiry) {
-      return res.json({ success: true, evaluation: cachedEval.data, cached: true });
+      if (isValidHomeworkEvaluation(cachedEval.data) && !isSyntheticHomeworkEvaluation(cachedEval.data)) {
+        return res.json({ success: true, evaluation: cachedEval.data, cached: true });
+      }
+    }
+
+    // Check if student already has a valid persisted evaluation in Firestore for this exact week and sentences
+    const rawWeek = homework.weekId || homework.id || 'week-1';
+    const cycle = extractPositiveIntegerCycle(rawWeek) || 1;
+    const canonicalWeekId = `week-${cycle}`;
+    const docIds = [callerUid, callerEmail].filter(Boolean);
+    const existingHw = await fetchHomeworkFromFirestore(docIds, canonicalWeekId, cycle).catch(() => null);
+    if (
+      existingHw &&
+      existingHw.aiEvaluation &&
+      isValidHomeworkEvaluation(existingHw.aiEvaluation) &&
+      !isSyntheticHomeworkEvaluation(existingHw.aiEvaluation)
+    ) {
+      const existingSentences = existingHw.studentAnswers?.sentences || {};
+      const sentencesMatch = (homework.sentenceWritingPrompts || []).every((p: any) => {
+        const curAns = (sentences[p.word] || sentences[p.word?.toLowerCase()] || sentences[p.word?.toUpperCase()] || '').trim();
+        const prevAns = (existingSentences[p.word] || existingSentences[p.word?.toLowerCase()] || existingSentences[p.word?.toUpperCase()] || '').trim();
+        return curAns === prevAns;
+      });
+      if (sentencesMatch) {
+        homeworkEvalCache.set(evalCacheKey, { data: existingHw.aiEvaluation, expiry: Date.now() + 600000 });
+        return res.json({ success: true, evaluation: existingHw.aiEvaluation, cached: true });
+      }
     }
 
     // Security Hotfix (Etapa 2 & Residuals): Payload bounds validation
@@ -15905,7 +15955,7 @@ STUDENT WRITTEN SENTENCES IN PART 3:
 ${JSON.stringify(
   (homework.sentenceWritingPrompts || []).map((p: any) => ({
     targetWord: p.word,
-    studentSentence: sentences[p.word] || '',
+    studentSentence: (sentences[p.word] || sentences[p.word?.toLowerCase()] || sentences[p.word?.toUpperCase()] || '').trim(),
     promptHint: p.hintEn || p.hint,
   })),
   null,
@@ -15957,11 +16007,26 @@ Output STRICT JSON matching this schema:
           systemInstruction: 'You are a warm, inspiring Native English teacher at "It\'s Simple". Evaluate student written sentences and provide feedback in valid JSON format.',
           untrustedUserDataPrompt: prompt,
           callerRole: caller.role,
-          validator: (json) => Array.isArray(json?.sentenceFeedback),
+          validator: (json) => validateHomeworkAiEvaluationResponse(json, homework.sentenceWritingPrompts || [], sentences || {}),
         });
 
-        if (contingencyRes.success && contingencyRes.parsedJson && Array.isArray(contingencyRes.parsedJson.sentenceFeedback)) {
-          sentenceEvaluationResults = contingencyRes.parsedJson.sentenceFeedback;
+        if (
+          contingencyRes.success &&
+          contingencyRes.parsedJson &&
+          validateHomeworkAiEvaluationResponse(contingencyRes.parsedJson, homework.sentenceWritingPrompts || [], sentences || {})
+        ) {
+          sentenceEvaluationResults = contingencyRes.parsedJson.sentenceFeedback.map((item: any) => {
+            const matchingPrompt = (homework.sentenceWritingPrompts || []).find(
+              (p: any) => (p.word || '').toLowerCase() === (item.word || '').toLowerCase()
+            );
+            const promptWord = matchingPrompt ? matchingPrompt.word : item.word;
+            const rawStudentText = (sentences[promptWord] || sentences[promptWord?.toLowerCase()] || sentences[item.word] || '').trim();
+            return {
+              ...item,
+              word: promptWord,
+              originalSentence: rawStudentText || '(nenhuma frase enviada)',
+            };
+          });
           tutorSummaryPt = contingencyRes.parsedJson.tutorFeedbackSummaryPt || '';
           tutorSummaryEn = contingencyRes.parsedJson.tutorFeedbackSummaryEn || '';
           levelStrengthsPt = contingencyRes.parsedJson.levelStrengthsPt || '';
@@ -16008,8 +16073,47 @@ Output STRICT JSON matching this schema:
       readingFeedback,
     };
 
-    // Cache evaluated result
-    homeworkEvalCache.set(evalCacheKey, { data: evaluationResponse, expiry: Date.now() + 600000 });
+    // Cache evaluated result only if validated and non-synthetic
+    if (isValidHomeworkEvaluation(evaluationResponse)) {
+      homeworkEvalCache.set(evalCacheKey, { data: evaluationResponse, expiry: Date.now() + 600000 });
+    }
+
+    // Persist genuine validated evaluation directly to Firestore '(default)'
+    const updatedHwForStorage = {
+      ...homework,
+      id: canonicalWeekId,
+      weekId: canonicalWeekId,
+      weeklyCycle: cycle,
+      studentUid: callerUid,
+      studentEmail: callerEmail || homework.studentEmail,
+      isCompleted: true,
+      score: overallScore,
+      submittedAt: new Date().toISOString(),
+      studentAnswers: {
+        matching,
+        fillInBlanks,
+        sentences,
+        quizAnswers,
+      },
+      aiEvaluation: evaluationResponse,
+      updatedAt: new Date().toISOString(),
+    };
+
+    const studentKey = callerUid || callerEmail;
+    const hwScopedKey = `${studentKey}::${canonicalWeekId}`;
+    const db = readDb();
+    if (!db.studentHomeworkMap) db.studentHomeworkMap = {};
+    db.studentHomeworkMap[hwScopedKey] = updatedHwForStorage;
+    if (callerEmail) {
+      db.studentHomeworkMap[`${callerEmail}::${canonicalWeekId}`] = updatedHwForStorage;
+    }
+    if (cycle === 1) {
+      db.studentHomeworkMap[studentKey] = updatedHwForStorage;
+      if (callerEmail) db.studentHomeworkMap[callerEmail] = updatedHwForStorage;
+      db.weeklyHomework = updatedHwForStorage;
+    }
+    writeDb(db);
+    saveHomeworkToFirestore(callerUid, canonicalWeekId, cycle, updatedHwForStorage).catch(() => {});
 
     res.json({ success: true, evaluation: evaluationResponse });
   } catch (error: any) {

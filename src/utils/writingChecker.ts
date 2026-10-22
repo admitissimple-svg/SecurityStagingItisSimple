@@ -1007,6 +1007,208 @@ export async function checkStudentWritingApi(
   return evaluateLocally(params);
 }
 
+export const SYNTHETIC_EVALUATION_PATTERNS: readonly string[] = [
+  'Parabéns pela dedicação! Você concluiu as etapas de memorização do vocabulário',
+  'Congratulations on your dedication! You completed your weekly memorization activity calibrated for',
+  'Demonstrou bom reconhecimento de vocabulário e dedicação na prática ativa.',
+  'Demonstrated strong vocabulary recall and dedication in active practice.',
+  'Traga esses termos para a sua próxima aula de conversação com seu Amigo Nativo.',
+  'Bring these terms into your next live conversation session with your Native Friend.',
+  'Continue praticando a formação de frases ativas conectadas à sua rotina.',
+  'Keep practicing active sentence construction tied to your routine.',
+  'Frase bem elaborada incorporando',
+  'Well-crafted sentence incorporating',
+  'Lembre-se de formar uma frase completa em inglês usando a palavra',
+  'Remember to build a full English sentence using',
+] as const;
+
+/**
+ * Detects whether an evaluation object contains synthetic or artificial fallback text
+ * produced by legacy heuristic generators.
+ */
+export function isSyntheticHomeworkEvaluation(evaluation: any): boolean {
+  if (!evaluation || typeof evaluation !== 'object') return true;
+
+  const summaryPt = String(
+    evaluation.tutorFeedbackSummaryPt ||
+    evaluation.overallFeedback ||
+    evaluation.overallSummaryPt ||
+    evaluation.summary ||
+    ''
+  );
+  const summaryEn = String(
+    evaluation.tutorFeedbackSummaryEn ||
+    evaluation.overallFeedbackEn ||
+    evaluation.overallSummaryEn ||
+    ''
+  );
+  const strengthsPt = String(evaluation.levelStrengthsPt || '');
+  const strengthsEn = String(evaluation.levelStrengthsEn || '');
+  const nextStepsPt = String(evaluation.levelNextStepsPt || '');
+  const nextStepsEn = String(evaluation.levelNextStepsEn || '');
+
+  for (const pattern of SYNTHETIC_EVALUATION_PATTERNS) {
+    if (
+      summaryPt.includes(pattern) ||
+      summaryEn.includes(pattern) ||
+      strengthsPt.includes(pattern) ||
+      strengthsEn.includes(pattern) ||
+      nextStepsPt.includes(pattern) ||
+      nextStepsEn.includes(pattern)
+    ) {
+      return true;
+    }
+  }
+
+  const sentences = Array.isArray(evaluation.sentenceFeedback)
+    ? evaluation.sentenceFeedback
+    : Array.isArray(evaluation.sentenceEvaluationResults)
+    ? evaluation.sentenceEvaluationResults
+    : [];
+
+  if (sentences.length === 0) {
+    return true;
+  }
+
+  const hasSyntheticSentence = sentences.some((s: any) => {
+    const advicePt = String(s?.levelAdvicePt || s?.advice || '');
+    const corrected = String(s?.correctedSentence || '');
+    const expPt = String(s?.explanationPt || s?.pedagogicalExplanation || '');
+    return (
+      advicePt.includes('Continue praticando a formação de frases ativas conectadas à sua rotina.') ||
+      expPt.includes('Frase bem elaborada incorporando') ||
+      expPt.includes('Lembre-se de formar uma frase completa em inglês usando a palavra') ||
+      (corrected.startsWith('I use ') && corrected.endsWith(' in my daily routine.'))
+    );
+  });
+  if (hasSyntheticSentence) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Validates that an evaluation has genuine structure, numeric score, and non-empty feedback.
+ */
+export function isValidHomeworkEvaluation(evaluation: any, requireOverallScore = true): boolean {
+  if (!evaluation || typeof evaluation !== 'object') return false;
+
+  if (requireOverallScore || typeof evaluation.overallScore !== 'undefined') {
+    if (
+      typeof evaluation.overallScore !== 'number' ||
+      isNaN(evaluation.overallScore) ||
+      evaluation.overallScore < 0 ||
+      evaluation.overallScore > 100
+    ) {
+      return false;
+    }
+  }
+
+  const summaryPt = String(
+    evaluation.tutorFeedbackSummaryPt ||
+    evaluation.overallFeedback ||
+    evaluation.overallSummaryPt ||
+    ''
+  ).trim();
+  const summaryEn = String(
+    evaluation.tutorFeedbackSummaryEn ||
+    evaluation.overallFeedbackEn ||
+    evaluation.overallSummaryEn ||
+    ''
+  ).trim();
+  if (!summaryPt && !summaryEn) return false;
+
+  const sentences = Array.isArray(evaluation.sentenceFeedback)
+    ? evaluation.sentenceFeedback
+    : Array.isArray(evaluation.sentenceEvaluationResults)
+    ? evaluation.sentenceEvaluationResults
+    : null;
+
+  if (!sentences || sentences.length === 0) {
+    return false;
+  }
+
+  if (isSyntheticHomeworkEvaluation(evaluation)) {
+    return false;
+  }
+
+  for (const item of sentences) {
+    if (!item || typeof item !== 'object') return false;
+    if (typeof item.word !== 'string' || !item.word.trim()) return false;
+    if (typeof item.isCorrect !== 'boolean') return false;
+    if (typeof item.correctedSentence !== 'string' || !item.correctedSentence.trim()) return false;
+    const expPt = String(item.explanationPt || item.pedagogicalExplanation || '').trim();
+    const expEn = String(item.explanationEn || item.explanation || '').trim();
+    if (!expPt && !expEn) return false;
+  }
+
+  return true;
+}
+
+/**
+ * Rigorously validates that a Gemini AI evaluation response accurately addresses the student's actual sentences.
+ */
+export function validateHomeworkAiEvaluationResponse(
+  json: any,
+  expectedPrompts: any[] = [],
+  studentSentences: Record<string, string> = {}
+): boolean {
+  if (!json || typeof json !== 'object') return false;
+  // Raw Gemini response might not have overallScore yet (calculated by server)
+  if (!isValidHomeworkEvaluation(json, false)) return false;
+
+  const promptWords = (expectedPrompts || [])
+    .map((p: any) => String(p.word || '').trim().toLowerCase())
+    .filter(Boolean);
+
+  const sentencesList = Array.isArray(json.sentenceFeedback)
+    ? json.sentenceFeedback
+    : Array.isArray(json.sentenceEvaluationResults)
+    ? json.sentenceEvaluationResults
+    : [];
+
+  if (promptWords.length > 0) {
+    const feedbackWords = sentencesList.map((s: any) => String(s.word || '').trim().toLowerCase());
+    const coversAll = promptWords.every((pw) => feedbackWords.includes(pw));
+    if (!coversAll) {
+      return false;
+    }
+  }
+
+  for (const item of sentencesList) {
+    const targetWord = String(item.word || '').trim();
+    const studentAns = (
+      studentSentences[targetWord] ||
+      studentSentences[targetWord.toLowerCase()] ||
+      studentSentences[targetWord.toUpperCase()] ||
+      ''
+    ).trim();
+    const orig = String(item.originalSentence || '').trim();
+
+    if (!studentAns) {
+      if (item.isCorrect === true) {
+        return false;
+      }
+    } else {
+      if (orig && orig !== '(nenhuma frase enviada)' && orig !== '(no sentence provided)') {
+        const lowerOrig = orig.toLowerCase();
+        const lowerAns = studentAns.toLowerCase();
+        const wordsInAns = lowerAns.split(/\s+/).filter((w) => w.length > 2);
+        const hasOverlap =
+          wordsInAns.some((w) => lowerOrig.includes(w)) ||
+          lowerOrig.includes(lowerAns.slice(0, 8)) ||
+          lowerAns.includes(lowerOrig.slice(0, 8));
+        if (wordsInAns.length > 0 && !hasOverlap) {
+          return false;
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
 export async function evaluateWeeklyHomeworkApi(params: {
   homework: WeeklyHomeworkData;
   studentAnswers: {
@@ -1019,6 +1221,8 @@ export async function evaluateWeeklyHomeworkApi(params: {
   studentName?: string;
   currentLanguage?: string;
 }): Promise<HomeworkAiEvaluation> {
+  let res: Response | null = null;
+  let status = 500;
   try {
     const token = await auth?.currentUser?.getIdToken().catch(() => null);
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -1026,127 +1230,56 @@ export async function evaluateWeeklyHomeworkApi(params: {
       headers['Authorization'] = `Bearer ${token}`;
     }
 
-    const res = await fetch('/api/homework/evaluate', {
+    res = await fetch('/api/homework/evaluate', {
       method: 'POST',
       headers,
       body: JSON.stringify(params),
     });
 
-    if (res.status === 401 || res.status === 403) {
-      console.warn(`Homework evaluation rejected (${res.status}): unauthenticated or unauthorized. Falling back to client evaluation.`);
-    } else if (res.ok) {
+    status = res.status;
+
+    if (res.ok) {
       const data = await res.json();
-      if (data && data.evaluation) {
+      if (data && data.evaluation && isValidHomeworkEvaluation(data.evaluation)) {
         return data.evaluation as HomeworkAiEvaluation;
       }
+      throw new Error('Formato de avaliação retornado é inválido ou incompleto.');
     }
-  } catch (err) {
-    console.warn('Error evaluating homework via API:', err);
+  } catch (err: any) {
+    if (err && (err as any).isAiUnavailable) {
+      throw err;
+    }
+    // Network or server error
+    let serverMessage = '';
+    if (res) {
+      try {
+        const errJson = await res.json();
+        serverMessage = errJson?.message || errJson?.error || '';
+      } catch {}
+    }
+    const finalMsg =
+      serverMessage ||
+      err?.message ||
+      'Serviço de avaliação pedagógica temporariamente indisponível após tentativa com os modelos de contingência. Suas respostas foram preservadas.';
+    const customErr = new Error(finalMsg);
+    (customErr as any).status = status;
+    (customErr as any).isAiUnavailable = true;
+    throw customErr;
   }
 
-  // Resilient client-side fallback evaluation
-  const { homework, studentAnswers, studentLevel = 'Beginner' } = params;
-  const { matching = {}, fillInBlanks = {}, sentences = {}, quizAnswers = {} } = studentAnswers;
-
-  let matchingCorrect = 0;
-  const matchingFeedback = (homework.matchingPairs || []).map((p) => {
-    const ans = (matching[p.id] || '').trim();
-    const isCorrect = ans.toLowerCase() === p.word.toLowerCase();
-    if (isCorrect) matchingCorrect++;
-    return {
-      id: p.id,
-      isCorrect,
-      userAnswer: ans || '(sem resposta)',
-      correctAnswer: p.word,
-      explanationPt: isCorrect
-        ? `Correto! "${p.word}" corresponde a "${p.translation}".`
-        : `A resposta correta é "${p.word}" (${p.translation}).`,
-      explanationEn: isCorrect
-        ? `Correct! "${p.word}" matches "${p.definition}".`
-        : `The correct answer is "${p.word}" (${p.definition}).`,
-    };
-  });
-
-  let fillCorrect = 0;
-  const fillFeedback = (homework.fillInBlanks || []).map((f) => {
-    const ans = (fillInBlanks[f.id] || '').trim();
-    const isCorrect = ans.toLowerCase() === f.correctWord.toLowerCase();
-    if (isCorrect) fillCorrect++;
-    return {
-      id: f.id,
-      isCorrect,
-      userAnswer: ans || '(sem resposta)',
-      correctAnswer: f.correctWord,
-      explanationPt: f.explanationPt || (isCorrect ? `Excelente! "${f.correctWord}" completa a frase perfeitamente.` : `A palavra correta é "${f.correctWord}".`),
-      explanationEn: f.explanationEn || (isCorrect ? `Great! "${f.correctWord}" completes the sentence.` : `The correct word is "${f.correctWord}".`),
-    };
-  });
-
-  let quizCorrect = 0;
-  const readingFeedback = (homework.readingPassage?.questions || []).map((q) => {
-    const ansIdx = quizAnswers[q.id];
-    const isCorrect = ansIdx === q.correctAnswer;
-    if (isCorrect) quizCorrect++;
-    return {
-      id: q.id,
-      isCorrect,
-      userAnswer: q.options[ansIdx] || '(sem resposta)',
-      correctAnswer: q.options[q.correctAnswer] || '',
-      explanationPt: q.explanation || (isCorrect ? 'Resposta correta!' : 'Opção alinhada com o texto.'),
-      explanationEn: q.explanation || (isCorrect ? 'Correct interpretation!' : 'Option aligned with the passage.'),
-    };
-  });
-
-  const sentenceFeedback = (homework.sentenceWritingPrompts || []).map((p) => {
-    const text = (sentences[p.word] || '').trim();
-    const isCorrect = text.length >= 8 && text.toLowerCase().includes(p.word.toLowerCase());
-    return {
-      word: p.word,
-      originalSentence: text || '(nenhuma frase enviada)',
-      isCorrect,
-      correctedSentence: text || `I use ${p.word} in my daily routine.`,
-      explanationPt: isCorrect
-        ? `Frase bem elaborada incorporando "${p.word}" com naturalidade.`
-        : `Lembre-se de formar uma frase completa em inglês usando a palavra "${p.word}".`,
-      explanationEn: isCorrect
-        ? `Well-crafted sentence incorporating "${p.word}" naturally.`
-        : `Remember to build a full English sentence using "${p.word}".`,
-      levelAdvicePt: 'Continue praticando a formação de frases ativas conectadas à sua rotina.',
-      levelAdviceEn: 'Keep practicing active sentence construction tied to your routine.',
-    };
-  });
-
-  const totalPoints = 100;
-  const totalM = Math.max(1, homework.matchingPairs.length);
-  const totalF = Math.max(1, homework.fillInBlanks.length);
-  const totalQ = Math.max(1, homework.readingPassage.questions.length);
-  const totalS = Math.max(1, homework.sentenceWritingPrompts.length);
-
-  let sentenceCorrect = 0;
-  sentenceFeedback.forEach((s) => { if (s.isCorrect) sentenceCorrect++; });
-
-  const score = Math.round(
-    (matchingCorrect / totalM) * 25 +
-    (fillCorrect / totalF) * 30 +
-    (sentenceCorrect / totalS) * 25 +
-    (quizCorrect / totalQ) * 20
+  // If res was not ok, parse error message and fail transparently (ZERO synthetic fallback)
+  let serverMessage = '';
+  try {
+    const errJson = await res.json();
+    serverMessage = errJson?.message || errJson?.error || '';
+  } catch {}
+  const unavailableError = new Error(
+    serverMessage ||
+      'Serviço de avaliação pedagógica temporariamente indisponível após tentativa com os modelos de contingência. Suas respostas foram preservadas.'
   );
-
-  return {
-    overallScore: Math.min(100, score),
-    evaluatedAt: new Date().toISOString(),
-    studentLevel: studentLevel || 'Beginner',
-    tutorFeedbackSummaryPt: `Parabéns pela dedicação! Você concluiu as etapas de memorização do vocabulário da sua semana com foco no nível ${studentLevel}. Continue integrando essas palavras na sua rotina diária.`,
-    tutorFeedbackSummaryEn: `Congratulations on your dedication! You completed your weekly memorization activity calibrated for ${studentLevel} level. Keep applying these words in your daily life.`,
-    levelStrengthsPt: 'Demonstrou bom reconhecimento de vocabulário e dedicação na prática ativa.',
-    levelStrengthsEn: 'Demonstrated strong vocabulary recall and dedication in active practice.',
-    levelNextStepsPt: 'Traga esses termos para a sua próxima aula de conversação com seu Amigo Nativo.',
-    levelNextStepsEn: 'Bring these terms into your next live conversation session with your Native Friend.',
-    matchingFeedback,
-    fillFeedback,
-    sentenceFeedback,
-    readingFeedback,
-  };
+  (unavailableError as any).status = status;
+  (unavailableError as any).isAiUnavailable = true;
+  throw unavailableError;
 }
 
 function evaluateLocally(params: CheckWritingParams): WritingEvaluationResult {
