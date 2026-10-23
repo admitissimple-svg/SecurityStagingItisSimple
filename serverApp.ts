@@ -14527,7 +14527,7 @@ export function isBadStoryText(text: string): boolean {
   if (paragraphs.length !== 4) return true;
 
   const t = text.toLowerCase();
-  return (
+  if (
     t.includes('the day began with great purpose as') ||
     t.includes('the working session began with clear intention as') ||
     t.includes('the project breakthrough') ||
@@ -14548,8 +14548,35 @@ export function isBadStoryText(text: string): boolean {
     t.includes('in the youtube video') ||
     t.includes('the video showed') ||
     t.includes('as seen in the video clip') ||
-    t.includes('watched the video')
-  );
+    t.includes('watched the video') ||
+    t.includes('pausing to watch the progress') ||
+    t.includes('delivering a series of small improvements')
+  ) {
+    return true;
+  }
+
+  // Detect ungrammatical sentence fragments (e.g. temporal clause followed only by a participle phrase without a main finite verb)
+  // e.g. "During the morning session, pausing to watch the progress."
+  // e.g. "Before concluding the session, delivering a series of small improvements."
+  const sentences = text.split(/(?<=[.!?])\s+/);
+  const finiteVerbPattern = /\b(was|is|were|are|am|became|seemed|helped|allowed|proved|felt|remained|created|enabled|made|gave|found|decided|began|started|worked|wanted|needed|saw|said|noticed|observed|agreed|concluded|reviewed|finished|celebrated|delivered|showed|guided|adjusted)\b/i;
+  const temporalOpener = /^(?:during|before|after|while|throughout|upon|in|on)\s+[^,]{2,60},/i;
+
+  for (const rawSent of sentences) {
+    const s = rawSent.trim();
+    if (!s) continue;
+    if (temporalOpener.test(s)) {
+      const parts = s.split(',');
+      if (parts.length === 2) {
+        const afterComma = parts[1].trim().replace(/[.!?]+$/, '');
+        if (/^[a-z]+ing\b/i.test(afterComma) && !finiteVerbPattern.test(afterComma)) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
 }
 
 export function validatePart4StoryResponse(json: any, targetWords?: string[]): boolean {
@@ -14706,7 +14733,17 @@ CRITICAL MANDATORY RULES (STRICTLY ENFORCED):
      * ADVERBS (e.g. "nowadays", "always", "already") must modify verbs or clauses smoothly.
    - Highlight every target word in markdown bold: **word**.
 
-3. COERÊNCIA DAS PERGUNTAS DE COMPREENSÃO (EXATAMENTE 2 OU 3 PERGUNTAS):
+3. RIGOROSA QUALIDADE GRAMATICAL E ZERO FRAGMENTOS DE FRASES:
+   - Every single sentence must be complete and grammatically sound in English, containing an explicit subject and a finite main verb.
+   - STRICTLY REJECT AND NEVER WRITE INCOMPLETE SENTENCES OR DANGLING PARTICIPIAL CLAUSES such as:
+     * "During the morning session, pausing to watch the progress." (PROHIBITED - missing subject and finite verb)
+     * "Before concluding the session, delivering a series of small improvements." (PROHIBITED - missing subject and finite verb)
+   - CORRECT VERSIONS TO MODEL:
+     * "During the morning session, Alex paused to watch the progress of the team."
+     * "Before concluding the session, the team delivered a series of small improvements."
+   - No awkward slot-filling, unnatural syntax, or artificial sentence connectors.
+
+4. COERÊNCIA DAS PERGUNTAS DE COMPREENSÃO (EXATAMENTE 2 OU 3 PERGUNTAS):
    - Generate exactly 2 or 3 multiple-choice reading comprehension questions based EXCLUSIVELY on concrete plot events, decisions, or results in the story you just wrote.
    - ZERO GENERIC QUESTIONS: Prohibit any question about English study habits, vocabulary flashcards, or general philosophies.
    - Exactly 4 plausible options per question ([Option A, Option B, Option C, Option D]). 1 unambiguously correct based on the story, 3 plausible narrative distractors.
@@ -14745,11 +14782,12 @@ ${profiledWordsList}
 ${videoPromptSnippet}
 MANDATORY RULES:
 1. Exactly 4 connected paragraphs separated by double newlines (\n\n).
-2. All 5 target words must be used with natural grammatical function and highlighted as **word**. No awkward slot-filling!
-3. Exactly 2 or 3 comprehension questions testing concrete story events.
+2. Complete grammatical sentences only: zero sentence fragments like "During the session, pausing to..." or "Before concluding, delivering...".
+3. All 5 target words must be used with natural grammatical function and highlighted as **word**. No awkward slot-filling!
+4. Exactly 2 or 3 comprehension questions testing concrete story events.
 Return strict JSON only.`;
 
-  // HOTFIX 3-MODEL CONTINGENCY: Sequential failover across up to 3 verified models on recoverable errors
+  // HOTFIX 2.3.5L: Sequential 3-Model Contingency Failover (gemini-3.5-flash -> gemini-3.8-flash -> gemini-3.1-flash-lite)
   const contingencyResult = await executeGeminiWithContingency({
     feature: 'homework_part4',
     systemInstruction,
@@ -14757,6 +14795,7 @@ Return strict JSON only.`;
     callerRole: 'student',
     apiKey,
     temperature: 0.7,
+    modelsOverride: ['gemini-3.5-flash', 'gemini-3.8-flash', 'gemini-3.1-flash-lite'],
     validator: (json) => validatePart4StoryResponse(json, words),
   });
 

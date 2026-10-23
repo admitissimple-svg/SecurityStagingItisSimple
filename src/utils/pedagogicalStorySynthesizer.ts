@@ -858,7 +858,7 @@ export function isBadStoryText(text?: string | null): boolean {
   if (paragraphs.length < 4) return true;
 
   const t = text.toLowerCase();
-  return (
+  if (
     t.includes('the day began with great purpose as') ||
     t.includes('the working session began with clear intention as') ||
     t.includes('the project breakthrough') ||
@@ -879,8 +879,35 @@ export function isBadStoryText(text?: string | null): boolean {
     t.includes('in the youtube video') ||
     t.includes('the video showed') ||
     t.includes('as seen in the video clip') ||
-    t.includes('watched the video')
-  );
+    t.includes('watched the video') ||
+    t.includes('pausing to watch the progress') ||
+    t.includes('delivering a series of small improvements')
+  ) {
+    return true;
+  }
+
+  // Detect ungrammatical sentence fragments (e.g. temporal clause followed only by a participle phrase without a main finite verb)
+  // e.g. "During the morning session, pausing to watch the progress."
+  // e.g. "Before concluding the session, delivering a series of small improvements."
+  const sentences = text.split(/(?<=[.!?])\s+/);
+  const finiteVerbPattern = /\b(was|is|were|are|am|became|seemed|helped|allowed|proved|felt|remained|created|enabled|made|gave|found|decided|began|started|worked|wanted|needed|saw|said|noticed|observed|agreed|concluded|reviewed|finished|celebrated|delivered|showed|guided|adjusted)\b/i;
+  const temporalOpener = /^(?:during|before|after|while|throughout|upon|in|on)\s+[^,]{2,60},/i;
+
+  for (const rawSent of sentences) {
+    const s = rawSent.trim();
+    if (!s) continue;
+    if (temporalOpener.test(s)) {
+      const parts = s.split(',');
+      if (parts.length === 2) {
+        const afterComma = parts[1].trim().replace(/[.!?]+$/, '');
+        if (/^[a-z]+ing\b/i.test(afterComma) && !finiteVerbPattern.test(afterComma)) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -1130,45 +1157,45 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
       // Special natural constructions for common tricky words
       if (lower === 'need') {
         if (role === 'intro') return `recognizing an immediate ${w} for clear organization`;
-        if (role === 'action') return `the team realized they would ${w} additional time to finalize everything properly`;
-        if (role === 'pivot') return `they discovered they still had a genuine ${w} for clearer instructions`;
-        return `addressing every essential ${w} brought confidence to the group`;
+        if (role === 'action') return `addressing their genuine ${w} for clearer instructions`;
+        if (role === 'pivot') return `confirming their essential ${w} for structured planning`;
+        return `addressing every essential ${w} with thoughtful care`;
       }
       if (lower === 'small') {
         if (role === 'intro') return `taking note of even a ${w} initial detail`;
-        if (role === 'action') return `paying close attention to each ${w} adjustment as work unfolded`;
+        if (role === 'action') return `implementing each ${w} adjustment as work unfolded`;
         if (role === 'pivot') return `realizing that even a ${w} change in strategy could resolve the challenge`;
         return `delivering a series of ${w} yet impactful improvements`;
       }
       if (lower === 'watch') {
         if (role === 'intro') return `taking time to ${w} how the process was handled`;
-        if (role === 'action') return `pausing to ${w} the progress made so far`;
+        if (role === 'action') return `observing how their planned adjustments supported the workflow`;
         if (role === 'pivot') return `stepping back to carefully ${w} the outcome of the initial trial`;
-        return `taking pride in being able to ${w} their hard work bear fruit`;
+        return `being able to ${w} their hard work bear fruit`;
       }
       if (lower === 'start') {
         if (role === 'intro') return `taking the initiative to ${w} the morning with clear intentions`;
-        if (role === 'action') return `working diligently to ${w} on the core milestones without hesitation`;
-        if (role === 'pivot') return `it was helpful to ${w} fresh with an updated perspective`;
+        if (role === 'action') return `working diligently to ${w} on core milestones without hesitation`;
+        if (role === 'pivot') return `getting ready to ${w} fresh with an updated perspective`;
         return `knowing that a steady ${w} had set the stage for great results`;
       }
 
       if (pos === 'verb') {
         if (role === 'intro') return `taking decisive action to ${w} the initial phase smoothly`;
         if (role === 'action') return `working side by side to ${w} the key steps effectively`;
-        if (role === 'pivot') return `it became crucial to ${w} the pending action before proceeding`;
-        return `investing genuine effort to ${w} the process produced rewarding outcomes`;
+        if (role === 'pivot') return `aligning on how to ${w} the pending action before proceeding`;
+        return `investing genuine effort to ${w} the process with high quality`;
       }
       if (pos === 'adjective') {
         if (role === 'intro') return `maintaining a ${w} outlook as the schedule got underway`;
         if (role === 'action') return `ensuring that the workflow remained ${w} and coordinated`;
-        if (role === 'pivot') return `adapting to unexpected feedback while staying ${w} and determined`;
+        if (role === 'pivot') return `adapting to feedback while staying ${w} and determined`;
         return `achieving a ${w} result that satisfied everyone involved`;
       }
       if (pos === 'adverb') {
-        if (role === 'intro') return `approaching the day ${w} set a steady pace`;
-        if (role === 'action') return `communicating ${w} with peers prevented misunderstandings`;
-        return `moving forward ${w} ensured that goals were achieved smoothly`;
+        if (role === 'intro') return `approaching the day ${w} to set a steady pace`;
+        if (role === 'action') return `communicating ${w} with peers to prevent misunderstandings`;
+        return `moving forward ${w} to ensure goals were achieved smoothly`;
       }
       if (role === 'intro') return `directing attention toward the central ${w}`;
       if (role === 'action') return `coordinating tasks around each important ${w}`;
@@ -1193,12 +1220,12 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
 
     const p2Parts: string[] = [];
     if (p2Words.length >= 1) {
-      p2Parts.push(`During the morning session, ${buildNaturalClause(p2Words[0], 'action')}.`);
+      p2Parts.push(`During the morning session, the team focused on ${buildNaturalClause(p2Words[0], 'action')}.`);
     } else {
       p2Parts.push(`During the morning session, colleagues shared actionable insights and coordinated their efforts.`);
     }
     if (p2Words.length >= 2) {
-      p2Parts.push(`At the same time, ${buildNaturalClause(p2Words[1], 'action')}.`);
+      p2Parts.push(`At the same time, the collaborators were ${buildNaturalClause(p2Words[1], 'action')}.`);
     } else {
       p2Parts.push(`Working through practical examples side by side enabled the group to maintain steady progress without delays.`);
     }
@@ -1215,7 +1242,7 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
 
     const p4Parts: string[] = [];
     if (p4Words.length >= 1) {
-      p4Parts.push(`Before concluding the session, ${buildNaturalClause(p4Words[0], 'conclusion')}.`);
+      p4Parts.push(`Before concluding the session, the team took pride in ${buildNaturalClause(p4Words[0], 'conclusion')}.`);
     } else {
       p4Parts.push(`Wrapping up the schedule on time brought a genuine sense of accomplishment across the team.`);
     }

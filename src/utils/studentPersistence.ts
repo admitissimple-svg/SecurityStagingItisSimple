@@ -5044,11 +5044,22 @@ export function createCleanInitializedHomework(
     matchingPairs: Array.isArray(partial?.matchingPairs) ? partial.matchingPairs : [],
     fillInBlanks: Array.isArray(partial?.fillInBlanks) ? partial.fillInBlanks : [],
     sentenceWritingPrompts: Array.isArray(partial?.sentenceWritingPrompts) ? partial.sentenceWritingPrompts : [],
-    readingPassage: partial?.readingPassage || {
-      title: `Week ${cycle} Reading`,
-      text: '',
-      questions: [],
-    },
+    readingPassage: partial?.readingPassage
+      ? {
+          ...partial.readingPassage,
+          questions: (Array.isArray(partial.readingPassage.questions) ? partial.readingPassage.questions : []).map(
+            (q: any, qIdx: number) => ({
+              ...q,
+              id: q?.id || `q-${qIdx + 1}`,
+              options: Array.isArray(q?.options) ? q.options : [],
+            })
+          ),
+        }
+      : {
+          title: `Week ${cycle} Reading`,
+          text: '',
+          questions: [],
+        },
     targetDay: partial?.targetDay,
     assignedPart: partial?.assignedPart,
     assignedPartKey: partial?.assignedPartKey,

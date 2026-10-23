@@ -1307,6 +1307,14 @@ export function generateWeeklyHomework(
     };
   }
 
+  readingPassageToUse.questions = (Array.isArray(readingPassageToUse.questions) ? readingPassageToUse.questions : []).map(
+    (q, qIdx) => ({
+      ...q,
+      id: q?.id || `q-${qIdx + 1}`,
+      options: Array.isArray(q?.options) ? q.options : [],
+    })
+  );
+
   const passageTitle = readingPassageToUse.title;
   const passageText = readingPassageToUse.text;
   const readingQuestions = readingPassageToUse.questions;
@@ -1578,6 +1586,11 @@ export async function generatePart4StoryWithAi(params: {
       if (data.readingPassage?.text && Array.isArray(data.readingPassage?.questions) && !isBadStoryText(data.readingPassage.text)) {
         return {
           ...data.readingPassage,
+          questions: data.readingPassage.questions.map((q: any, idx: number) => ({
+            ...q,
+            id: q?.id || `q-${idx + 1}`,
+            options: Array.isArray(q?.options) ? q.options : [],
+          })),
           isAiGenerated: true,
         };
       }

@@ -267,6 +267,24 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     );
   }, [targetDay, activeStudyDays, weeklyCycle]);
 
+  // Check if Video of the Day for targetDay has been watched (non-blocking)
+  const isVideoWatchedForTargetDay = useMemo(() => {
+    const checkKey1 = `video_day_${targetDay}`;
+    const checkKey2 = `video_${targetDay}`;
+    if (weeklyChecks?.[checkKey1] || weeklyChecks?.[checkKey2]) {
+      return true;
+    }
+    const dayList = routinesByDay?.[targetDay] || [];
+    return dayList.some((act: any) => {
+      if (!act) return false;
+      if (act.completedVideoToday) return true;
+      const hasVideo =
+        (Array.isArray(act.teacherVideos) && act.teacherVideos.length > 0 && Boolean(act.teacherVideos[0]?.videoId)) ||
+        Boolean(act.videoId);
+      return hasVideo && Boolean(act.completedToday || act.completed);
+    });
+  }, [weeklyChecks, routinesByDay, targetDay]);
+
   // Accurately determine if targetDay's activity part has been completed
   const isTodayPartCompleted = Boolean(
     homework?.completedPartsByDay?.[targetDay] ||
@@ -412,6 +430,16 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
   const [evalError, setEvalError] = useState<string | null>(null);
 
   const activeDayActivity = homework?.dailyActivities?.[targetDay];
+  const activeDayPassage = activeDayActivity?.readingPassage || homework.readingPassage;
+  const safeQuestions = useMemo(() => {
+    if (Array.isArray(activeDayPassage?.questions) && activeDayPassage.questions.length > 0) {
+      return activeDayPassage.questions;
+    }
+    if (Array.isArray(homework?.readingPassage?.questions) && homework.readingPassage.questions.length > 0) {
+      return homework.readingPassage.questions;
+    }
+    return [];
+  }, [activeDayPassage?.questions, homework?.readingPassage?.questions]);
 
   React.useEffect(() => {
     const dayAnswers =
@@ -755,9 +783,11 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
   }, [homework.sentenceWritingPrompts, sentenceAnswers, sentenceFeedbacks]);
 
   const isReadingComplete = useMemo(() => {
-    if (!homework.readingPassage?.questions || homework.readingPassage.questions.length === 0) return false;
-    return homework.readingPassage.questions.every((q) => quizAnswers[q.id] !== undefined);
-  }, [homework.readingPassage?.questions, quizAnswers]);
+    const activePassage = activeDayActivity?.readingPassage || homework.readingPassage;
+    const questions = Array.isArray(activePassage?.questions) ? activePassage.questions : [];
+    if (questions.length === 0) return false;
+    return questions.every((q) => q && quizAnswers[q.id || ''] !== undefined);
+  }, [activeDayActivity?.readingPassage, homework.readingPassage, quizAnswers]);
 
   // Check if today's scheduled part has been answered
   const isPartAnswersComplete = useMemo(() => {
@@ -1136,7 +1166,8 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
   };
 
   const handleSavePart4 = async () => {
-    const questionsList = homework.readingPassage?.questions || [];
+    const activePassage = activeDayActivity?.readingPassage || homework.readingPassage;
+    const questionsList = Array.isArray(activePassage?.questions) ? activePassage.questions : [];
     if (!isReadingComplete) {
       setSubmittedFeedbackToast(
         isEn
@@ -2017,7 +2048,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                           </div>
 
                           <div className="flex flex-wrap gap-1.5 pl-7">
-                            {item.options.map((opt, optIdx) => {
+                            {(Array.isArray(item.options) ? item.options : []).map((opt, optIdx) => {
                               const isSelected = selectedOption === opt;
                               return (
                                 <button
@@ -2644,10 +2675,18 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                     </div>
                   </div>
 
+                  {/* Non-blocking suggestion when Video of the Day has not been watched */}
+                  {!isVideoWatchedForTargetDay && (
+                    <div className="p-3 bg-gradient-to-r from-blue-50/90 via-indigo-50/80 to-blue-50/90 border border-blue-200/90 rounded-xl flex items-center gap-2.5 text-xs text-[#000035] shadow-2xs animate-in fade-in duration-200">
+                      <span className="text-base select-none shrink-0" role="img" aria-label="movie camera">🎬</span>
+                      <p className="font-semibold text-slate-800 leading-snug">
+                        Watch your Video of the Day to make your Mini-Story even more personalized!
+                      </p>
+                    </div>
+                  )}
+
                   {/* Reading passage */}
                   {(() => {
-                    const activeDayPassage = activeDayActivity?.readingPassage || homework.readingPassage;
-
                     if (isGeneratingPart4Story) {
                       return (
                         <MemorizationAiLoadingSkeleton
@@ -2706,7 +2745,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                       );
                     }
 
-                    if (!activeDayPassage || (!activeDayPassage.text && (!activeDayPassage.questions || activeDayPassage.questions.length === 0))) {
+                    if (!activeDayPassage || (!activeDayPassage.text && safeQuestions.length === 0)) {
                       return (
                         <div className="p-8 bg-slate-50 rounded-2xl border border-dashed border-slate-300 text-center space-y-3">
                           <BookOpen className="w-10 h-10 text-[#1C4C96]/60 mx-auto" />
@@ -2780,22 +2819,25 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
                         {/* Questions */}
                         <div className="space-y-3">
-                          {(activeDayPassage?.questions || []).map((q, qIdx) => {
-                            const selectedChoice = quizAnswers[q.id];
+                          {safeQuestions.map((q, qIdx) => {
+                            if (!q) return null;
+                            const safeOptions = Array.isArray(q.options) ? q.options : [];
+                            const qId = q.id || `q-${qIdx + 1}`;
+                            const selectedChoice = quizAnswers[qId];
                             return (
                               <div
-                                key={q.id}
+                                key={qId}
                                 className="p-3.5 bg-white rounded-xl border border-slate-200 space-y-2.5"
                               >
                                 <div className="flex items-start gap-2">
                                   <span className="w-5 h-5 rounded-md bg-[#000035] text-white text-[10px] font-bold flex items-center justify-center shrink-0 mt-0.5">
                                     {qIdx + 1}
                                   </span>
-                                  <p className="text-xs font-semibold text-slate-900">{q.question}</p>
+                                  <p className="text-xs font-semibold text-slate-900">{q.question || `Question ${qIdx + 1}`}</p>
                                 </div>
 
                                 <div className="space-y-1 pl-7">
-                                  {q.options.map((opt, optIdx) => {
+                                  {safeOptions.map((opt, optIdx) => {
                                     const isSelected = selectedChoice === optIdx;
                                     return (
                                       <div
@@ -2803,7 +2845,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                                         onClick={() => {
                                           setQuizAnswers((prev) => ({
                                             ...prev,
-                                            [q.id]: optIdx,
+                                            [qId]: optIdx,
                                           }));
                                           if (aiEvaluation?.readingFeedback) {
                                             setAiEvaluation((prev) => {
@@ -2811,7 +2853,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                                               return {
                                                 ...prev,
                                                 readingFeedback: prev.readingFeedback.map((rf: any) =>
-                                                  (rf.id === q.id || rf.id === `q-${qIdx + 1}`)
+                                                  (rf.id === qId || rf.id === `q-${qIdx + 1}`)
                                                     ? { ...rf, isModified: true }
                                                     : rf
                                                 ),
@@ -2824,7 +2866,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                                               reading: {
                                                 ...prev.reading!,
                                                 status: 'draft',
-                                                answers: { ...quizAnswers, [q.id]: optIdx },
+                                                answers: { ...quizAnswers, [qId]: optIdx },
                                                 updatedAt: new Date().toISOString(),
                                               },
                                             }));
@@ -2900,7 +2942,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                         </div>
                       ) : (
                         <span className="text-[11px] text-slate-500 font-medium">
-                          {Object.keys(quizAnswers).length} / {(homework.readingPassage?.questions || []).length} {isEn ? 'answered' : 'respondidas'} • {isEn ? 'Answer all to record on S-Path' : 'Responda todas para gravar no S-Path'}
+                          {Object.keys(quizAnswers).length} / {safeQuestions.length} {isEn ? 'answered' : 'respondidas'} • {isEn ? 'Answer all to record on S-Path' : 'Responda todas para gravar no S-Path'}
                         </span>
                       )}
                     </div>
@@ -2941,7 +2983,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                           {isEn ? 'Part 4: Mini-Story Reading' : 'Parte 4: Interpretação de Texto'}
                         </span>
                         <span className="text-[11px] text-slate-500 font-semibold">
-                          {(homework.readingPassage?.questions || []).length} {isEn ? 'questions' : 'perguntas'}
+                          {safeQuestions.length} {isEn ? 'questions' : 'perguntas'}
                         </span>
                       </div>
 
@@ -2953,16 +2995,19 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                       )}
 
                       <div className="space-y-2">
-                        {(homework.readingPassage?.questions || []).map((q, idx) => {
-                          const chosenIdx = quizAnswers[q.id] !== undefined ? quizAnswers[q.id] : quizAnswers[String(idx)];
+                        {safeQuestions.map((q: any, idx: number) => {
+                          if (!q) return null;
+                          const qId = q.id || `q-${idx + 1}`;
+                          const safeOpts = Array.isArray(q.options) ? q.options : [];
+                          const chosenIdx = quizAnswers[qId] !== undefined ? quizAnswers[qId] : quizAnswers[String(idx)];
                           const isAnswered = chosenIdx !== undefined && chosenIdx !== null && typeof chosenIdx === 'number';
-                          const rfItem = aiEvaluation?.readingFeedback?.find((rf: any) => rf.id === q.id || rf.id === `q-${idx + 1}`);
+                          const rfItem = aiEvaluation?.readingFeedback?.find((rf: any) => rf.id === qId || rf.id === `q-${idx + 1}`);
                           const isEvaluated = Boolean(rfItem && !rfItem.isModified);
                           const isQuizCorrect = isEvaluated
                             ? Boolean(rfItem?.isCorrect)
                             : (isAnswered && chosenIdx === q.correctAnswer);
-                          const chosenText = isAnswered && q.options?.[chosenIdx] ? q.options[chosenIdx] : (isAnswered ? String(chosenIdx) : '');
-                          const correctText = q.options?.[q.correctAnswer] || '';
+                          const chosenText = isAnswered && safeOpts[chosenIdx] !== undefined ? safeOpts[chosenIdx] : (isAnswered ? String(chosenIdx) : '');
+                          const correctText = safeOpts[q.correctAnswer] || '';
                           const explanation = isEn
                             ? (rfItem?.explanationEn || q.explanation)
                             : (rfItem?.explanationPt || q.explanation);
