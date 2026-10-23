@@ -1666,7 +1666,11 @@ export async function fetchRoutineVideosFromFirestoreServer(
       const uData = userSnap.data() || {};
       const uCycle = typeof uData.weeklyCycle === 'number' ? uData.weeklyCycle : typeof uData.weeklyCycle === 'string' ? parseInt(uData.weeklyCycle.replace(/\D/g, ''), 10) : NaN;
       if (!isNaN(uCycle) && uCycle > 0) {
-        activeCycle = uCycle;
+        if (!isNaN(parsedPassedCycle) && parsedPassedCycle > 0) {
+          activeCycle = Math.max(parsedPassedCycle, uCycle);
+        } else {
+          activeCycle = uCycle;
+        }
       }
       result.weeklyCycle = activeCycle;
 

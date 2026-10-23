@@ -458,19 +458,6 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
     authUid ||
     (studentUid && isValidCanonicalUid(studentUid) ? studentUid : '');
 
-  const [routinesByDay, setRoutinesByDay] = useState<Partial<Record<DayOfWeek, SavedRoutineVideo>>>({});
-  const [watchedHistory, setWatchedHistory] = useState<string[]>([]);
-  const [weeklyCycle, setWeeklyCycle] = useState<number>(() => activeWeeklyCycle || 1);
-  const [loadedUid, setLoadedUid] = useState<string | null>(null);
-  const [isLoading, setIsLoading] = useState<boolean>(() => Boolean(effectiveUid));
-  const [isInitialized, setIsInitialized] = useState<boolean>(false);
-  const [lastSavedDay, setLastSavedDay] = useState<DayOfWeek | null>(null);
-
-  const activeCycleRef = useRef<number>(activeWeeklyCycle || 1);
-  const fetchVersionRef = useRef<number>(0);
-
-  const isRoutineLoading = Boolean(effectiveUid && loadedUid !== effectiveUid) || isLoading;
-
   /**
    * Constructs a pristine clean 7-day routine object with zero selected videos or topics.
    */
@@ -498,9 +485,25 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
     return clean;
   }, []);
 
+  const [routinesByDay, setRoutinesByDay] = useState<Partial<Record<DayOfWeek, SavedRoutineVideo>>>(() =>
+    createClean7DayRoutines(activeWeeklyCycle || 1)
+  );
+  const [watchedHistory, setWatchedHistory] = useState<string[]>([]);
+  const [weeklyCycle, setWeeklyCycle] = useState<number>(() => activeWeeklyCycle || 1);
+  const [loadedUid, setLoadedUid] = useState<string | null>(null);
+  const [loadedCycle, setLoadedCycle] = useState<number | null>(null);
+  const [isLoading, setIsLoading] = useState<boolean>(() => Boolean(effectiveUid));
+  const [isInitialized, setIsInitialized] = useState<boolean>(false);
+  const [networkError, setNetworkError] = useState<string | null>(null);
+  const [lastSavedDay, setLastSavedDay] = useState<DayOfWeek | null>(null);
+
+  const activeCycleRef = useRef<number>(activeWeeklyCycle || 1);
+  const fetchVersionRef = useRef<number>(0);
+
   /**
    * Synchronously and immediately resets all 7 days in-memory upon cycle advance.
    * Cancels/invalidates any in-flight requests from the older cycle.
+   * HOTFIX 2.3.5H: Explicitly terminates loading because a new cycle has confirmed empty 7-day routines.
    */
   const resetAllDaysImmediately = useCallback((newCycle: number) => {
     activeCycleRef.current = newCycle;
@@ -508,15 +511,21 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
     const clean = createClean7DayRoutines(newCycle);
     setRoutinesByDay(clean);
     setWeeklyCycle(newCycle);
+    setIsLoading(false);
+    setLoadedUid(effectiveUid);
+    setLoadedCycle(newCycle);
+    setIsInitialized(true);
+    setNetworkError(null);
     return clean;
-  }, [createClean7DayRoutines]);
+  }, [createClean7DayRoutines, effectiveUid]);
 
   const loadData = useCallback(async (uid: string, targetCycle?: number) => {
     if (!uid) {
-      setRoutinesByDay({});
+      setRoutinesByDay(createClean7DayRoutines(activeCycleRef.current || 1));
       setWatchedHistory([]);
       setIsLoading(false);
       setIsInitialized(true);
+      setNetworkError(null);
       return;
     }
 
@@ -524,6 +533,8 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
     const cycleToFetch = targetCycle || activeCycleRef.current || 1;
 
     setIsLoading(true);
+    setNetworkError(null);
+
     try {
       const headers = await getAuthHeaders();
       const res = await fetch(`/api/routines/daily-video?studentUid=${encodeURIComponent(uid)}&weeklyCycle=${encodeURIComponent(cycleToFetch)}`, {
@@ -531,16 +542,21 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
         headers,
       });
 
-      if (res.ok) {
-        // Discard stale responses from outdated async calls
-        if (fetchVersionRef.current !== version) {
-          return;
-        }
+      // Discard stale responses from outdated async calls
+      if (fetchVersionRef.current !== version) {
+        return;
+      }
 
+      if (res.ok) {
         const data = await res.json();
 
         // Discard response if server cycle does not match the active cycle
         if (data.weeklyCycle !== undefined && data.weeklyCycle !== activeCycleRef.current) {
+          // HOTFIX 2.3.5H: Block response from older cycle, but ensure active cycle loading is concluded cleanly
+          setLoadedUid(uid);
+          setLoadedCycle(activeCycleRef.current);
+          setIsLoading(false);
+          setIsInitialized(true);
           return;
         }
 
@@ -551,7 +567,7 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
             const item = data.routinesByDay[d];
             if (item && typeof item === 'object') {
               const itemCycle = item.weeklyCycle !== undefined ? Number(item.weeklyCycle) : activeCycleRef.current;
-              if (itemCycle === activeCycleRef.current) {
+              if (itemCycle === activeCycleRef.current && item.videoId && item.videoId.trim() !== '') {
                 filtered[d] = item;
               } else {
                 filtered[d] = {
@@ -572,11 +588,29 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
                   updatedAt: new Date().toISOString(),
                 };
               }
+            } else {
+              filtered[d] = {
+                videoId: '',
+                title: '',
+                videoTitle: '',
+                url: '',
+                playlistId: '',
+                playlistTitle: '',
+                isRepeatVideo: false,
+                dayOfWeek: d,
+                activityId: 'act-1',
+                instructions: '',
+                duration: '',
+                completed: false,
+                completedToday: false,
+                weeklyCycle: activeCycleRef.current,
+                updatedAt: new Date().toISOString(),
+              };
             }
           });
           setRoutinesByDay(filtered);
         } else {
-          setRoutinesByDay({});
+          setRoutinesByDay(createClean7DayRoutines(activeCycleRef.current));
         }
 
         if (Array.isArray(data.watchedVideosHistory)) {
@@ -586,16 +620,26 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
           setWeeklyCycle(data.weeklyCycle);
         }
         setLoadedUid(uid);
+        setLoadedCycle(activeCycleRef.current);
+        setNetworkError(null);
+      } else {
+        console.warn(`[useRoutine] Server returned non-ok status ${res.status}`);
+        setNetworkError(`Server status ${res.status}`);
+        setLoadedUid(uid);
+        setLoadedCycle(cycleToFetch);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.warn('[useRoutine] Error loading routine data from backend:', err);
+      setNetworkError(err?.message || 'Network error');
+      setLoadedUid(uid);
+      setLoadedCycle(cycleToFetch);
     } finally {
       if (fetchVersionRef.current === version) {
         setIsLoading(false);
         setIsInitialized(true);
       }
     }
-  }, []);
+  }, [createClean7DayRoutines]);
 
   // React strictly to external activeWeeklyCycle changes (e.g. from Start a New Week)
   useEffect(() => {
@@ -609,6 +653,12 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
         fetchVersionRef.current += 1;
         const clean = createClean7DayRoutines(activeWeeklyCycle);
         setRoutinesByDay(clean);
+        // HOTFIX 2.3.5H: Explicitly terminate loading on cycle advance
+        setIsLoading(false);
+        setLoadedUid(effectiveUid);
+        setLoadedCycle(activeWeeklyCycle);
+        setIsInitialized(true);
+        setNetworkError(null);
 
         if (effectiveUid) {
           loadData(effectiveUid, activeWeeklyCycle);
@@ -618,9 +668,10 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
   }, [activeWeeklyCycle, effectiveUid, loadData, createClean7DayRoutines]);
 
   useEffect(() => {
-    setRoutinesByDay({});
+    setRoutinesByDay(createClean7DayRoutines(activeCycleRef.current || 1));
     setWatchedHistory([]);
     setLoadedUid(null);
+    setLoadedCycle(null);
 
     if (!effectiveUid) {
       setIsLoading(false);
@@ -629,7 +680,7 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
     }
 
     loadData(effectiveUid, activeCycleRef.current);
-  }, [effectiveUid, loadData]);
+  }, [effectiveUid, loadData, createClean7DayRoutines]);
 
   // Save selected video for a day: updates local React state ONLY after persistence is confirmed
   const saveVideoForDay = useCallback(
@@ -752,10 +803,33 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
     [effectiveUid]
   );
 
+  const areAll7DaysEmpty = useCallback((routines: Partial<Record<DayOfWeek, SavedRoutineVideo>>) => {
+    return ALL_DAYS_OF_WEEK.every((day) => {
+      const item = routines[day];
+      return !item || !item.videoId || item.videoId.trim() === '';
+    });
+  }, []);
+
   const currentDayRoutine = selectedDay ? routinesByDay[selectedDay] || null : null;
   const hasSavedVideoToday = Boolean(
     currentDayRoutine && currentDayRoutine.videoId && currentDayRoutine.videoId.trim() !== ''
   );
+
+  // HOTFIX 2.3.5H: Clearly differentiate loading, empty, loaded, and error.
+  // A valid empty routine (all 7 days empty or confirmed clean) must NEVER be in infinite loading.
+  const isRoutineLoading = Boolean(
+    effectiveUid &&
+      (!isInitialized || (isLoading && loadedUid !== effectiveUid)) &&
+      !areAll7DaysEmpty(routinesByDay)
+  );
+
+  const routineStatus: 'loading' | 'empty' | 'loaded' | 'error' = networkError && !hasSavedVideoToday
+    ? 'error'
+    : isRoutineLoading
+    ? 'loading'
+    : hasSavedVideoToday
+    ? 'loaded'
+    : 'empty';
 
   return {
     routinesByDay,
@@ -764,6 +838,8 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
     watchedHistory,
     weeklyCycle,
     isLoading: isRoutineLoading,
+    routineStatus,
+    networkError,
     isInitialized,
     lastSavedDay,
     saveVideoForDay,

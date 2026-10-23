@@ -332,6 +332,9 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     resetAllDaysImmediately,
     selectNextUnwatchedVideo: pickNextUnwatched,
     isLoading: isRoutineLoading,
+    routineStatus,
+    networkError: routineNetworkError,
+    refreshRoutines,
   } = useRoutine(effectiveStudentUid, selectedDay, userProfile?.weeklyCycle || weeklyCycle || 1);
 
   // 5 Words State
@@ -876,7 +879,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
   const validVidId = hasAssignedVideo
     ? (extractYouTubeVideoId(rawVideoUrl) || assignedVideo?.videoId || '')
     : '';
-  const defaultVideoTitle = isRoutineLoading
+  const defaultVideoTitle = routineStatus === 'loading'
     ? (isEn ? 'Loading video...' : 'Carregando vídeo...')
     : hasAssignedVideo
     ? (assignedVideo?.title || 'Daily Video Practice')
@@ -2170,8 +2173,8 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
                                       : 'Tópico: Escolha o vídeo da playlist para unificar o nome da rotina e injetar o vídeo exclusivo')
                               }
                             >
-                              <option value="" className="text-slate-600 bg-white font-medium">
-                                {isRoutineLoading
+                                <option value="" className="text-slate-600 bg-white font-medium">
+                                {routineStatus === 'loading'
                                   ? (isEn ? '⏳ Loading routine...' : '⏳ Carregando rotina...')
                                   : isLoadingPlaylists
                                   ? (isEn ? '⏳ Loading videos...' : '⏳ Carregando vídeos...')
@@ -2511,7 +2514,31 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
                 allowFullScreen
                 onLoad={handleVideoIframeLoad}
               />
-            ) : isRoutineLoading ? (
+            ) : routineStatus === 'error' && !hasAssignedVideo ? (
+              <div className="w-full h-full flex flex-col items-center justify-center text-white space-y-3 p-6 text-center bg-gradient-to-b from-[#062863]/60 to-[#000035]">
+                <div className="w-12 h-12 rounded-2xl bg-amber-500/20 text-amber-300 flex items-center justify-center mb-1">
+                  <AlertTriangle className="w-6 h-6" />
+                </div>
+                <p className="text-sm font-bold text-slate-100">
+                  {isEn ? 'Could not load routine video' : 'Não foi possível carregar o vídeo da rotina'}
+                </p>
+                <p className="text-xs text-slate-300 max-w-sm">
+                  {isEn
+                    ? 'A connection issue occurred. You can choose a new video or retry connecting.'
+                    : 'Ocorreu um erro de conexão. Você pode escolher um novo vídeo ou tentar novamente.'}
+                </p>
+                <div className="flex items-center space-x-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => refreshRoutines && refreshRoutines()}
+                    className="px-3.5 py-1.5 rounded-xl bg-[#1C4C96] hover:bg-[#2563EB] text-white text-xs font-semibold flex items-center space-x-1.5 transition cursor-pointer"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>{isEn ? 'Retry' : 'Tentar novamente'}</span>
+                  </button>
+                </div>
+              </div>
+            ) : routineStatus === 'loading' ? (
               <div className="w-full h-full flex flex-col items-center justify-center text-white space-y-3 p-6 text-center bg-gradient-to-b from-[#062863]/60 to-[#000035]">
                 <Loader2 className="w-8 h-8 text-[#9AB4FF] animate-spin" />
                 <p className="text-xs font-bold text-slate-200">
