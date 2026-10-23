@@ -144,20 +144,11 @@ export const StartNewWeekModal: React.FC<StartNewWeekModalProps> = ({
   const handleConfirmSubmit = async () => {
     if (isLoadingAction) return;
     setIsSubmitting(true);
-    let timeoutTimer: any = null;
     try {
-      const confirmPromise = Promise.resolve(onConfirm(studyDaysTarget, selectedDays));
-      const timeoutPromise = new Promise((resolve) => {
-        timeoutTimer = setTimeout(() => {
-          console.warn('Start new week confirmation reached timeout, completing modal action');
-          resolve(true);
-        }, 5000);
-      });
-      await Promise.race([confirmPromise, timeoutPromise]);
+      await onConfirm(studyDaysTarget, selectedDays);
     } catch (err) {
       console.warn('Error confirming start new week:', err);
     } finally {
-      if (timeoutTimer) clearTimeout(timeoutTimer);
       setIsSubmitting(false);
       try {
         onClose();

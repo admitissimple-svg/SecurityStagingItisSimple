@@ -127,6 +127,9 @@ import {
   verifyTeacherLessonAccessServer,
   getStudentActivitiesBetweenLessonsServer,
   registerDbReader,
+  advanceWeeklyCycleTransactionServer,
+  fetchStudentCycleStatusFromServerFirestore,
+  saveLastCycleResultToFirestore,
 } from './src/serverFirestore';
 import { normalizeDictionaryWord } from './src/utils/studentDictionaryLibrary';
 import { DEFAULT_CURATED_PLAYLISTS } from './src/utils/youtubeService';
@@ -443,6 +446,7 @@ interface AppDb {
   sessionNotesMap: Record<string, any>;
   sessionNotesProgressMap: Record<string, any>;
   pedagogicalTransformationsMap: Record<string, any>;
+  cycleAttempts?: Record<string, { attemptId: string; result: any }>;
 }
 
 const DEFAULT_LANDING_CONTENT = {
@@ -6566,278 +6570,446 @@ app.get('/api/student-routines', (req, res) => {
  * - Resets weekly activity checklist for the fresh cycle.
  * - Persists full state linked to student UID in Firestore and local db.
  */
+// HOTFIX 2.3.5E: In-process lock map per student UID to serialize concurrent requests on the same process
+const inProcessCycleLocks = new Map<string, Promise<any>>();
+
 app.post(['/api/student-routines/start-new-week', '/api/student/reset-week'], async (req, res) => {
-  const db = readDb();
-  const studentEmail = ((req.body.studentEmail as string) || (req.body.email as string) || '').toLowerCase().trim();
-  const uid = ((req.body.uid as string) || (req.body.studentUid as string) || '').trim();
-  const rawLevel = (req.body.level as string) || '';
-  const weeklyStudyDaysTarget =
-    typeof req.body.weeklyStudyDaysTarget === 'number' && req.body.weeklyStudyDaysTarget >= 1 && req.body.weeklyStudyDaysTarget <= 7
-      ? req.body.weeklyStudyDaysTarget
-      : undefined;
-  const weeklyStudyDays = Array.isArray(req.body.weeklyStudyDays) ? req.body.weeklyStudyDays : undefined;
+  // 1. Authenticate Firebase ID Token
+  const authHeader = req.headers.authorization || '';
+  let authenticatedUid = '';
+  let authenticatedEmail = '';
+  let tokenVerified = false;
 
-  const resolved = resolveStudentIdentifiers(db, studentEmail, uid);
-  const targetKeys = Array.from(new Set([resolved.uid, resolved.email, studentEmail, uid].filter(Boolean) as string[]));
-
-  if (targetKeys.length === 0) {
-    return res.status(400).json({ error: 'Missing student identifier (email or uid)' });
-  }
-
-  // Persist weeklyStudyDaysTarget and weeklyStudyDays if provided
-  if (!db.weeklyStudyDaysTargets) db.weeklyStudyDaysTargets = {};
-  if (!db.weeklyStudyDays) db.weeklyStudyDays = {};
-  targetKeys.forEach((k) => {
-    if (weeklyStudyDaysTarget) db.weeklyStudyDaysTargets[k] = weeklyStudyDaysTarget;
-    if (weeklyStudyDays) db.weeklyStudyDays[k] = weeklyStudyDays;
-  });
-
-  if (resolved.email && db.userProfiles?.[resolved.email]) {
-    if (weeklyStudyDaysTarget) db.userProfiles[resolved.email].weeklyStudyDaysTarget = weeklyStudyDaysTarget;
-    if (weeklyStudyDays) db.userProfiles[resolved.email].weeklyStudyDays = weeklyStudyDays;
-  }
-
-  // 1. Move all currently assigned videos and tracks to consumed history, merging global watched history
-  if (!db.studentWatchedVideos) db.studentWatchedVideos = {};
-  if (!db.studentListenedTracks) db.studentListenedTracks = {};
-
-  const clientWatchedHistory: string[] = Array.isArray(req.body.watchedVideosHistory)
-    ? req.body.watchedVideosHistory
-    : [];
-
-  targetKeys.forEach((k) => {
-    if (!db.studentWatchedVideos[k]) db.studentWatchedVideos[k] = [];
-
-    // Merge global watched history from client Firestore
-    clientWatchedHistory.forEach((id: string) => {
-      const vid = extractServerYouTubeId(id);
-      if (vid && !db.studentWatchedVideos[k].includes(vid)) {
-        db.studentWatchedVideos[k].push(vid);
+  if (authHeader.startsWith('Bearer ')) {
+    const token = authHeader.substring(7).trim();
+    try {
+      const adminAuth = getFirebaseAdminAuth();
+      const decoded = await adminAuth.verifyIdToken(token);
+      if (decoded?.uid) {
+        authenticatedUid = decoded.uid;
+        authenticatedEmail = (decoded.email || '').toLowerCase().trim();
+        tokenVerified = true;
       }
+    } catch (authErr) {
+      return res.status(401).json({
+        error: 'Unauthorized',
+        message: 'Invalid or expired Firebase ID token.',
+      });
+    }
+  }
+
+  // Non-test mode strictly requires valid Firebase authentication
+  const isTestOrDiag = process.env.NODE_ENV === 'test' || isDiagnosticMode() || process.env.ALLOW_MOCK_TEST_AUTH === 'true';
+  if (!tokenVerified && !isTestOrDiag) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Authentication required: Firebase ID token is missing or unverified.',
+    });
+  }
+
+  const rawBodyUid = ((req.body.uid as string) || (req.body.studentUid as string) || '').trim();
+  const rawBodyEmail = ((req.body.studentEmail as string) || (req.body.email as string) || '').toLowerCase().trim();
+
+  // Authoritative identity derivation:
+  // If token is authenticated, authenticatedUid & authenticatedEmail are strictly authoritative
+  const effectiveUid = authenticatedUid || (isTestOrDiag ? rawBodyUid : '');
+  const effectiveEmail = authenticatedEmail || (isTestOrDiag ? rawBodyEmail : '');
+
+  if (!effectiveUid && !effectiveEmail) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Missing valid student credentials' });
+  }
+
+  const expectedCycle = typeof req.body.expectedCycle === 'number' ? req.body.expectedCycle : undefined;
+  const attemptId = typeof req.body.attemptId === 'string' ? req.body.attemptId.trim() : '';
+
+  // Concurrency serialization lock per effective student
+  const lockKey = effectiveUid || effectiveEmail;
+  if (lockKey) {
+    const activeLock = inProcessCycleLocks.get(lockKey);
+    if (activeLock) {
+      try {
+        await activeLock;
+      } catch {}
+    }
+  }
+
+  let releaseCycleLock!: () => void;
+  const lockPromise = new Promise<void>((resolve) => {
+    releaseCycleLock = resolve;
+  });
+  if (lockKey) {
+    inProcessCycleLocks.set(lockKey, lockPromise);
+  }
+
+  try {
+    const db = readDb();
+    if (!db.cycleAttempts) db.cycleAttempts = {};
+
+    const resolved = resolveStudentIdentifiers(db, effectiveEmail, effectiveUid);
+    const targetKeys = Array.from(new Set([resolved.uid, resolved.email, effectiveEmail, effectiveUid].filter(Boolean) as string[]));
+
+    if (targetKeys.length === 0) {
+      return res.status(400).json({ error: 'Missing student identifier (email or uid)' });
+    }
+
+    const rawLevel = (req.body.level as string) || '';
+    const weeklyStudyDaysTarget =
+      typeof req.body.weeklyStudyDaysTarget === 'number' && req.body.weeklyStudyDaysTarget >= 1 && req.body.weeklyStudyDaysTarget <= 7
+        ? req.body.weeklyStudyDaysTarget
+        : undefined;
+    const weeklyStudyDays = Array.isArray(req.body.weeklyStudyDays) ? req.body.weeklyStudyDays : undefined;
+
+    // 2a. Idempotency Check: if exact same attemptId was already confirmed, return cached result immediately without reset
+    const primaryKey = resolved.uid || resolved.email;
+    const cachedAttempt = primaryKey ? db.cycleAttempts[primaryKey] : null;
+    if (attemptId && cachedAttempt && cachedAttempt.attemptId === attemptId && cachedAttempt.result) {
+      return res.status(200).json(cachedAttempt.result);
+    }
+
+    // Determine current persisted cycle (Firestore is authoritative if available)
+    let currentCycle =
+      db.userProfiles?.[resolved.email]?.weeklyCycle ||
+      db.students?.find((s: any) => s.email?.toLowerCase() === resolved.email || (resolved.uid && s.uid === resolved.uid))?.weeklyCycle ||
+      1;
+
+    if (resolved.uid) {
+      const fsStatus = await fetchStudentCycleStatusFromServerFirestore(resolved.uid);
+      if (fsStatus) {
+        currentCycle = fsStatus.currentCycle;
+        if (attemptId && fsStatus.lastCycleAttemptId === attemptId && fsStatus.lastCycleResult) {
+          return res.status(200).json(fsStatus.lastCycleResult);
+        }
+      }
+    }
+
+    // 2b. Cycle conflict detection: expectedCycle vs currentCycle
+    if (expectedCycle !== undefined && currentCycle !== expectedCycle) {
+      return res.status(409).json({
+        error: 'Cycle Conflict',
+        message: `Expected cycle ${expectedCycle} does not match current persisted cycle ${currentCycle}.`,
+        expectedCycle,
+        persistedCycle: currentCycle,
+        currentCycle,
+        success: false,
+      });
+    }
+
+    const nextCycle = currentCycle + 1;
+
+    // 2c. Multi-instance Firestore Transaction
+    if (resolved.uid) {
+      const txResult = await advanceWeeklyCycleTransactionServer(
+        resolved.uid,
+        expectedCycle,
+        attemptId,
+        nextCycle,
+        {
+          weeklyStudyDaysTarget,
+          weeklyStudyDays,
+        }
+      );
+
+      if (txResult.conflict) {
+        return res.status(409).json({
+          error: 'Cycle Conflict',
+          message: `Expected cycle ${expectedCycle} does not match current persisted cycle ${txResult.persistedCycle}.`,
+          expectedCycle,
+          persistedCycle: txResult.persistedCycle,
+          currentCycle: txResult.persistedCycle,
+          success: false,
+        });
+      }
+
+      if (txResult.isIdempotentReplay && cachedAttempt?.result) {
+        return res.status(200).json(cachedAttempt.result);
+      }
+    }
+
+    // Persist weeklyStudyDaysTarget and weeklyStudyDays if provided
+    if (!db.weeklyStudyDaysTargets) db.weeklyStudyDaysTargets = {};
+    if (!db.weeklyStudyDays) db.weeklyStudyDays = {};
+    targetKeys.forEach((k) => {
+      if (weeklyStudyDaysTarget) db.weeklyStudyDaysTargets[k] = weeklyStudyDaysTarget;
+      if (weeklyStudyDays) db.weeklyStudyDays[k] = weeklyStudyDays;
     });
 
-    const existingVideos = db.studentVideoAssignments?.[k] || [];
-    if (Array.isArray(existingVideos)) {
-      existingVideos.forEach((v: any) => {
-        const vid = extractServerYouTubeId(v.videoId || v.videoUrl);
+    if (resolved.email && db.userProfiles?.[resolved.email]) {
+      if (weeklyStudyDaysTarget) db.userProfiles[resolved.email].weeklyStudyDaysTarget = weeklyStudyDaysTarget;
+      if (weeklyStudyDays) db.userProfiles[resolved.email].weeklyStudyDays = weeklyStudyDays;
+      db.userProfiles[resolved.email].weeklyCycle = nextCycle;
+    }
+
+    if (db.students) {
+      db.students = db.students.map((s: any) => {
+        if (s.email?.toLowerCase() === resolved.email || (resolved.uid && s.uid === resolved.uid)) {
+          return {
+            ...s,
+            weeklyCycle: nextCycle,
+            weeklyStudyDaysTarget: weeklyStudyDaysTarget || s.weeklyStudyDaysTarget,
+            weeklyStudyDays: weeklyStudyDays || s.weeklyStudyDays,
+          };
+        }
+        return s;
+      });
+    }
+
+    // 3. Move all currently assigned videos and tracks to consumed history, merging global watched history
+    if (!db.studentWatchedVideos) db.studentWatchedVideos = {};
+    if (!db.studentListenedTracks) db.studentListenedTracks = {};
+
+    const clientWatchedHistory: string[] = Array.isArray(req.body.watchedVideosHistory)
+      ? req.body.watchedVideosHistory
+      : [];
+
+    targetKeys.forEach((k) => {
+      if (!db.studentWatchedVideos[k]) db.studentWatchedVideos[k] = [];
+
+      clientWatchedHistory.forEach((id: string) => {
+        const vid = extractServerYouTubeId(id);
         if (vid && !db.studentWatchedVideos[k].includes(vid)) {
           db.studentWatchedVideos[k].push(vid);
         }
       });
-    }
 
-    const existingTracks = db.studentSpotifyAssignments?.[k] || [];
-    if (Array.isArray(existingTracks)) {
+      const existingVideos = db.studentVideoAssignments?.[k] || [];
+      if (Array.isArray(existingVideos)) {
+        existingVideos.forEach((v: any) => {
+          const vid = extractServerYouTubeId(v.videoId || v.videoUrl);
+          if (vid && !db.studentWatchedVideos[k].includes(vid)) {
+            db.studentWatchedVideos[k].push(vid);
+          }
+        });
+      }
+
+      const existingTracks = db.studentSpotifyAssignments?.[k] || [];
+      if (Array.isArray(existingTracks)) {
+        if (!db.studentListenedTracks[k]) db.studentListenedTracks[k] = [];
+        existingTracks.forEach((t: any) => {
+          const tid = extractSpotifyTrackId(t.trackId || t.url || t.trackUrl);
+          if (tid && !db.studentListenedTracks[k].includes(tid)) {
+            db.studentListenedTracks[k].push(tid);
+          }
+        });
+      }
+
+      if (db.studentVideoAssignments?.[k]) {
+        db.studentVideoAssignments[k] = [];
+      }
+      if (db.studentSpotifyAssignments?.[k]) {
+        db.studentSpotifyAssignments[k] = [];
+      }
+    });
+
+    // Reset weekly activity checks and reset routine completion/repeat flags for the new week
+    if (!db.studentWeeklyChecks) db.studentWeeklyChecks = {};
+    if (!db.studentAwaitingTopicSelection) db.studentAwaitingTopicSelection = {};
+
+    targetKeys.forEach((k) => {
+      db.studentWeeklyChecks[k] = {};
+      db.studentAwaitingTopicSelection[k] = true;
+      db.studentVideoAssignments[k] = [];
+
+      if (db.studentRoutinesMap?.[k]) {
+        Object.keys(db.studentRoutinesMap[k]).forEach((dayKey) => {
+          const dayActs = db.studentRoutinesMap[k][dayKey];
+          if (Array.isArray(dayActs)) {
+            dayActs.forEach((act: any) => {
+              act.learnedWords = [];
+              act.completed = false;
+              act.completedToday = false;
+              act.isRepeatVideo = false;
+              act.repeatVideo = false;
+              const isVideoAct =
+                act.id?.endsWith('1') ||
+                act.activityName?.toLowerCase().includes('vídeo') ||
+                act.activityName?.toLowerCase().includes('video');
+              if (isVideoAct) {
+                act.activityName = 'Video of the Day';
+                act.playlistId = '';
+                act.playlistTitle = '';
+                act.teacherVideos = [];
+              }
+            });
+          }
+        });
+      }
+    });
+
+    // Ingest past listened tracks history
+    const clientListenedHistory: string[] = Array.isArray(req.body.listenedTracksHistory)
+      ? req.body.listenedTracksHistory
+      : [];
+
+    targetKeys.forEach((k) => {
+      if (!db.studentListenedTracks) db.studentListenedTracks = {};
       if (!db.studentListenedTracks[k]) db.studentListenedTracks[k] = [];
-      existingTracks.forEach((t: any) => {
-        const tid = extractSpotifyTrackId(t.trackId || t.url || t.trackUrl);
+      clientListenedHistory.forEach((id: string) => {
+        const tid = extractSpotifyTrackId(id);
         if (tid && !db.studentListenedTracks[k].includes(tid)) {
           db.studentListenedTracks[k].push(tid);
         }
       });
-    }
-
-    // Clear current assignments so fresh generation is applied
-    if (db.studentVideoAssignments?.[k]) {
-      db.studentVideoAssignments[k] = [];
-    }
-    if (db.studentSpotifyAssignments?.[k]) {
-      db.studentSpotifyAssignments[k] = [];
-    }
-  });
-
-  // 2. Advance student weekly cycle count
-  const currentCycle =
-    db.userProfiles?.[resolved.email]?.weeklyCycle ||
-    db.students?.find((s: any) => s.email?.toLowerCase() === resolved.email || (resolved.uid && s.uid === resolved.uid))?.weeklyCycle ||
-    1;
-  const nextCycle = currentCycle + 1;
-
-  if (resolved.email && db.userProfiles?.[resolved.email]) {
-    db.userProfiles[resolved.email].weeklyCycle = nextCycle;
-  }
-  if (db.students) {
-    db.students = db.students.map((s: any) => {
-      if (s.email?.toLowerCase() === resolved.email || (resolved.uid && s.uid === resolved.uid)) {
-        return {
-          ...s,
-          weeklyCycle: nextCycle,
-          weeklyStudyDaysTarget: weeklyStudyDaysTarget || s.weeklyStudyDaysTarget,
-          weeklyStudyDays: weeklyStudyDays || s.weeklyStudyDays,
-        };
-      }
-      return s;
-    });
-  }
-
-  // 3. Reset weekly activity checks and reset routine completion/repeat flags for the new week
-  if (!db.studentWeeklyChecks) db.studentWeeklyChecks = {};
-  if (!db.studentAwaitingTopicSelection) db.studentAwaitingTopicSelection = {};
-
-  targetKeys.forEach((k) => {
-    db.studentWeeklyChecks[k] = {};
-    db.studentAwaitingTopicSelection[k] = true;
-    db.studentVideoAssignments[k] = [];
-
-    if (db.studentRoutinesMap?.[k]) {
-      Object.keys(db.studentRoutinesMap[k]).forEach((dayKey) => {
-        const dayActs = db.studentRoutinesMap[k][dayKey];
-        if (Array.isArray(dayActs)) {
-          dayActs.forEach((act: any) => {
-            act.learnedWords = [];
-            act.completed = false;
-            act.completedToday = false;
-            act.isRepeatVideo = false;
-            act.repeatVideo = false;
-            const isVideoAct =
-              act.id?.endsWith('1') ||
-              act.activityName?.toLowerCase().includes('vídeo') ||
-              act.activityName?.toLowerCase().includes('video');
-            if (isVideoAct) {
-              act.activityName = 'Video of the Day';
-              act.playlistId = '';
-              act.playlistTitle = '';
-              act.teacherVideos = [];
-            }
-          });
-        }
-      });
-    }
-  });
-
-  // Reset global default routines completion and repeat flags
-  if (db.routinesByDay) {
-    Object.keys(db.routinesByDay).forEach((dayKey) => {
-      const dayActs = db.routinesByDay[dayKey];
-      if (Array.isArray(dayActs)) {
-        dayActs.forEach((act: any) => {
-          act.learnedWords = [];
-          act.completed = false;
-          act.completedToday = false;
-          act.isRepeatVideo = false;
-          act.repeatVideo = false;
-        });
-      }
-    });
-  }
-
-  // 4. Ingest past listened tracks history from client to guarantee anti-repetition exclusivity
-  const clientListenedHistory: string[] = Array.isArray(req.body.listenedTracksHistory)
-    ? req.body.listenedTracksHistory
-    : [];
-
-  targetKeys.forEach((k) => {
-    if (!db.studentListenedTracks) db.studentListenedTracks = {};
-    if (!db.studentListenedTracks[k]) db.studentListenedTracks[k] = [];
-    clientListenedHistory.forEach((id: string) => {
-      const tid = extractSpotifyTrackId(id);
-      if (tid && !db.studentListenedTracks[k].includes(tid)) {
-        db.studentListenedTracks[k].push(tid);
-      }
-    });
-  });
-
-  // Distribute new weekly Spotify tracks with guaranteed anti-repetition.
-  const studentLevel = normalizeStudentLevel(rawLevel || resolveStudentLevel(db, resolved.email, resolved.uid)).key;
-  const weeklyStudyDaysList: DayOfWeek[] | undefined = Array.isArray(req.body.weeklyStudyDays)
-    ? req.body.weeklyStudyDays
-    : undefined;
-  const newTracks = distributeWeeklySpotifyForStudent(
-    db,
-    resolved.email,
-    resolved.uid,
-    studentLevel,
-    undefined,
-    undefined,
-    weeklyStudyDaysList
-  );
-
-  // 5. Ingest new client-assigned videos or distribute fresh unseen videos sequentially
-  const clientAssignedVideos: any[] = Array.isArray(req.body.newAssignedVideos)
-    ? req.body.newAssignedVideos
-    : [];
-
-  let newVideos: any[] = [];
-  if (clientAssignedVideos.length > 0) {
-    newVideos = clientAssignedVideos.map((v: any, idx: number) => {
-      const vidId = extractServerYouTubeId(v.videoId || v.url) || v.videoId;
-      return {
-        id: `assign-${v.day}-${Date.now()}-${idx}`,
-        activityId: `act-${v.day}-1`,
-        studentEmail: resolved.email,
-        studentUid: resolved.uid,
-        day: v.day,
-        playlistId: v.playlistId,
-        playlistTitle: v.playlistTitle,
-        videoId: vidId,
-        title: v.videoTitle || v.title || 'Daily Video Practice',
-        videoTitle: v.videoTitle || v.title || 'Daily Video Practice',
-        videoUrl: v.url || `https://www.youtube.com/watch?v=${vidId}`,
-        embedUrl: `https://www.youtube-nocookie.com/embed/${vidId}?rel=0&modestbranding=1&enablejsapi=1`,
-        assignedAt: new Date().toISOString(),
-        duration: v.duration || '6-10 min',
-        instructions: v.instructions || 'Daily Video Practice',
-      };
     });
 
-    targetKeys.forEach((k) => {
-      db.studentVideoAssignments[k] = newVideos;
-      if (!db.studentRoutinesMap[k]) {
-        db.studentRoutinesMap[k] = JSON.parse(JSON.stringify(db.routinesByDay || defaultRoutinesByDay));
-      }
-      newVideos.forEach((v: any) => {
-        const d = v.day;
-        if (d && db.studentRoutinesMap[k][d]) {
-          db.studentRoutinesMap[k][d] = db.studentRoutinesMap[k][d].map((act: any) => {
-            const isVideoAct =
-              act.id?.endsWith('1') ||
-              act.activityName?.toLowerCase().includes('vídeo') ||
-              act.activityName?.toLowerCase().includes('video') ||
-              (act.teacherVideos && act.teacherVideos.length > 0);
-            if (isVideoAct) {
-              return {
-                ...act,
-                activityName: v.playlistTitle || act.activityName || 'Daily Video Practice',
-                teacherVideos: [
-                  {
-                    id: `vid-${d}-${v.videoId}`,
-                    videoId: v.videoId,
-                    title: v.videoTitle || v.title || 'Daily Video Practice',
-                    videoTitle: v.videoTitle || v.title || 'Daily Video Practice',
-                    url: v.videoUrl,
-                    duration: v.duration || '6-10 min',
-                    playlistId: v.playlistId,
-                    playlistTitle: v.playlistTitle,
-                  },
-                ],
-                isRepeatVideo: false,
-                repeatVideo: false,
-                completed: false,
-                completedToday: false,
-              };
-            }
-            return act;
-          });
-        }
-      });
-    });
-  } else if (!req.body.resetTopicsToChooseTopic && req.body.autoAssignVideos) {
-    newVideos = distributeWeeklyYouTubeForStudent(
+    // Distribute Spotify tracks for new week
+    const studentLevel = normalizeStudentLevel(rawLevel || resolveStudentLevel(db, resolved.email, resolved.uid)).key;
+    const weeklyStudyDaysList: DayOfWeek[] | undefined = Array.isArray(req.body.weeklyStudyDays)
+      ? req.body.weeklyStudyDays
+      : undefined;
+    const newTracks = distributeWeeklySpotifyForStudent(
       db,
       resolved.email,
       resolved.uid,
       studentLevel,
       undefined,
       undefined,
-      weeklyStudyDays,
-      clientWatchedHistory
+      weeklyStudyDaysList
     );
-  } else {
-    // Default for starting a new week: all days start clean with "Choose a Topic"
-    newVideos = [];
+
+    let newVideos: any[] = [];
+    writeDb(db);
+
+    const rawRoutines =
+      (resolved.uid && db.studentRoutinesMap?.[resolved.uid]) ||
+      (resolved.email && db.studentRoutinesMap?.[resolved.email]) ||
+      db.routinesByDay ||
+      defaultRoutinesByDay;
+
+    const routines: any = {};
+    Object.keys(rawRoutines).forEach((d) => {
+      routines[d] = (rawRoutines[d] || []).map((act: any) => {
+        const isVideoAct =
+          act.id?.endsWith('1') ||
+          act.activityName?.toLowerCase().includes('vídeo') ||
+          act.activityName?.toLowerCase().includes('video') ||
+          (act.teacherVideos && act.teacherVideos.length > 0);
+        const shouldResetVideo = isVideoAct && (!req.body.autoAssignVideos || req.body.resetTopicsToChooseTopic);
+        return {
+          ...act,
+          learnedWords: [],
+          completed: false,
+          completedToday: false,
+          isRepeatVideo: false,
+          repeatVideo: false,
+          ...(shouldResetVideo ? {
+            activityName: 'Video of the Day',
+            playlistId: '',
+            playlistTitle: '',
+            teacherVideos: [],
+          } : {}),
+        };
+      });
+    });
+
+    // 5. Cloud Firestore synchronization linked to UID
+    if (resolved.uid) {
+      try {
+        await resetDailyRoutinesForNewWeekInFirestoreServer(resolved.uid, nextCycle);
+        const watched = db.studentWatchedVideos[resolved.uid] || [];
+        for (const vidId of watched) {
+          await addWatchedVideoToUserDoc(resolved.uid, vidId);
+        }
+
+        await saveStudentAssignmentsByUid(resolved.uid, {
+          uid: resolved.uid,
+          email: resolved.email,
+          level: studentLevel,
+          weeklyCycle: nextCycle,
+          weeklyStudyDaysTarget: weeklyStudyDaysTarget || db.weeklyStudyDaysTargets?.[resolved.uid] || 7,
+          weeklyStudyDays: weeklyStudyDays || db.weeklyStudyDays?.[resolved.uid] || [],
+          videoAssignments: newVideos,
+          spotifyAssignments: newTracks,
+          routines,
+          watchedVideos: db.studentWatchedVideos[resolved.uid] || [],
+          listenedTracks: db.studentListenedTracks[resolved.uid] || [],
+          updatedAt: new Date().toISOString(),
+        });
+      } catch (e) {
+        console.warn('Firestore sync notice for start-new-week:', e);
+      }
+    }
+    saveAppStateToFirestore(db).catch(() => {});
+
+    const confirmedResult = {
+      success: true,
+      weeklyCycle: nextCycle,
+      weeklyStudyDaysTarget: weeklyStudyDaysTarget || db.weeklyStudyDaysTargets?.[resolved.email] || 7,
+      weeklyStudyDays: weeklyStudyDays || db.weeklyStudyDays?.[resolved.email] || [],
+      message: 'New weekly cycle activated successfully',
+      routines,
+      videoAssignments: newVideos,
+      spotifyAssignments: newTracks,
+      attemptId: attemptId || undefined,
+    };
+
+    if (attemptId && primaryKey) {
+      db.cycleAttempts[primaryKey] = { attemptId, result: confirmedResult };
+      if (resolved.uid) {
+        saveLastCycleResultToFirestore(resolved.uid, attemptId, confirmedResult).catch(() => {});
+      }
+    }
+
+    return res.json(confirmedResult);
+  } finally {
+    if (lockKey && inProcessCycleLocks.get(lockKey) === lockPromise) {
+      inProcessCycleLocks.delete(lockKey);
+    }
+    if (releaseCycleLock) releaseCycleLock();
+  }
+});
+
+// HOTFIX 2.3.5E: Recovery endpoint to verify current cycle and attempt status
+app.get(['/api/student-routines/cycle-status', '/api/student-routines/start-new-week'], async (req, res) => {
+  let callerUid = '';
+  let callerEmail = '';
+  const authHeader = req.headers.authorization || '';
+  if (authHeader.startsWith('Bearer ')) {
+    const token = authHeader.substring(7).trim();
+    try {
+      const adminAuth = getFirebaseAdminAuth();
+      const decoded = await adminAuth.verifyIdToken(token);
+      if (decoded?.uid) {
+        callerUid = decoded.uid;
+        callerEmail = (decoded.email || '').toLowerCase().trim();
+      }
+    } catch {}
   }
 
-  writeDb(db);
+  const db = readDb();
+  const queryUid = ((req.query.studentUid as string) || (req.query.uid as string) || '').trim();
+  const queryEmail = ((req.query.studentEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
+  const attemptId = ((req.query.attemptId as string) || '').trim();
+
+  const effectiveUid = callerUid || queryUid;
+  const effectiveEmail = callerEmail || queryEmail;
+
+  const resolved = resolveStudentIdentifiers(db, effectiveEmail, effectiveUid);
+  if (!resolved.uid && !resolved.email) {
+    return res.status(400).json({ error: 'Missing student identifier' });
+  }
+
+  let currentCycle =
+    db.userProfiles?.[resolved.email]?.weeklyCycle ||
+    db.students?.find((s: any) => s.email?.toLowerCase() === resolved.email || (resolved.uid && s.uid === resolved.uid))?.weeklyCycle ||
+    1;
+
+  let lastCycleAttemptId =
+    (resolved.uid && db.cycleAttempts?.[resolved.uid]?.attemptId) ||
+    (resolved.email && db.cycleAttempts?.[resolved.email]?.attemptId) ||
+    '';
+  let lastCycleResult =
+    (resolved.uid && db.cycleAttempts?.[resolved.uid]?.result) ||
+    (resolved.email && db.cycleAttempts?.[resolved.email]?.result) ||
+    null;
+
+  if (resolved.uid) {
+    const fsStatus = await fetchStudentCycleStatusFromServerFirestore(resolved.uid);
+    if (fsStatus) {
+      currentCycle = fsStatus.currentCycle;
+      if (fsStatus.lastCycleAttemptId) lastCycleAttemptId = fsStatus.lastCycleAttemptId;
+      if (fsStatus.lastCycleResult) lastCycleResult = fsStatus.lastCycleResult;
+    }
+  }
 
   const rawRoutines =
     (resolved.uid && db.studentRoutinesMap?.[resolved.uid]) ||
@@ -6845,70 +7017,24 @@ app.post(['/api/student-routines/start-new-week', '/api/student/reset-week'], as
     db.routinesByDay ||
     defaultRoutinesByDay;
 
-  const routines: any = {};
-  Object.keys(rawRoutines).forEach((d) => {
-    routines[d] = (rawRoutines[d] || []).map((act: any) => {
-      const isVideoAct =
-        act.id?.endsWith('1') ||
-        act.activityName?.toLowerCase().includes('vídeo') ||
-        act.activityName?.toLowerCase().includes('video') ||
-        (act.teacherVideos && act.teacherVideos.length > 0);
-      const shouldResetVideo = isVideoAct && (!req.body.autoAssignVideos || req.body.resetTopicsToChooseTopic);
-      return {
-        ...act,
-        learnedWords: [],
-        completed: false,
-        completedToday: false,
-        isRepeatVideo: false,
-        repeatVideo: false,
-        ...(shouldResetVideo ? {
-          activityName: 'Video of the Day',
-          playlistId: '',
-          playlistTitle: '',
-          teacherVideos: [],
-        } : {}),
-      };
-    });
-  });
-
-  // 5. Cloud Firestore synchronization linked to UID
-  if (resolved.uid) {
-    try {
-      await resetDailyRoutinesForNewWeekInFirestoreServer(resolved.uid, nextCycle);
-      const watched = db.studentWatchedVideos[resolved.uid] || [];
-      for (const vidId of watched) {
-        await addWatchedVideoToUserDoc(resolved.uid, vidId);
-      }
-
-      await saveStudentAssignmentsByUid(resolved.uid, {
-        uid: resolved.uid,
-        email: resolved.email,
-        level: studentLevel,
-        weeklyCycle: nextCycle,
-        weeklyStudyDaysTarget: weeklyStudyDaysTarget || db.weeklyStudyDaysTargets?.[resolved.uid] || 7,
-        weeklyStudyDays: weeklyStudyDays || db.weeklyStudyDays?.[resolved.uid] || [],
-        videoAssignments: newVideos,
-        spotifyAssignments: newTracks,
-        routines,
-        watchedVideos: db.studentWatchedVideos[resolved.uid] || [],
-        listenedTracks: db.studentListenedTracks[resolved.uid] || [],
-        updatedAt: new Date().toISOString(),
-      });
-    } catch (e) {
-      console.warn('Firestore sync notice for start-new-week:', e);
-    }
-  }
-  saveAppStateToFirestore(db).catch(() => {});
-
-  res.json({
+  return res.json({
     success: true,
-    weeklyCycle: nextCycle,
-    weeklyStudyDaysTarget: weeklyStudyDaysTarget || db.weeklyStudyDaysTargets?.[resolved.email] || 7,
-    weeklyStudyDays: weeklyStudyDays || db.weeklyStudyDays?.[resolved.email] || [],
-    message: 'New weekly cycle activated successfully',
-    routines,
-    videoAssignments: newVideos,
-    spotifyAssignments: newTracks,
+    studentUid: resolved.uid,
+    studentEmail: resolved.email,
+    currentCycle,
+    weeklyCycle: currentCycle,
+    lastCycleAttemptId,
+    attemptConfirmed: attemptId ? lastCycleAttemptId === attemptId : undefined,
+    lastCycleResult,
+    routines: rawRoutines,
+    weeklyStudyDaysTarget:
+      (resolved.uid && db.weeklyStudyDaysTargets?.[resolved.uid]) ||
+      (resolved.email && db.weeklyStudyDaysTargets?.[resolved.email]) ||
+      7,
+    weeklyStudyDays:
+      (resolved.uid && db.weeklyStudyDays?.[resolved.uid]) ||
+      (resolved.email && db.weeklyStudyDays?.[resolved.email]) ||
+      [],
   });
 });
 

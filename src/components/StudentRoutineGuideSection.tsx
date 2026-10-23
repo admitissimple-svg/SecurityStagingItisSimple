@@ -986,8 +986,8 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
 
   const activeNativeFriendFeedback = teacherFeedback?.[selectedDay];
 
-  // Automatic behavioral trackers for Daily Video and Spotify Audio
-  const isVideoWatchedToday = Boolean(weeklyChecks?.[`video_day_${selectedDay}`]);
+  // HOTFIX 2.3.5E: The Watched status strictly requires a valid video associated with the day and cycle
+  const isVideoWatchedToday = Boolean(validVidId) && Boolean(weeklyChecks?.[`video_day_${selectedDay}`]);
   const isAudioListenedToday = Boolean(weeklyChecks?.[`audio_day_${selectedDay}`]);
 
   const handleVideoCompleted = useCallback((vid: string, tit?: string) => {
@@ -2420,7 +2420,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
               </h3>
             </div>
             <div className="flex items-center gap-2 shrink-0">
-              {isVideoWatchedToday && (
+              {isVideoWatchedToday && Boolean(validVidId) && (
                 <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-[11px] font-extrabold bg-emerald-500/15 border border-emerald-500/40 text-emerald-800 shadow-2xs">
                   <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
                   <span>{isEn ? 'Watched' : 'Assistido'}</span>

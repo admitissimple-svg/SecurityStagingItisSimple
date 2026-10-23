@@ -50,7 +50,7 @@ const ALL_DAYS_OF_WEEK: DayOfWeek[] = [
 /**
  * Retrieves client authentication headers with Firebase ID token if authenticated.
  */
-async function getAuthHeaders(): Promise<Record<string, string>> {
+export async function getAuthHeaders(): Promise<Record<string, string>> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'Accept': 'application/json',

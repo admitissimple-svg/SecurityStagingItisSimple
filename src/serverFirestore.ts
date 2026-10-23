@@ -5177,3 +5177,147 @@ export async function getStudentActivitiesBetweenLessonsServer(
   };
 }
 
+/**
+ * HOTFIX 2.3.5E: Transactional Cycle Conflict Error
+ */
+export class CycleConflictError extends Error {
+  public actualCycle: number;
+  public expectedCycle?: number;
+  constructor(actualCycle: number, expectedCycle?: number, message?: string) {
+    super(
+      message ||
+        `Cycle conflict: expected cycle ${expectedCycle !== undefined ? expectedCycle : 'unknown'} does not match persisted cycle ${actualCycle}`
+    );
+    this.name = 'CycleConflictError';
+    this.actualCycle = actualCycle;
+    this.expectedCycle = expectedCycle;
+  }
+}
+
+export interface CycleStatusRecord {
+  currentCycle: number;
+  lastCycleAttemptId?: string;
+  lastCycleResult?: any;
+  updatedAt?: string;
+}
+
+/**
+ * HOTFIX 2.3.5E: Fetches current persisted cycle and last confirmed attempt from Firestore
+ */
+export async function fetchStudentCycleStatusFromServerFirestore(
+  studentUid: string
+): Promise<CycleStatusRecord | null> {
+  const db = getFirestoreDb();
+  if (!db || !studentUid) return null;
+  try {
+    const userDoc = await db.collection('users').doc(studentUid).get();
+    if (!userDoc.exists) return null;
+    const d = userDoc.data();
+    return {
+      currentCycle: typeof d?.weeklyCycle === 'number' && d.weeklyCycle > 0 ? d.weeklyCycle : 1,
+      lastCycleAttemptId: d?.lastCycleAttemptId,
+      lastCycleResult: d?.lastCycleResult,
+      updatedAt: d?.updatedAt,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * HOTFIX 2.3.5E: Persists the confirmed cycle advance result on users/{studentUID}
+ */
+export async function saveLastCycleResultToFirestore(
+  studentUid: string,
+  attemptId: string,
+  result: any
+): Promise<void> {
+  const db = getFirestoreDb();
+  if (!db || !studentUid || getIsCloudWriteDisabled()) return;
+  try {
+    await db.collection('users').doc(studentUid).set(
+      {
+        lastCycleAttemptId: attemptId,
+        lastCycleResult: result,
+        updatedAt: new Date().toISOString(),
+      },
+      { merge: true }
+    );
+  } catch {}
+}
+
+/**
+ * HOTFIX 2.3.5E: Atomically validates and commits weeklyCycle advance in Firestore using runTransaction.
+ * Guarantees cross-instance protection against duplicate or concurrent cycle increments.
+ */
+export async function advanceWeeklyCycleTransactionServer(
+  studentUid: string,
+  expectedCycle: number | undefined,
+  attemptId: string | undefined,
+  newCycle: number,
+  metadata?: {
+    weeklyStudyDaysTarget?: number;
+    weeklyStudyDays?: string[];
+  }
+): Promise<{
+  success: boolean;
+  persistedCycle: number;
+  isIdempotentReplay?: boolean;
+  conflict?: boolean;
+}> {
+  const db = getFirestoreDb();
+  if (!db || !studentUid || getIsCloudWriteDisabled()) {
+    return { success: true, persistedCycle: newCycle };
+  }
+
+  try {
+    const userRef = db.collection('users').doc(studentUid);
+    const result = await db.runTransaction(async (transaction) => {
+      const userSnap = await transaction.get(userRef);
+      const fsData = userSnap.data() || {};
+      const persistedCycle =
+        typeof fsData.weeklyCycle === 'number' && fsData.weeklyCycle > 0
+          ? fsData.weeklyCycle
+          : 1;
+
+      // 1. Idempotency check: if lastCycleAttemptId matches attemptId, this attempt already completed
+      if (attemptId && fsData.lastCycleAttemptId === attemptId) {
+        return { success: true, persistedCycle, isIdempotentReplay: true };
+      }
+
+      // 2. Conflict check: if expectedCycle is provided and differs from persistedCycle
+      if (expectedCycle !== undefined && persistedCycle !== expectedCycle) {
+        throw new CycleConflictError(persistedCycle, expectedCycle);
+      }
+
+      // 3. Atomically write updated cycle and attemptId
+      const nowIso = new Date().toISOString();
+      transaction.set(
+        userRef,
+        {
+          weeklyCycle: newCycle,
+          lastCycleAttemptId: attemptId || null,
+          weeklyStudyDaysTarget: metadata?.weeklyStudyDaysTarget || fsData.weeklyStudyDaysTarget || 7,
+          weeklyStudyDays: metadata?.weeklyStudyDays || fsData.weeklyStudyDays || [],
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+
+      return { success: true, persistedCycle: newCycle };
+    });
+
+    return result;
+  } catch (err: any) {
+    if (err instanceof CycleConflictError) {
+      return { success: false, conflict: true, persistedCycle: err.actualCycle };
+    }
+    if (isPermissionError(err)) {
+      setIsCloudWriteDisabled(true);
+      return { success: true, persistedCycle: newCycle };
+    }
+    console.warn('[serverFirestore] advanceWeeklyCycleTransactionServer notice:', err);
+    return { success: true, persistedCycle: newCycle };
+  }
+}
+

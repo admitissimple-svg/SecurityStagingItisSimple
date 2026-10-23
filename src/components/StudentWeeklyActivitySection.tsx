@@ -489,7 +489,9 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
           const isMemo = entry.type === 'memorization' || (entry as any).type === 'homework';
           if (!isMemo) return false;
           if (entry.dayOfWeek && entry.dayOfWeek.toLowerCase() === dayKey.toLowerCase()) {
-            if (entry.week === undefined || entry.week === activeWeekCycle || Number(entry.week) === activeWeekCycle) return true;
+            const entryWeek = entry.week !== undefined && entry.week !== null ? Number(entry.week) : null;
+            if (entryWeek !== null) return entryWeek === activeWeekCycle;
+            return activeWeekCycle === 1;
           }
           return false;
         });
@@ -531,6 +533,10 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
             actName.includes('áudio') ||
             actName.includes('podcast');
           if (isDedicatedVideo && !isDedicatedAudio) {
+            const hasValidVideo =
+              (act.teacherVideos && act.teacherVideos.length > 0 && Boolean(act.teacherVideos[0]?.videoId)) ||
+              Boolean((act as any).videoId);
+            if (!hasValidVideo) return false;
             return Boolean(act.completedToday || act.completed);
           }
           return false;
@@ -545,9 +551,9 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
 
           // Strictly match the scheduled day for this routine item and active week
           if (entry.dayOfWeek && entry.dayOfWeek.toLowerCase() === dayKey.toLowerCase()) {
-            if (entry.week === undefined || entry.week === activeWeekCycle || Number(entry.week) === activeWeekCycle) {
-              return true;
-            }
+            const entryWeek = entry.week !== undefined && entry.week !== null ? Number(entry.week) : null;
+            if (entryWeek !== null) return entryWeek === activeWeekCycle;
+            return activeWeekCycle === 1;
           }
           return false;
         });
@@ -599,7 +605,9 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
           const isAudio = entry.type === 'audio' || (entry as any).type === 'audio_day';
           if (!isAudio) return false;
           if (entry.dayOfWeek && entry.dayOfWeek.toLowerCase() === dayKey.toLowerCase()) {
-            if (entry.week === undefined || entry.week === activeWeekCycle || Number(entry.week) === activeWeekCycle) return true;
+            const entryWeek = entry.week !== undefined && entry.week !== null ? Number(entry.week) : null;
+            if (entryWeek !== null) return entryWeek === activeWeekCycle;
+            return activeWeekCycle === 1;
           }
           return false;
         });
@@ -620,7 +628,9 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
           const isLesson = entry.type === 'lesson' || (entry as any).type === 'tutor_live';
           if (!isLesson) return false;
           if (entry.dayOfWeek && entry.dayOfWeek.toLowerCase() === dayKey.toLowerCase()) {
-            if (entry.week === undefined || entry.week === activeWeekCycle || Number(entry.week) === activeWeekCycle) return true;
+            const entryWeek = entry.week !== undefined && entry.week !== null ? Number(entry.week) : null;
+            if (entryWeek !== null) return entryWeek === activeWeekCycle;
+            return activeWeekCycle === 1;
           }
           return false;
         });

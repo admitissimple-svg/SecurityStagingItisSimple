@@ -4,7 +4,7 @@ import {
   addMultipleVideosToWatchedHistoryInFirestore,
   fetchAllRoutineVideosFromFirestore,
   resetRepeatFlagsInFirestore,
-  resetDailyRoutinesForNewWeekInFirestore,
+  getAuthHeaders,
 } from '../hooks/useRoutine';
 import { normalizeStudentIdForPath, withFirestoreTimeout } from '../utils/routineSync';
 import { extractYouTubeVideoId } from '../utils/youtube';
@@ -325,32 +325,33 @@ export async function executeStartNewWeek(
       }
     }
 
-    // Step 3: COMPLETELY RESET DAILY ROUTINES IN FIRESTORE TO "CHOOSE A TOPIC"
-    // Every day of the new week must start clean: no pre-assigned video, no locked playlist
-    if (cleanUid) {
-      try {
-        await withFirestoreTimeout(
-          resetDailyRoutinesForNewWeekInFirestore(cleanUid, ALL_DAYS),
-          2500,
-          false
-        );
-      } catch (err) {
-        console.warn('Notice resetting daily routines in Firestore for new week:', err);
-      }
-    }
+    // HOTFIX 2.3.5E: Removed redundant client call to resetDailyRoutinesForNewWeekInFirestore.
+    // The backend POST /api/student-routines/start-new-week executes the atomic reset and advances the cycle.
 
-    // Step 4: Call backend reset endpoint with resetTopicsToChooseTopic: true and full media exclusivity
+    // Step 3 & 4: Call backend reset endpoint with authentication, expectedCycle, attemptId, and full media exclusivity
     const normLevel = normalizeStudentLevel(params.studentLevel || 'intermediate');
+    const expectedCycle = params.currentCycle || 1;
+    const attemptId = `start_week_${cleanUid || 'student'}_cycle${expectedCycle}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+
+    let authHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+    try {
+      const routineHeaders = await getAuthHeaders();
+      authHeaders = { ...authHeaders, ...routineHeaders };
+    } catch {}
 
     let data: any = null;
+    let requestTimedOutOrErrored = false;
+
     try {
       const fetchPromise = fetch('/api/student-routines/start-new-week', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify({
           studentEmail: !isPlaceholder ? studentEmail : '',
           uid: cleanUid,
           studentUid: cleanUid,
+          expectedCycle,
+          attemptId,
           weeklyStudyDaysTarget: targetDays,
           weeklyStudyDays: chosenDays,
           watchedVideosHistory: Array.from(accumulatedWatchedSet),
@@ -360,30 +361,115 @@ export async function executeStartNewWeek(
         }),
       });
 
-      const res = await withFirestoreTimeout(fetchPromise, 4500, null as any);
-      if (res && res.ok) {
-        data = await res.json();
+      const res = await withFirestoreTimeout(fetchPromise, 6000, null as any);
+
+      if (res) {
+        if (res.status === 409) {
+          const conflictData = await res.json().catch(() => ({}));
+          console.warn('Start a New Week cycle conflict returned by server:', conflictData);
+          return {
+            success: false,
+            weeklyCycle: conflictData.persistedCycle || conflictData.currentCycle || expectedCycle,
+            weeklyStudyDaysTarget: targetDays,
+            weeklyStudyDays: chosenDays,
+            routines: params.currentRoutines || ({} as any),
+            message: conflictData.message || 'Cycle conflict: the current cycle diverged. Please refresh the page.',
+          };
+        } else if (res.ok) {
+          data = await res.json();
+        } else {
+          console.error('Backend start-new-week call returned error status:', res.status);
+          const errData = await res.json().catch(() => ({}));
+          return {
+            success: false,
+            weeklyCycle: expectedCycle,
+            weeklyStudyDaysTarget: targetDays,
+            weeklyStudyDays: chosenDays,
+            routines: params.currentRoutines || ({} as any),
+            message: errData.message || `Backend error ${res.status} while starting new week.`,
+          };
+        }
       } else {
-        console.error('Backend start-new-week call returned error status or timed out:', res?.status);
+        requestTimedOutOrErrored = true;
+      }
+    } catch (netErr) {
+      console.warn('Network or timeout notice during start-new-week:', netErr);
+      requestTimedOutOrErrored = true;
+    }
+
+    // HOTFIX 2.3.5E — Requirement 5: Timeout and recovery verification
+    // If the HTTP response did not arrive, avoid treating timeout as definitive failure:
+    // 1. Consult persisted cycle on backend
+    // 2. Check if the attempt was completed
+    // 3. Sync React state with confirmed result
+    // 4. Present success only when completion is proven
+    // 5. If uncertain, block automatic re-attempts
+    if (requestTimedOutOrErrored && !data) {
+      console.warn('Start new week response did not arrive. Performing recovery inquiry with backend...');
+      try {
+        const queryUrl = `/api/student-routines/cycle-status?studentUid=${encodeURIComponent(cleanUid)}&attemptId=${encodeURIComponent(attemptId)}`;
+        const statusRes = await withFirestoreTimeout(
+          fetch(queryUrl, { method: 'GET', headers: authHeaders }),
+          3500,
+          null as any
+        );
+
+        if (statusRes && statusRes.ok) {
+          const statusData = await statusRes.json();
+          const confirmedCycle = statusData.currentCycle || statusData.weeklyCycle;
+          const attemptWasConfirmed = Boolean(statusData.attemptConfirmed || statusData.lastCycleAttemptId === attemptId);
+
+          if (attemptWasConfirmed || confirmedCycle === expectedCycle + 1) {
+            console.info('Recovery confirmed: start-new-week was successfully committed on the server despite HTTP timeout.');
+            data = statusData.lastCycleResult || {
+              weeklyCycle: confirmedCycle,
+              weeklyStudyDaysTarget: statusData.weeklyStudyDaysTarget || targetDays,
+              weeklyStudyDays: statusData.weeklyStudyDays || chosenDays,
+              routines: statusData.routines,
+              message: 'New weekly cycle activated successfully (recovered).',
+            };
+          } else if (confirmedCycle === expectedCycle && !attemptWasConfirmed) {
+            console.warn('Recovery confirmed: advance was NOT executed before failure.');
+            return {
+              success: false,
+              weeklyCycle: expectedCycle,
+              weeklyStudyDaysTarget: targetDays,
+              weeklyStudyDays: chosenDays,
+              routines: params.currentRoutines || ({} as any),
+              message: 'Cycle advance was not executed. Please try again.',
+            };
+          } else {
+            console.warn('Recovery returned uncertain status:', statusData);
+            return {
+              success: false,
+              weeklyCycle: confirmedCycle || expectedCycle,
+              weeklyStudyDaysTarget: targetDays,
+              weeklyStudyDays: chosenDays,
+              routines: params.currentRoutines || ({} as any),
+              message: 'Synchronization uncertain. Please check your connection and verify your current cycle.',
+            };
+          }
+        } else {
+          return {
+            success: false,
+            weeklyCycle: expectedCycle,
+            weeklyStudyDaysTarget: targetDays,
+            weeklyStudyDays: chosenDays,
+            routines: params.currentRoutines || ({} as any),
+            message: 'Request timed out and cycle status could not be verified. Please check connection and refresh.',
+          };
+        }
+      } catch (recoveryErr) {
+        console.error('Error during cycle recovery check:', recoveryErr);
         return {
           success: false,
-          weeklyCycle: params.currentCycle || 1,
+          weeklyCycle: expectedCycle,
           weeklyStudyDaysTarget: targetDays,
           weeklyStudyDays: chosenDays,
           routines: params.currentRoutines || ({} as any),
-          message: 'Backend synchronization failed while starting new week.',
+          message: 'Connection timed out and synchronization could not be verified. Please refresh.',
         };
       }
-    } catch (netErr) {
-      console.warn('Notice during backend sync in executeStartNewWeek:', netErr);
-      return {
-        success: false,
-        weeklyCycle: params.currentCycle || 1,
-        weeklyStudyDaysTarget: targetDays,
-        weeklyStudyDays: chosenDays,
-        routines: params.currentRoutines || ({} as any),
-        message: 'Network error communicating with backend.',
-      };
     }
 
     // Step 5: Construct clean, sanitized routines:
