@@ -440,6 +440,35 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     }
     return [];
   }, [activeDayPassage?.questions, homework?.readingPassage?.questions]);
+  const safeMatchingPairs = useMemo(() => {
+    if (Array.isArray(activeDayActivity?.matchingPairs) && activeDayActivity.matchingPairs.length > 0) {
+      return activeDayActivity.matchingPairs;
+    }
+    if (Array.isArray(homework?.matchingPairs) && homework.matchingPairs.length > 0) {
+      return homework.matchingPairs;
+    }
+    return [];
+  }, [activeDayActivity?.matchingPairs, homework?.matchingPairs]);
+
+  const safeFillInBlanks = useMemo(() => {
+    if (Array.isArray(activeDayActivity?.fillInBlanks) && activeDayActivity.fillInBlanks.length > 0) {
+      return activeDayActivity.fillInBlanks;
+    }
+    if (Array.isArray(homework?.fillInBlanks) && homework.fillInBlanks.length > 0) {
+      return homework.fillInBlanks;
+    }
+    return [];
+  }, [activeDayActivity?.fillInBlanks, homework?.fillInBlanks]);
+
+  const safeSentenceWritingPrompts = useMemo(() => {
+    if (Array.isArray(activeDayActivity?.sentenceWritingPrompts) && activeDayActivity.sentenceWritingPrompts.length > 0) {
+      return activeDayActivity.sentenceWritingPrompts;
+    }
+    if (Array.isArray(homework?.sentenceWritingPrompts) && homework.sentenceWritingPrompts.length > 0) {
+      return homework.sentenceWritingPrompts;
+    }
+    return [];
+  }, [activeDayActivity?.sentenceWritingPrompts, homework?.sentenceWritingPrompts]);
 
   React.useEffect(() => {
     const dayAnswers =
@@ -755,18 +784,18 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
   // Check if each individual part has all questions answered
   const isMatchingComplete = useMemo(() => {
-    if (!homework.matchingPairs || homework.matchingPairs.length === 0) return false;
-    return homework.matchingPairs.every((pair) => Boolean(matchingAnswers[pair.id]));
-  }, [homework.matchingPairs, matchingAnswers]);
+    if (!safeMatchingPairs || safeMatchingPairs.length === 0) return false;
+    return safeMatchingPairs.every((pair) => Boolean(matchingAnswers[pair.id]));
+  }, [safeMatchingPairs, matchingAnswers]);
 
   const isFillComplete = useMemo(() => {
-    if (!homework.fillInBlanks || homework.fillInBlanks.length === 0) return false;
-    return homework.fillInBlanks.every((item) => Boolean(fillAnswers[item.id]));
-  }, [homework.fillInBlanks, fillAnswers]);
+    if (!safeFillInBlanks || safeFillInBlanks.length === 0) return false;
+    return safeFillInBlanks.every((item) => Boolean(fillAnswers[item.id]));
+  }, [safeFillInBlanks, fillAnswers]);
 
   const isWritingComplete = useMemo(() => {
-    if (!homework.sentenceWritingPrompts || homework.sentenceWritingPrompts.length === 0) return false;
-    return homework.sentenceWritingPrompts.every((p) => {
+    if (!safeSentenceWritingPrompts || safeSentenceWritingPrompts.length === 0) return false;
+    return safeSentenceWritingPrompts.every((p) => {
       const val =
         sentenceAnswers[p.word] ||
         sentenceAnswers[p.word.trim()] ||
@@ -780,7 +809,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       );
       return val.trim().length >= 3 || hasFeedback;
     });
-  }, [homework.sentenceWritingPrompts, sentenceAnswers, sentenceFeedbacks]);
+  }, [safeSentenceWritingPrompts, sentenceAnswers, sentenceFeedbacks]);
 
   const isReadingComplete = useMemo(() => {
     const activePassage = activeDayActivity?.readingPassage || homework.readingPassage;
@@ -913,7 +942,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
   // Dedicated Save Handlers per part
   const handleSavePart1 = async () => {
-    const pairsList = homework.matchingPairs || [];
+    const pairsList = safeMatchingPairs;
     if (!isMatchingComplete) {
       setSubmittedFeedbackToast(
         isEn
@@ -964,7 +993,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
   };
 
   const handleSavePart2 = async () => {
-    const fillList = homework.fillInBlanks || [];
+    const fillList = safeFillInBlanks;
     if (!isFillComplete) {
       setSubmittedFeedbackToast(
         isEn
@@ -1014,7 +1043,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     }
   };
   const handleSavePart3 = async () => {
-    const promptList = homework.sentenceWritingPrompts || [];
+    const promptList = safeSentenceWritingPrompts;
     if (!isWritingComplete) {
       setSubmittedFeedbackToast(
         isEn
@@ -1811,7 +1840,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                     <span className="text-[11px] font-bold text-[#1C4C96] bg-[#9AB4FF]/20 px-2.5 py-1 rounded-full border border-[#9AB4FF]/40 self-start sm:self-auto">
                       {memT.part1.answeredCount(
                         Object.values(matchingAnswers).filter(Boolean).length,
-                        homework.matchingPairs.length
+                        safeMatchingPairs.length
                       )}
                     </span>
                   </div>
@@ -1821,7 +1850,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                     <span className="text-[11px] font-bold text-slate-500 mr-1 uppercase tracking-wide">
                       {memT.part1.wordsBankLabel}
                     </span>
-                    {homework.matchingPairs.map((p) => {
+                    {safeMatchingPairs.map((p) => {
                       const isUsed = Object.values(matchingAnswers).includes(p.word);
                       return (
                         <span
@@ -1840,7 +1869,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
                   {/* Matching list */}
                   <div className="space-y-2">
-                    {homework.matchingPairs.map((item, idx) => {
+                    {safeMatchingPairs.map((item, idx) => {
                       const selectedVal = matchingAnswers[item.id] || '';
                       const isAnswered = Boolean(selectedVal);
                       return (
@@ -1878,7 +1907,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                               className="px-3 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-bold text-[#000035] focus:outline-none focus:ring-1 focus:ring-[#1C4C96] focus:border-[#1C4C96] cursor-pointer"
                             >
                               <option value="">{memT.part1.selectPlaceholder}</option>
-                              {homework.matchingPairs.map((opt) => (
+                              {safeMatchingPairs.map((opt) => (
                                 <option key={opt.id} value={opt.word}>
                                   {opt.word}
                                 </option>
@@ -1902,7 +1931,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                         <span className="text-[11px] text-slate-500 font-medium">
                           {memT.part1.answeredCount(
                             Object.values(matchingAnswers).filter(Boolean).length,
-                            homework.matchingPairs.length
+                            safeMatchingPairs.length
                           )} • {isEn ? 'Answer all to record on S-Path' : 'Responda todas para gravar no S-Path'}
                         </span>
                       )}
@@ -1943,12 +1972,12 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                           {isEn ? 'Part 1: Meaning Association' : 'Parte 1: Associação de Palavras'}
                         </span>
                         <span className="text-[11px] text-slate-500 font-semibold">
-                          {homework.matchingPairs.length} {isEn ? 'items' : 'itens'}
+                          {safeMatchingPairs.length} {isEn ? 'items' : 'itens'}
                         </span>
                       </div>
 
                       <div className="space-y-2">
-                        {homework.matchingPairs.map((pair) => {
+                        {safeMatchingPairs.map((pair) => {
                           const safeKey = pair.word ? pair.word.toLowerCase().replace(/[^a-z0-9]/g, '_') : '';
                           const userAns = matchingAnswers[pair.id] || (safeKey ? matchingAnswers[`match-${safeKey}`] : '') || matchingAnswers[pair.word] || '';
                           const isAnswered = Boolean(userAns.trim());
@@ -2020,13 +2049,13 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                     <span className="text-[11px] font-bold text-[#1C4C96] bg-[#9AB4FF]/20 px-2.5 py-1 rounded-full border border-[#9AB4FF]/40 self-start sm:self-auto">
                       {memT.part2.completedCount(
                         Object.values(fillAnswers).filter(Boolean).length,
-                        homework.fillInBlanks.length
+                        safeFillInBlanks.length
                       )}
                     </span>
                   </div>
 
                   <div className="space-y-3">
-                    {homework.fillInBlanks.map((item, idx) => {
+                    {safeFillInBlanks.map((item, idx) => {
                       const selectedOption = fillAnswers[item.id];
                       return (
                         <div
@@ -2097,7 +2126,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                         <span className="text-[11px] text-slate-500 font-medium">
                           {memT.part2.completedCount(
                             Object.values(fillAnswers).filter(Boolean).length,
-                            homework.fillInBlanks.length
+                            safeFillInBlanks.length
                           )} • {isEn ? 'Answer all to record on S-Path' : 'Responda todas para gravar no S-Path'}
                         </span>
                       )}
@@ -2138,12 +2167,12 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                           {isEn ? 'Part 2: Fill in the Blanks' : 'Parte 2: Lacunas da Rotina'}
                         </span>
                         <span className="text-[11px] text-slate-500 font-semibold">
-                          {homework.fillInBlanks.length} {isEn ? 'items' : 'itens'}
+                          {safeFillInBlanks.length} {isEn ? 'items' : 'itens'}
                         </span>
                       </div>
 
                       <div className="space-y-2">
-                        {homework.fillInBlanks.map((fill) => {
+                        {safeFillInBlanks.map((fill) => {
                           const safeKey = fill.correctWord ? fill.correctWord.toLowerCase().replace(/[^a-z0-9]/g, '_') : '';
                           const userAns = fillAnswers[fill.id] || (safeKey ? fillAnswers[`fill-${safeKey}`] : '') || fillAnswers[fill.correctWord] || '';
                           const isAnswered = Boolean(userAns.trim());
@@ -2216,7 +2245,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                   </div>
 
                   <div className="space-y-3">
-                    {homework.sentenceWritingPrompts.map((prompt, idx) => {
+                    {safeSentenceWritingPrompts.map((prompt, idx) => {
                       const promptWord = prompt.word;
                       const val =
                         sentenceAnswers[promptWord] ??
@@ -2471,7 +2500,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                         </div>
                       ) : (
                         <span className="text-[11px] text-slate-500 font-medium">
-                          {Object.values(sentenceAnswers).filter((s) => (s || '').trim().length >= 3).length} / {homework.sentenceWritingPrompts.length} {isEn ? 'written' : 'escritas'} • {isEn ? 'Write all to record on S-Path' : 'Escreva todas para gravar no S-Path'}
+                          {Object.values(sentenceAnswers).filter((s) => (s || '').trim().length >= 3).length} / {safeSentenceWritingPrompts.length} {isEn ? 'written' : 'escritas'} • {isEn ? 'Write all to record on S-Path' : 'Escreva todas para gravar no S-Path'}
                         </span>
                       )}
                     </div>
@@ -2556,12 +2585,12 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                           {isEn ? 'Part 3: Sentence Writing' : 'Parte 3: Construção de Frases Ativas'}
                         </span>
                         <span className="text-[11px] text-slate-500 font-semibold">
-                          {homework.sentenceWritingPrompts.length} {isEn ? 'sentences' : 'frases'}
+                          {safeSentenceWritingPrompts.length} {isEn ? 'sentences' : 'frases'}
                         </span>
                       </div>
 
                       <div className="space-y-2.5">
-                        {homework.sentenceWritingPrompts.map((prompt) => {
+                        {safeSentenceWritingPrompts.map((prompt) => {
                           const userSentence = (sentenceAnswers[prompt.word] || '').trim();
                           const feedback = sentenceFeedbacks[prompt.word];
                           const evalItem = aiEvaluation?.sentenceFeedback?.find(
@@ -3134,7 +3163,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                         {memT.results.vocabKeyLabel}
                       </span>
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                        {homework.matchingPairs.map((item, idx) => {
+                        {safeMatchingPairs.map((item, idx) => {
                           const actName = wordToActivityMap[item.word.toLowerCase()];
                           return (
                             <div key={idx} className="flex flex-col sm:flex-row sm:items-center justify-between border-b border-slate-200 pb-1.5 pt-1 text-xs gap-1.5">

@@ -1151,10 +1151,21 @@ export function generateWeeklyHomework(
         totalWordsCollected: existing.selectedWords.length,
         vocabularyList: existing.selectedWords,
         allRoutineWords: existing.selectedWords,
-        matchingPairs: existing.matchingPairs || [],
-        fillInBlanks: existing.fillInBlanks || [],
-        sentenceWritingPrompts: existing.sentenceWritingPrompts || [],
-        readingPassage: existing.readingPassage || { title: '', text: '', questions: [] },
+        matchingPairs: Array.isArray(existing.matchingPairs) ? existing.matchingPairs : [],
+        fillInBlanks: Array.isArray(existing.fillInBlanks) ? existing.fillInBlanks : [],
+        sentenceWritingPrompts: Array.isArray(existing.sentenceWritingPrompts) ? existing.sentenceWritingPrompts : [],
+        readingPassage: existing.readingPassage
+          ? {
+              ...existing.readingPassage,
+              questions: Array.isArray(existing.readingPassage.questions)
+                ? existing.readingPassage.questions.map((q: any, qIdx: number) => ({
+                    ...q,
+                    id: q?.id || `q-${qIdx + 1}`,
+                    options: Array.isArray(q?.options) ? q.options : [],
+                  }))
+                : [],
+            }
+          : { title: '', text: '', questions: [] },
         studentAnswers: existing.studentAnswers,
         partsProgress: existing.partsProgress,
         aiEvaluation: existing.aiEvaluation,

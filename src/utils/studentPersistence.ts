@@ -5129,9 +5129,28 @@ export function subscribeToStudentHomeworkProgress(
               // Document is empty, reset, or unanswered: notify subscriber with clean initialized state
               callback(createCleanInitializedHomework(cleanUid, studentEmail, cycle, data));
             } else {
+              const cleanBase = createCleanInitializedHomework(cleanUid, studentEmail, cycle, data);
               callback({
-                ...createCleanInitializedHomework(cleanUid, studentEmail, cycle, data),
+                ...cleanBase,
                 ...data,
+                matchingPairs: Array.isArray(data.matchingPairs) ? data.matchingPairs : cleanBase.matchingPairs,
+                fillInBlanks: Array.isArray(data.fillInBlanks) ? data.fillInBlanks : cleanBase.fillInBlanks,
+                sentenceWritingPrompts: Array.isArray(data.sentenceWritingPrompts) ? data.sentenceWritingPrompts : cleanBase.sentenceWritingPrompts,
+                vocabularyList: Array.isArray(data.vocabularyList) ? data.vocabularyList : cleanBase.vocabularyList,
+                allRoutineWords: Array.isArray(data.allRoutineWords) ? data.allRoutineWords : cleanBase.allRoutineWords,
+                readingPassage: data.readingPassage
+                  ? {
+                      ...cleanBase.readingPassage,
+                      ...data.readingPassage,
+                      questions: Array.isArray(data.readingPassage.questions)
+                        ? data.readingPassage.questions.map((q: any, qIdx: number) => ({
+                            ...q,
+                            id: q?.id || `q-${qIdx + 1}`,
+                            options: Array.isArray(q?.options) ? q.options : [],
+                          }))
+                        : (cleanBase.readingPassage?.questions || []),
+                    }
+                  : cleanBase.readingPassage,
                 weekId: canonicalWeekId,
                 weeklyCycle: cycle,
               } as WeeklyHomeworkData);
