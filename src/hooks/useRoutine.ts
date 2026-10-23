@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { auth } from '../firebase';
 import { DayOfWeek, TeacherOverrideTrack } from '../types';
 import { normalizeStudentIdForPath } from '../utils/routineSync';
@@ -466,15 +466,52 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
   const [isInitialized, setIsInitialized] = useState<boolean>(false);
   const [lastSavedDay, setLastSavedDay] = useState<DayOfWeek | null>(null);
 
+  const activeCycleRef = useRef<number>(activeWeeklyCycle || 1);
+  const fetchVersionRef = useRef<number>(0);
+
   const isRoutineLoading = Boolean(effectiveUid && loadedUid !== effectiveUid) || isLoading;
 
-  useEffect(() => {
-    if (activeWeeklyCycle && activeWeeklyCycle > 0) {
-      setWeeklyCycle(activeWeeklyCycle);
-    }
-  }, [activeWeeklyCycle]);
+  /**
+   * Constructs a pristine clean 7-day routine object with zero selected videos or topics.
+   */
+  const createClean7DayRoutines = useCallback((cycle: number): Partial<Record<DayOfWeek, SavedRoutineVideo>> => {
+    const clean: Partial<Record<DayOfWeek, SavedRoutineVideo>> = {};
+    ALL_DAYS_OF_WEEK.forEach((d) => {
+      clean[d] = {
+        videoId: '',
+        title: '',
+        videoTitle: '',
+        url: '',
+        playlistId: '',
+        playlistTitle: '',
+        isRepeatVideo: false,
+        dayOfWeek: d,
+        activityId: 'act-1',
+        instructions: '',
+        duration: '',
+        completed: false,
+        completedToday: false,
+        weeklyCycle: cycle,
+        updatedAt: new Date().toISOString(),
+      };
+    });
+    return clean;
+  }, []);
 
-  const loadData = useCallback(async (uid: string) => {
+  /**
+   * Synchronously and immediately resets all 7 days in-memory upon cycle advance.
+   * Cancels/invalidates any in-flight requests from the older cycle.
+   */
+  const resetAllDaysImmediately = useCallback((newCycle: number) => {
+    activeCycleRef.current = newCycle;
+    fetchVersionRef.current += 1;
+    const clean = createClean7DayRoutines(newCycle);
+    setRoutinesByDay(clean);
+    setWeeklyCycle(newCycle);
+    return clean;
+  }, [createClean7DayRoutines]);
+
+  const loadData = useCallback(async (uid: string, targetCycle?: number) => {
     if (!uid) {
       setRoutinesByDay({});
       setWatchedHistory([]);
@@ -483,25 +520,69 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
       return;
     }
 
+    const version = ++fetchVersionRef.current;
+    const cycleToFetch = targetCycle || activeCycleRef.current || 1;
+
     setIsLoading(true);
     try {
       const headers = await getAuthHeaders();
-      const res = await fetch(`/api/routines/daily-video?studentUid=${encodeURIComponent(uid)}`, {
+      const res = await fetch(`/api/routines/daily-video?studentUid=${encodeURIComponent(uid)}&weeklyCycle=${encodeURIComponent(cycleToFetch)}`, {
         method: 'GET',
         headers,
       });
 
       if (res.ok) {
+        // Discard stale responses from outdated async calls
+        if (fetchVersionRef.current !== version) {
+          return;
+        }
+
         const data = await res.json();
+
+        // Discard response if server cycle does not match the active cycle
+        if (data.weeklyCycle !== undefined && data.weeklyCycle !== activeCycleRef.current) {
+          return;
+        }
+
         if (data.routinesByDay && typeof data.routinesByDay === 'object') {
-          setRoutinesByDay(data.routinesByDay);
+          // Strictly filter routines to ensure they belong to activeCycleRef.current
+          const filtered: Partial<Record<DayOfWeek, SavedRoutineVideo>> = {};
+          ALL_DAYS_OF_WEEK.forEach((d) => {
+            const item = data.routinesByDay[d];
+            if (item && typeof item === 'object') {
+              const itemCycle = item.weeklyCycle !== undefined ? Number(item.weeklyCycle) : activeCycleRef.current;
+              if (itemCycle === activeCycleRef.current) {
+                filtered[d] = item;
+              } else {
+                filtered[d] = {
+                  videoId: '',
+                  title: '',
+                  videoTitle: '',
+                  url: '',
+                  playlistId: '',
+                  playlistTitle: '',
+                  isRepeatVideo: false,
+                  dayOfWeek: d,
+                  activityId: 'act-1',
+                  instructions: '',
+                  duration: '',
+                  completed: false,
+                  completedToday: false,
+                  weeklyCycle: activeCycleRef.current,
+                  updatedAt: new Date().toISOString(),
+                };
+              }
+            }
+          });
+          setRoutinesByDay(filtered);
         } else {
           setRoutinesByDay({});
         }
+
         if (Array.isArray(data.watchedVideosHistory)) {
           setWatchedHistory(data.watchedVideosHistory);
         }
-        if (typeof data.weeklyCycle === 'number') {
+        if (typeof data.weeklyCycle === 'number' && data.weeklyCycle === activeCycleRef.current) {
           setWeeklyCycle(data.weeklyCycle);
         }
         setLoadedUid(uid);
@@ -509,10 +590,32 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
     } catch (err) {
       console.warn('[useRoutine] Error loading routine data from backend:', err);
     } finally {
-      setIsLoading(false);
-      setIsInitialized(true);
+      if (fetchVersionRef.current === version) {
+        setIsLoading(false);
+        setIsInitialized(true);
+      }
     }
   }, []);
+
+  // React strictly to external activeWeeklyCycle changes (e.g. from Start a New Week)
+  useEffect(() => {
+    if (activeWeeklyCycle && activeWeeklyCycle > 0) {
+      const prev = activeCycleRef.current;
+      activeCycleRef.current = activeWeeklyCycle;
+      setWeeklyCycle(activeWeeklyCycle);
+
+      if (prev !== activeWeeklyCycle) {
+        // Immediate in-memory clean reset of all 7 days for the new weeklyCycle
+        fetchVersionRef.current += 1;
+        const clean = createClean7DayRoutines(activeWeeklyCycle);
+        setRoutinesByDay(clean);
+
+        if (effectiveUid) {
+          loadData(effectiveUid, activeWeeklyCycle);
+        }
+      }
+    }
+  }, [activeWeeklyCycle, effectiveUid, loadData, createClean7DayRoutines]);
 
   useEffect(() => {
     setRoutinesByDay({});
@@ -525,7 +628,7 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
       return;
     }
 
-    loadData(effectiveUid);
+    loadData(effectiveUid, activeCycleRef.current);
   }, [effectiveUid, loadData]);
 
   // Save selected video for a day: updates local React state ONLY after persistence is confirmed
@@ -667,7 +770,8 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
     markVideoAsWatched,
     resetRepeatFlags,
     resetRoutinesForNewWeek,
-    refreshRoutines: () => (effectiveUid ? loadData(effectiveUid) : Promise.resolve()),
+    resetAllDaysImmediately,
+    refreshRoutines: () => (effectiveUid ? loadData(effectiveUid, activeCycleRef.current) : Promise.resolve()),
     selectNextUnwatchedVideo: <T extends { videoId?: string; id?: string; url?: string }>(
       candidates: T[],
       customJournal?: any[]

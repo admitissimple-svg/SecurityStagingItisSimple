@@ -304,6 +304,36 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
   const activeActivity =
     sortedActivities.find((a) => a.id === selectedActivityId) || sortedActivities[0] || null;
 
+  // Sentence of the day State
+  const [sentenceInput, setSentenceInput] = useState<string>('');
+  const [sentenceSavedSuccess, setSentenceSavedSuccess] = useState<boolean>(false);
+  const [sentenceEvaluation, setSentenceEvaluation] = useState<WritingEvaluationResult | null>(null);
+  const [isCheckingSentence, setIsCheckingSentence] = useState<boolean>(false);
+  const [savedTopicsBeforeRepeat, setSavedTopicsBeforeRepeat] = useState<Record<string, string>>({});
+
+  // Strictly neutral initial state: topics start as "" until user voluntarily selects
+  const [selectedTopicByDay, setSelectedTopicByDay] = useState<Partial<Record<DayOfWeek, string>>>({});
+
+  const authUid = auth?.currentUser?.uid || '';
+  const effectiveStudentUid =
+    (isValidCanonicalUid(authUid) ? authUid : '') ||
+    (isValidCanonicalUid((userProfile as any)?.uid) ? (userProfile as any).uid : '') ||
+    (isValidCanonicalUid(userProfile?.id) ? userProfile.id : '') ||
+    userProfile?.email ||
+    auth?.currentUser?.email ||
+    '';
+  const {
+    routinesByDay: persistedRoutinesByDay,
+    watchedHistory,
+    saveVideoForDay,
+    markVideoAsWatched,
+    resetRepeatFlags,
+    resetRoutinesForNewWeek,
+    resetAllDaysImmediately,
+    selectNextUnwatchedVideo: pickNextUnwatched,
+    isLoading: isRoutineLoading,
+  } = useRoutine(effectiveStudentUid, selectedDay, userProfile?.weeklyCycle || weeklyCycle || 1);
+
   // 5 Words State
   const [words, setWords] = useState<string[]>(['', '', '', '', '']);
   const [wordsSaveFeedback, setWordsSaveFeedback] = useState<boolean>(false);
@@ -321,11 +351,14 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     setWordsSaveFeedback(false);
   }, [activeActivity?.id, selectedDay, weeklyCycle, activeActivity?.learnedWords?.join(',')]);
 
-  // HOTFIX 2.3.5C: Immediate UI reset of all active 5 words & sentence inputs upon cycle advance
+  // HOTFIX 2.3.5G: Immediate UI reset of all active 5 words & sentence inputs upon cycle advance
   const prevCycleTrackerRef = useRef<number>(weeklyCycle || userProfile?.weeklyCycle || 1);
   useEffect(() => {
     const curCycle = weeklyCycle || userProfile?.weeklyCycle || 1;
     if (prevCycleTrackerRef.current !== curCycle) {
+      if (typeof resetAllDaysImmediately === 'function') {
+        resetAllDaysImmediately(curCycle);
+      }
       setWords(['', '', '', '', '']);
       setWordDefinitions({});
       setWordsSaveFeedback(false);
@@ -334,11 +367,12 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
       setSentenceEvaluation(null);
       setSelectedTopicByDay({});
       setCustomSuggestionActivities({});
+      setSuggestingUrlActivityId(null);
       setSuggestingUrlValues({});
       setSavedTopicsBeforeRepeat({});
       prevCycleTrackerRef.current = curCycle;
     }
-  }, [weeklyCycle, userProfile?.weeklyCycle]);
+  }, [weeklyCycle, userProfile?.weeklyCycle, resetAllDaysImmediately]);
 
   // Keep English definitions synchronized using Native Friend Notes unified pedagogical standard
   // Reuses My Dictionary definitions (2.2B.2)
@@ -432,44 +466,28 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
   const [spotifyPlayerMode, setSpotifyPlayerMode] = useState<'app' | 'web'>('app');
   const [spotifyEmbedView, setSpotifyEmbedView] = useState<'track' | 'playlist'>('track');
 
-  // Sentence of the day State
-  const [sentenceInput, setSentenceInput] = useState<string>('');
-  const [sentenceSavedSuccess, setSentenceSavedSuccess] = useState<boolean>(false);
-  const [sentenceEvaluation, setSentenceEvaluation] = useState<WritingEvaluationResult | null>(null);
-  const [isCheckingSentence, setIsCheckingSentence] = useState<boolean>(false);
-  const [savedTopicsBeforeRepeat, setSavedTopicsBeforeRepeat] = useState<Record<string, string>>({});
-
-  // Strictly neutral initial state: topics start as "" until user voluntarily selects
-  const [selectedTopicByDay, setSelectedTopicByDay] = useState<Partial<Record<DayOfWeek, string>>>({});
-
-  const authUid = auth?.currentUser?.uid || '';
-  const effectiveStudentUid =
-    (isValidCanonicalUid(authUid) ? authUid : '') ||
-    (isValidCanonicalUid((userProfile as any)?.uid) ? (userProfile as any).uid : '') ||
-    (isValidCanonicalUid(userProfile?.id) ? userProfile.id : '') ||
-    userProfile?.email ||
-    auth?.currentUser?.email ||
-    '';
-  const {
-    routinesByDay: persistedRoutinesByDay,
-    watchedHistory,
-    saveVideoForDay,
-    markVideoAsWatched,
-    resetRepeatFlags,
-    resetRoutinesForNewWeek,
-    selectNextUnwatchedVideo: pickNextUnwatched,
-    isLoading: isRoutineLoading,
-  } = useRoutine(effectiveStudentUid, selectedDay, userProfile?.weeklyCycle || weeklyCycle || 1);
 
   // Sync saved topic and video from Firestore so refreshing the page preserves the selection
   useEffect(() => {
     if (persistedRoutinesByDay) {
+      const activeCycle = userProfile?.weeklyCycle || weeklyCycle || 1;
       setSelectedTopicByDay((prev) => {
         const next = { ...prev };
         let changed = false;
         Object.keys(persistedRoutinesByDay).forEach((dayKey) => {
           const d = dayKey as DayOfWeek;
           const persisted = persistedRoutinesByDay[d];
+
+          // Strict cycle filter: discard any routine belonging to a different weekly cycle
+          const itemCycle = persisted?.weeklyCycle !== undefined ? Number(persisted.weeklyCycle) : activeCycle;
+          if (itemCycle !== activeCycle) {
+            if (next[d]) {
+              delete next[d];
+              changed = true;
+            }
+            return;
+          }
+
           if (persisted && (persisted.videoId || persisted.playlistId) && !next[d]) {
             const topic =
               persisted.playlistId === 'custom_suggestion' ||
@@ -483,7 +501,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
               next[d] = topic;
               changed = true;
             }
-          } else if (persisted && persisted.videoId === '' && persisted.playlistId === '' && next[d]) {
+          } else if (persisted && (!persisted.videoId || persisted.videoId === '') && (!persisted.playlistId || persisted.playlistId === '') && next[d]) {
             delete next[d];
             changed = true;
           }
@@ -491,7 +509,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
         return changed ? next : prev;
       });
     }
-  }, [persistedRoutinesByDay]);
+  }, [persistedRoutinesByDay, userProfile?.weeklyCycle, weeklyCycle]);
 
   // Reset day-specific ephemeral input state only when student identity actually switches
   const prevStudentUidRef = useRef<string>(effectiveStudentUid);
@@ -780,12 +798,18 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
 
   const currentDayActivities = routinesByDay[selectedDay] || [];
 
-  const persistedVideo = persistedRoutinesByDay[selectedDay];
+  const activeCycle = userProfile?.weeklyCycle || weeklyCycle || 1;
+  const rawPersistedVideo = persistedRoutinesByDay[selectedDay];
+  // Strict cycle barrier: discard persisted routine if it belongs to an older cycle
+  const persistedVideo =
+    rawPersistedVideo && (rawPersistedVideo.weeklyCycle === undefined || Number(rawPersistedVideo.weeklyCycle) === activeCycle)
+      ? rawPersistedVideo
+      : null;
 
   // Active YouTube video extraction: priority given to Firestore persisted video, then activeActivity, then day activities
   // If persistedVideo explicitly has empty videoId (''), no video was chosen by the student yet
   const hasPersistedVideoId = Boolean(persistedVideo && persistedVideo.videoId && persistedVideo.videoId.trim() !== '');
-  const isPersistedClean = Boolean(persistedVideo && persistedVideo.videoId === '');
+  const isPersistedClean = !persistedVideo || Boolean(persistedVideo.videoId === '');
 
   const rawAssignedVideo: TeacherAssignedVideo | null =
     hasPersistedVideoId
@@ -831,15 +855,14 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     Boolean(activeActivity && customSuggestionActivities[activeActivity.id]) ||
     (assignedVideo as any)?.playlistId === 'custom_suggestion' ||
     (assignedVideo as any)?.isCustomSuggestion === true ||
-    activeActivity?.activityName === 'Your Suggestion' ||
-    activeActivity?.activityName === 'Sua Sugestão' ||
+    ((activeActivity?.activityName === 'Your Suggestion' || activeActivity?.activityName === 'Sua Sugestão') && Boolean(assignedVideo?.videoId || userChosenTopicForDay === 'custom_suggestion')) ||
     (assignedVideo as any)?.playlistTitle === 'Your Suggestion' ||
     (assignedVideo as any)?.playlistTitle === 'Sua Sugestão' ||
-    persistedVideo?.playlistId === 'custom_suggestion' ||
-    persistedVideo?.playlistTitle === 'Your Suggestion' ||
-    persistedVideo?.playlistTitle === 'Sua Sugestão' ||
-    persistedVideo?.title === 'Your Suggestion' ||
-    persistedVideo?.title === 'Sua Sugestão' ||
+    ((persistedVideo?.playlistId === 'custom_suggestion' ||
+      persistedVideo?.playlistTitle === 'Your Suggestion' ||
+      persistedVideo?.playlistTitle === 'Sua Sugestão' ||
+      persistedVideo?.title === 'Your Suggestion' ||
+      persistedVideo?.title === 'Sua Sugestão') && Boolean(persistedVideo?.videoId || userChosenTopicForDay === 'custom_suggestion')) ||
     userChosenTopicForDay === 'custom_suggestion';
 
   // Rule 2a: Do NOT auto-fill any URL when "Your Suggestion" is selected without a saved video URL
@@ -1890,22 +1913,27 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
                 const isSelected = act.id === activeActivity?.id;
                 const wordsCount = act.learnedWords ? act.learnedWords.length : 0;
 
-                const persistedDay = persistedRoutinesByDay[selectedDay];
+                const rawPersistedDay = persistedRoutinesByDay[selectedDay];
+                const persistedDay =
+                  rawPersistedDay && (rawPersistedDay.weeklyCycle === undefined || Number(rawPersistedDay.weeklyCycle) === activeCycle)
+                    ? rawPersistedDay
+                    : null;
+
                 const isDayCustomSuggestion =
-                  persistedDay?.playlistId === 'custom_suggestion' ||
+                  (persistedDay?.playlistId === 'custom_suggestion' ||
                   (persistedDay as any)?.isCustomSuggestion === true ||
                   persistedDay?.title === 'Your Suggestion' ||
                   persistedDay?.title === 'Sua Sugestão' ||
                   persistedDay?.playlistTitle === 'Your Suggestion' ||
                   persistedDay?.playlistTitle === 'Sua Sugestão' ||
-                  selectedTopicByDay[selectedDay] === 'custom_suggestion';
+                  selectedTopicByDay[selectedDay] === 'custom_suggestion') &&
+                  Boolean(persistedDay?.videoId || selectedTopicByDay[selectedDay] === 'custom_suggestion');
 
                 const isCustomSuggestion =
                   Boolean(customSuggestionActivities[act.id]) ||
                   (act.teacherVideos?.[0] as any)?.playlistId === 'custom_suggestion' ||
                   (act.teacherVideos?.[0] as any)?.isCustomSuggestion === true ||
-                  act.activityName === 'Your Suggestion' ||
-                  act.activityName === 'Sua Sugestão' ||
+                  ((act.activityName === 'Your Suggestion' || act.activityName === 'Sua Sugestão') && Boolean(act.teacherVideos?.[0]?.videoId || selectedTopicByDay[selectedDay] === 'custom_suggestion')) ||
                   (act.teacherVideos?.[0] as any)?.playlistTitle === 'Your Suggestion' ||
                   (act.teacherVideos?.[0] as any)?.playlistTitle === 'Sua Sugestão' ||
                   ((act.id.endsWith('1') || act.activityName?.toLowerCase().includes('vídeo') || act.activityName?.toLowerCase().includes('video')) && isDayCustomSuggestion);
@@ -2603,7 +2631,11 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
           try {
             const success = await onStartNewWeek(studyDaysTarget, selectedDays);
             if (success) {
-              // HOTFIX 2.3.5C: Immediately clear the 5 words panel and derived states for the new cycle
+              const curCycle = weeklyCycle || userProfile?.weeklyCycle || 1;
+              const nextCycle = curCycle + 1;
+              if (typeof resetAllDaysImmediately === 'function') {
+                resetAllDaysImmediately(nextCycle);
+              }
               setWords(['', '', '', '', '']);
               setWordDefinitions({});
               setWordsSaveFeedback(false);
@@ -2612,8 +2644,10 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
               setSentenceEvaluation(null);
               setSelectedTopicByDay({});
               setCustomSuggestionActivities({});
+              setSuggestingUrlActivityId(null);
               setSuggestingUrlValues({});
               setSavedTopicsBeforeRepeat({});
+              prevCycleTrackerRef.current = nextCycle;
               setIsNewWeekModalOpen(false);
             }
           } catch (err) {

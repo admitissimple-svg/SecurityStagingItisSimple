@@ -6822,7 +6822,13 @@ app.post(['/api/student-routines/start-new-week', '/api/student/reset-week'], as
               const isVideoAct =
                 act.id?.endsWith('1') ||
                 act.activityName?.toLowerCase().includes('vídeo') ||
-                act.activityName?.toLowerCase().includes('video');
+                act.activityName?.toLowerCase().includes('video') ||
+                act.activityName === 'Your Suggestion' ||
+                act.activityName === 'Sua Sugestão' ||
+                Boolean(act.playlistId) ||
+                Boolean(act.playlistTitle) ||
+                Boolean(act.isRepeatVideo) ||
+                (act.teacherVideos && act.teacherVideos.length > 0);
               if (isVideoAct) {
                 act.activityName = 'Video of the Day';
                 act.playlistId = '';
@@ -6882,6 +6888,11 @@ app.post(['/api/student-routines/start-new-week', '/api/student/reset-week'], as
           act.id?.endsWith('1') ||
           act.activityName?.toLowerCase().includes('vídeo') ||
           act.activityName?.toLowerCase().includes('video') ||
+          act.activityName === 'Your Suggestion' ||
+          act.activityName === 'Sua Sugestão' ||
+          Boolean(act.playlistId) ||
+          Boolean(act.playlistTitle) ||
+          Boolean(act.isRepeatVideo) ||
           (act.teacherVideos && act.teacherVideos.length > 0);
         const shouldResetVideo = isVideoAct && (!req.body.autoAssignVideos || req.body.resetTopicsToChooseTopic);
         return {
@@ -12962,8 +12973,9 @@ app.get('/api/routines/daily-video', async (req, res) => {
     return res.status(400).json({ error: 'studentUid or studentEmail is required' });
   }
 
+  const requestedCycle = req.query.weeklyCycle !== undefined ? (req.query.weeklyCycle as string) : undefined;
   const firestoreData = effectiveUid
-    ? await fetchRoutineVideosFromFirestoreServer(effectiveUid)
+    ? await fetchRoutineVideosFromFirestoreServer(effectiveUid, requestedCycle)
     : { routinesByDay: {}, weeklyCycle: 1, watchedVideosHistory: [] };
 
   const inMemoryAssignments =
@@ -12975,7 +12987,8 @@ app.get('/api/routines/daily-video', async (req, res) => {
   if (Array.isArray(inMemoryAssignments) && inMemoryAssignments.length > 0) {
     inMemoryAssignments.forEach((assign: any) => {
       const d = assign.day || assign.dayOfWeek;
-      if (d && !mergedRoutines[d] && assign.videoId) {
+      const assignCycle = assign.weeklyCycle !== undefined ? Number(assign.weeklyCycle) : firestoreData.weeklyCycle;
+      if (d && !mergedRoutines[d] && assign.videoId && assignCycle === firestoreData.weeklyCycle) {
         mergedRoutines[d] = {
           videoId: assign.videoId,
           title: assign.videoTitle || assign.title || 'Daily Video Practice',

@@ -6919,6 +6919,7 @@ export default function App() {
 
                 {/* Section 2: Daily Routine Guide STEP BY STEP (Image 2) */}
                 <StudentRoutineGuideSection
+                  key={`routine-guide-${userProfile?.weeklyCycle || 1}`}
                   routinesByDay={routinesByDay}
                   selectedDay={selectedDay}
                   onSelectDay={setSelectedDay}

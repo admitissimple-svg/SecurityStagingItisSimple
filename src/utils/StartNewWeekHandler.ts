@@ -485,6 +485,11 @@ export async function executeStartNewWeek(
           act.id?.endsWith('1') ||
           act.activityName?.toLowerCase().includes('vídeo') ||
           act.activityName?.toLowerCase().includes('video') ||
+          act.activityName === 'Your Suggestion' ||
+          act.activityName === 'Sua Sugestão' ||
+          Boolean(act.playlistId) ||
+          Boolean(act.playlistTitle) ||
+          Boolean(act.isRepeatVideo) ||
           (act.teacherVideos && act.teacherVideos.length > 0);
 
         if (isVideoAct) {
