@@ -15,6 +15,7 @@ export interface SavedRoutineVideo {
   dayOfWeek: DayOfWeek;
   activityId?: string;
   isRepeatVideo?: boolean;
+  isCustomSuggestion?: boolean;
   instructions?: string;
   duration?: string;
   completed?: boolean;

@@ -11270,11 +11270,12 @@ app.post('/api/routines/teacher-video', (req, res) => {
 
     const targetUid = uid || (email ? email.toLowerCase().trim().replace(/[^a-zA-Z0-9_-]/g, '_') : '');
     if (targetUid) {
+      const explicitCycle = req.body.weeklyCycle || undefined;
       targetDays.forEach((d: string) => {
         const dayActs = existingRoutines[d] || [];
         const videoAct = dayActs.find((a: any) => a.teacherVideos && a.teacherVideos.length > 0) || dayActs[0];
         if (videoAct) {
-          saveRoutineVideoSubcollection(targetUid, d, videoAct).catch(() => {});
+          saveRoutineVideoSubcollection(targetUid, d, videoAct, explicitCycle).catch(() => {});
         }
       });
       saveStudentAssignmentsByUid(targetUid, {
@@ -12820,6 +12821,7 @@ app.post('/api/student-video-assignments/assign', async (req, res) => {
 
   if (uid) {
     try {
+      const cycleToUse = req.body.weeklyCycle || (uid && db.userProfiles?.[uid]?.weeklyCycle) || 1;
       await saveRoutineVideoSubcollection(uid, targetDay, {
         videoId: validVidId,
         videoTitle: assignedVideoObj.title,
@@ -12832,12 +12834,9 @@ app.post('/api/student-video-assignments/assign', async (req, res) => {
         isRepeatVideo: playlistId === 'repeat_previous_video',
         instructions: assignedVideoObj.instructions || '',
         duration: assignedVideoObj.duration || '5-10 min',
+        weeklyCycle: cycleToUse,
         updatedAt: new Date().toISOString(),
-      });
-
-      if (validVidId && playlistId !== 'repeat_previous_video') {
-        await addWatchedVideoToUserDoc(uid, validVidId);
-      }
+      }, cycleToUse);
 
       await saveStudentAssignmentsByUid(uid, {
         uid,
@@ -13051,26 +13050,32 @@ app.post('/api/routines/daily-video', async (req, res) => {
   const cleanTitle = title || videoTitle || (cleanVidId ? 'Daily Video Practice' : 'Video of the Day');
   const cleanUrl = url || (cleanVidId ? `https://www.youtube.com/watch?v=${cleanVidId}` : '');
 
-  let currentCycle = typeof bodyWeeklyCycle === 'number' && bodyWeeklyCycle > 0 ? bodyWeeklyCycle : undefined;
-  if (!currentCycle && effectiveUid) {
+  let currentCycle = typeof bodyWeeklyCycle === 'number' && bodyWeeklyCycle > 0
+    ? bodyWeeklyCycle
+    : (typeof bodyWeeklyCycle === 'string' ? parseInt(bodyWeeklyCycle.replace(/\D/g, ''), 10) : undefined);
+  if ((!currentCycle || isNaN(currentCycle)) && effectiveUid) {
     const fs = getFirestoreDb();
     if (fs) {
       try {
         const uDoc = await fs.collection('users').doc(effectiveUid).get();
         if (uDoc.exists) {
           const uData = uDoc.data();
-          if (typeof uData?.weeklyCycle === 'number' && uData.weeklyCycle > 0) {
-            currentCycle = uData.weeklyCycle;
+          const uCycle = typeof uData?.weeklyCycle === 'number' ? uData.weeklyCycle : (typeof uData?.weeklyCycle === 'string' ? parseInt(uData.weeklyCycle.replace(/\D/g, ''), 10) : NaN);
+          if (!isNaN(uCycle) && uCycle > 0) {
+            currentCycle = uCycle;
           }
         }
       } catch {}
     }
   }
-  if (!currentCycle) {
-    currentCycle =
-      (effectiveUid && db.userProfiles?.[effectiveUid]?.weeklyCycle) ||
+  if (!currentCycle || isNaN(currentCycle)) {
+    const rawCycle = (effectiveUid && db.userProfiles?.[effectiveUid]?.weeklyCycle) ||
       (resolved.email && db.userProfiles?.[resolved.email]?.weeklyCycle) ||
       1;
+    currentCycle = typeof rawCycle === 'number' ? rawCycle : (typeof rawCycle === 'string' ? parseInt(rawCycle.replace(/\D/g, ''), 10) : 1);
+  }
+  if (!currentCycle || isNaN(currentCycle) || currentCycle < 1) {
+    currentCycle = 1;
   }
 
   const videoObj = {
@@ -13095,9 +13100,6 @@ app.post('/api/routines/daily-video', async (req, res) => {
   if (effectiveUid) {
     try {
       firestoreSaved = await saveRoutineVideoSubcollection(effectiveUid, targetDay, videoObj, currentCycle);
-      if (cleanVidId && !isRepeatVideo) {
-        await addWatchedVideoToUserDoc(effectiveUid, cleanVidId, cleanTitle);
-      }
     } catch (fsErr) {
       console.warn('[serverApp] Error saving routine video to Firestore:', fsErr);
     }

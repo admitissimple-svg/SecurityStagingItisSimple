@@ -1526,6 +1526,16 @@ export async function fetchTeacherAvailabilityFromFirestore(uidOrEmail: string):
   }
 }
 
+function extractYouTubeIdInternal(urlOrId: string | null | undefined): string | null {
+  if (!urlOrId) return null;
+  const clean = urlOrId.trim();
+  if (/^[a-zA-Z0-9_-]{11}$/.test(clean)) return clean;
+  const match = clean.match(
+    /(?:youtube(?:-nocookie)?\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?|shorts)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/i
+  );
+  return match && match[1] && match[1].length === 11 ? match[1] : null;
+}
+
 /**
  * Persists daily routine video selection to users/{uid}/routines/{dayOfWeek}
  * and mirrors to users/{uid}.routinesByDay with weekly cycle binding
@@ -1534,27 +1544,43 @@ export async function saveRoutineVideoSubcollection(
   uid: string,
   dayOfWeek: string,
   data: any,
-  weeklyCycle?: number
+  weeklyCycle?: number | string
 ): Promise<boolean> {
   if (isCloudWriteDisabled) return false;
   const db = getFirestoreDb();
   if (!db || !uid || !dayOfWeek) return false;
   try {
     const userRef = db.collection('users').doc(uid);
-    let targetCycle = typeof weeklyCycle === 'number' && weeklyCycle > 0 ? weeklyCycle : 1;
+
+    let targetCycle = 1;
+    const cycleCandidates = [weeklyCycle, data?.weeklyCycle];
+    for (const cand of cycleCandidates) {
+      const n = typeof cand === 'number' ? cand : typeof cand === 'string' ? parseInt(cand.replace(/\D/g, ''), 10) : NaN;
+      if (!isNaN(n) && n > 0) {
+        targetCycle = n;
+        break;
+      }
+    }
     try {
       const uSnap = await withTimeout(userRef.get(), 2500);
       if (uSnap && uSnap.exists) {
         const uData = uSnap.data();
-        if (typeof uData?.weeklyCycle === 'number' && uData.weeklyCycle > 0) {
-          targetCycle = Math.max(targetCycle, uData.weeklyCycle);
+        const uCycle = typeof uData?.weeklyCycle === 'number' ? uData.weeklyCycle : typeof uData?.weeklyCycle === 'string' ? parseInt(uData.weeklyCycle.replace(/\D/g, ''), 10) : NaN;
+        if (!isNaN(uCycle) && uCycle > 0) {
+          targetCycle = Math.max(targetCycle, uCycle);
         }
       }
     } catch {}
 
-    const cleanVidId = (data.videoId || '').trim();
-    const cleanTitle = (data.title || data.videoTitle || (cleanVidId ? 'Daily Video Practice' : 'Video of the Day')).trim();
-    const cleanUrl = data.url || (cleanVidId ? `https://www.youtube.com/watch?v=${cleanVidId}` : '');
+    const firstVideo = (Array.isArray(data.teacherVideos) && data.teacherVideos.length > 0) ? data.teacherVideos[0] : null;
+    const rawVidId = data.videoId || firstVideo?.videoId || firstVideo?.id || data.url || firstVideo?.url || '';
+    const cleanVidId = (extractYouTubeIdInternal(rawVidId) || (typeof rawVidId === 'string' && !rawVidId.startsWith('vid-') && !rawVidId.startsWith('act-') ? rawVidId : '')).trim();
+    const cleanTitle = (data.title || data.videoTitle || firstVideo?.title || firstVideo?.videoTitle || (cleanVidId ? 'Daily Video Practice' : 'Video of the Day')).trim();
+    const cleanUrl = data.url || firstVideo?.url || (cleanVidId ? `https://www.youtube.com/watch?v=${cleanVidId}` : '');
+    const cleanPlaylistId = data.playlistId || firstVideo?.playlistId || '';
+    const cleanPlaylistTitle = data.playlistTitle || firstVideo?.playlistTitle || (cleanPlaylistId === 'custom_suggestion' ? 'Your Suggestion' : '');
+    const isRepeat = Boolean(data.isRepeatVideo || firstVideo?.isRepeatVideo || cleanPlaylistId === 'repeat_previous_video');
+    const isCustom = Boolean(data.isCustomSuggestion || firstVideo?.isCustomSuggestion || cleanPlaylistId === 'custom_suggestion' || cleanPlaylistTitle === 'Your Suggestion' || cleanPlaylistTitle === 'Sua Sugestão');
 
     const sanitized = JSON.parse(JSON.stringify({
       ...data,
@@ -1563,13 +1589,14 @@ export async function saveRoutineVideoSubcollection(
       title: cleanTitle,
       videoTitle: cleanTitle,
       url: cleanUrl,
-      playlistId: data.playlistId || '',
-      playlistTitle: data.playlistTitle || '',
+      playlistId: cleanPlaylistId,
+      playlistTitle: cleanPlaylistTitle,
       dayOfWeek,
       activityId: data.activityId || 'act-1',
-      isRepeatVideo: Boolean(data.isRepeatVideo),
-      instructions: data.instructions || '',
-      duration: data.duration || '5-10 min',
+      isRepeatVideo: isRepeat,
+      isCustomSuggestion: isCustom,
+      instructions: data.instructions || firstVideo?.instructions || '',
+      duration: data.duration || firstVideo?.duration || '5-10 min',
       weeklyCycle: targetCycle,
       updatedAt: data.updatedAt || new Date().toISOString(),
     }));
@@ -1610,19 +1637,20 @@ export async function saveRoutineVideoSubcollection(
  */
 export async function fetchRoutineVideosFromFirestoreServer(
   uid: string,
-  weeklyCycle?: number
+  weeklyCycle?: number | string
 ): Promise<{
   routinesByDay: Record<string, any>;
   weeklyCycle: number;
   watchedVideosHistory: string[];
 }> {
+  const parsedPassedCycle = typeof weeklyCycle === 'number' ? weeklyCycle : typeof weeklyCycle === 'string' ? parseInt(weeklyCycle.replace(/\D/g, ''), 10) : 1;
   const result: {
     routinesByDay: Record<string, any>;
     weeklyCycle: number;
     watchedVideosHistory: string[];
   } = {
     routinesByDay: {},
-    weeklyCycle: weeklyCycle || 1,
+    weeklyCycle: !isNaN(parsedPassedCycle) && parsedPassedCycle > 0 ? parsedPassedCycle : 1,
     watchedVideosHistory: [],
   };
 
@@ -1633,11 +1661,12 @@ export async function fetchRoutineVideosFromFirestoreServer(
     const userRef = db.collection('users').doc(uid);
     const userSnap = await withTimeout(userRef.get(), 4000);
 
-    let activeCycle = weeklyCycle || 1;
+    let activeCycle = result.weeklyCycle;
     if (userSnap && userSnap.exists) {
       const uData = userSnap.data() || {};
-      if (typeof uData.weeklyCycle === 'number' && uData.weeklyCycle > 0) {
-        activeCycle = uData.weeklyCycle;
+      const uCycle = typeof uData.weeklyCycle === 'number' ? uData.weeklyCycle : typeof uData.weeklyCycle === 'string' ? parseInt(uData.weeklyCycle.replace(/\D/g, ''), 10) : NaN;
+      if (!isNaN(uCycle) && uCycle > 0) {
+        activeCycle = uCycle;
       }
       result.weeklyCycle = activeCycle;
 
@@ -1655,7 +1684,8 @@ export async function fetchRoutineVideosFromFirestoreServer(
       if (uData.routinesByDay && typeof uData.routinesByDay === 'object') {
         Object.entries(uData.routinesByDay).forEach(([day, item]: [string, any]) => {
           if (item && typeof item === 'object') {
-            const itemCycle = typeof item.weeklyCycle === 'number' ? item.weeklyCycle : activeCycle;
+            const rawCycle = item.weeklyCycle;
+            const itemCycle = typeof rawCycle === 'number' ? rawCycle : typeof rawCycle === 'string' ? parseInt(rawCycle.replace(/\D/g, ''), 10) : activeCycle;
             // Strict weekly cycle matching to prevent cross-cycle bleeding
             if (itemCycle === activeCycle) {
               result.routinesByDay[day] = { ...item, dayOfWeek: day, weeklyCycle: activeCycle };
@@ -1671,7 +1701,8 @@ export async function fetchRoutineVideosFromFirestoreServer(
         const data = docSnap.data();
         if (data) {
           const day = docSnap.id;
-          const itemCycle = typeof data.weeklyCycle === 'number' ? data.weeklyCycle : activeCycle;
+          const rawCycle = data.weeklyCycle;
+          const itemCycle = typeof rawCycle === 'number' ? rawCycle : typeof rawCycle === 'string' ? parseInt(rawCycle.replace(/\D/g, ''), 10) : activeCycle;
           // Strict weekly cycle matching
           if (itemCycle === activeCycle) {
             const hasVideoField = data.videoId !== undefined || data.url !== undefined || data.isRepeatVideo !== undefined;
@@ -1717,15 +1748,6 @@ export interface VideoContextForPart4 {
   legitimateWeeklyVocab?: string[];
 }
 
-function extractYouTubeIdInternal(urlOrId: string | null | undefined): string | null {
-  if (!urlOrId) return null;
-  const clean = urlOrId.trim();
-  if (/^[a-zA-Z0-9_-]{11}$/.test(clean)) return clean;
-  const match = clean.match(
-    /(?:youtube(?:-nocookie)?\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?|shorts)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/i
-  );
-  return match && match[1] && match[1].length === 11 ? match[1] : null;
-}
 
 /**
  * Resolves verified, structured video and vocabulary context from Firestore

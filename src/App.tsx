@@ -1492,6 +1492,7 @@ export default function App() {
                           playlistId: v.playlistId || '',
                           playlistTitle: v.playlistTitle || '',
                           isRepeatVideo: Boolean(v.isRepeatVideo),
+                          isCustomSuggestion: Boolean(v.isCustomSuggestion || v.playlistId === 'custom_suggestion' || v.title === 'Your Suggestion' || v.playlistTitle === 'Your Suggestion'),
                           instructions: v.instructions || '',
                           duration: v.duration || '5-10 min',
                         }],
@@ -2013,6 +2014,7 @@ export default function App() {
                                 playlistId: dayData.playlistId || '',
                                 playlistTitle: dayData.playlistTitle || '',
                                 isRepeatVideo: Boolean(dayData.isRepeatVideo),
+                                isCustomSuggestion: Boolean(dayData.isCustomSuggestion || dayData.playlistId === 'custom_suggestion' || dayData.title === 'Your Suggestion' || dayData.playlistTitle === 'Your Suggestion'),
                                 instructions: dayData.instructions || item.teacherVideos?.[0]?.instructions || '',
                                 duration: dayData.duration || item.teacherVideos?.[0]?.duration || '5-10 min',
                               },
@@ -4195,7 +4197,8 @@ export default function App() {
     });
 
     const activeEmail = currentAccount?.email || userProfile?.email;
-    const activeUid = currentAccount?.uid || (currentAccount as any)?.id || userProfile?.id;
+    const activeUid = auth?.currentUser?.uid || currentAccount?.uid || (currentAccount as any)?.id || userProfile?.id;
+    const activeCycle = parseWeekCycleNumber(userProfile?.weeklyCycle) || 1;
     if (activeEmail || activeUid) {
       // 1. Direct daily-video persistence endpoint (backed by Firestore users/{uid}/routines/{day})
       fetch('/api/routines/daily-video', {
@@ -4211,12 +4214,12 @@ export default function App() {
           videoTitle: video.title,
           url: video.url,
           playlistId: (video as any).playlistId || '',
-          playlistTitle: playlistTopic || '',
+          playlistTitle: playlistTopic || (video as any).playlistTitle || '',
           isRepeatVideo: Boolean((video as any).isRepeatVideo),
           activityId,
           instructions: video.instructions,
           duration: video.duration,
-          weeklyCycle: userProfile?.weeklyCycle || 1,
+          weeklyCycle: activeCycle,
         }),
       }).catch(() => {});
 
@@ -4226,8 +4229,8 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           activityId,
-          activityName: playlistTopic,
-          playlistTitle: playlistTopic,
+          activityName: playlistTopic || (video as any).playlistTitle || 'Video of the Day',
+          playlistTitle: playlistTopic || (video as any).playlistTitle || '',
           playlistId: (video as any).playlistId || '',
           videos: [video],
           teacherNotes: video.instructions,
@@ -4235,6 +4238,7 @@ export default function App() {
           day,
           studentEmail: activeEmail,
           studentUid: activeUid,
+          weeklyCycle: activeCycle,
         }),
       }).catch(() => {});
     }
