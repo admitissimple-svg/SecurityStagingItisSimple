@@ -14519,16 +14519,18 @@ function hasGenericBoilerplate(data: any): boolean {
 // Detection for stale, formulaic, or robotic story templates that should never be shown to students
 export function isBadStoryText(text: string): boolean {
   if (!text || typeof text !== 'string' || text.trim().length < 120) return true;
-  // HOTFIX 2.3: Enforce the pedagogical 4-paragraph narrative structure
+  // HOTFIX 2.3.5K: Enforce the pedagogical 4-paragraph narrative structure
   const paragraphs = text
-    .split(/\n+/)
+    .split(/\n\s*\n/)
     .map((p) => p.trim())
     .filter((p) => p.length > 25);
-  if (paragraphs.length < 4) return true;
+  if (paragraphs.length !== 4) return true;
 
   const t = text.toLowerCase();
   return (
     t.includes('the day began with great purpose as') ||
+    t.includes('the working session began with clear intention as') ||
+    t.includes('the project breakthrough') ||
     t.includes('reviewed key plans regarding') ||
     t.includes('address **') ||
     t.includes('managing **') ||
@@ -14538,7 +14540,15 @@ export function isBadStoryText(text: string): boolean {
     t.includes('refreshing weather') ||
     t.includes('storm terms') ||
     t.includes('a productive day of focus and growth') ||
-    t.includes('finishing the workday on schedule allowed everyone to celebrate')
+    t.includes('finishing the workday on schedule allowed everyone to celebrate') ||
+    t.includes('collaborating closely with colleagues to') ||
+    t.includes('before wrapping up the day, celebrating the successful delivery of') ||
+    t.includes('delivery of the small') ||
+    t.includes('to need every detail') ||
+    t.includes('in the youtube video') ||
+    t.includes('the video showed') ||
+    t.includes('as seen in the video clip') ||
+    t.includes('watched the video')
   );
 }
 
@@ -14546,11 +14556,52 @@ export function validatePart4StoryResponse(json: any, targetWords?: string[]): b
   if (!json || typeof json !== 'object') return false;
   if (!json.title || typeof json.title !== 'string' || json.title.trim().length < 3) return false;
   if (!json.text || typeof json.text !== 'string' || isBadStoryText(json.text)) return false;
-  if (!Array.isArray(json.questions) || json.questions.length < 2) return false;
+
+  // 1. Strictly 4 paragraphs
+  const paragraphs = json.text
+    .split(/\n\s*\n/)
+    .map((p: string) => p.trim())
+    .filter((p: string) => p.length > 25);
+  if (paragraphs.length !== 4) return false;
+
+  // 2. Target words must appear in text
+  if (Array.isArray(targetWords) && targetWords.length > 0) {
+    const textLower = json.text.toLowerCase();
+    for (const w of targetWords) {
+      const clean = (w || '').trim().toLowerCase();
+      if (!clean) continue;
+      if (!textLower.includes(clean)) {
+        // Allow inflected form or root (e.g., needed -> need, starting -> start)
+        const base = clean.replace(/ed$|s$|ing$/, '');
+        if (base.length >= 3 && textLower.includes(base)) continue;
+        return false;
+      }
+    }
+  }
+
+  // 3. Exactly 2 or 3 questions
+  if (!Array.isArray(json.questions) || json.questions.length < 2 || json.questions.length > 3) return false;
+
   for (const q of json.questions) {
-    if (!q || typeof q.question !== 'string' || q.question.trim().length < 8) return false;
-    if (!Array.isArray(q.options) || q.options.length < 4) return false;
+    if (!q || typeof q.question !== 'string' || q.question.trim().length < 10) return false;
+    if (!Array.isArray(q.options) || q.options.length !== 4) return false;
+    const uniqueOptions = new Set(q.options.map((o: any) => String(o || '').trim().toLowerCase()));
+    if (uniqueOptions.size < 4) return false; // Options must be distinct
     if (typeof q.correctAnswer !== 'number' && typeof q.correctAnswer !== 'string') return false;
+    if (typeof q.correctAnswer === 'number' && (q.correctAnswer < 0 || q.correctAnswer > 3)) return false;
+    if (!q.explanation || typeof q.explanation !== 'string' || q.explanation.trim().length < 5) return false;
+
+    // Filter generic/meta questions
+    const qLower = q.question.toLowerCase();
+    if (
+      qLower.includes('how many words') ||
+      qLower.includes('target vocabulary') ||
+      qLower.includes('study english') ||
+      qLower.includes('in the video clip') ||
+      qLower.includes('youtube video')
+    ) {
+      return false;
+    }
   }
   return true;
 }
@@ -14592,7 +14643,7 @@ export function validateDirectMemorizationAiResponse(json: any, targetWords?: st
 }
 
 // Dedicated Generator for Part 4: Mini-Story / Routine Reading & Interpretation with Gemini API
-// 100% INÉDITA, ORGANIC VOCABULARY INTEGRATION, AND DYNAMIC STORY-GROUNDED COMPREHENSION QUESTIONS
+// HOTFIX 2.3.5K: Contextual, Natural Narrative with Word Grammar Profiles and Authentic Comprehension Questions
 async function generatePart4StoryWithGemini(
   words: string[],
   studentLevel: string,
@@ -14603,64 +14654,62 @@ async function generatePart4StoryWithGemini(
   if (!apiKey || !Array.isArray(words) || words.length === 0) return null;
 
   const levelMeta = normalizeStudentLevel(studentLevel);
-  const protagonist = (studentName && studentName !== 'Student' ? studentName.split(' ')[0] : 'Student').trim();
+
+  // Profile words to give Gemini exact part of speech and authentic meaning
+  const profiledWordsList = words.map((w) => {
+    const prof = profileWord(w);
+    return `* "${w}" (${prof.partOfSpeech.toUpperCase()}): Definition: "${prof.definitionEn}". Must be used with correct grammatical syntax (e.g. if verb, conjugate or use as natural action/state; if adjective, modify noun or follow linking verb; if noun, act as subject/object).`;
+  }).join('\n');
 
   const videoInstruction = videoContext && videoContext.hasVideo && videoContext.videoTitle ? `
-5. CONTEXTUAL VIDEO THEMATIC INSPIRATION (OPTIONAL GROUNDING):
+5. CONTEXTUAL VIDEO THEME (THEMATIC INSPIRATION ONLY):
    - Daily Routine Video Title: "${videoContext.videoTitle}"
-   ${videoContext.themeOrCategory ? `- Category / Playlist Theme: "${videoContext.themeOrCategory}"` : ''}
+   ${videoContext.themeOrCategory ? `- Category / Theme: "${videoContext.themeOrCategory}"` : ''}
+   ${(videoContext as any).description ? `- Description: "${(videoContext as any).description}"` : ''}
    - Student Watch Status: ${videoContext.isWatched ? 'Confirmed watched by student' : 'Selected in weekly routine (not confirmed watched)'}
-   ${Array.isArray(videoContext.fiveWordsVocab) && videoContext.fiveWordsVocab.length > 0 ? `- 5 Words Recorded for this Routine: [${videoContext.fiveWordsVocab.join(', ')}]` : ''}
 
-   STRICT ANTI-HALLUCINATION & COHERENCE MANDATE:
-   * Ground the setting, domain, premise, or scenario of the story in the overarching theme or subject matter of this video title (e.g., barista skills, business presentation, scientific research, travel adventure).
+   COHERENCE & STRICT ANTI-HALLUCINATION RULES:
+   * Ground the setting, atmosphere, industry, or environment of the story in the overarching subject matter of this video title (e.g. barista coffee techniques, public speaking, culinary arts, science lab, travel logistics, creative design).
    * ABSOLUTE PROHIBITION ON HALLUCINATING VIDEO DETAILS: NEVER invent, simulate, or fabricate transcripts, spoken dialogue, specific scene events, or quotes from the video.
-   * NEVER state or assert that the student watched the video unless watch status is confirmed above.
-   * The mini-story must be an original 4-paragraph narrative centered on the student's active words of the day: [${words.join(', ')}]. It must NOT pretend to summarize the video.
-   * All reading comprehension questions must test concrete events in the story you write, NOT external YouTube facts.
-` : '';
+   * NEVER state or assert that the student watched the video.
+   * The mini-story must be an original narrative connecting today's words. It is NOT a summary of the video.
+` : `
+5. CONTEXTUAL SETTING:
+   - No video context is available for this session.
+   - Set the narrative in a realistic, engaging daily life, workplace, community, or creative scenario.
+`;
 
-  const systemInstruction = `You are a distinguished literary author, linguistic stylist, and senior English Language Teaching (ELT) instructional designer for "It's Simple - Learn English by Living Your Life".
-Your mission is to craft a 100% ORIGINAL, INÉDITA, and COMPELLING short story (Part 4: Routine Reading & Interpretation) and dynamic, narrative-grounded reading comprehension questions tailored to the student's proficiency level (${levelMeta.labelEn} - CEFR ${levelMeta.cefr}).
+  const systemInstruction = `You are an expert English Language Teaching (ELT) instructional designer and literary storyteller for "It's Simple - Learn English by Living Your Life".
+Your mission is to craft an ORIGINAL, NATURAL, and COHESIVE 4-paragraph mini-story (Part 4: Routine Reading & Interpretation) and 2 to 3 narrative-grounded reading comprehension questions tailored to the student's proficiency level (${levelMeta.labelEn} - CEFR ${levelMeta.cefr}).
 
 CRITICAL MANDATORY RULES (STRICTLY ENFORCED):
 
-1. GERAÇÃO DE CONTEÚDO 100% INÉDITO COM ESTRUTURA DE 4 PARÁGRAFOS (ZERO TEMPLATES / ZERO REUSO):
-   - You must construct a brand-new, vivid, and original storyline specifically customized to the provided words of the day.
-   - MANDATORY 4-PARAGRAPH FORMAT: The story MUST consist of exactly 4 cohesive paragraphs separated by double newlines (\`\n\n\`):
-     * Paragraph 1: Setup, protagonist context, and situation introduction.
+1. ESTRUTURA MANDATÓRIA DE EXATAMENTE 4 PARÁGRAFOS CONECTADOS (ZERO TEMPLATES):
+   - The story MUST consist of exactly 4 cohesive paragraphs separated by double newlines (\`\n\n\`):
+     * Paragraph 1: Setup, situation context, and introducing a relatable protagonist (e.g. Alex, Elena, Marcus, or Maya).
      * Paragraph 2: Challenge, conflict, tension, or pivotal incident.
-     * Paragraph 3: Decisive action, turning point, or resolution development.
+     * Paragraph 3: Decisive action, turning point, or teamwork collaboration.
      * Paragraph 4: Outcome, reflection, and lasting takeaway.
-   - ABSOLUTE PROHIBITION ON STATIC TEMPLATES: You are strictly forbidden from reusing formulaic slot templates where only the target words change.
-   - Specifically NEVER write or mimic sentences like:
-     * "The day began with great purpose as [Name] reviewed key plans regarding [word]..."
-     * "Taking decisive steps early in the morning ensured everyone was prepared to address [word]..."
-     * "Transitioning into the afternoon, the team focused their energy on managing [word]..."
-     * "At the same time, dedicating careful attention to [word] strengthened mutual trust..."
-     * "Before wrapping up the day, taking a moment to evaluate the progress made on [word]..."
-     * "Finishing the workday on schedule allowed everyone to celebrate their achievements..."
-   - Vary the scenario and genre creatively and realistically across calls:
-     * High-stakes workplace discussions, design critiques, urgent troubleshooting, lab diagnostics, software or product launches
-     * Culinary arts, artisan workshops, pottery, architecture, craftsmanship
-     * Travel complications, transit logistics, airport connections, international conferences
-     * Everyday moments, personal triumphs, community initiatives, athletic or health challenges
-   - Featuring ${protagonist} as a capable, relatable protagonist navigating this concrete situation.
+   - ZERO REUSE OF STATIC TEMPLATES: Strictly forbidden are formulaic slot sentences such as:
+     * "The working session began with clear intention as..."
+     * "Collaborating closely with colleagues to need every detail..."
+     * "Before wrapping up the day, celebrating the successful delivery of the small..."
+     * "The project breakthrough..."
+   - DO NOT assume personal names, professions, or private facts about the student. Feature a neutral, relatable protagonist.
 
-2. INTEGRAÇÃO ORGÂNICA DAS PALAVRAS DO DIA:
-   - Every single word from the day's vocabulary list must be woven naturally and grammatically into the story.
-   - Respect real-world parts of speech:
-     * Verbs must be used as genuine actions or states (e.g. "negotiate terms", "reinforce the foundation", "exited through the side door").
-     * Adjectives must modify nouns or follow linking verbs (e.g. "a perfect alignment", "the weather was perfect", "remained willing to assist").
-     * Nouns must function as subjects, direct objects, or complements.
-   - NEVER force a verb or adjective into an awkward noun position.
-   - Every target word MUST be highlighted in markdown bold: **word**.
+2. INTEGRAÇÃO GRAMATICALMENTE CORRETA E NATURAL DAS 5 PALAVRAS:
+   - Every single word from the day's vocabulary list MUST be integrated into the story naturally and with grammatical precision.
+   - Respect real-world parts of speech and authentic meaning:
+     * VERBS (e.g. "need", "start", "watch", "learn") must express authentic actions or states with appropriate syntax (e.g. "They needed more information before making a decision", "Alex started the preparation early"). NEVER write broken phrases like "to need every detail".
+     * ADJECTIVES (e.g. "small", "clear", "productive") must modify nouns or follow linking verbs (e.g. "even a small adjustment made a difference", "the instructions were clear"). NEVER force an adjective into a noun slot like "delivery of the small".
+     * NOUNS (e.g. "business", "break", "routine", "environment") must act as subjects, direct objects, or prepositional objects (e.g. "understanding how the local business operated").
+     * ADVERBS (e.g. "nowadays", "always", "already") must modify verbs or clauses smoothly.
+   - Highlight every target word in markdown bold: **word**.
 
-3. COERÊNCIA TOTAL DAS PERGUNTAS DE INTERPRETAÇÃO:
-   - Generate 2 to 3 multiple-choice reading comprehension questions based EXCLUSIVELY on the newly generated mini-story.
-   - 100% STORY-GROUNDED: Every question must probe specific plot events, character motivations, decisions, or concrete outcomes from the story you just wrote.
-   - ZERO GENERIC QUESTIONS: Prohibit any question about English study habits, vocabulary memorization, grammar theory, or general philosophies.
-   - 4 Narrative-specific options: Exactly 4 options per question ([Option A, Option B, Option C, Option D]). 1 option must be unambiguously correct based on the story, and 3 must be plausible narrative distractors derived from the story context.
+3. COERÊNCIA DAS PERGUNTAS DE COMPREENSÃO (EXATAMENTE 2 OU 3 PERGUNTAS):
+   - Generate exactly 2 or 3 multiple-choice reading comprehension questions based EXCLUSIVELY on concrete plot events, decisions, or results in the story you just wrote.
+   - ZERO GENERIC QUESTIONS: Prohibit any question about English study habits, vocabulary flashcards, or general philosophies.
+   - Exactly 4 plausible options per question ([Option A, Option B, Option C, Option D]). 1 unambiguously correct based on the story, 3 plausible narrative distractors.
    - Accurate zero-based correctAnswer index (0, 1, 2, or 3).
    - Clear explanation directly referencing the story sentence that proves the answer.
 ${videoInstruction}
@@ -14680,22 +14729,24 @@ Output format must be a strict JSON object:
 }`;
 
   const videoPromptSnippet = videoContext && videoContext.hasVideo && videoContext.videoTitle ? `
-Daily Video Thematic Inspiration:
+Daily Video Inspiration:
 - Title: "${videoContext.videoTitle}"
-${videoContext.themeOrCategory ? `- Theme/Category: "${videoContext.themeOrCategory}"\n` : ''}- Watch status: ${videoContext.isWatched ? 'Confirmed watched' : 'Selected in routine'}
-Note: Use this solely as realistic thematic inspiration for the setting/premise. Do NOT invent false video dialogues or scenes.
-` : '';
+${videoContext.themeOrCategory ? `- Category / Theme: "${videoContext.themeOrCategory}"\n` : ''}
+(Use purely as thematic setting inspiration. Do not fabricate scenes, quotes, or transcripts from the video.)
+` : `
+Setting Inspiration: Everyday professional, creative, or community scenario.
+`;
 
-  const userPrompt = `Generate a 100% INÉDITA mini-story and 2-3 coherent comprehension questions for:
+  const userPrompt = `Generate the 4-paragraph mini-story and 2-3 reading questions for:
 Protagonist: "Alex"
-Proficiency Level: ${levelMeta.labelEn} (${levelMeta.labelPt} - CEFR ${levelMeta.cefr})
+Proficiency Level: ${levelMeta.labelEn} (CEFR ${levelMeta.cefr})
 Target Words of the Day to weave in organically with **word**:
-${words.map((w, i) => `${i + 1}. "${w}"`).join('\n')}
+${profiledWordsList}
 ${videoPromptSnippet}
 MANDATORY RULES:
-1. Plot must be 100% original, lively, and engaging. Absolutely ZERO formulaic templates!
-2. All target words must be used with grammatical precision and highlighted as **word**.
-3. All questions must test factual events, decisions, and turning points in this narrative.
+1. Exactly 4 connected paragraphs separated by double newlines (\n\n).
+2. All 5 target words must be used with natural grammatical function and highlighted as **word**. No awkward slot-filling!
+3. Exactly 2 or 3 comprehension questions testing concrete story events.
 Return strict JSON only.`;
 
   // HOTFIX 3-MODEL CONTINGENCY: Sequential failover across up to 3 verified models on recoverable errors
@@ -14717,7 +14768,8 @@ Return strict JSON only.`;
       parsed.text &&
       !isBadStoryText(parsed.text) &&
       Array.isArray(parsed.questions) &&
-      parsed.questions.length > 0
+      parsed.questions.length >= 2 &&
+      parsed.questions.length <= 3
     ) {
       parsed.questions = parsed.questions.map((q: any, idx: number) => {
         let corrIdx = 0;
@@ -14736,7 +14788,10 @@ Return strict JSON only.`;
         };
       });
 
-      return parsed;
+      return {
+        ...parsed,
+        isAiGenerated: true,
+      };
     }
   }
 

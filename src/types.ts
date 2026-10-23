@@ -706,6 +706,7 @@ export interface ReadingPassage {
   title: string;
   text: string;
   questions: ReadingQuestion[];
+  isAiGenerated?: boolean;
 }
 
 export interface HomeworkItemFeedback {

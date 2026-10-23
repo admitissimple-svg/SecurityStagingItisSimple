@@ -18,6 +18,7 @@ import {
   synthesizeCohesiveStoryAndQuestions,
   synthesizeFillInBlanks,
   profileWord,
+  isBadStoryText,
 } from './pedagogicalStorySynthesizer';
 import { auth } from '../firebase';
 import { normalizeDictionaryWord } from './studentDictionaryLibrary';
@@ -1273,16 +1274,42 @@ export function generateWeeklyHomework(
   });
 
   // 5. Build Reading Passage & Comprehension (Part 4 - Mini-Story Coesa e Gramaticalmente Fluida)
-  const synthesizedStory = synthesizeCohesiveStoryAndQuestions({
-    words: rawWords.map((rw) => rw.word),
-    studentLevel: levelLabel,
-    studentName: name,
-    wordDetails: rawWords,
-  });
+  // HOTFIX 2.3.5K: If targetDay already has a valid AI-generated or validated reading passage, preserve it verbatim across F5!
+  const existingStory = targetDay && existingDailyActivities?.[targetDay]?.readingPassage;
+  const hasExistingValidStory = Boolean(
+    existingStory?.text &&
+    !isBadStoryText(existingStory.text) &&
+    Array.isArray(existingStory.questions) &&
+    existingStory.questions.length >= 2
+  );
 
-  const passageTitle = synthesizedStory.title;
-  const passageText = synthesizedStory.text;
-  const readingQuestions = synthesizedStory.questions;
+  let readingPassageToUse: ReadingPassage;
+  if (hasExistingValidStory) {
+    readingPassageToUse = {
+      ...existingStory!,
+      isAiGenerated: existingStory!.isAiGenerated ?? true,
+    };
+  } else if (existingStory?.text) {
+    readingPassageToUse = {
+      ...existingStory,
+      isAiGenerated: Boolean(existingStory.isAiGenerated),
+    };
+  } else {
+    const defaultSynthesized = synthesizeCohesiveStoryAndQuestions({
+      words: rawWords.map((rw) => rw.word),
+      studentLevel: levelLabel,
+      studentName: name,
+      wordDetails: rawWords,
+    });
+    readingPassageToUse = {
+      ...defaultSynthesized,
+      isAiGenerated: false,
+    };
+  }
+
+  const passageTitle = readingPassageToUse.title;
+  const passageText = readingPassageToUse.text;
+  const readingQuestions = readingPassageToUse.questions;
 
   const wordOrigins: WordOriginSnapshot[] = rawWords.map((item) => ({
     word: item.word,
@@ -1307,11 +1334,7 @@ export function generateWeeklyHomework(
       matchingPairs,
       fillInBlanks,
       sentenceWritingPrompts,
-      readingPassage: {
-        title: passageTitle,
-        text: passageText,
-        questions: readingQuestions,
-      },
+      readingPassage: readingPassageToUse,
       assignedPart: schedule?.partNumber,
       assignedPartKey: schedule?.partKey,
       studentAnswers: {},
@@ -1340,11 +1363,7 @@ export function generateWeeklyHomework(
     matchingPairs,
     fillInBlanks,
     sentenceWritingPrompts,
-    readingPassage: {
-      title: passageTitle,
-      text: passageText,
-      questions: readingQuestions,
-    },
+    readingPassage: readingPassageToUse,
     dailyActivities: updatedDailyActivities,
     isEmpty: false,
     isCompleted: false,
@@ -1514,13 +1533,14 @@ export async function generatePart4StoryWithAi(params: {
   wordDetails?: any[];
   targetDay?: DayOfWeek | string;
   weeklyCycle?: number;
+  videoContext?: any;
 }): Promise<ReadingPassage | null> {
   const cleanWords = Array.from(new Set(params.words.filter(Boolean)));
   if (cleanWords.length === 0) return null;
 
   try {
     const controller = new AbortController();
-    const abortTimeout = setTimeout(() => controller.abort(), 20000);
+    const abortTimeout = setTimeout(() => controller.abort(), 25000);
 
     const currentUid = auth?.currentUser?.uid || params.studentUid || '';
     const currentEmail = (auth?.currentUser?.email || params.studentEmail || '').toLowerCase().trim();
@@ -1543,6 +1563,7 @@ export async function generatePart4StoryWithAi(params: {
         wordDetails: params.wordDetails || [],
         targetDay: params.targetDay,
         weeklyCycle: params.weeklyCycle,
+        videoContext: params.videoContext,
       }),
     });
     clearTimeout(abortTimeout);
@@ -1554,19 +1575,19 @@ export async function generatePart4StoryWithAi(params: {
 
     if (response.ok) {
       const data = await response.json();
-      if (data.readingPassage?.text && Array.isArray(data.readingPassage?.questions)) {
-        return data.readingPassage;
+      if (data.readingPassage?.text && Array.isArray(data.readingPassage?.questions) && !isBadStoryText(data.readingPassage.text)) {
+        return {
+          ...data.readingPassage,
+          isAiGenerated: true,
+        };
       }
     }
   } catch (err) {
-    console.warn('Part 4 AI generation failed, falling back:', err);
+    console.warn('Part 4 AI generation failed:', err);
   }
 
-  return synthesizeCohesiveStoryAndQuestions({
-    words: cleanWords,
-    studentLevel: params.studentLevel,
-    studentName: params.studentName,
-    wordDetails: params.wordDetails,
-  });
+  // HOTFIX 2.3.5K: Strictly zero synthetic fallback or fictional emergency text to simulate success.
+  // Returns null so that the UI presents a recoverable error allowing user retry.
+  return null;
 }
 

@@ -847,8 +847,45 @@ export function profileWord(
 }
 
 /**
- * Generates a completely natural, cohesive, human-like narrative (Part 4)
- * that logically connects ALL target words into a realistic scenario with ZERO repetition.
+ * Detection for stale, formulaic, or robotic story templates that should never be shown to students.
+ */
+export function isBadStoryText(text?: string | null): boolean {
+  if (!text || typeof text !== 'string' || text.trim().length < 120) return true;
+  const paragraphs = text
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 25);
+  if (paragraphs.length < 4) return true;
+
+  const t = text.toLowerCase();
+  return (
+    t.includes('the day began with great purpose as') ||
+    t.includes('the working session began with clear intention as') ||
+    t.includes('the project breakthrough') ||
+    t.includes('reviewed key plans regarding') ||
+    t.includes('address **') ||
+    t.includes('managing **') ||
+    t.includes('progress made on **') ||
+    t.includes('to make sure everything stayed aligned') ||
+    t.includes('quick to ') ||
+    t.includes('refreshing weather') ||
+    t.includes('storm terms') ||
+    t.includes('a productive day of focus and growth') ||
+    t.includes('finishing the workday on schedule allowed everyone to celebrate') ||
+    t.includes('collaborating closely with colleagues to') ||
+    t.includes('before wrapping up the day, celebrating the successful delivery of') ||
+    t.includes('delivery of the small') ||
+    t.includes('to need every detail') ||
+    t.includes('in the youtube video') ||
+    t.includes('the video showed') ||
+    t.includes('as seen in the video clip') ||
+    t.includes('watched the video')
+  );
+}
+
+/**
+ * Generates a natural, cohesive narrative (Part 4)
+ * connecting target words into a realistic scenario without robotic templates.
  */
 export function synthesizeCohesiveStoryAndQuestions(params: {
   words: string[];
@@ -1067,18 +1104,19 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
   }
   // SCENARIO 3: Dynamic Contextual Narrative Synthesizer (Zero Formulaic Templates)
   else {
+
     const themes = [
       {
-        title: `The Project Breakthrough (${levelLabel})`,
-        settingEn: 'creative studio and strategic workplace',
+        title: `Everyday Focus and Teamwork (${levelLabel})`,
+        settingEn: 'collaborative workshop',
       },
       {
-        title: `Turning Plans into Action (${levelLabel})`,
-        settingEn: 'fast-paced team sprint',
+        title: `A Morning of Clear Direction (${levelLabel})`,
+        settingEn: 'productive studio space',
       },
       {
-        title: `Navigating the Milestone (${levelLabel})`,
-        settingEn: 'collaborative professional environment',
+        title: `Practical Steps in Daily Life (${levelLabel})`,
+        settingEn: 'community project setting',
       },
     ];
     const chosenTheme = themes[Math.abs(words.join('').length) % themes.length];
@@ -1087,27 +1125,55 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
     const buildNaturalClause = (p: LexicalWordProfile, role: 'intro' | 'action' | 'pivot' | 'conclusion'): string => {
       const w = `**${p.word}**`;
       const pos = p.partOfSpeech;
+      const lower = p.word.toLowerCase();
+
+      // Special natural constructions for common tricky words
+      if (lower === 'need') {
+        if (role === 'intro') return `recognizing an immediate ${w} for clear organization`;
+        if (role === 'action') return `the team realized they would ${w} additional time to finalize everything properly`;
+        if (role === 'pivot') return `they discovered they still had a genuine ${w} for clearer instructions`;
+        return `addressing every essential ${w} brought confidence to the group`;
+      }
+      if (lower === 'small') {
+        if (role === 'intro') return `taking note of even a ${w} initial detail`;
+        if (role === 'action') return `paying close attention to each ${w} adjustment as work unfolded`;
+        if (role === 'pivot') return `realizing that even a ${w} change in strategy could resolve the challenge`;
+        return `delivering a series of ${w} yet impactful improvements`;
+      }
+      if (lower === 'watch') {
+        if (role === 'intro') return `taking time to ${w} how the process was handled`;
+        if (role === 'action') return `pausing to ${w} the progress made so far`;
+        if (role === 'pivot') return `stepping back to carefully ${w} the outcome of the initial trial`;
+        return `taking pride in being able to ${w} their hard work bear fruit`;
+      }
+      if (lower === 'start') {
+        if (role === 'intro') return `taking the initiative to ${w} the morning with clear intentions`;
+        if (role === 'action') return `working diligently to ${w} on the core milestones without hesitation`;
+        if (role === 'pivot') return `it was helpful to ${w} fresh with an updated perspective`;
+        return `knowing that a steady ${w} had set the stage for great results`;
+      }
+
       if (pos === 'verb') {
-        if (role === 'intro') return `early on, ${protagonist} took decisive steps to ${w} key components of the assignment`;
-        if (role === 'action') return `collaborating closely with colleagues to ${w} every detail with precision`;
-        if (role === 'pivot') return `it was essential to ${w} before moving to the next deliverable`;
-        return `the effort invested to ${w} produced outstanding results for the entire group`;
+        if (role === 'intro') return `taking decisive action to ${w} the initial phase smoothly`;
+        if (role === 'action') return `working side by side to ${w} the key steps effectively`;
+        if (role === 'pivot') return `it became crucial to ${w} the pending action before proceeding`;
+        return `investing genuine effort to ${w} the process produced rewarding outcomes`;
       }
       if (pos === 'adjective') {
-        if (role === 'intro') return `achieving a ${w} balance required patience, active listening, and steady focus`;
-        if (role === 'action') return `the team remained ${w} to adapt their strategy as new feedback arrived`;
-        if (role === 'pivot') return `recognizing that while circumstances were rarely ${w}, steady dedication made all the difference`;
-        return `delivering a ${w} outcome brought genuine pride to everyone involved`;
+        if (role === 'intro') return `maintaining a ${w} outlook as the schedule got underway`;
+        if (role === 'action') return `ensuring that the workflow remained ${w} and coordinated`;
+        if (role === 'pivot') return `adapting to unexpected feedback while staying ${w} and determined`;
+        return `achieving a ${w} result that satisfied everyone involved`;
       }
       if (pos === 'adverb') {
-        if (role === 'intro') return `approaching the morning schedule ${w} established a clear rhythm for the day`;
-        if (role === 'action') return `working ${w} alongside the team prevented unnecessary misunderstandings`;
-        return `moving forward ${w} ensured that all milestones were met on schedule`;
+        if (role === 'intro') return `approaching the day ${w} set a steady pace`;
+        if (role === 'action') return `communicating ${w} with peers prevented misunderstandings`;
+        return `moving forward ${w} ensured that goals were achieved smoothly`;
       }
-      if (role === 'intro') return `${protagonist} focused early attention on understanding the core ${w}`;
-      if (role === 'action') return `maintaining transparent communication around each ${w} kept the momentum strong`;
-      if (role === 'pivot') return `taking time to address the primary ${w} resolved pending questions`;
-      return `celebrating the successful delivery of the ${w} concluded a deeply rewarding day`;
+      if (role === 'intro') return `directing attention toward the central ${w}`;
+      if (role === 'action') return `coordinating tasks around each important ${w}`;
+      if (role === 'pivot') return `evaluating the impact of this particular ${w} clarified the next steps`;
+      return `celebrating the successful completion of the ${w}`;
     };
 
     const total = profiles.length;
@@ -1118,18 +1184,18 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
 
     const p1Parts: string[] = [];
     if (p1Words.length >= 1) {
-      p1Parts.push(`The working session began with clear intention as ${buildNaturalClause(p1Words[0], 'intro')}.`);
+      p1Parts.push(`The day commenced with focus as Alex gathered materials, ${buildNaturalClause(p1Words[0], 'intro')}.`);
     } else {
-      p1Parts.push(`The day commenced with clear focus as the team gathered to coordinate priorities.`);
+      p1Parts.push(`The day commenced with clear focus as the group gathered to coordinate priorities.`);
     }
-    p1Parts.push(`Aligning on concrete objectives from the outset gave everyone confidence to move forward smoothly.`);
+    p1Parts.push(`Establishing shared objectives early on gave the team confidence to move forward smoothly.`);
     p1 = p1Parts.join(' ');
 
     const p2Parts: string[] = [];
     if (p2Words.length >= 1) {
-      p2Parts.push(`During the morning collaboration, ${buildNaturalClause(p2Words[0], 'action')}.`);
+      p2Parts.push(`During the morning session, ${buildNaturalClause(p2Words[0], 'action')}.`);
     } else {
-      p2Parts.push(`During the midday collaboration, team members shared actionable insights and coordinated their efforts.`);
+      p2Parts.push(`During the morning session, colleagues shared actionable insights and coordinated their efforts.`);
     }
     if (p2Words.length >= 2) {
       p2Parts.push(`At the same time, ${buildNaturalClause(p2Words[1], 'action')}.`);
@@ -1142,57 +1208,57 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
     if (p3Words.length >= 1) {
       p3Parts.push(`As the afternoon progressed, ${buildNaturalClause(p3Words[0], 'pivot')}.`);
     } else {
-      p3Parts.push(`Navigating unexpected questions during the project review required creative problem-solving.`);
+      p3Parts.push(`Navigating unexpected questions during the review required creative problem-solving.`);
     }
-    p3Parts.push(`Taking time to review feedback with colleagues clarified the best route to achieve top quality.`);
+    p3Parts.push(`Taking time to review feedback with peers clarified the best route to achieve top quality.`);
     p3 = p3Parts.join(' ');
 
     const p4Parts: string[] = [];
     if (p4Words.length >= 1) {
-      p4Parts.push(`Before wrapping up the day, ${buildNaturalClause(p4Words[0], 'conclusion')}.`);
+      p4Parts.push(`Before concluding the session, ${buildNaturalClause(p4Words[0], 'conclusion')}.`);
     } else {
       p4Parts.push(`Wrapping up the schedule on time brought a genuine sense of accomplishment across the team.`);
     }
-    p4Parts.push(`Finishing each milestone with care proved once again that thoughtful collaboration and steady habits create lasting professional success.`);
+    p4Parts.push(`Reflecting on the experience proved once again that thoughtful collaboration and steady habits create lasting confidence.`);
     p4 = p4Parts.join(' ');
 
     questions.push({
       id: 'q-1',
-      question: `According to the narrative, what did ${protagonist} do at the start of the working session?`,
+      question: `According to the narrative, how did the group begin their day?`,
       options: [
-        `Took decisive steps to establish clear focus and coordinate core objectives early on.`,
-        `Decided to cancel all scheduled commitments and postpone the project until next week.`,
-        `Left the working area completely without informing colleagues or sharing instructions.`,
-        `Refused to communicate with team members during the morning session.`,
+        `By establishing shared objectives and focusing on immediate priorities.`,
+        `By canceling their scheduled plans and leaving the venue.`,
+        `By postponing all communications until the following week.`,
+        `By refusing to cooperate with colleagues during the morning.`,
       ],
       correctAnswer: 0,
-      explanation: `The opening paragraph explains that ${protagonist} began the working session with clear intention to coordinate core objectives early on.`,
+      explanation: `The opening paragraph explains that establishing shared objectives early gave the team confidence to proceed.`,
     });
 
     questions.push({
       id: 'q-2',
-      question: `How did ${protagonist} and the team maintain productive momentum during the collaboration?`,
+      question: `What helped the team maintain momentum during the collaboration?`,
       options: [
-        `By addressing key deliverables proactively and collaborating transparently through practical steps.`,
-        `By working in total isolation and declining to review ongoing assignments.`,
-        `By deleting their existing project files and starting over from scratch.`,
-        `By postponing their daily responsibilities until the following month.`,
+        `Addressing practical challenges step by step and reviewing feedback together.`,
+        `Ignoring suggestions from colleagues and working in isolation.`,
+        `Discarding their project notes and starting over from the beginning.`,
+        `Leaving the workspace early without completing the tasks.`,
       ],
       correctAnswer: 0,
-      explanation: `The middle sections emphasize that addressing key deliverables proactively and transparently kept momentum strong.`,
+      explanation: `The middle paragraphs highlight that addressing steps together and reviewing feedback clarified the best path forward.`,
     });
 
     questions.push({
       id: 'q-3',
-      question: `What was the primary takeaway emphasized by the team at the end of the day?`,
+      question: `What was the key takeaway emphasized at the conclusion of the story?`,
       options: [
-        `That thoughtful collaboration, steady habits, and clear communication create lasting success.`,
-        `That establishing daily routines creates unnecessary complications in the workplace.`,
-        `That team members should avoid coordinating tasks with one another.`,
-        `That planning ahead has no meaningful influence on weekly milestones.`,
+        `That thoughtful collaboration and steady habits create lasting confidence.`,
+        `That planning ahead creates unnecessary complications in daily routines.`,
+        `That team members should avoid discussing challenges with each other.`,
+        `That morning preparation has no influence on afternoon results.`,
       ],
       correctAnswer: 0,
-      explanation: `The concluding paragraph highlights that thoughtful collaboration and steady habits create lasting professional success.`,
+      explanation: `The concluding paragraph highlights that thoughtful collaboration and steady habits create lasting confidence.`,
     });
   }
 

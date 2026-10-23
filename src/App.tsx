@@ -7195,6 +7195,7 @@ export default function App() {
       activeStudyDays={userProfile?.weeklyStudyDays}
       weeklyCycle={userProfile?.weeklyCycle || 1}
       weeklyChecks={weeklyChecks}
+      routinesByDay={routinesByDay}
       onChangeDay={(day) => setHomeworkTargetDay(day)}
       onSaveProgress={(updated) => {
         const activeDay = updated.targetDay || homeworkTargetDay;
