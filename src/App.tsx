@@ -33,7 +33,12 @@ import {
   DEFAULT_TEACHER_TIMEZONE,
 } from './utils/timezone';
 import { getTodayDayOfWeek, DAYS_OF_WEEK } from './utils/notifications';
-import { generateWeeklyHomeworkFromRoutines, generateWeeklyHomeworkWithAi } from './utils/homeworkGenerator';
+import {
+  generateWeeklyHomeworkFromRoutines,
+  generateWeeklyHomeworkWithAi,
+  isActivityStartedOrAnswered,
+  getDayOfWeekFromDateString,
+} from './utils/homeworkGenerator';
 import { normalizeStudentLevel, fetchTracksForStudentLevel } from './utils/spotify';
 import { executeStartNewWeek } from './utils/StartNewWeekHandler';
 import {
@@ -950,9 +955,10 @@ export default function App() {
       userProfile,
       excludedWords: excludedDictionaryWords,
       existingDailyActivities: weeklyHomework?.dailyActivities,
+      lessons,
     });
 
-    // HOTFIX 2.3.5 / 2.3.5B (Etapa 3 & 5): Manage independent daily activities per targetDay and cycle
+    // HOTFIX 2.3.5 / 2.3.5B / 2.3.5J: Manage independent daily activities per targetDay and cycle with strict vocabulary priority
     setWeeklyHomework((prev) => {
       const prevCycle = parseWeekCycleNumber(prev?.weeklyCycle ?? prev?.weekId ?? prev?.id);
       const genCycle = parseWeekCycleNumber(generated?.weeklyCycle ?? generated?.weekId ?? generated?.id);
@@ -975,64 +981,55 @@ export default function App() {
       if (prev?.targetDay) {
         const pDay = prev.targetDay;
         const currentSnap = combinedDaily[pDay] || {};
-        const hasPrevAnswers = Boolean(
-          prev.studentAnswers &&
-          (Object.keys(prev.studentAnswers.matching || {}).length > 0 ||
-            Object.keys(prev.studentAnswers.fillInBlanks || {}).length > 0 ||
-            Object.keys(prev.studentAnswers.sentences || {}).length > 0 ||
-            Object.keys(prev.studentAnswers.quizAnswers || {}).length > 0)
-        );
-        combinedDaily[pDay] = {
-          ...currentSnap,
-          id: currentSnap.id || `hw-${pDay}-${prev.weeklyCycle || 1}`,
-          day: pDay,
-          weeklyCycle: prev.weeklyCycle || 1,
-          studentUid: prev.studentUid || userProfile?.id || (userProfile as any)?.uid || '',
-          selectedWords: (Array.isArray(prev.vocabularyList) && prev.vocabularyList.length > 0)
-            ? prev.vocabularyList
-            : (currentSnap.selectedWords || []),
-          wordOrigins: currentSnap.wordOrigins || [],
-          matchingPairs: (Array.isArray(prev.matchingPairs) && prev.matchingPairs.length > 0)
-            ? prev.matchingPairs
-            : (currentSnap.matchingPairs || []),
-          fillInBlanks: (Array.isArray(prev.fillInBlanks) && prev.fillInBlanks.length > 0)
-            ? prev.fillInBlanks
-            : (currentSnap.fillInBlanks || []),
-          sentenceWritingPrompts: (Array.isArray(prev.sentenceWritingPrompts) && prev.sentenceWritingPrompts.length > 0)
-            ? prev.sentenceWritingPrompts
-            : (currentSnap.sentenceWritingPrompts || []),
-          readingPassage: prev.readingPassage?.text ? prev.readingPassage : currentSnap.readingPassage,
-          studentAnswers: hasPrevAnswers ? prev.studentAnswers : (currentSnap.studentAnswers || prev.studentAnswers),
-          partsProgress: prev.partsProgress || currentSnap.partsProgress,
-          aiEvaluation: prev.aiEvaluation || currentSnap.aiEvaluation,
-          score: typeof prev.score === 'number' ? prev.score : currentSnap.score,
-          isCompleted: Boolean(prev.completedPartsByDay?.[pDay] || prev.isCompleted || currentSnap.isCompleted),
-          isStarted: Boolean(currentSnap.isStarted || hasPrevAnswers || prev.partsProgress || prev.isCompleted),
-          updatedAt: new Date().toISOString(),
-        };
+        const isPrevStarted = isActivityStartedOrAnswered(prev as any) || isActivityStartedOrAnswered(currentSnap);
+        if (isPrevStarted) {
+          const hasPrevAnswers = Boolean(
+            prev.studentAnswers &&
+            (Object.keys(prev.studentAnswers.matching || {}).length > 0 ||
+              Object.keys(prev.studentAnswers.fillInBlanks || {}).length > 0 ||
+              Object.keys(prev.studentAnswers.sentences || {}).length > 0 ||
+              Object.keys(prev.studentAnswers.quizAnswers || {}).length > 0)
+          );
+          combinedDaily[pDay] = {
+            ...currentSnap,
+            id: currentSnap.id || `hw-${pDay}-${prev.weeklyCycle || 1}`,
+            day: pDay,
+            weeklyCycle: prev.weeklyCycle || 1,
+            studentUid: prev.studentUid || userProfile?.id || (userProfile as any)?.uid || '',
+            selectedWords: (Array.isArray(prev.vocabularyList) && prev.vocabularyList.length > 0)
+              ? prev.vocabularyList
+              : (currentSnap.selectedWords || []),
+            wordOrigins: currentSnap.wordOrigins || [],
+            matchingPairs: (Array.isArray(prev.matchingPairs) && prev.matchingPairs.length > 0)
+              ? prev.matchingPairs
+              : (currentSnap.matchingPairs || []),
+            fillInBlanks: (Array.isArray(prev.fillInBlanks) && prev.fillInBlanks.length > 0)
+              ? prev.fillInBlanks
+              : (currentSnap.fillInBlanks || []),
+            sentenceWritingPrompts: (Array.isArray(prev.sentenceWritingPrompts) && prev.sentenceWritingPrompts.length > 0)
+              ? prev.sentenceWritingPrompts
+              : (currentSnap.sentenceWritingPrompts || []),
+            readingPassage: prev.readingPassage?.text ? prev.readingPassage : currentSnap.readingPassage,
+            studentAnswers: hasPrevAnswers ? prev.studentAnswers : (currentSnap.studentAnswers || prev.studentAnswers),
+            partsProgress: prev.partsProgress || currentSnap.partsProgress,
+            aiEvaluation: prev.aiEvaluation || currentSnap.aiEvaluation,
+            score: typeof prev.score === 'number' ? prev.score : currentSnap.score,
+            isCompleted: Boolean(prev.completedPartsByDay?.[pDay] || prev.isCompleted || currentSnap.isCompleted),
+            isStarted: true,
+            updatedAt: new Date().toISOString(),
+          };
+        }
       }
 
       // If user is switching to homeworkTargetDay:
-      // If we already have a snapshot for homeworkTargetDay, restore that day's questions, words, and answers!
+      // If we already have a snapshot for homeworkTargetDay:
       const targetSnapshot = combinedDaily[homeworkTargetDay];
+      const isTargetStarted = isActivityStartedOrAnswered(targetSnapshot);
 
-      // If same day as prev, keep prev active state
+      // If same day as prev and target has been started, keep prev active state
       if (prev && isSameWeek && prev.targetDay === homeworkTargetDay) {
-        const hasValidEvaluation = Boolean(
-          prev?.aiEvaluation &&
-          isValidHomeworkEvaluation(prev.aiEvaluation) &&
-          !isSyntheticHomeworkEvaluation(prev.aiEvaluation)
-        );
-
-        const hasStudentAnswers = Boolean(
-          prev?.studentAnswers &&
-          (Object.keys(prev.studentAnswers.matching || {}).length > 0 ||
-            Object.keys(prev.studentAnswers.fillInBlanks || {}).length > 0 ||
-            Object.keys(prev.studentAnswers.sentences || {}).length > 0 ||
-            Object.keys(prev.studentAnswers.quizAnswers || {}).length > 0)
-        );
-
-        if (hasValidEvaluation || hasStudentAnswers || prev.isCompleted || (typeof prev.score === 'number' && prev.score > 0)) {
+        const isPrevStarted = isActivityStartedOrAnswered(prev as any);
+        if (isPrevStarted) {
           return {
             ...generated,
             ...prev,
@@ -1060,8 +1057,8 @@ export default function App() {
         }
       }
 
-      // If switching to a different day or initializing homeworkTargetDay:
-      if (targetSnapshot && targetSnapshot.selectedWords && targetSnapshot.selectedWords.length > 0) {
+      // If targetSnapshot exists and has been started/answered, restore it:
+      if (targetSnapshot && targetSnapshot.selectedWords && targetSnapshot.selectedWords.length > 0 && isTargetStarted) {
         return {
           ...generated,
           targetDay: homeworkTargetDay,
@@ -1092,6 +1089,36 @@ export default function App() {
         };
       }
 
+      // Otherwise, the activity for homeworkTargetDay has not been started.
+      // Use freshly generated activities with the newly saved/resolved vocabulary:
+      const updatedDailyActivities = {
+        ...combinedDaily,
+        [homeworkTargetDay]: generated.dailyActivities?.[homeworkTargetDay] || {
+          id: `hw-${homeworkTargetDay}-${userProfile?.weeklyCycle || 1}`,
+          day: homeworkTargetDay,
+          weeklyCycle: userProfile?.weeklyCycle || 1,
+          studentUid: (currentAccount?.uid || userProfile?.id || (userProfile as any)?.uid || '').trim(),
+          selectedWords: generated.vocabularyList || [],
+          wordOrigins: (generated as any).wordOrigins || [],
+          matchingPairs: generated.matchingPairs || [],
+          fillInBlanks: generated.fillInBlanks || [],
+          sentenceWritingPrompts: generated.sentenceWritingPrompts || [],
+          readingPassage: generated.readingPassage,
+          isCompleted: false,
+          isStarted: false,
+          score: 0,
+          studentAnswers: {
+            matching: {},
+            fillInBlanks: {},
+            sentences: {},
+            quizAnswers: {},
+          },
+          partsProgress: {},
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+      };
+
       return {
         ...generated,
         targetDay: homeworkTargetDay,
@@ -1110,10 +1137,10 @@ export default function App() {
         },
         aiEvaluation: undefined,
         score: 0,
-        dailyActivities: combinedDaily,
+        dailyActivities: updatedDailyActivities,
       };
     });
-  }, [routinesByDay, userProfile.name, userProfile.level, studentDictionaryEntries, excludedDictionaryWords, homeworkTargetDay, userProfile?.weeklyStudyDays, userProfile?.weeklyCycle]);
+  }, [routinesByDay, userProfile.name, userProfile.level, studentDictionaryEntries, excludedDictionaryWords, homeworkTargetDay, userProfile?.weeklyStudyDays, userProfile?.weeklyCycle, lessons]);
 
   // Synchronize completedPartsByDay from weeklyChecks so memorization S-Path checks are always in sync
   useEffect(() => {
@@ -6011,11 +6038,16 @@ export default function App() {
     // Also include vocabulary words noted by teacher during live lessons
     (lessons || []).forEach((l) => {
       if (l && Array.isArray(l.vocabularyNotes) && l.vocabularyNotes.length > 0) {
+        const lessonDay = getDayOfWeekFromDateString(
+          l.sessionDate || l.startDateTime,
+          userProfile?.timezone || DEFAULT_STUDENT_TIMEZONE
+        );
         l.vocabularyNotes.forEach((vn) => {
           if (vn && vn.word && vn.word.trim()) {
             list.push({
               word: vn.word.trim(),
               sourceActivityName: `Live Session with ${l.teacherName || 'Native Friend'}`,
+              sourceDay: lessonDay || undefined,
             });
           }
         });
@@ -7165,7 +7197,7 @@ export default function App() {
       weeklyChecks={weeklyChecks}
       onChangeDay={(day) => setHomeworkTargetDay(day)}
       onSaveProgress={(updated) => {
-        const activeDay = homeworkTargetDay;
+        const activeDay = updated.targetDay || homeworkTargetDay;
         const currentDaily = { ...(updated.dailyActivities || weeklyHomework?.dailyActivities || {}) };
         const resolvedUid = (currentAccount?.uid || userProfile?.id || (userProfile as any)?.uid || '').trim();
         if (activeDay) {
@@ -7213,7 +7245,7 @@ export default function App() {
         }
       }}
       onSubmitToTeacher={(updated) => {
-        const activeDay = homeworkTargetDay;
+        const activeDay = updated.targetDay || homeworkTargetDay;
         const currentDaily = { ...(updated.dailyActivities || weeklyHomework?.dailyActivities || {}) };
         const resolvedUid = (currentAccount?.uid || userProfile?.id || (userProfile as any)?.uid || '').trim();
         if (activeDay) {
@@ -7252,7 +7284,7 @@ export default function App() {
         }
         const wordsUsed = updated?.vocabularyList?.map((w) => w.word) || [];
         if (wordsUsed.length > 0) {
-          handleMarkDailyMemorizationPracticed(homeworkTargetDay, wordsUsed);
+          handleMarkDailyMemorizationPracticed(activeDay, wordsUsed);
         }
         setNotifications((prev) => [
           {

@@ -249,6 +249,8 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
   const handleSelectDay = (newDay: DayOfWeek) => {
     setInternalDay(newDay);
+    const newSchedule = getDailyMemorizationSchedule(newDay, activeStudyDays, weeklyCycle || 1);
+    setActiveTab(newSchedule.partKey);
     if (onChangeDay) {
       onChangeDay(newDay);
     }
@@ -598,40 +600,27 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     }
   }, [activeTab, isMatchingComplete, isFillComplete, isWritingComplete, isReadingComplete]);
 
-  const getDayForPart = useCallback(
-    (partKey: string): DayOfWeek => {
-      const activeList =
-        Array.isArray(activeStudyDays) && activeStudyDays.length > 0
-          ? activeStudyDays
-          : (['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'] as DayOfWeek[]);
-      for (const d of activeList) {
-        const sched = getDailyMemorizationSchedule(d, activeStudyDays, weeklyCycle || 1);
-        if (sched.partKey === partKey) return d;
-      }
-      return targetDay;
-    },
-    [activeStudyDays, weeklyCycle, targetDay]
-  );
-
   // Per-part completion indicators
   const isPart1Completed = Boolean(
     partsProgress.matching?.status === 'completed' ||
-    homework?.completedPartsByDay?.[getDayForPart('matching')]
+    (dailySchedule.partKey === 'matching' && isTodayPartCompleted)
   );
   const isPart2Completed = Boolean(
     partsProgress.fill?.status === 'completed' ||
-    homework?.completedPartsByDay?.[getDayForPart('fill')]
+    (dailySchedule.partKey === 'fill' && isTodayPartCompleted)
   );
   const isPart3Completed = Boolean(
     partsProgress.writing?.status === 'completed' ||
-    (hasGenuineEvaluation && isWritingComplete)
+    (hasGenuineEvaluation && isWritingComplete) ||
+    (dailySchedule.partKey === 'writing' && isTodayPartCompleted)
   );
   const isPart4Completed = Boolean(
     partsProgress.reading?.status === 'completed' ||
-    homework?.completedPartsByDay?.[getDayForPart('reading')]
+    (dailySchedule.partKey === 'reading' && isTodayPartCompleted)
   );
 
   // Event-driven helper to synchronously mark S-Path completed and persist to state/DB
+  // Strictly records completion for the selected day executed, preserving rotation of parts
   const markSPathCompleted = useCallback(
     (day: DayOfWeek, partKey: string, updatedPartsProgress?: WeeklyHomeworkData['partsProgress']) => {
       const effectiveEvaluation = aiEvaluation || homework?.aiEvaluation;
@@ -645,8 +634,36 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
         effectivePartsProgress.reading?.status === 'completed'
       );
 
+      const currentDaily = { ...(homework?.dailyActivities || {}) };
+      currentDaily[day] = {
+        ...(currentDaily[day] || {}),
+        id: currentDaily[day]?.id || `hw-${day}-${weeklyCycle || 1}`,
+        day: day,
+        weeklyCycle: weeklyCycle || 1,
+        studentUid: homework?.studentUid || '',
+        selectedWords: activeDayActivity?.selectedWords || homework?.vocabularyList || [],
+        wordOrigins: activeDayActivity?.wordOrigins || [],
+        matchingPairs: activeDayActivity?.matchingPairs || homework?.matchingPairs || [],
+        fillInBlanks: activeDayActivity?.fillInBlanks || homework?.fillInBlanks || [],
+        sentenceWritingPrompts: activeDayActivity?.sentenceWritingPrompts || homework?.sentenceWritingPrompts || [],
+        readingPassage: activeDayActivity?.readingPassage || homework?.readingPassage,
+        studentAnswers: {
+          matching: { ...(homework?.studentAnswers?.matching || {}), ...matchingAnswers },
+          fillInBlanks: { ...(homework?.studentAnswers?.fillInBlanks || {}), ...fillAnswers },
+          sentences: { ...(homework?.studentAnswers?.sentences || {}), ...sentenceAnswers },
+          quizAnswers: { ...(homework?.studentAnswers?.quizAnswers || {}), ...quizAnswers },
+        },
+        partsProgress: effectivePartsProgress,
+        aiEvaluation: effectiveEvaluation,
+        score: effectiveScore,
+        isCompleted: true,
+        isStarted: true,
+        updatedAt: new Date().toISOString(),
+      };
+
       const updated: WeeklyHomeworkData = {
         ...homework,
+        targetDay: day,
         isDayPartCompleted: true,
         completedPartsByDay: {
           ...(homework?.completedPartsByDay || {}),
@@ -662,6 +679,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
         aiEvaluation: effectiveEvaluation,
         score: effectiveScore,
         isCompleted: allFourDone || Boolean(homework?.isCompleted),
+        dailyActivities: currentDaily,
       };
 
       onSaveProgress(updated);
@@ -669,7 +687,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
         onCompleteTodayPart(partKey as any, day);
       }
     },
-    [homework, matchingAnswers, fillAnswers, sentenceAnswers, quizAnswers, onSaveProgress, onCompleteTodayPart, aiEvaluation, partsProgress]
+    [homework, matchingAnswers, fillAnswers, sentenceAnswers, quizAnswers, onSaveProgress, onCompleteTodayPart, aiEvaluation, partsProgress, weeklyCycle, activeDayActivity]
   );
 
   // Dedicated Save Handlers per part
@@ -711,8 +729,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       };
       setPartsProgress(nextPartsProgress);
 
-      const dayForPart = getDayForPart('matching');
-      markSPathCompleted(dayForPart, 'matching', nextPartsProgress);
+      markSPathCompleted(targetDay, 'matching', nextPartsProgress);
 
       setSubmittedFeedbackToast(
         isEn
@@ -763,8 +780,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       };
       setPartsProgress(nextPartsProgress);
 
-      const dayForPart = getDayForPart('fill');
-      markSPathCompleted(dayForPart, 'fill', nextPartsProgress);
+      markSPathCompleted(targetDay, 'fill', nextPartsProgress);
 
       setSubmittedFeedbackToast(
         isEn
@@ -855,8 +871,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       const finalParts = { ...partsProgress, writing: completedPart };
       setPartsProgress(finalParts);
 
-      const dayForPart = getDayForPart('writing');
-      markSPathCompleted(dayForPart, 'writing', finalParts);
+      markSPathCompleted(targetDay, 'writing', finalParts);
 
       setSubmittedFeedbackToast(
         isEn
@@ -908,8 +923,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       const finalParts = { ...partsProgress, writing: completedPart };
       setPartsProgress(finalParts);
 
-      const dayForPart = getDayForPart('writing');
-      markSPathCompleted(dayForPart, 'writing', finalParts);
+      markSPathCompleted(targetDay, 'writing', finalParts);
 
       setSubmittedFeedbackToast(
         isEn
@@ -1006,8 +1020,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       const finalParts = { ...partsProgress, reading: completedPart };
       setPartsProgress(finalParts);
 
-      const dayForPart = getDayForPart('reading');
-      markSPathCompleted(dayForPart, 'reading', finalParts);
+      markSPathCompleted(targetDay, 'reading', finalParts);
 
       setSubmittedFeedbackToast(
         isEn
@@ -1064,8 +1077,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       const finalParts = { ...partsProgress, reading: completedPart };
       setPartsProgress(finalParts);
 
-      const dayForPart = getDayForPart('reading');
-      markSPathCompleted(dayForPart, 'reading', finalParts);
+      markSPathCompleted(targetDay, 'reading', finalParts);
 
       // Check if all 4 parts are now completed
       const allPartsCompleted = Boolean(
