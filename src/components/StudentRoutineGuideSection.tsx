@@ -739,23 +739,11 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
   });
   const [isLoadingSpotify, setIsLoadingSpotify] = useState<boolean>(false);
 
-  // Dynamic Spotify track fetch and cache validation when student level is active
+  // HOTFIX SPOTIFY — PLAYLISTS OFICIAIS:
+  // Eliminated Spotify Web API calls for individual song selection in daily listening activity.
   useEffect(() => {
     checkAndInvalidateSpotifyCache();
-    setIsLoadingSpotify(true);
-    // Triggers https://api.spotify.com/v1/playlists/{playlistId}/tracks (e.g. 34E52K1dEJO5CzZRPkIR4I for Intermediate)
-    fetchTracksForStudentLevel(normalizedLevel)
-      .then((tracks) => {
-        if (tracks && tracks.length > 0) {
-          setLiveSpotifyTracks(tracks);
-        }
-      })
-      .catch((err) => {
-        console.warn('Erro ao carregar faixas do Spotify em tempo real:', err);
-      })
-      .finally(() => {
-        setIsLoadingSpotify(false);
-      });
+    setIsLoadingSpotify(false);
   }, [normalizedLevel]);
 
   // Daily Exclusivity (1 song per study day) based on student's active plan and weekly cycle
@@ -950,7 +938,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
       !isLevelMismatchedAudio &&
       !isAssignedPlaylistMismatched &&
       assignedSpotify.url.trim() !== '' &&
-      assignedSpotify.url.trim() !== (currentDayTrack?.url || dailySpotifyTrack.url).trim()
+      assignedSpotify.url.trim() !== (currentDayTrack?.url || dailySpotifyTrack?.url || '').trim()
     )
   );
 
@@ -970,22 +958,21 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
       ? (getSpotifyEmbedUrl(assignedSpotify.url) || currentDayTrack?.embedUrl || '')
       : (currentDayTrack?.embedUrl || ''));
 
-  // Strict daily exclusivity: Guarantee 1 single track embed (never full playlist)
+  // HOTFIX SPOTIFY — PLAYLISTS OFICIAIS:
+  // Direct presentation of official playlist for student's level
   const sanitizedEmbedUrl = useMemo(() => {
-    if (!effectiveEmbedUrl) return '';
-    if (effectiveEmbedUrl.includes('/embed/playlist/')) {
-      const trackId = currentDayTrack?.trackId && !currentDayTrack.trackId.startsWith('http')
-        ? currentDayTrack.trackId
-        : '7qiZfU4dY1lWllzX7mPBI3';
-      return `https://open.spotify.com/embed/track/${trackId}?utm_source=generator&theme=0`;
+    if (teacherOverride?.url) {
+      return teacherOverride.embedUrl || getSpotifyEmbedUrl(teacherOverride.url) || levelPlaylistConfig.embedPlaylistUrl;
     }
-    return effectiveEmbedUrl;
-  }, [effectiveEmbedUrl, currentDayTrack]);
-  const effectiveDirectUrl = teacherOverride?.url
-    ? getSpotifyDirectUrl(teacherOverride.url)
-    : (hasTeacherCustomAudio && assignedSpotify?.url
-      ? getSpotifyDirectUrl(assignedSpotify.url)
-      : (currentDayTrack?.url || levelPlaylistConfig.playlistUrl));
+    return levelPlaylistConfig.embedPlaylistUrl;
+  }, [teacherOverride, levelPlaylistConfig]);
+
+  const effectiveDirectUrl = useMemo(() => {
+    if (teacherOverride?.url) {
+      return getSpotifyDirectUrl(teacherOverride.url);
+    }
+    return levelPlaylistConfig.playlistUrl;
+  }, [teacherOverride, levelPlaylistConfig]);
   const effectiveCoverUrl = teacherOverride?.coverUrl || teacherOverride?.imageUrl || currentDayTrack?.imageUrl || (currentDayTrack?.albumImages && currentDayTrack.albumImages[0]?.url) || '';
   const effectiveTeacherTip = teacherOverride?.instructions
     ? teacherOverride.instructions

@@ -45,6 +45,7 @@ import {
   getSpotifyContentType,
   getSpotifyDirectUrl,
   CORRUPT_SPOTIFY_IDS,
+  SPOTIFY_PLAYLIST_IDS,
 } from '../utils/spotify';
 import { Translations, getActivityDisplayName } from '../utils/i18n';
 import { defaultRoutinesByDay } from '../data/defaultRoutines';
@@ -491,14 +492,14 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
           activeSpotType = toAudioType(itemWithSpot.teacherSpotify.type, itemWithSpot.teacherSpotify.url);
         } else {
           // Strictly synchronize with what student sees by default for their level
-          activeSpotUrl = defaultDailyTrack.url;
+          activeSpotUrl = defaultDailyTrack?.url || '';
           activeSpotType = 'music';
         }
 
         // Auto-sanitize on load: if broken or corrupted link, fallback cleanly to level default
         const parsedSpot = parseSpotifyUrl(activeSpotUrl);
         if (!parsedSpot.isValid) {
-          activeSpotUrl = defaultDailyTrack.url;
+          activeSpotUrl = defaultDailyTrack?.url || '';
           activeSpotType = 'music';
         } else if (parsedSpot.canonicalUrl) {
           activeSpotUrl = parsedSpot.canonicalUrl;
@@ -1134,11 +1135,12 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
   // Handler: Reset a day's Spotify track to the student's verified level default
   const handleResetToDefaultTrack = (dayId: DayOfWeek) => {
     const defaultTrack = getDailySpotifyTrackForStudent(currentNormalizedLevel, dayId);
-    setSpotifyUrls((prev) => ({ ...prev, [dayId]: defaultTrack.url }));
+    const fallbackUrl = defaultTrack?.url || `https://open.spotify.com/playlist/${SPOTIFY_PLAYLIST_IDS[currentNormalizedLevel] || SPOTIFY_PLAYLIST_IDS.beginner}`;
+    setSpotifyUrls((prev) => ({ ...prev, [dayId]: fallbackUrl }));
     setSpotifyTypes((prev) => ({ ...prev, [dayId]: 'music' }));
     setSpotValidationErrors((prev) => ({ ...prev, [dayId]: '' }));
     setPlayerFallbackMode((prev) => ({ ...prev, [dayId]: false }));
-    handleSaveSpotifyDay(dayId, defaultTrack.url, 'music');
+    handleSaveSpotifyDay(dayId, fallbackUrl, 'music');
   };
 
   // Handler: Reset active study days to verified curriculum tracks with one click
@@ -1150,9 +1152,10 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
 
       for (const day of activeWeekDays) {
         const defTrack = getDailySpotifyTrackForStudent(currentNormalizedLevel, day.id);
-        updatedUrls[day.id] = defTrack.url;
+        const fallbackUrl = defTrack?.url || `https://open.spotify.com/playlist/${SPOTIFY_PLAYLIST_IDS[currentNormalizedLevel] || SPOTIFY_PLAYLIST_IDS.beginner}`;
+        updatedUrls[day.id] = fallbackUrl;
         updatedTypes[day.id] = 'music';
-        await handleSaveSpotifyDay(day.id, defTrack.url, 'music');
+        await handleSaveSpotifyDay(day.id, fallbackUrl, 'music');
       }
 
       setSpotifyUrls(updatedUrls);
@@ -1205,7 +1208,7 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
 
     const parsed = parseSpotifyUrl(rawUrl);
     const canonicalUrl = parsed.isValid && parsed.canonicalUrl ? parsed.canonicalUrl : rawUrl;
-    const isDefault = canonicalUrl === defaultTrack.url.trim();
+    const isDefault = Boolean(defaultTrack?.url && canonicalUrl === defaultTrack.url.trim());
 
     // Ensure input field is populated with the clean canonical URL
     if (canonicalUrl !== spotifyUrls[dayId]) {
@@ -1218,13 +1221,13 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
       finalSpotify = {
         id: `spot-${dayId}-${Date.now()}`,
         url: canonicalUrl,
-        title: isDefault
+        title: (isDefault && defaultTrack?.title)
           ? defaultTrack.title
           : type === 'podcast'
           ? 'Recommended English Podcast'
           : 'Recommended English Song',
-        artistOrHost: isDefault ? defaultTrack.artist : (currentAccount?.name || 'Native Friend'),
-        instructions: isDefault
+        artistOrHost: (isDefault && defaultTrack?.artist) ? defaultTrack.artist : (currentAccount?.name || 'Native Friend'),
+        instructions: (isDefault && defaultTrack?.teacherTipEn)
           ? defaultTrack.teacherTipEn
           : 'Listen attentively to practice your listening comprehension.',
         type,

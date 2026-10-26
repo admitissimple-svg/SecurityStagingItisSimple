@@ -2756,9 +2756,6 @@ export default function App() {
         });
       }
 
-      // Pre-fetch and cache Spotify playlist tracks for the selected student level
-      const normLevel = normalizeStudentLevel(selectedLevel);
-      fetchTracksForStudentLevel(normLevel).catch(() => {});
 
       // Push welcome notification immediately
       setNotifications((prev) => [
@@ -3022,9 +3019,6 @@ export default function App() {
       };
       setUserProfile(freshProfile);
 
-      // Pre-fetch Spotify tracks matching student level
-      const normLevel = normalizeStudentLevel(freshProfile.level);
-      fetchTracksForStudentLevel(normLevel).catch(() => {});
     } else {
       setUserProfile(createDefaultStudentProfile(null));
     }
