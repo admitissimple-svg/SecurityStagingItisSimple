@@ -38,8 +38,6 @@ import {
   PEDAGOGICAL_PROMPT_VERSION,
 } from '../utils/pedagogicalTransformer';
 import { syncSessionVocabularyToStudentDictionary } from '../utils/sessionVocabularySync';
-import { normalizeDictionaryWord } from '../utils/studentDictionaryLibrary';
-import { getAccessToken } from '../utils/auth';
 import { getDb, auth } from '../firebase';
 import { isValidCanonicalUid } from '../utils/studentPersistence';
 import { collection, getDocs, query, where } from 'firebase/firestore';
@@ -153,51 +151,8 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
   const [selectedSessionKey, setSelectedSessionKey] = useState<string>('');
   const [isLoadingSessions, setIsLoadingSessions] = useState<boolean>(true);
 
-  // Confirmed persisted dictionary words for current student (Fase 4B.7A)
-  const [persistedWordsSet, setPersistedWordsSet] = useState<Set<string>>(new Set());
   const [isSyncingVocab, setIsSyncingVocab] = useState<boolean>(false);
   const [vocabSyncError, setVocabSyncError] = useState<string | null>(null);
-
-  // Hydrate confirmed persisted dictionary words from student's backend dictionary
-  useEffect(() => {
-    // FASE 4B.8.2: Await valid canonical authentication before querying protected dictionary data
-    if (!isOpen || !hasValidAuth) return;
-    let isMounted = true;
-
-    async function loadStudentPersistedDictionary() {
-      try {
-        const token = (await getAccessToken().catch(() => null)) || (await auth?.currentUser?.getIdToken().catch(() => null));
-        const headers: Record<string, string> = {};
-        if (token) headers['Authorization'] = `Bearer ${token}`;
-
-        // Strictly query by authenticated canonical UID only (never use studentEmail as an identity substitute)
-        const res = await fetch(
-          `/api/student-dictionary?uid=${encodeURIComponent(resolvedUid)}`,
-          { headers }
-        ).catch(() => null);
-
-        if (res && res.ok) {
-          const data = await res.json().catch(() => ({}));
-          const list: StudentDictionaryEntry[] = Array.isArray(data?.dictionary) ? data.dictionary : Array.isArray(data) ? data : [];
-          const words = new Set<string>();
-          list.forEach((entry) => {
-            const norm = normalizeDictionaryWord(entry.normalizedWord || entry.word);
-            if (norm) words.add(norm);
-          });
-          if (isMounted) {
-            setPersistedWordsSet(words);
-          }
-        }
-      } catch (err) {
-        console.warn('NativeFriendsNotes: notice loading student dictionary', err);
-      }
-    }
-
-    loadStudentPersistedDictionary();
-    return () => {
-      isMounted = false;
-    };
-  }, [isOpen, hasValidAuth, resolvedUid]);
 
   // Transformation data state
   const [transformation, setTransformation] = useState<PedagogicalLessonTransformation | null>(null);
@@ -488,15 +443,6 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
             });
 
             if (syncedEntries && syncedEntries.length > 0) {
-              setPersistedWordsSet((prev) => {
-                const next = new Set(prev);
-                syncedEntries.forEach((entry) => {
-                  const norm = normalizeDictionaryWord(entry.normalizedWord || entry.word);
-                  if (norm) next.add(norm);
-                });
-                return next;
-              });
-
               if (onVocabularySynced) {
                 onVocabularySynced(syncedEntries);
               }
