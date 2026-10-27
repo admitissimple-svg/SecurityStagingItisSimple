@@ -20,16 +20,45 @@ import crypto from 'crypto';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { getFirestoreDb } from './serverFirestore';
 
-export const DEFAULT_GEMINI_MODEL: string = 'gemini-3.5-flash';
+export const DEFAULT_GEMINI_MODEL: string = 'gemini-3.8-flash';
+
+export const DEPRECATED_LEGACY_MODELS: readonly string[] = [
+  'gemini-1.5-flash',
+  'gemini-1.5-pro',
+  'gemini-pro',
+  'gemini-2.0-flash',
+  'gemini-2.0-pro',
+  'gemini-2.0-flash-thinking',
+  'gemini-2.5-flash',
+] as const;
+
+/**
+ * Checks whether a given model identifier is a deprecated/legacy or invalid model.
+ */
+export function isLegacyOrInvalidModel(modelName: string): boolean {
+  if (!modelName || typeof modelName !== 'string') return true;
+  const clean = modelName.trim().replace(/^models\//, '').toLowerCase();
+  if (!clean || clean.length < 3) return true;
+  if (
+    clean.includes('1.5') ||
+    clean.includes('2.0') ||
+    clean.includes('2.5') ||
+    clean === 'gemini-pro' ||
+    clean === 'gemini-flash'
+  ) {
+    return true;
+  }
+  return false;
+}
 
 /**
  * Resolves the primary Gemini model from the environment variable GEMINI_MODEL.
- * Sanitizes input (stripping 'models/' prefix), ignores deprecated/legacy staging values ('gemini-2.5-flash'),
- * and safely defaults to 'gemini-3.5-flash'.
+ * Sanitizes input (stripping 'models/' prefix), rejects deprecated/legacy models,
+ * and safely defaults to 'gemini-3.8-flash'.
  */
 export function resolveGeminiModel(): string {
   const envModel = (process.env.GEMINI_MODEL || '').trim().replace(/^models\//, '');
-  if (envModel && envModel !== 'gemini-2.5-flash') {
+  if (envModel && !isLegacyOrInvalidModel(envModel)) {
     return envModel;
   }
   return DEFAULT_GEMINI_MODEL;
@@ -38,19 +67,22 @@ export function resolveGeminiModel(): string {
 export const GEMINI_FIXED_MODEL = resolveGeminiModel();
 
 /**
- * Validated 3-model contingency pool.
- * Verified available in project: gemini-3.5-flash, gemini-3.8-flash, gemini-3.1-flash-lite.
+ * Standard 3-model contingency sequence:
+ * 1. gemini-3.8-flash
+ * 2. gemini-3.5-flash-lite
+ * 3. gemini-3.1-flash-lite
  */
-export const GEMINI_CONTINGENCY_MODELS: readonly string[] = [
-  'gemini-3.5-flash',
+export const DEFAULT_CONTINGENCY_POOL: readonly string[] = [
   'gemini-3.8-flash',
+  'gemini-3.5-flash-lite',
   'gemini-3.1-flash-lite',
 ] as const;
 
+export const GEMINI_CONTINGENCY_MODELS = DEFAULT_CONTINGENCY_POOL;
+
 /**
  * Resolves the ordered list of up to three contingency models.
- * If GEMINI_MODEL is set, it becomes the primary model, followed by the remaining contingency models.
- * If GEMINI_CONTINGENCY_MODELS is explicitly configured, it sanitizes and uses that list.
+ * Preserves environment variable configuration without allowing invalid/legacy identifiers to compromise the cascade.
  */
 export function resolveGeminiContingencyModels(): string[] {
   const envContingency = (process.env.GEMINI_CONTINGENCY_MODELS || '').trim();
@@ -58,13 +90,43 @@ export function resolveGeminiContingencyModels(): string[] {
     const list = envContingency
       .split(',')
       .map((m) => m.trim().replace(/^models\//, ''))
-      .filter((m) => Boolean(m) && m !== 'gemini-2.5-flash');
-    if (list.length > 0) return list.slice(0, 3);
+      .filter((m) => Boolean(m) && !isLegacyOrInvalidModel(m));
+    if (list.length > 0) {
+      const uniqueList = Array.from(new Set(list));
+      for (const m of DEFAULT_CONTINGENCY_POOL) {
+        if (uniqueList.length >= 3) break;
+        if (!uniqueList.includes(m)) {
+          uniqueList.push(m);
+        }
+      }
+      return uniqueList.slice(0, 3);
+    }
   }
+
   const primary = resolveGeminiModel();
-  const pool = ['gemini-3.5-flash', 'gemini-3.8-flash', 'gemini-3.1-flash-lite'];
+  const pool = [...DEFAULT_CONTINGENCY_POOL];
   const ordered = [primary, ...pool.filter((m) => m !== primary)];
   return ordered.slice(0, 3);
+}
+
+/**
+ * Resolves compatible thinking configuration for Gemini models.
+ * For Gemini 3 series, utilizes thinkingLevel: LOW (via ThinkingLevel enum from @google/genai).
+ * For Gemini 4 series, utilizes thinkingLevel: LOW.
+ * For models where compatibility is not guaranteed or parameters are invalid, omits thinkingConfig completely.
+ * Indiscriminate { thinkingBudget: 0 } is strictly removed.
+ */
+export function resolveThinkingConfig(model: string): { thinkingLevel: any } | undefined {
+  const cleanModel = (model || '').trim().replace(/^models\//, '').toLowerCase();
+
+  if (cleanModel.startsWith('gemini-3') || cleanModel.startsWith('gemini-4')) {
+    if (ThinkingLevel && ThinkingLevel.LOW) {
+      return { thinkingLevel: ThinkingLevel.LOW };
+    }
+    return { thinkingLevel: 'LOW' };
+  }
+
+  return undefined;
 }
 
 export type GeminiFeature =
@@ -500,11 +562,83 @@ export function validatePayloadBounds(
 export type GeminiFailureCategory =
   | 'QUOTA_EXCEEDED'
   | 'SERVICE_UNAVAILABLE'
+  | 'MODEL_NOT_FOUND'
+  | 'MODEL_INCOMPATIBLE_CONFIG'
   | 'AUTH_ERROR'
   | 'TIMEOUT'
   | 'INVALID_RESPONSE'
   | 'POLICY_VIOLATION'
   | string;
+
+/**
+ * Detects whether an error is specifically caused by an incompatible model configuration
+ * (e.g. unsupported thinking parameters, unsupported fields for that specific model).
+ * Does not classify safety, harm, or authentication violations as config errors.
+ */
+export function isModelConfigIncompatibleError(error?: {
+  statusCode?: number;
+  category?: GeminiFailureCategory;
+  rawMessage?: string;
+} | Error | null): boolean {
+  if (!error) return false;
+  let rawMessage = '';
+  let statusCode: number | undefined;
+  let category: GeminiFailureCategory | undefined;
+
+  if (error instanceof Error) {
+    rawMessage = error.message || '';
+    statusCode = (error as any).status || (error as any).statusCode;
+  } else {
+    rawMessage = error.rawMessage || '';
+    statusCode = error.statusCode;
+    category = error.category;
+  }
+
+  if (category === 'MODEL_INCOMPATIBLE_CONFIG') return true;
+
+  const raw = rawMessage.toLowerCase();
+
+  // Preserves security & policy locks: never classify safety or auth as config incompatibility
+  if (
+    raw.includes('safety') ||
+    raw.includes('harm_category') ||
+    raw.includes('blocked') ||
+    raw.includes('policy') ||
+    raw.includes('permission') ||
+    raw.includes('api_key') ||
+    raw.includes('apikey') ||
+    raw.includes('billing') ||
+    raw.includes('quota')
+  ) {
+    return false;
+  }
+
+  const is400 = statusCode === 400 || raw.includes('400') || raw.includes('invalid_argument');
+  if (!is400) return false;
+
+  // Specific parameter or model capability incompatibility patterns
+  if (
+    raw.includes('thinking') ||
+    raw.includes('thinking_config') ||
+    raw.includes('thinking_budget') ||
+    raw.includes('thinking_level') ||
+    raw.includes('thinkingconfig') ||
+    raw.includes('thinkingbudget') ||
+    raw.includes('thinkinglevel') ||
+    raw.includes('not supported for this model') ||
+    raw.includes('not supported on model') ||
+    raw.includes('is not supported') ||
+    raw.includes('unsupported field') ||
+    raw.includes('unsupported parameter') ||
+    raw.includes('unknown field') ||
+    raw.includes('unrecognized field') ||
+    raw.includes('unsupported option')
+  ) {
+    return true;
+  }
+
+  return false;
+}
 
 export interface GeminiSingleAttemptResponse {
   text?: string;
@@ -580,8 +714,9 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
       temperature,
     };
 
-    if (modelToUse.startsWith('gemini-3') || modelToUse.startsWith('gemini-4')) {
-      config.thinkingConfig = { thinkingBudget: 0 };
+    const thinkingConfig = resolveThinkingConfig(modelToUse);
+    if (thinkingConfig) {
+      config.thinkingConfig = thinkingConfig;
     }
 
     let timerId: NodeJS.Timeout | null = null;
@@ -677,36 +812,95 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
       errMsg.toLowerCase().includes('overloaded') ||
       errMsg.toLowerCase().includes('model is experiencing high demand');
 
+    const isNotFound =
+      rawStatus === 404 ||
+      (!errMsg.toLowerCase().includes('apikey') &&
+        !errMsg.toLowerCase().includes('api key') &&
+        (errMsg.includes('404') ||
+          errMsg.toLowerCase().includes('not found') ||
+          errMsg.toLowerCase().includes('not_found')));
+
+    const isConfigIncompatible = isModelConfigIncompatibleError(err);
+
     const statusCode = isServiceUnavailable
       ? 503
-      : rawStatus || (errMsg.includes('429') ? 429 : errMsg.includes('403') ? 403 : errMsg.includes('401') ? 401 : errMsg.includes('400') ? 400 : 500);
+      : isNotFound
+      ? 404
+      : isConfigIncompatible
+      ? 400
+      : rawStatus ||
+        (errMsg.includes('429')
+          ? 429
+          : errMsg.includes('403')
+          ? 403
+          : errMsg.includes('401')
+          ? 401
+          : errMsg.includes('400')
+          ? 400
+          : 500);
 
-    const isQuota = !isServiceUnavailable && (statusCode === 429 || errMsg.toLowerCase().includes('quota') || errMsg.toLowerCase().includes('resource_exhausted'));
-    const isAuth = !isServiceUnavailable && (statusCode === 401 || statusCode === 403 || errMsg.toLowerCase().includes('permission_denied') || errMsg.toLowerCase().includes('api_key'));
-    const isTimeout = !isServiceUnavailable && (errMsg.toLowerCase().includes('timeout') || statusCode === 408);
-    const isPolicyOrBadReq = statusCode === 400 || errMsg.toLowerCase().includes('invalid_argument') || errMsg.toLowerCase().includes('safety');
+    const isQuota =
+      !isServiceUnavailable &&
+      !isNotFound &&
+      (statusCode === 429 ||
+        errMsg.toLowerCase().includes('quota') ||
+        errMsg.toLowerCase().includes('resource_exhausted'));
+
+    const isAuth =
+      !isServiceUnavailable &&
+      !isNotFound &&
+      (statusCode === 401 ||
+        statusCode === 403 ||
+        errMsg.toLowerCase().includes('permission_denied') ||
+        errMsg.toLowerCase().includes('permission denied') ||
+        errMsg.toLowerCase().includes('api_key') ||
+        errMsg.toLowerCase().includes('apikey'));
+
+    const isTimeout =
+      !isServiceUnavailable &&
+      !isNotFound &&
+      (errMsg.toLowerCase().includes('timeout') || statusCode === 408);
+
+    const isPolicyViolation =
+      !isConfigIncompatible &&
+      !isAuth &&
+      !isQuota &&
+      !isServiceUnavailable &&
+      !isNotFound &&
+      (statusCode === 400 ||
+        errMsg.toLowerCase().includes('invalid_argument') ||
+        errMsg.toLowerCase().includes('safety') ||
+        errMsg.toLowerCase().includes('harm_category'));
 
     const category: GeminiFailureCategory = isServiceUnavailable
       ? 'SERVICE_UNAVAILABLE'
+      : isNotFound
+      ? 'MODEL_NOT_FOUND'
+      : isConfigIncompatible
+      ? 'MODEL_INCOMPATIBLE_CONFIG'
       : isQuota
       ? 'QUOTA_EXCEEDED'
       : isAuth
       ? 'AUTH_ERROR'
       : isTimeout
       ? 'TIMEOUT'
-      : isPolicyOrBadReq
+      : isPolicyViolation
       ? 'POLICY_VIOLATION'
       : 'INVALID_RESPONSE';
 
     const safeReason = isServiceUnavailable
       ? 'Gemini model is temporarily experiencing high demand (HTTP 503).'
+      : isNotFound
+      ? 'Gemini model was not found or is unavailable (HTTP 404).'
+      : isConfigIncompatible
+      ? 'Gemini model rejected request due to incompatible configuration parameter.'
       : isQuota
       ? 'Gemini quota or rate limit exceeded.'
       : isAuth
       ? 'Gemini authentication failed or invalid credentials.'
       : isTimeout
       ? 'Request timed out waiting for model response.'
-      : isPolicyOrBadReq
+      : isPolicyViolation
       ? 'Request could not be processed due to invalid parameters or policy.'
       : 'Gemini service encountered an internal error.';
 
@@ -757,16 +951,42 @@ export function isNonRecoverableGeminiError(error?: {
     rawMessage = error.rawMessage || '';
   }
 
+  // 1. Incompatible configuration error (HTTP 400 parameter mismatch): recoverable, proceed to next model
+  if (category === 'MODEL_INCOMPATIBLE_CONFIG' || isModelConfigIncompatibleError(error)) {
+    return false;
+  }
+
+  // 2. Model not found (HTTP 404): recoverable, proceed to next model (unless API key missing)
+  if (category === 'MODEL_NOT_FOUND') {
+    return false;
+  }
+  const raw = rawMessage.toLowerCase();
+  if (statusCode === 404) {
+    if (raw.includes('apikey not found') || raw.includes('api key not found')) {
+      return true; // Auth error
+    }
+    return false; // Model not found is recoverable across contingency pool
+  }
+
+  // 3. Strict non-recoverable checks (Auth, true Policy, general 400/401/403):
   if (category === 'AUTH_ERROR') return true;
   if (category === 'POLICY_VIOLATION') return true;
-  if (statusCode === 401 || statusCode === 403 || statusCode === 400) return true;
-
-  const raw = rawMessage.toLowerCase();
+  if (statusCode === 401 || statusCode === 403) return true;
+  if (statusCode === 400) {
+    return true;
+  }
 
   // Quota evaluation:
   // If quota is per-model (e.g. GenerateRequestsPerDayPerProjectPerModel, free_tier_requests): recoverable on next model in contingency pool.
   // If quota is shared/project-wide (e.g. daily limit for project): non-recoverable.
   if (category === 'QUOTA_EXCEEDED' || statusCode === 429 || raw.includes('quota') || raw.includes('resource_exhausted')) {
+    if (
+      raw.includes('project_quota') ||
+      raw.includes('shared_quota') ||
+      (raw.includes('project') && (raw.includes('perday') || raw.includes('limit') || raw.includes('billable')))
+    ) {
+      return true; // Project-level or shared quota exhausted: abort immediately
+    }
     if (
       raw.includes('perprojectpermodel') ||
       raw.includes('free_tier_requests') ||
@@ -774,9 +994,6 @@ export function isNonRecoverableGeminiError(error?: {
       raw.includes('generativelanguage.googleapis.com')
     ) {
       return false; // Per-model quota: next model in contingency can be attempted
-    }
-    if (raw.includes('project') && (raw.includes('perday') || raw.includes('limit_exceeded') || raw.includes('billable'))) {
-      return true; // Project-level quota exhausted
     }
     // Default for 429: per-model quota in free-tier allows trying next model
     return false;
@@ -931,12 +1148,25 @@ export async function executeGeminiWithContingency(
         });
       }
     } catch (err: any) {
+      const isNonRec = isNonRecoverableGeminiError(err);
+      const isNotFound =
+        err?.status === 404 ||
+        err?.statusCode === 404 ||
+        (String(err?.message || '').toLowerCase().includes('not found') &&
+          !String(err?.message || '').toLowerCase().includes('apikey'));
+      const isConfigIncompat = isModelConfigIncompatibleError(err);
       attempt = {
         text: '',
         parsedJson: null,
         error: {
-          statusCode: err?.status || err?.statusCode || 500,
-          category: isNonRecoverableGeminiError(err) ? 'AUTH_ERROR' : 'SERVICE_UNAVAILABLE',
+          statusCode: err?.status || err?.statusCode || (isNotFound ? 404 : isConfigIncompat ? 400 : 500),
+          category: isNonRec
+            ? 'AUTH_ERROR'
+            : isNotFound
+            ? 'MODEL_NOT_FOUND'
+            : isConfigIncompat
+            ? 'MODEL_INCOMPATIBLE_CONFIG'
+            : 'SERVICE_UNAVAILABLE',
           safeReason: err?.message || 'Execution failed',
           rawMessage: err?.message || String(err),
         },

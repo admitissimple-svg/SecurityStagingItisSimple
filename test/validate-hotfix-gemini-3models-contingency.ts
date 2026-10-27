@@ -52,8 +52,8 @@ async function runHotfix3ModelContingencyTests(): Promise<void> {
   console.log('--- 1. Modelos Efetivamente Verificados e Sequência de Contingência ---');
 
   assert(
-    DEFAULT_GEMINI_MODEL === 'gemini-3.5-flash',
-    `1.1: DEFAULT_GEMINI_MODEL é 'gemini-3.5-flash' (atual: ${DEFAULT_GEMINI_MODEL})`
+    DEFAULT_GEMINI_MODEL === 'gemini-3.8-flash',
+    `1.1: DEFAULT_GEMINI_MODEL é 'gemini-3.8-flash' (atual: ${DEFAULT_GEMINI_MODEL})`
   );
 
   assert(
@@ -62,16 +62,16 @@ async function runHotfix3ModelContingencyTests(): Promise<void> {
   );
 
   assert(
-    GEMINI_CONTINGENCY_MODELS[0] === 'gemini-3.5-flash' &&
-    GEMINI_CONTINGENCY_MODELS[1] === 'gemini-3.8-flash' &&
+    GEMINI_CONTINGENCY_MODELS[0] === 'gemini-3.8-flash' &&
+    GEMINI_CONTINGENCY_MODELS[1] === 'gemini-3.5-flash-lite' &&
     GEMINI_CONTINGENCY_MODELS[2] === 'gemini-3.1-flash-lite',
     `1.3: Lista de contingência corresponde exatamente aos modelos verificados na API: ${JSON.stringify(GEMINI_CONTINGENCY_MODELS)}`
   );
 
   const defaultSequence = resolveGeminiContingencyModels();
   assert(
-    defaultSequence[0] === 'gemini-3.5-flash' &&
-    defaultSequence[1] === 'gemini-3.8-flash' &&
+    defaultSequence[0] === 'gemini-3.8-flash' &&
+    defaultSequence[1] === 'gemini-3.5-flash-lite' &&
     defaultSequence[2] === 'gemini-3.1-flash-lite',
     `1.4: resolveGeminiContingencyModels() padrão mantém sequência ordenada correta`
   );
@@ -79,11 +79,11 @@ async function runHotfix3ModelContingencyTests(): Promise<void> {
   // Verificação de override via GEMINI_MODEL
   const originalEnvModel = process.env.GEMINI_MODEL;
   try {
-    process.env.GEMINI_MODEL = 'gemini-3.8-flash';
+    process.env.GEMINI_MODEL = 'gemini-3.5-flash-lite';
     const overriddenSequence = resolveGeminiContingencyModels();
     assert(
-      overriddenSequence[0] === 'gemini-3.8-flash' &&
-      overriddenSequence[1] === 'gemini-3.5-flash' &&
+      overriddenSequence[0] === 'gemini-3.5-flash-lite' &&
+      overriddenSequence[1] === 'gemini-3.8-flash' &&
       overriddenSequence[2] === 'gemini-3.1-flash-lite',
       `1.5: resolveGeminiContingencyModels() prioriza modelo configurado em GEMINI_MODEL sem duplicatas`
     );
@@ -171,8 +171,8 @@ async function runHotfix3ModelContingencyTests(): Promise<void> {
       '3.1.1: Execução com sucesso retorna resultado esperado'
     );
     assert(
-      attemptsMade.length === 1 && attemptsMade[0] === 'gemini-3.5-flash',
-      `3.1.2: Sucesso no 1º modelo fez exatamente 1 chamada ao gemini-3.5-flash (chamadas: ${JSON.stringify(attemptsMade)})`
+      attemptsMade.length === 1 && attemptsMade[0] === 'gemini-3.8-flash',
+      `3.1.2: Sucesso no 1º modelo fez exatamente 1 chamada ao gemini-3.8-flash (chamadas: ${JSON.stringify(attemptsMade)})`
     );
   }
 
@@ -181,8 +181,8 @@ async function runHotfix3ModelContingencyTests(): Promise<void> {
     const attemptsMade: string[] = [];
     const mockExecutor = async (model: string) => {
       attemptsMade.push(model);
-      if (model === 'gemini-3.5-flash') {
-        throw new Error('503 Service Unavailable: High load on gemini-3.5-flash');
+      if (model === 'gemini-3.8-flash') {
+        throw new Error('503 Service Unavailable: High load on gemini-3.8-flash');
       }
       return {
         text: '{"status":"ok_from_model_2"}',
@@ -210,9 +210,9 @@ async function runHotfix3ModelContingencyTests(): Promise<void> {
     );
     assert(
       attemptsMade.length === 2 &&
-      attemptsMade[0] === 'gemini-3.5-flash' &&
-      attemptsMade[1] === 'gemini-3.8-flash',
-      `3.2.2: Transição correta: tentou gemini-3.5-flash, falhou e chamou gemini-3.8-flash (chamadas: ${JSON.stringify(attemptsMade)})`
+      attemptsMade[0] === 'gemini-3.8-flash' &&
+      attemptsMade[1] === 'gemini-3.5-flash-lite',
+      `3.2.2: Transição correta: tentou gemini-3.8-flash, falhou e chamou gemini-3.5-flash-lite (chamadas: ${JSON.stringify(attemptsMade)})`
     );
   }
 
@@ -239,7 +239,7 @@ async function runHotfix3ModelContingencyTests(): Promise<void> {
       '3.3.1: Falha não-recuperável abortou e retornou success: false com parsedJson: null'
     );
     assert(
-      attemptsMade.length === 1 && attemptsMade[0] === 'gemini-3.5-flash',
+      attemptsMade.length === 1 && attemptsMade[0] === 'gemini-3.8-flash',
       `3.3.2: Interrupção imediata respeitada: exatamente 1 chamada realizada, não tentou modelos 2 e 3 (chamadas: ${JSON.stringify(attemptsMade)})`
     );
   }
@@ -268,8 +268,8 @@ async function runHotfix3ModelContingencyTests(): Promise<void> {
     );
     assert(
       attemptsMade.length === 3 &&
-      attemptsMade[0] === 'gemini-3.5-flash' &&
-      attemptsMade[1] === 'gemini-3.8-flash' &&
+      attemptsMade[0] === 'gemini-3.8-flash' &&
+      attemptsMade[1] === 'gemini-3.5-flash-lite' &&
       attemptsMade[2] === 'gemini-3.1-flash-lite',
       `3.4.2: Percorreu exatamente os 3 modelos de contingência sequencialmente (chamadas: ${JSON.stringify(attemptsMade)})`
     );
@@ -280,7 +280,7 @@ async function runHotfix3ModelContingencyTests(): Promise<void> {
     const attemptsMade: string[] = [];
     const mockExecutor = async (model: string) => {
       attemptsMade.push(model);
-      if (model === 'gemini-3.5-flash') {
+      if (model === 'gemini-3.8-flash') {
         // Retorna JSON válido mas que não satisfaz a validação pedagógica
         return {
           text: '{"empty":true}',
@@ -317,7 +317,7 @@ async function runHotfix3ModelContingencyTests(): Promise<void> {
       '3.5.1: JSON que falhou na validação ativou failover para o próximo modelo com sucesso'
     );
     assert(
-      attemptsMade.length === 2 && attemptsMade[0] === 'gemini-3.5-flash' && attemptsMade[1] === 'gemini-3.8-flash',
+      attemptsMade.length === 2 && attemptsMade[0] === 'gemini-3.8-flash' && attemptsMade[1] === 'gemini-3.5-flash-lite',
       '3.5.2: 1º modelo descartado por falha no validador; 2º modelo aceito'
     );
   }
