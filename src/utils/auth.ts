@@ -153,10 +153,78 @@ function parseJwtClaims(token: string): Record<string, any> | null {
   }
 }
 
+export const KNOWN_ADMIN_EMAILS = new Set([
+  'adm.itissimple@gmail.com',
+  'estilobeeadm@gmail.com',
+  'estilobeeforkids@gmail.com',
+  'admin@itissimple.com',
+]);
+
+let cachedAdminEmailFromServer: string | null = null;
+let lastAdminCheckTime = 0;
+
+/**
+ * Checks whether an authenticated user is an authorized administrator candidate.
+ * Combines token claims, email verification, known bootstrap emails, and /api/auth/admin-status.
+ * Does not depend exclusively on unhydrated user profile records.
+ */
+export async function isAuthorizedAdminUser(user: User | null): Promise<boolean> {
+  if (!user) return false;
+
+  // 1. If token already carries custom admin claims, user is confirmed administrator
+  try {
+    const token = await user.getIdToken();
+    const claims = parseJwtClaims(token);
+    if (claims?.role === 'admin' || claims?.admin === true) {
+      return true;
+    }
+  } catch {}
+
+  // 2. Strict backend invariant: caller email must be verified
+  if (!user.emailVerified) {
+    return false;
+  }
+
+  const cleanEmail = (user.email || '').trim().toLowerCase();
+  if (!cleanEmail) {
+    return false;
+  }
+
+  // 3. Known authorized administrator emails
+  if (KNOWN_ADMIN_EMAILS.has(cleanEmail)) {
+    return true;
+  }
+
+  // 4. Server-configured administrator email from /api/auth/admin-status
+  const now = Date.now();
+  if (cachedAdminEmailFromServer && now - lastAdminCheckTime < 60000) {
+    if (cleanEmail === cachedAdminEmailFromServer) {
+      return true;
+    }
+  } else {
+    try {
+      const res = await fetch('/api/auth/admin-status');
+      if (res.ok) {
+        const data = await res.json();
+        if (data && typeof data.adminEmail === 'string' && data.adminEmail.trim()) {
+          cachedAdminEmailFromServer = data.adminEmail.trim().toLowerCase();
+          lastAdminCheckTime = now;
+          if (cleanEmail === cachedAdminEmailFromServer) {
+            return true;
+          }
+        }
+      }
+    } catch {}
+  }
+
+  return false;
+}
+
 /**
  * Resolves a verified Firebase ID Token with administrator permissions.
- * If the current token lacks custom claim role='admin', it invokes the backend
- * sync endpoint and refreshes the token to receive the server-minted claim.
+ * If the current token lacks custom claim role='admin', it verifies that the caller
+ * is an authorized administrator before invoking the backend sync endpoint.
+ * Non-admin users receive their standard Firebase ID Token without unnecessary sync attempts.
  */
 export async function getAdminAccessToken(): Promise<string | null> {
   const user = await waitForAuthUser();
@@ -167,21 +235,32 @@ export async function getAdminAccessToken(): Promise<string | null> {
   let token = await user.getIdToken();
   const claims = parseJwtClaims(token);
 
-  if (claims?.role !== 'admin' && claims?.admin !== true) {
-    try {
-      const res = await fetch('/api/auth/sync-admin-claims', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-      });
-      if (res.ok) {
-        token = await user.getIdToken(true);
-      }
-    } catch (err) {
-      console.warn('[auth] Notice during admin claims sync:', err);
+  if (claims?.role === 'admin' || claims?.admin === true) {
+    inMemoryToken = token;
+    return token;
+  }
+
+  // Strict check: Only authorized administrators should initiate admin claims synchronization
+  const isAuthorized = await isAuthorizedAdminUser(user);
+  if (!isAuthorized) {
+    // Non-admin user: return standard Firebase ID Token without calling sync-admin-claims
+    inMemoryToken = token;
+    return token;
+  }
+
+  try {
+    const res = await fetch('/api/auth/sync-admin-claims', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    if (res.ok) {
+      token = await user.getIdToken(true);
     }
+  } catch (err) {
+    console.warn('[auth] Notice during admin claims sync:', err);
   }
 
   inMemoryToken = token;

@@ -51,7 +51,7 @@ import { recordConsumedVideo, recordConsumedTrack } from './hooks/useStudentHist
 import { extractYouTubeVideoId, getYouTubeWatchUrl } from './utils/youtube';
 import { getInstantOrCachedWord, lookupWord, isGenericPedagogicalDefinition, isGenericPedagogicalExample } from './utils/dictionaryService';
 import { auth, getDb, getAllFirestoreDbs } from './firebase';
-import { getAccessToken, getAdminAccessToken, waitForAuthUser, firebaseSignUpWithEmail, firebaseSignInWithEmail } from './utils/auth';
+import { getAccessToken, getAdminAccessToken, waitForAuthUser, isAuthorizedAdminUser, firebaseSignUpWithEmail, firebaseSignInWithEmail } from './utils/auth';
 import { isValidHomeworkEvaluation, isSyntheticHomeworkEvaluation } from './utils/writingChecker';
 import { useNativeFriends, isTutorApproved, isTeacherRole } from './hooks/useNativeFriends';
 import { onAuthStateChanged, signOut as firebaseSignOutAuth } from 'firebase/auth';
@@ -724,7 +724,10 @@ export default function App() {
         const authUser = await waitForAuthUser().catch(() => null);
         let tutorToken: string | null = null;
         if (authUser) {
-          tutorToken = await getAdminAccessToken().catch(() => null);
+          const isAdmin = await isAuthorizedAdminUser(authUser).catch(() => false);
+          if (isAdmin) {
+            tutorToken = await getAdminAccessToken().catch(() => null);
+          }
           if (!tutorToken) {
             tutorToken = await authUser.getIdToken().catch(() => null);
           }

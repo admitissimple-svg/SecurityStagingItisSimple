@@ -194,7 +194,10 @@ export async function fetchPublicNativeFriendsFromFirestore(options?: {
 
     const headers: Record<string, string> = {};
     if (user) {
-      let token = await getAdminAccessToken().catch(() => null);
+      let token: string | null = null;
+      if (options?.requireAdminToken) {
+        token = await getAdminAccessToken().catch(() => null);
+      }
       if (!token) {
         token = await user.getIdToken().catch(() => null);
       }

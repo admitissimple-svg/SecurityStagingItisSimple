@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { auth } from '../firebase';
+import { doc, getDoc, setDoc } from 'firebase/firestore';
+import { auth, db } from '../firebase';
 import { DayOfWeek, TeacherOverrideTrack } from '../types';
 import { normalizeStudentIdForPath } from '../utils/routineSync';
 import { extractYouTubeVideoId } from '../utils/youtube';
@@ -303,13 +304,15 @@ export async function addMultipleVideosToWatchedHistoryInFirestore(
 }
 
 /**
- * Appends a Spotify track record to the student's listened tracks history via backend API.
+ * Appends a Spotify track record to the student's listened tracks history directly in Firestore.
+ * Avoids deprecated API endpoints and ensures real persistence and verification.
  */
 export async function addTrackToListenedHistoryInFirestore(
   studentUid: string,
   trackId: string,
   trackTitle?: string,
-  artist?: string
+  artist?: string,
+  customDb?: any
 ): Promise<boolean> {
   const cleanUid = normalizeStudentIdForPath(studentUid);
   const cleanTrackId = (trackId || '').trim();
@@ -318,19 +321,73 @@ export async function addTrackToListenedHistoryInFirestore(
   const cleanArtist = (artist || 'Spotify Artist').trim();
 
   try {
-    const headers = await getAuthHeaders();
-    const res = await fetch('/api/student-track-assignments/listen', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        studentUid: cleanUid,
+    const targetDb = customDb || db;
+    if (customDb && typeof customDb.doc === 'function') {
+      const docRef = customDb.doc(`users/${cleanUid}`);
+      const snap = await docRef.get().catch(() => null);
+      const existingData = snap?.exists ? (typeof snap.data === 'function' ? snap.data() : snap.data) : null;
+      const currentListened = Array.isArray(existingData?.listenedTracksHistory)
+        ? existingData.listenedTracksHistory
+        : [];
+
+      const exists = currentListened.some((t: any) =>
+        typeof t === 'string' ? t === cleanTrackId : t?.trackId === cleanTrackId || t?.id === cleanTrackId
+      );
+
+      if (!exists) {
+        const entry: ListenedTrackEntry = {
+          trackId: cleanTrackId,
+          trackTitle: cleanTitle,
+          artist: cleanArtist,
+          listenedAt: new Date().toISOString(),
+        };
+        await docRef.set(
+          {
+            listenedTracksHistory: [
+              ...currentListened,
+              { ...entry, id: cleanTrackId, title: cleanTitle },
+            ],
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        );
+      }
+      return true;
+    }
+
+    const userRef = doc(targetDb, 'users', cleanUid);
+    const snap = await getDoc(userRef).catch(() => null);
+    const existingData = snap?.exists() ? snap.data() : null;
+    const currentListened = Array.isArray(existingData?.listenedTracksHistory)
+      ? existingData.listenedTracksHistory
+      : [];
+
+    const exists = currentListened.some((t: any) =>
+      typeof t === 'string' ? t === cleanTrackId : t?.trackId === cleanTrackId || t?.id === cleanTrackId
+    );
+
+    if (!exists) {
+      const entry: ListenedTrackEntry = {
         trackId: cleanTrackId,
-        title: cleanTitle,
+        trackTitle: cleanTitle,
         artist: cleanArtist,
-      }),
-    });
-    return res.ok;
-  } catch {
+        listenedAt: new Date().toISOString(),
+      };
+      await setDoc(
+        userRef,
+        {
+          listenedTracksHistory: [
+            ...currentListened,
+            { ...entry, id: cleanTrackId, title: cleanTitle },
+          ],
+          updatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+    }
+    return true;
+  } catch (error) {
+    console.warn('[useRoutine] Error recording listened track to Firestore:', error);
     return false;
   }
 }
