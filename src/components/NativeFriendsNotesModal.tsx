@@ -306,66 +306,85 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
         });
       }
 
-      // 2. Query Firestore /users/{studentUid}/session_notes
-      try {
+      // 2. Fetch Firestore /users/{studentUid}/session_notes and REST API /api/session-notes in parallel via Promise.allSettled
+      const firestoreTask = (async (): Promise<SessionOption[]> => {
         const firestore = getDb();
-        if (firestore && resolvedUid) {
-          const userNotesCol = collection(firestore, 'users', resolvedUid, 'session_notes');
-          const snap = await getDocs(userNotesCol);
-          snap.forEach((docSnap) => {
-            const data = docSnap.data();
-            if (data && data.content && data.content.trim()) {
-              const dateStr = data.sessionDate || docSnap.id.replace('session_', '').slice(0, 10);
-              const timestamp = new Date(dateStr || data.updatedAt || 0).getTime();
-              const key = docSnap.id;
-              if (!sessionsMap.has(key)) {
-                sessionsMap.set(key, {
-                  key,
-                  lessonId: data.lessonId,
-                  dateStr,
-                  topic: data.topic || 'In-Session Coaching',
-                  teacherName: data.teacherName || 'Native Friend',
-                  rawContent: data.content,
-                  timestamp,
-                });
-              }
-            }
-          });
-        }
-      } catch (fsErr) {
-        console.warn('NativeFriendsNotes: Firestore /users query notice:', fsErr);
-      }
+        if (!firestore || !resolvedUid) return [];
+        const userNotesCol = collection(firestore, 'users', resolvedUid, 'session_notes');
+        const snap = await getDocs(userNotesCol);
+        const docs: SessionOption[] = [];
+        snap.forEach((docSnap) => {
+          const data = docSnap.data();
+          if (data && data.content && data.content.trim()) {
+            const dateStr = data.sessionDate || docSnap.id.replace('session_', '').slice(0, 10);
+            const timestamp = new Date(dateStr || data.updatedAt || 0).getTime();
+            docs.push({
+              key: docSnap.id,
+              lessonId: data.lessonId,
+              dateStr,
+              topic: data.topic || 'In-Session Coaching',
+              teacherName: data.teacherName || 'Native Friend',
+              rawContent: data.content,
+              timestamp,
+            });
+          }
+        });
+        return docs;
+      })();
 
-      // 3. Query Server API: /api/session-notes strictly by canonical studentUid
-      try {
+      const apiTask = (async (): Promise<SessionOption[]> => {
+        if (!resolvedUid) return [];
         const queryParams = new URLSearchParams();
         queryParams.set('studentUid', resolvedUid);
 
         const res = await fetch(`/api/session-notes?${queryParams.toString()}`);
-        if (res.ok) {
-          const serverNotes = await res.json();
-          if (Array.isArray(serverNotes)) {
-            serverNotes.forEach((n: any) => {
-              if (n && n.content && n.content.trim()) {
-                const key = n.id || `session_${n.sessionDate}`;
-                const timestamp = new Date(n.sessionDate || n.updatedAt || 0).getTime();
-                if (!sessionsMap.has(key)) {
-                  sessionsMap.set(key, {
-                    key,
-                    lessonId: n.lessonId,
-                    dateStr: n.sessionDate || 'Session',
-                    topic: n.topic || 'In-Session Notes',
-                    teacherName: n.teacherName || 'Native Friend',
-                    rawContent: n.content,
-                    timestamp,
-                  });
-                }
-              }
-            });
-          }
+        if (!res.ok) {
+          throw new Error(`Server returned HTTP ${res.status}`);
         }
-      } catch (apiErr) {
-        console.warn('NativeFriendsNotes: Server notes query notice:', apiErr);
+        const serverNotes = await res.json();
+        const docs: SessionOption[] = [];
+        if (Array.isArray(serverNotes)) {
+          serverNotes.forEach((n: any) => {
+            if (n && n.content && n.content.trim()) {
+              const key = n.id || `session_${n.sessionDate}`;
+              const timestamp = new Date(n.sessionDate || n.updatedAt || 0).getTime();
+              docs.push({
+                key,
+                lessonId: n.lessonId,
+                dateStr: n.sessionDate || 'Session',
+                topic: n.topic || 'In-Session Notes',
+                teacherName: n.teacherName || 'Native Friend',
+                rawContent: n.content,
+                timestamp,
+              });
+            }
+          });
+        }
+        return docs;
+      })();
+
+      const [firestoreResult, apiResult] = await Promise.allSettled([firestoreTask, apiTask]);
+
+      // Process Firestore results first (preserving priority/deduplication order)
+      if (firestoreResult.status === 'fulfilled') {
+        firestoreResult.value.forEach((item) => {
+          if (!sessionsMap.has(item.key)) {
+            sessionsMap.set(item.key, item);
+          }
+        });
+      } else {
+        console.warn('NativeFriendsNotes: Firestore /users query notice:', firestoreResult.reason);
+      }
+
+      // Process REST API results next
+      if (apiResult.status === 'fulfilled') {
+        apiResult.value.forEach((item) => {
+          if (!sessionsMap.has(item.key)) {
+            sessionsMap.set(item.key, item);
+          }
+        });
+      } else {
+        console.warn('NativeFriendsNotes: Server notes query notice:', apiResult.reason);
       }
 
       // 4. Convert to array and sort STRICTLY DESCENDING (newest / most recent first)
