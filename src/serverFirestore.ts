@@ -2518,7 +2518,17 @@ export function removeUndefinedFields<T = any>(val: T): T {
  * - Deduplicated deterministically by normalized word.
  * - Strips any undefined fields so Firestore Admin SDK never encounters undefined.
  */
-function consolidateServerEntries(existingEntries: any[], newEntries: any[]): any[] {
+/**
+ * Server-side consolidation of student dictionary entries.
+ * Guarantees:
+ * - Richer definitions and authentic examples are preserved.
+ * - Multi-origin history is accumulated.
+ * - practiceCount is never decreased or reset.
+ * - lastPracticedAt is strictly preserved (most recent timestamp kept).
+ * - Deduplicated deterministically by normalized word.
+ * - Strips any undefined fields so Firestore Admin SDK never encounters undefined.
+ */
+export function consolidateServerEntries(existingEntries: any[], newEntries: any[]): any[] {
   const masterMap = new Map<string, any>();
 
   (existingEntries || []).forEach((e) => {
@@ -2539,6 +2549,12 @@ function consolidateServerEntries(existingEntries: any[], newEntries: any[]): an
 
     if (!existing) {
       const isItemProvisional = Boolean(item.isProvisional || item.isFallback || item.enrichmentStatus === 'pending');
+      const resolvedNewDef = (item.definitionEn || item.meaningOrTip || '').trim();
+      const isNewGeneric = !resolvedNewDef || isGenericPedagogicalDefinition(resolvedNewDef);
+      const initialEnrichmentStatus = (item.enrichmentStatus === 'enriched' || (!isNewGeneric && Boolean(resolvedNewDef))) && !isItemProvisional
+        ? 'enriched'
+        : 'pending';
+
       const singleOrigins = Array.isArray(item.origins)
         ? item.origins
         : (item.source
@@ -2562,8 +2578,9 @@ function consolidateServerEntries(existingEntries: any[], newEntries: any[]): an
         originalWord: item.originalWord || rawWord,
         normalizedWord: key,
         practiceCount: typeof item.practiceCount === 'number' ? item.practiceCount : 0,
+        practiceHistory: Array.isArray(item.practiceHistory) ? item.practiceHistory : [],
         origins: singleOrigins.map(removeUndefinedFields),
-        enrichmentStatus: item.enrichmentStatus === 'enriched' && !isItemProvisional ? 'enriched' : 'pending',
+        enrichmentStatus: initialEnrichmentStatus,
         isProvisional: isItemProvisional,
       };
       if (item.simpleDefinition && typeof item.simpleDefinition === 'string' && item.simpleDefinition.trim()) {
@@ -2653,6 +2670,9 @@ function consolidateServerEntries(existingEntries: any[], newEntries: any[]): an
     }
 
     const resolvedSimpleDef = (item.simpleDefinition || existing.simpleDefinition || '').trim();
+    const resolvedTranslationPt = (item.translationPt || existing.translationPt || '').trim();
+    const resolvedPartOfSpeech = (item.partOfSpeech || existing.partOfSpeech || '').trim();
+
     const mergedEntry: Record<string, any> = {
       ...existing,
       ...item,
@@ -2668,6 +2688,12 @@ function consolidateServerEntries(existingEntries: any[], newEntries: any[]): an
       enrichmentStatus: resolvedEnrichmentStatus,
       isProvisional: isItemProvisional && !isExistingEnriched,
     };
+    if (resolvedTranslationPt) {
+      mergedEntry.translationPt = resolvedTranslationPt;
+    }
+    if (resolvedPartOfSpeech) {
+      mergedEntry.partOfSpeech = resolvedPartOfSpeech;
+    }
     if (resolvedSimpleDef) {
       mergedEntry.simpleDefinition = resolvedSimpleDef;
     }
@@ -2684,9 +2710,218 @@ function consolidateServerEntries(existingEntries: any[], newEntries: any[]): an
 }
 
 /**
+ * Semantically compares two values for dictionary entry properties.
+ * Handles strings (trimmed), numbers, booleans, objects, arrays, and null/undefined.
+ */
+export function areValuesSemanticallyEqual(val1: any, val2: any): boolean {
+  if (val1 === val2) return true;
+
+  // Treat undefined, null, empty string, empty array, and empty plain object as semantically empty
+  const isVal1Empty =
+    val1 === undefined ||
+    val1 === null ||
+    val1 === '' ||
+    (Array.isArray(val1) && val1.length === 0) ||
+    (typeof val1 === 'object' && val1 !== null && !Array.isArray(val1) && Object.keys(val1).length === 0);
+  const isVal2Empty =
+    val2 === undefined ||
+    val2 === null ||
+    val2 === '' ||
+    (Array.isArray(val2) && val2.length === 0) ||
+    (typeof val2 === 'object' && val2 !== null && !Array.isArray(val2) && Object.keys(val2).length === 0);
+  if (isVal1Empty && isVal2Empty) return true;
+  if (isVal1Empty !== isVal2Empty) return false;
+
+  // Handle strings with trimmed comparison
+  if (typeof val1 === 'string' && typeof val2 === 'string') {
+    return val1.trim() === val2.trim();
+  }
+
+  // Handle numbers
+  if (typeof val1 === 'number' && typeof val2 === 'number') {
+    return val1 === val2;
+  }
+
+  // Handle booleans
+  if (typeof val1 === 'boolean' || typeof val2 === 'boolean') {
+    return Boolean(val1) === Boolean(val2);
+  }
+
+  // Handle arrays
+  if (Array.isArray(val1) && Array.isArray(val2)) {
+    if (val1.length !== val2.length) return false;
+    for (let i = 0; i < val1.length; i++) {
+      if (!areValuesSemanticallyEqual(val1[i], val2[i])) return false;
+    }
+    return true;
+  }
+  if (Array.isArray(val1) || Array.isArray(val2)) {
+    return false;
+  }
+
+  // Handle plain objects
+  if (typeof val1 === 'object' && typeof val2 === 'object') {
+    const keys1 = Object.keys(val1).filter(
+      (k) => k !== 'updatedAt' && val1[k] !== undefined && val1[k] !== null && val1[k] !== ''
+    );
+    const keys2 = Object.keys(val2).filter(
+      (k) => k !== 'updatedAt' && val2[k] !== undefined && val2[k] !== null && val2[k] !== ''
+    );
+
+    const keySet = new Set([...keys1, ...keys2]);
+    for (const key of keySet) {
+      if (!areValuesSemanticallyEqual(val1[key], val2[key])) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Determines whether a dictionary entry has materially changed compared to its existing Firestore document.
+ * Compares:
+ * 1. Word & Canonical identification (word, normalizedWord, originalWord, id, studentUid)
+ * 2. Definitions & Translations (definitionEn, simpleDefinition, translationPt, translations, explanations, partOfSpeech, phonetic, ipa, audio, audioUrl)
+ * 3. Examples (exampleSentenceEn, exampleSentence, examples array)
+ * 4. Origins & Lesson references (origins array, lessonRefId, routineRef, source, sourceActivityName, sourceDay, learnedAt, firstSeenAt)
+ * 5. Practice metrics (practiceCount, lastPracticedAt, practiceHistory)
+ * 6. Pedagogical metadata (enrichmentStatus, isProvisional, isFallback, cefrLevel, customNotes, notFound, aiMetadata)
+ * Excludes timestamp fields generated at persistence time (e.g. updatedAt).
+ */
+export function hasVocabularyEntryChanged(existingDoc: any, targetDoc: any): boolean {
+  if (!existingDoc) return true;
+  if (!targetDoc) return false;
+
+  // 1. Core word & canonical identity
+  const word1 = (existingDoc.word || '').trim();
+  const word2 = (targetDoc.word || '').trim();
+  if (word1.toLowerCase() !== word2.toLowerCase()) return true;
+
+  const norm1 = (existingDoc.normalizedWord || word1).toLowerCase().trim();
+  const norm2 = (targetDoc.normalizedWord || word2).toLowerCase().trim();
+  if (norm1 !== norm2) return true;
+
+  const origWord1 = (existingDoc.originalWord || word1).trim();
+  const origWord2 = (targetDoc.originalWord || word2).trim();
+  if (origWord1 !== origWord2) return true;
+
+  // 2. Definitions and translations
+  const def1 = (existingDoc.definitionEn || '').trim();
+  const def2 = (targetDoc.definitionEn || '').trim();
+  if (def1 !== def2) return true;
+
+  const simpleDef1 = (existingDoc.simpleDefinition || '').trim();
+  const simpleDef2 = (targetDoc.simpleDefinition || '').trim();
+  if (simpleDef1 !== simpleDef2) return true;
+
+  const transPt1 = (existingDoc.translationPt || '').trim();
+  const transPt2 = (targetDoc.translationPt || '').trim();
+  if (transPt1 !== transPt2) return true;
+
+  const pos1 = (existingDoc.partOfSpeech || '').trim();
+  const pos2 = (targetDoc.partOfSpeech || '').trim();
+  if (pos1 !== pos2) return true;
+
+  const phon1 = (existingDoc.phonetic || existingDoc.ipa || '').trim();
+  const phon2 = (targetDoc.phonetic || targetDoc.ipa || '').trim();
+  if (phon1 !== phon2) return true;
+
+  const audio1 = (existingDoc.audio || existingDoc.audioUrl || '').trim();
+  const audio2 = (targetDoc.audio || targetDoc.audioUrl || '').trim();
+  if (audio1 !== audio2) return true;
+
+  if (!areValuesSemanticallyEqual(existingDoc.translations, targetDoc.translations)) return true;
+  if (!areValuesSemanticallyEqual(existingDoc.explanations, targetDoc.explanations)) return true;
+
+  // 3. Examples
+  const ex1 = (existingDoc.exampleSentenceEn || existingDoc.exampleSentence || '').trim();
+  const ex2 = (targetDoc.exampleSentenceEn || targetDoc.exampleSentence || '').trim();
+  if (ex1 !== ex2) return true;
+
+  if (!areValuesSemanticallyEqual(existingDoc.examples, targetDoc.examples)) return true;
+
+  // 4. Origins and lesson references
+  if (!areValuesSemanticallyEqual(existingDoc.origins, targetDoc.origins)) return true;
+  if (!areValuesSemanticallyEqual(existingDoc.routineRef, targetDoc.routineRef)) return true;
+
+  const lessonRef1 = (existingDoc.lessonRefId || '').trim();
+  const lessonRef2 = (targetDoc.lessonRefId || '').trim();
+  if (lessonRef1 !== lessonRef2) return true;
+
+  const source1 = (existingDoc.source || '').trim();
+  const source2 = (targetDoc.source || '').trim();
+  if (source1 !== source2) return true;
+
+  const srcAct1 = (existingDoc.sourceActivityName || '').trim();
+  const srcAct2 = (targetDoc.sourceActivityName || '').trim();
+  if (srcAct1 !== srcAct2) return true;
+
+  const srcDay1 = (existingDoc.sourceDay || '').trim();
+  const srcDay2 = (targetDoc.sourceDay || '').trim();
+  if (srcDay1 !== srcDay2) return true;
+
+  // 5. Practice metrics
+  const pCount1 = typeof existingDoc.practiceCount === 'number' ? existingDoc.practiceCount : 0;
+  const pCount2 = typeof targetDoc.practiceCount === 'number' ? targetDoc.practiceCount : 0;
+  if (pCount1 !== pCount2) return true;
+
+  const lastPrac1 = (existingDoc.lastPracticedAt || '').trim();
+  const lastPrac2 = (targetDoc.lastPracticedAt || '').trim();
+  if (lastPrac1 !== lastPrac2) return true;
+
+  if (!areValuesSemanticallyEqual(existingDoc.practiceHistory, targetDoc.practiceHistory)) return true;
+
+  // 6. Pedagogical metadata
+  const enrich1 = (existingDoc.enrichmentStatus || '').trim();
+  const enrich2 = (targetDoc.enrichmentStatus || '').trim();
+  if (enrich1 !== enrich2) return true;
+
+  if (Boolean(existingDoc.isProvisional) !== Boolean(targetDoc.isProvisional)) return true;
+  if (Boolean(existingDoc.isFallback) !== Boolean(targetDoc.isFallback)) return true;
+  if (Boolean(existingDoc.notFound) !== Boolean(targetDoc.notFound)) return true;
+
+  const cefr1 = (existingDoc.cefrLevel || '').trim();
+  const cefr2 = (targetDoc.cefrLevel || '').trim();
+  if (cefr1 !== cefr2) return true;
+
+  const notes1 = (existingDoc.customNotes || '').trim();
+  const notes2 = (targetDoc.customNotes || '').trim();
+  if (notes1 !== notes2) return true;
+
+  if (!areValuesSemanticallyEqual(existingDoc.aiMetadata, targetDoc.aiMetadata)) return true;
+
+  // 7. General equality for any additional custom keys (ignoring updatedAt, studentUid, studentEmail)
+  const ignoredKeys = new Set(['updatedAt', 'studentUid', 'studentEmail']);
+  const allKeys = new Set([
+    ...Object.keys(existingDoc || {}),
+    ...Object.keys(targetDoc || {}),
+  ]);
+
+  for (const k of allKeys) {
+    if (ignoredKeys.has(k)) continue;
+    if (k === 'id') {
+      const id1 = (existingDoc.id || '').trim();
+      const id2 = (targetDoc.id || '').trim();
+      if (id1 && id2 && id1 !== id2) return true;
+      if (!id1 && id2) return true;
+      continue;
+    }
+    if (!areValuesSemanticallyEqual(existingDoc[k], targetDoc[k])) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
  * Server-side persistent storage of student vocabulary in Cloud Firestore.
  * Strictly requires a canonical student Firebase Auth UID (rejects synthetic usr-* / st-* or teacher UID).
  * Persists to canonical document users/{canonicalStudentUid} and subcollection users/{canonicalStudentUid}/vocabulary/{wordDocId}.
+ * HOTFIX: Eliminates redundant writes to both root document and subcollection when documents are unchanged.
  */
 export async function saveStudentVocabularyToFirestoreServer(
   studentUid: string,
@@ -2711,20 +2946,37 @@ export async function saveStudentVocabularyToFirestoreServer(
 
     // 1. Fetch existing entries from canonical user document
     let existingList: any[] = [];
+    let existingRootVocab: any[] = [];
+    let rootDocExists = false;
+    let rootUserData: any = null;
+
     try {
       const userSnap = await db.collection('users').doc(cleanUid).get();
-      if (userSnap.exists && Array.isArray(userSnap.data()?.vocabulary)) {
-        existingList = userSnap.data()?.vocabulary;
+      if (userSnap.exists) {
+        rootDocExists = true;
+        rootUserData = userSnap.data();
+        if (Array.isArray(rootUserData?.vocabulary)) {
+          existingRootVocab = rootUserData.vocabulary;
+          existingList = [...existingRootVocab];
+        }
       }
     } catch {}
 
     // 2. Fetch existing entries from canonical subcollection
+    const existingSubcollectionByDocId = new Map<string, any>();
+    const existingSubcollectionByNormWord = new Map<string, any>();
+
     try {
       const subSnap = await db.collection('users').doc(cleanUid).collection('vocabulary').get();
       if (!subSnap.empty) {
         subSnap.forEach((docItem) => {
           const item = docItem.data();
           if (item && item.word) {
+            existingSubcollectionByDocId.set(docItem.id, item);
+            const norm = (item.normalizedWord || item.word).toLowerCase().trim();
+            if (norm) {
+              existingSubcollectionByNormWord.set(norm, item);
+            }
             existingList.push(item);
           }
         });
@@ -2734,28 +2986,69 @@ export async function saveStudentVocabularyToFirestoreServer(
     // 3. Consolidate entries cumulatively and recursively eliminate all undefined fields
     const consolidated = removeUndefinedFields(consolidateServerEntries(existingList, sanitizedEntries));
 
-    // 4. Save to canonical root document users/{cleanUid} with guaranteed zero undefined values
-    const rootPayload = removeUndefinedFields({
-      vocabulary: consolidated,
-      updatedAt: new Date().toISOString(),
-    });
-    await db.collection('users').doc(cleanUid).set(rootPayload, { merge: true });
+    // 4. Save to canonical root document users/{cleanUid} ONLY if vocabulary content has changed
+    let rootChanged = !rootDocExists || !Array.isArray(rootUserData?.vocabulary);
+    if (!rootChanged) {
+      if (existingRootVocab.length !== consolidated.length) {
+        rootChanged = true;
+      } else {
+        const rootMap = new Map<string, any>();
+        for (const item of existingRootVocab) {
+          if (item && item.word) {
+            const k = (item.normalizedWord || item.word).toLowerCase().trim();
+            rootMap.set(k, item);
+          }
+        }
+        if (rootMap.size !== consolidated.length) {
+          rootChanged = true;
+        } else {
+          for (const item of consolidated) {
+            const k = (item.normalizedWord || item.word).toLowerCase().trim();
+            const existingRootItem = rootMap.get(k);
+            if (!existingRootItem || hasVocabularyEntryChanged(existingRootItem, item)) {
+              rootChanged = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    if (rootChanged) {
+      const rootPayload = removeUndefinedFields({
+        vocabulary: consolidated,
+        updatedAt: new Date().toISOString(),
+      });
+      await db.collection('users').doc(cleanUid).set(rootPayload, { merge: true });
+    }
 
     // 5. Save individual entries to subcollection users/{cleanUid}/vocabulary/{wordDocId}
+    // HOTFIX: Only persist new or effectively modified documents to eliminate redundant Firestore writes!
     for (const item of consolidated) {
       if (item && item.word) {
         const rawWord = (item.normalizedWord || item.word).toLowerCase().trim();
         const wordDocId = rawWord.replace(/[^a-zA-Z0-9_-]/g, '_');
-        const docPayload = removeUndefinedFields({
+        const existingSubDoc = existingSubcollectionByDocId.get(wordDocId) || existingSubcollectionByNormWord.get(rawWord);
+
+        const targetDocData = removeUndefinedFields({
           ...item,
           studentUid: cleanUid,
           ...(cleanEmail || item.studentEmail ? { studentEmail: cleanEmail || item.studentEmail } : {}),
-          updatedAt: new Date().toISOString(),
         });
-        await db.collection('users').doc(cleanUid).collection('vocabulary').doc(wordDocId).set(
-          docPayload,
-          { merge: true }
-        );
+
+        const isNewDoc = !existingSubDoc;
+        const isModified = isNewDoc || hasVocabularyEntryChanged(existingSubDoc, targetDocData);
+
+        if (isModified) {
+          const docPayload = removeUndefinedFields({
+            ...targetDocData,
+            updatedAt: new Date().toISOString(),
+          });
+          await db.collection('users').doc(cleanUid).collection('vocabulary').doc(wordDocId).set(
+            docPayload,
+            { merge: true }
+          );
+        }
       }
     }
 
