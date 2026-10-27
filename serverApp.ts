@@ -8613,7 +8613,7 @@ app.get('/api/session-notes/progress', async (req, res) => {
 
 // Update Native Friends Notes Sequential Review Progress
 app.post('/api/session-notes/progress', async (req, res) => {
-  const { studentUid, studentEmail, lastSessionKey, stepIndex, lastReviewedTab, lastReviewedDate } = req.body || {};
+  const { studentUid, studentEmail, lastSessionKey, stepIndex, lastReviewedTab, lastReviewedDate, lastAssignedDate } = req.body || {};
   const key = (studentUid || studentEmail || '').trim();
   if (!key) return res.status(400).json({ error: 'Missing student identifier' });
   const db = readDb();
@@ -8628,6 +8628,7 @@ app.post('/api/session-notes/progress', async (req, res) => {
     stepIndex: typeof stepIndex === 'number' ? stepIndex : (existingProg.stepIndex || 0),
     lastReviewedTab: lastReviewedTab !== undefined ? lastReviewedTab : (existingProg.lastReviewedTab || ''),
     lastReviewedDate: lastReviewedDate !== undefined ? lastReviewedDate : (existingProg.lastReviewedDate || ''),
+    lastAssignedDate: req.body?.lastAssignedDate !== undefined ? req.body.lastAssignedDate : (existingProg.lastAssignedDate || ''),
     lastReminderShownDate: existingProg.lastReminderShownDate || '',
     updatedAt: new Date().toISOString(),
   };

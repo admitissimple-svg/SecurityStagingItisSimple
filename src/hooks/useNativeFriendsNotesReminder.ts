@@ -50,6 +50,7 @@ export interface UseNativeFriendsNotesReminderParams {
   timeZone?: string;
   currentLanguage?: string;
   studentLevel?: EnglishLevel | string;
+  simulatedTodayDate?: string;
 }
 
 export function useNativeFriendsNotesReminder({
@@ -59,6 +60,7 @@ export function useNativeFriendsNotesReminder({
   timeZone = 'America/Sao_Paulo',
   currentLanguage = 'pt',
   studentLevel = EnglishLevel.INTERMEDIATE,
+  simulatedTodayDate,
 }: UseNativeFriendsNotesReminderParams) {
   const isEn = currentLanguage === 'en';
   const effectiveTz = sanitizeTimeZone(timeZone);
@@ -72,9 +74,26 @@ export function useNativeFriendsNotesReminder({
   const [latestTransformation, setLatestTransformation] = useState<PedagogicalLessonTransformation | null>(null);
   const [stepIndex, setStepIndex] = useState<number>(0);
   const [storedSessionKey, setStoredSessionKey] = useState<string>('');
+  const [storedLastAssignedDate, setStoredLastAssignedDate] = useState<string>('');
   const [storedLastReviewedDate, setStoredLastReviewedDate] = useState<string>('');
   const [storedLastReminderShownDate, setStoredLastReminderShownDate] = useState<string>('');
+  const [hasExistingProgress, setHasExistingProgress] = useState<boolean>(false);
+  const [isProgressLoaded, setIsProgressLoaded] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(true);
+  const initialProgressLoadedRef = useRef<boolean>(false);
+
+  const todayInTz = useMemo(() => {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: effectiveTz,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date());
+  }, [effectiveTz]);
+
+  const effectiveTodayDate = useMemo(() => {
+    return simulatedTodayDate || todayInTz;
+  }, [simulatedTodayDate, todayInTz]);
 
   // 1. Fetch past sessions for the isolated student (Strictly Descending: newest first)
   const loadSessions = useCallback(async () => {
@@ -208,6 +227,10 @@ export function useNativeFriendsNotesReminder({
   const loadStoredProgress = useCallback(async () => {
     let loadedSessionKey = '';
     let loadedStepIndex = 0;
+    let loadedAssignedDate = '';
+    let loadedReviewedDate = '';
+    let loadedReminderShownDate = '';
+    let exists = false;
 
     // 2a. Check Firestore /users/{studentUid}/session_notes/review_cycle
     try {
@@ -218,10 +241,12 @@ export function useNativeFriendsNotesReminder({
         if (snap.exists()) {
           const data = snap.data();
           if (data) {
+            exists = true;
             loadedSessionKey = data.lastSessionKey || '';
             loadedStepIndex = typeof data.stepIndex === 'number' ? data.stepIndex : 0;
-            if (data.lastReviewedDate) setStoredLastReviewedDate(data.lastReviewedDate);
-            if (data.lastReminderShownDate) setStoredLastReminderShownDate(data.lastReminderShownDate);
+            loadedAssignedDate = data.lastAssignedDate || data.lastAssignedReviewDate || '';
+            loadedReviewedDate = data.lastReviewedDate || '';
+            loadedReminderShownDate = data.lastReminderShownDate || '';
           }
         }
       }
@@ -230,29 +255,37 @@ export function useNativeFriendsNotesReminder({
     }
 
     // 2b. Check Server API fallback
-    try {
-      const queryParams = new URLSearchParams();
-      if (resolvedUid) queryParams.set('studentUid', resolvedUid);
-      if (resolvedEmail) queryParams.set('studentEmail', resolvedEmail);
+    if (!exists) {
+      try {
+        const queryParams = new URLSearchParams();
+        if (resolvedUid) queryParams.set('studentUid', resolvedUid);
+        if (resolvedEmail) queryParams.set('studentEmail', resolvedEmail);
 
-      const res = await fetch(`/api/session-notes/progress?${queryParams.toString()}`);
-      if (res.ok) {
-        const progressData = await res.json();
-        if (progressData) {
-          if (!loadedSessionKey && progressData.lastSessionKey) {
-            loadedSessionKey = progressData.lastSessionKey;
-            loadedStepIndex = progressData.stepIndex || 0;
+        const res = await fetch(`/api/session-notes/progress?${queryParams.toString()}`);
+        if (res.ok) {
+          const progressData = await res.json();
+          if (progressData) {
+            exists = true;
+            loadedSessionKey = progressData.lastSessionKey || '';
+            loadedStepIndex = typeof progressData.stepIndex === 'number' ? progressData.stepIndex : 0;
+            loadedAssignedDate = progressData.lastAssignedDate || progressData.lastAssignedReviewDate || '';
+            loadedReviewedDate = progressData.lastReviewedDate || '';
+            loadedReminderShownDate = progressData.lastReminderShownDate || '';
           }
-          if (progressData.lastReviewedDate) setStoredLastReviewedDate(progressData.lastReviewedDate);
-          if (progressData.lastReminderShownDate) setStoredLastReminderShownDate(progressData.lastReminderShownDate);
         }
+      } catch (err) {
+        console.warn('useNativeFriendsNotesReminder: Server progress read notice:', err);
       }
-    } catch (err) {
-      console.warn('useNativeFriendsNotesReminder: Server progress read notice:', err);
     }
 
     setStoredSessionKey(loadedSessionKey);
     setStepIndex(loadedStepIndex);
+    if (loadedAssignedDate) setStoredLastAssignedDate(loadedAssignedDate);
+    if (loadedReviewedDate) setStoredLastReviewedDate(loadedReviewedDate);
+    if (loadedReminderShownDate) setStoredLastReminderShownDate(loadedReminderShownDate);
+    setHasExistingProgress(exists);
+    setIsProgressLoaded(true);
+    initialProgressLoadedRef.current = true;
   }, [resolvedUid, resolvedEmail]);
 
   useEffect(() => {
@@ -272,8 +305,12 @@ export function useNativeFriendsNotesReminder({
           if (data) {
             if (data.lastSessionKey) setStoredSessionKey(data.lastSessionKey);
             if (typeof data.stepIndex === 'number') setStepIndex(data.stepIndex);
+            if (data.lastAssignedDate) setStoredLastAssignedDate(data.lastAssignedDate);
             if (data.lastReviewedDate) setStoredLastReviewedDate(data.lastReviewedDate);
             if (data.lastReminderShownDate) setStoredLastReminderShownDate(data.lastReminderShownDate);
+            setHasExistingProgress(true);
+            setIsProgressLoaded(true);
+            initialProgressLoadedRef.current = true;
           }
         }
       },
@@ -337,31 +374,40 @@ export function useNativeFriendsNotesReminder({
 
   // 4. Save review progress to Firestore and Server (NO localStorage)
   const persistProgress = useCallback(
-    async (newSessionKey: string, newStepIndex: number, lastTab?: string) => {
-      setStoredSessionKey(newSessionKey);
+    async (params: {
+      sessionKey: string;
+      stepIndex: number;
+      lastAssignedDate?: string;
+      lastReviewedDate?: string;
+      lastReviewedTab?: string;
+    }) => {
+      const { sessionKey, stepIndex: newStepIndex, lastAssignedDate, lastReviewedDate, lastReviewedTab } = params;
+      setStoredSessionKey(sessionKey);
       setStepIndex(newStepIndex);
+      setHasExistingProgress(true);
+      if (lastAssignedDate !== undefined) setStoredLastAssignedDate(lastAssignedDate);
+      if (lastReviewedDate !== undefined) setStoredLastReviewedDate(lastReviewedDate);
 
-      const todayInTz = new Intl.DateTimeFormat('en-CA', {
-        timeZone: effectiveTz,
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-      }).format(new Date());
+      const cyclePayload: Record<string, any> = {
+        lastSessionKey: sessionKey,
+        stepIndex: newStepIndex,
+        updatedAt: new Date().toISOString(),
+      };
 
-      setStoredLastReviewedDate(todayInTz);
+      if (lastAssignedDate !== undefined) {
+        cyclePayload.lastAssignedDate = lastAssignedDate;
+      }
+      if (lastReviewedDate !== undefined) {
+        cyclePayload.lastReviewedDate = lastReviewedDate;
+      }
+      if (lastReviewedTab !== undefined) {
+        cyclePayload.lastReviewedTab = lastReviewedTab;
+      }
 
       // Save directly to Firestore /users/{studentUid}/session_notes/review_cycle and users/{studentUid}
       try {
         const firestore = getDb();
         if (firestore && resolvedUid) {
-          const cyclePayload = {
-            lastSessionKey: newSessionKey,
-            stepIndex: newStepIndex,
-            lastReviewedTab: lastTab || '',
-            lastReviewedDate: todayInTz,
-            updatedAt: new Date().toISOString(),
-          };
-
           const cycleDocRef = doc(firestore, 'users', resolvedUid, 'session_notes', 'review_cycle');
           const userDocRef = doc(firestore, 'users', resolvedUid);
 
@@ -382,17 +428,18 @@ export function useNativeFriendsNotesReminder({
           body: JSON.stringify({
             studentUid: resolvedUid,
             studentEmail: resolvedEmail,
-            lastSessionKey: newSessionKey,
+            lastSessionKey: sessionKey,
             stepIndex: newStepIndex,
-            lastReviewedTab: lastTab || '',
-            lastReviewedDate: todayInTz,
+            lastAssignedDate: cyclePayload.lastAssignedDate,
+            lastReviewedDate: cyclePayload.lastReviewedDate,
+            lastReviewedTab: cyclePayload.lastReviewedTab,
           }),
         });
       } catch (err) {
         console.warn('useNativeFriendsNotesReminder: Server progress save notice:', err);
       }
     },
-    [resolvedUid, resolvedEmail, effectiveTz]
+    [resolvedUid, resolvedEmail]
   );
 
   // 5. Check Regra 1: Se o aluno nunca teve nenhuma aula com o amigo nativo, nenhum lembrete será exibido
@@ -416,14 +463,6 @@ export function useNativeFriendsNotesReminder({
 
   // 6. Check if student has a scheduled lesson with native friend TODAY
   const { hasLessonToday, scheduledLessonToday } = useMemo(() => {
-    // Current date formatted in student's timezone (YYYY-MM-DD)
-    const todayInTz = new Intl.DateTimeFormat('en-CA', {
-      timeZone: effectiveTz,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    }).format(new Date());
-
     const studentLessons = lessons.filter((l) => {
       if (!l) return false;
       const lStudentUid = l.studentUid || (l as any)?.studentId || '';
@@ -440,14 +479,14 @@ export function useNativeFriendsNotesReminder({
         (l.startDateTime && typeof l.startDateTime === 'string'
           ? l.startDateTime.split('T')[0]
           : '');
-      return lDate === todayInTz;
+      return lDate === effectiveTodayDate;
     });
 
     return {
       hasLessonToday: Boolean(activeScheduledToday),
       scheduledLessonToday: activeScheduledToday || null,
     };
-  }, [lessons, effectiveTz, resolvedUid, resolvedEmail]);
+  }, [lessons, effectiveTodayDate, resolvedUid, resolvedEmail]);
 
   // 7. Check if Quick Review is not empty for latest session
   const isQuickReviewNotEmpty = useMemo(() => {
@@ -527,26 +566,101 @@ export function useNativeFriendsNotesReminder({
     return tabs;
   }, [latestSession, latestTransformation, isQuickReviewNotEmpty, isEn]);
 
-  // 9. Regra 4: Na próxima aula com novas notas geradas, a lógica de revisão sequencial deve atualizar-se automaticamente para os novos apontamentos, mantendo o mesmo ciclo.
+  // 9. Regra 4: Sequential Review Progression & Idempotent Daily Step Assignment
+  const isEvaluatingRef = useRef<boolean>(false);
+
   useEffect(() => {
-    if (latestSession && storedSessionKey && latestSession.key !== storedSessionKey) {
-      // A new lesson with new notes was detected! Reset cycle to Tab 1 (index 0) for the new notes
-      persistProgress(latestSession.key, 0);
-    } else if (latestSession && !storedSessionKey) {
-      // First time recording notes for this session
-      persistProgress(latestSession.key, 0);
+    // 1. MUST wait until initial stored progress has finished loading!
+    if (!isProgressLoaded || isLoading || !latestSession || !latestSession.key) {
+      return;
     }
-  }, [latestSession, storedSessionKey, persistProgress]);
 
-  // 10. Advance sequential step to next non-empty tab
-  const advanceSequentialStep = useCallback(() => {
-    if (!latestSession || availableReviewTabs.length === 0) return;
-    const nextIndex = (stepIndex + 1) % availableReviewTabs.length;
-    const currentTab = availableReviewTabs[stepIndex % availableReviewTabs.length]?.tab;
-    persistProgress(latestSession.key, nextIndex, currentTab);
-  }, [latestSession, availableReviewTabs, stepIndex, persistProgress]);
+    if (isEvaluatingRef.current) return;
 
-  // 11. Compute Dynamic Reminder based on the 4 Strict Rules
+    const todayDate = effectiveTodayDate;
+    const sessionKey = latestSession.key;
+
+    // Case 1: First time recording progress for this session
+    if (!hasExistingProgress || !storedSessionKey) {
+      isEvaluatingRef.current = true;
+      persistProgress({
+        sessionKey,
+        stepIndex: 0,
+        lastAssignedDate: todayDate,
+      }).finally(() => {
+        isEvaluatingRef.current = false;
+      });
+      return;
+    }
+
+    // Case 2: Reference session has changed (a new lesson with new notes was added)
+    // "Reiniciar o ciclo por nova sessão somente quando houver confirmação de que a sessão de referência realmente mudou."
+    if (storedSessionKey && storedSessionKey !== sessionKey) {
+      isEvaluatingRef.current = true;
+      persistProgress({
+        sessionKey,
+        stepIndex: 0,
+        lastAssignedDate: todayDate,
+      }).finally(() => {
+        isEvaluatingRef.current = false;
+      });
+      return;
+    }
+
+    // Case 3: Same session as stored (storedSessionKey === sessionKey)
+    // Check if step for todayDate has already been assigned
+    if (storedLastAssignedDate === todayDate) {
+      // Step was ALREADY assigned today!
+      // "Preservar a etapa atribuída durante todo o dia."
+      // "Não avançar duas vezes por F5, logout/login, re-renderização ou duas abas simultâneas do navegador."
+      return;
+    }
+
+    // If storedLastAssignedDate is empty (legacy document), set it to todayDate without advancing
+    if (!storedLastAssignedDate) {
+      isEvaluatingRef.current = true;
+      persistProgress({
+        sessionKey,
+        stepIndex,
+        lastAssignedDate: todayDate,
+      }).finally(() => {
+        isEvaluatingRef.current = false;
+      });
+      return;
+    }
+
+    // If today is a day with scheduled lesson:
+    // "Dias com aula agendada: Direcionar para a aba 4 — Quick Review. Não consumir uma etapa da sequência dos dias sem aula."
+    if (hasLessonToday) {
+      // Do not consume sequence!
+      return;
+    }
+
+    // If today is a NEW eligible day without lesson (storedLastAssignedDate !== todayDate and !hasLessonToday)
+    // Advance to next non-lesson step: (stepIndex + 1) % 3
+    const nextStep = (stepIndex + 1) % 3;
+    isEvaluatingRef.current = true;
+    persistProgress({
+      sessionKey,
+      stepIndex: nextStep,
+      lastAssignedDate: todayDate,
+    }).finally(() => {
+      isEvaluatingRef.current = false;
+    });
+  }, [
+    isProgressLoaded,
+    isLoading,
+    latestSession,
+    storedSessionKey,
+    hasExistingProgress,
+    storedLastAssignedDate,
+    hasLessonToday,
+    effectiveTodayDate,
+    stepIndex,
+    persistProgress,
+  ]);
+
+  // 10. Compute Dynamic Reminder based on the 4 Strict Rules
   const reminder = useMemo<NativeFriendsNotesReminder | null>(() => {
     // Regra 1: Se o aluno nunca teve nenhuma aula com o amigo nativo, nenhum lembrete será exibido.
     if (!hasHadAnyLesson || !latestSession) {
@@ -554,6 +668,9 @@ export function useNativeFriendsNotesReminder({
     }
 
     // Regra 2: Se o aluno tem uma aula agendada com o amigo nativo no próprio dia, o lembrete automático será para ler o Quick Review (caso este não esteja vazio).
+    // Dias com aula agendada:
+    // - Direcionar para a aba 4 — Quick Review.
+    // - Não consumir uma etapa da sequência dos dias sem aula.
     if (hasLessonToday) {
       if (isQuickReviewNotEmpty) {
         return {
@@ -570,43 +687,63 @@ export function useNativeFriendsNotesReminder({
           teacherName: latestSession.teacherName,
           topic: latestSession.topic,
           isLessonToday: true,
+          stepIndex: 3,
+          totalSteps: 4,
           availableTabs: availableReviewTabs,
         };
       }
       return null;
     }
 
-    // Regra 3: Se o aluno já possui notas registadas de aulas anteriores, mas não é dia de nova aula,
-    // sempre que abrir o aplicativo o aluno será lembrado de revisar os seus apontamentos de forma sequencial
-    // (Aba 1, depois Aba 2, Aba 3 e Aba 4, consecutivamente) até chegar à próxima aula (caso este não estejam vazios).
-    if (availableReviewTabs.length === 0) {
-      return null;
-    }
+    // Regra 3: Se o aluno já possui notas registadas de aulas anteriores, mas não é dia de nova aula:
+    // Dias sem aula:
+    // - Primeiro dia elegível: aba 1 — Analyze Mistakes.
+    // - Segundo dia elegível: aba 2 — Grammar Points.
+    // - Terceiro dia elegível: aba 3 — Vocabulary & Expressions.
+    // - Quarto dia elegível: retornar à aba 1.
+    // A progressão deve considerar apenas dias sem aula e ser individual por aluno.
+    const nonLessonSteps: Array<{ tab: 'mistakes' | 'grammar' | 'vocab'; tabNumber: 1 | 2 | 3; label: string; labelEn: string }> = [
+      {
+        tab: 'mistakes',
+        tabNumber: 1,
+        label: isEn ? 'Analyze Mistakes' : 'Análise de Erros',
+        labelEn: 'Analyze Mistakes',
+      },
+      {
+        tab: 'grammar',
+        tabNumber: 2,
+        label: isEn ? 'Grammar Points' : 'Pontos Gramaticais',
+        labelEn: 'Grammar Points',
+      },
+      {
+        tab: 'vocab',
+        tabNumber: 3,
+        label: isEn ? 'Vocabulary & Expressions' : 'Vocabulário & Expressões',
+        labelEn: 'Vocabulary & Expressions',
+      },
+    ];
 
-    const currentTabDef = availableReviewTabs[stepIndex % availableReviewTabs.length];
-    if (!currentTabDef) return null;
-
-    const currentStepNum = currentTabDef.tabNumber;
-    const currentStepLabel = currentTabDef.label;
+    const effectiveStepIndex = stepIndex % 3;
+    const currentStepDef = nonLessonSteps[effectiveStepIndex];
 
     return {
       rule: 'rule_3_sequential_review',
       title: isEn
-        ? `📚 Review Step ${currentStepNum} of 4 • Last Session`
-        : `📚 Revisão Passo ${currentStepNum} de 4 • Última Aula`,
+        ? `📚 Review Step ${currentStepDef.tabNumber} of 4 • Last Session`
+        : `📚 Revisão Passo ${currentStepDef.tabNumber} de 4 • Última Aula`,
       message: isEn
-        ? `Time to review your notes from your last session! Today focus on Tab ${currentStepNum}: ${currentStepLabel}.`
-        : `Hora de revisar seus apontamentos da última aula! Hoje revise: Aba ${currentStepNum} — ${currentStepLabel}.`,
-      targetTab: currentTabDef.tab,
-      tabNumber: currentStepNum,
-      tabLabel: currentStepLabel,
+        ? `Time to review your notes from your last session! Today focus on Tab ${currentStepDef.tabNumber}: ${currentStepDef.label}.`
+        : `Hora de revisar seus apontamentos da última aula! Hoje revise: Aba ${currentStepDef.tabNumber} — ${currentStepDef.label}.`,
+      targetTab: currentStepDef.tab,
+      tabNumber: currentStepDef.tabNumber,
+      tabLabel: currentStepDef.label,
       sessionKey: latestSession.key,
       sessionDate: latestSession.dateStr,
       teacherName: latestSession.teacherName,
       topic: latestSession.topic,
       isLessonToday: false,
-      stepIndex: stepIndex % availableReviewTabs.length,
-      totalSteps: availableReviewTabs.length,
+      stepIndex: effectiveStepIndex,
+      totalSteps: 4,
       availableTabs: availableReviewTabs,
     };
   }, [
@@ -619,18 +756,22 @@ export function useNativeFriendsNotesReminder({
     isEn,
   ]);
 
-  const todayInTz = useMemo(() => {
-    return new Intl.DateTimeFormat('en-CA', {
-      timeZone: effectiveTz,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    }).format(new Date());
-  }, [effectiveTz]);
+  // 11. Advance sequential step / mark review completed
+  const advanceSequentialStep = useCallback(() => {
+    if (!latestSession) return;
+    const currentTab = reminder?.targetTab || 'mistakes';
+    persistProgress({
+      sessionKey: latestSession.key,
+      stepIndex,
+      lastAssignedDate: storedLastAssignedDate || effectiveTodayDate,
+      lastReviewedDate: effectiveTodayDate,
+      lastReviewedTab: currentTab,
+    });
+  }, [latestSession, reminder?.targetTab, persistProgress, stepIndex, storedLastAssignedDate, effectiveTodayDate]);
 
   const isReviewCompletedToday = useMemo(() => {
-    return Boolean(storedLastReviewedDate && storedLastReviewedDate === todayInTz);
-  }, [storedLastReviewedDate, todayInTz]);
+    return Boolean(storedLastReviewedDate && storedLastReviewedDate === effectiveTodayDate);
+  }, [storedLastReviewedDate, effectiveTodayDate]);
 
   const claimDailyReminder = useCallback(async (): Promise<{ canShow: boolean; alreadyShown: boolean }> => {
     if (!resolvedUid && !resolvedEmail) return { canShow: false, alreadyShown: true };
@@ -642,7 +783,7 @@ export function useNativeFriendsNotesReminder({
           studentUid: resolvedUid,
           studentEmail: resolvedEmail,
           timeZone: effectiveTz,
-          dateStr: todayInTz,
+          dateStr: effectiveTodayDate,
         }),
       });
       if (res.ok) {
@@ -659,7 +800,7 @@ export function useNativeFriendsNotesReminder({
       console.warn('useNativeFriendsNotesReminder: claimDailyReminder notice:', err);
     }
     return { canShow: false, alreadyShown: false };
-  }, [resolvedUid, resolvedEmail, effectiveTz, todayInTz]);
+  }, [resolvedUid, resolvedEmail, effectiveTz, effectiveTodayDate]);
 
   return {
     reminder,
@@ -670,12 +811,15 @@ export function useNativeFriendsNotesReminder({
     availableReviewTabs,
     stepIndex,
     isLoading,
+    isProgressLoaded,
     hasLessonToday,
     hasHadAnyLesson,
     scheduledLessonToday,
     isReviewCompletedToday,
     storedLastReviewedDate,
+    storedLastAssignedDate,
     storedLastReminderShownDate,
     claimDailyReminder,
+    persistProgress,
   };
 }
