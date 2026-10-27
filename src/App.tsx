@@ -1844,6 +1844,11 @@ export default function App() {
       fetchStudentVocabularyFromFirestore(canonicalStudentUid, dictEmail).then((fsEntries) => {
         if (isCancelled) return;
         if (role === 'student' && activeStudentUidRef.current !== canonicalStudentUid) return;
+        const cachedExclusions = getCachedExcludedDictionaryWords(canonicalStudentUid, dictEmail);
+        if (cachedExclusions.length > 0 && excludedDictionaryWordsRef.current.length === 0) {
+          excludedDictionaryWordsRef.current = cachedExclusions;
+          setExcludedDictionaryWords(cachedExclusions);
+        }
         if (Array.isArray(fsEntries) && fsEntries.length > 0) {
           setStudentDictionaryEntries((prev) => {
             if (role === 'student' && activeStudentUidRef.current !== canonicalStudentUid) return prev;
@@ -1851,39 +1856,6 @@ export default function App() {
           });
         }
       });
-
-      // 2. Mirror from backend
-      auth.currentUser?.getIdToken().then((token) => {
-        const headers: Record<string, string> = {};
-        if (token) headers['Authorization'] = `Bearer ${token}`;
-        return fetch(`/api/student-dictionary?studentEmail=${encodeURIComponent(dictEmail)}${canonicalStudentUid ? `&uid=${encodeURIComponent(canonicalStudentUid)}` : ''}`, { headers });
-      }).catch(() => {
-        return fetch(`/api/student-dictionary?studentEmail=${encodeURIComponent(dictEmail)}${canonicalStudentUid ? `&uid=${encodeURIComponent(canonicalStudentUid)}` : ''}`);
-      })
-        .then((r) => (r.ok ? r.json() : null))
-        .then((data) => {
-          if (isCancelled || !data) return;
-          if (role === 'student' && activeStudentUidRef.current !== canonicalStudentUid) return;
-
-          const entries = Array.isArray(data) ? data : (Array.isArray(data?.dictionary) ? data.dictionary : []);
-          const excluded = Array.isArray(data?.excludedWords)
-            ? data.excludedWords.map((w: string) => normalizeDictionaryWord(w)).filter(Boolean)
-            : [];
-
-          if (excluded.length > 0) {
-            excludedDictionaryWordsRef.current = excluded;
-            setExcludedDictionaryWords(excluded);
-            cacheExcludedWordsLocally(canonicalStudentUid, dictEmail, excluded);
-          }
-
-          if (entries.length > 0) {
-            setStudentDictionaryEntries((prev) => {
-              if (role === 'student' && activeStudentUidRef.current !== canonicalStudentUid) return prev;
-              return consolidateDictionaryEntries(prev, entries, excludedDictionaryWordsRef.current);
-            });
-          }
-        })
-        .catch((err) => console.warn('Could not fetch student dictionary:', err));
 
       // 3. Direct Firestore fetch for student journal
       fetchStudentJournalFromFirestore(uid, dictEmail).then((fsJournal) => {
