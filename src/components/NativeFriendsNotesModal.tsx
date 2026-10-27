@@ -74,6 +74,12 @@ interface SessionOption {
 // Module-level in-memory cache for open/close modal transitions (Zero localStorage)
 const sessionNotesModalMemoryCache = new Map<string, PedagogicalLessonTransformation>();
 
+// In-flight synchronization promises to prevent duplicate simultaneous executions across remounts
+const inFlightVocabSyncPromises = new Map<string, Promise<StudentDictionaryEntry[]>>();
+
+// Completed synchronization keys for canonical UID + session key + content hash to prevent redundant background syncs
+const completedVocabSyncKeys = new Set<string>();
+
 export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = ({
   isOpen,
   onClose,
@@ -93,6 +99,14 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
   onOpenJournal,
 }) => {
   const isEn = currentLanguage === 'en';
+
+  const isMountedRef = useRef<boolean>(true);
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   // Resolved identity for strict UID-level isolation (FASE 4B.8.2: authenticated Firebase Auth UID exclusively)
   const [currentUserAuthUid, setCurrentUserAuthUid] = useState<string>(() => {
@@ -384,6 +398,104 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
     return activeSession?.rawContent ? extractNotesMarkings(activeSession.rawContent) : { newWords: [], pronounceItems: [] };
   }, [activeSession?.rawContent]);
 
+  // Asynchronous independent vocabulary synchronization (decoupled from visual report loading)
+  const performVocabularySync = useCallback(
+    (
+      currentResult: PedagogicalLessonTransformation,
+      session: SessionOption,
+      forceSync: boolean = false
+    ) => {
+      // FASE 4B.8.2: Require valid canonical authentication prior to persisting
+      if (!hasValidAuth || !resolvedUid || !session) return;
+
+      const contentHash = computeNotesHash(session.rawContent || '');
+      const syncKey = `${resolvedUid}__${session.key}__${contentHash}`;
+
+      if (forceSync) {
+        completedVocabSyncKeys.delete(syncKey);
+      }
+
+      // If already successfully synchronized for this specific content version and student, skip redundant sync
+      if (!forceSync && completedVocabSyncKeys.has(syncKey)) {
+        return;
+      }
+
+      // If an asynchronous synchronization is already in flight for this exact key, connect to it without duplicate POST
+      const existingPromise = inFlightVocabSyncPromises.get(syncKey);
+      if (existingPromise) {
+        setIsSyncingVocab(true);
+        setVocabSyncError(null);
+        existingPromise
+          .then(() => {
+            if (isMountedRef.current) {
+              setIsSyncingVocab(false);
+            }
+          })
+          .catch((err) => {
+            if (isMountedRef.current) {
+              setIsSyncingVocab(false);
+              setVocabSyncError(
+                err?.message || (isEn ? 'Failed to sync vocabulary to My Dictionary.' : 'Falha ao sincronizar vocabulário com o Meu Dicionário.')
+              );
+            }
+          });
+        return;
+      }
+
+      // Start new asynchronous sync independently from report rendering
+      setIsSyncingVocab(true);
+      setVocabSyncError(null);
+
+      const isDefinitive = Boolean(currentResult.isAiGenerated && !currentResult.isProvisional && !currentResult.isFallback);
+
+      const syncPromise = syncSessionVocabularyToStudentDictionary({
+        studentUid: resolvedUid, // Strictly canonical UID from authenticated Firebase Auth
+        studentEmail: resolvedEmail,
+        rawNotes: session.rawContent,
+        vocabularyAndExpressions: currentResult.vocabularyAndExpressions,
+        studentLevel,
+        sessionDate: session.dateStr,
+        topic: session.topic,
+        teacherName: session.teacherName,
+        lessonId: session.lessonId,
+        isDefinitiveAi: isDefinitive,
+      });
+
+      inFlightVocabSyncPromises.set(syncKey, syncPromise);
+
+      syncPromise
+        .then((syncedEntries) => {
+          completedVocabSyncKeys.add(syncKey);
+          if (syncedEntries && syncedEntries.length > 0) {
+            if (onVocabularySynced) {
+              try {
+                onVocabularySynced(syncedEntries);
+              } catch (cbErr) {
+                console.error('NativeFriendsNotes: onVocabularySynced callback notice:', cbErr);
+              }
+            }
+          }
+          if (isMountedRef.current) {
+            setIsSyncingVocab(false);
+          }
+        })
+        .catch((syncErr: any) => {
+          console.error('NativeFriendsNotes: vocabulary sync failure:', syncErr);
+          completedVocabSyncKeys.delete(syncKey);
+          if (isMountedRef.current) {
+            setVocabSyncError(
+              syncErr?.message || (isEn ? 'Failed to sync vocabulary to My Dictionary.' : 'Falha ao sincronizar vocabulário com o Meu Dicionário.')
+            );
+            setIsSyncingVocab(false);
+          }
+        })
+        .finally(() => {
+          inFlightVocabSyncPromises.delete(syncKey);
+        });
+    },
+    [hasValidAuth, resolvedUid, resolvedEmail, studentLevel, isEn, onVocabularySynced]
+  );
+
   // Load and transform pedagogical notes whenever active session changes
   const loadPedagogicalNotes = useCallback(
     async (forceRegenerate: boolean = false) => {
@@ -396,13 +508,17 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
       if (!forceRegenerate && sessionNotesModalMemoryCache.has(cacheKey)) {
         const cached = sessionNotesModalMemoryCache.get(cacheKey)!;
         setTransformation(cached);
+        // Instant visual unlock: notes display immediately from cache
         setIsLoadingTransformation(false);
+        // Trigger vocabulary sync asynchronously in background without delaying UI display
+        performVocabularySync(cached, activeSession, false);
         return;
       }
 
       setIsLoadingTransformation(true);
+      let result: PedagogicalLessonTransformation | null = null;
       try {
-        const result = await fetchPedagogicalTransformation({
+        result = await fetchPedagogicalTransformation({
           rawNotes: activeSession.rawContent,
           topic: activeSession.topic,
           sessionDate: activeSession.dateStr,
@@ -417,52 +533,24 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
           triggerAiIfMissing: true,
         });
 
+        // Step 1: Set pedagogical transformation report as soon as available
         setTransformation(result);
         if (result && result.isAiGenerated && !result.isProvisional) {
           sessionNotesModalMemoryCache.set(cacheKey, result);
         }
-
-        // Automatically sync session vocabulary (proven Alt + W only) into student's My Dictionary in Firestore via backend
-        // FASE 4B.8.2: Require valid canonical authentication prior to persisting
-        if (hasValidAuth) {
-          setIsSyncingVocab(true);
-          setVocabSyncError(null);
-          try {
-            const isDefinitive = Boolean(result.isAiGenerated && !result.isProvisional && !result.isFallback);
-            const syncedEntries = await syncSessionVocabularyToStudentDictionary({
-              studentUid: resolvedUid, // Strictly canonical UID from authenticated Firebase Auth
-              studentEmail: resolvedEmail,
-              rawNotes: activeSession.rawContent,
-              vocabularyAndExpressions: result.vocabularyAndExpressions,
-              studentLevel,
-              sessionDate: activeSession.dateStr,
-              topic: activeSession.topic,
-              teacherName: activeSession.teacherName,
-              lessonId: activeSession.lessonId,
-              isDefinitiveAi: isDefinitive,
-            });
-
-            if (syncedEntries && syncedEntries.length > 0) {
-              if (onVocabularySynced) {
-                onVocabularySynced(syncedEntries);
-              }
-            }
-          } catch (syncErr: any) {
-            console.error('NativeFriendsNotes: vocabulary sync failure:', syncErr);
-            setVocabSyncError(
-              syncErr?.message || (isEn ? 'Failed to sync vocabulary to My Dictionary.' : 'Falha ao sincronizar vocabulário com o Meu Dicionário.')
-            );
-          } finally {
-            setIsSyncingVocab(false);
-          }
-        }
       } catch (err) {
         console.warn('Failed to load pedagogical notes:', err);
       } finally {
+        // Step 2: Unblock visual presentation immediately so the user sees notes without delay
         setIsLoadingTransformation(false);
       }
+
+      // Step 3: Run automatic vocabulary synchronization asynchronously and independently from visual loading
+      if (result) {
+        performVocabularySync(result, activeSession, forceRegenerate);
+      }
     },
-    [activeSession, studentLevel, resolvedUid, resolvedEmail, currentLanguage]
+    [activeSession, studentLevel, resolvedUid, resolvedEmail, currentLanguage, performVocabularySync]
   );
 
   // FASE 4B.9: Active session & content hash tracking to guarantee zero repeated Gemini calls
@@ -721,11 +809,13 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
               }`}
             >
               <span>3. {isEn ? 'Vocabulary & Expressions' : 'Vocabulary & Expressions'}</span>
-              {transformation?.vocabularyAndExpressions && (
+              {isSyncingVocab ? (
+                <RefreshCw className="w-3.5 h-3.5 text-purple-300 animate-spin" />
+              ) : transformation?.vocabularyAndExpressions ? (
                 <span className="w-4 h-4 rounded-full bg-white/20 text-[10px] flex items-center justify-center font-black">
                   {transformation.vocabularyAndExpressions.length}
                 </span>
-              )}
+              ) : null}
               {currentSequentialTab === 'vocab' && (
                 <span className="w-2 h-2 rounded-full bg-amber-400 absolute -top-0.5 -right-0.5 animate-pulse" title="Sua etapa de hoje" />
               )}
@@ -1248,6 +1338,17 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                     </span>
                   </div>
 
+                  {isSyncingVocab && (
+                    <div className="p-3 rounded-2xl bg-purple-50/90 border border-purple-200/90 text-purple-900 text-xs flex items-center gap-2.5 shadow-2xs">
+                      <RefreshCw className="w-3.5 h-3.5 text-purple-600 animate-spin shrink-0" />
+                      <span className="font-medium">
+                        {isEn
+                          ? 'Syncing marked session vocabulary (Alt + W) into My Dictionary...'
+                          : 'Sincronizando termos marcados da aula (Alt + W) com o Meu Dicionário...'}
+                      </span>
+                    </div>
+                  )}
+
                   {vocabSyncError && (
                     <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-xs flex items-center justify-between gap-3 shadow-2xs">
                       <div className="flex items-center gap-2">
@@ -1256,7 +1357,13 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                       </div>
                       <button
                         type="button"
-                        onClick={() => loadPedagogicalNotes(false)}
+                        onClick={() => {
+                          if (transformation && activeSession) {
+                            performVocabularySync(transformation, activeSession, true);
+                          } else {
+                            loadPedagogicalNotes(false);
+                          }
+                        }}
                         className="px-3 py-1.5 rounded-xl bg-amber-200/80 hover:bg-amber-300 text-amber-950 font-bold text-xs transition cursor-pointer shrink-0"
                       >
                         {isEn ? 'Retry Sync' : 'Tentar Novamente'}
