@@ -49,14 +49,14 @@ async function runHotfixSurgicalValidation() {
   console.log('--- 1. Verificação das Políticas do Gemini Security ---');
 
   assert(
-    GEMINI_POLICIES.check_daily_sentence.timeoutMs === 9000,
-    '1.1: Timeout da política check_daily_sentence ajustado para 9.000 ms',
+    GEMINI_POLICIES.check_daily_sentence.timeoutMs === 16000,
+    '1.1: Timeout da política check_daily_sentence ajustado para 16.000 ms',
     `atual: ${GEMINI_POLICIES.check_daily_sentence.timeoutMs} ms`
   );
 
   assert(
-    GEMINI_POLICIES.check_daily_sentence.maxOutputTokens === 450,
-    '1.2: maxOutputTokens de check_daily_sentence preservado em 450'
+    GEMINI_POLICIES.check_daily_sentence.maxOutputTokens === 1500,
+    '1.2: maxOutputTokens de check_daily_sentence ajustado para 1500'
   );
 
   assert(

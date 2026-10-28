@@ -171,11 +171,11 @@ export const GEMINI_POLICIES: Record<GeminiFeature, FeaturePolicy> = {
     timeoutMs: 15000,
   },
   check_daily_sentence: {
-    maxOutputTokens: 450,
+    maxOutputTokens: 1500,
     rateLimitWindowSeconds: 60,
     rateLimitMaxRequests: 15,
     maxInputLengthChars: 500,
-    timeoutMs: 9000,
+    timeoutMs: 16000,
   },
   check_writing: {
     maxOutputTokens: 600,

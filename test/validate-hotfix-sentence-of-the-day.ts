@@ -446,12 +446,12 @@ async function runSentenceOfTheDayHotfixTests(): Promise<void> {
 
   const policy = GEMINI_POLICIES['check_daily_sentence'];
   assert(
-    policy.maxOutputTokens === 450,
-    `9.1: maxOutputTokens para check_daily_sentence preservado em 450 (atual: ${policy.maxOutputTokens})`
+    policy.maxOutputTokens === 1500,
+    `9.1: maxOutputTokens para check_daily_sentence ajustado para 1500 (atual: ${policy.maxOutputTokens})`
   );
   assert(
-    policy.timeoutMs === 9000,
-    `9.2: timeoutMs para check_daily_sentence ajustado exclusivamente para 9000ms (atual: ${policy.timeoutMs}ms)`
+    policy.timeoutMs === 16000,
+    `9.2: timeoutMs para check_daily_sentence ajustado exclusivamente para 16000ms (atual: ${policy.timeoutMs}ms)`
   );
   assert(
     policy.maxInputLengthChars === 500,
