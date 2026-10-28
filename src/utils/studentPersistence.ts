@@ -1553,7 +1553,7 @@ export async function purchasePackageWithTransaction(params: PurchasePackageTran
       }
 
       const contracted = Number(resData.contractedLessons || params.packageLessons);
-      const available = Number(resData.profile?.availableLessons || contracted);
+      const available = Number(resData.availableLessons ?? resData.profile?.availableLessons ?? contracted);
 
       return {
         success: true,

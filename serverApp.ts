@@ -5672,10 +5672,13 @@ app.post('/api/students/purchase-package', async (req, res) => {
   if (idempotencyKey && Array.isArray(db.transactions)) {
     const existingTx = db.transactions.find((tx: any) => tx.idempotencyKey === idempotencyKey);
     if (existingTx) {
+      const authContracted = Number(db.contractedLessons?.[cleanStudentEmail] || db.userProfiles?.[cleanStudentEmail]?.contractedLessons || 0);
+      const authAvailable = Number(db.userProfiles?.[cleanStudentEmail]?.availableLessons ?? authContracted);
       return res.json({
         success: true,
         message: 'Package already purchased (idempotent)',
-        contractedLessons: Number(db.contractedLessons?.[cleanStudentEmail] || db.userProfiles?.[cleanStudentEmail]?.contractedLessons || 0),
+        contractedLessons: authContracted,
+        availableLessons: authAvailable,
         profile: db.userProfiles?.[cleanStudentEmail],
         transaction: existingTx,
       });
@@ -5723,11 +5726,14 @@ app.post('/api/students/purchase-package', async (req, res) => {
 
   // 5. ATOMIC TRANSACTION IN FIRESTORE VIA FIREBASE ADMIN SDK
   const firestoreDb = getFirestoreDb();
-  let atomicContractedTotal = 0;
-  let atomicAvailableTotal = 0;
+  let atomicContractedTotal: number | null = null;
+  let atomicAvailableTotal: number | null = null;
 
   if (firestoreDb && targetStudentUid) {
     try {
+      let txContracted: number | null = null;
+      let txAvailable: number | null = null;
+
       await firestoreDb.runTransaction(async (transaction) => {
         const studentRef = firestoreDb.collection('users').doc(targetStudentUid);
         const teacherRef = firestoreDb.collection('users').doc(canonicalTeacherUid);
@@ -5741,12 +5747,12 @@ app.post('/api/students/purchase-package', async (req, res) => {
         const currentContracted = Number(studentData.contractedLessons ?? db.contractedLessons?.[cleanStudentEmail] ?? 0);
         const currentAvailable = Number(studentData.availableLessons ?? currentContracted);
 
-        atomicContractedTotal = currentContracted + lessonsToAdd;
-        atomicAvailableTotal = currentAvailable + lessonsToAdd;
+        txContracted = currentContracted + lessonsToAdd;
+        txAvailable = currentAvailable + lessonsToAdd;
 
         const studentUpdate: Record<string, any> = {
-          contractedLessons: atomicContractedTotal,
-          availableLessons: atomicAvailableTotal,
+          contractedLessons: txContracted,
+          availableLessons: txAvailable,
           teacherUid: canonicalTeacherUid,
           assignedNativeFriendUID: canonicalTeacherUid,
           nativeFriendUID: canonicalTeacherUid,
@@ -5763,6 +5769,10 @@ app.post('/api/students/purchase-package', async (req, res) => {
           transaction.set(teacherRef, { updatedAt: nowIso }, { merge: true });
         }
       });
+
+      // Assign atomic totals only upon successful transaction commit
+      atomicContractedTotal = txContracted;
+      atomicAvailableTotal = txAvailable;
 
       firestoreDb.collection('student_assignments').doc(targetStudentUid).set({
         studentUid: targetStudentUid,
@@ -5782,8 +5792,13 @@ app.post('/api/students/purchase-package', async (req, res) => {
   // 6. Update local synchronized state
   if (!db.contractedLessons) db.contractedLessons = {};
   const currentContracted = Number(db.contractedLessons[cleanStudentEmail] || 0);
-  const newTotal = atomicContractedTotal > 0 ? atomicContractedTotal : (currentContracted + lessonsToAdd);
+  const newTotal = atomicContractedTotal !== null ? atomicContractedTotal : (currentContracted + lessonsToAdd);
   db.contractedLessons[cleanStudentEmail] = newTotal;
+
+  if (!db.userProfiles) db.userProfiles = {};
+  const existingProfile = db.userProfiles[cleanStudentEmail] || {};
+  const currentAvailableInProfile = Number(existingProfile.availableLessons ?? currentContracted);
+  const authoritativeAvailable = atomicAvailableTotal !== null ? atomicAvailableTotal : (currentAvailableInProfile + lessonsToAdd);
 
   // Update student in db.students
   let studentFound = false;
@@ -5798,6 +5813,7 @@ app.post('/api/students/purchase-package', async (req, res) => {
         assignedNativeFriendUID: canonicalTeacherUid,
         nativeFriendUID: canonicalTeacherUid,
         contractedLessons: newTotal,
+        availableLessons: authoritativeAvailable,
         status: 'active',
       };
     }
@@ -5817,6 +5833,7 @@ app.post('/api/students/purchase-package', async (req, res) => {
       goal: 'English for everyday life & work',
       learningGoal: 'English for everyday life & work',
       contractedLessons: newTotal,
+      availableLessons: authoritativeAvailable,
       completedLessonsCount: 0,
       teacherEmail: finalTeacherEmail,
       teacherName: finalTeacherName,
@@ -5833,8 +5850,6 @@ app.post('/api/students/purchase-package', async (req, res) => {
   }
 
   // Update db.userProfiles
-  if (!db.userProfiles) db.userProfiles = {};
-  const existingProfile = db.userProfiles[cleanStudentEmail] || {};
   db.userProfiles[cleanStudentEmail] = {
     ...existingProfile,
     id: targetStudentUid || existingProfile.id || `usr-${Date.now()}`,
@@ -5849,6 +5864,7 @@ app.post('/api/students/purchase-package', async (req, res) => {
     nativeFriendUID: canonicalTeacherUid,
     enrollmentStatus: 'active',
     contractedLessons: newTotal,
+    availableLessons: authoritativeAvailable,
     weeklyNativeLessonsTarget: newWeeklyTarget,
     subscriptionType: 'package',
     completedLessonsCount: existingProfile.completedLessonsCount || 0,
@@ -5882,6 +5898,7 @@ app.post('/api/students/purchase-package', async (req, res) => {
     success: true,
     message: 'Package purchased successfully and Native Friend assigned',
     contractedLessons: newTotal,
+    availableLessons: authoritativeAvailable,
     teacherUid: canonicalTeacherUid,
     profile: db.userProfiles[cleanStudentEmail],
     transaction,
