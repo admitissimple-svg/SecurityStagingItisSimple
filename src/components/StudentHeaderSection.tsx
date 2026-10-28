@@ -195,11 +195,13 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
       })
     : null;
 
-  // Contract calculation: default to 0 for new students without contracts, but at least 1 if they booked a trial lesson
+  // Contract calculation: authoritative contracted lessons from userProfile, falling back to contractedLessons map
   const totalContractedCount =
-    contractedLessons[studentEmail] !== undefined
-      ? contractedLessons[studentEmail]
-      : Math.max(userProfile?.contractedLessons ?? 0, studentLessons.length > 0 ? 1 : 0);
+    typeof userProfile?.contractedLessons === 'number'
+      ? userProfile.contractedLessons
+      : (contractedLessons[studentEmail] !== undefined
+          ? contractedLessons[studentEmail]
+          : (studentLessons.length > 0 ? 1 : 0));
 
   const [isEditingContract, setIsEditingContract] = useState<boolean>(false);
   const [contractInputVal, setContractInputVal] = useState<number>(totalContractedCount);
@@ -212,8 +214,11 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
     return false;
   }).length;
 
-  // 3. Saldo restante = Contratadas - realizadas
-  const studentRemainingBalance = Math.max(0, totalContractedCount - studentRealizadasCount);
+  // 3. Saldo restante = availableLessons autoritativo do Firestore / backend (Correção C)
+  // NUNCA calcular créditos disponíveis a partir do total contratado ou estado legado!
+  // Se availableLessons não estiver disponível, exibir estado indisponível ('—') sem inventar créditos
+  const hasAuthoritativeAvailable = typeof userProfile?.availableLessons === 'number';
+  const studentRemainingBalance = hasAuthoritativeAvailable ? userProfile!.availableLessons! : null;
 
   // 4. Agendadas = aulas agendadas ativas (não concluídas e não canceladas)
   const activeScheduledLessons = studentLessons.filter((l) => {
@@ -336,7 +341,7 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
               </span>
               <div className="flex items-baseline gap-1 mt-0.5">
                 <span className="text-sm sm:text-base font-black text-white leading-none">
-                  {studentRemainingBalance}
+                  {hasAuthoritativeAvailable ? studentRemainingBalance : '—'}
                 </span>
                 <span className="text-[9px] text-[#9AB4FF] font-bold leading-none">
                   {isEn ? 'avail.' : 'disponíveis'}

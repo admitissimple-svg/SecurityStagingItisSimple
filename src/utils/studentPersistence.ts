@@ -1594,17 +1594,21 @@ export async function purchasePackageWithTransaction(params: PurchasePackageTran
         const studentDocRef = adminDb.collection('users').doc(studentUid);
         const teacherDocRef = adminDb.collection('users').doc(canonicalTeacherUid);
         let finalContracted = params.packageLessons;
+        let finalAvailable = params.packageLessons;
 
         await adminDb.runTransaction(async (transaction: any) => {
           const studentSnap = await transaction.get(studentDocRef);
           const studentData = studentSnap.exists ? (studentSnap.data() || {}) : {};
           const currentContracted = Number(studentData.contractedLessons || 0);
-          const currentAvailable = Number(studentData.availableLessons || currentContracted);
+          const currentAvailable = typeof studentData.availableLessons === 'number'
+            ? studentData.availableLessons
+            : 0;
           finalContracted = currentContracted + params.packageLessons;
+          finalAvailable = currentAvailable + params.packageLessons;
 
           transaction.set(studentDocRef, {
             contractedLessons: finalContracted,
-            availableLessons: currentAvailable + params.packageLessons,
+            availableLessons: finalAvailable,
             teacherUid: canonicalTeacherUid,
             assignedNativeFriendUID: canonicalTeacherUid,
             nativeFriendUID: canonicalTeacherUid,
@@ -1621,11 +1625,12 @@ export async function purchasePackageWithTransaction(params: PurchasePackageTran
         return {
           success: true,
           contractedLessons: finalContracted,
-          availableLessons: finalContracted,
+          availableLessons: finalAvailable,
           teacherUid: canonicalTeacherUid,
           profile: {
             teacherUid: canonicalTeacherUid,
             contractedLessons: finalContracted,
+            availableLessons: finalAvailable,
             teacherEmail: teacherRes.email || cleanTeacherEmail,
             teacherName: teacherRes.name || params.teacherName || '',
           },

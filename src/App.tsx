@@ -509,8 +509,8 @@ export default function App() {
               teacherMeetUrl: firestoreDoc?.teacherMeetUrl || '',
               teacherUid: teacherUid,
               assignedNativeFriendUID: teacherUid,
-              nativeFriendUID: teacherUid,
-              contractedLessons: typeof firestoreDoc?.contractedLessons === 'number' ? firestoreDoc.contractedLessons : 1,
+              contractedLessons: typeof firestoreDoc?.contractedLessons === 'number' ? firestoreDoc.contractedLessons : (firestoreDoc?.hasCompletedTrialLesson ? 1 : 0),
+              availableLessons: typeof firestoreDoc?.availableLessons === 'number' ? firestoreDoc.availableLessons : undefined,
               completedLessonsCount: typeof firestoreDoc?.completedLessonsCount === 'number' ? firestoreDoc.completedLessonsCount : 0,
               hasCompletedTrialLesson: Boolean(firestoreDoc?.hasCompletedTrialLesson),
               onboardingCompleted: typeof firestoreDoc?.onboardingCompleted === "boolean"
@@ -2613,7 +2613,8 @@ export default function App() {
         assignedNativeFriendUID: canonicalTutorUid || undefined,
         nativeFriendUID: canonicalTutorUid || undefined,
         enrollmentStatus: 'active',
-        contractedLessons: Math.max(userProfile.contractedLessons || 0, 1),
+        contractedLessons: userProfile.contractedLessons !== undefined ? Math.max(userProfile.contractedLessons, 1) : 1,
+        availableLessons: userProfile.availableLessons,
         hasCompletedTrialLesson: false,
         subscriptionType: 'trial',
       };
@@ -3038,7 +3039,8 @@ export default function App() {
         dailyPhraseTime: (initialProfile as any)?.dailyPhraseTime || '20:00',
         teacherEmail: (initialProfile as any)?.teacherEmail || null,
         teacherName: (initialProfile as any)?.teacherName || null,
-        contractedLessons: (initialProfile as any)?.contractedLessons ?? 1,
+        contractedLessons: (initialProfile as any)?.contractedLessons ?? 0,
+        availableLessons: typeof (initialProfile as any)?.availableLessons === 'number' ? (initialProfile as any).availableLessons : undefined,
       };
       setUserProfile(freshProfile);
 

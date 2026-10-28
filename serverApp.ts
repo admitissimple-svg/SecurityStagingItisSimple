@@ -5255,10 +5255,11 @@ app.get('/api/user-profile', async (req, res) => {
     });
   }
 
-  // Also check Firestore for teacher/Native Friend record
+  // Also check Firestore for teacher/Native Friend record or authoritative student document
+  let fsUser: any = null;
   if (email || uid) {
     try {
-      const fsUser = await fetchUserFromFirestore(email, uid);
+      fsUser = await fetchUserFromFirestore(email, uid);
       if (fsUser && (fsUser.role === 'teacher' || fsUser.isTeacher || fsUser.role === 'native_friend' || fsUser.role === 'tutor')) {
         return res.json({
           success: true,
@@ -5329,6 +5330,16 @@ app.get('/api/user-profile', async (req, res) => {
     if (!db.userProfiles) db.userProfiles = {};
     db.userProfiles[email] = profile;
     writeDb(db);
+  } else if (!profile && fsUser) {
+    profile = {
+      ...fsUser,
+      id: fsUser.id || fsUser.uid || uid,
+      uid: fsUser.uid || fsUser.id || uid,
+      email: fsUser.email || email,
+    };
+    if (!db.userProfiles) db.userProfiles = {};
+    db.userProfiles[email] = profile;
+    writeDb(db);
   } else if (!profile && !student) {
     return res.json({
       success: true,
@@ -5338,6 +5349,15 @@ app.get('/api/user-profile', async (req, res) => {
   }
 
   if (profile) {
+    // Populate authoritative credits from Firestore user doc if present
+    if (fsUser) {
+      if (typeof fsUser.contractedLessons === 'number') {
+        profile.contractedLessons = fsUser.contractedLessons;
+      }
+      if (typeof fsUser.availableLessons === 'number') {
+        profile.availableLessons = fsUser.availableLessons;
+      }
+    }
     const studentPlanDays =
       (db.weeklyStudyDays?.[email] && db.weeklyStudyDays[email].length > 0)
         ? db.weeklyStudyDays[email]
@@ -5485,6 +5505,10 @@ app.post('/api/user-profile', async (req, res) => {
     }
   }
 
+  // Strict Credit Hardening (Correção B): Stripping any attempt to update credits via profile endpoint
+  delete rawProfile.contractedLessons;
+  delete rawProfile.availableLessons;
+
   const oldLevelKey = normalizeStudentLevel(existing.level).key;
   const newLevelKey = normalizeStudentLevel(rawProfile.level || existing.level).key;
 
@@ -5507,7 +5531,6 @@ app.post('/api/user-profile', async (req, res) => {
     userLevel: resolvedLevel,
     learningGoal: resolvedLearningGoal,
     dailyGoalMinutes: rawProfile.dailyGoalMinutes ?? existing.dailyGoalMinutes ?? 30,
-    contractedLessons: Number(rawProfile.contractedLessons ?? existing.contractedLessons ?? db.contractedLessons?.[targetEmail] ?? 1),
     completedLessonsCount: Number(existing.completedLessonsCount ?? rawProfile.completedLessonsCount ?? 0),
     teacherEmail: finalTeacherEmail,
     teacherName: finalTeacherName,
@@ -5528,6 +5551,10 @@ app.post('/api/user-profile', async (req, res) => {
     updatedAt: new Date().toISOString(),
   };
 
+  // Crucial: Delete financial fields from Firestore write payload so merge:true never modifies credits
+  delete updatedProfileObj.contractedLessons;
+  delete updatedProfileObj.availableLessons;
+
   if (rawProfile.avatar || rawProfile.picture) {
     updatedProfileObj.avatar = rawProfile.avatar || rawProfile.picture;
     updatedProfileObj.picture = rawProfile.avatar || rawProfile.picture;
@@ -5537,9 +5564,26 @@ app.post('/api/user-profile', async (req, res) => {
   // Canonical record strictly in users/{targetUid}
   const firestoreDb = getFirestoreDb();
   let persistedToFirestore = false;
+  let canonicalContractedFromFs: number | undefined = undefined;
+  let canonicalAvailableFromFs: number | undefined = undefined;
+
   if (firestoreDb && targetUid) {
     try {
+      // Read current canonical credit balances from Firestore document
+      const currentDocSnap = await firestoreDb.collection('users').doc(targetUid).get().catch(() => null);
+      if (currentDocSnap && currentDocSnap.exists) {
+        const curData = currentDocSnap.data() || {};
+        if (typeof curData.contractedLessons === 'number') {
+          canonicalContractedFromFs = curData.contractedLessons;
+        }
+        if (typeof curData.availableLessons === 'number') {
+          canonicalAvailableFromFs = curData.availableLessons;
+        }
+      }
+
       await firestoreDb.collection('users').doc(targetUid).set(updatedProfileObj, { merge: true });
+      persistedToFirestore = true;
+
       if (firestoreDb && targetUid && updatedProfileObj.teacherUid) {
         firestoreDb.collection('student_assignments').doc(targetUid).set({
           studentUid: targetUid,
@@ -5561,8 +5605,18 @@ app.post('/api/user-profile', async (req, res) => {
     }
   }
 
-  // 4. Update local cache / state
-  db.userProfiles[targetEmail] = updatedProfileObj;
+  // Authoritative read-only balances
+  const effectiveContracted = canonicalContractedFromFs ?? existing.contractedLessons ?? (db.contractedLessons?.[targetEmail] !== undefined ? db.contractedLessons[targetEmail] : undefined);
+  const effectiveAvailable = canonicalAvailableFromFs ?? existing.availableLessons;
+
+  // 4. Update local cache / state strictly with read-only authoritative credits
+  const fullProfileWithAuthoritativeCredits = {
+    ...updatedProfileObj,
+    ...(effectiveContracted !== undefined ? { contractedLessons: effectiveContracted } : {}),
+    ...(effectiveAvailable !== undefined ? { availableLessons: effectiveAvailable } : {}),
+  };
+
+  db.userProfiles[targetEmail] = fullProfileWithAuthoritativeCredits;
 
   const studentIdx = (db.students || []).findIndex(
     (s: any) =>
@@ -5589,7 +5643,8 @@ app.post('/api/user-profile', async (req, res) => {
       teacherUid: updatedProfileObj.teacherUid,
       assignedNativeFriendUID: updatedProfileObj.assignedNativeFriendUID,
       nativeFriendUID: updatedProfileObj.nativeFriendUID,
-      contractedLessons: updatedProfileObj.contractedLessons,
+      ...(effectiveContracted !== undefined ? { contractedLessons: effectiveContracted } : {}),
+      ...(effectiveAvailable !== undefined ? { availableLessons: effectiveAvailable } : {}),
       status: updatedProfileObj.enrollmentStatus === 'cancelled' ? 'cancelled' : (updatedProfileObj.teacherEmail ? 'active' : 'not_enrolled'),
     };
   } else {
@@ -5605,7 +5660,8 @@ app.post('/api/user-profile', async (req, res) => {
       studentLevel: updatedProfileObj.level,
       goal: updatedProfileObj.learningGoal,
       learningGoal: updatedProfileObj.learningGoal,
-      contractedLessons: updatedProfileObj.contractedLessons,
+      ...(effectiveContracted !== undefined ? { contractedLessons: effectiveContracted } : {}),
+      ...(effectiveAvailable !== undefined ? { availableLessons: effectiveAvailable } : {}),
       completedLessonsCount: 0,
       teacherEmail: updatedProfileObj.teacherEmail,
       teacherName: updatedProfileObj.teacherName,
@@ -5630,7 +5686,7 @@ app.post('/api/user-profile', async (req, res) => {
   }
 
   await writeDbSync(db);
-  res.json({ success: true, profile: db.userProfiles[targetEmail], persistedToFirestore });
+  res.json({ success: true, profile: fullProfileWithAuthoritativeCredits, persistedToFirestore });
 });
 
 // Purchase Lesson Package with a specific Native Friend (binds tutor as fixed + adds lessons)
@@ -5661,29 +5717,14 @@ app.post('/api/students/purchase-package', async (req, res) => {
       ? requestedEmail
       : (verifiedCaller.email?.toLowerCase().trim() || requestedEmail)
   );
-  const targetStudentUid = verifiedCaller.role === 'admin' && req.body.studentUid ? req.body.studentUid : verifiedCaller.uid;
+  const targetStudentUid = (verifiedCaller.role === 'admin' && req.body.studentUid ? req.body.studentUid : verifiedCaller.uid)?.trim();
 
-  if (!cleanStudentEmail && !targetStudentUid) {
-    return res.status(400).json({ error: 'Identificador do aluno é obrigatório.' });
+  if (!targetStudentUid || !isValidCanonicalUid(targetStudentUid)) {
+    return res.status(400).json({ error: 'Identificador canônico do aluno inválido ou ausente.' });
   }
 
   // 3. Idempotency protection to prevent duplicate purchases on retry
   const idempotencyKey = String(req.body.idempotencyKey || req.body.requestId || req.headers['idempotency-key'] || '').trim();
-  if (idempotencyKey && Array.isArray(db.transactions)) {
-    const existingTx = db.transactions.find((tx: any) => tx.idempotencyKey === idempotencyKey);
-    if (existingTx) {
-      const authContracted = Number(db.contractedLessons?.[cleanStudentEmail] || db.userProfiles?.[cleanStudentEmail]?.contractedLessons || 0);
-      const authAvailable = Number(db.userProfiles?.[cleanStudentEmail]?.availableLessons ?? authContracted);
-      return res.json({
-        success: true,
-        message: 'Package already purchased (idempotent)',
-        contractedLessons: authContracted,
-        availableLessons: authAvailable,
-        profile: db.userProfiles?.[cleanStudentEmail],
-        transaction: existingTx,
-      });
-    }
-  }
 
   const cleanTeacherEmail = (teacherEmail || '').toLowerCase().trim();
   const incomingTeacherRef = req.body.teacherId || req.body.publicTutorId || req.body.tutorId || req.body.teacherUid || cleanTeacherEmail;
@@ -5726,79 +5767,152 @@ app.post('/api/students/purchase-package', async (req, res) => {
 
   // 5. ATOMIC TRANSACTION IN FIRESTORE VIA FIREBASE ADMIN SDK
   const firestoreDb = getFirestoreDb();
+  if (!firestoreDb) {
+    return res.status(503).json({
+      success: false,
+      error: 'Serviço de persistência Firestore indisponível para contratação de pacotes.',
+    });
+  }
+
   let atomicContractedTotal: number | null = null;
   let atomicAvailableTotal: number | null = null;
+  let isIdempotentReplay = false;
+  let recordedStudentData: any = null;
 
-  if (firestoreDb && targetStudentUid) {
-    try {
-      let txContracted: number | null = null;
-      let txAvailable: number | null = null;
+  try {
+    await firestoreDb.runTransaction(async (transaction) => {
+      const studentRef = firestoreDb.collection('users').doc(targetStudentUid);
+      const teacherRef = firestoreDb.collection('users').doc(canonicalTeacherUid);
 
-      await firestoreDb.runTransaction(async (transaction) => {
-        const studentRef = firestoreDb.collection('users').doc(targetStudentUid);
-        const teacherRef = firestoreDb.collection('users').doc(canonicalTeacherUid);
+      const [studentSnap, teacherSnap] = await Promise.all([
+        transaction.get(studentRef),
+        transaction.get(teacherRef).catch(() => null),
+      ]);
 
-        const [studentSnap, teacherSnap] = await Promise.all([
-          transaction.get(studentRef).catch(() => null),
-          transaction.get(teacherRef).catch(() => null),
-        ]);
+      if (!studentSnap.exists) {
+        const notFoundErr = new Error('Aluno não encontrado no Firestore.');
+        (notFoundErr as any).statusCode = 404;
+        throw notFoundErr;
+      }
 
-        const studentData = (studentSnap && studentSnap.exists) ? (studentSnap.data() || {}) : {};
-        const currentContracted = Number(studentData.contractedLessons ?? db.contractedLessons?.[cleanStudentEmail] ?? 0);
-        const currentAvailable = Number(studentData.availableLessons ?? currentContracted);
+      const studentData = studentSnap.data() || {};
+      recordedStudentData = studentData;
 
-        txContracted = currentContracted + lessonsToAdd;
-        txAvailable = currentAvailable + lessonsToAdd;
+      // Check idempotency strictly inside the transaction
+      const processedPurchases = studentData.processedPurchases || {};
+      if (idempotencyKey && processedPurchases[idempotencyKey]) {
+        const prevTx = processedPurchases[idempotencyKey];
+        atomicContractedTotal = typeof studentData.contractedLessons === 'number'
+          ? studentData.contractedLessons
+          : prevTx.contractedLessons;
+        atomicAvailableTotal = typeof studentData.availableLessons === 'number'
+          ? studentData.availableLessons
+          : prevTx.availableLessons;
+        isIdempotentReplay = true;
+        return;
+      }
 
-        const studentUpdate: Record<string, any> = {
-          contractedLessons: txContracted,
-          availableLessons: txAvailable,
-          teacherUid: canonicalTeacherUid,
-          assignedNativeFriendUID: canonicalTeacherUid,
-          nativeFriendUID: canonicalTeacherUid,
-          teacherEmail: finalTeacherEmail,
-          teacherName: finalTeacherName,
-          enrollmentStatus: 'active',
-          weeklyNativeLessonsTarget: newWeeklyTarget,
-          subscriptionType: 'package',
-          updatedAt: nowIso,
-        };
+      // Read authoritative balances directly from canonical Firestore student document
+      const currentAvailable = typeof studentData.availableLessons === 'number'
+        ? studentData.availableLessons
+        : 0;
 
-        transaction.set(studentRef, studentUpdate, { merge: true });
-        if (teacherSnap && teacherSnap.exists) {
-          transaction.set(teacherRef, { updatedAt: nowIso }, { merge: true });
-        }
-      });
+      const currentContracted = typeof studentData.contractedLessons === 'number'
+        ? studentData.contractedLessons
+        : currentAvailable;
 
-      // Assign atomic totals only upon successful transaction commit
+      const txContracted = currentContracted + lessonsToAdd;
+      const txAvailable = currentAvailable + lessonsToAdd;
+
       atomicContractedTotal = txContracted;
       atomicAvailableTotal = txAvailable;
 
-      firestoreDb.collection('student_assignments').doc(targetStudentUid).set({
-        studentUid: targetStudentUid,
+      const updatedProcessedPurchases = { ...processedPurchases };
+      if (idempotencyKey) {
+        updatedProcessedPurchases[idempotencyKey] = {
+          lessonsAdded: lessonsToAdd,
+          contractedLessons: txContracted,
+          availableLessons: txAvailable,
+          teacherUid: canonicalTeacherUid,
+          timestamp: nowIso,
+        };
+      }
+
+      const studentUpdate: Record<string, any> = {
+        contractedLessons: txContracted,
+        availableLessons: txAvailable,
         teacherUid: canonicalTeacherUid,
-        teacherAuthUid: canonicalTeacherUid,
         assignedNativeFriendUID: canonicalTeacherUid,
         nativeFriendUID: canonicalTeacherUid,
         teacherEmail: finalTeacherEmail,
         teacherName: finalTeacherName,
+        enrollmentStatus: 'active',
+        weeklyNativeLessonsTarget: newWeeklyTarget,
+        subscriptionType: 'package',
+        processedPurchases: updatedProcessedPurchases,
         updatedAt: nowIso,
-      }, { merge: true }).catch(() => {});
-    } catch (fsErr) {
-      console.warn('[purchase-package] Firestore Admin transaction notice:', fsErr);
+      };
+
+      transaction.set(studentRef, studentUpdate, { merge: true });
+      if (teacherSnap && teacherSnap.exists) {
+        transaction.set(teacherRef, { updatedAt: nowIso }, { merge: true });
+      }
+    });
+  } catch (fsErr: any) {
+    console.error('[purchase-package] Failed to persist package credits in Firestore transaction:', fsErr);
+    if (fsErr?.statusCode === 404) {
+      return res.status(404).json({
+        success: false,
+        error: fsErr.message || 'Aluno não encontrado no Firestore.',
+      });
     }
+    if (isPermissionError(fsErr)) {
+      return res.status(500).json({
+        success: false,
+        error: 'Erro de infraestrutura ao persistir créditos de aulas no banco de dados Firestore.',
+        code: 'FIRESTORE_INFRASTRUCTURE_ERROR',
+      });
+    }
+    const msg = String(fsErr?.message || '');
+    const code = fsErr?.code;
+    const isTimeout =
+      code === 4 ||
+      code === 'deadline-exceeded' ||
+      msg.includes('DEADLINE_EXCEEDED') ||
+      msg.includes('timeout') ||
+      msg.includes('ETIMEDOUT');
+    if (isTimeout) {
+      return res.status(504).json({
+        success: false,
+        error: 'Tempo limite esgotado ao persistir créditos no banco de dados Firestore. Tente novamente.',
+        code: 'FIRESTORE_TIMEOUT',
+      });
+    }
+    return res.status(500).json({
+      success: false,
+      error: 'Falha ao processar e persistir compra de créditos no Firestore.',
+      message: msg,
+    });
   }
 
-  // 6. Update local synchronized state
+  // Update student assignments doc in background
+  firestoreDb.collection('student_assignments').doc(targetStudentUid).set({
+    studentUid: targetStudentUid,
+    teacherUid: canonicalTeacherUid,
+    teacherAuthUid: canonicalTeacherUid,
+    assignedNativeFriendUID: canonicalTeacherUid,
+    nativeFriendUID: canonicalTeacherUid,
+    teacherEmail: finalTeacherEmail,
+    teacherName: finalTeacherName,
+    updatedAt: nowIso,
+  }, { merge: true }).catch(() => {});
+
+  // 6. Update local synchronized state strictly after transaction commit
   if (!db.contractedLessons) db.contractedLessons = {};
-  const currentContracted = Number(db.contractedLessons[cleanStudentEmail] || 0);
-  const newTotal = atomicContractedTotal !== null ? atomicContractedTotal : (currentContracted + lessonsToAdd);
-  db.contractedLessons[cleanStudentEmail] = newTotal;
+  db.contractedLessons[cleanStudentEmail] = atomicContractedTotal!;
 
   if (!db.userProfiles) db.userProfiles = {};
   const existingProfile = db.userProfiles[cleanStudentEmail] || {};
-  const currentAvailableInProfile = Number(existingProfile.availableLessons ?? currentContracted);
-  const authoritativeAvailable = atomicAvailableTotal !== null ? atomicAvailableTotal : (currentAvailableInProfile + lessonsToAdd);
 
   // Update student in db.students
   let studentFound = false;
@@ -5812,8 +5926,8 @@ app.post('/api/students/purchase-package', async (req, res) => {
         teacherUid: canonicalTeacherUid,
         assignedNativeFriendUID: canonicalTeacherUid,
         nativeFriendUID: canonicalTeacherUid,
-        contractedLessons: newTotal,
-        availableLessons: authoritativeAvailable,
+        contractedLessons: atomicContractedTotal!,
+        availableLessons: atomicAvailableTotal!,
         status: 'active',
       };
     }
@@ -5822,8 +5936,8 @@ app.post('/api/students/purchase-package', async (req, res) => {
 
   if (!studentFound) {
     db.students.push({
-      id: targetStudentUid || `st-${Date.now()}`,
-      uid: targetStudentUid || `st-${Date.now()}`,
+      id: targetStudentUid,
+      uid: targetStudentUid,
       name: cleanStudentEmail.split('@')[0],
       studentName: cleanStudentEmail.split('@')[0],
       email: cleanStudentEmail,
@@ -5832,8 +5946,8 @@ app.post('/api/students/purchase-package', async (req, res) => {
       studentLevel: 'iniciante',
       goal: 'English for everyday life & work',
       learningGoal: 'English for everyday life & work',
-      contractedLessons: newTotal,
-      availableLessons: authoritativeAvailable,
+      contractedLessons: atomicContractedTotal!,
+      availableLessons: atomicAvailableTotal!,
       completedLessonsCount: 0,
       teacherEmail: finalTeacherEmail,
       teacherName: finalTeacherName,
@@ -5852,8 +5966,8 @@ app.post('/api/students/purchase-package', async (req, res) => {
   // Update db.userProfiles
   db.userProfiles[cleanStudentEmail] = {
     ...existingProfile,
-    id: targetStudentUid || existingProfile.id || `usr-${Date.now()}`,
-    uid: targetStudentUid || existingProfile.uid || `usr-${Date.now()}`,
+    id: targetStudentUid,
+    uid: targetStudentUid,
     email: cleanStudentEmail,
     name: existingProfile.name || cleanStudentEmail.split('@')[0],
     level: existingProfile.level || 'iniciante',
@@ -5863,8 +5977,8 @@ app.post('/api/students/purchase-package', async (req, res) => {
     assignedNativeFriendUID: canonicalTeacherUid,
     nativeFriendUID: canonicalTeacherUid,
     enrollmentStatus: 'active',
-    contractedLessons: newTotal,
-    availableLessons: authoritativeAvailable,
+    contractedLessons: atomicContractedTotal!,
+    availableLessons: atomicAvailableTotal!,
     weeklyNativeLessonsTarget: newWeeklyTarget,
     subscriptionType: 'package',
     completedLessonsCount: existingProfile.completedLessonsCount || 0,
@@ -5889,16 +6003,17 @@ app.post('/api/students/purchase-package', async (req, res) => {
     timestamp: nowIso,
     status: 'completed',
   };
-  db.transactions.unshift(transaction);
+  if (!isIdempotentReplay) {
+    db.transactions.unshift(transaction);
+  }
 
   await writeDbSync(db);
-  saveUserToFirestore(db.userProfiles[cleanStudentEmail]).catch(() => {});
 
   res.json({
     success: true,
-    message: 'Package purchased successfully and Native Friend assigned',
-    contractedLessons: newTotal,
-    availableLessons: authoritativeAvailable,
+    message: isIdempotentReplay ? 'Package already purchased (idempotent)' : 'Package purchased successfully and Native Friend assigned',
+    contractedLessons: atomicContractedTotal,
+    availableLessons: atomicAvailableTotal,
     teacherUid: canonicalTeacherUid,
     profile: db.userProfiles[cleanStudentEmail],
     transaction,
