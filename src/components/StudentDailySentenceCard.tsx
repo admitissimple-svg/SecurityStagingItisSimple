@@ -217,7 +217,26 @@ export const StudentDailySentenceCard: React.FC<StudentDailySentenceCardProps> =
       {/* AI Grammar Analysis Result Card */}
       {sentenceEvaluation && (
         <div className="animate-in fade-in duration-200">
-          {sentenceEvaluation.hasAnyError ||
+          {sentenceEvaluation.isAiUnavailable ? (
+            <div className="p-3 bg-amber-50 rounded-2xl border border-amber-200 text-amber-900 flex items-center justify-between gap-2 text-xs shadow-2xs">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                <span className="font-bold">
+                  {isEn
+                    ? 'AI correction is temporarily unavailable. Please try again shortly.'
+                    : 'A correção da IA está temporariamente indisponível. Por favor, tente novamente em instantes.'}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSentenceEvaluation(null)}
+                className="text-amber-700 hover:text-amber-900 text-[10px] font-bold px-2 py-0.5 rounded-md hover:bg-amber-100 cursor-pointer"
+                title={isEn ? 'Dismiss' : 'Fechar'}
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          ) : sentenceEvaluation.hasAnyError ||
           sentenceEvaluation.isCorrect === false ||
           (sentenceEvaluation.correctedSentence &&
             sentenceEvaluation.correctedSentence.trim().replace(/[.!?]+$/, '') !==

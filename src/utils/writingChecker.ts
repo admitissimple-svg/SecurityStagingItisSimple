@@ -902,6 +902,28 @@ export async function checkDailySentenceAi(
       return fallbackResult;
     }
 
+    if (res.status === 503 || res.status === 429) {
+      console.warn(`Daily sentence check AI unavailable (${res.status}).`);
+      const unavailableMsgEn = 'AI correction is temporarily unavailable. Please try again shortly.';
+      const unavailableMsgPt = 'A correção da IA está temporariamente indisponível. Por favor, tente novamente em instantes.';
+      return {
+        hasAnyError: false,
+        isAiUnavailable: true,
+        wordFeedbacks: [],
+        correctedSentence: cleanSentence,
+        explanation: unavailableMsgEn,
+        overallSummaryEn: unavailableMsgEn,
+        overallSummaryPt: unavailableMsgPt,
+        sentenceFeedback: {
+          original: cleanSentence,
+          hasError: false,
+          corrected: cleanSentence,
+          explanationPt: unavailableMsgPt,
+          explanationEn: unavailableMsgEn,
+        },
+      };
+    }
+
     if (res.ok) {
       const data = await res.json();
       if (data && typeof data === 'object') {
@@ -990,16 +1012,45 @@ export async function checkDailySentenceAi(
       }
     }
   } catch (err) {
-    console.warn('Isolated daily sentence check fallback:', err);
+    console.warn('Isolated daily sentence check error:', err);
+    const unavailableMsgEn = 'AI correction is temporarily unavailable. Please try again shortly.';
+    const unavailableMsgPt = 'A correção da IA está temporariamente indisponível. Por favor, tente novamente em instantes.';
+    return {
+      hasAnyError: false,
+      isAiUnavailable: true,
+      wordFeedbacks: [],
+      correctedSentence: cleanSentence,
+      explanation: unavailableMsgEn,
+      overallSummaryEn: unavailableMsgEn,
+      overallSummaryPt: unavailableMsgPt,
+      sentenceFeedback: {
+        original: cleanSentence,
+        hasError: false,
+        corrected: cleanSentence,
+        explanationPt: unavailableMsgPt,
+        explanationEn: unavailableMsgEn,
+      },
+    };
   }
 
-  const fallbackResult = evaluateLocally({
-    sentence: cleanSentence,
-    dailyWords: cleanDailyWords,
-    words: cleanDailyWords,
-  });
-  dailySentenceClientCache.set(cacheKey, fallbackResult);
-  return fallbackResult;
+  const unavailableMsgEn = 'AI correction is temporarily unavailable. Please try again shortly.';
+  const unavailableMsgPt = 'A correção da IA está temporariamente indisponível. Por favor, tente novamente em instantes.';
+  return {
+    hasAnyError: false,
+    isAiUnavailable: true,
+    wordFeedbacks: [],
+    correctedSentence: cleanSentence,
+    explanation: unavailableMsgEn,
+    overallSummaryEn: unavailableMsgEn,
+    overallSummaryPt: unavailableMsgPt,
+    sentenceFeedback: {
+      original: cleanSentence,
+      hasError: false,
+      corrected: cleanSentence,
+      explanationPt: unavailableMsgPt,
+      explanationEn: unavailableMsgEn,
+    },
+  };
 }
 
 export interface CheckWritingParams {

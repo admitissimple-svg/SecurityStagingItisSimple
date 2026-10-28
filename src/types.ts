@@ -883,4 +883,5 @@ export interface WritingEvaluationResult {
   usedTrigger?: boolean;
   targetWordFeedback?: string;
   triggerFeedback?: string;
+  isAiUnavailable?: boolean;
 }

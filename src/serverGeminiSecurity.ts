@@ -175,7 +175,7 @@ export const GEMINI_POLICIES: Record<GeminiFeature, FeaturePolicy> = {
     rateLimitWindowSeconds: 60,
     rateLimitMaxRequests: 15,
     maxInputLengthChars: 500,
-    timeoutMs: 5500,
+    timeoutMs: 9000,
   },
   check_writing: {
     maxOutputTokens: 600,

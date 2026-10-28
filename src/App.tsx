@@ -642,10 +642,12 @@ export default function App() {
   const [excludedDictionaryWords, setExcludedDictionaryWords] = useState<string[]>(() => {
     return getCachedExcludedDictionaryWords(currentAccount?.uid, currentAccount?.email);
   });
-  // FASE 4B.3: Canonical student UID reference to discard out-of-order and cross-account async responses
+  // FASE 4B.3 & HOTFIX: Canonical student UID reference to discard out-of-order and cross-account async responses
   const activeStudentUidRef = useRef<string>(
     currentAccount?.role === 'student' ? normalizeUid(currentAccount?.uid, currentAccount?.email) : ''
   );
+  const [isDictionaryHydrated, setIsDictionaryHydrated] = useState<boolean>(false);
+  const dictionaryRequestIdRef = useRef<number>(0);
   const excludedDictionaryWordsRef = useRef<string[]>(excludedDictionaryWords);
   useEffect(() => {
     excludedDictionaryWordsRef.current = excludedDictionaryWords;
@@ -1267,6 +1269,7 @@ export default function App() {
   useEffect(() => {
     if (!currentAccount?.email) {
       activeStudentUidRef.current = '';
+      setIsDictionaryHydrated(false);
       setLessons([]);
       setStudents([]);
       setWeeklyChecks({});
@@ -1612,25 +1615,14 @@ export default function App() {
               });
           }
 
-          // Fetch student exclusions first from Firestore/server, then student vocabulary
+          // Fetch student exclusions first from Firestore/server
           fetchExcludedDictionaryWords(uid, email)
             .then((excluded) => {
-              if (isCancelled) return null;
-              if (activeStudentUidRef.current !== uid) return null;
+              if (isCancelled) return;
+              if (activeStudentUidRef.current !== uid) return;
               if (Array.isArray(excluded)) {
                 excludedDictionaryWordsRef.current = excluded;
                 setExcludedDictionaryWords(excluded);
-              }
-              return fetchStudentVocabularyFromFirestore(uid, email);
-            })
-            .then((vocab) => {
-              if (isCancelled || !vocab) return;
-              if (activeStudentUidRef.current !== uid) return;
-              if (Array.isArray(vocab) && vocab.length > 0) {
-                setStudentDictionaryEntries((prev) => {
-                  if (activeStudentUidRef.current !== uid) return prev;
-                  return consolidateDictionaryEntries(prev, vocab, excludedDictionaryWordsRef.current);
-                });
               }
             })
             .catch(() => {});
@@ -1839,25 +1831,8 @@ export default function App() {
     // Strictly isolate: teachers and non-students must NEVER query the student's private dictionary endpoint
     if (role === 'student' && (email || uid)) {
       const dictEmail = email || userProfile?.email || '';
-      const canonicalStudentUid = normalizeUid(uid, dictEmail);
-      // 1. Direct Firestore fetch for vocabulary (cumulative)
-      fetchStudentVocabularyFromFirestore(canonicalStudentUid, dictEmail).then((fsEntries) => {
-        if (isCancelled) return;
-        if (role === 'student' && activeStudentUidRef.current !== canonicalStudentUid) return;
-        const cachedExclusions = getCachedExcludedDictionaryWords(canonicalStudentUid, dictEmail);
-        if (cachedExclusions.length > 0 && excludedDictionaryWordsRef.current.length === 0) {
-          excludedDictionaryWordsRef.current = cachedExclusions;
-          setExcludedDictionaryWords(cachedExclusions);
-        }
-        if (Array.isArray(fsEntries) && fsEntries.length > 0) {
-          setStudentDictionaryEntries((prev) => {
-            if (role === 'student' && activeStudentUidRef.current !== canonicalStudentUid) return prev;
-            return consolidateDictionaryEntries(prev, fsEntries, excludedDictionaryWordsRef.current);
-          });
-        }
-      });
 
-      // 3. Direct Firestore fetch for student journal
+      // Direct Firestore fetch for student journal
       fetchStudentJournalFromFirestore(uid, dictEmail).then((fsJournal) => {
         if (Array.isArray(fsJournal) && fsJournal.length > 0) {
           setDailyJournalEntries(fsJournal);
@@ -2275,31 +2250,21 @@ export default function App() {
     };
   }, [selectedDay, selectedActivityId, currentAccount?.role, currentAccount?.uid, currentAccount?.email]);
 
-  // Refresh student dictionary whenever the modal is opened (students only)
+  // Hotfix A: Hydrate student dictionary from GET /api/student-dictionary upon login/startup (students only)
+  // as well as whenever PersonalDictionaryModal is opened.
   useEffect(() => {
-    if (!isPersonalDictionaryOpen || currentAccount?.role !== 'student') return;
-    const isStudentUser = currentAccount?.role === 'student';
-    const targetStudentFromFilter = !isStudentUser && selectedStudentFilter && selectedStudentFilter !== 'all'
-      ? studentsList.find((s) =>
-          Boolean(s) &&
-          (((s.email || '').toLowerCase().trim() === (selectedStudentFilter || '').toLowerCase().trim()) ||
-            s.uid === selectedStudentFilter ||
-            s.id === selectedStudentFilter)
-        )
-      : null;
+    if (currentAccount?.role !== 'student') {
+      setIsDictionaryHydrated(false);
+      return;
+    }
 
-    const cleanEmail = isStudentUser
-      ? (currentAccount?.email || auth.currentUser?.email || userProfile?.email || '').toLowerCase().trim()
-      : (targetStudentFromFilter?.email || (selectedStudentFilter !== 'all' && selectedStudentFilter.includes('@') ? selectedStudentFilter : '')).toLowerCase().trim();
-
-    const rawUid = isStudentUser
-      ? (currentAccount?.uid || auth.currentUser?.uid || userProfile?.id || (userProfile as any)?.uid || '')
-      : (targetStudentFromFilter?.uid || targetStudentFromFilter?.id || (selectedStudentFilter !== 'all' && !selectedStudentFilter.includes('@') ? selectedStudentFilter : ''));
-
+    const cleanEmail = (currentAccount?.email || auth.currentUser?.email || userProfile?.email || '').toLowerCase().trim();
+    const rawUid = currentAccount?.uid || auth.currentUser?.uid || userProfile?.id || (userProfile as any)?.uid || '';
     const uid = normalizeUid(rawUid, cleanEmail);
     if (!uid && !cleanEmail) return;
 
     let isEffectCancelled = false;
+    const reqId = ++dictionaryRequestIdRef.current;
 
     auth.currentUser?.getIdToken().then((token) => {
       const headers: Record<string, string> = {};
@@ -2310,8 +2275,12 @@ export default function App() {
     })
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
-        if (isEffectCancelled || !data) return;
-        if (currentAccount?.role === 'student' && activeStudentUidRef.current !== uid) return;
+        if (isEffectCancelled || !data) {
+          setIsDictionaryHydrated(true);
+          return;
+        }
+        if (dictionaryRequestIdRef.current !== reqId) return;
+        if (activeStudentUidRef.current !== uid) return;
 
         const entries = Array.isArray(data) ? data : (Array.isArray(data?.dictionary) ? data.dictionary : []);
         const excluded = Array.isArray(data?.excludedWords)
@@ -2326,20 +2295,25 @@ export default function App() {
 
         const excludedSet = new Set(excluded);
         setStudentDictionaryEntries((prev) => {
-          if (currentAccount?.role === 'student' && activeStudentUidRef.current !== uid) return prev;
+          if (dictionaryRequestIdRef.current !== reqId) return prev;
+          if (activeStudentUidRef.current !== uid) return prev;
           const filteredPrev = prev.filter((p) => !excludedSet.has(normalizeDictionaryWord(p.normalizedWord || p.word)));
           if (entries.length > 0) {
             return consolidateDictionaryEntries(filteredPrev, entries, excluded);
           }
           return filteredPrev;
         });
+        setIsDictionaryHydrated(true);
       })
-      .catch((err) => console.warn('Could not refresh student dictionary:', err));
+      .catch((err) => {
+        console.warn('Could not refresh student dictionary:', err);
+        setIsDictionaryHydrated(true);
+      });
 
     return () => {
       isEffectCancelled = true;
     };
-  }, [isPersonalDictionaryOpen, currentAccount?.email, currentAccount?.role, currentAccount?.uid, selectedStudentFilter, userProfile?.email]);
+  }, [isPersonalDictionaryOpen, currentAccount?.email, currentAccount?.role, currentAccount?.uid, userProfile?.email]);
 
   // Handler: Manage/Update Native Friend Subscription
   const handleUpdateSubscription = async (teacherEmail: string | null, teacherName: string | null) => {
@@ -6971,6 +6945,7 @@ export default function App() {
                   onBehavioralComplete={handleBehavioralActivityComplete}
                   dictionaryEntries={consolidatedActiveDictionary}
                   excludedWords={excludedDictionaryWords}
+                  isDictionaryHydrated={isDictionaryHydrated}
                   hasConfirmedTrialLesson={hasConfirmedTrialLesson}
                   onScheduleTrialLesson={() => setIsScheduleModalOpen(true)}
                 />

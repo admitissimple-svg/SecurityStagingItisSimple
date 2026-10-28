@@ -450,8 +450,8 @@ async function runSentenceOfTheDayHotfixTests(): Promise<void> {
     `9.1: maxOutputTokens para check_daily_sentence preservado em 450 (atual: ${policy.maxOutputTokens})`
   );
   assert(
-    policy.timeoutMs === 5500,
-    `9.2: timeoutMs para check_daily_sentence preservado em 5500ms sem aumento (atual: ${policy.timeoutMs}ms)`
+    policy.timeoutMs === 9000,
+    `9.2: timeoutMs para check_daily_sentence ajustado exclusivamente para 9000ms (atual: ${policy.timeoutMs}ms)`
   );
   assert(
     policy.maxInputLengthChars === 500,

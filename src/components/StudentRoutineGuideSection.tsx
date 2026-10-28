@@ -137,6 +137,7 @@ interface StudentRoutineGuideSectionProps {
   }) => void;
   dictionaryEntries?: StudentDictionaryEntry[];
   excludedWords?: string[];
+  isDictionaryHydrated?: boolean;
   hasConfirmedTrialLesson?: boolean;
   onScheduleTrialLesson?: () => void;
 }
@@ -170,6 +171,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
   onBehavioralComplete,
   dictionaryEntries = [],
   excludedWords = [],
+  isDictionaryHydrated = true,
   hasConfirmedTrialLesson,
   onScheduleTrialLesson,
 }) => {
@@ -421,6 +423,9 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
 
     // Native Friend Notes Standard: 600ms debounce with selective lookup to minimize AI queries and cost
     const timer = setTimeout(() => {
+      // Hotfix A.5: Evitar que a rotina solicite novas definições enquanto a hidratação inicial do dicionário estiver pendente
+      if (isDictionaryHydrated === false) return;
+
       const wordsToLookup = words
         .map((w, idx) => ({ word: w.trim(), idx }))
         .filter(
@@ -463,7 +468,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     }, 600);
 
     return () => clearTimeout(timer);
-  }, [words, userProfile?.level, userProfile?.uid, userProfile?.email, dictionaryEntries]);
+  }, [words, userProfile?.level, userProfile?.uid, userProfile?.email, dictionaryEntries, isDictionaryHydrated]);
 
   // Spotify view toggle: App Player or Spotify Web, and Track vs Full Playlist view
   const [spotifyPlayerMode, setSpotifyPlayerMode] = useState<'app' | 'web'>('app');

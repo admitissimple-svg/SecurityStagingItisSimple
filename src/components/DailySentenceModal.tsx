@@ -281,7 +281,26 @@ export const DailySentenceModal: React.FC<DailySentenceModalProps> = ({
 
           {/* AI Feedback */}
           {evaluation && (
-            (evaluation.hasAnyError || !evaluation.isCorrect || (evaluation.correctedSentence && evaluation.correctedSentence.trim() !== sentenceInput.trim())) ? (
+            evaluation.isAiUnavailable ? (
+              <div className="p-3 bg-amber-50 rounded-xl border border-amber-200 text-xs text-amber-900 flex items-center justify-between gap-2 animate-in fade-in">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                  <span className="font-bold">
+                    {isEn
+                      ? 'AI correction is temporarily unavailable. Please try again shortly.'
+                      : 'A correção da IA está temporariamente indisponível. Por favor, tente novamente em instantes.'}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setEvaluation(null)}
+                  className="p-1 rounded-lg text-amber-700 hover:text-amber-900 hover:bg-amber-100 transition cursor-pointer"
+                  title={isEn ? 'Dismiss' : 'Fechar'}
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ) : (evaluation.hasAnyError || !evaluation.isCorrect || (evaluation.correctedSentence && evaluation.correctedSentence.trim() !== sentenceInput.trim())) ? (
               <div className="p-3 bg-amber-50 rounded-xl border border-amber-200 text-xs space-y-2 text-amber-900 animate-in fade-in">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-1.5 font-bold text-amber-950">
