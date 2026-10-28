@@ -2805,6 +2805,9 @@ export default function App() {
       }
 
       const newCount = Number(txResult.contractedLessons || params.packageLessons);
+      const authoritativeAvailable = txResult.availableLessons !== undefined
+        ? Number(txResult.availableLessons)
+        : (txResult.profile?.availableLessons !== undefined ? Number(txResult.profile.availableLessons) : newCount);
 
       // Align weekly live lesson target with purchased frequency (4 -> 1x, 8 -> 2x, 12 -> 3x)
       let newWeeklyTarget = userProfile.weeklyNativeLessonsTarget || 1;
@@ -2814,18 +2817,23 @@ export default function App() {
 
       const canonicalTeacherUid = txResult.teacherUid || txResult.profile?.teacherUid || (txResult as any)?.teacherUid || '';
 
-      // Update userProfile with fixed teacher and updated lesson balance
+      // Update userProfile with fixed teacher, package subscription, and updated lesson balances
       setUserProfile((prev) => ({
         ...prev,
+        subscriptionType: 'package',
+        contractedLessons: newCount,
+        availableLessons: authoritativeAvailable,
         teacherEmail: cleanTeacherEmail,
         teacherName: cleanTeacherName,
         teacherUid: canonicalTeacherUid || prev.teacherUid,
         assignedNativeFriendUID: canonicalTeacherUid || prev.assignedNativeFriendUID,
         nativeFriendUID: canonicalTeacherUid || prev.nativeFriendUID,
         enrollmentStatus: 'active',
-        contractedLessons: newCount,
         weeklyNativeLessonsTarget: newWeeklyTarget,
       }));
+
+      // Clear any pending trial intent on package purchase
+      setScheduleStudentInfo(null);
 
       // Update contractedLessons map
       setContractedLessons((prev) => ({
@@ -4269,7 +4277,32 @@ export default function App() {
       return;
     }
 
-    const isTrialBooking = Boolean((scheduleStudentInfo as any)?.isTrialLesson || userProfile?.subscriptionType === 'trial');
+    // Authoritative trial eligibility & intention determination:
+    // 1. Check if student has already completed or has an active scheduled trial lesson
+    const hasAlreadyUsedTrial = Boolean(
+      userProfile?.hasCompletedTrialLesson ||
+      hasConfirmedTrialLesson ||
+      lessons.some((l) => {
+        const isStudent =
+          (finalStudentEmail && (l.studentEmail || '').toLowerCase().trim() === finalStudentEmail) ||
+          (finalStudentUid && (l.studentUid === finalStudentUid || (l as any).uid === finalStudentUid));
+        const isCancelled = (l.status as string) === 'cancelled' || (l.status as string) === 'canceled' || Boolean(l.cancelledAt);
+        return isStudent && Boolean(l.isTrialLesson) && !isCancelled;
+      })
+    );
+
+    // 2. Determine eligibility: student must NOT have used a trial already, and must NOT be on a paid package
+    const isEligibleForTrial = !hasAlreadyUsedTrial && userProfile?.subscriptionType !== 'package';
+
+    // 3. Determine explicit intention: requested strictly and explicitly by an authorized trial flow
+    const hasExplicitTrialIntent = Boolean((scheduleStudentInfo as any)?.isTrialLesson === true);
+
+    // 4. A booking is a trial lesson ONLY when both eligibility and explicit intention are met.
+    // The mere presence of open onboarding modals, missing credits, or incomplete onboarding does not make a booking trial.
+    const isTrialBooking = Boolean(
+      isEligibleForTrial &&
+      hasExplicitTrialIntent
+    );
     const deterministicId = `lesson-${currentUser.uid}-${new Date(lessonData.startDateTime).getTime()}`;
 
     const newLesson: LiveLesson = {
@@ -4318,7 +4351,7 @@ export default function App() {
         ...prev,
         availableLessons: txResult.remainingLessons,
         contractedLessons: txResult.contractedLessons ?? prev.contractedLessons,
-        hasCompletedTrialLesson: prev.hasCompletedTrialLesson,
+        hasCompletedTrialLesson: isTrialBooking ? true : prev.hasCompletedTrialLesson,
         onboardingCompleted: isTrialBooking ? true : prev.onboardingCompleted,
         teacherUid: confirmedLesson.teacherUid || prev.teacherUid,
         teacherEmail: confirmedLesson.teacherEmail || prev.teacherEmail,
@@ -4381,12 +4414,15 @@ export default function App() {
         assignedNativeFriendUID: finalTeacherUid,
         nativeFriendUID: finalTeacherUid,
         enrollmentStatus: 'active',
-        contractedLessons: Math.max(prev?.contractedLessons || 0, 1),
+        hasCompletedTrialLesson: isTrialBooking ? true : Boolean(prev?.hasCompletedTrialLesson),
+        onboardingCompleted: isTrialBooking ? true : Boolean(prev?.onboardingCompleted),
+        contractedLessons: txResult.contractedLessons ?? Math.max(prev?.contractedLessons || 0, 1),
+        availableLessons: txResult.remainingLessons !== undefined ? txResult.remainingLessons : prev?.availableLessons,
       }));
 
       setContractedLessons((prev) => ({
         ...prev,
-        [finalStudentEmail]: Math.max(prev[finalStudentEmail] || 0, 1),
+        [finalStudentEmail]: txResult.contractedLessons ?? Math.max(prev[finalStudentEmail] || 0, 1),
       }));
 
       saveStudentNativeFriendToFirestore(finalStudentUid, finalStudentEmail, {
@@ -4411,29 +4447,13 @@ export default function App() {
           assignedNativeFriendUID: finalTeacherUid,
           nativeFriendUID: finalTeacherUid,
           enrollmentStatus: 'active',
+          hasCompletedTrialLesson: isTrialBooking ? true : Boolean(userProfile?.hasCompletedTrialLesson),
           onboardingCompleted: isTrialBooking ? true : Boolean(userProfile?.onboardingCompleted),
-          contractedLessons: Math.max(userProfile?.contractedLessons || 0, 1),
+          contractedLessons: txResult.contractedLessons ?? Math.max(userProfile?.contractedLessons || 0, 1),
+          availableLessons: txResult.remainingLessons !== undefined ? txResult.remainingLessons : userProfile?.availableLessons,
         },
         finalStudentEmail
       ).catch(() => {});
-
-      fetch('/api/user-profile', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: finalStudentEmail,
-          profile: {
-            id: finalStudentUid,
-            name: finalStudentName,
-            email: finalStudentEmail,
-            teacherEmail: lessonData.teacherEmail,
-            teacherName: lessonData.teacherName,
-            enrollmentStatus: 'active',
-            onboardingCompleted: isTrialBooking ? true : Boolean(userProfile?.onboardingCompleted),
-            contractedLessons: Math.max(userProfile?.contractedLessons || 0, 1),
-          },
-        }),
-      }).catch(() => {});
     }
 
     // Direct student to their personal dashboard page and close modals
@@ -6947,7 +6967,15 @@ export default function App() {
                   excludedWords={excludedDictionaryWords}
                   isDictionaryHydrated={isDictionaryHydrated}
                   hasConfirmedTrialLesson={hasConfirmedTrialLesson}
-                  onScheduleTrialLesson={() => setIsScheduleModalOpen(true)}
+                  onScheduleTrialLesson={() => {
+                    setScheduleStudentInfo({
+                      name: userProfile?.name || currentAccount?.name || '',
+                      email: userProfile?.email || currentAccount?.email || '',
+                      uid: userProfile?.id || currentAccount?.uid,
+                      isTrialLesson: true,
+                    });
+                    setIsScheduleModalOpen(true);
+                  }}
                 />
 
                 {/* Section 3: Weekly Activity (Image 3) */}
@@ -7383,6 +7411,15 @@ export default function App() {
         initialSelectedTutor={subscriptionTargetTutor}
         onScheduleTrialLessonWithTutor={(tutor) => {
           setTeacherEmailForConfig(tutor.email || tutor.id);
+          setScheduleStudentInfo({
+            name: userProfile?.name || currentAccount?.name || '',
+            email: userProfile?.email || currentAccount?.email || '',
+            uid: userProfile?.id || currentAccount?.uid,
+            isTrialLesson: true,
+            teacherId: tutor.publicTutorId || tutor.id,
+            teacherEmail: tutor.email,
+            teacherName: tutor.name,
+          });
           setIsManageSubscriptionOpen(false);
           setIsScheduleModalOpen(true);
         }}
@@ -7469,12 +7506,13 @@ export default function App() {
         onOpenScheduleTrialLesson={(tutor, studentInfo) => {
           setTeacherEmailForConfig(tutor.email || tutor.id);
           if (studentInfo && studentInfo.email) {
-            setScheduleStudentInfo(studentInfo);
+            setScheduleStudentInfo({ ...studentInfo, isTrialLesson: true });
           } else {
             setScheduleStudentInfo({
               name: userProfile.name,
               email: userProfile.email,
               uid: userProfile.id,
+              isTrialLesson: true,
             });
           }
           setIsScheduleModalOpen(true);
