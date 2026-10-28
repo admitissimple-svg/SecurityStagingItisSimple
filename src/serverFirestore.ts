@@ -4392,6 +4392,15 @@ export interface ScheduleLessonServerResult {
   statusCode: number;
 }
 
+export class SchedulingTransactionError extends Error {
+  statusCode: number;
+  constructor(message: string, statusCode: number = 500) {
+    super(message);
+    this.name = 'SchedulingTransactionError';
+    this.statusCode = statusCode;
+  }
+}
+
 /**
  * Server-authoritative atomic scheduling service using Firebase Admin SDK.
  * 
@@ -4401,9 +4410,11 @@ export interface ScheduleLessonServerResult {
  * 3. Verification of tutor role and approved status (rejects unapproved/pending tutors).
  * 4. Conflict detection: blocks overlapping slots for both teacher and student.
  * 5. Trial lesson eligibility enforcement (prevents duplicate trial usage).
- * 6. Balance verification and atomic decrement for paid lessons.
- * 7. Idempotent execution preventing duplicate lessons on repeated submission.
- * 8. Atomic persistence in Cloud Firestore via Firebase Admin SDK runTransaction.
+ * 6. Balance verification and atomic decrement inside Firestore runTransaction for paid lessons.
+ * 7. Authoritative balance in users/{studentAuthUid}: rejects missing/undefined balances (HTTP 422) and insufficient balance (HTTP 402).
+ * 8. Idempotent execution within transaction preventing duplicate lessons on repeated submission.
+ * 9. Safe handling of persistence failures without permissive fallbacks or false successes.
+ * 10. Local synchronized state updated exclusively after confirmed atomic commit in Firestore (default).
  */
 export async function scheduleLessonAtomicServer(
   params: ScheduleLessonServerParams
@@ -4458,9 +4469,17 @@ export async function scheduleLessonAtomicServer(
     };
   }
 
+  // 3. Validate Firestore database readiness
   const db = getFirestoreDb();
+  if (!db || isCloudWriteDisabled) {
+    return {
+      success: false,
+      error: 'Serviço de persistência Firestore (default) indisponível no momento.',
+      statusCode: 503,
+    };
+  }
 
-  // 3. Resolve Native Friend (Teacher) profile using canonical identity resolver
+  // 4. Resolve Native Friend (Teacher) profile using canonical identity resolver
   const isTargetUid = isValidCanonicalUid(cleanTeacherTarget);
   const isTargetEmail = cleanTeacherTarget.includes('@');
   const teacherResolution = await resolveTeacherCanonicalIdentity({
@@ -4532,7 +4551,7 @@ export async function scheduleLessonAtomicServer(
   }
 
   // Check Firestore if available across tutors, users, and teacher_availability
-  if (!teacherConfiguredMeetUrl && db) {
+  if (!teacherConfiguredMeetUrl) {
     try {
       const emailDocId = resolvedTeacherEmail ? resolvedTeacherEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : '';
       const [tUidDoc, tPubDoc, uUidDoc, aUidDoc, aEmailDoc] = await Promise.all([
@@ -4559,7 +4578,6 @@ export async function scheduleLessonAtomicServer(
   if (!resolvedMeetLink && meetLink && !isGenericMeetUrl(meetLink)) {
     resolvedMeetLink = meetLink.trim();
   }
-  // Never fabricate a generic system URL like meet.google.com/new
   if (isGenericMeetUrl(resolvedMeetLink)) {
     resolvedMeetLink = '';
   }
@@ -4576,26 +4594,10 @@ export async function scheduleLessonAtomicServer(
     };
   }
 
-  // 4. Locate Student Profile
-  let studentDoc: any = null;
-  if (db) {
-    studentDoc = await fetchUserDocumentFromFirestore(studentAuthUid, 2500);
-    if (!studentDoc && cleanStudentEmail) {
-      const emailDocId = cleanStudentEmail.replace(/[^a-zA-Z0-9]/g, '-');
-      studentDoc = await fetchUserDocumentFromFirestore(emailDocId, 2000);
-    }
-  }
-  if (!studentDoc && dbState) {
-    studentDoc =
-      (cleanStudentEmail ? dbState.userProfiles?.[cleanStudentEmail] : null) ||
-      (dbState.students || []).find((s: any) => (s.email || '').toLowerCase().trim() === cleanStudentEmail || s.uid === studentAuthUid || s.id === studentAuthUid);
-  }
+  // 5. Deterministic Lesson ID for exact deduplication and idempotency
+  const deterministicLessonId = requestId || `lesson-${studentAuthUid}-${startTime}`;
 
-  const currentContracted = Number(studentDoc?.contractedLessons ?? 0);
-  const currentAvailable = studentDoc?.availableLessons !== undefined ? Number(studentDoc.availableLessons) : currentContracted;
-  const hasAlreadyCompletedTrial = Boolean(studentDoc?.hasCompletedTrialLesson);
-
-  // 5. Gather existing lessons for conflict and trial checks
+  // 6. Gather existing lessons for conflict check
   const allExistingLessons: any[] = [];
   if (Array.isArray(existingLessons)) {
     allExistingLessons.push(...existingLessons);
@@ -4603,17 +4605,19 @@ export async function scheduleLessonAtomicServer(
   if (dbState && Array.isArray(dbState.liveLessons)) {
     allExistingLessons.push(...dbState.liveLessons);
   }
-  if (db) {
-    try {
-      const [tSnap, tPubSnap, sSnap] = await Promise.all([
-        db.collection('lessons').where('teacherUid', '==', canonicalTeacherUid).get().catch(() => null),
-        (resolvedPublicTutorId && resolvedPublicTutorId !== canonicalTeacherUid ? db.collection('lessons').where('teacherUid', '==', resolvedPublicTutorId).get().catch(() => null) : null),
-        db.collection('lessons').where('studentUid', '==', studentAuthUid).get().catch(() => null),
-      ]);
-      if (tSnap) tSnap.forEach((d) => allExistingLessons.push({ id: d.id, ...d.data() }));
-      if (tPubSnap) tPubSnap.forEach((d) => allExistingLessons.push({ id: d.id, ...d.data() }));
-      if (sSnap) sSnap.forEach((d) => allExistingLessons.push({ id: d.id, ...d.data() }));
-    } catch {}
+  try {
+    const [tSnap, tPubSnap, sSnap] = await Promise.all([
+      db.collection('lessons').where('teacherUid', '==', canonicalTeacherUid).get().catch(() => null),
+      (resolvedPublicTutorId && resolvedPublicTutorId !== canonicalTeacherUid
+        ? db.collection('lessons').where('teacherUid', '==', resolvedPublicTutorId).get().catch(() => null)
+        : null),
+      db.collection('lessons').where('studentUid', '==', studentAuthUid).get().catch(() => null),
+    ]);
+    if (tSnap) tSnap.forEach((d) => allExistingLessons.push({ id: d.id, ...d.data() }));
+    if (tPubSnap) tPubSnap.forEach((d) => allExistingLessons.push({ id: d.id, ...d.data() }));
+    if (sSnap) sSnap.forEach((d) => allExistingLessons.push({ id: d.id, ...d.data() }));
+  } catch (queryErr) {
+    console.warn('[serverFirestore] Warning: Querying existing lessons encountered error:', queryErr);
   }
 
   // Deduplicate existing lessons by id
@@ -4623,25 +4627,14 @@ export async function scheduleLessonAtomicServer(
   });
   const consolidatedLessons = Array.from(existingLessonsMap.values());
 
-  // 6. Deterministic Lesson ID & Idempotency Check (Anti-Duplication on retry/rapid clicks)
-  const deterministicLessonId = requestId || `lesson-${studentAuthUid}-${startTime}`;
-  const existingExactLesson = consolidatedLessons.find((l) => l.id === deterministicLessonId);
-  if (existingExactLesson && existingExactLesson.status === 'scheduled') {
-    return {
-      success: true,
-      lesson: existingExactLesson,
-      remainingLessons: currentAvailable,
-      contractedLessons: currentContracted,
-      isTrialLesson: Boolean(isTrialLesson),
-      statusCode: 200,
-    };
-  }
-
   // 7. Check Overlapping Conflicts (Anti-Duplicity Rule: teacher or student cannot have overlapping slots)
   const candidateConflict = consolidatedLessons.find((l) => {
     const isCancelled = l.status === 'cancelled' || l.status === 'canceled' || Boolean(l.cancelledAt);
     if (isCancelled) return false;
     if (l.status && l.status !== 'scheduled') return false;
+
+    // The exact same lesson ID (e.g. repeated idempotent submission) is not an overlapping conflict
+    if (l.id === deterministicLessonId) return false;
 
     // Check time overlap
     if (!l.startDateTime || !l.endDateTime) return false;
@@ -4650,7 +4643,7 @@ export async function scheduleLessonAtomicServer(
     const overlaps = lStart < endTime && lEnd > startTime;
     if (!overlaps) return false;
 
-    // Teacher conflict - supports canonical UID and legacy public ID for backwards compatibility
+    // Teacher conflict
     const isSameTeacher =
       (l.teacherUid && (
         l.teacherUid === canonicalTeacherUid ||
@@ -4685,235 +4678,339 @@ export async function scheduleLessonAtomicServer(
     };
   }
 
-  // 8. Check Trial Lesson Eligibility & Balance
-  if (isTrialLesson) {
-    if (hasAlreadyCompletedTrial) {
-      return {
-        success: false,
-        error: 'Aula experimental já foi utilizada anteriormente por este estudante.',
-        statusCode: 400,
-      };
-    }
-
-    const existingActiveTrial = consolidatedLessons.find((l) => {
-      const isCancelled = l.status === 'cancelled' || l.status === 'canceled' || Boolean(l.cancelledAt);
-      if (isCancelled) return false;
-      const isSameStudent =
-        l.studentUid === studentAuthUid ||
-        (cleanStudentEmail && (l.studentEmail || '').toLowerCase().trim() === cleanStudentEmail);
-      return isSameStudent && Boolean(l.isTrialLesson);
-    });
-
-    if (existingActiveTrial) {
-      return {
-        success: false,
-        error: 'Você já possui uma aula experimental agendada ou realizada.',
-        statusCode: 400,
-      };
-    }
-  } else {
-    // Check balance for regular lesson
-    if (currentAvailable <= 0) {
-      return {
-        success: false,
-        error: 'Saldo de aulas insuficiente. Por favor, adquira créditos de aulas antes de agendar.',
-        statusCode: 402,
-      };
-    }
-  }
-
-  // 9. Compute updated balances
-  let newContracted = currentContracted;
-  let newAvailable = currentAvailable;
-  if (isTrialLesson) {
-    newContracted = Math.max(currentContracted, 1);
-    newAvailable = Math.max(0, currentAvailable);
-  } else {
-    newContracted = currentContracted;
-    newAvailable = Math.max(0, currentAvailable - 1);
-  }
-
+  // 8. ATOMIC EXECUTION IN CLOUD FIRESTORE VIA runTransaction
   const nowIso = new Date().toISOString();
-  const sanitizedLesson = {
-    id: deterministicLessonId,
-    title: title || (isTrialLesson ? 'Aula Experimental Ao Vivo (Google Meet)' : 'Aula Ao Vivo 1-on-1'),
-    description: description || '',
-    startDateTime,
-    endDateTime,
-    studentUid: studentAuthUid,
-    studentEmail: cleanStudentEmail || studentDoc?.email || '',
-    studentName: studentName || studentDoc?.name || (cleanStudentEmail ? cleanStudentEmail.split('@')[0] : 'Aluno'),
-    teacherUid: canonicalTeacherUid, // STRICTLY Firebase Auth UID!
-    teacherAuthUid: canonicalTeacherUid,
-    teacherPublicId: resolvedPublicTutorId,
-    teacherEmail: resolvedTeacherEmail,
-    teacherName: resolvedTeacherName,
-    meetLink: resolvedMeetLink,
-    status: 'scheduled',
-    isTrialLesson: Boolean(isTrialLesson),
-    createdAt: nowIso,
-    updatedAt: nowIso,
+  let txData: {
+    isIdempotent: boolean;
+    lesson: any;
+    remainingLessons: number;
+    contractedLessons: number;
+    hasCompletedTrialLesson: boolean;
+    onboardingCompleted: boolean;
   };
 
-  // 10. Atomic Execution: Firebase Admin SDK runTransaction when available
-  if (db && !isCloudWriteDisabled) {
-    try {
-      await db.runTransaction(async (transaction) => {
-        const studentRef = db.collection('users').doc(studentAuthUid);
-        const lessonRef = db.collection('lessons').doc(deterministicLessonId);
-        const studentSubLessonRef = db.collection('users').doc(studentAuthUid).collection('lessons').doc(deterministicLessonId);
+  try {
+    txData = await db.runTransaction(async (transaction) => {
+      const studentRef = db.collection('users').doc(studentAuthUid);
+      const lessonRef = db.collection('lessons').doc(deterministicLessonId);
+      const studentSubLessonRef = db.collection('users').doc(studentAuthUid).collection('lessons').doc(deterministicLessonId);
+      const teacherUserSubLessonRef = db.collection('users').doc(canonicalTeacherUid).collection('lessons').doc(deterministicLessonId);
+      const tutorSubLessonRef = db.collection('tutors').doc(canonicalTeacherUid).collection('lessons').doc(deterministicLessonId);
+      const assignmentRef = db.collection('student_assignments').doc(studentAuthUid);
 
-        transaction.set(lessonRef, sanitizedLesson, { merge: true });
-        transaction.set(studentSubLessonRef, sanitizedLesson, { merge: true });
+      // A. ALL READS OCCUR BEFORE WRITES
+      const [studentSnap, lessonSnap] = await Promise.all([
+        transaction.get(studentRef),
+        transaction.get(lessonRef),
+      ]);
 
-        // Update teacher subcollection in /users and /tutors strictly with canonical UID
-        const teacherUserSubLesson = db.collection('users').doc(canonicalTeacherUid).collection('lessons').doc(deterministicLessonId);
-        transaction.set(teacherUserSubLesson, sanitizedLesson, { merge: true });
-
-        const tutorSubLesson = db.collection('tutors').doc(canonicalTeacherUid).collection('lessons').doc(deterministicLessonId);
-        transaction.set(tutorSubLesson, sanitizedLesson, { merge: true });
-
-        // Student assignments record
-        const assignmentRef = db.collection('student_assignments').doc(studentAuthUid);
-        transaction.set(
-          assignmentRef,
-          {
-            studentUid: studentAuthUid,
-            teacherUid: canonicalTeacherUid,
-            teacherAuthUid: canonicalTeacherUid,
-            teacherPublicId: resolvedPublicTutorId,
-            assignedNativeFriendUID: canonicalTeacherUid,
-            nativeFriendUID: canonicalTeacherUid,
-            teacherEmail: resolvedTeacherEmail,
-            teacherName: resolvedTeacherName,
-            updatedAt: nowIso,
-          },
-          { merge: true }
-        );
-
-        // Student document update
-        transaction.set(
-          studentRef,
-          {
-            uid: studentAuthUid,
-            id: studentAuthUid,
-            email: cleanStudentEmail || studentDoc?.email || '',
-            name: sanitizedLesson.studentName,
-            teacherUid: canonicalTeacherUid,
-            assignedNativeFriendUID: canonicalTeacherUid,
-            nativeFriendUID: canonicalTeacherUid,
-            teacherEmail: resolvedTeacherEmail,
-            teacherName: resolvedTeacherName,
-            teacherMeetUrl: resolvedMeetLink,
-            enrollmentStatus: 'active',
-            hasCompletedTrialLesson: isTrialLesson ? true : hasAlreadyCompletedTrial,
-            onboardingCompleted: isTrialLesson ? true : (studentDoc?.onboardingCompleted ?? true),
-            contractedLessons: newContracted,
-            availableLessons: newAvailable,
-            updatedAt: nowIso,
-          },
-          { merge: true }
-        );
-
-        // Idempotent reconciliation of legacy student doc without deletion
-        if (studentDoc && studentDoc.id && studentDoc.id !== studentAuthUid) {
-          const legacyStudentRef = db.collection('users').doc(studentDoc.id);
-          transaction.set(legacyStudentRef, { canonicalUid: studentAuthUid, updatedAt: nowIso }, { merge: true });
+      // B. IDEMPOTENCY CHECK INSIDE TRANSACTION
+      // If the lesson already exists with status 'scheduled', return existing state without debiting
+      if (lessonSnap.exists) {
+        const existingData = lessonSnap.data();
+        if (existingData && existingData.status === 'scheduled') {
+          const studentData = studentSnap.exists ? (studentSnap.data() || {}) : {};
+          const currentAvailable = typeof studentData.availableLessons === 'number'
+            ? studentData.availableLessons
+            : 0;
+          const currentContracted = typeof studentData.contractedLessons === 'number'
+            ? studentData.contractedLessons
+            : currentAvailable;
+          return {
+            isIdempotent: true,
+            lesson: { id: lessonSnap.id, ...existingData },
+            remainingLessons: currentAvailable,
+            contractedLessons: currentContracted,
+            hasCompletedTrialLesson: Boolean(studentData.hasCompletedTrialLesson),
+            onboardingCompleted: Boolean(studentData.onboardingCompleted ?? true),
+          };
         }
-      });
-    } catch (txErr: any) {
-      if (isPermissionError(txErr)) {
-        isCloudWriteDisabled = true;
-        console.info('[serverFirestore] Remote schedule transaction restricted by IAM, committing to synchronized state.');
-      } else {
-        console.warn('[serverFirestore] Firestore admin transaction warning:', txErr);
       }
+
+      // C. VALIDATE AUTHORITATIVE STUDENT DOCUMENT
+      if (!studentSnap.exists) {
+        throw new SchedulingTransactionError(
+          'Registro do aluno não encontrado no Firestore.',
+          404
+        );
+      }
+
+      const studentData = studentSnap.data() || {};
+
+      // D. VALIDATE BALANCE AND ELIGIBILITY INSIDE TRANSACTION
+      let newAvailable: number;
+      let newContracted: number;
+
+      if (isTrialLesson) {
+        if (studentData.hasCompletedTrialLesson === true) {
+          throw new SchedulingTransactionError(
+            'Aula experimental já foi utilizada anteriormente por este estudante.',
+            400
+          );
+        }
+        // Trial lesson does not consume regular paid credits
+        newAvailable = typeof studentData.availableLessons === 'number'
+          ? studentData.availableLessons
+          : 0;
+        newContracted = Math.max(Number(studentData.contractedLessons || 0), 1);
+      } else {
+        // Regular lesson: authoritatively check availableLessons in Firestore
+        // Strict requirement: Never invent credits, never substitute undefined with contractedLessons
+        if (
+          studentData.availableLessons === undefined ||
+          studentData.availableLessons === null ||
+          typeof studentData.availableLessons !== 'number'
+        ) {
+          throw new SchedulingTransactionError(
+            'Saldo de aulas ausente ou não definido no documento do aluno.',
+            422
+          );
+        }
+
+        // Authoritative zero balance is strictly preserved and blocks scheduling
+        if (studentData.availableLessons <= 0) {
+          throw new SchedulingTransactionError(
+            'Saldo de aulas insuficiente. Por favor, adquira créditos de aulas antes de agendar.',
+            402
+          );
+        }
+
+        newAvailable = studentData.availableLessons - 1;
+        newContracted = typeof studentData.contractedLessons === 'number'
+          ? studentData.contractedLessons
+          : studentData.availableLessons;
+      }
+
+      // E. SANITIZED LESSON DATA
+      const sanitizedLesson = {
+        id: deterministicLessonId,
+        title: title || (isTrialLesson ? 'Aula Experimental Ao Vivo (Google Meet)' : 'Aula Ao Vivo 1-on-1'),
+        description: description || '',
+        startDateTime,
+        endDateTime,
+        studentUid: studentAuthUid,
+        studentEmail: cleanStudentEmail || studentData.email || '',
+        studentName: studentName || studentData.name || (cleanStudentEmail ? cleanStudentEmail.split('@')[0] : 'Aluno'),
+        teacherUid: canonicalTeacherUid, // STRICTLY Firebase Auth UID!
+        teacherAuthUid: canonicalTeacherUid,
+        teacherPublicId: resolvedPublicTutorId,
+        teacherEmail: resolvedTeacherEmail,
+        teacherName: resolvedTeacherName,
+        meetLink: resolvedMeetLink,
+        status: 'scheduled',
+        isTrialLesson: Boolean(isTrialLesson),
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      // F. ATOMIC WRITES
+      transaction.set(lessonRef, sanitizedLesson, { merge: true });
+      transaction.set(studentSubLessonRef, sanitizedLesson, { merge: true });
+      transaction.set(teacherUserSubLessonRef, sanitizedLesson, { merge: true });
+      transaction.set(tutorSubLessonRef, sanitizedLesson, { merge: true });
+      transaction.set(
+        assignmentRef,
+        {
+          studentUid: studentAuthUid,
+          teacherUid: canonicalTeacherUid,
+          teacherAuthUid: canonicalTeacherUid,
+          teacherPublicId: resolvedPublicTutorId,
+          assignedNativeFriendUID: canonicalTeacherUid,
+          nativeFriendUID: canonicalTeacherUid,
+          teacherEmail: resolvedTeacherEmail,
+          teacherName: resolvedTeacherName,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+      transaction.set(
+        studentRef,
+        {
+          uid: studentAuthUid,
+          id: studentAuthUid,
+          email: cleanStudentEmail || studentData.email || '',
+          name: sanitizedLesson.studentName,
+          teacherUid: canonicalTeacherUid,
+          assignedNativeFriendUID: canonicalTeacherUid,
+          nativeFriendUID: canonicalTeacherUid,
+          teacherEmail: resolvedTeacherEmail,
+          teacherName: resolvedTeacherName,
+          teacherMeetUrl: resolvedMeetLink,
+          enrollmentStatus: 'active',
+          hasCompletedTrialLesson: isTrialLesson ? true : Boolean(studentData.hasCompletedTrialLesson),
+          onboardingCompleted: isTrialLesson ? true : Boolean(studentData.onboardingCompleted ?? true),
+          contractedLessons: newContracted,
+          availableLessons: newAvailable,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+
+      // Idempotent reconciliation of legacy student doc without deletion
+      if (studentData.id && studentData.id !== studentAuthUid) {
+        const legacyStudentRef = db.collection('users').doc(studentData.id);
+        transaction.set(legacyStudentRef, { canonicalUid: studentAuthUid, updatedAt: nowIso }, { merge: true });
+      }
+
+      return {
+        isIdempotent: false,
+        lesson: sanitizedLesson,
+        remainingLessons: newAvailable,
+        contractedLessons: newContracted,
+        hasCompletedTrialLesson: isTrialLesson ? true : Boolean(studentData.hasCompletedTrialLesson),
+        onboardingCompleted: isTrialLesson ? true : Boolean(studentData.onboardingCompleted ?? true),
+      };
+    });
+  } catch (txErr: any) {
+    if (txErr instanceof SchedulingTransactionError) {
+      return {
+        success: false,
+        error: txErr.message,
+        statusCode: txErr.statusCode,
+      };
     }
+
+    const msg = String(txErr?.message || '');
+    const code = txErr?.code;
+
+    if (isPermissionError(txErr)) {
+      console.error('[serverFirestore] Firestore runTransaction permission error during schedule:', msg);
+      return {
+        success: false,
+        error: 'Permissão negada para persistência da aula no Firestore.',
+        statusCode: 403,
+      };
+    }
+
+    const isTimeout =
+      code === 4 ||
+      code === 'deadline-exceeded' ||
+      msg.includes('DEADLINE_EXCEEDED') ||
+      msg.includes('timeout') ||
+      msg.includes('ETIMEDOUT');
+
+    if (isTimeout) {
+      console.error('[serverFirestore] Firestore runTransaction timeout during schedule:', msg);
+      return {
+        success: false,
+        error: 'Tempo limite esgotado ao persistir agendamento no Firestore. Tente novamente.',
+        statusCode: 504,
+      };
+    }
+
+    const isUnavailable =
+      code === 14 ||
+      code === 'unavailable' ||
+      msg.includes('UNAVAILABLE') ||
+      msg.includes('ECONNREFUSED');
+
+    if (isUnavailable) {
+      console.error('[serverFirestore] Firestore service unavailable during schedule:', msg);
+      return {
+        success: false,
+        error: 'Serviço Firestore temporariamente indisponível.',
+        statusCode: 503,
+      };
+    }
+
+    console.error('[serverFirestore] Unexpected transaction error in scheduleLessonAtomicServer:', msg);
+    return {
+      success: false,
+      error: 'Falha de persistência atômica no banco de dados. Agendamento não confirmado.',
+      statusCode: 500,
+    };
   }
 
-  // 11. Synchronize in-memory AppDb if provided
+  // 9. Synchronize in-memory AppDb exclusively AFTER confirmed Firestore transaction
   if (dbState) {
-    if (!Array.isArray(dbState.liveLessons)) dbState.liveLessons = [];
-    const existingIdx = dbState.liveLessons.findIndex((l: any) => l.id === deterministicLessonId);
-    if (existingIdx >= 0) {
-      dbState.liveLessons[existingIdx] = sanitizedLesson;
-    } else {
-      dbState.liveLessons.unshift(sanitizedLesson);
-    }
+    try {
+      if (!Array.isArray(dbState.liveLessons)) dbState.liveLessons = [];
+      const effectiveLesson = txData.lesson;
+      const existingIdx = dbState.liveLessons.findIndex((l: any) => l.id === deterministicLessonId);
+      if (existingIdx >= 0) {
+        dbState.liveLessons[existingIdx] = effectiveLesson;
+      } else {
+        dbState.liveLessons.unshift(effectiveLesson);
+      }
 
-    if (!dbState.userProfiles) dbState.userProfiles = {};
-    const profileKey = cleanStudentEmail || studentAuthUid;
-    dbState.userProfiles[profileKey] = {
-      ...(dbState.userProfiles[profileKey] || {}),
-      id: studentAuthUid,
-      uid: studentAuthUid,
-      email: cleanStudentEmail,
-      name: sanitizedLesson.studentName,
-      teacherUid: canonicalTeacherUid,
-      assignedNativeFriendUID: canonicalTeacherUid,
-      nativeFriendUID: canonicalTeacherUid,
-      teacherEmail: resolvedTeacherEmail,
-      teacherName: resolvedTeacherName,
-      teacherMeetUrl: resolvedMeetLink,
-      enrollmentStatus: 'active',
-      hasCompletedTrialLesson: isTrialLesson ? true : hasAlreadyCompletedTrial,
-      onboardingCompleted: isTrialLesson ? true : (dbState.userProfiles[profileKey]?.onboardingCompleted ?? true),
-      contractedLessons: newContracted,
-      availableLessons: newAvailable,
-      updatedAt: nowIso,
-    };
-
-    if (!Array.isArray(dbState.students)) dbState.students = [];
-    const stIdx = dbState.students.findIndex(
-      (s: any) => (s.email || '').toLowerCase().trim() === cleanStudentEmail || s.uid === studentAuthUid || s.id === studentAuthUid
-    );
-    if (stIdx >= 0) {
-      dbState.students[stIdx] = {
-        ...dbState.students[stIdx],
-        uid: studentAuthUid,
-        studentUid: studentAuthUid,
-        teacherUid: canonicalTeacherUid,
-        assignedNativeFriendUID: canonicalTeacherUid,
-        nativeFriendUID: canonicalTeacherUid,
-        teacherEmail: resolvedTeacherEmail,
-        teacherName: resolvedTeacherName,
-        status: 'active',
-        contractedLessons: newContracted,
-        hasCompletedTrialLesson: isTrialLesson ? true : hasAlreadyCompletedTrial,
-        onboardingCompleted: isTrialLesson ? true : ((dbState.students[stIdx] as any)?.onboardingCompleted ?? true),
-        teacherMeetUrl: resolvedMeetLink,
-      };
-    } else {
-      dbState.students.push({
+      if (!dbState.userProfiles) dbState.userProfiles = {};
+      const profileKey = cleanStudentEmail || studentAuthUid;
+      dbState.userProfiles[profileKey] = {
+        ...(dbState.userProfiles[profileKey] || {}),
         id: studentAuthUid,
         uid: studentAuthUid,
-        studentUid: studentAuthUid,
-        name: sanitizedLesson.studentName,
-        studentName: sanitizedLesson.studentName,
         email: cleanStudentEmail,
-        studentEmail: cleanStudentEmail,
+        name: effectiveLesson.studentName,
         teacherUid: canonicalTeacherUid,
         assignedNativeFriendUID: canonicalTeacherUid,
         nativeFriendUID: canonicalTeacherUid,
         teacherEmail: resolvedTeacherEmail,
         teacherName: resolvedTeacherName,
         teacherMeetUrl: resolvedMeetLink,
-        status: 'active',
-        contractedLessons: newContracted,
-        hasCompletedTrialLesson: isTrialLesson ? true : false,
-        onboardingCompleted: isTrialLesson ? true : false,
-        createdAt: nowIso,
-      });
+        enrollmentStatus: 'active',
+        hasCompletedTrialLesson: isTrialLesson ? true : Boolean(txData.hasCompletedTrialLesson),
+        onboardingCompleted: isTrialLesson ? true : Boolean(txData.onboardingCompleted ?? true),
+        contractedLessons: txData.contractedLessons,
+        availableLessons: txData.remainingLessons,
+        updatedAt: nowIso,
+      };
+
+      if (!Array.isArray(dbState.students)) dbState.students = [];
+      const stIdx = dbState.students.findIndex(
+        (s: any) => (s.email || '').toLowerCase().trim() === cleanStudentEmail || s.uid === studentAuthUid || s.id === studentAuthUid
+      );
+      if (stIdx >= 0) {
+        dbState.students[stIdx] = {
+          ...dbState.students[stIdx],
+          uid: studentAuthUid,
+          studentUid: studentAuthUid,
+          teacherUid: canonicalTeacherUid,
+          assignedNativeFriendUID: canonicalTeacherUid,
+          nativeFriendUID: canonicalTeacherUid,
+          teacherEmail: resolvedTeacherEmail,
+          teacherName: resolvedTeacherName,
+          status: 'active',
+          contractedLessons: txData.contractedLessons,
+          availableLessons: txData.remainingLessons,
+          hasCompletedTrialLesson: isTrialLesson ? true : Boolean(txData.hasCompletedTrialLesson),
+          onboardingCompleted: isTrialLesson ? true : Boolean(txData.onboardingCompleted ?? true),
+          teacherMeetUrl: resolvedMeetLink,
+        };
+      } else {
+        dbState.students.push({
+          id: studentAuthUid,
+          uid: studentAuthUid,
+          studentUid: studentAuthUid,
+          name: effectiveLesson.studentName,
+          studentName: effectiveLesson.studentName,
+          email: cleanStudentEmail,
+          studentEmail: cleanStudentEmail,
+          teacherUid: canonicalTeacherUid,
+          assignedNativeFriendUID: canonicalTeacherUid,
+          nativeFriendUID: canonicalTeacherUid,
+          teacherEmail: resolvedTeacherEmail,
+          teacherName: resolvedTeacherName,
+          teacherMeetUrl: resolvedMeetLink,
+          status: 'active',
+          contractedLessons: txData.contractedLessons,
+          availableLessons: txData.remainingLessons,
+          hasCompletedTrialLesson: isTrialLesson ? true : false,
+          onboardingCompleted: isTrialLesson ? true : false,
+          createdAt: nowIso,
+        });
+      }
+    } catch (syncErr) {
+      console.warn('[serverFirestore] Aviso: Falha na sincronização local de dbState pós-commit Firestore:', syncErr);
     }
   }
 
   return {
     success: true,
-    lesson: sanitizedLesson,
-    remainingLessons: newAvailable,
-    contractedLessons: newContracted,
+    lesson: txData.lesson,
+    remainingLessons: txData.remainingLessons,
+    contractedLessons: txData.contractedLessons,
     isTrialLesson: Boolean(isTrialLesson),
-    onboardingCompleted: isTrialLesson ? true : Boolean(studentDoc?.onboardingCompleted ?? true),
+    onboardingCompleted: txData.onboardingCompleted,
     statusCode: 200,
   };
 }

@@ -4402,7 +4402,7 @@ export default function App() {
           ? `Scheduling failed: ${txResult.error}`
           : `Falha no agendamento: ${txResult.error}`
       );
-      return;
+      throw new Error(txResult.error || 'Scheduling failed');
     }
 
     // Success path: Add confirmed lesson to state and apply balances

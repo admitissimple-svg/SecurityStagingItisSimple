@@ -7696,7 +7696,11 @@ app.post('/api/lessons/schedule', firebaseAuthMiddleware, async (req, res) => {
       });
     }
 
-    await writeDbSync(db);
+    try {
+      await writeDbSync(db);
+    } catch (syncErr) {
+      console.warn('[serverApp] Warning: Failed to sync local app_db after confirmed Firestore transaction:', syncErr);
+    }
     return res.status(200).json(result);
   } catch (err: any) {
     console.error('Error in POST /api/lessons/schedule:', err);
