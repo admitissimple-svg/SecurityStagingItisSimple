@@ -2754,27 +2754,79 @@ export default function App() {
 
   // Handler: Purchase Lesson Package with a specific Native Friend (Fixed Assignment)
   const handlePurchasePackage = async (params: {
-    teacherEmail: string;
+    teacherEmail?: string;
     teacherName: string;
     packageLessons: number;
     packagePriceBrl?: number;
     packagePriceUsd?: number;
     paymentMethod?: string;
+    teacherId?: string;
+    teacherUid?: string;
+    publicTutorId?: string;
+    isRecurringMonthly?: boolean;
+    monthlyFrequency?: string;
   }) => {
     if (!currentAccount?.email) return;
 
     try {
       const cleanStEmail = currentAccount.email.toLowerCase().trim();
       const stUid = currentAccount.uid || userProfile?.id || cleanStEmail;
-      const cleanTeacherEmail = params.teacherEmail ? params.teacherEmail.trim().toLowerCase() : '';
-      const cleanTeacherName = params.teacherName ? params.teacherName.trim() : 'Native Friend';
-      const matchedTutor = tutors.find((t) =>
-        (cleanTeacherEmail && (t.email || '').toLowerCase().trim() === cleanTeacherEmail) ||
-        (cleanTeacherEmail && t.id === cleanTeacherEmail)
-      );
-      const targetTeacherId = matchedTutor?.publicTutorId || matchedTutor?.id || cleanTeacherEmail;
 
-      if (!targetTeacherId && !cleanTeacherEmail) {
+      // 1. Extract raw identifiers preserving case (DO NOT apply toLowerCase to Firebase UIDs)
+      const rawTeacherUid = typeof params.teacherUid === 'string' ? params.teacherUid.trim() : '';
+      const rawTeacherId = typeof params.teacherId === 'string' ? params.teacherId.trim() : '';
+      const rawPublicTutorId = typeof params.publicTutorId === 'string' ? params.publicTutorId.trim() : '';
+      const rawTeacherEmail = typeof params.teacherEmail === 'string' ? params.teacherEmail.trim() : '';
+
+      // Check for valid canonical Firebase UID candidate (case-sensitive)
+      const candidateCanonicalUid =
+        (rawTeacherUid && isValidCanonicalUid(rawTeacherUid) ? rawTeacherUid : '') ||
+        (rawTeacherId && isValidCanonicalUid(rawTeacherId) ? rawTeacherId : '');
+
+      let matchedTutor: NativeFriendTutor | undefined = undefined;
+
+      // 2. Prioritize lookup by canonical UID (case-sensitive matching)
+      if (candidateCanonicalUid) {
+        matchedTutor = tutors.find((t) =>
+          (t.uid && t.uid === candidateCanonicalUid) ||
+          (t.authUid && t.authUid === candidateCanonicalUid) ||
+          (t.id && t.id === candidateCanonicalUid)
+        );
+      }
+
+      // 3. Fallback: Lookup by publicTutorId or teacherId (slugs)
+      if (!matchedTutor && (rawPublicTutorId || rawTeacherId)) {
+        const candidateSlug = rawPublicTutorId || rawTeacherId;
+        matchedTutor = tutors.find((t) =>
+          (t.publicTutorId && t.publicTutorId === candidateSlug) ||
+          (t.id && t.id === candidateSlug) ||
+          (t.publicTutorId && t.publicTutorId.toLowerCase() === candidateSlug.toLowerCase()) ||
+          (t.id && t.id.toLowerCase() === candidateSlug.toLowerCase())
+        );
+      }
+
+      // 4. Legacy compatibility: Lookup by email (only if email is provided and contains @)
+      if (!matchedTutor && rawTeacherEmail && rawTeacherEmail.includes('@')) {
+        const cleanEmail = rawTeacherEmail.toLowerCase();
+        matchedTutor = tutors.find((t) =>
+          (t.email && t.email.trim().toLowerCase() === cleanEmail)
+        );
+      }
+
+      // 5. Resolve canonical teacher UID strictly (do not use teacherName as identifier, do not accept unvalidated arbitrary strings)
+      const canonicalTeacherUid =
+        (matchedTutor?.uid && isValidCanonicalUid(matchedTutor.uid) ? matchedTutor.uid.trim() : '') ||
+        (matchedTutor?.id && isValidCanonicalUid(matchedTutor.id) ? matchedTutor.id.trim() : '') ||
+        (matchedTutor?.authUid && isValidCanonicalUid(matchedTutor.authUid) ? matchedTutor.authUid.trim() : '') ||
+        candidateCanonicalUid;
+
+      const hasValidTeacherIdentifier = Boolean(
+        (canonicalTeacherUid && isValidCanonicalUid(canonicalTeacherUid)) ||
+        (matchedTutor && (matchedTutor.id || matchedTutor.publicTutorId)) ||
+        (rawTeacherEmail && rawTeacherEmail.includes('@') && matchedTutor)
+      );
+
+      if (!hasValidTeacherIdentifier) {
         alert(
           currentLanguage === 'en'
             ? 'Please select a valid Native Friend to purchase lessons.'
@@ -2783,6 +2835,15 @@ export default function App() {
         return;
       }
 
+      const targetTeacherId =
+        canonicalTeacherUid ||
+        matchedTutor?.publicTutorId ||
+        matchedTutor?.id ||
+        (rawTeacherEmail ? rawTeacherEmail.toLowerCase() : '');
+
+      const cleanTeacherName = matchedTutor?.name || (params.teacherName ? params.teacherName.trim() : 'Native Friend');
+      const cleanTeacherEmail = (matchedTutor?.email || rawTeacherEmail || '').toLowerCase().trim();
+
       // Atomic backend transaction via Firebase Admin SDK
       const txResult = await purchasePackageWithTransaction({
         studentUid: stUid,
@@ -2790,7 +2851,8 @@ export default function App() {
         teacherEmail: cleanTeacherEmail,
         teacherName: cleanTeacherName,
         teacherId: targetTeacherId,
-        publicTutorId: matchedTutor?.publicTutorId || matchedTutor?.id,
+        teacherUid: canonicalTeacherUid || undefined,
+        publicTutorId: matchedTutor?.publicTutorId || rawPublicTutorId || undefined,
         packageLessons: params.packageLessons,
       });
 
@@ -2815,7 +2877,11 @@ export default function App() {
       else if (params.packageLessons === 8) newWeeklyTarget = 2;
       else if (params.packageLessons === 12) newWeeklyTarget = 3;
 
-      const canonicalTeacherUid = txResult.teacherUid || txResult.profile?.teacherUid || (txResult as any)?.teacherUid || '';
+      const authoritativeTeacherUid =
+        txResult.teacherUid ||
+        txResult.profile?.teacherUid ||
+        canonicalTeacherUid ||
+        '';
 
       // Update userProfile with fixed teacher, package subscription, and updated lesson balances
       setUserProfile((prev) => ({
@@ -2823,11 +2889,11 @@ export default function App() {
         subscriptionType: 'package',
         contractedLessons: newCount,
         availableLessons: authoritativeAvailable,
-        teacherEmail: cleanTeacherEmail,
-        teacherName: cleanTeacherName,
-        teacherUid: canonicalTeacherUid || prev.teacherUid,
-        assignedNativeFriendUID: canonicalTeacherUid || prev.assignedNativeFriendUID,
-        nativeFriendUID: canonicalTeacherUid || prev.nativeFriendUID,
+        teacherEmail: cleanTeacherEmail || txResult.profile?.teacherEmail || prev.teacherEmail,
+        teacherName: cleanTeacherName || txResult.profile?.teacherName || prev.teacherName,
+        teacherUid: authoritativeTeacherUid || prev.teacherUid,
+        assignedNativeFriendUID: authoritativeTeacherUid || prev.assignedNativeFriendUID,
+        nativeFriendUID: authoritativeTeacherUid || prev.nativeFriendUID,
         enrollmentStatus: 'active',
         weeklyNativeLessonsTarget: newWeeklyTarget,
       }));
@@ -2850,9 +2916,9 @@ export default function App() {
             (st.email || st.studentEmail || '').toLowerCase().trim() === cleanEmail
               ? {
                   ...st,
-                  teacherEmail: cleanTeacherEmail,
-                  teacherName: cleanTeacherName,
-                  teacherUid: canonicalTeacherUid || (st as any).teacherUid,
+                  teacherEmail: cleanTeacherEmail || txResult.profile?.teacherEmail || (st as any).teacherEmail,
+                  teacherName: cleanTeacherName || txResult.profile?.teacherName || st.teacherName,
+                  teacherUid: authoritativeTeacherUid || (st as any).teacherUid,
                   contractedLessons: newCount,
                   weeklyNativeLessonsTarget: newWeeklyTarget,
                   status: 'active',
@@ -2868,9 +2934,9 @@ export default function App() {
             studentName: userProfile.name || currentAccount.name || cleanEmail.split('@')[0],
             email: cleanEmail,
             studentEmail: cleanEmail,
-            teacherEmail: cleanTeacherEmail,
-            teacherName: cleanTeacherName,
-            teacherUid: canonicalTeacherUid,
+            teacherEmail: cleanTeacherEmail || txResult.profile?.teacherEmail || '',
+            teacherName: cleanTeacherName || txResult.profile?.teacherName || '',
+            teacherUid: authoritativeTeacherUid,
             contractedLessons: newCount,
             weeklyNativeLessonsTarget: newWeeklyTarget,
             status: 'active',

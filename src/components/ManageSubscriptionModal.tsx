@@ -25,6 +25,7 @@ import {
   CalendarCheck,
 } from 'lucide-react';
 import { GoogleAccount, Language, NativeFriendTutor, UserProfile } from '../types';
+import { isValidCanonicalUid } from '../utils/tutorConsolidation';
 
 interface LessonPackageOption {
   lessonsCount: number;
@@ -207,8 +208,11 @@ interface ManageSubscriptionModalProps {
   currentLanguage: Language;
   onUpdateSubscription: (teacherEmail: string | null, teacherName: string | null) => Promise<void>;
   onPurchasePackage?: (params: {
-    teacherEmail: string;
+    teacherEmail?: string;
     teacherName: string;
+    teacherId?: string;
+    teacherUid?: string;
+    publicTutorId?: string;
     packageLessons: number;
     packagePriceBrl: number;
     packagePriceUsd: number;
@@ -265,15 +269,19 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
     }
   }, [isOpen, initialSelectedTutor]);
 
+  const currentTeacherUid = userProfile?.teacherUid || userProfile?.assignedNativeFriendUID || userProfile?.nativeFriendUID || '';
   const currentTeacherEmail = (userProfile?.teacherEmail || '').toLowerCase().trim();
   const currentTeacherName = userProfile?.teacherName || '';
 
   // Find matching tutor info if available
-  const currentTutor = tutorsList.find(
-   (t) => !!currentTeacherEmail && (t?.email || '').toLowerCase().trim() === currentTeacherEmail
-  ) || (currentTeacherEmail ? {
-    id: `tutor-${currentTeacherEmail}`,
-    name: currentTeacherName || currentTeacherEmail.split('@')[0],
+  const currentTutor = tutorsList.find((t) => {
+    if (currentTeacherUid && (t?.uid === currentTeacherUid || t?.id === currentTeacherUid)) return true;
+    if (currentTeacherEmail && (t?.email || '').toLowerCase().trim() === currentTeacherEmail) return true;
+    return false;
+  }) || (currentTeacherEmail || currentTeacherUid ? {
+    id: currentTeacherUid || `tutor-${currentTeacherEmail}`,
+    uid: currentTeacherUid || undefined,
+    name: currentTeacherName || (currentTeacherEmail ? currentTeacherEmail.split('@')[0] : 'Native Friend'),
     email: currentTeacherEmail,
     pricePerSessionUsd: 15,
     pricePerSessionBrl: 83,
@@ -304,8 +312,7 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
   }, [tutorsList]);
 
   const hasActiveSubscription = Boolean(
-    currentTeacherEmail &&
-    currentTeacherEmail.trim() !== '' &&
+    ((currentTeacherEmail && currentTeacherEmail.trim() !== '') || (currentTeacherUid && currentTeacherUid.trim() !== '')) &&
     userProfile?.enrollmentStatus !== 'cancelled' &&
     userProfile?.enrollmentStatus !== 'not_enrolled'
   );
@@ -367,10 +374,27 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
     const pkg = selectedPkg;
     setIsProcessing(true);
     try {
+      const canonicalTeacherUid =
+        (selectedTutorForPurchase.uid && isValidCanonicalUid(selectedTutorForPurchase.uid) ? selectedTutorForPurchase.uid.trim() : '') ||
+        (selectedTutorForPurchase.id && isValidCanonicalUid(selectedTutorForPurchase.id) ? selectedTutorForPurchase.id.trim() : '') ||
+        (selectedTutorForPurchase.authUid && isValidCanonicalUid(selectedTutorForPurchase.authUid) ? selectedTutorForPurchase.authUid.trim() : '');
+
+      const resolvedTeacherId =
+        canonicalTeacherUid ||
+        selectedTutorForPurchase.id ||
+        selectedTutorForPurchase.publicTutorId;
+
+      const resolvedPublicTutorId =
+        selectedTutorForPurchase.publicTutorId ||
+        (!isValidCanonicalUid(selectedTutorForPurchase.id) ? selectedTutorForPurchase.id : undefined);
+
       if (onPurchasePackage) {
         await onPurchasePackage({
-          teacherEmail: selectedTutorForPurchase.email,
+          teacherEmail: selectedTutorForPurchase.email || '',
           teacherName: selectedTutorForPurchase.name,
+          teacherId: resolvedTeacherId || undefined,
+          teacherUid: canonicalTeacherUid || undefined,
+          publicTutorId: resolvedPublicTutorId || undefined,
           packageLessons: pkg.lessonsCount,
           packagePriceBrl: pkg.priceBrl,
           packagePriceUsd: pkg.priceUsd,
@@ -380,7 +404,7 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
         });
       } else {
         // Fallback: update subscription directly
-        await onUpdateSubscription(selectedTutorForPurchase.email, selectedTutorForPurchase.name);
+        await onUpdateSubscription(selectedTutorForPurchase.email || resolvedTeacherId || null, selectedTutorForPurchase.name);
       }
 
       setPurchaseCompleted(true);
@@ -1026,8 +1050,9 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
                 <div className="grid grid-cols-1 gap-3">
                   {approvedTutors.map((tutor) => {
                     const isSelected = Boolean(
-                      (tutor.email && tutor.email.toLowerCase() === currentTeacherEmail) ||
-                      (tutor.id && tutor.id.toLowerCase() === currentTeacherEmail)
+                      (currentTeacherUid && (tutor.uid === currentTeacherUid || tutor.id === currentTeacherUid)) ||
+                      (currentTeacherEmail && tutor.email && tutor.email.toLowerCase() === currentTeacherEmail) ||
+                      (currentTeacherEmail && tutor.id && tutor.id.toLowerCase() === currentTeacherEmail)
                     ) && hasActiveSubscription;
                     return (
                       <div
