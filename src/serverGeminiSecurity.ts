@@ -287,6 +287,7 @@ export function logGeminiAudited(event: {
   tokensEstimated?: number;
   detail?: string;
   model?: string;
+  correlationId?: string;
 }): void {
   const cleanDetail = (event.detail || '')
     .replace(/[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+/g, '[REDACTED_EMAIL]')
@@ -296,6 +297,7 @@ export function logGeminiAudited(event: {
 
   const logPayload = {
     timestamp: new Date().toISOString(),
+    correlationId: event.correlationId,
     feature: event.feature,
     model: event.model || resolveGeminiModel(),
     status: event.status,
@@ -1089,6 +1091,22 @@ export function isGenericPedagogicalExample(example: string | undefined | null):
   return false;
 }
 
+export interface GeminiAttemptDetail {
+  attemptNumber: number;
+  model: string;
+  success: boolean;
+  category?: GeminiFailureCategory;
+  statusCode?: number;
+  safeReason?: string;
+  durationMs?: number;
+}
+
+export type GeminiInterruptionReason =
+  | 'sucesso'
+  | 'erro não recuperável'
+  | 'esgotamento dos modelos'
+  | 'timeout';
+
 export interface GeminiContingencyResult {
   success: boolean;
   text?: string;
@@ -1096,6 +1114,9 @@ export interface GeminiContingencyResult {
   modelUsed?: string;
   attemptsCount: number;
   modelsAttempted: string[];
+  attemptsDetails?: GeminiAttemptDetail[];
+  interruptionReason?: GeminiInterruptionReason;
+  totalDurationMs?: number;
   error?: {
     statusCode?: number;
     category: GeminiFailureCategory;
@@ -1123,19 +1144,23 @@ export async function executeGeminiWithContingency(
     validator?: (json: any) => boolean;
     jsonValidator?: (json: any) => boolean;
     modelsOverride?: string[];
+    correlationId?: string;
   },
   attemptExecutor?: (model: string, params: any) => Promise<any>
 ): Promise<GeminiContingencyResult> {
+  const cascadeStartTime = Date.now();
   const models = params.modelsOverride && params.modelsOverride.length > 0
     ? params.modelsOverride.slice(0, 3)
     : resolveGeminiContingencyModels();
 
   const modelsAttempted: string[] = [];
+  const attemptsDetails: GeminiAttemptDetail[] = [];
   let lastError: any = null;
 
   for (let i = 0; i < models.length; i++) {
     const currentModel = models[i];
     modelsAttempted.push(currentModel);
+    const attemptStartTime = Date.now();
 
     let attempt: any = null;
     try {
@@ -1173,15 +1198,28 @@ export async function executeGeminiWithContingency(
       };
     }
 
+    const attemptDurationMs = Date.now() - attemptStartTime;
+
     if (attempt?.parsedJson) {
       const validatorFn = params.jsonValidator || params.validator;
       const isValid = validatorFn ? validatorFn(attempt.parsedJson) : true;
       if (isValid) {
+        attemptsDetails.push({
+          attemptNumber: i + 1,
+          model: currentModel,
+          success: true,
+          statusCode: 200,
+          safeReason: 'Valid structured response',
+          durationMs: attemptDurationMs,
+        });
+
         logGeminiAudited({
           feature: params.feature,
           status: 'SUCCESS',
           callerRole: params.callerRole,
           model: currentModel,
+          correlationId: params.correlationId,
+          durationMs: attemptDurationMs,
           detail: `Contingency success on model ${currentModel} (attempt ${i + 1}/${models.length})`,
         });
         return {
@@ -1191,6 +1229,9 @@ export async function executeGeminiWithContingency(
           modelUsed: currentModel,
           attemptsCount: i + 1,
           modelsAttempted,
+          attemptsDetails,
+          interruptionReason: 'sucesso',
+          totalDurationMs: Date.now() - cascadeStartTime,
         };
       } else {
         attempt.error = {
@@ -1208,6 +1249,16 @@ export async function executeGeminiWithContingency(
       safeReason: `Model ${currentModel} returned an empty or invalid response.`,
     };
 
+    attemptsDetails.push({
+      attemptNumber: i + 1,
+      model: currentModel,
+      success: false,
+      category: lastError.category,
+      statusCode: lastError.statusCode,
+      safeReason: lastError.safeReason,
+      durationMs: attemptDurationMs,
+    });
+
     // Rule 3: Stop immediately on non-recoverable errors (auth, policy, shared quota)
     if (isNonRecoverableGeminiError(lastError)) {
       lastError.nonRecoverable = true;
@@ -1216,6 +1267,8 @@ export async function executeGeminiWithContingency(
         status: 'GEMINI_ERROR',
         callerRole: params.callerRole,
         model: currentModel,
+        correlationId: params.correlationId,
+        durationMs: attemptDurationMs,
         detail: `Non-recoverable error (${lastError.category}: ${lastError.rawMessage?.slice(0, 80)}). Aborting contingency sequence immediately.`,
       });
       return {
@@ -1224,6 +1277,9 @@ export async function executeGeminiWithContingency(
         modelUsed: currentModel,
         attemptsCount: i + 1,
         modelsAttempted,
+        attemptsDetails,
+        interruptionReason: 'erro não recuperável',
+        totalDurationMs: Date.now() - cascadeStartTime,
         error: lastError,
       };
     }
@@ -1235,6 +1291,8 @@ export async function executeGeminiWithContingency(
         status: 'CONTINGENCY_FAILOVER',
         callerRole: params.callerRole,
         model: currentModel,
+        correlationId: params.correlationId,
+        durationMs: attemptDurationMs,
         detail: `Recoverable error on ${currentModel} (${lastError.category}). Falling over to contingency model ${models[i + 1]}.`,
       });
     }
@@ -1245,14 +1303,23 @@ export async function executeGeminiWithContingency(
     feature: params.feature,
     status: 'GEMINI_ERROR',
     callerRole: params.callerRole,
+    correlationId: params.correlationId,
+    durationMs: Date.now() - cascadeStartTime,
     detail: `All ${models.length} contingency models exhausted (${modelsAttempted.join(', ')}). Returning transparent error without synthetic fallbacks.`,
   });
+
+  const finalInterruptionReason: GeminiInterruptionReason =
+    lastError?.category === 'TIMEOUT' ? 'timeout' : 'esgotamento dos modelos';
 
   return {
     success: false,
     parsedJson: null,
+    modelUsed: modelsAttempted[modelsAttempted.length - 1],
     attemptsCount: modelsAttempted.length,
     modelsAttempted,
+    attemptsDetails,
+    interruptionReason: finalInterruptionReason,
+    totalDurationMs: Date.now() - cascadeStartTime,
     error: lastError,
   };
 }

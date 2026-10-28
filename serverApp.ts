@@ -231,6 +231,8 @@ import {
   resetGeminiSecurityStateForTesting,
   sendGeminiCostControlUnavailable,
   GeminiFeature,
+  GeminiAttemptDetail,
+  GeminiInterruptionReason,
   isGenericPedagogicalDefinition,
   isGenericPedagogicalExample,
 } from './src/serverGeminiSecurity';
@@ -272,12 +274,6 @@ export function parsePort(val?: string | number): number | null {
   return null;
 }
 
-export function resolvePort(portEnv?: string | number, appPortEnv?: string | number, defaultPort = 3000): number {
-  return parsePort(portEnv) ?? parsePort(appPortEnv) ?? defaultPort;
-}
-
-export const PORT = resolvePort(process.env.PORT, process.env.APP_PORT, 3000);
-
 /**
  * Detects whether the current runtime is an AI Studio Preview or development environment,
  * even when running inside Google Cloud Run (which injects K_SERVICE / K_REVISION).
@@ -313,6 +309,47 @@ export function isCloudRunPreviewEnvironment(): boolean {
   const appUrl = (process.env.APP_URL || '').toLowerCase();
   return appUrl.includes('ais-') || appUrl.includes('preview');
 }
+
+export function parseCliPort(): number | null {
+  const args = process.argv || [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--port' && args[i + 1]) {
+      const p = parsePort(args[i + 1]);
+      if (p) return p;
+    }
+    if (args[i].startsWith('--port=')) {
+      const p = parsePort(args[i].split('=')[1]);
+      if (p) return p;
+    }
+  }
+  return null;
+}
+
+export function resolvePort(portEnv?: string | number, appPortEnv?: string | number, defaultPort = 3000): number {
+  return parsePort(portEnv) ?? parsePort(appPortEnv) ?? defaultPort;
+}
+
+export function resolveEffectivePort(): number {
+  const cliPort = parseCliPort();
+  if (cliPort) return cliPort;
+
+  const appPort = parsePort(process.env.APP_PORT);
+  if (appPort) return appPort;
+
+  // In AI Studio / preview environment, Nginx is listening on 8080 and proxies to port 3000.
+  // When Cloud Run injects PORT=8080, normalize it to 3000 to prevent port collision with Nginx.
+  if (isCloudRunPreviewEnvironment()) {
+    const rawPort = parsePort(process.env.PORT);
+    if (rawPort && rawPort !== 8080) {
+      return rawPort;
+    }
+    return 3000;
+  }
+
+  return resolvePort(process.env.PORT, process.env.APP_PORT, 3000);
+}
+
+export const PORT = resolveEffectivePort();
 
 /**
  * Single explicit source of truth for runtime execution mode.
@@ -8706,8 +8743,12 @@ export type GeminiFailureCategory =
   | 'QUOTA_EXCEEDED'
   | 'SERVICE_UNAVAILABLE'
   | 'MODEL_UNAVAILABLE'
+  | 'MODEL_NOT_FOUND'
+  | 'MODEL_INCOMPATIBLE_CONFIG'
+  | 'POLICY_VIOLATION'
   | 'TIMEOUT'
-  | 'INVALID_RESPONSE';
+  | 'INVALID_RESPONSE'
+  | string;
 
 export function categorizeGeminiError(err: any): { category: GeminiFailureCategory; safeReason: string } {
   const msg = String(err?.message || err?.statusText || err || '').toLowerCase();
@@ -15268,10 +15309,87 @@ app.post('/api/email-logs', (req, res) => {
 // 12a. Isolated, Token-Optimized AI Handler Strictly for "Sentence of the Day" (Project: itissimple-security-staging)
 const dailySentenceEvaluationCache = new Map<string, { data: any; expiry: number }>();
 
-async function evaluateDailySentenceIsolated(
+export interface DailySentenceDiagnostics {
+  correlationId: string;
+  feature: GeminiFeature;
+  model: string;
+  attemptsCount: number;
+  modelsAttempted: string[];
+  category: GeminiFailureCategory | 'NONE';
+  statusCode: number;
+  safeReason: string;
+  totalDurationMs: number;
+  interruptionReason: GeminiInterruptionReason;
+  attempts: Array<{
+    attempt: number;
+    model: string;
+    success: boolean;
+    category?: GeminiFailureCategory;
+    statusCode?: number;
+    safeReason?: string;
+    durationMs?: number;
+  }>;
+}
+
+export interface DailySentenceEvaluationResult {
+  success: boolean;
+  data: any | null;
+  diagnostics: DailySentenceDiagnostics;
+  error?: {
+    statusCode?: number;
+    category: GeminiFailureCategory;
+    safeReason: string;
+    nonRecoverable?: boolean;
+    rawMessage?: string;
+  };
+}
+
+export function logDailySentenceDiagnostic(diag: DailySentenceDiagnostics): void {
+  const structuredEntry = {
+    tag: 'GEMINI_OBSERVABILITY',
+    timestamp: new Date().toISOString(),
+    feature: diag.feature,
+    model: diag.model || 'none',
+    attemptsCount: diag.attemptsCount,
+    category: diag.category || 'NONE',
+    statusCode: diag.statusCode || 200,
+    safeReason: diag.safeReason || 'Success',
+    totalDurationMs: diag.totalDurationMs,
+    correlationId: diag.correlationId,
+    cascadeInterruptionReason: diag.interruptionReason,
+    interruptionReason: diag.interruptionReason,
+    attempts: (diag.attempts || []).map((a) => ({
+      attempt: a.attempt,
+      model: a.model,
+      success: a.success,
+      category: a.category || (a.success ? 'NONE' : 'UNKNOWN'),
+      statusCode: a.statusCode || (a.success ? 200 : 500),
+      safeReason: a.safeReason || (a.success ? 'Success' : 'Failed'),
+      durationMs: a.durationMs || 0,
+    })),
+  };
+
+  const jsonStr = JSON.stringify(structuredEntry);
+  if (diag.interruptionReason === 'sucesso') {
+    console.log(`[GeminiObservability] ${jsonStr}`);
+  } else {
+    console.warn(`[GeminiObservability] ${jsonStr}`);
+  }
+}
+
+export async function evaluateDailySentenceIsolated(
   sentence: string,
-  dailyWords: string[] = []
-): Promise<any> {
+  dailyWords: string[] = [],
+  options?: {
+    correlationId?: string;
+    callerRole?: string;
+    modelsOverride?: string[];
+    attemptExecutor?: (model: string, params: any) => Promise<any>;
+  }
+): Promise<DailySentenceEvaluationResult & Record<string, any>> {
+  const startTime = Date.now();
+  const correlationId =
+    options?.correlationId || `cds_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
   const rawClean = (sentence || '').trim();
   const cleanDailyWords = Array.from(
     new Set(
@@ -15284,7 +15402,26 @@ async function evaluateDailySentenceIsolated(
   const cacheKey = `v3::${rawClean}::${cleanDailyWords.map((w) => w.toLowerCase()).sort().join(',')}`;
   const cached = dailySentenceEvaluationCache.get(cacheKey);
   if (cached && cached.expiry > Date.now()) {
-    return cached.data;
+    const diag: DailySentenceDiagnostics = {
+      correlationId,
+      feature: 'check_daily_sentence',
+      model: 'cache',
+      attemptsCount: 0,
+      modelsAttempted: [],
+      category: 'NONE',
+      statusCode: 200,
+      safeReason: 'Grammar evaluation served from in-memory cache.',
+      totalDurationMs: Date.now() - startTime,
+      interruptionReason: 'sucesso',
+      attempts: [],
+    };
+    logDailySentenceDiagnostic(diag);
+    return {
+      success: true,
+      data: cached.data,
+      diagnostics: diag,
+      ...cached.data,
+    };
   }
 
   // 1. Run deterministic grammar, capitalization ("I"), verb tense ("passed"), and vocabulary analysis
@@ -15301,10 +15438,37 @@ async function evaluateDailySentenceIsolated(
     wordFeedbacks,
   } = deterministic;
 
+  if (rawClean.length < 3) {
+    const diag: DailySentenceDiagnostics = {
+      correlationId,
+      feature: 'check_daily_sentence',
+      model: 'none',
+      attemptsCount: 0,
+      modelsAttempted: [],
+      category: 'POLICY_VIOLATION',
+      statusCode: 400,
+      safeReason: 'Sentence is too short for meaningful grammatical evaluation (<3 chars).',
+      totalDurationMs: Date.now() - startTime,
+      interruptionReason: 'erro não recuperável',
+      attempts: [],
+    };
+    logDailySentenceDiagnostic(diag);
+    return {
+      success: false,
+      data: null,
+      diagnostics: diag,
+      error: {
+        statusCode: 400,
+        category: 'POLICY_VIOLATION',
+        safeReason: diag.safeReason,
+        nonRecoverable: true,
+      },
+    };
+  }
+
   // 2. Concise, token-optimized Gemini API call strictly for Sentence of the Day
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (apiKey && rawClean.length >= 3) {
-    const concisePrompt = `You are a strict English grammar checker for "Sentence of the Day".
+  const apiKey = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
+  const concisePrompt = `You are a strict English grammar checker for "Sentence of the Day".
 Evaluate the student's sentence with zero-tolerance for errors:
 1. Capitalization: Standalone pronoun "i" MUST be "I" (e.g. "because i pass" -> "because I passed", "now i will" -> "now I will"). First word of sentence must be capitalized.
 2. Verb Tense & Agreement: Check tense consistency across clauses (e.g. if the sentence starts in past tense like "Today was a perfect day", causal/subordinate clauses like "because i pass the test" MUST use past tense "because I passed the test"). Check 3rd-person singular, modals, and auxiliaries.
@@ -15317,136 +15481,223 @@ Daily Words: ${JSON.stringify(cleanDailyWords)}
 Return strict JSON:
 {"hasAnyError":boolean,"isCorrect":boolean,"usedWords":[string],"missingWords":[string],"correctedSentence":string,"explanationPt":string,"explanationEn":string,"wordFeedbacks":[{"original":string,"hasError":boolean,"corrected":string,"explanationPt":string,"explanationEn":string}]}`;
 
-    // HOTFIX 3-MODEL CONTINGENCY: Sequential failover across up to 3 verified models on recoverable errors
-    const contingencyResult = await executeGeminiWithContingency({
+  // HOTFIX 3-MODEL CONTINGENCY: Sequential failover across up to 3 verified models on recoverable errors
+  const contingencyResult = await executeGeminiWithContingency(
+    {
       feature: 'check_daily_sentence',
       systemInstruction: 'You are an ultra-rigorous English grammar checker for Sentence of the Day. Respond strictly in valid JSON.',
       untrustedUserDataPrompt: concisePrompt,
-      callerRole: 'student',
+      callerRole: options?.callerRole || 'student',
       apiKey,
       temperature: 0.1,
       validator: (json) => typeof json === 'object' && ('hasAnyError' in json || 'isCorrect' in json),
+      modelsOverride: options?.modelsOverride,
+      correlationId,
+    },
+    options?.attemptExecutor
+  );
+
+  const parsed = contingencyResult?.parsedJson;
+  if (parsed && typeof parsed === 'object') {
+    // Ensure Gemini's correctedSentence also passes deterministic capitalization/tense rules
+    const rawAiCorrected =
+      parsed.correctedSentence && parsed.correctedSentence.trim()
+        ? parsed.correctedSentence.trim()
+        : programmaticFixed;
+    const postChecked = analyzeSentenceGrammarDeterministic(rawAiCorrected, cleanDailyWords);
+    const finalCorrected =
+      rawAiCorrected !== rawClean
+        ? postChecked.fixedSentence
+        : programmaticFixed;
+
+    const normalizedOriginal = rawClean.replace(/[.!?\s]+$/, '');
+    const normalizedCorrected = finalCorrected.replace(/[.!?\s]+$/, '');
+    const hasDiff = Boolean(normalizedCorrected && normalizedCorrected !== normalizedOriginal);
+
+    const finalUsedWords =
+      Array.isArray(parsed.usedWords) && parsed.usedWords.length > 0
+        ? parsed.usedWords
+        : usedWords;
+    const finalMissingWords =
+      Array.isArray(parsed.missingWords) && parsed.missingWords.length > 0
+        ? parsed.missingWords
+        : missingWords;
+
+    const finalHasError = Boolean(
+      hasProgrammaticError ||
+        hasDiff ||
+        parsed.hasAnyError === true ||
+        parsed.isCorrect === false ||
+        !usedTargetWord
+    );
+
+    const aiExplPt = parsed.explanationPt || parsed.explanation || '';
+    const aiExplEn = parsed.explanationEn || parsed.explanation || '';
+
+    const combinedExplPt =
+      Array.from(new Set([...programmaticErrorsPt, aiExplPt].filter(Boolean)))
+        .join(' ')
+        .trim() ||
+      (finalHasError
+        ? 'Ajustes gramaticais sugeridos para tornar sua frase correta e natural.'
+        : 'Sua frase está gramaticalmente correta e natural.');
+
+    const combinedExplEn =
+      Array.from(new Set([...programmaticErrorsEn, aiExplEn].filter(Boolean)))
+        .join(' ')
+        .trim() ||
+      (finalHasError
+        ? 'Suggested grammar adjustments to make your sentence accurate and natural.'
+        : 'Your sentence is grammatically accurate and natural.');
+
+    // Merge wordFeedbacks from deterministic check and Gemini
+    const combinedWordFeedbacks = [...wordFeedbacks];
+    if (Array.isArray(parsed.wordFeedbacks)) {
+      parsed.wordFeedbacks.forEach((wf: any) => {
+        if (
+          wf &&
+          wf.hasError &&
+          wf.original &&
+          wf.corrected &&
+          !combinedWordFeedbacks.some(
+            (existing) =>
+              existing.original.toLowerCase() === String(wf.original).toLowerCase()
+          )
+        ) {
+          combinedWordFeedbacks.push(wf);
+        }
+      });
+    }
+
+    const targetWordFeedback = hasWordConstraint
+      ? usedTargetWord
+        ? finalMissingWords.length > 0
+          ? `Palavras utilizadas (${finalUsedWords.length}/${cleanDailyWords.length}): ${finalUsedWords.join(', ')}. Não incluída(s): ${finalMissingWords.join(', ')}.`
+          : `Palavras da rotina utilizadas (${finalUsedWords.length}/${cleanDailyWords.length}): ${finalUsedWords.join(', ')}.`
+        : `Inclua pelo menos uma palavra da sua rotina na frase (${cleanDailyWords.slice(0, 5).join(', ')}).`
+      : '';
+
+    const resultPayload = {
+      hasAnyError: finalHasError,
+      isCorrect: !finalHasError,
+      usedTargetWord,
+      usedWords: finalUsedWords,
+      missingWords: finalMissingWords,
+      targetWordFeedback,
+      wordFeedbacks: combinedWordFeedbacks,
+      sentenceFeedback: {
+        original: rawClean,
+        hasError: finalHasError,
+        corrected: finalCorrected,
+        explanationPt: combinedExplPt,
+        explanationEn: combinedExplEn,
+      },
+      correctedSentence: finalCorrected,
+      explanation: combinedExplPt,
+      overallSummaryPt: finalHasError
+        ? combinedExplPt
+        : `Excelente! Frase natural com o vocabulário da sua rotina (${finalUsedWords.join(', ') || 'palavras de hoje'}).`,
+      overallSummaryEn: finalHasError
+        ? combinedExplEn
+        : `Outstanding! Natural sentence using your daily vocabulary (${finalUsedWords.join(', ') || 'today’s words'}).`,
+    };
+
+    if (dailySentenceEvaluationCache.size > 200) {
+      const firstKey = dailySentenceEvaluationCache.keys().next().value;
+      if (firstKey) dailySentenceEvaluationCache.delete(firstKey);
+    }
+    dailySentenceEvaluationCache.set(cacheKey, {
+      data: resultPayload,
+      expiry: Date.now() + 30 * 60 * 1000,
     });
 
-    const parsed = contingencyResult?.parsedJson;
-    if (parsed && typeof parsed === 'object') {
-      // Ensure Gemini's correctedSentence also passes deterministic capitalization/tense rules
-      const rawAiCorrected =
-        parsed.correctedSentence && parsed.correctedSentence.trim()
-          ? parsed.correctedSentence.trim()
-          : programmaticFixed;
-      const postChecked = analyzeSentenceGrammarDeterministic(rawAiCorrected, cleanDailyWords);
-      const finalCorrected =
-        rawAiCorrected !== rawClean
-          ? postChecked.fixedSentence
-          : programmaticFixed;
+    const diag: DailySentenceDiagnostics = {
+      correlationId,
+      feature: 'check_daily_sentence',
+      model: contingencyResult.modelUsed || 'unknown',
+      attemptsCount: contingencyResult.attemptsCount,
+      modelsAttempted: contingencyResult.modelsAttempted,
+      category: 'NONE',
+      statusCode: 200,
+      safeReason: 'Grammar evaluation completed successfully.',
+      totalDurationMs: contingencyResult.totalDurationMs || (Date.now() - startTime),
+      interruptionReason: 'sucesso',
+      attempts: (contingencyResult.attemptsDetails || []).map((ad) => ({
+        attempt: ad.attemptNumber,
+        model: ad.model,
+        success: ad.success,
+        category: ad.category,
+        statusCode: ad.statusCode,
+        safeReason: ad.safeReason,
+        durationMs: ad.durationMs,
+      })),
+    };
+    logDailySentenceDiagnostic(diag);
 
-      const normalizedOriginal = rawClean.replace(/[.!?\s]+$/, '');
-      const normalizedCorrected = finalCorrected.replace(/[.!?\s]+$/, '');
-      const hasDiff = Boolean(normalizedCorrected && normalizedCorrected !== normalizedOriginal);
-
-      const finalUsedWords =
-        Array.isArray(parsed.usedWords) && parsed.usedWords.length > 0
-          ? parsed.usedWords
-          : usedWords;
-      const finalMissingWords =
-        Array.isArray(parsed.missingWords) && parsed.missingWords.length > 0
-          ? parsed.missingWords
-          : missingWords;
-
-      const finalHasError = Boolean(
-        hasProgrammaticError ||
-          hasDiff ||
-          parsed.hasAnyError === true ||
-          parsed.isCorrect === false ||
-          !usedTargetWord
-      );
-
-      const aiExplPt = parsed.explanationPt || parsed.explanation || '';
-      const aiExplEn = parsed.explanationEn || parsed.explanation || '';
-
-      const combinedExplPt =
-        Array.from(new Set([...programmaticErrorsPt, aiExplPt].filter(Boolean)))
-          .join(' ')
-          .trim() ||
-        (finalHasError
-          ? 'Ajustes gramaticais sugeridos para tornar sua frase correta e natural.'
-          : 'Sua frase está gramaticalmente correta e natural.');
-
-      const combinedExplEn =
-        Array.from(new Set([...programmaticErrorsEn, aiExplEn].filter(Boolean)))
-          .join(' ')
-          .trim() ||
-        (finalHasError
-          ? 'Suggested grammar adjustments to make your sentence accurate and natural.'
-          : 'Your sentence is grammatically accurate and natural.');
-
-      // Merge wordFeedbacks from deterministic check and Gemini
-      const combinedWordFeedbacks = [...wordFeedbacks];
-      if (Array.isArray(parsed.wordFeedbacks)) {
-        parsed.wordFeedbacks.forEach((wf: any) => {
-          if (
-            wf &&
-            wf.hasError &&
-            wf.original &&
-            wf.corrected &&
-            !combinedWordFeedbacks.some(
-              (existing) =>
-                existing.original.toLowerCase() === String(wf.original).toLowerCase()
-            )
-          ) {
-            combinedWordFeedbacks.push(wf);
-          }
-        });
-      }
-
-      const targetWordFeedback = hasWordConstraint
-        ? usedTargetWord
-          ? finalMissingWords.length > 0
-            ? `Palavras utilizadas (${finalUsedWords.length}/${cleanDailyWords.length}): ${finalUsedWords.join(', ')}. Não incluída(s): ${finalMissingWords.join(', ')}.`
-            : `Palavras da rotina utilizadas (${finalUsedWords.length}/${cleanDailyWords.length}): ${finalUsedWords.join(', ')}.`
-          : `Inclua pelo menos uma palavra da sua rotina na frase (${cleanDailyWords.slice(0, 5).join(', ')}).`
-        : '';
-
-      const resultPayload = {
-        hasAnyError: finalHasError,
-        isCorrect: !finalHasError,
-        usedTargetWord,
-        usedWords: finalUsedWords,
-        missingWords: finalMissingWords,
-        targetWordFeedback,
-        wordFeedbacks: combinedWordFeedbacks,
-        sentenceFeedback: {
-          original: rawClean,
-          hasError: finalHasError,
-          corrected: finalCorrected,
-          explanationPt: combinedExplPt,
-          explanationEn: combinedExplEn,
-        },
-        correctedSentence: finalCorrected,
-        explanation: combinedExplPt,
-        overallSummaryPt: finalHasError
-          ? combinedExplPt
-          : `Excelente! Frase natural com o vocabulário da sua rotina (${finalUsedWords.join(', ') || 'palavras de hoje'}).`,
-        overallSummaryEn: finalHasError
-          ? combinedExplEn
-          : `Outstanding! Natural sentence using your daily vocabulary (${finalUsedWords.join(', ') || 'today’s words'}).`,
-      };
-
-      if (dailySentenceEvaluationCache.size > 200) {
-        const firstKey = dailySentenceEvaluationCache.keys().next().value;
-        if (firstKey) dailySentenceEvaluationCache.delete(firstKey);
-      }
-      dailySentenceEvaluationCache.set(cacheKey, {
-        data: resultPayload,
-        expiry: Date.now() + 30 * 60 * 1000,
-      });
-      return resultPayload;
-    }
+    return {
+      success: true,
+      data: resultPayload,
+      diagnostics: diag,
+      ...resultPayload,
+    };
   }
 
-  // Transparent failure: do NOT invent synthetic passes or fake grammar evaluations
-  return null;
+  // Preserve failure details and log structured observability entry
+  const lastErr = contingencyResult.error || {
+    statusCode: 503,
+    category: 'SERVICE_UNAVAILABLE' as GeminiFailureCategory,
+    safeReason: 'All contingency models failed to provide a valid response.',
+  };
+
+  const interruptionReason: GeminiInterruptionReason =
+    contingencyResult.interruptionReason ||
+    (lastErr.nonRecoverable
+      ? 'erro não recuperável'
+      : lastErr.category === 'TIMEOUT'
+      ? 'timeout'
+      : 'esgotamento dos modelos');
+
+  const modelLogged =
+    contingencyResult.modelUsed ||
+    (contingencyResult.modelsAttempted.length > 0
+      ? contingencyResult.modelsAttempted[contingencyResult.modelsAttempted.length - 1]
+      : 'none');
+
+  const diag: DailySentenceDiagnostics = {
+    correlationId,
+    feature: 'check_daily_sentence',
+    model: modelLogged,
+    attemptsCount: contingencyResult.attemptsCount || contingencyResult.modelsAttempted.length,
+    modelsAttempted: contingencyResult.modelsAttempted,
+    category: lastErr.category || 'SERVICE_UNAVAILABLE',
+    statusCode: lastErr.statusCode || 503,
+    safeReason: lastErr.safeReason || 'Gemini service encountered an error.',
+    totalDurationMs: contingencyResult.totalDurationMs || (Date.now() - startTime),
+    interruptionReason,
+    attempts: (contingencyResult.attemptsDetails || []).map((ad) => ({
+      attempt: ad.attemptNumber,
+      model: ad.model,
+      success: ad.success,
+      category: ad.category,
+      statusCode: ad.statusCode,
+      safeReason: ad.safeReason,
+      durationMs: ad.durationMs,
+    })),
+  };
+
+  logDailySentenceDiagnostic(diag);
+
+  return {
+    success: false,
+    data: null,
+    diagnostics: diag,
+    error: {
+      statusCode: lastErr.statusCode,
+      category: lastErr.category,
+      safeReason: lastErr.safeReason,
+      nonRecoverable: lastErr.nonRecoverable,
+    },
+  };
 }
 
 app.post('/api/check-daily-sentence', firebaseAuthMiddleware, async (req, res) => {
@@ -15518,21 +15769,48 @@ app.post('/api/check-daily-sentence', firebaseAuthMiddleware, async (req, res) =
       });
     }
 
-    let result: any = null;
+    const correlationId =
+      (req.headers['x-correlation-id'] as string) ||
+      (req.headers['x-request-id'] as string) ||
+      `cds_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    res.setHeader('X-Correlation-Id', correlationId);
+
+    let evalOutcome: DailySentenceEvaluationResult | null = null;
     try {
-      result = await evaluateDailySentenceIsolated(sentence, dailyWords);
+      evalOutcome = await evaluateDailySentenceIsolated(sentence, dailyWords, {
+        correlationId,
+        callerRole: caller.role,
+      });
     } finally {
       await flightLock.release();
     }
-    if (!result) {
+
+    if (!evalOutcome || !evalOutcome.success || !evalOutcome.data) {
       return res.status(503).json({
         success: false,
         error: 'AiUnavailable',
         message: 'Serviço de verificação da Frase do Dia temporariamente indisponível. Sua frase foi preservada.',
       });
     }
-    return res.json(result);
+    return res.json(evalOutcome.data);
   } catch (err: any) {
+    const errorCorrelationId =
+      (req.headers['x-correlation-id'] as string) ||
+      (req.headers['x-request-id'] as string) ||
+      `cds_${Date.now()}_err`;
+    logDailySentenceDiagnostic({
+      correlationId: errorCorrelationId,
+      feature: 'check_daily_sentence',
+      model: 'none',
+      attemptsCount: 0,
+      modelsAttempted: [],
+      category: 'SERVICE_UNAVAILABLE',
+      statusCode: 503,
+      safeReason: 'Unexpected internal error in check-daily-sentence endpoint.',
+      totalDurationMs: 0,
+      interruptionReason: 'erro não recuperável',
+      attempts: [],
+    });
     return res.status(503).json({
       success: false,
       error: 'AiUnavailable',
@@ -16788,7 +17066,13 @@ export async function startServer() {
 
   server.on('error', (err: any) => {
     if (err.code === 'EADDRINUSE') {
-      console.warn(`Port ${PORT} is already in use, listening skipped.`);
+      console.warn(`Port ${PORT} is already in use.`);
+      if (PORT !== 3000) {
+        console.log('Attempting fallback to port 3000...');
+        app.listen(3000, '0.0.0.0', () => {
+          console.log(`It's Simple Server running on fallback http://0.0.0.0:3000 (PORT=3000)`);
+        });
+      }
     } else {
       console.error('Server error event:', err);
     }

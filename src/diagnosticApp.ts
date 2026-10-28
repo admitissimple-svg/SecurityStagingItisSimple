@@ -35,11 +35,40 @@ export function parsePort(val?: string | number): number | null {
   return null;
 }
 
+export function parseCliPort(): number | null {
+  const args = process.argv || [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--port' && args[i + 1]) {
+      const p = parsePort(args[i + 1]);
+      if (p) return p;
+    }
+    if (args[i].startsWith('--port=')) {
+      const p = parsePort(args[i].split('=')[1]);
+      if (p) return p;
+    }
+  }
+  return null;
+}
+
 export function resolvePort(portEnv?: string | number, appPortEnv?: string | number, defaultPort = 3000): number {
   return parsePort(portEnv) ?? parsePort(appPortEnv) ?? defaultPort;
 }
 
-export const PORT = resolvePort(process.env.PORT, process.env.APP_PORT, 3000);
+export function resolveEffectiveDiagnosticPort(): number {
+  const cliPort = parseCliPort();
+  if (cliPort) return cliPort;
+
+  const appPort = parsePort(process.env.APP_PORT);
+  if (appPort) return appPort;
+
+  const rawPort = parsePort(process.env.PORT);
+  if (rawPort && rawPort !== 8080) {
+    return rawPort;
+  }
+  return 3000;
+}
+
+export const PORT = resolveEffectiveDiagnosticPort();
 
 // Strict CORS middleware for diagnostic staging backend
 app.use((req, res, next) => {

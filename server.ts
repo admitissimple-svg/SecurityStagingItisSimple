@@ -55,11 +55,28 @@ export function isCloudRunPreviewEnvironment(): boolean {
   return appUrl.includes('ais-') || appUrl.includes('preview');
 }
 
+// If --port is provided in command line arguments (e.g. npm run dev --port 3000), prioritize it
+for (let i = 0; i < (process.argv || []).length; i++) {
+  if (process.argv[i] === '--port' && process.argv[i + 1]) {
+    process.env.PORT = process.argv[i + 1];
+    break;
+  }
+  if (process.argv[i].startsWith('--port=')) {
+    process.env.PORT = process.argv[i].split('=')[1];
+    break;
+  }
+}
+
 // In preview/development environments, normalize NODE_ENV to development if unset.
 // Only set production if explicitly running in a production Cloud Run service or APP_ENV=production.
 if (isCloudRunPreviewEnvironment()) {
   if (!process.env.NODE_ENV) {
     process.env.NODE_ENV = 'development';
+  }
+  // In AI Studio preview/dev environment, Nginx is listening on 8080 and proxies traffic to Node on port 3000.
+  // When Cloud Run injects PORT=8080, normalize it to 3000 to prevent port collision with Nginx.
+  if (process.env.PORT === '8080' && !process.env.APP_PORT) {
+    process.env.PORT = '3000';
   }
 } else if (!process.env.NODE_ENV && (process.env.K_SERVICE || process.env.K_REVISION || process.env.APP_ENV === 'production')) {
   process.env.NODE_ENV = 'production';
