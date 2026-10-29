@@ -4045,6 +4045,41 @@ export async function fetchStudentDailyJournalFromServerFirestore(docId: string)
 }
 
 /**
+ * Delete a student daily journal entry directly from Cloud Firestore (users/{studentUid}/journal/{entryId} and users/{studentUid}.dailyJournalEntries)
+ */
+export async function deleteStudentJournalEntryFromServerFirestore(
+  studentUid: string,
+  entryId: string
+): Promise<boolean> {
+  const db = getFirestoreDb();
+  if (!db || !studentUid || !entryId) return false;
+  try {
+    const cleanUid = studentUid.trim();
+    const userRef = db.collection('users').doc(cleanUid);
+
+    // 1. Delete from subcollection
+    await userRef.collection('journal').doc(entryId).delete().catch(() => {});
+
+    // 2. Remove from dailyJournalEntries array in user doc
+    const userSnap = await userRef.get().catch(() => null);
+    if (userSnap && userSnap.exists) {
+      const data = userSnap.data();
+      if (Array.isArray(data?.dailyJournalEntries)) {
+        const filtered = data.dailyJournalEntries.filter((e: any) => e.id !== entryId);
+        await userRef.set(
+          { dailyJournalEntries: filtered, updatedAt: new Date().toISOString() },
+          { merge: true }
+        );
+      }
+    }
+    return true;
+  } catch (err) {
+    console.warn('deleteStudentJournalEntryFromServerFirestore error:', err);
+    return false;
+  }
+}
+
+/**
  * Subcollection-scoped persistence for routine checks
  */
 export async function fetchWeeklyChecksFromFirestore(

@@ -121,6 +121,7 @@ import {
   subscribeToStudentWeeklyChecks,
   subscribeToStudentDailyJournal,
   subscribeToStudentDailyRoutines,
+  fetchStudentDailyRoutinesFromFirestore,
   deleteStudentVocabularyFromFirestore,
   fetchExcludedDictionaryWords,
   addExcludedDictionaryWord,
@@ -581,6 +582,9 @@ export default function App() {
 
   // 4. Routines State by Day (Auto-positions on today's focus)
   const [routinesByDay, setRoutinesByDay] = useState<Record<DayOfWeek, RoutineItem[]>>(defaultRoutinesByDay);
+  // Routines Hydration State (Distinguishes uninitialized, loading, loaded with words, loaded empty, and read error)
+  const [routinesHydrationStatus, setRoutinesHydrationStatus] = useState<'uninitialized' | 'loading' | 'loaded_with_words' | 'loaded_empty' | 'error'>('uninitialized');
+  const activeRoutinesHydrationUidRef = useRef<string>('');
   const [selectedDay, setSelectedDay] = useState<DayOfWeek>(() => getTodayDayOfWeek());
   const [selectedActivityId, setSelectedActivityId] = useState<string>(() => {
     const today = getTodayDayOfWeek();
@@ -931,6 +935,15 @@ export default function App() {
 
   // Generate Weekly Homework automatically whenever routines, dictionary, or targetDay change
   useEffect(() => {
+    // CORREÇÃO A (Requisitos 1, 2, 3, 4): Bloquear a geração de homework enquanto a primeira hidratação do Firestore não estiver concluída.
+    if (routinesHydrationStatus === 'uninitialized' || routinesHydrationStatus === 'loading') {
+      return;
+    }
+    // Falha de leitura não é interpretada como ausência de palavras. Não sobrescrever com vazio.
+    if (routinesHydrationStatus === 'error') {
+      return;
+    }
+
     const customWordList = consolidatedActiveDictionary.map((e) => ({
       id: e.id,
       word: e.word,
@@ -965,6 +978,18 @@ export default function App() {
 
     // HOTFIX 2.3.5 / 2.3.5B / 2.3.5J: Manage independent daily activities per targetDay and cycle with strict vocabulary priority
     setWeeklyHomework((prev) => {
+      // CORREÇÃO A (Requisitos 5, 6, 7): Preservar atividades semanais previamente persistidas.
+      // Não sobrescrever respostas ou atividades válidas com estruturas vazias devido a estado transitório.
+      if (
+        generated?.isEmpty &&
+        prev &&
+        !prev.isEmpty &&
+        ((Array.isArray(prev.sentenceWritingPrompts) && prev.sentenceWritingPrompts.length > 0) ||
+          (Array.isArray(prev.vocabularyList) && prev.vocabularyList.length > 0))
+      ) {
+        return prev;
+      }
+
       const prevCycle = parseWeekCycleNumber(prev?.weeklyCycle ?? prev?.weekId ?? prev?.id);
       const genCycle = parseWeekCycleNumber(generated?.weeklyCycle ?? generated?.weekId ?? generated?.id);
       const isSameWeek = Boolean(
@@ -1145,7 +1170,7 @@ export default function App() {
         dailyActivities: updatedDailyActivities,
       };
     });
-  }, [routinesByDay, userProfile.name, userProfile.level, studentDictionaryEntries, excludedDictionaryWords, homeworkTargetDay, userProfile?.weeklyStudyDays, userProfile?.weeklyCycle, lessons]);
+  }, [routinesByDay, routinesHydrationStatus, userProfile.name, userProfile.level, studentDictionaryEntries, excludedDictionaryWords, homeworkTargetDay, userProfile?.weeklyStudyDays, userProfile?.weeklyCycle, lessons]);
 
   // Synchronize completedPartsByDay from weeklyChecks so memorization S-Path checks are always in sync
   useEffect(() => {
@@ -1269,6 +1294,8 @@ export default function App() {
   useEffect(() => {
     if (!currentAccount?.email) {
       activeStudentUidRef.current = '';
+      activeRoutinesHydrationUidRef.current = '';
+      setRoutinesHydrationStatus('uninitialized');
       setIsDictionaryHydrated(false);
       setLessons([]);
       setStudents([]);
@@ -1413,6 +1440,8 @@ export default function App() {
 
     // 3. If student, immediately reset routines and session state to clean state before fetching
     if (role === 'student') {
+      activeRoutinesHydrationUidRef.current = uid;
+      setRoutinesHydrationStatus('loading');
       setWeeklyChecks({});
       setStudentJournal([]);
       setWeeklyHomework(null);
@@ -1556,6 +1585,50 @@ export default function App() {
             console.warn('Notice hydrating routines from Firestore on login:', e);
           }
 
+          // CORREÇÃO A: Hydrate student daily routines (including 5 learned words) directly from Firestore
+          try {
+            const routinesFs = await fetchStudentDailyRoutinesFromFirestore(effectiveStudentUid);
+            if (routinesFs && routinesFs.success && routinesFs.routines) {
+              (Object.keys(routinesFs.routines) as DayOfWeek[]).forEach((day) => {
+                const dayData = routinesFs.routines[day];
+                if (dayData && Array.isArray(dayData.learnedWords) && dayData.learnedWords.length > 0) {
+                  const dayList = baseRoutines[day] || defaultRoutinesByDay[day] || [];
+                  baseRoutines[day] = dayList.map((item, idx) => {
+                    if (
+                      idx === 0 ||
+                      item.id.endsWith('1') ||
+                      item.activityName?.toLowerCase().includes('video') ||
+                      item.activityName?.toLowerCase().includes('vídeo') ||
+                      (item.teacherVideos && item.teacherVideos.length > 0)
+                    ) {
+                      return {
+                        ...item,
+                        learnedWords: dayData.learnedWords,
+                      };
+                    }
+                    return item;
+                  });
+                }
+              });
+
+              if (activeRoutinesHydrationUidRef.current === uid) {
+                const hasWords = Object.values(baseRoutines).some((dayList) =>
+                  (dayList || []).some((item) => Array.isArray(item.learnedWords) && item.learnedWords.length > 0)
+                );
+                setRoutinesHydrationStatus(hasWords ? 'loaded_with_words' : 'loaded_empty');
+              }
+            } else if (routinesFs && routinesFs.error) {
+              if (activeRoutinesHydrationUidRef.current === uid) {
+                setRoutinesHydrationStatus('error');
+              }
+            }
+          } catch (routinesErr) {
+            console.warn('Notice loading routines from Firestore in loadStudentData:', routinesErr);
+            if (activeRoutinesHydrationUidRef.current === uid) {
+              setRoutinesHydrationStatus('error');
+            }
+          }
+
           // Apply this specific student's registered routine times
           const vidTime = loadedProfile?.routineVideoTime;
           const audTime = loadedProfile?.routineAudioTime;
@@ -1580,25 +1653,6 @@ export default function App() {
                   const derivedChecks = deriveWeeklyChecksFromJournal(journalData, loadedCycle);
                   setWeeklyChecks((prev) => ({ ...prev, ...derivedChecks }));
                 }
-              }
-            })
-            .catch(() => {});
-
-          // Hydrate student daily journal (Sentence of the Day + Lesson Reviews)
-          fetch(`/api/student-journal?uid=${encodeURIComponent(uid)}&studentEmail=${encodeURIComponent(email)}`)
-            .then((r) => (r.ok ? r.json() : null))
-            .then((entries) => {
-              if (Array.isArray(entries) && entries.length > 0) {
-                setDailyJournalEntries((prev) => {
-                  const map = new Map<string, any>();
-                  (prev || []).forEach((e) => { if (e?.id) map.set(e.id, e); });
-                  entries.forEach((e) => { if (e?.id) map.set(e.id, e); });
-                  return Array.from(map.values()).sort((a, b) => {
-                    const tA = new Date(a.createdAt || a.date).getTime();
-                    const tB = new Date(b.createdAt || b.date).getTime();
-                    return tB - tA;
-                  });
-                });
               }
             })
             .catch(() => {});
@@ -1832,29 +1886,12 @@ export default function App() {
     if (role === 'student' && (email || uid)) {
       const dictEmail = email || userProfile?.email || '';
 
-      // Direct Firestore fetch for student journal
+      // Direct Firestore fetch for student journal (Firestore is exclusive canonical source of truth)
       fetchStudentJournalFromFirestore(uid, dictEmail).then((fsJournal) => {
         if (Array.isArray(fsJournal) && fsJournal.length > 0) {
           setDailyJournalEntries(fsJournal);
         }
       });
-
-      // 4. Backend journal mirror
-      fetch(`/api/student-journal?studentEmail=${encodeURIComponent(dictEmail)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`)
-        .then((r) => (r.ok ? r.json() : []))
-        .then((data) => {
-          if (Array.isArray(data) && data.length > 0) {
-            setDailyJournalEntries((prev) => {
-              const map = new Map<string, DailyJournalEntry>();
-              prev.forEach((e) => map.set(e.id, e));
-              data.forEach((e: DailyJournalEntry) => map.set(e.id, e));
-              const list = Array.from(map.values());
-              list.sort((a, b) => new Date(b.createdAt || b.date).getTime() - new Date(a.createdAt || a.date).getTime());
-              return list;
-            });
-          }
-        })
-        .catch(() => {});
     }
 
     return () => {
@@ -1940,98 +1977,118 @@ export default function App() {
     const email = currentAccount?.email || userProfile?.email || '';
     if (!uid && !email) return;
 
-    const unsub = subscribeToStudentDailyRoutines(uid, (cloudRoutines) => {
-      if (cloudRoutines && typeof cloudRoutines === 'object' && Object.keys(cloudRoutines).length > 0) {
-        const currentActiveCycle = activeCycleRef.current;
-        setRoutinesByDay((prev) => {
-          const merged = { ...prev };
-          (Object.keys(cloudRoutines) as DayOfWeek[]).forEach((day) => {
-            const dayData = cloudRoutines[day];
-            if (dayData && typeof dayData === 'object') {
-              // HOTFIX 2.3.5C: Discard stale documents from prior weekly cycles to prevent resurrecting old words
-              if (typeof dayData.weeklyCycle === 'number' && dayData.weeklyCycle < currentActiveCycle) {
-                return;
+    const unsub = subscribeToStudentDailyRoutines(
+      uid,
+      (cloudRoutines) => {
+        // CORREÇÃO A (Requisito 9): Impedir que uma resposta assíncrona de uma sessão anterior atualize os dados de outro usuário.
+        if (activeRoutinesHydrationUidRef.current !== uid) return;
+
+        if (cloudRoutines && typeof cloudRoutines === 'object' && Object.keys(cloudRoutines).length > 0) {
+          const currentActiveCycle = activeCycleRef.current;
+          setRoutinesByDay((prev) => {
+            const merged = { ...prev };
+            (Object.keys(cloudRoutines) as DayOfWeek[]).forEach((day) => {
+              const dayData = cloudRoutines[day];
+              if (dayData && typeof dayData === 'object') {
+                // HOTFIX 2.3.5C: Discard stale documents from prior weekly cycles to prevent resurrecting old words
+                if (typeof dayData.weeklyCycle === 'number' && dayData.weeklyCycle < currentActiveCycle) {
+                  return;
+                }
+                if (Array.isArray(dayData)) {
+                  merged[day] = dayData;
+                } else {
+                  const dayList = merged[day] || defaultRoutinesByDay[day] || [];
+                  const hasVideoField = dayData.videoId !== undefined || dayData.isRepeatVideo !== undefined;
+                  const cleanVidId = dayData.videoId ? dayData.videoId.trim() : '';
+                  merged[day] = dayList.map((item, idx) => {
+                    if (
+                      idx === 0 ||
+                      item.id.endsWith('1') ||
+                      item.activityName?.toLowerCase().includes('vídeo') ||
+                      item.activityName?.toLowerCase().includes('video') ||
+                      (item.teacherVideos && item.teacherVideos.length > 0)
+                    ) {
+                      const resolvedActivityName = hasVideoField
+                        ? (cleanVidId
+                            ? (dayData.playlistTitle || dayData.title || dayData.videoTitle || item.activityName)
+                            : (dayData.playlistTitle || 'Video of the Day'))
+                        : item.activityName;
+
+                      const resolvedPlaylistId = hasVideoField
+                        ? (dayData.playlistId || '')
+                        : item.playlistId;
+
+                      const resolvedPlaylistTitle = hasVideoField
+                        ? (dayData.playlistTitle || '')
+                        : item.playlistTitle;
+
+                      const resolvedVideos = hasVideoField
+                        ? (cleanVidId
+                            ? [
+                                {
+                                  id: cleanVidId,
+                                  videoId: cleanVidId,
+                                  title: dayData.title || dayData.videoTitle || 'Daily Video Practice',
+                                  url: dayData.url || `https://www.youtube.com/watch?v=${cleanVidId}`,
+                                  playlistId: dayData.playlistId || '',
+                                  playlistTitle: dayData.playlistTitle || '',
+                                  isRepeatVideo: Boolean(dayData.isRepeatVideo),
+                                  isCustomSuggestion: Boolean(dayData.isCustomSuggestion || dayData.playlistId === 'custom_suggestion' || dayData.title === 'Your Suggestion' || dayData.playlistTitle === 'Your Suggestion'),
+                                  instructions: dayData.instructions || item.teacherVideos?.[0]?.instructions || '',
+                                  duration: dayData.duration || item.teacherVideos?.[0]?.duration || '5-10 min',
+                                },
+                              ]
+                            : [])
+                        : item.teacherVideos;
+
+                      // HOTFIX 2.3.5D: learnedWords must NEVER be reset by regular routine sync/snapshots or cleanVidId
+                      // Reset exclusively occurs inside StartNewWeekHandler
+                      const resolvedWords = Array.isArray(dayData.learnedWords) && dayData.learnedWords.length > 0
+                        ? dayData.learnedWords
+                        : (item.learnedWords || []);
+
+                      return {
+                        ...item,
+                        activityName: resolvedActivityName,
+                        playlistId: resolvedPlaylistId,
+                        playlistTitle: resolvedPlaylistTitle,
+                        teacherVideos: resolvedVideos,
+                        learnedWords: resolvedWords,
+                        teacherSpotify: dayData.teacherOverrideTrack
+                          ? {
+                              id: dayData.teacherOverrideTrack.url || 'track',
+                              title: dayData.teacherOverrideTrack.title,
+                              artist: dayData.teacherOverrideTrack.artist || dayData.teacherOverrideTrack.artistOrHost,
+                              url: dayData.teacherOverrideTrack.url,
+                            }
+                          : item.teacherSpotify,
+                        completedToday: dayData.completedToday !== undefined ? dayData.completedToday : item.completedToday,
+                      };
+                    }
+                    return item;
+                  });
+                }
               }
-              if (Array.isArray(dayData)) {
-                merged[day] = dayData;
-              } else {
-                const dayList = merged[day] || defaultRoutinesByDay[day] || [];
-                const hasVideoField = dayData.videoId !== undefined || dayData.isRepeatVideo !== undefined;
-                const cleanVidId = dayData.videoId ? dayData.videoId.trim() : '';
-                merged[day] = dayList.map((item, idx) => {
-                  if (
-                    idx === 0 ||
-                    item.id.endsWith('1') ||
-                    item.activityName?.toLowerCase().includes('vídeo') ||
-                    item.activityName?.toLowerCase().includes('video') ||
-                    (item.teacherVideos && item.teacherVideos.length > 0)
-                  ) {
-                    const resolvedActivityName = hasVideoField
-                      ? (cleanVidId
-                          ? (dayData.playlistTitle || dayData.title || dayData.videoTitle || item.activityName)
-                          : (dayData.playlistTitle || 'Video of the Day'))
-                      : item.activityName;
+            });
 
-                    const resolvedPlaylistId = hasVideoField
-                      ? (dayData.playlistId || '')
-                      : item.playlistId;
+            // Update routinesHydrationStatus based on whether words exist
+            const hasWords = Object.values(merged).some((dayList) =>
+              (dayList || []).some((item) => Array.isArray(item.learnedWords) && item.learnedWords.length > 0)
+            );
+            setRoutinesHydrationStatus(hasWords ? 'loaded_with_words' : 'loaded_empty');
 
-                    const resolvedPlaylistTitle = hasVideoField
-                      ? (dayData.playlistTitle || '')
-                      : item.playlistTitle;
-
-                    const resolvedVideos = hasVideoField
-                      ? (cleanVidId
-                          ? [
-                              {
-                                id: cleanVidId,
-                                videoId: cleanVidId,
-                                title: dayData.title || dayData.videoTitle || 'Daily Video Practice',
-                                url: dayData.url || `https://www.youtube.com/watch?v=${cleanVidId}`,
-                                playlistId: dayData.playlistId || '',
-                                playlistTitle: dayData.playlistTitle || '',
-                                isRepeatVideo: Boolean(dayData.isRepeatVideo),
-                                isCustomSuggestion: Boolean(dayData.isCustomSuggestion || dayData.playlistId === 'custom_suggestion' || dayData.title === 'Your Suggestion' || dayData.playlistTitle === 'Your Suggestion'),
-                                instructions: dayData.instructions || item.teacherVideos?.[0]?.instructions || '',
-                                duration: dayData.duration || item.teacherVideos?.[0]?.duration || '5-10 min',
-                              },
-                            ]
-                          : [])
-                      : item.teacherVideos;
-
-                    // HOTFIX 2.3.5D: learnedWords must NEVER be reset by regular routine sync/snapshots or cleanVidId
-                    // Reset exclusively occurs inside StartNewWeekHandler
-                    const resolvedWords = Array.isArray(dayData.learnedWords) && dayData.learnedWords.length > 0
-                      ? dayData.learnedWords
-                      : (item.learnedWords || []);
-
-                    return {
-                      ...item,
-                      activityName: resolvedActivityName,
-                      playlistId: resolvedPlaylistId,
-                      playlistTitle: resolvedPlaylistTitle,
-                      teacherVideos: resolvedVideos,
-                      learnedWords: resolvedWords,
-                      teacherSpotify: dayData.teacherOverrideTrack
-                        ? {
-                            id: dayData.teacherOverrideTrack.url || 'track',
-                            title: dayData.teacherOverrideTrack.title,
-                            artist: dayData.teacherOverrideTrack.artist || dayData.teacherOverrideTrack.artistOrHost,
-                            url: dayData.teacherOverrideTrack.url,
-                          }
-                        : item.teacherSpotify,
-                      completedToday: dayData.completedToday !== undefined ? dayData.completedToday : item.completedToday,
-                    };
-                  }
-                  return item;
-                });
-              }
-            }
+            return merged;
           });
-          return merged;
-        });
+        } else {
+          setRoutinesHydrationStatus('loaded_empty');
+        }
+      },
+      (err) => {
+        if (activeRoutinesHydrationUidRef.current === uid) {
+          setRoutinesHydrationStatus('error');
+        }
       }
-    });
+    );
 
     return () => unsub();
   }, [currentAccount?.uid, currentAccount?.email, userProfile?.id]);
@@ -6169,6 +6226,10 @@ export default function App() {
   };
 
   const handleDeleteJournalEntry = async (entryId: string) => {
+    const prevJournalEntries = [...dailyJournalEntries];
+    const prevProfileJournal = [...(userProfile?.dailyJournalEntries || [])];
+
+    // Optimistically update UI
     setDailyJournalEntries((prev) => prev.filter((e) => e.id !== entryId));
     setUserProfile((prev) => ({
       ...prev,
@@ -6178,7 +6239,28 @@ export default function App() {
     const studentUid = currentAccount?.uid || userProfile?.id || '';
     const studentEmail = (currentAccount?.email || userProfile?.email || '').toLowerCase().trim();
     if (studentUid || studentEmail) {
-      deleteStudentJournalEntryFromFirestore(studentUid, entryId, studentEmail).catch(() => {});
+      const success = await deleteStudentJournalEntryFromFirestore(studentUid, entryId, studentEmail);
+      if (!success) {
+        // Rollback state if Firestore deletion failed
+        setDailyJournalEntries(prevJournalEntries);
+        setUserProfile((prev) => ({
+          ...prev,
+          dailyJournalEntries: prevProfileJournal,
+        }));
+        setNotifications((prev) => [
+          {
+            id: `err_journal_del_${Date.now()}`,
+            type: 'error',
+            title: currentLanguage === 'en' ? 'Delete Failed' : 'Falha na Exclusão',
+            message: currentLanguage === 'en'
+              ? 'Could not delete entry from Firestore. Your entry was restored.'
+              : 'Não foi possível excluir a frase do Firestore. O registro foi restaurado.',
+            timestamp: new Date().toISOString(),
+            read: false,
+          },
+          ...prev,
+        ]);
+      }
     }
   };
 

@@ -100,6 +100,7 @@ import {
   deleteUserByEmailFromFirestore,
   saveSessionNotesProgressToFirestore,
   saveStudentJournalToFirestore,
+  deleteStudentJournalEntryFromServerFirestore,
   fetchUserDocumentFromFirestore,
   fetchTutorDocumentFromFirestore,
   fetchWeeklyChecksFromFirestore,
@@ -10775,74 +10776,105 @@ ${batchToEnrich.map((w, i) => `${i + 1}. ${w}`).join('\n')}`;
 });
 
 
-// Endpoint: Get student journal entries
-app.get('/api/student-journal', async (req, res) => {
+// Endpoint: Get student journal entries (Requires authentication; strictly uses caller UID)
+app.get('/api/student-journal', firebaseAuthMiddleware, async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-  const db = readDb();
-  const studentEmail = ((req.query.studentEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
-  const uid = (req.query.uid as string) || '';
+  const caller = req.user!;
+  const callerUid = caller.uid;
+  const requestedUid = ((req.query.uid as string) || '').trim();
 
-  if (studentEmail || uid) {
-    const fromEmail = (studentEmail && db.studentJournalMap?.[studentEmail]) || [];
-    const fromUid = (uid && db.studentJournalMap?.[uid]) || [];
-    const map = new Map<string, any>();
-    [...fromEmail, ...fromUid].forEach((entry: any) => {
-      if (entry?.id) map.set(entry.id, entry);
-    });
-
-    if (map.size === 0) {
-      const docId = uid || studentEmail;
-      try {
-        const fsEntries = await fetchStudentDailyJournalFromServerFirestore(docId);
-        if (Array.isArray(fsEntries) && fsEntries.length > 0) {
-          if (!db.studentJournalMap) db.studentJournalMap = {};
-          if (uid) db.studentJournalMap[uid] = fsEntries;
-          if (studentEmail) db.studentJournalMap[studentEmail] = fsEntries;
-          return res.json(fsEntries);
-        }
-      } catch {}
-    }
-
-    const list = Array.from(map.values()).sort((a, b) => {
-      const tA = new Date(a.createdAt || a.date).getTime();
-      const tB = new Date(b.createdAt || b.date).getTime();
-      return tB - tA;
-    });
-    return res.json(list);
+  if (caller.role !== 'admin' && requestedUid && requestedUid !== callerUid) {
+    return res.status(403).json({ error: 'Forbidden', message: 'Cannot access journal of another user.' });
   }
-  res.json([]);
+
+  const targetUid = (caller.role === 'admin' && requestedUid) ? requestedUid : callerUid;
+  const fsEntries = await fetchStudentDailyJournalFromServerFirestore(targetUid);
+  return res.json(fsEntries || []);
 });
 
-// Endpoint: Save student journal entry
-app.post('/api/student-journal', async (req, res) => {
+// Endpoint: Save student journal entry (Requires authentication; strictly uses caller UID)
+app.post('/api/student-journal', firebaseAuthMiddleware, async (req, res) => {
+  const caller = req.user!;
+  const callerUid = caller.uid;
+  const { studentUid, entry } = req.body || {};
+
+  if (caller.role !== 'admin' && studentUid && studentUid !== callerUid) {
+    return res.status(403).json({ error: 'Forbidden', message: 'Cannot write journal of another user.' });
+  }
+
+  if (!entry || !entry.id) {
+    return res.status(400).json({ error: 'Valid entry with id is required' });
+  }
+
+  const targetUid = (caller.role === 'admin' && studentUid) ? studentUid : callerUid;
+  const db = getFirestoreDb();
+  if (db) {
+    try {
+      const userRef = db.collection('users').doc(targetUid);
+      await userRef.collection('journal').doc(entry.id).set(entry, { merge: true });
+      const userSnap = await userRef.get().catch(() => null);
+      if (userSnap && userSnap.exists) {
+        const uData = userSnap.data();
+        const currentList = Array.isArray(uData?.dailyJournalEntries) ? uData.dailyJournalEntries : [];
+        const filtered = currentList.filter((e: any) => e.id !== entry.id);
+        await userRef.set({ dailyJournalEntries: [entry, ...filtered], updatedAt: new Date().toISOString() }, { merge: true });
+      }
+    } catch (fsErr) {
+      console.warn('save journal error:', fsErr);
+    }
+  }
+
+  return res.json({ success: true, entry });
+});
+
+// Endpoint: Delete student journal entry with strict Firebase Auth and canonical UID verification
+app.delete('/api/student-journal', firebaseAuthMiddleware, async (req, res) => {
+  const caller = req.user!;
+  const callerUid = caller.uid;
+  const callerEmail = (caller.email || '').toLowerCase().trim();
+
+  const requestedUid = ((req.query.uid as string) || (req.body?.studentUid as string) || (req.body?.uid as string) || '').trim();
+  const requestedEmail = ((req.query.studentEmail as string) || (req.query.email as string) || (req.body?.studentEmail as string) || '').toLowerCase().trim();
+
+  // Security Gate: Non-admin users can ONLY delete entries from their own canonical UID
+  if (caller.role !== 'admin') {
+    if (requestedUid && requestedUid !== callerUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Unauthorized: Cannot delete journal entries belonging to another user.',
+      });
+    }
+    if (requestedEmail && callerEmail && requestedEmail !== callerEmail) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Unauthorized: Cannot delete journal entries belonging to another user.',
+      });
+    }
+  }
+
+  const targetUid = (caller.role === 'admin' && requestedUid) ? requestedUid : callerUid;
+  const entryId = (req.query.id as string) || (req.body?.id as string) || (req.body?.entryId as string) || '';
+
+  if (!entryId) {
+    return res.status(400).json({ error: 'id is required' });
+  }
+
+  // 1. Authoritative Cloud Firestore deletion
+  await deleteStudentJournalEntryFromServerFirestore(targetUid, entryId);
+
+  // 2. Clear any legacy in-memory / db.json references to prevent resurrection
   const db = readDb();
-  const { studentEmail, studentUid, entry } = req.body || {};
-  const cleanEmail = (studentEmail || '').toLowerCase().trim();
-
-  if (!cleanEmail && !studentUid) {
-    return res.status(400).json({ error: 'studentEmail or studentUid is required' });
+  if (db.studentJournalMap) {
+    if (targetUid && Array.isArray(db.studentJournalMap[targetUid])) {
+      db.studentJournalMap[targetUid] = db.studentJournalMap[targetUid].filter((e: any) => e.id !== entryId);
+    }
+    if (callerEmail && Array.isArray(db.studentJournalMap[callerEmail])) {
+      db.studentJournalMap[callerEmail] = db.studentJournalMap[callerEmail].filter((e: any) => e.id !== entryId);
+    }
+    await writeDbSync(db);
   }
 
-  if (!db.studentJournalMap) db.studentJournalMap = {};
-  const currentList: any[] =
-    (cleanEmail && db.studentJournalMap[cleanEmail]) ||
-    (studentUid && db.studentJournalMap[studentUid]) ||
-    [];
-
-  const filtered = currentList.filter((e: any) => e.id !== entry.id);
-  const updated = [entry, ...filtered];
-
-  if (cleanEmail) db.studentJournalMap[cleanEmail] = updated;
-  if (studentUid) db.studentJournalMap[studentUid] = updated;
-
-  // Direct atomic write to Cloud Firestore by UID
-  const docId = studentUid || cleanEmail;
-  if (docId) {
-    saveStudentJournalToFirestore(docId, updated).catch(() => {});
-  }
-
-  await writeDbSync(db);
-  res.json({ success: true, journal: updated });
+  return res.json({ success: true, deletedId: entryId });
 });
 
 // Endpoint: Student Journal Activity Log (Multi-device cloud synchronization for video, audio, memorization, lesson)
@@ -14365,10 +14397,17 @@ app.post(['/api/homework', '/api/homework/submit'], firebaseAuthMiddleware, asyn
 
   writeDb(db);
 
-  // Firestore persistence
+  // Firestore persistence: await confirmed persistence in canonical Firestore '(default)'
   const docId = cleanUid || cleanEmail;
   if (docId) {
-    saveHomeworkToFirestore(docId, canonicalWeekId, cycle, hwPayload).catch(() => {});
+    const fsOk = await saveHomeworkToFirestore(docId, canonicalWeekId, cycle, hwPayload);
+    if (!fsOk) {
+      return res.status(500).json({
+        success: false,
+        error: 'FirestorePersistenceFailed',
+        message: 'Falha ao confirmar persistência do homework no Firestore.',
+      });
+    }
   }
 
   res.json({
@@ -16658,8 +16697,69 @@ app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
     const matchScore = (matchingCorrect / totalMatching) * 20;
     const fillScore = (fillCorrect / totalFill) * 25;
 
-    // AI evaluation of sentences and reading comprehension with Gemini 3-model contingency
-    const apiKey = process.env.GEMINI_API_KEY;
+    // Merge answers without overwriting non-empty answers with empty ones
+    const existingSentences = existingHw?.studentAnswers?.sentences || {};
+    const existingQuiz = existingHw?.studentAnswers?.quizAnswers || {};
+    const existingMatching = existingHw?.studentAnswers?.matching || {};
+    const existingFill = existingHw?.studentAnswers?.fillInBlanks || {};
+
+    const mergedSentences = { ...existingSentences };
+    Object.entries(sentences || {}).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && String(v).trim().length > 0) {
+        mergedSentences[k] = v;
+      }
+    });
+
+    const mergedQuizAnswers = { ...existingQuiz };
+    Object.entries(quizAnswers || {}).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && String(v).trim().length > 0) {
+        mergedQuizAnswers[k] = v;
+      }
+    });
+
+    const mergedMatching = { ...existingMatching, ...(matching || {}) };
+    const mergedFill = { ...existingFill, ...(fillInBlanks || {}) };
+
+    // FASE 8.1 - ORDEM DAS OPERAÇÕES: Validar → Persistir respostas → Confirmar Firestore → Avaliar com Gemini → Persistir resultado da avaliação
+    const unvalidatedHwState = {
+      ...homework,
+      id: canonicalWeekId,
+      weekId: canonicalWeekId,
+      weeklyCycle: cycle,
+      studentUid: callerUid,
+      studentEmail: callerEmail || homework.studentEmail,
+      studentAnswers: {
+        matching: mergedMatching,
+        fillInBlanks: mergedFill,
+        sentences: mergedSentences,
+        quizAnswers: mergedQuizAnswers,
+      },
+      aiEvaluation: (existingHw?.aiEvaluation && isValidHomeworkEvaluation(existingHw.aiEvaluation) && !isSyntheticHomeworkEvaluation(existingHw.aiEvaluation))
+        ? existingHw.aiEvaluation
+        : undefined,
+      updatedAt: new Date().toISOString(),
+    };
+
+    let initialPersistOk = false;
+    try {
+      initialPersistOk = await saveHomeworkToFirestore(callerUid, canonicalWeekId, cycle, unvalidatedHwState);
+    } catch (errPersist) {
+      console.warn('[homework/evaluate] Erro ao gravar respostas iniciais no Firestore:', errPersist);
+      initialPersistOk = false;
+    }
+
+    if (!initialPersistOk) {
+      await flightLock.release();
+      return res.status(500).json({
+        success: false,
+        persisted: false,
+        error: 'FirestorePersistenceFailed',
+        message: 'Falha ao salvar as respostas no banco de dados Firestore. Tente novamente.',
+      });
+    }
+
+    // AI evaluation of sentences with Gemini 3-model contingency (Frase do Dia robust pattern)
+    const apiKey = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
     let sentenceEvaluationResults: any[] = [];
     let readingEvaluationResults: any[] = [];
     let tutorSummaryPt = '';
@@ -16671,30 +16771,15 @@ app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
 
     try {
       if (apiKey) {
-        const passageQuestions = (homework.readingPassage?.questions || []).map((q: any, idx: number) => {
-          const userAnsIdx = quizAnswers[q.id] !== undefined ? quizAnswers[q.id] : quizAnswers[String(idx)];
-          const answered = userAnsIdx !== undefined && userAnsIdx !== null && userAnsIdx !== '';
-          const userAnsText = answered && q.options?.[userAnsIdx] ? q.options[userAnsIdx] : (answered ? String(userAnsIdx) : '(no answer provided)');
-          return {
-            id: q.id || `q-${idx + 1}`,
-            question: q.question,
-            options: q.options || [],
-            correctOptionIndex: q.correctAnswer,
-            correctOptionText: q.options?.[q.correctAnswer] || '',
-            studentChosenIndex: answered ? userAnsIdx : null,
-            studentChosenText: userAnsText,
-          };
-        });
-
         const prompt = `You are a warm, inspiring Native English teacher at "It's Simple".
-Evaluate this student's completed Weekly Memorization Activity.
+Evaluate this student's completed Part 3 Written Sentences for their Weekly Memorization Activity.
 
 STUDENT PROFILE:
-Name: ${studentName}
+Name: ${effectiveName}
 Level: ${levelMeta.labelEn} (${levelMeta.labelPt} - CEFR ${levelMeta.cefr})
 Level Goals: ${levelMeta.grammarFocusEn}
 
-PART 3: STUDENT WRITTEN SENTENCES:
+PART 3: STUDENT WRITTEN SENTENCES (5 TARGET WORDS):
 ${JSON.stringify(
   (homework.sentenceWritingPrompts || []).map((p: any) => ({
     targetWord: p.word,
@@ -16707,40 +16792,20 @@ ${JSON.stringify(
   2
 )}
 
-PART 4: MINI-STORY READING PASSAGE & COMPREHENSION QUESTIONS:
-Title: "${homework.readingPassage?.title || 'Story'}"
-Story Text:
-${homework.readingPassage?.text || '(no passage text)'}
-
-Student Comprehension Answers:
-${JSON.stringify(passageQuestions, null, 2)}
-
-OTHER SECTIONS STATS:
-- Matching (Part 1): ${matchingCorrect}/${totalMatching} correct
-- Fill in Blanks (Part 2): ${fillCorrect}/${totalFill} correct
-
-CRITICAL EVALUATION INSTRUCTIONS:
-1. FOR PART 3 SENTENCES (MANDATORY PEDAGOGICAL RIGOR & CONTEXTUAL DISTINCTION):
-   - For each sentence, assess both Grammar & Accuracy and Contextual Improvement separately:
-     a) Grammar & Accuracy: Evaluate grammar, vocabulary, subject-verb agreement, and target word usage according to CEFR ${levelMeta.cefr}. If the sentence is grammatically sound, complete, and uses the target word properly, set isCorrect: true.
-     b) Contextual Improvement: Provide a natural, idiomatic sentence in "correctedSentence".
-   - CRITICAL RULE: A grammatically correct sentence must NEVER be marked isCorrect: false simply because a more sophisticated or native-like phrasing is possible. If the sentence is correct, set isCorrect: true and use "correctedSentence" for a richer contextual alternative.
-   - ZERO SYNTHETIC APPROVALS: Incomplete fragments, missing subjects, transitive verbs ending abruptly without objects (e.g. 'nobody told'), dangling trailing prepositions (e.g. 'anyone know about'), or short fragments (< 3 words) MUST ALWAYS be marked isCorrect: false with a corrected full sentence.
-   - In "explanationPt" and "explanationEn", clearly state:
-     * Grammar & Accuracy status (is the sentence grammatically correct, or what error was found).
-     * Contextual feedback explaining why the suggested phrasing sounds more natural or how it enriches the sentence.
-   - In "levelAdvicePt" and "levelAdviceEn", provide guidance on how the sentence fulfills the grammatical challenge for ${levelMeta.labelEn} (levelInstruction).
-
-2. FOR PART 4 READING COMPREHENSION:
-   - Evaluate each answer against the actual story text provided above.
-   - Accept semantically correct choices that accurately interpret the events and details in the story.
-   - Identify incorrect or unanswered choices with clear explanations grounded in the passage text.
-   - Output an entry in "readingFeedback" for each question with its id, isCorrect, explanationPt, and explanationEn.
-
-3. Provide a personalized summary note from the tutor:
+CRITICAL EVALUATION INSTRUCTIONS (PART 3):
+1. FOR EACH SENTENCE, assess both Grammar & Accuracy and Contextual Improvement separately:
+   a) Grammar & Accuracy: Evaluate grammar, vocabulary, subject-verb agreement, and target word usage according to CEFR ${levelMeta.cefr}. If the sentence is grammatically sound, complete, and uses the target word properly, set isCorrect: true.
+   b) Contextual Improvement: Provide a natural, idiomatic sentence in "correctedSentence".
+2. CRITICAL RULE: A grammatically correct sentence must NEVER be marked isCorrect: false simply because a more sophisticated or native-like phrasing is possible. If the sentence is correct, set isCorrect: true and use "correctedSentence" for a richer contextual alternative.
+3. ZERO SYNTHETIC APPROVALS: Incomplete fragments, missing subjects, transitive verbs ending abruptly without objects (e.g. 'nobody told'), dangling trailing prepositions (e.g. 'anyone know about'), or short fragments (< 3 words) MUST ALWAYS be marked isCorrect: false with a corrected full sentence.
+4. In "explanationPt" and "explanationEn", clearly state:
+   - Grammar & Accuracy status (is the sentence grammatically correct, or what error was found).
+   - Contextual feedback explaining why the suggested phrasing sounds more natural or how it enriches the sentence.
+5. In "levelAdvicePt" and "levelAdviceEn", provide guidance on how the sentence fulfills the grammatical challenge for ${levelMeta.labelEn} (levelInstruction).
+6. Provide a personalized summary note from the tutor:
    - "tutorFeedbackSummaryPt" (in Portuguese) and "tutorFeedbackSummaryEn" (in English).
-4. Provide level-specific strengths ("levelStrengthsPt", "levelStrengthsEn").
-5. Provide actionable next steps for their English routine ("levelNextStepsPt", "levelNextStepsEn").
+7. Provide level-specific strengths ("levelStrengthsPt", "levelStrengthsEn").
+8. Provide actionable next steps for their English routine ("levelNextStepsPt", "levelNextStepsEn").
 
 Output STRICT JSON matching this schema:
 {
@@ -16756,14 +16821,6 @@ Output STRICT JSON matching this schema:
       "levelAdviceEn": "string"
     }
   ],
-  "readingFeedback": [
-    {
-      "id": "string",
-      "isCorrect": boolean,
-      "explanationPt": "string",
-      "explanationEn": "string"
-    }
-  ],
   "tutorFeedbackSummaryPt": "string",
   "tutorFeedbackSummaryEn": "string",
   "levelStrengthsPt": "string",
@@ -16775,15 +16832,15 @@ Output STRICT JSON matching this schema:
         // HOTFIX 3-MODEL CONTINGENCY: Sequential failover across up to 3 verified models on recoverable errors
         const contingencyRes = await executeGeminiWithContingency({
           feature: 'homework_evaluate',
-          systemInstruction: 'You are a warm, inspiring Native English teacher at "It\'s Simple". Evaluate student written sentences and reading comprehension, providing accurate feedback in valid JSON format.',
+          systemInstruction: 'You are a warm, inspiring Native English teacher at "It\'s Simple". Evaluate student written sentences providing accurate, rigorous feedback strictly in valid JSON format.',
           untrustedUserDataPrompt: prompt,
           callerRole: caller.role,
+          apiKey,
+          temperature: 0.1,
           validator: (json) => validateHomeworkAiEvaluationResponse(
             json,
             homework.sentenceWritingPrompts || [],
-            sentences || {},
-            homework.readingPassage?.questions || [],
-            quizAnswers || {}
+            sentences || {}
           ),
         });
 
@@ -16793,9 +16850,7 @@ Output STRICT JSON matching this schema:
           validateHomeworkAiEvaluationResponse(
             contingencyRes.parsedJson,
             homework.sentenceWritingPrompts || [],
-            sentences || {},
-            homework.readingPassage?.questions || [],
-            quizAnswers || {}
+            sentences || {}
           )
         ) {
           sentenceEvaluationResults = contingencyRes.parsedJson.sentenceFeedback.map((item: any) => {
@@ -16837,7 +16892,7 @@ Output STRICT JSON matching this schema:
             };
           });
 
-          // Process Part 4 readingFeedback from Gemini with exact comparison backup
+          // Part 4 readingFeedback derived deterministically from questions and student answers, with optional AI insight
           const geminiReadingMap = new Map<string, any>();
           if (Array.isArray(contingencyRes.parsedJson.readingFeedback)) {
             for (const rf of contingencyRes.parsedJson.readingFeedback) {
@@ -16882,6 +16937,8 @@ Output STRICT JSON matching this schema:
     if (sentenceEvaluationResults.length === 0) {
       return res.status(503).json({
         success: false,
+        persisted: true,
+        evaluationStatus: 'pending_evaluation',
         error: 'AiUnavailable',
         message: 'Serviço de avaliação pedagógica temporariamente indisponível após tentativa com os modelos de contingência. Suas respostas foram preservadas.',
       });
@@ -16919,11 +16976,6 @@ Output STRICT JSON matching this schema:
       readingFeedback: finalReadingFeedback,
     };
 
-    // Cache evaluated result only if validated and non-synthetic
-    if (isValidHomeworkEvaluation(evaluationResponse)) {
-      homeworkEvalCache.set(evalCacheKey, { data: evaluationResponse, expiry: Date.now() + 600000 });
-    }
-
     // Persist genuine validated evaluation directly to Firestore '(default)'
     const updatedHwForStorage = {
       ...homework,
@@ -16936,14 +16988,37 @@ Output STRICT JSON matching this schema:
       score: overallScore,
       submittedAt: new Date().toISOString(),
       studentAnswers: {
-        matching,
-        fillInBlanks,
-        sentences,
-        quizAnswers,
+        matching: mergedMatching,
+        fillInBlanks: mergedFill,
+        sentences: mergedSentences,
+        quizAnswers: mergedQuizAnswers,
       },
       aiEvaluation: evaluationResponse,
       updatedAt: new Date().toISOString(),
     };
+
+    let evalPersistOk = false;
+    try {
+      evalPersistOk = await saveHomeworkToFirestore(callerUid, canonicalWeekId, cycle, updatedHwForStorage);
+    } catch (errPersistEval) {
+      console.warn('[homework/evaluate] Erro ao gravar resultado da avaliação no Firestore:', errPersistEval);
+      evalPersistOk = false;
+    }
+
+    if (!evalPersistOk) {
+      return res.status(500).json({
+        success: false,
+        persisted: true,
+        evaluationStatus: 'evaluation_persist_failed',
+        error: 'EvaluationPersistenceFailed',
+        message: 'Suas respostas foram salvas, mas ocorreu uma falha ao registrar a avaliação definitiva no banco de dados. Tente novamente.',
+      });
+    }
+
+    // Cache evaluated result only after confirmed persistence
+    if (isValidHomeworkEvaluation(evaluationResponse)) {
+      homeworkEvalCache.set(evalCacheKey, { data: evaluationResponse, expiry: Date.now() + 600000 });
+    }
 
     const studentKey = callerUid || callerEmail;
     const hwScopedKey = `${studentKey}::${canonicalWeekId}`;
@@ -16959,9 +17034,13 @@ Output STRICT JSON matching this schema:
       db.weeklyHomework = updatedHwForStorage;
     }
     writeDb(db);
-    saveHomeworkToFirestore(callerUid, canonicalWeekId, cycle, updatedHwForStorage).catch(() => {});
 
-    res.json({ success: true, evaluation: evaluationResponse });
+    return res.json({
+      success: true,
+      persisted: true,
+      evaluationStatus: 'completed',
+      evaluation: evaluationResponse,
+    });
   } catch (error: any) {
     console.error('Error evaluating homework:', error);
     res.status(500).json({ error: error.message || 'Internal Server Error' });

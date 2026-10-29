@@ -185,11 +185,11 @@ export const GEMINI_POLICIES: Record<GeminiFeature, FeaturePolicy> = {
     timeoutMs: 6000,
   },
   homework_evaluate: {
-    maxOutputTokens: 1200,
+    maxOutputTokens: 2500,
     rateLimitWindowSeconds: 300,
     rateLimitMaxRequests: 6,
-    maxInputLengthChars: 4000,
-    timeoutMs: 15000,
+    maxInputLengthChars: 8000,
+    timeoutMs: 30000,
   },
   dictionary_define: {
     maxOutputTokens: 600,

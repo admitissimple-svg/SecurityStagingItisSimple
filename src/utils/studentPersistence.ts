@@ -1192,17 +1192,7 @@ export async function saveStudentJournalEntryToFirestore(
       null
     );
 
-    // 3. Mirror to server backend API
-    fetch('/api/student-journal', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        studentEmail: cleanEmail,
-        studentUid: cleanUid,
-        entry: sanitizedEntry,
-      }),
-    }).catch(() => {});
-
+    // Journal is 100% Firestore-authoritative (users/{cleanUid}/journal and users/{cleanUid})
     return true;
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, `users/${cleanUid}/journal/${entry.id}`);
@@ -5272,10 +5262,19 @@ export function subscribeToStudentDailyJournal(
   if (!db || !cleanUid) return () => {};
 
   const unsubscribers: (() => void)[] = [];
-  const journalMap = new Map<string, DailyJournalEntry>();
+  const subColMap = new Map<string, DailyJournalEntry>();
+  const userDocMap = new Map<string, DailyJournalEntry>();
+  const deletedIdsSet = new Set<string>();
 
   const rebuildAndNotify = () => {
-    const list = Array.from(journalMap.values());
+    const combined = new Map<string, DailyJournalEntry>();
+    userDocMap.forEach((val, id) => {
+      if (!deletedIdsSet.has(id)) combined.set(id, val);
+    });
+    subColMap.forEach((val, id) => {
+      if (!deletedIdsSet.has(id)) combined.set(id, val);
+    });
+    const list = Array.from(combined.values());
     list.sort((a, b) => {
       const timeA = new Date(a.createdAt || a.date).getTime();
       const timeB = new Date(b.createdAt || b.date).getTime();
@@ -5290,14 +5289,24 @@ export function subscribeToStudentDailyJournal(
       onSnapshot(
         subCol,
         (snap) => {
-          journalMap.clear();
+          snap.docChanges().forEach((change) => {
+            if (change.type === 'removed') {
+              deletedIdsSet.add(change.doc.id);
+              subColMap.delete(change.doc.id);
+            }
+          });
+          subColMap.clear();
           snap.forEach((d) => {
             const item = d.data() as DailyJournalEntry;
-            if (item?.id) journalMap.set(item.id, item);
+            if (item?.id && !deletedIdsSet.has(item.id)) {
+              subColMap.set(item.id, item);
+            }
           });
           rebuildAndNotify();
         },
-        () => {}
+        (err) => {
+          console.warn('Real-time journal subcollection notice:', err);
+        }
       )
     );
 
@@ -5306,17 +5315,22 @@ export function subscribeToStudentDailyJournal(
       onSnapshot(
         userRef,
         (snap) => {
+          userDocMap.clear();
           if (snap.exists()) {
             const data = snap.data();
             if (Array.isArray(data?.dailyJournalEntries)) {
               data.dailyJournalEntries.forEach((item: DailyJournalEntry) => {
-                if (item?.id) journalMap.set(item.id, item);
+                if (item?.id && !deletedIdsSet.has(item.id)) {
+                  userDocMap.set(item.id, item);
+                }
               });
-              rebuildAndNotify();
             }
           }
+          rebuildAndNotify();
         },
-        () => {}
+        (err) => {
+          console.warn('Real-time journal userDoc notice:', err);
+        }
       )
     );
   } catch {}
@@ -5343,26 +5357,56 @@ export async function deleteStudentJournalEntryFromFirestore(
   try {
     // 1. Delete from subcollection
     const entryRef = doc(db, 'users', cleanUid, 'journal', entryId);
-    await withFirestoreTimeout(deleteDoc(entryRef), 2000, null);
+    await withFirestoreTimeout(deleteDoc(entryRef), 3000, null);
 
     // 2. Remove from user profile doc dailyJournalEntries array
     const userRef = doc(db, 'users', cleanUid);
-    const userSnap = await withFirestoreTimeout(getDoc(userRef), 2000, null);
+    const userSnap = await withFirestoreTimeout(getDoc(userRef), 2500, null);
     if (userSnap && userSnap.exists()) {
       const data = userSnap.data();
       if (Array.isArray(data?.dailyJournalEntries)) {
         const filtered = data.dailyJournalEntries.filter((e: DailyJournalEntry) => e.id !== entryId);
         await withFirestoreTimeout(
           setDoc(userRef, { dailyJournalEntries: filtered, updatedAt: new Date().toISOString() }, { merge: true }),
-          2000,
+          2500,
           null
         );
       }
     }
+
+    // Journal deletion is 100% Firestore-authoritative (users/{cleanUid}/journal and users/{cleanUid})
     return true;
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, `users/${cleanUid}/journal/${entryId}`);
     return false;
+  }
+}
+
+/**
+ * Fetch student daily routines directly from Cloud Firestore once.
+ * Distinguishes between loading, success (with or without words), and network/read errors.
+ */
+export async function fetchStudentDailyRoutinesFromFirestore(
+  studentUid: string
+): Promise<{ success: boolean; routines: Partial<Record<DayOfWeek, any>>; error?: any }> {
+  const db = getDb();
+  const cleanUid = normalizeUid(studentUid);
+  if (!db || !cleanUid) return { success: false, routines: {} };
+
+  try {
+    const routinesCol = collection(db, 'users', cleanUid, 'routines');
+    const snap = await withFirestoreTimeout(getDocs(routinesCol), 3500, null);
+    if (!snap) {
+      return { success: false, routines: {}, error: new Error('Routines fetch timed out') };
+    }
+    const routinesMap: Partial<Record<DayOfWeek, any>> = {};
+    snap.forEach((docSnap) => {
+      routinesMap[docSnap.id as DayOfWeek] = docSnap.data();
+    });
+    return { success: true, routines: routinesMap };
+  } catch (err) {
+    handleFirestoreError(err, OperationType.GET, `users/${cleanUid}/routines`);
+    return { success: false, routines: {}, error: err };
   }
 }
 
@@ -5372,7 +5416,8 @@ export async function deleteStudentJournalEntryFromFirestore(
  */
 export function subscribeToStudentDailyRoutines(
   studentUid: string,
-  callback: (routines: Partial<Record<DayOfWeek, any>>) => void
+  callback: (routines: Partial<Record<DayOfWeek, any>>) => void,
+  onError?: (err: any) => void
 ): () => void {
   const db = getDb();
   const cleanUid = normalizeUid(studentUid);
@@ -5389,11 +5434,15 @@ export function subscribeToStudentDailyRoutines(
         });
         callback(routinesMap);
       },
-      (err) => console.warn('Real-time student routines subscription notice:', err)
+      (err) => {
+        console.warn('Real-time student routines subscription notice:', err);
+        if (onError) onError(err);
+      }
     );
     return unsub;
   } catch (err) {
     console.warn('subscribeToStudentDailyRoutines error:', err);
+    if (onError) onError(err);
     return () => {};
   }
 }
