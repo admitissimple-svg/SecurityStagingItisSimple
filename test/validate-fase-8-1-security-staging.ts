@@ -630,7 +630,7 @@ describe('FASE 8.1 — Testes de Segurança e Persistência', () => {
 
   it('14. Nenhuma alteração na progressão do S-Path', async () => {
     // Part 3 failure retains status pending_evaluation without marking S-Path step as completed
-    const partStatus = 'pending_evaluation';
+    const partStatus: string = 'pending_evaluation';
     const isCompleted = partStatus === 'completed';
     assert.equal(isCompleted, false, 'Pending evaluation must not advance S-Path check');
   });

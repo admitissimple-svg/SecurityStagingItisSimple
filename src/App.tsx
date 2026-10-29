@@ -38,7 +38,9 @@ import {
   generateWeeklyHomeworkWithAi,
   isActivityStartedOrAnswered,
   getDayOfWeekFromDateString,
+  deriveContextualSentencePrompt,
 } from './utils/homeworkGenerator';
+import { synthesizeFillInBlanks } from './utils/pedagogicalStorySynthesizer';
 import { normalizeStudentLevel, fetchTracksForStudentLevel } from './utils/spotify';
 import { executeStartNewWeek } from './utils/StartNewWeekHandler';
 import {
@@ -136,6 +138,8 @@ import {
   saveStudentHomeworkProgressToFirestore,
   fetchStudentHomeworkProgressFromFirestore,
   subscribeToStudentHomeworkProgress,
+  mergeDailyActivities,
+  StudentVocabularySubscriptionStatus,
   getDateForDayInCurrentWeek,
   getTodayIsoDate,
   mapStepIdToJournalType,
@@ -650,7 +654,14 @@ export default function App() {
   const activeStudentUidRef = useRef<string>(
     currentAccount?.role === 'student' ? normalizeUid(currentAccount?.uid, currentAccount?.email) : ''
   );
-  const [isDictionaryHydrated, setIsDictionaryHydrated] = useState<boolean>(false);
+  const [dictionaryHydrationStatus, setDictionaryHydrationStatus] = useState<
+    StudentVocabularySubscriptionStatus | 'uninitialized'
+  >('uninitialized');
+  const isDictionaryHydrated =
+    dictionaryHydrationStatus === 'loaded_with_words' ||
+    dictionaryHydrationStatus === 'loaded_empty';
+  const setIsDictionaryHydrated = (val: boolean) =>
+    setDictionaryHydrationStatus(val ? 'loaded_with_words' : 'uninitialized');
   const dictionaryRequestIdRef = useRef<number>(0);
   const excludedDictionaryWordsRef = useRef<string[]>(excludedDictionaryWords);
   useEffect(() => {
@@ -935,11 +946,20 @@ export default function App() {
 
   // Generate Weekly Homework automatically whenever routines, dictionary, or targetDay change
   useEffect(() => {
-    // CORREÇÃO A (Requisitos 1, 2, 3, 4): Bloquear a geração de homework enquanto a primeira hidratação do Firestore não estiver concluída.
-    if (routinesHydrationStatus === 'uninitialized' || routinesHydrationStatus === 'loading') {
+    // FASE 8.4: Bloquear a geração de homework enquanto a primeira hidratação do vocabulário e rotinas do Firestore não estiver concluída.
+    if (
+      dictionaryHydrationStatus === 'uninitialized' ||
+      dictionaryHydrationStatus === 'loading'
+    ) {
       return;
     }
     // Falha de leitura não é interpretada como ausência de palavras. Não sobrescrever com vazio.
+    if (dictionaryHydrationStatus === 'error') {
+      return;
+    }
+    if (routinesHydrationStatus === 'uninitialized' || routinesHydrationStatus === 'loading') {
+      return;
+    }
     if (routinesHydrationStatus === 'error') {
       return;
     }
@@ -959,7 +979,14 @@ export default function App() {
       lastPracticedAt: e.lastPracticedAt,
       studentUid: currentAccount?.uid || userProfile?.id || (userProfile as any)?.uid,
       studentEmail: currentAccount?.email || userProfile?.email,
+      origins: e.origins,
+      lessonRefId: e.lessonRefId,
+      partOfSpeech: e.partOfSpeech,
+      cefrLevel: e.cefrLevel,
+      normalizedWord: e.normalizedWord,
     }));
+
+    const activityDate = getDateForDayInCurrentWeek(homeworkTargetDay);
 
     const generated = generateWeeklyHomeworkFromRoutines({
       routinesByDay,
@@ -968,6 +995,7 @@ export default function App() {
       studentEmail: currentAccount?.email || userProfile.email,
       customWords: customWordList,
       targetDay: homeworkTargetDay,
+      activityDate,
       activeStudyDays: userProfile?.weeklyStudyDays,
       weeklyCycle: userProfile?.weeklyCycle || 1,
       userProfile,
@@ -1094,11 +1122,36 @@ export default function App() {
           targetDay: homeworkTargetDay,
           totalWordsCollected: targetSnapshot.selectedWords.length,
           vocabularyList: targetSnapshot.selectedWords,
-          allRoutineWords: targetSnapshot.selectedWords,
-          matchingPairs: targetSnapshot.matchingPairs || generated.matchingPairs,
-          fillInBlanks: targetSnapshot.fillInBlanks || generated.fillInBlanks,
-          sentenceWritingPrompts: targetSnapshot.sentenceWritingPrompts || generated.sentenceWritingPrompts,
-          readingPassage: targetSnapshot.readingPassage || generated.readingPassage,
+          matchingPairs: (Array.isArray(targetSnapshot.matchingPairs) && targetSnapshot.matchingPairs.length > 0)
+            ? targetSnapshot.matchingPairs
+            : (Array.isArray(generated.matchingPairs) && generated.matchingPairs.length > 0)
+            ? generated.matchingPairs
+            : targetSnapshot.selectedWords.map((v: any, idx: number) => ({
+                id: `pair-${idx + 1}`,
+                word: v.word,
+                definition: v.definitionEn,
+                translation: v.translationPt,
+              })),
+          fillInBlanks: (Array.isArray(targetSnapshot.fillInBlanks) && targetSnapshot.fillInBlanks.length > 0)
+            ? targetSnapshot.fillInBlanks
+            : (Array.isArray(generated.fillInBlanks) && generated.fillInBlanks.length > 0)
+            ? generated.fillInBlanks
+            : synthesizeFillInBlanks(targetSnapshot.selectedWords.map((v: any) => typeof v === 'string' ? v : v.word), targetSnapshot.selectedWords),
+          sentenceWritingPrompts: (Array.isArray(targetSnapshot.sentenceWritingPrompts) && targetSnapshot.sentenceWritingPrompts.length > 0)
+            ? targetSnapshot.sentenceWritingPrompts
+            : (Array.isArray(generated.sentenceWritingPrompts) && generated.sentenceWritingPrompts.length > 0)
+            ? generated.sentenceWritingPrompts
+            : targetSnapshot.selectedWords.map((v: any) => deriveContextualSentencePrompt({
+                word: typeof v === 'string' ? v : v.word,
+                definitionEn: v.definitionEn,
+                translationPt: v.translationPt,
+                exampleSentence: v.exampleSentence,
+                sourceActivityName: v.sourceActivityName,
+                partOfSpeech: v.partOfSpeech,
+                cefrLevel: v.cefrLevel,
+                studentLevel: userProfile?.level,
+              })),
+          readingPassage: (targetSnapshot.readingPassage?.text) ? targetSnapshot.readingPassage : generated.readingPassage,
           studentAnswers: targetSnapshot.studentAnswers || {
             matching: {},
             fillInBlanks: {},
@@ -1442,6 +1495,7 @@ export default function App() {
     if (role === 'student') {
       activeRoutinesHydrationUidRef.current = uid;
       setRoutinesHydrationStatus('loading');
+      setDictionaryHydrationStatus('loading');
       setWeeklyChecks({});
       setStudentJournal([]);
       setWeeklyHomework(null);
@@ -1719,6 +1773,7 @@ export default function App() {
                       ...(prev.completedPartsByDay || {}),
                       ...(cloudHw.completedPartsByDay || {}),
                     },
+                    dailyActivities: mergeDailyActivities(prev.dailyActivities, cloudHw.dailyActivities),
                     studentAnswers: {
                       matching: { ...(prev.studentAnswers?.matching || {}), ...(cloudHw.studentAnswers?.matching || {}) },
                       fillInBlanks: { ...(prev.studentAnswers?.fillInBlanks || {}), ...(cloudHw.studentAnswers?.fillInBlanks || {}) },
@@ -2252,6 +2307,9 @@ export default function App() {
       if (activeStudentUidRef.current !== uid) return;
 
       const status = snapshotResult?.status;
+      if (status) {
+        setDictionaryHydrationStatus(status);
+      }
       // Do not overwrite existing valid entries if state is error or initial loading with empty
       if (status === 'error') {
         return;
@@ -2273,6 +2331,9 @@ export default function App() {
           return Boolean(norm && !excludedDictionaryWordsRef.current.includes(norm));
         });
         setStudentDictionaryEntries(filtered);
+        if (!status) {
+          setDictionaryHydrationStatus(filtered.length > 0 ? 'loaded_with_words' : 'loaded_empty');
+        }
       }
     });
 
@@ -2333,7 +2394,7 @@ export default function App() {
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
         if (isEffectCancelled || !data) {
-          setIsDictionaryHydrated(true);
+          setDictionaryHydrationStatus('loaded_empty');
           return;
         }
         if (dictionaryRequestIdRef.current !== reqId) return;
@@ -2360,11 +2421,11 @@ export default function App() {
           }
           return filteredPrev;
         });
-        setIsDictionaryHydrated(true);
+        setDictionaryHydrationStatus(entries.length > 0 ? 'loaded_with_words' : 'loaded_empty');
       })
       .catch((err) => {
         console.warn('Could not refresh student dictionary:', err);
-        setIsDictionaryHydrated(true);
+        setDictionaryHydrationStatus('error');
       });
 
     return () => {

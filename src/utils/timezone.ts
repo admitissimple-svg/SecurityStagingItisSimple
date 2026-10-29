@@ -447,4 +447,66 @@ export function findTeacherLessonConflict<T extends {
   return null;
 }
 
+/**
+ * Returns the YYYY-MM-DD date formatted in the specified timezone (default America/Sao_Paulo).
+ */
+export function getIsoDateInTimeZone(
+  dateInput?: string | number | Date | null,
+  timeZone: string = DEFAULT_STUDENT_TIMEZONE
+): string {
+  if (!dateInput) return '';
+  if (typeof dateInput === 'string') {
+    const trimmed = dateInput.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+      return trimmed;
+    }
+  }
+  const dateObj = dateInput instanceof Date ? dateInput : new Date(dateInput);
+  if (isNaN(dateObj.getTime())) return '';
+  try {
+    const tz = sanitizeTimeZone(timeZone);
+    const formatter = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    });
+    return formatter.format(dateObj);
+  } catch {
+    const y = dateObj.getFullYear();
+    const m = String(dateObj.getMonth() + 1).padStart(2, '0');
+    const d = String(dateObj.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  }
+}
+
+/**
+ * Deterministically calculates the YYYY-MM-DD date for a given DayOfWeek
+ * relative to the student's current weekly cycle and timezone.
+ */
+export function getDateForDayInCurrentWeek(
+  targetDay: DayOfWeek,
+  refDate: Date = new Date(),
+  timeZone: string = DEFAULT_STUDENT_TIMEZONE
+): string {
+  const dayOrder: DayOfWeek[] = [
+    'monday',
+    'tuesday',
+    'wednesday',
+    'thursday',
+    'friday',
+    'saturday',
+    'sunday',
+  ];
+  const targetIdx = dayOrder.indexOf((targetDay || 'monday').toLowerCase() as DayOfWeek);
+  if (targetIdx === -1) return getIsoDateInTimeZone(refDate, timeZone);
+
+  const currentDay = getStudentCurrentDayOfWeek(timeZone, refDate);
+  const currentIdx = dayOrder.indexOf(currentDay);
+  const diffDays = targetIdx - currentIdx;
+
+  const targetDateObj = new Date(refDate.getTime() + diffDays * 86400000);
+  return getIsoDateInTimeZone(targetDateObj, timeZone);
+}
+
 

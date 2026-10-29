@@ -104,6 +104,7 @@ export interface DictionaryEntryOrigin {
   activityName?: string;
   dayOfWeek?: DayOfWeek;
   date?: string;
+  createdAt?: string;
   lessonId?: string;
   videoId?: string;
   videoTitle?: string;
@@ -668,6 +669,9 @@ export interface HomeworkVocabItem {
   lastPracticedAt?: string;
   partOfSpeech?: string;
   cefrLevel?: string;
+  origins?: DictionaryEntryOrigin[];
+  lessonRefId?: string;
+  normalizedWord?: string;
 }
 
 export interface MatchingPair {

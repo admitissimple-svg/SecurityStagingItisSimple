@@ -19,6 +19,7 @@ import {
   StudentJournalActivityType,
   DayOfWeek,
   WeeklyHomeworkData,
+  DailyHomeworkActivity,
   UserProfile,
   NativeFriendTutor,
 } from '../types';
@@ -36,6 +37,21 @@ import {
   migrateLegacyLocalStorageToFirestore,
 } from './firestoreSchemaValidator';
 import { isSyntheticHomeworkEvaluation, isValidHomeworkEvaluation } from './writingChecker';
+import {
+  getIsoDateInTimeZone,
+  getDateForDayInCurrentWeek as getDateForDayInCurrentWeekTz,
+  DEFAULT_STUDENT_TIMEZONE,
+} from './timezone';
+import {
+  synthesizeFillInBlanks,
+  synthesizeCohesiveStoryAndQuestions,
+} from './pedagogicalStorySynthesizer';
+import {
+  isActivityStartedOrAnswered,
+  deriveContextualSentencePrompt,
+} from './homeworkGenerator';
+
+export { getIsoDateInTimeZone };
 
 // Pure in-memory session caches to provide instant zero-delay UI rendering during active session
 // ZERO dependency on localStorage: 100% of persistent data is stored in Cloud Firestore
@@ -3811,31 +3827,17 @@ export function getTodayIsoDate(): string {
 }
 
 /**
- * Calculates the calendar date (YYYY-MM-DD) for a specific day of the week in the current week.
- * Reference week starts Monday (index 0) and ends Sunday (index 6).
+ * Calculates the calendar date (YYYY-MM-DD) for a specific day of the week in the current week,
+ * respecting the application timezone.
  */
-export function getDateForDayInCurrentWeek(targetDay: DayOfWeek, refDate: Date = new Date()): string {
-  const dayIndexMap: Record<DayOfWeek, number> = {
-    monday: 1,
-    tuesday: 2,
-    wednesday: 3,
-    thursday: 4,
-    friday: 5,
-    saturday: 6,
-    sunday: 0,
-  };
-  const currentDayIndex = refDate.getDay(); // 0 is Sunday, 1 is Monday...
-  const targetDayIndex = dayIndexMap[targetDay];
-
-  // In Monday-first week: Mon=0, Tue=1, Wed=2, Thu=3, Fri=4, Sat=5, Sun=6
-  const currentMonFirst = (currentDayIndex + 6) % 7;
-  const targetMonFirst = (targetDayIndex + 6) % 7;
-  const diffDays = targetMonFirst - currentMonFirst;
-
-  const targetDate = new Date(refDate);
-  targetDate.setDate(refDate.getDate() + diffDays);
-  return targetDate.toISOString().split('T')[0];
+export function getDateForDayInCurrentWeek(
+  targetDay: DayOfWeek,
+  refDate: Date = new Date(),
+  timeZone: string = DEFAULT_STUDENT_TIMEZONE
+): string {
+  return getDateForDayInCurrentWeekTz(targetDay, refDate, timeZone);
 }
+
 
 /**
  * Maps a routine row stepId to its corresponding StudentJournalActivityType
@@ -4407,6 +4409,135 @@ export function subscribeToStudentJournal(
 }
 
 /**
+ * Merges dailyActivities per-day ensuring that student answers, evaluations,
+ * and exercise question lists (matchingPairs, fillInBlanks, sentenceWritingPrompts, readingPassage)
+ * are never wiped or overwritten with empty arrays.
+ */
+export function mergeDailyActivities(
+  fallbackDays: Record<string, DailyHomeworkActivity> = {},
+  primaryDays: Record<string, DailyHomeworkActivity> = {}
+): Record<string, DailyHomeworkActivity> {
+  const result: Record<string, DailyHomeworkActivity> = { ...(fallbackDays || {}) };
+
+  for (const [dayKey, primaryAct] of Object.entries(primaryDays || {})) {
+    if (!primaryAct) continue;
+    const fallbackAct = result[dayKey];
+    if (!fallbackAct) {
+      result[dayKey] = primaryAct;
+      continue;
+    }
+
+    const selectedWords =
+      Array.isArray(primaryAct.selectedWords) && primaryAct.selectedWords.length > 0
+        ? primaryAct.selectedWords
+        : Array.isArray(fallbackAct.selectedWords) && fallbackAct.selectedWords.length > 0
+        ? fallbackAct.selectedWords
+        : [];
+
+    const wordOrigins =
+      Array.isArray(primaryAct.wordOrigins) && primaryAct.wordOrigins.length > 0
+        ? primaryAct.wordOrigins
+        : fallbackAct.wordOrigins || [];
+
+    const matchingPairs =
+      Array.isArray(primaryAct.matchingPairs) && primaryAct.matchingPairs.length > 0
+        ? primaryAct.matchingPairs
+        : Array.isArray(fallbackAct.matchingPairs) && fallbackAct.matchingPairs.length > 0
+        ? fallbackAct.matchingPairs
+        : selectedWords.map((v, idx) => ({
+            id: `pair-${idx + 1}`,
+            word: v.word,
+            definition: v.definitionEn,
+            translation: v.translationPt,
+          }));
+
+    const fillInBlanks =
+      Array.isArray(primaryAct.fillInBlanks) && primaryAct.fillInBlanks.length > 0
+        ? primaryAct.fillInBlanks
+        : Array.isArray(fallbackAct.fillInBlanks) && fallbackAct.fillInBlanks.length > 0
+        ? fallbackAct.fillInBlanks
+        : selectedWords.length > 0
+        ? synthesizeFillInBlanks(selectedWords.map((v) => typeof v === 'string' ? v : v.word), selectedWords)
+        : [];
+
+    const sentenceWritingPrompts =
+      Array.isArray(primaryAct.sentenceWritingPrompts) && primaryAct.sentenceWritingPrompts.length > 0
+        ? primaryAct.sentenceWritingPrompts
+        : Array.isArray(fallbackAct.sentenceWritingPrompts) && fallbackAct.sentenceWritingPrompts.length > 0
+        ? fallbackAct.sentenceWritingPrompts
+        : selectedWords.length > 0
+        ? selectedWords.map((v) => deriveContextualSentencePrompt({
+            word: typeof v === 'string' ? v : v.word,
+            definitionEn: v.definitionEn,
+            translationPt: v.translationPt,
+            exampleSentence: v.exampleSentence,
+            sourceActivityName: v.sourceActivityName,
+            partOfSpeech: v.partOfSpeech,
+            cefrLevel: v.cefrLevel,
+          }))
+        : [];
+
+    const readingPassage = primaryAct.readingPassage?.text
+      ? primaryAct.readingPassage
+      : fallbackAct.readingPassage?.text
+      ? fallbackAct.readingPassage
+      : primaryAct.readingPassage || fallbackAct.readingPassage;
+
+    const mergedAnswers = {
+      matching: { ...(fallbackAct.studentAnswers?.matching || {}), ...(primaryAct.studentAnswers?.matching || {}) },
+      fillInBlanks: { ...(fallbackAct.studentAnswers?.fillInBlanks || {}), ...(primaryAct.studentAnswers?.fillInBlanks || {}) },
+      sentences: { ...(fallbackAct.studentAnswers?.sentences || {}), ...(primaryAct.studentAnswers?.sentences || {}) },
+      quizAnswers: { ...(fallbackAct.studentAnswers?.quizAnswers || {}), ...(primaryAct.studentAnswers?.quizAnswers || {}) },
+    };
+
+    const mergedPartsProgress = {
+      matching: primaryAct.partsProgress?.matching || fallbackAct.partsProgress?.matching,
+      fill: primaryAct.partsProgress?.fill || fallbackAct.partsProgress?.fill,
+      writing: primaryAct.partsProgress?.writing || fallbackAct.partsProgress?.writing,
+      reading: primaryAct.partsProgress?.reading || fallbackAct.partsProgress?.reading,
+    };
+
+    const finalAiEvaluation = primaryAct.aiEvaluation || fallbackAct.aiEvaluation;
+    const finalScore =
+      typeof primaryAct.score === 'number' && primaryAct.score > 0
+        ? primaryAct.score
+        : typeof fallbackAct.score === 'number' && fallbackAct.score > 0
+        ? fallbackAct.score
+        : typeof primaryAct.score === 'number'
+        ? primaryAct.score
+        : fallbackAct.score ?? 0;
+
+    const isStarted = Boolean(
+      primaryAct.isStarted ||
+      fallbackAct.isStarted ||
+      isActivityStartedOrAnswered(primaryAct) ||
+      isActivityStartedOrAnswered(fallbackAct)
+    );
+
+    result[dayKey] = {
+      ...fallbackAct,
+      ...primaryAct,
+      selectedWords,
+      wordOrigins,
+      matchingPairs,
+      fillInBlanks,
+      sentenceWritingPrompts,
+      readingPassage,
+      studentAnswers: mergedAnswers,
+      partsProgress: mergedPartsProgress,
+      aiEvaluation: finalAiEvaluation,
+      score: finalScore,
+      isCompleted: Boolean(primaryAct.isCompleted || fallbackAct.isCompleted),
+      isStarted,
+      createdAt: fallbackAct.createdAt || primaryAct.createdAt || new Date().toISOString(),
+      updatedAt: primaryAct.updatedAt || fallbackAct.updatedAt || new Date().toISOString(),
+    };
+  }
+
+  return result;
+}
+
+/**
  * Merges two homework objects ensuring student answers, genuine evaluations,
  * scores, per-part progress, and question lists are never wiped by empty fields or autosaves.
  */
@@ -4466,6 +4597,8 @@ export function mergeHomeworkRecords(primary: any, fallback: any): any {
     primary.isCompleted || fallback.isCompleted || (finalAiEvaluation && finalScore > 0)
   );
 
+  const mergedDaily = mergeDailyActivities(fallback.dailyActivities, primary.dailyActivities);
+
   return {
     ...fallback,
     ...primary,
@@ -4496,10 +4629,7 @@ export function mergeHomeworkRecords(primary: any, fallback: any): any {
       ...(fallback.completedPartsByDay || {}),
       ...(primary.completedPartsByDay || {}),
     },
-    dailyActivities: {
-      ...(fallback.dailyActivities || {}),
-      ...(primary.dailyActivities || {}),
-    },
+    dailyActivities: mergedDaily,
     studentAnswers: mergedAnswers,
     partsProgress: mergedPartsProgress,
     aiEvaluation: finalAiEvaluation,
@@ -4511,6 +4641,7 @@ export function mergeHomeworkRecords(primary: any, fallback: any): any {
 /**
  * Sanitizes loaded homework data so that legacy synthetic evaluations are never
  * treated as valid evaluations, while preserving student answers, words, and history.
+ * Defensively ensures that exercises on daily activities are never left as empty arrays.
  */
 export function sanitizeLoadedHomeworkData(hw: any): WeeklyHomeworkData {
   if (!hw || typeof hw !== 'object') return hw;
@@ -4524,6 +4655,58 @@ export function sanitizeLoadedHomeworkData(hw: any): WeeklyHomeworkData {
       }
     }
   }
+
+  // Defensively ensure dailyActivities exercises are never empty if selectedWords exist
+  if (clean.dailyActivities && typeof clean.dailyActivities === 'object') {
+    const sanitizedDays: Record<string, DailyHomeworkActivity> = {};
+    for (const [dayKey, dayAct] of Object.entries(clean.dailyActivities as Record<string, DailyHomeworkActivity>)) {
+      if (!dayAct) continue;
+      const words = dayAct.selectedWords;
+      if (Array.isArray(words) && words.length > 0) {
+        const matchingPairs = (Array.isArray(dayAct.matchingPairs) && dayAct.matchingPairs.length > 0)
+          ? dayAct.matchingPairs
+          : words.map((v, idx) => ({
+              id: `pair-${idx + 1}`,
+              word: v.word,
+              definition: v.definitionEn,
+              translation: v.translationPt,
+            }));
+        const fillInBlanks = (Array.isArray(dayAct.fillInBlanks) && dayAct.fillInBlanks.length > 0)
+          ? dayAct.fillInBlanks
+          : synthesizeFillInBlanks(words.map((v) => typeof v === 'string' ? v : v.word), words);
+        const sentenceWritingPrompts = (Array.isArray(dayAct.sentenceWritingPrompts) && dayAct.sentenceWritingPrompts.length > 0)
+          ? dayAct.sentenceWritingPrompts
+          : words.map((v) => deriveContextualSentencePrompt({
+              word: typeof v === 'string' ? v : v.word,
+              definitionEn: v.definitionEn,
+              translationPt: v.translationPt,
+              exampleSentence: v.exampleSentence,
+              sourceActivityName: v.sourceActivityName,
+              partOfSpeech: v.partOfSpeech,
+              cefrLevel: v.cefrLevel,
+            }));
+        const readingPassage = dayAct.readingPassage?.text
+          ? dayAct.readingPassage
+          : synthesizeCohesiveStoryAndQuestions({
+              words: words.map((v) => typeof v === 'string' ? v : v.word),
+              studentName: clean.studentName,
+              wordDetails: words,
+            });
+
+        sanitizedDays[dayKey] = {
+          ...dayAct,
+          matchingPairs,
+          fillInBlanks,
+          sentenceWritingPrompts,
+          readingPassage,
+        };
+      } else {
+        sanitizedDays[dayKey] = dayAct;
+      }
+    }
+    clean.dailyActivities = sanitizedDays;
+  }
+
   return clean as WeeklyHomeworkData;
 }
 
@@ -4700,10 +4883,10 @@ export async function saveStudentHomeworkProgressToFirestore(
       ? existingHomework.readingPassage
       : sanitizedHomework.readingPassage;
 
-    const mergedDailyActivities = {
-      ...(existingHomework?.dailyActivities || {}),
-      ...(sanitizedHomework?.dailyActivities || {}),
-    };
+    const mergedDailyActivities = mergeDailyActivities(
+      existingHomework?.dailyActivities,
+      sanitizedHomework?.dailyActivities
+    );
 
     const payload = stampSchemaVersion({
       ...existingHomework,
