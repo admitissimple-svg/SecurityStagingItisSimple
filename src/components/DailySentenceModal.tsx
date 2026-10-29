@@ -24,7 +24,11 @@ interface DailySentenceModalProps {
   currentLanguage: Language;
   dictionaryEntries?: StudentDictionaryEntry[];
   excludedWords?: string[];
-  onSaveDailySentence: (sentence: string, wordsUsed: string[], evaluationResult?: WritingEvaluationResult | null) => void;
+  onSaveDailySentence: (
+    sentence: string,
+    wordsUsed: string[],
+    evaluationResult?: WritingEvaluationResult | null
+  ) => Promise<boolean | void> | boolean | void;
   onOpenJournalModal?: () => void;
 }
 
@@ -43,7 +47,9 @@ export const DailySentenceModal: React.FC<DailySentenceModalProps> = ({
   const [sentenceInput, setSentenceInput] = useState<string>('');
   const [evaluation, setEvaluation] = useState<WritingEvaluationResult | null>(null);
   const [isChecking, setIsChecking] = useState<boolean>(false);
+  const [isSaving, setIsSaving] = useState<boolean>(false);
   const [saveSuccess, setSaveSuccess] = useState<boolean>(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   const excludedSet = useMemo(() => {
     return new Set((excludedWords || []).map((w) => (w || '').trim().toLowerCase()));
@@ -140,12 +146,29 @@ export const DailySentenceModal: React.FC<DailySentenceModalProps> = ({
       .map((e) => e.word.trim());
     const combinedWords = Array.from(new Set([...matchedWords, ...dictMatchedWords]));
     const wordsToRecord = combinedWords.length > 0 ? combinedWords : (activeEval?.usedWords || allWords);
-    onSaveDailySentence(clean, wordsToRecord, activeEval);
-    setSaveSuccess(true);
-    setTimeout(() => {
-      setSaveSuccess(false);
-      onClose();
-    }, 1200);
+
+    setIsSaving(true);
+    setSaveError(null);
+    try {
+      const ok = await onSaveDailySentence(clean, wordsToRecord, activeEval);
+      if (ok !== false) {
+        setSaveSuccess(true);
+        setTimeout(() => {
+          setSaveSuccess(false);
+          onClose();
+        }, 1200);
+      } else {
+        setSaveError(
+          isEn ? 'Failed to save to journal. Please try again.' : 'Falha ao salvar no diário. Tente novamente.'
+        );
+      }
+    } catch {
+      setSaveError(
+        isEn ? 'Failed to save to journal. Please try again.' : 'Falha ao salvar no diário. Tente novamente.'
+      );
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   if (!isOpen) return null;
@@ -201,6 +224,13 @@ export const DailySentenceModal: React.FC<DailySentenceModalProps> = ({
             <div className="p-3 bg-[#9AB4FF]/20 border border-[#607EC9] rounded-2xl text-xs font-bold text-[#062863] flex items-center gap-2">
               <Check className="w-4 h-4 text-[#1C4C96]" />
               <span>{isEn ? 'Saved to journal!' : 'Frase salva no seu diário com sucesso!'}</span>
+            </div>
+          )}
+
+          {saveError && (
+            <div className="p-3 bg-rose-50 border border-rose-200 rounded-2xl text-xs font-bold text-rose-700 flex items-center gap-2">
+              <X className="w-4 h-4 text-rose-600" />
+              <span>{saveError}</span>
             </div>
           )}
 
@@ -428,10 +458,20 @@ export const DailySentenceModal: React.FC<DailySentenceModalProps> = ({
               </button>
               <button
                 type="submit"
-                className="px-5 py-2 bg-[#1C4C96] hover:bg-[#062863] text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-xs cursor-pointer"
+                disabled={isSaving || !sentenceInput.trim()}
+                className="px-5 py-2 bg-[#1C4C96] hover:bg-[#062863] text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-xs cursor-pointer disabled:opacity-50"
               >
-                <Send className="w-3.5 h-3.5" />
-                <span>{isEn ? 'Save to Journal' : 'Salvar no Diário'}</span>
+                {isSaving ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>{isEn ? 'Saving...' : 'Salvando...'}</span>
+                  </>
+                ) : (
+                  <>
+                    <Send className="w-3.5 h-3.5" />
+                    <span>{isEn ? 'Save to Journal' : 'Salvar no Diário'}</span>
+                  </>
+                )}
               </button>
             </div>
           </div>

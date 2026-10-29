@@ -109,6 +109,24 @@ export function normalizeWeekId(week?: string | number | null): string | null {
 }
 
 /**
+ * Executes a Promise with a strict timeout that rejects if the operation exceeds the deadline.
+ * Unlike withFirestoreTimeout, this does not swallow rejections or convert failures to null.
+ */
+export async function withStrictTimeout<T>(
+  promise: Promise<T>,
+  ms = 4000,
+  timeoutMessage = 'Firestore operation timed out'
+): Promise<T> {
+  let timer: any;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(timeoutMessage)), ms);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+/**
  * Extracts numeric cycle from week identifier (e.g. 'week-2' -> 2, 3 -> 3).
  * Returns null if cycle cannot be determined.
  * CRITICAL: Never silently defaults to 1 and never returns malformed week numbers.
@@ -1155,6 +1173,7 @@ export function subscribeToStudentVocabulary(
 /**
  * Persist student daily journal entry directly to Firestore.
  * Saves to users/{studentUID} and subcollection users/{studentUID}/journal/{entryId}.
+ * Propagates real write failures, awaits confirmation, and enforces strict timeout without swallowing errors.
  */
 export async function saveStudentJournalEntryToFirestore(
   studentUid: string,
@@ -1162,10 +1181,14 @@ export async function saveStudentJournalEntryToFirestore(
   studentEmail?: string
 ): Promise<boolean> {
   const db = getDb();
-  if (!db) return false;
+  if (!db) {
+    throw new Error('Firestore database is not initialized');
+  }
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
   const cleanUid = normalizeUid(studentUid, cleanEmail);
-  if (!cleanUid) return false;
+  if (!cleanUid) {
+    throw new Error('Valid student UID is required to save journal entry');
+  }
 
   try {
     const sanitizedEntry: DailyJournalEntry = JSON.parse(
@@ -1177,47 +1200,65 @@ export async function saveStudentJournalEntryToFirestore(
       })
     );
 
-    // 1. Save in dedicated subcollection
+    // 1. Save in dedicated canonical subcollection
     const stampedEntry = stampSchemaVersion(sanitizedEntry);
     assertSafeFirestoreWrite(`users/${cleanUid}/journal/${sanitizedEntry.id}`, stampedEntry, undefined, true);
     const entryRef = doc(db, 'users', cleanUid, 'journal', sanitizedEntry.id);
-    await withFirestoreTimeout(setDoc(entryRef, stampedEntry, { merge: true }), 3000, null);
+    await withStrictTimeout(
+      setDoc(entryRef, stampedEntry, { merge: true }),
+      4500,
+      'Saving journal entry to subcollection timed out'
+    );
 
     // 2. Also retrieve and update list in user profile doc for single-fetch efficiency
     const userRef = doc(db, 'users', cleanUid);
-    const userSnap = await withFirestoreTimeout(getDoc(userRef), 2000, null);
+    const userSnap = await withStrictTimeout(
+      getDoc(userRef),
+      3500,
+      'Reading user document timed out'
+    );
     let existingList: DailyJournalEntry[] = [];
+    let existingDeleted: string[] = [];
     if (userSnap && userSnap.exists()) {
       const data = userSnap.data();
       if (Array.isArray(data?.dailyJournalEntries)) {
         existingList = data.dailyJournalEntries;
       }
+      if (Array.isArray(data?.deletedJournalEntryIds)) {
+        existingDeleted = data.deletedJournalEntryIds;
+      }
     }
 
+    // Ensure re-saved entry is removed from tombstones if it was previously deleted
+    const updatedDeleted = existingDeleted.filter((id) => id !== sanitizedEntry.id);
     const filtered = existingList.filter((e) => e.id !== sanitizedEntry.id);
     const updatedList = [sanitizedEntry, ...filtered];
     const stampedUserUpdate = stampSchemaVersion({
       dailyJournalEntries: updatedList,
+      deletedJournalEntryIds: updatedDeleted,
       updatedAt: new Date().toISOString(),
     });
     assertSafeFirestoreWrite(`users/${cleanUid}`, stampedUserUpdate, userSnap?.data(), true);
 
-    await withFirestoreTimeout(
+    await withStrictTimeout(
       setDoc(userRef, stampedUserUpdate, { merge: true }),
-      2500,
-      null
+      3500,
+      'Updating user journal entry list timed out'
     );
 
     // Journal is 100% Firestore-authoritative (users/{cleanUid}/journal and users/{cleanUid})
     return true;
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, `users/${cleanUid}/journal/${entry.id}`);
-    return false;
+    throw error;
   }
 }
 
 /**
  * Fetch student daily journal entries directly from Firestore.
+ * Subcollection users/{cleanUid}/journal is the canonical source of truth.
+ * Legacy array users/{cleanUid}.dailyJournalEntries is only used as fallback for historical
+ * unmigrated entries and respects deletedJournalEntryIds tombstones.
  */
 export async function fetchStudentJournalFromFirestore(
   studentUid: string,
@@ -1230,28 +1271,46 @@ export async function fetchStudentJournalFromFirestore(
 
   try {
     const journalMap = new Map<string, DailyJournalEntry>();
+    const deletedIds = new Set<string>();
 
-    // 1. Try subcollection
+    // 1. Load user doc first to check tombstone deletedJournalEntryIds
+    const userRef = doc(db, 'users', cleanUid);
+    const userSnap = await withFirestoreTimeout(getDoc(userRef), 2500, null);
+    let legacyEntries: DailyJournalEntry[] = [];
+    if (userSnap && userSnap.exists()) {
+      const data = userSnap.data();
+      if (Array.isArray(data?.deletedJournalEntryIds)) {
+        data.deletedJournalEntryIds.forEach((id: string) => deletedIds.add(id));
+      }
+      if (Array.isArray(data?.dailyJournalEntries)) {
+        legacyEntries = data.dailyJournalEntries;
+      }
+    }
+
+    // 2. Canonical subcollection users/{cleanUid}/journal
     const colRef = collection(db, 'users', cleanUid, 'journal');
-    const colSnap = await withFirestoreTimeout(getDocs(colRef), 2500, null);
+    const colSnap = await withFirestoreTimeout(getDocs(colRef), 3000, null);
+    let hasSubcollectionEntries = false;
     if (colSnap && !colSnap.empty) {
+      hasSubcollectionEntries = true;
       colSnap.forEach((d) => {
         const item = d.data() as DailyJournalEntry;
-        if (item?.id) journalMap.set(item.id, item);
+        if (item?.id && !deletedIds.has(item.id)) {
+          journalMap.set(item.id, item);
+        }
       });
     }
 
-    // 2. Also check parent user doc
-    const userRef = doc(db, 'users', cleanUid);
-    const userSnap = await withFirestoreTimeout(getDoc(userRef), 2000, null);
-    if (userSnap && userSnap.exists()) {
-      const data = userSnap.data();
-      if (Array.isArray(data?.dailyJournalEntries)) {
-        data.dailyJournalEntries.forEach((item: DailyJournalEntry) => {
-          if (item?.id) journalMap.set(item.id, item);
-        });
+    // 3. Fallback to unmigrated historical entries from legacy array only if not deleted
+    legacyEntries.forEach((item: DailyJournalEntry) => {
+      if (item?.id && !deletedIds.has(item.id)) {
+        // If the subcollection is active, entries deleted from subcollection must NOT be resurrected
+        // Only include legacy items if the subcollection has not yet been populated for this student
+        if (!hasSubcollectionEntries && !journalMap.has(item.id)) {
+          journalMap.set(item.id, item);
+        }
       }
-    }
+    });
 
     // Check email doc if UID doc was empty
     if (journalMap.size === 0 && studentEmail) {
@@ -1261,9 +1320,14 @@ export async function fetchStudentJournalFromFirestore(
         const altSnap = await withFirestoreTimeout(getDoc(altRef), 2000, null);
         if (altSnap && altSnap.exists()) {
           const altData = altSnap.data();
+          if (Array.isArray(altData?.deletedJournalEntryIds)) {
+            altData.deletedJournalEntryIds.forEach((id: string) => deletedIds.add(id));
+          }
           if (Array.isArray(altData?.dailyJournalEntries)) {
             altData.dailyJournalEntries.forEach((item: DailyJournalEntry) => {
-              if (item?.id) journalMap.set(item.id, item);
+              if (item?.id && !deletedIds.has(item.id) && !journalMap.has(item.id)) {
+                journalMap.set(item.id, item);
+              }
             });
           }
         }
@@ -5195,8 +5259,8 @@ export async function fetchStudentHomeworkProgressFromFirestore(
 
 /**
  * Creates a clean, initialized homework state for a given student and week cycle.
- * Ensures answers, completed parts, and completion flags are completely cleared,
- * while preserving the expected WeeklyHomeworkData structure and UI compatibility.
+ * Ensures answers, completed parts, and completion flags are cleared for an unstarted cycle,
+ * while preserving valid dailyActivities, selectedWords, exercises, studentLevel, and structure.
  */
 export function createCleanInitializedHomework(
   studentUid: string,
@@ -5205,6 +5269,83 @@ export function createCleanInitializedHomework(
   partial?: Partial<WeeklyHomeworkData>
 ): WeeklyHomeworkData {
   const canonicalWeekId = normalizeWeekId(cycle) || `week-${cycle}`;
+
+  // Defensively preserve and sanitize dailyActivities if present in partial
+  let dailyActivities: Record<string, DailyHomeworkActivity> = {};
+  if (partial?.dailyActivities && typeof partial.dailyActivities === 'object') {
+    dailyActivities = { ...partial.dailyActivities };
+    // Ensure activities with selectedWords have deterministically synthesized questions if questions are missing
+    for (const [dayKey, dayAct] of Object.entries(dailyActivities)) {
+      if (!dayAct) continue;
+      const words = dayAct.selectedWords;
+      if (Array.isArray(words) && words.length > 0) {
+        const matchingPairs = (Array.isArray(dayAct.matchingPairs) && dayAct.matchingPairs.length > 0)
+          ? dayAct.matchingPairs
+          : words.map((v, idx) => ({
+              id: `pair-${idx + 1}`,
+              word: typeof v === 'string' ? v : v.word,
+              definition: typeof v === 'string' ? '' : v.definitionEn,
+              translation: typeof v === 'string' ? '' : v.translationPt,
+            }));
+
+        const fillInBlanks = (Array.isArray(dayAct.fillInBlanks) && dayAct.fillInBlanks.length > 0)
+          ? dayAct.fillInBlanks
+          : synthesizeFillInBlanks(words.map((v) => typeof v === 'string' ? v : v.word), words);
+
+        const sentenceWritingPrompts = (Array.isArray(dayAct.sentenceWritingPrompts) && dayAct.sentenceWritingPrompts.length > 0)
+          ? dayAct.sentenceWritingPrompts
+          : words.map((v) => deriveContextualSentencePrompt({
+              word: typeof v === 'string' ? v : v.word,
+              definitionEn: typeof v === 'string' ? '' : v.definitionEn,
+              translationPt: typeof v === 'string' ? '' : v.translationPt,
+              exampleSentence: typeof v === 'string' ? '' : v.exampleSentence,
+              sourceActivityName: typeof v === 'string' ? '' : v.sourceActivityName,
+              partOfSpeech: typeof v === 'string' ? '' : v.partOfSpeech,
+              cefrLevel: typeof v === 'string' ? '' : v.cefrLevel,
+            }));
+
+        dailyActivities[dayKey] = {
+          ...dayAct,
+          matchingPairs,
+          fillInBlanks,
+          sentenceWritingPrompts,
+        };
+      }
+    }
+  }
+
+  const vocabularyList = Array.isArray(partial?.vocabularyList) ? partial.vocabularyList : [];
+  const matchingPairs = (Array.isArray(partial?.matchingPairs) && partial.matchingPairs.length > 0)
+    ? partial.matchingPairs
+    : vocabularyList.map((v, idx) => ({
+        id: `pair-${idx + 1}`,
+        word: typeof v === 'string' ? v : v.word,
+        definition: typeof v === 'string' ? '' : v.definitionEn,
+        translation: typeof v === 'string' ? '' : v.translationPt,
+      }));
+
+  const fillInBlanks = (Array.isArray(partial?.fillInBlanks) && partial.fillInBlanks.length > 0)
+    ? partial.fillInBlanks
+    : vocabularyList.length > 0
+    ? synthesizeFillInBlanks(vocabularyList.map((v) => typeof v === 'string' ? v : v.word), vocabularyList)
+    : [];
+
+  const sentenceWritingPrompts = (Array.isArray(partial?.sentenceWritingPrompts) && partial.sentenceWritingPrompts.length > 0)
+    ? partial.sentenceWritingPrompts
+    : vocabularyList.length > 0
+    ? vocabularyList.map((v) => deriveContextualSentencePrompt({
+        word: typeof v === 'string' ? v : v.word,
+        definitionEn: typeof v === 'string' ? '' : v.definitionEn,
+        translationPt: typeof v === 'string' ? '' : v.translationPt,
+        exampleSentence: typeof v === 'string' ? '' : v.exampleSentence,
+        sourceActivityName: typeof v === 'string' ? '' : v.sourceActivityName,
+        partOfSpeech: typeof v === 'string' ? '' : v.partOfSpeech,
+        cefrLevel: typeof v === 'string' ? '' : v.cefrLevel,
+      }))
+    : [];
+
+  const studentLevel = partial?.studentLevel || (partial as any)?.level || (partial as any)?.englishLevel || 'intermediate';
+
   return {
     id: partial?.id || `hw-${canonicalWeekId}-${studentUid}`,
     weekId: canonicalWeekId,
@@ -5212,16 +5353,16 @@ export function createCleanInitializedHomework(
     studentUid,
     studentEmail: studentEmail || partial?.studentEmail || '',
     studentName: partial?.studentName || 'Student',
-    studentLevel: partial?.studentLevel || 'intermediate',
+    studentLevel,
     createdAt: partial?.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     weekLabel: partial?.weekLabel || `Week ${cycle}`,
-    totalWordsCollected: partial?.totalWordsCollected || 0,
-    vocabularyList: Array.isArray(partial?.vocabularyList) ? partial.vocabularyList : [],
+    totalWordsCollected: partial?.totalWordsCollected || vocabularyList.length,
+    vocabularyList,
     allRoutineWords: Array.isArray(partial?.allRoutineWords) ? partial.allRoutineWords : [],
-    matchingPairs: Array.isArray(partial?.matchingPairs) ? partial.matchingPairs : [],
-    fillInBlanks: Array.isArray(partial?.fillInBlanks) ? partial.fillInBlanks : [],
-    sentenceWritingPrompts: Array.isArray(partial?.sentenceWritingPrompts) ? partial.sentenceWritingPrompts : [],
+    matchingPairs,
+    fillInBlanks,
+    sentenceWritingPrompts,
     readingPassage: partial?.readingPassage
       ? {
           ...partial.readingPassage,
@@ -5241,6 +5382,7 @@ export function createCleanInitializedHomework(
     targetDay: partial?.targetDay,
     assignedPart: partial?.assignedPart,
     assignedPartKey: partial?.assignedPartKey,
+    dailyActivities,
     // Explicitly clean / empty answers and completion state
     isCompleted: false,
     isDayPartCompleted: false,
@@ -5252,7 +5394,7 @@ export function createCleanInitializedHomework(
       sentences: {},
       quizAnswers: {},
     },
-    isEmpty: partial?.isEmpty !== undefined ? partial.isEmpty : true,
+    isEmpty: partial?.isEmpty !== undefined ? partial.isEmpty : (vocabularyList.length === 0 && Object.keys(dailyActivities).length === 0),
     emptyWarning: partial?.emptyWarning,
     emptyWarningEn: partial?.emptyWarningEn,
   };
@@ -5292,7 +5434,6 @@ export function subscribeToStudentHomeworkProgress(
         (snap) => {
           if (snap.exists()) {
             // Canonical document EXISTS:
-            // Return its data even when empty or unanswered. Never consult legacy storage.
             const data = (snap.data() || {}) as Partial<WeeklyHomeworkData>;
             const hasCompletedParts = data.completedPartsByDay && Object.keys(data.completedPartsByDay).length > 0;
             const hasAnswers = data.studentAnswers && (
@@ -5303,19 +5444,37 @@ export function subscribeToStudentHomeworkProgress(
             );
             const isCompleted = !!data.isCompleted || !!data.isDayPartCompleted;
 
-            if ((!hasCompletedParts && !hasAnswers && !isCompleted) || data.isEmpty) {
-              // Document is empty, reset, or unanswered: notify subscriber with clean initialized state
+            const hasExercises = Boolean(
+              (Array.isArray(data.matchingPairs) && data.matchingPairs.length > 0) ||
+              (Array.isArray(data.fillInBlanks) && data.fillInBlanks.length > 0) ||
+              (Array.isArray(data.sentenceWritingPrompts) && data.sentenceWritingPrompts.length > 0) ||
+              (data.dailyActivities && Object.values(data.dailyActivities).some((act: any) =>
+                (Array.isArray(act?.matchingPairs) && act.matchingPairs.length > 0) ||
+                (Array.isArray(act?.fillInBlanks) && act.fillInBlanks.length > 0) ||
+                (Array.isArray(act?.sentenceWritingPrompts) && act.sentenceWritingPrompts.length > 0) ||
+                (Array.isArray(act?.selectedWords) && act.selectedWords.length > 0)
+              ))
+            );
+
+            // Truly empty document without answers, completion, or exercises: notify subscriber with clean initialized state
+            if ((!hasCompletedParts && !hasAnswers && !isCompleted && !hasExercises) || (data.isEmpty && !hasExercises)) {
               callback(createCleanInitializedHomework(cleanUid, studentEmail, cycle, data));
             } else {
               const cleanBase = createCleanInitializedHomework(cleanUid, studentEmail, cycle, data);
-              callback({
+              const mergedDaily = data.dailyActivities
+                ? mergeDailyActivities(cleanBase.dailyActivities, data.dailyActivities)
+                : cleanBase.dailyActivities;
+
+              const sanitizedResult = sanitizeLoadedHomeworkData({
                 ...cleanBase,
                 ...data,
-                matchingPairs: Array.isArray(data.matchingPairs) ? data.matchingPairs : cleanBase.matchingPairs,
-                fillInBlanks: Array.isArray(data.fillInBlanks) ? data.fillInBlanks : cleanBase.fillInBlanks,
-                sentenceWritingPrompts: Array.isArray(data.sentenceWritingPrompts) ? data.sentenceWritingPrompts : cleanBase.sentenceWritingPrompts,
-                vocabularyList: Array.isArray(data.vocabularyList) ? data.vocabularyList : cleanBase.vocabularyList,
-                allRoutineWords: Array.isArray(data.allRoutineWords) ? data.allRoutineWords : cleanBase.allRoutineWords,
+                dailyActivities: mergedDaily,
+                matchingPairs: Array.isArray(data.matchingPairs) && data.matchingPairs.length > 0 ? data.matchingPairs : cleanBase.matchingPairs,
+                fillInBlanks: Array.isArray(data.fillInBlanks) && data.fillInBlanks.length > 0 ? data.fillInBlanks : cleanBase.fillInBlanks,
+                sentenceWritingPrompts: Array.isArray(data.sentenceWritingPrompts) && data.sentenceWritingPrompts.length > 0 ? data.sentenceWritingPrompts : cleanBase.sentenceWritingPrompts,
+                vocabularyList: Array.isArray(data.vocabularyList) && data.vocabularyList.length > 0 ? data.vocabularyList : cleanBase.vocabularyList,
+                allRoutineWords: Array.isArray(data.allRoutineWords) && data.allRoutineWords.length > 0 ? data.allRoutineWords : cleanBase.allRoutineWords,
+                studentLevel: data.studentLevel || cleanBase.studentLevel,
                 readingPassage: data.readingPassage
                   ? {
                       ...cleanBase.readingPassage,
@@ -5332,6 +5491,8 @@ export function subscribeToStudentHomeworkProgress(
                 weekId: canonicalWeekId,
                 weeklyCycle: cycle,
               } as WeeklyHomeworkData);
+
+              callback(sanitizedResult);
             }
           } else {
             // Canonical document DOES NOT EXIST (deleted, missing, or not yet created)
@@ -5433,6 +5594,9 @@ export function subscribeToStudentHomeworkProgress(
 /**
  * Real-time subscription to student daily journal entries (Sentence of the Day).
  * Synchronizes instantly across devices when sentences are created, edited, or deleted.
+ * Subcollection users/{cleanUid}/journal is the canonical source of truth.
+ * Legacy array users/{cleanUid}.dailyJournalEntries is only used as fallback if subcollection has no entries,
+ * and deleted entries recorded in deletedJournalEntryIds are never resurrected.
  */
 export function subscribeToStudentDailyJournal(
   studentUid: string,
@@ -5451,12 +5615,18 @@ export function subscribeToStudentDailyJournal(
 
   const rebuildAndNotify = () => {
     const combined = new Map<string, DailyJournalEntry>();
-    userDocMap.forEach((val, id) => {
-      if (!deletedIdsSet.has(id)) combined.set(id, val);
-    });
+    // Canonical subcollection entries take absolute authority
     subColMap.forEach((val, id) => {
       if (!deletedIdsSet.has(id)) combined.set(id, val);
     });
+    // Legacy array only acts as fallback for historical unmigrated entries if subcollection has no entries
+    if (subColMap.size === 0) {
+      userDocMap.forEach((val, id) => {
+        if (!deletedIdsSet.has(id) && !combined.has(id)) {
+          combined.set(id, val);
+        }
+      });
+    }
     const list = Array.from(combined.values());
     list.sort((a, b) => {
       const timeA = new Date(a.createdAt || a.date).getTime();
@@ -5501,6 +5671,9 @@ export function subscribeToStudentDailyJournal(
           userDocMap.clear();
           if (snap.exists()) {
             const data = snap.data();
+            if (Array.isArray(data?.deletedJournalEntryIds)) {
+              data.deletedJournalEntryIds.forEach((id: string) => deletedIdsSet.add(id));
+            }
             if (Array.isArray(data?.dailyJournalEntries)) {
               data.dailyJournalEntries.forEach((item: DailyJournalEntry) => {
                 if (item?.id && !deletedIdsSet.has(item.id)) {
@@ -5525,6 +5698,9 @@ export function subscribeToStudentDailyJournal(
 
 /**
  * Delete a student daily journal entry directly from Cloud Firestore and sync across all devices.
+ * Strictly deletes from subcollection users/{cleanUid}/journal/{entryId}, filters the entry from
+ * users/{cleanUid}.dailyJournalEntries, and registers a persistent tombstone in deletedJournalEntryIds
+ * to permanently prevent legacy reintroduction.
  */
 export async function deleteStudentJournalEntryFromFirestore(
   studentUid: string,
@@ -5538,23 +5714,33 @@ export async function deleteStudentJournalEntryFromFirestore(
   if (!cleanUid) return false;
 
   try {
-    // 1. Delete from subcollection
+    // 1. Delete from canonical subcollection
     const entryRef = doc(db, 'users', cleanUid, 'journal', entryId);
-    await withFirestoreTimeout(deleteDoc(entryRef), 3000, null);
+    await withStrictTimeout(deleteDoc(entryRef), 4000, 'Deleting journal entry from subcollection timed out');
 
-    // 2. Remove from user profile doc dailyJournalEntries array
+    // 2. Remove from user profile doc dailyJournalEntries array and record tombstone
     const userRef = doc(db, 'users', cleanUid);
-    const userSnap = await withFirestoreTimeout(getDoc(userRef), 2500, null);
+    const userSnap = await withStrictTimeout(getDoc(userRef), 3000, 'Reading user document timed out');
     if (userSnap && userSnap.exists()) {
       const data = userSnap.data();
-      if (Array.isArray(data?.dailyJournalEntries)) {
-        const filtered = data.dailyJournalEntries.filter((e: DailyJournalEntry) => e.id !== entryId);
-        await withFirestoreTimeout(
-          setDoc(userRef, { dailyJournalEntries: filtered, updatedAt: new Date().toISOString() }, { merge: true }),
-          2500,
-          null
-        );
-      }
+      const existingList = Array.isArray(data?.dailyJournalEntries) ? data.dailyJournalEntries : [];
+      const filtered = existingList.filter((e: DailyJournalEntry) => e.id !== entryId);
+      const existingDeleted = Array.isArray(data?.deletedJournalEntryIds) ? data.deletedJournalEntryIds : [];
+      const updatedDeleted = Array.from(new Set([...existingDeleted, entryId]));
+
+      await withStrictTimeout(
+        setDoc(
+          userRef,
+          {
+            dailyJournalEntries: filtered,
+            deletedJournalEntryIds: updatedDeleted,
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        ),
+        3500,
+        'Updating user doc journal tombstones timed out'
+      );
     }
 
     // Journal deletion is 100% Firestore-authoritative (users/{cleanUid}/journal and users/{cleanUid})

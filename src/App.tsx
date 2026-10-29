@@ -461,11 +461,18 @@ export default function App() {
           };
 
           // Guarantee that student profile in Firestore is created/saved using doc(db, 'users', fbUser.uid)
+          // Guarantee that student profile in Firestore is created/saved using doc(db, 'users', fbUser.uid)
           // Do NOT overwrite if user has a teacher/tutor role
           if (resolvedRole === 'student' && firestoreDoc?.role !== 'teacher' && firestoreDoc?.role !== 'native_friend') {
             const db = getDb();
             if (db && fbUser.uid) {
-              const studentPayload = {
+              const existingStoredLevel =
+                firestoreDoc?.level ||
+                firestoreDoc?.englishLevel ||
+                firestoreDoc?.userLevel ||
+                firestoreDoc?.cefrLevel;
+
+              const studentPayload: Record<string, any> = {
                 id: fbUser.uid,
                 uid: fbUser.uid,
                 email: cleanEmail,
@@ -473,7 +480,6 @@ export default function App() {
                 role: 'student',
                 picture: account.picture,
                 avatar: account.picture,
-                level: firestoreDoc?.level || firestoreDoc?.englishLevel || EnglishLevel.BEGINNER,
                 learningGoal: firestoreDoc?.learningGoal || '',
                 routineVideoTime: firestoreDoc?.routineVideoTime || '09:00',
                 routineAudioTime: firestoreDoc?.routineAudioTime || '14:00',
@@ -481,6 +487,14 @@ export default function App() {
                 ...(firestoreDoc || {}),
                 updatedAt: new Date().toISOString(),
               };
+
+              // Strictly preserve existing level in Firestore. Never overwrite with BEGINNER on login.
+              if (existingStoredLevel) {
+                studentPayload.level = existingStoredLevel;
+              } else {
+                delete studentPayload.level;
+              }
+
               setDoc(doc(db, 'users', fbUser.uid), studentPayload, { merge: true }).catch(() => null);
             }
 
@@ -492,6 +506,14 @@ export default function App() {
                   ? firestoreDoc.nativeFriendUID
                   : undefined;
 
+            const existingKnownLevel =
+              firestoreDoc?.level ||
+              firestoreDoc?.englishLevel ||
+              firestoreDoc?.userLevel ||
+              firestoreDoc?.cefrLevel ||
+              userProfile?.level ||
+              EnglishLevel.BEGINNER;
+
             const restoredProfile: UserProfile = {
               ...createDefaultStudentProfile(account),
               id: fbUser.uid,
@@ -500,9 +522,9 @@ export default function App() {
               name: account.name,
               picture: account.picture,
               avatar: account.picture,
-              level: (firestoreDoc?.level || firestoreDoc?.englishLevel || EnglishLevel.BEGINNER) as EnglishLevel,
-              englishLevel: (firestoreDoc?.level || firestoreDoc?.englishLevel || EnglishLevel.BEGINNER) as EnglishLevel,
-              userLevel: (firestoreDoc?.level || firestoreDoc?.englishLevel || EnglishLevel.BEGINNER) as EnglishLevel,
+              level: existingKnownLevel as EnglishLevel,
+              englishLevel: existingKnownLevel as EnglishLevel,
+              userLevel: existingKnownLevel as EnglishLevel,
               learningGoal: firestoreDoc?.learningGoal || '',
               weeklyStudyDaysTarget: typeof firestoreDoc?.weeklyStudyDaysTarget === 'number' ? firestoreDoc.weeklyStudyDaysTarget : 4,
               weeklyStudyDays: firestoreDoc?.weeklyStudyDays || ['monday', 'tuesday', 'wednesday', 'thursday'],
@@ -943,6 +965,61 @@ export default function App() {
   const currentActivity = useMemo(() => {
     return currentDayRoutines.find((item) => item.id === selectedActivityId) || currentDayRoutines[0] || null;
   }, [currentDayRoutines, selectedActivityId]);
+
+  // Compute all words from routines and live sessions for Personal Dictionary & Homework
+  const wordsFromRoutines = useMemo(() => {
+    const list: Array<{ word: string; sourceActivityName?: string; sourceDay?: DayOfWeek }> = [];
+    if (routinesByDay && typeof routinesByDay === 'object') {
+      (Object.keys(routinesByDay) as DayOfWeek[]).forEach((day) => {
+        (routinesByDay[day] || []).forEach((act) => {
+          (act?.learnedWords || []).forEach((w) => {
+            if (w && w.trim()) {
+              list.push({
+                word: w.trim(),
+                sourceActivityName: act.activityName,
+                sourceDay: day,
+              });
+            }
+          });
+        });
+      });
+    }
+
+    // Also include vocabulary words noted by teacher during live lessons
+    (lessons || []).forEach((l) => {
+      if (l && Array.isArray(l.vocabularyNotes) && l.vocabularyNotes.length > 0) {
+        const lessonDay = getDayOfWeekFromDateString(
+          l.sessionDate || l.startDateTime,
+          userProfile?.timezone || DEFAULT_STUDENT_TIMEZONE
+        );
+        l.vocabularyNotes.forEach((vn) => {
+          if (vn && vn.word && vn.word.trim()) {
+            list.push({
+              word: vn.word.trim(),
+              sourceActivityName: `Live Session with ${l.teacherName || 'Native Friend'}`,
+              sourceDay: lessonDay || undefined,
+            });
+          }
+        });
+      }
+    });
+
+    return list;
+  }, [routinesByDay, lessons, userProfile?.timezone]);
+
+  // Phase 2.2E / Etapa 5: Unified consolidated active dictionary library
+  // Combines previous & current routine words, Native Friends notes, manual additions,
+  // rich definitions, and excludes persistent deletions.
+  const consolidatedActiveDictionary = useMemo(() => {
+    return buildConsolidatedActiveDictionary(
+      studentDictionaryEntries,
+      wordsFromRoutines,
+      excludedDictionaryWords,
+      userProfile?.level,
+      currentAccount?.uid,
+      currentAccount?.email
+    );
+  }, [studentDictionaryEntries, wordsFromRoutines, excludedDictionaryWords, userProfile?.level, currentAccount?.uid, currentAccount?.email]);
 
   // Generate Weekly Homework automatically whenever routines, dictionary, or targetDay change
   useEffect(() => {
@@ -1544,11 +1621,26 @@ export default function App() {
             apiProfileData?.enrollmentStatus ||
             (effectiveTeacherEmail ? 'active' : 'not_enrolled');
 
+          const effectiveLevel =
+            fsProfile?.level ||
+            fsProfile?.englishLevel ||
+            fsProfile?.userLevel ||
+            (fsProfile as any)?.cefrLevel ||
+            apiProfileData?.level ||
+            apiProfileData?.englishLevel ||
+            apiProfileData?.userLevel ||
+            (apiProfileData as any)?.cefrLevel ||
+            userProfile?.level ||
+            baseProfile.level;
+
           const effectiveStudentUid = currentAccount?.uid || auth.currentUser?.uid || uid;
           loadedProfile = {
             ...baseProfile,
             ...(apiProfileData || {}),
             ...(fsProfile || {}),
+            level: effectiveLevel,
+            englishLevel: effectiveLevel,
+            userLevel: effectiveLevel,
             id: effectiveStudentUid,
             uid: effectiveStudentUid,
             name: fsProfile?.name || apiProfileData?.name || currentAccount!.name || '',
@@ -2231,48 +2323,81 @@ export default function App() {
             return cloudHw;
           }
 
-          // If the cloud homework is reset, empty, or unanswered:
-          const isResetOrEmpty =
-            (!cloudHw.studentAnswers ||
-              (Object.keys(cloudHw.studentAnswers.matching || {}).length === 0 &&
-                Object.keys(cloudHw.studentAnswers.fillInBlanks || {}).length === 0 &&
-                Object.keys(cloudHw.studentAnswers.sentences || {}).length === 0 &&
-                Object.keys(cloudHw.studentAnswers.quizAnswers || {}).length === 0)) &&
-            (!cloudHw.completedPartsByDay || Object.keys(cloudHw.completedPartsByDay).length === 0) &&
-            !cloudHw.isCompleted;
+          // Distinguish between intentional reset vs incomplete/empty snapshot:
+          const cloudHasExercises =
+            (Array.isArray(cloudHw.matchingPairs) && cloudHw.matchingPairs.length > 0) ||
+            (Array.isArray(cloudHw.fillInBlanks) && cloudHw.fillInBlanks.length > 0) ||
+            (Array.isArray(cloudHw.sentenceWritingPrompts) && cloudHw.sentenceWritingPrompts.length > 0) ||
+            (cloudHw.dailyActivities && Object.values(cloudHw.dailyActivities).some((act: any) =>
+              (Array.isArray(act?.matchingPairs) && act.matchingPairs.length > 0) ||
+              (Array.isArray(act?.fillInBlanks) && act.fillInBlanks.length > 0) ||
+              (Array.isArray(act?.sentenceWritingPrompts) && act.sentenceWritingPrompts.length > 0) ||
+              (Array.isArray(act?.selectedWords) && act.selectedWords.length > 0)
+            ));
 
-          if (isResetOrEmpty) {
-            return {
-              ...prev,
-              ...cloudHw,
-              isCompleted: false,
-              isDayPartCompleted: false,
-              score: 0,
-              completedPartsByDay: {},
-              studentAnswers: {
-                matching: {},
-                fillInBlanks: {},
-                sentences: {},
-                quizAnswers: {},
-              },
-            };
+          const isIntentionalReset = Boolean(
+            (cloudHw as any).isReset ||
+            (cloudHw.isEmpty && !cloudHasExercises && (cloudHw as any).resetAt)
+          );
+
+          if (isIntentionalReset) {
+            return cloudHw;
           }
+
+          // Defensive reconciliation: never wipe populated dailyActivities or exercises with an empty/partial snapshot
+          const mergedDaily = mergeDailyActivities(
+            prev?.dailyActivities || {},
+            cloudHw?.dailyActivities || {}
+          );
+
+          const mergedMatching = (Array.isArray(cloudHw.matchingPairs) && cloudHw.matchingPairs.length > 0)
+            ? cloudHw.matchingPairs
+            : (Array.isArray(prev.matchingPairs) && prev.matchingPairs.length > 0)
+            ? prev.matchingPairs
+            : [];
+
+          const mergedFill = (Array.isArray(cloudHw.fillInBlanks) && cloudHw.fillInBlanks.length > 0)
+            ? cloudHw.fillInBlanks
+            : (Array.isArray(prev.fillInBlanks) && prev.fillInBlanks.length > 0)
+            ? prev.fillInBlanks
+            : [];
+
+          const mergedSentences = (Array.isArray(cloudHw.sentenceWritingPrompts) && cloudHw.sentenceWritingPrompts.length > 0)
+            ? cloudHw.sentenceWritingPrompts
+            : (Array.isArray(prev.sentenceWritingPrompts) && prev.sentenceWritingPrompts.length > 0)
+            ? prev.sentenceWritingPrompts
+            : [];
+
+          const mergedVocab = (Array.isArray(cloudHw.vocabularyList) && cloudHw.vocabularyList.length > 0)
+            ? cloudHw.vocabularyList
+            : (Array.isArray(prev.vocabularyList) && prev.vocabularyList.length > 0)
+            ? prev.vocabularyList
+            : [];
+
+          const mergedAnswers = {
+            matching: { ...(prev.studentAnswers?.matching || {}), ...(cloudHw.studentAnswers?.matching || {}) },
+            fillInBlanks: { ...(prev.studentAnswers?.fillInBlanks || {}), ...(cloudHw.studentAnswers?.fillInBlanks || {}) },
+            sentences: { ...(prev.studentAnswers?.sentences || {}), ...(cloudHw.studentAnswers?.sentences || {}) },
+            quizAnswers: { ...(prev.studentAnswers?.quizAnswers || {}), ...(cloudHw.studentAnswers?.quizAnswers || {}) },
+          };
 
           return {
             ...prev,
             ...cloudHw,
+            matchingPairs: mergedMatching,
+            fillInBlanks: mergedFill,
+            sentenceWritingPrompts: mergedSentences,
+            vocabularyList: mergedVocab,
+            dailyActivities: mergedDaily,
+            studentAnswers: mergedAnswers,
             completedPartsByDay: {
+              ...(prev.completedPartsByDay || {}),
               ...(cloudHw.completedPartsByDay || {}),
             },
-            studentAnswers: {
-              matching: { ...(cloudHw.studentAnswers?.matching || {}) },
-              fillInBlanks: { ...(cloudHw.studentAnswers?.fillInBlanks || {}) },
-              sentences: { ...(cloudHw.studentAnswers?.sentences || {}) },
-              quizAnswers: { ...(cloudHw.studentAnswers?.quizAnswers || {}) },
-            },
             aiEvaluation: cloudHw.aiEvaluation || prev.aiEvaluation,
-            score: typeof cloudHw.score === 'number' ? cloudHw.score : prev.score,
+            score: typeof cloudHw.score === 'number' && cloudHw.score > 0 ? cloudHw.score : prev.score,
             isCompleted: typeof cloudHw.isCompleted === 'boolean' ? cloudHw.isCompleted : prev.isCompleted,
+            studentLevel: cloudHw.studentLevel || prev.studentLevel,
           };
         });
       },
@@ -6165,69 +6290,31 @@ export default function App() {
     }).length;
   }, [tutors]);
 
-  // Compute all words from routines and live sessions for Personal Dictionary
-  const wordsFromRoutines = useMemo(() => {
-    const list: Array<{ word: string; sourceActivityName?: string; sourceDay?: DayOfWeek }> = [];
-    if (routinesByDay && typeof routinesByDay === 'object') {
-      (Object.keys(routinesByDay) as DayOfWeek[]).forEach((day) => {
-        (routinesByDay[day] || []).forEach((act) => {
-          (act?.learnedWords || []).forEach((w) => {
-            if (w && w.trim()) {
-              list.push({
-                word: w.trim(),
-                sourceActivityName: act.activityName,
-                sourceDay: day,
-              });
-            }
-          });
-        });
-      });
-    }
-
-    // Also include vocabulary words noted by teacher during live lessons
-    (lessons || []).forEach((l) => {
-      if (l && Array.isArray(l.vocabularyNotes) && l.vocabularyNotes.length > 0) {
-        const lessonDay = getDayOfWeekFromDateString(
-          l.sessionDate || l.startDateTime,
-          userProfile?.timezone || DEFAULT_STUDENT_TIMEZONE
-        );
-        l.vocabularyNotes.forEach((vn) => {
-          if (vn && vn.word && vn.word.trim()) {
-            list.push({
-              word: vn.word.trim(),
-              sourceActivityName: `Live Session with ${l.teacherName || 'Native Friend'}`,
-              sourceDay: lessonDay || undefined,
-            });
-          }
-        });
-      }
-    });
-
-    return list;
-  }, [routinesByDay, lessons]);
-
-  // Phase 2.2E / Etapa 5: Unified consolidated active dictionary library
-  // Combines previous & current routine words, Native Friends notes, manual additions,
-  // rich definitions, and excludes persistent deletions.
-  const consolidatedActiveDictionary = useMemo(() => {
-    return buildConsolidatedActiveDictionary(
-      studentDictionaryEntries,
-      wordsFromRoutines,
-      excludedDictionaryWords,
-      userProfile?.level,
-      currentAccount?.uid,
-      currentAccount?.email
-    );
-  }, [studentDictionaryEntries, wordsFromRoutines, excludedDictionaryWords, userProfile?.level, currentAccount?.uid, currentAccount?.email]);
-
   // Handler: Save Daily Sentence and persist in Firestore Journal
   const handleSaveDailySentence = async (
     sentence: string,
     wordsUsed: string[],
     evaluationResult?: WritingEvaluationResult | null
-  ) => {
+  ): Promise<boolean> => {
     const studentUid = auth?.currentUser?.uid || currentAccount?.uid || userProfile?.id || '';
     const studentEmail = (auth?.currentUser?.email || currentAccount?.email || userProfile?.email || '').toLowerCase().trim();
+
+    if (!studentUid && !studentEmail) {
+      setNotifications((prev) => [
+        {
+          id: `err_journal_${Date.now()}`,
+          title: currentLanguage === 'en' ? 'Save Failed' : 'Falha ao Salvar',
+          message: currentLanguage === 'en'
+            ? 'User identity required to save journal entry.'
+            : 'Identificação de usuário necessária para salvar no diário.',
+          type: 'error',
+          timestamp: new Date().toISOString(),
+          read: false,
+        },
+        ...prev,
+      ]);
+      return false;
+    }
 
     const effectiveWords = (wordsUsed && wordsUsed.length > 0)
       ? wordsUsed
@@ -6255,35 +6342,56 @@ export default function App() {
       studentEmail,
     };
 
-    setDailyJournalEntries((prev) => [newJournalEntry, ...prev.filter((e) => e.id !== newJournalEntry.id)]);
+    try {
+      // 1. Await Firestore confirmation BEFORE updating state or showing success
+      const success = await saveStudentJournalEntryToFirestore(studentUid, newJournalEntry, studentEmail);
+      if (!success) {
+        throw new Error('Save to Firestore was not confirmed');
+      }
 
-    setUserProfile((prev) => ({
-      ...prev,
-      dailyJournalEntries: [
-        newJournalEntry,
-        ...(prev.dailyJournalEntries || []).filter((e) => e.id !== newJournalEntry.id),
-      ],
-    }));
+      // 2. Only update state upon confirmed Firestore write
+      setDailyJournalEntries((prev) => [newJournalEntry, ...prev.filter((e) => e.id !== newJournalEntry.id)]);
 
-    // Phase 2.2E (Etapas 1 & 2):
-    // 1. Frase do Dia is strictly saved in My Journal via saveStudentJournalEntryToFirestore.
-    // 2. No recordActivityInStudentJournal call (removes S-Path video_day collateral checkmark).
-    // 3. No markVocabularyWordsPracticedInFirestore call (removes practiceCount/history contamination).
-    if (studentUid || studentEmail) {
-      saveStudentJournalEntryToFirestore(studentUid, newJournalEntry, studentEmail);
+      setUserProfile((prev) => ({
+        ...prev,
+        dailyJournalEntries: [
+          newJournalEntry,
+          ...(prev.dailyJournalEntries || []).filter((e) => e.id !== newJournalEntry.id),
+        ],
+      }));
+
+      // 3. Notify user of success WITHOUT exposing personal sentence text in notification or logs
+      setNotifications((prev) => [
+        {
+          id: `notif-${Date.now()}`,
+          title: currentLanguage === 'en' ? 'Sentence Saved to Journal!' : 'Frase Salva no Diário!',
+          message: currentLanguage === 'en'
+            ? 'Your daily sentence was securely recorded in your journal.'
+            : 'Sua frase do dia foi registrada com segurança no seu diário.',
+          type: 'success',
+          timestamp: new Date().toISOString(),
+          read: false,
+        },
+        ...prev,
+      ]);
+
+      return true;
+    } catch {
+      setNotifications((prev) => [
+        {
+          id: `err_journal_${Date.now()}`,
+          title: currentLanguage === 'en' ? 'Save Failed' : 'Falha ao Salvar',
+          message: currentLanguage === 'en'
+            ? 'Unable to save your sentence to Firestore. Please try again.'
+            : 'Não foi possível salvar sua frase no Firestore. Por favor, tente novamente.',
+          type: 'error',
+          timestamp: new Date().toISOString(),
+          read: false,
+        },
+        ...prev,
+      ]);
+      return false;
     }
-
-    setNotifications((prev) => [
-      {
-        id: `notif-${Date.now()}`,
-        title: currentLanguage === 'en' ? 'Sentence Saved to Journal!' : 'Frase Salva no Diário!',
-        message: sentence,
-        type: 'success',
-        timestamp: new Date().toISOString(),
-        read: false,
-      },
-      ...prev,
-    ]);
   };
 
   const handleDeleteJournalEntry = async (entryId: string) => {
@@ -7385,6 +7493,19 @@ export default function App() {
         const currentDaily = { ...(updated.dailyActivities || weeklyHomework?.dailyActivities || {}) };
         const resolvedUid = (currentAccount?.uid || userProfile?.id || (userProfile as any)?.uid || '').trim();
         if (activeDay) {
+          const activityCandidate = {
+            ...(currentDaily[activeDay] || {}),
+            studentAnswers: updated.studentAnswers,
+            partsProgress: updated.partsProgress,
+            aiEvaluation: updated.aiEvaluation,
+            score: updated.score,
+            isCompleted: Boolean(updated.completedPartsByDay?.[activeDay] || updated.isCompleted),
+          };
+          const isStarted = Boolean(
+            isActivityStartedOrAnswered(updated) ||
+            isActivityStartedOrAnswered(activityCandidate)
+          );
+
           currentDaily[activeDay] = {
             ...(currentDaily[activeDay] || {}),
             id: currentDaily[activeDay]?.id || `hw-${activeDay}-${userProfile?.weeklyCycle || 1}`,
@@ -7402,7 +7523,7 @@ export default function App() {
             aiEvaluation: updated.aiEvaluation,
             score: updated.score,
             isCompleted: Boolean(updated.completedPartsByDay?.[activeDay] || updated.isCompleted),
-            isStarted: true,
+            isStarted,
             updatedAt: new Date().toISOString(),
           };
         }
@@ -7433,6 +7554,19 @@ export default function App() {
         const currentDaily = { ...(updated.dailyActivities || weeklyHomework?.dailyActivities || {}) };
         const resolvedUid = (currentAccount?.uid || userProfile?.id || (userProfile as any)?.uid || '').trim();
         if (activeDay) {
+          const activityCandidate = {
+            ...(currentDaily[activeDay] || {}),
+            studentAnswers: updated.studentAnswers,
+            partsProgress: updated.partsProgress,
+            aiEvaluation: updated.aiEvaluation,
+            score: updated.score,
+            isCompleted: Boolean(updated.completedPartsByDay?.[activeDay] || updated.isCompleted),
+          };
+          const isStarted = Boolean(
+            isActivityStartedOrAnswered(updated) ||
+            isActivityStartedOrAnswered(activityCandidate)
+          );
+
           currentDaily[activeDay] = {
             ...(currentDaily[activeDay] || {}),
             id: currentDaily[activeDay]?.id || `hw-${activeDay}-${userProfile?.weeklyCycle || 1}`,
@@ -7450,7 +7584,7 @@ export default function App() {
             aiEvaluation: updated.aiEvaluation,
             score: updated.score,
             isCompleted: Boolean(updated.completedPartsByDay?.[activeDay] || updated.isCompleted),
-            isStarted: true,
+            isStarted,
             updatedAt: new Date().toISOString(),
           };
         }

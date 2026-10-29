@@ -37,8 +37,13 @@ import {
   isValidHomeworkEvaluation,
 } from '../utils/writingChecker';
 import { getMemorizationTranslations } from '../utils/i18n/memorizationActivity';
-import { getDailyMemorizationSchedule, generatePart4StoryWithAi } from '../utils/homeworkGenerator';
-import { isBadStoryText } from '../utils/pedagogicalStorySynthesizer';
+import {
+  getDailyMemorizationSchedule,
+  generatePart4StoryWithAi,
+  deriveContextualSentencePrompt,
+  isActivityStartedOrAnswered,
+} from '../utils/homeworkGenerator';
+import { isBadStoryText, synthesizeFillInBlanks } from '../utils/pedagogicalStorySynthesizer';
 import { speakText } from '../utils/audio';
 
 interface WeeklyHomeworkModalProps {
@@ -325,15 +330,18 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
   };
 
   const studentLevelDisplay = useMemo(() => {
-    const raw = (homework?.studentLevel || 'Beginner').toLowerCase();
-    if (raw.includes('avan') || raw.includes('advan')) {
+    const raw = String(homework?.studentLevel || (homework as any)?.level || 'intermediate').toLowerCase();
+    if (raw.includes('avan') || raw.includes('advan') || raw.includes('c1') || raw.includes('c2')) {
       return isEn ? 'Advanced Level' : 'Nível Avançado';
     }
-    if (raw.includes('inter')) {
+    if (raw.includes('inter') || raw.includes('b1') || raw.includes('b2')) {
       return isEn ? 'Intermediate Level' : 'Nível Intermediário';
     }
-    return isEn ? 'Beginner Level' : 'Nível Iniciante';
-  }, [homework?.studentLevel, isEn]);
+    if (raw.includes('inic') || raw.includes('begin') || raw.includes('a1') || raw.includes('a2')) {
+      return isEn ? 'Beginner Level' : 'Nível Iniciante';
+    }
+    return isEn ? 'Intermediate Level' : 'Nível Intermediário';
+  }, [homework?.studentLevel, (homework as any)?.level, isEn]);
 
   const formattedWeekLabel = useMemo(() => {
     if (!homework?.weekLabel) return '';
@@ -446,8 +454,21 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     if (Array.isArray(homework?.matchingPairs) && homework.matchingPairs.length > 0) {
       return homework.matchingPairs;
     }
+    const words = (Array.isArray(activeDayActivity?.selectedWords) && activeDayActivity.selectedWords.length > 0)
+      ? activeDayActivity.selectedWords
+      : (Array.isArray(homework?.vocabularyList) && homework.vocabularyList.length > 0)
+      ? homework.vocabularyList
+      : [];
+    if (words.length > 0) {
+      return words.map((v: any, idx: number) => ({
+        id: `pair-${idx + 1}`,
+        word: typeof v === 'string' ? v : v.word,
+        definition: typeof v === 'string' ? '' : (v.definitionEn || ''),
+        translation: typeof v === 'string' ? '' : (v.translationPt || ''),
+      }));
+    }
     return [];
-  }, [activeDayActivity?.matchingPairs, homework?.matchingPairs]);
+  }, [activeDayActivity?.matchingPairs, activeDayActivity?.selectedWords, homework?.matchingPairs, homework?.vocabularyList]);
 
   const safeFillInBlanks = useMemo(() => {
     if (Array.isArray(activeDayActivity?.fillInBlanks) && activeDayActivity.fillInBlanks.length > 0) {
@@ -456,8 +477,19 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     if (Array.isArray(homework?.fillInBlanks) && homework.fillInBlanks.length > 0) {
       return homework.fillInBlanks;
     }
+    const words = (Array.isArray(activeDayActivity?.selectedWords) && activeDayActivity.selectedWords.length > 0)
+      ? activeDayActivity.selectedWords
+      : (Array.isArray(homework?.vocabularyList) && homework.vocabularyList.length > 0)
+      ? homework.vocabularyList
+      : [];
+    if (words.length > 0) {
+      return synthesizeFillInBlanks(
+        words.map((v: any) => typeof v === 'string' ? v : v.word),
+        words
+      );
+    }
     return [];
-  }, [activeDayActivity?.fillInBlanks, homework?.fillInBlanks]);
+  }, [activeDayActivity?.fillInBlanks, activeDayActivity?.selectedWords, homework?.fillInBlanks, homework?.vocabularyList]);
 
   const safeSentenceWritingPrompts = useMemo(() => {
     if (Array.isArray(activeDayActivity?.sentenceWritingPrompts) && activeDayActivity.sentenceWritingPrompts.length > 0) {
@@ -466,8 +498,24 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     if (Array.isArray(homework?.sentenceWritingPrompts) && homework.sentenceWritingPrompts.length > 0) {
       return homework.sentenceWritingPrompts;
     }
+    const words = (Array.isArray(activeDayActivity?.selectedWords) && activeDayActivity.selectedWords.length > 0)
+      ? activeDayActivity.selectedWords
+      : (Array.isArray(homework?.vocabularyList) && homework.vocabularyList.length > 0)
+      ? homework.vocabularyList
+      : [];
+    if (words.length > 0) {
+      return words.map((v: any) => deriveContextualSentencePrompt({
+        word: typeof v === 'string' ? v : v.word,
+        definitionEn: typeof v === 'string' ? '' : (v.definitionEn || ''),
+        translationPt: typeof v === 'string' ? '' : (v.translationPt || ''),
+        exampleSentence: typeof v === 'string' ? '' : (v.exampleSentence || ''),
+        sourceActivityName: typeof v === 'string' ? '' : (v.sourceActivityName || ''),
+        partOfSpeech: typeof v === 'string' ? '' : (v.partOfSpeech || ''),
+        cefrLevel: typeof v === 'string' ? '' : (v.cefrLevel || ''),
+      }));
+    }
     return [];
-  }, [activeDayActivity?.sentenceWritingPrompts, homework?.sentenceWritingPrompts]);
+  }, [activeDayActivity?.sentenceWritingPrompts, activeDayActivity?.selectedWords, homework?.sentenceWritingPrompts, homework?.vocabularyList]);
 
   React.useEffect(() => {
     const dayAnswers =
@@ -552,7 +600,19 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       aiEvaluation: effectiveEvaluation,
       score: effectiveScore,
       isCompleted: Boolean(effectiveIsCompleted || homework?.completedPartsByDay?.[targetDay]),
-      isStarted: true,
+      isStarted: isActivityStartedOrAnswered({
+        ...(currentDaily[targetDay] || {}),
+        studentAnswers: {
+          matching: matchingAnswers,
+          fillInBlanks: fillAnswers,
+          sentences: sentenceAnswers,
+          quizAnswers: quizAnswers,
+        },
+        partsProgress,
+        aiEvaluation: effectiveEvaluation,
+        score: effectiveScore,
+        isCompleted: Boolean(effectiveIsCompleted || homework?.completedPartsByDay?.[targetDay]),
+      }),
       updatedAt: new Date().toISOString(),
     };
 
@@ -696,7 +756,21 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
           aiEvaluation,
           score: homework.score || 0,
           isCompleted: Boolean(homework.isCompleted),
-          isStarted: Boolean((homework as any).isStarted || Object.keys(quizAnswers).length > 0),
+          isStarted: isActivityStartedOrAnswered({
+            ...(currentDaily[activeDayKey] || {}),
+            studentAnswers: {
+              ...(currentDaily[activeDayKey]?.studentAnswers || {}),
+              ...homework.studentAnswers,
+              matching: matchingAnswers,
+              fillInBlanks: fillAnswers,
+              sentences: sentenceAnswers,
+              quizAnswers: quizAnswers,
+            },
+            partsProgress,
+            aiEvaluation,
+            score: homework.score || 0,
+            isCompleted: Boolean(homework.isCompleted),
+          }),
           updatedAt: new Date().toISOString(),
         };
 
