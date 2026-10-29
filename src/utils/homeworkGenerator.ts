@@ -782,12 +782,22 @@ export function resolveDailyMemorizationVocabulary(params: {
         : undefined
     );
 
+    const resolvedPartOfSpeech =
+      rawItem?.partOfSpeech ||
+      dictMatch?.partOfSpeech ||
+      (staticDict as any)?.partOfSpeech ||
+      prof?.partOfSpeech;
+    const resolvedCefr =
+      rawItem?.cefrLevel ||
+      dictMatch?.cefrLevel ||
+      (staticDict as any)?.cefrLevel;
+
     return {
       id: rawItem?.id || dictMatch?.id || `vocab_${norm}`,
       word: cleanWord,
-      definitionEn: rawItem?.definitionEn || dictMatch?.definitionEn || prof.definitionEn,
-      translationPt: rawItem?.translationPt || dictMatch?.translationPt || prof.translationPt,
-      exampleSentence: rawItem?.exampleSentence || dictMatch?.exampleSentence || prof.exampleSentenceEn,
+      definitionEn: rawItem?.definitionEn || rawItem?.meaningOrTip || dictMatch?.definitionEn || (staticDict ? staticDict.definitionEn : prof.definitionEn),
+      translationPt: rawItem?.translationPt || dictMatch?.translationPt || (staticDict ? staticDict.translationPt : prof.translationPt),
+      exampleSentence: rawItem?.exampleSentence || dictMatch?.exampleSentence || (staticDict ? staticDict.exampleSentence : prof.exampleSentenceEn),
       sourceActivityName: sourceActivity,
       sourceDay: targetDay,
       source: originType === 'native_friend' ? 'live_lesson' : 'routine',
@@ -804,6 +814,8 @@ export function resolveDailyMemorizationVocabulary(params: {
           ? rawItem.practiceCount
           : (dictMatch as any)?.practiceCount || 0,
       lastPracticedAt: rawItem?.lastPracticedAt || (dictMatch as any)?.lastPracticedAt,
+      partOfSpeech: resolvedPartOfSpeech,
+      cefrLevel: resolvedCefr,
     };
   };
 
@@ -1009,6 +1021,434 @@ export function buildDailyVocabularyQueueForDay(
     studentEmail,
     excludedWords,
   });
+}
+
+export interface ContextualSentencePromptParams {
+  word: string;
+  definitionEn?: string;
+  translationPt?: string;
+  exampleSentence?: string;
+  sourceActivityName?: string;
+  partOfSpeech?: string;
+  cefrLevel?: string;
+  studentLevel?: string;
+}
+
+/**
+ * Validates whether a definition is genuine and pedagogically informative,
+ * or merely a generic synthetic placeholder / boilerplate.
+ */
+export function isGenericPedagogicalDefinition(def?: string): boolean {
+  if (!def || typeof def !== 'string') return true;
+  const t = def.trim().toLowerCase();
+  if (t.length < 5) return true;
+  return (
+    t.includes('an important concept, role, or term referring to') ||
+    t.includes('to engage in, conduct, or carry out the action of') ||
+    t.includes('characterized by being') ||
+    t.includes('in a distinct manner, degree, or timing characterized as') ||
+    t.includes('core active vocabulary applied') ||
+    t.includes('active vocabulary practiced during') ||
+    t.includes('key vocabulary term practiced') ||
+    t.includes('applied during your daily') ||
+    t.includes('understanding how to optimize') ||
+    t.includes('the team established a') ||
+    t.includes('key concept representing') ||
+    t.includes('descriptive term characterizing') ||
+    t.includes('action term describing') ||
+    t.includes('modifying term highlighting') ||
+    t.includes('with clear intention creates noticeable progress') ||
+    t.includes('focus on the sentence context to identify') ||
+    t.includes('practicing with') ||
+    t.includes('builds natural fluency and confidence') ||
+    t.includes('plays an indispensable role') ||
+    t.includes('having a clear and structured') ||
+    t.includes('definition not available') ||
+    t.includes('no definition provided') ||
+    t.includes('meaning not specified') ||
+    t.includes('n/a') ||
+    t === 'to practice' ||
+    t === 'vocabulary word' ||
+    t === 'general vocabulary'
+  );
+}
+
+/**
+ * Detects whether the provided lexical parameters are contradictory,
+ * mutually incompatible, or ambiguously unresolved without a disambiguating context.
+ */
+export function isContradictoryOrAmbiguousContext(params: {
+  word: string;
+  definitionEn?: string;
+  translationPt?: string;
+  exampleSentence?: string;
+  sourceActivityName?: string;
+  partOfSpeech?: string;
+}): boolean {
+  const def = (params.definitionEn || '').trim().toLowerCase();
+  const act = (params.sourceActivityName || '').trim().toLowerCase();
+  const pos = (params.partOfSpeech || '').trim().toLowerCase();
+  const trans = (params.translationPt || '').trim().toLowerCase();
+
+  // 1. Explicit unresolved multiple meanings or ambiguity markers
+  if (
+    def.includes('multiple meanings') ||
+    def.includes('various meanings') ||
+    def.includes('different meanings depending on context') ||
+    def.includes('ambiguous meaning') ||
+    def.includes('meaning depends on context')
+  ) {
+    return true;
+  }
+
+  // 2. Ambiguity in source activity without disambiguating definition
+  if (
+    (act.includes('unspecified') || act.includes('no context') || act.includes('ambiguous')) &&
+    (!def || isGenericPedagogicalDefinition(def))
+  ) {
+    return true;
+  }
+
+  // 3. POS vs Definition contradiction
+  if (pos && def) {
+    const isInfinitiveVerb = /^to\s+[a-z]{3,}\b/.test(def);
+    const isNounPos = pos === 'noun' || pos === 'substantivo';
+    if (isNounPos && isInfinitiveVerb && !def.includes('ability to') && !def.includes('tendency to') && !def.includes('attempt to') && !def.includes('act to')) {
+      return true;
+    }
+
+    const isConcreteNounDef = /^(a|an|the)\s+(person|device|tool|instrument|vehicle|building|room|machine|substance|plant|animal)\b/.test(def);
+    const isVerbPos = pos === 'verb' || pos === 'verbo';
+    if (isVerbPos && isConcreteNounDef) {
+      return true;
+    }
+
+    const isAdjPos = pos === 'adjective' || pos === 'adjetivo';
+    if (isAdjPos && isInfinitiveVerb) {
+      return true;
+    }
+  }
+
+  // 4. Definition vs Translation severe domain contradiction
+  if (def.includes('financial institution') && trans.includes('margem de rio')) {
+    return true;
+  }
+  if (def.includes('river bank') && trans.includes('instituição financeira')) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Checks if a sentence writing prompt is already personalized and valid,
+ * distinguishing it from legacy generic CEFR templates.
+ */
+export function isPersonalizedPrompt(p?: Partial<SentenceWritingPrompt> | null): boolean {
+  if (!p) return false;
+  const hint = (p.hint || p.hintEn || p.hintPt || '').trim();
+  if (!hint) return false;
+
+  const lower = hint.toLowerCase();
+  const isOldGeneric =
+    lower.includes('formulate an advanced sentence applying') ||
+    lower.includes('write a realistic compound sentence with') ||
+    lower.includes('write a clear, direct english sentence about your daily routine') ||
+    lower.includes('formule uma frase em nível avançado aplicando') ||
+    lower.includes('escreva uma frase intermediária autêntica com') ||
+    lower.includes('escreva uma frase simples e direta sobre sua rotina') ||
+    lower.includes('escreva uma frase completa em inglês usando');
+
+  return !isOldGeneric;
+}
+
+/**
+ * Phase 6: Deterministically derives a contextualized sentence writing prompt
+ * based on verified word semantic data (definition, translation, example, source activity, POS, CEFR).
+ * Zero additional Gemini API calls. Returns empty prompts when context is insufficient or ambiguous.
+ */
+export function deriveContextualSentencePrompt(
+  params: ContextualSentencePromptParams
+): SentenceWritingPrompt {
+  const cleanWord = (params.word || '').trim();
+  if (!cleanWord) {
+    return { word: '', hint: '', hintEn: '', hintPt: '', levelInstruction: '' };
+  }
+
+  const rawDef = (params.definitionEn || '').trim();
+  const rawTrans = (params.translationPt || '').trim();
+  const rawEx = (params.exampleSentence || '').trim();
+  const sourceAct = (params.sourceActivityName || '').trim();
+  const pos = (params.partOfSpeech || '').trim().toLowerCase();
+  const studentLvl = (params.studentLevel || params.cefrLevel || 'intermediate').toLowerCase();
+
+  const isAdv = studentLvl.includes('avanc') || studentLvl.includes('advan') || studentLvl.includes('c1') || studentLvl.includes('c2');
+
+  const lowerWord = cleanWord.toLowerCase();
+  const hasRealDef = rawDef.length > 0 && !isGenericPedagogicalDefinition(rawDef);
+  const hasRealEx =
+    rawEx.length > 0 &&
+    !isGenericPedagogicalDefinition(rawEx) &&
+    rawEx.toLowerCase().includes(lowerWord) &&
+    !rawEx.toLowerCase().includes('i practice using');
+
+  // Rule 4 & 8: If no valid definition AND no contextual example -> context is insufficient
+  // Translation alone is NOT sufficient context without definition/example.
+  if (!hasRealDef && !hasRealEx) {
+    return {
+      word: cleanWord,
+      hint: '',
+      hintEn: '',
+      hintPt: '',
+      levelInstruction: '',
+    };
+  }
+
+  // Rule 8: If contradictory or ambiguous -> omit rather than provide false guidance
+  if (
+    isContradictoryOrAmbiguousContext({
+      word: cleanWord,
+      definitionEn: rawDef,
+      translationPt: rawTrans,
+      exampleSentence: rawEx,
+      sourceActivityName: sourceAct,
+      partOfSpeech: pos,
+    })
+  ) {
+    return {
+      word: cleanWord,
+      hint: '',
+      hintEn: '',
+      hintPt: '',
+      levelInstruction: '',
+    };
+  }
+
+  // We have genuine context!
+  // Determine register, communicative domain, and semantic affordances:
+  const defLower = rawDef.toLowerCase();
+  const transLower = rawTrans.toLowerCase();
+  const actLower = sourceAct.toLowerCase();
+
+  let hintEn = '';
+  let hintPt = '';
+  let levelInstruction = '';
+
+  // 1. Pragmatic Register: Informal / Colloquial / Disbelief / Insincerity
+  // e.g. BULLSHIT or colloquial slang
+  const isInformalOrTaboo =
+    /\b(informal|slang|colloquial|vulgar|taboo|pejorative|derogatory|swear|insincere|deceitful)\b/i.test(defLower) ||
+    /\b(besteira|balela|conversa fiada|palavrão|gíria)\b/i.test(transLower) ||
+    lowerWord === 'bullshit';
+
+  const isNonsenseOrUntrue =
+    defLower.includes('untrue') ||
+    defLower.includes('deceitful') ||
+    defLower.includes('insincere') ||
+    defLower.includes('exaggerated') ||
+    defLower.includes('nonsense') ||
+    transLower.includes('besteira') ||
+    transLower.includes('balela') ||
+    transLower.includes('conversa fiada');
+
+  if (isInformalOrTaboo && isNonsenseOrUntrue) {
+    hintEn = `Use "${cleanWord}" in an informal context to express skepticism or reject a statement you consider untrue or insincere.`;
+    hintPt = `Use "${cleanWord}" em um contexto informal para expressar ceticismo ou rejeitar uma afirmação que você considera falsa ou sem sinceridade.`;
+    levelInstruction = isAdv
+      ? 'Contextualize in candid dialogue, personal reflection, or calling out exaggeration.'
+      : '';
+    return { word: cleanWord, hint: hintEn, hintEn, hintPt, levelInstruction };
+  }
+
+  // 2. Structural text formatting / list presentation / slide design
+  // e.g. BULLET (list marker)
+  const isListOrPresentation =
+    defLower.includes('list') ||
+    defLower.includes('items in a list') ||
+    defLower.includes('presentation slides') ||
+    defLower.includes('printed text') ||
+    defLower.includes('symbol used') ||
+    transLower.includes('marcador de tópicos') ||
+    transLower.includes('ponto de lista') ||
+    actLower.includes('presentation') ||
+    actLower.includes('slide') ||
+    actLower.includes('notes');
+
+  if (
+    isListOrPresentation &&
+    (defLower.includes('dot') || defLower.includes('mark') || defLower.includes('symbol') || defLower.includes('list') || transLower.includes('marcador') || transLower.includes('tópico'))
+  ) {
+    hintEn = `Apply "${cleanWord}" in the context of organizing information, such as preparing slides, meeting notes, or list items.`;
+    hintPt = `Aplique "${cleanWord}" no contexto de organização de texto, como na preparação de slides, notas de reunião ou tópicos de uma lista.`;
+    levelInstruction = '';
+    return { word: cleanWord, hint: hintEn, hintEn, hintPt, levelInstruction };
+  }
+
+  // 3. Tracking metrics / plotting / data monitoring / progress over time
+  // e.g. CHARTING
+  const isTrackingOrMetrics =
+    defLower.includes('charting') ||
+    defLower.includes('tracking') ||
+    defLower.includes('mapping progress') ||
+    defLower.includes('trends') ||
+    defLower.includes('record over time') ||
+    defLower.includes('graph') ||
+    transLower.includes('rastreamento') ||
+    transLower.includes('mapeamento') ||
+    transLower.includes('registro de dados') ||
+    actLower.includes('metrics') ||
+    actLower.includes('data');
+
+  if (isTrackingOrMetrics) {
+    hintEn = `Use "${cleanWord}" to describe tracking progress, monitoring metrics, or mapping data trends over time.`;
+    hintPt = `Use "${cleanWord}" para descrever o acompanhamento de métricas, o monitoramento do progresso ou a análise de dados ao longo do tempo.`;
+    levelInstruction = isAdv
+      ? 'Reference measurable outcomes, strategic indicators, or organizational trends.'
+      : '';
+    return { word: cleanWord, hint: hintEn, hintEn, hintPt, levelInstruction };
+  }
+
+  // 4. Contingency / Condition & consequence / Alternatives
+  // e.g. OTHERWISE
+  const isContingencyOrAlternative =
+    defLower.includes('if a circumstance is different') ||
+    defLower.includes('if a condition is not met') ||
+    defLower.includes('what will or might happen') ||
+    defLower.includes('in a different way') ||
+    defLower.includes('or else') ||
+    transLower.includes('caso contrário') ||
+    transLower.includes('de outro modo') ||
+    transLower.includes('senão');
+
+  if (isContingencyOrAlternative) {
+    hintEn = `Use "${cleanWord}" to connect an important condition or requirement with the consequence that happens if it is not met.`;
+    hintPt = `Use "${cleanWord}" para relacionar uma ação ou condição importante à consequência que ocorrerá caso ela não seja cumprida.`;
+    levelInstruction = `State the condition first, followed by "${cleanWord}" and the outcome.`;
+    return { word: cleanWord, hint: hintEn, hintEn, hintPt, levelInstruction };
+  }
+
+  // 5. Sensory / subtle light / faint emergence of hope or opportunity
+  // e.g. GLIMMERING
+  const isLightOrFaintHope =
+    defLower.includes('shining faintly') ||
+    defLower.includes('unsteady light') ||
+    defLower.includes('faint sign of hope') ||
+    defLower.includes('initial sign of') ||
+    transLower.includes('cintilante') ||
+    transLower.includes('lampejo') ||
+    transLower.includes('esperança');
+
+  if (isLightOrFaintHope) {
+    hintEn = `Apply "${cleanWord}" to describe either a soft, unsteady light (like water reflections) or an emerging sign of hope and new possibility.`;
+    hintPt = `Aplique "${cleanWord}" para descrever uma luz suave e tremeluzente ou um vislumbre sutil de esperança e oportunidade.`;
+    levelInstruction = '';
+    return { word: cleanWord, hint: hintEn, hintEn, hintPt, levelInstruction };
+  }
+
+  // 6. Action / Verb semantics (starting with "To [verb]..." or POS verb)
+  if (hasRealDef && (pos === 'verb' || /^to\s+[a-z]{3,}\b/i.test(rawDef))) {
+    const cleanedAction = rawDef
+      .replace(/^to\s+/i, '')
+      .replace(/\.$/, '')
+      .trim();
+
+    if (defLower.includes('hot drink') || defLower.includes('boiling water') || defLower.includes('tea or coffee')) {
+      hintEn = `Use "${cleanWord}" to describe preparing or brewing a hot drink (such as coffee or tea) in your routine.`;
+      hintPt = `Use "${cleanWord}" para descrever o preparo de uma bebida quente (como café ou chá) na sua rotina.`;
+    } else if (defLower.includes('liquid to flow') || defLower.includes('into another vessel')) {
+      hintEn = `Use "${cleanWord}" to describe serving or pouring a liquid into a cup or container.`;
+      hintPt = `Use "${cleanWord}" para descrever o ato de servir ou despejar um líquido em uma xícara ou recipiente.`;
+    } else if (defLower.includes('small mouthfuls') || defLower.includes('drink something by taking')) {
+      hintEn = `Use "${cleanWord}" to describe enjoying or tasting a drink in small, slow sips.`;
+      hintPt = `Use "${cleanWord}" para descrever o ato de saborear ou beber algo em pequenos goles.`;
+    } else if (defLower.includes('period of work or tension') || defLower.includes('rest from work')) {
+      hintEn = `Use "${cleanWord}" to describe how you relax and unwind after a busy or demanding period.`;
+      hintPt = `Use "${cleanWord}" para descrever como você relaxa e descansa após um período intenso de trabalho ou esforço.`;
+    } else if (defLower.includes('straighten') || defLower.includes('limbs') || defLower.includes('flexibility')) {
+      hintEn = `Use "${cleanWord}" to describe stretching your muscles to relieve tension or improve flexibility.`;
+      hintPt = `Use "${cleanWord}" para descrever o alongamento do corpo para aliviar a tensão ou melhorar a flexibilidade.`;
+    } else if (cleanedAction) {
+      const actionWords = cleanedAction.split(/\s+/);
+      const shortAction = actionWords.length > 9 ? actionWords.slice(0, 9).join(' ') : cleanedAction;
+      hintEn = `Use "${cleanWord}" to describe the action of ${shortAction}.`;
+      const transHead = rawTrans ? rawTrans.split('/')[0].trim() : '';
+      hintPt = transHead
+        ? `Use "${cleanWord}" (${transHead}) para expressar a ação de ${shortAction}.`
+        : `Use "${cleanWord}" para expressar a ação de ${shortAction}.`;
+    }
+
+    if (hintEn && hintPt) {
+      return { word: cleanWord, hint: hintEn, hintEn, hintPt, levelInstruction: '' };
+    }
+  }
+
+  // 7. Physical Tools / Utensils / Daily Routine Nouns
+  if (
+    hasRealDef &&
+    (defLower.includes('cup with a handle') ||
+      defLower.includes('pan with a long handle') ||
+      defLower.includes('exercise machine') ||
+      defLower.includes('meal eaten in the middle') ||
+      defLower.includes('sliced bread made crisp'))
+  ) {
+    if (defLower.includes('cup with a handle')) {
+      hintEn = `Use "${cleanWord}" to describe having a warm beverage in your morning or evening routine.`;
+      hintPt = `Use "${cleanWord}" para descrever o momento de saborear uma bebida quente na sua rotina.`;
+    } else if (defLower.includes('pan with a long handle')) {
+      hintEn = `Use "${cleanWord}" in the context of preparing or cooking food in the kitchen.`;
+      hintPt = `Use "${cleanWord}" no contexto de cozinhar ou preparar alimentos na cozinha.`;
+    } else if (defLower.includes('exercise machine')) {
+      hintEn = `Use "${cleanWord}" to describe an indoor workout or cardiovascular training session.`;
+      hintPt = `Use "${cleanWord}" para descrever um treino cardiovascular ou corrida em ambiente interno.`;
+    } else if (defLower.includes('meal eaten in the middle')) {
+      hintEn = `Use "${cleanWord}" to describe having a midday meal with colleagues, friends, or family.`;
+      hintPt = `Use "${cleanWord}" para descrever o momento da refeição do meio-dia com colegas ou familiares.`;
+    } else if (defLower.includes('sliced bread')) {
+      hintEn = `Use "${cleanWord}" in the context of having breakfast or a quick snack.`;
+      hintPt = `Use "${cleanWord}" no contexto do café da manhã ou de um lanche rápido.`;
+    }
+    return { word: cleanWord, hint: hintEn, hintEn, hintPt, levelInstruction: '' };
+  }
+
+  // 8. General Noun / Concept semantics
+  if (hasRealDef && (pos === 'noun' || /^(a|an|the)\s+/i.test(rawDef))) {
+    const cleanConcept = rawDef
+      .replace(/^(a|an|the)\s+/i, '')
+      .replace(/\.$/, '')
+      .trim();
+    if (cleanConcept) {
+      const conceptWords = cleanConcept.split(/\s+/);
+      const shortConcept = conceptWords.length > 9 ? conceptWords.slice(0, 9).join(' ') : cleanConcept;
+
+      hintEn = `Apply "${cleanWord}" in a sentence related to ${shortConcept}.`;
+      const transHead = rawTrans ? rawTrans.split('/')[0].trim() : '';
+      hintPt = transHead
+        ? `Aplique "${cleanWord}" (${transHead}) em uma frase sobre esse tema ou contexto.`
+        : `Aplique "${cleanWord}" em uma frase sobre esse tema ou contexto.`;
+      return { word: cleanWord, hint: hintEn, hintEn, hintPt, levelInstruction: '' };
+    }
+  }
+
+  // 9. Adjective / Descriptive semantics
+  if (hasRealDef && (pos === 'adjective' || defLower.includes('characterized by') || defLower.includes('expressing a'))) {
+    hintEn = `Apply "${cleanWord}" to describe a person, situation, or quality characterized by this state.`;
+    const transHead = rawTrans ? rawTrans.split('/')[0].trim() : '';
+    hintPt = transHead
+      ? `Aplique "${cleanWord}" (${transHead}) para descrever uma pessoa, situação ou característica.`
+      : `Aplique "${cleanWord}" para descrever uma pessoa, situação ou característica.`;
+    return { word: cleanWord, hint: hintEn, hintEn, hintPt, levelInstruction: '' };
+  }
+
+  // 10. Fallback on authentic contextual example if definition was absent
+  if (!hasRealDef && hasRealEx) {
+    hintEn = `Apply "${cleanWord}" in a realistic sentence similar to how it was used in your lesson or routine.`;
+    hintPt = `Aplique "${cleanWord}" em uma frase realista contextualizada na sua rotina ou conversa recente.`;
+    return { word: cleanWord, hint: hintEn, hintEn, hintPt, levelInstruction: '' };
+  }
+
+  // Default fallback if context cannot be reliably articulated without guessing:
+  // Rule 4: Return empty rather than generic boilerplate!
+  return { word: cleanWord, hint: '', hintEn: '', hintPt: '', levelInstruction: '' };
 }
 
 export function generateWeeklyHomework(
@@ -1245,43 +1685,30 @@ export function generateWeeklyHomework(
     rawWords
   );
 
-  // 4. Build Sentence Writing Prompts (Part 3 - Construção de Frases Ativas): Calibrado por nível
-  const sentenceWritingPrompts: SentenceWritingPrompt[] = rawWords.slice(0, 5).map((item) => {
-    const prof = profileWord(item.word);
-    let hintEn = '';
-    let hintPt = '';
+  // 4. Build Sentence Writing Prompts (Part 3 - Construção de Frases Ativas Contextuais - FASE 6)
+  const existingPrompts = targetDay && existingDailyActivities?.[targetDay]?.sentenceWritingPrompts;
 
-    if (isAdv) {
-      hintEn = `Formulate an advanced sentence applying "${item.word}" to analyze a complex decision, project challenge, or strategic goal in your career.`;
-      hintPt = `Formule uma frase em nível avançado aplicando "${item.word}" (${prof.translationPt}) para analisar uma decisão complexa, desafio de projeto ou meta estratégica.`;
-      return {
-        word: item.word,
-        hint: hintEn,
-        hintEn,
-        hintPt,
-        levelInstruction: 'Use complex clauses, conditionals (if/would), or executive phrasing.',
-      };
+  const sentenceWritingPrompts: SentenceWritingPrompt[] = rawWords.slice(0, 5).map((item) => {
+    // Preserve existing valid personalized prompts for this word across updates
+    if (Array.isArray(existingPrompts)) {
+      const match = existingPrompts.find(
+        (ep) => ep && ep.word && ep.word.trim().toLowerCase() === item.word.trim().toLowerCase()
+      );
+      if (match && isPersonalizedPrompt(match)) {
+        return match;
+      }
     }
-    if (isInter) {
-      hintEn = `Write a realistic compound sentence with "${item.word}" connecting two related actions or explaining a key reason in your daily routine or work.`;
-      hintPt = `Escreva uma frase intermediária autêntica com "${item.word}" (${prof.translationPt}) conectando duas ações ou explicando uma razão da sua rotina ou trabalho.`;
-      return {
-        word: item.word,
-        hint: hintEn,
-        hintEn,
-        hintPt,
-        levelInstruction: 'Connect two ideas using a connector like "because", "although", "since", or "while".',
-      };
-    }
-    hintEn = `Write a clear, direct English sentence about your daily routine or home life applying "${item.word}".`;
-    hintPt = `Escreva uma frase simples e direta sobre sua rotina diária aplicando "${item.word}" (${prof.translationPt}).`;
-    return {
+
+    return deriveContextualSentencePrompt({
       word: item.word,
-      hint: hintEn,
-      hintEn,
-      hintPt,
-      levelInstruction: 'Use a clear Subject + Verb + Object structure.',
-    };
+      definitionEn: item.definitionEn,
+      translationPt: item.translationPt,
+      exampleSentence: item.exampleSentence,
+      sourceActivityName: item.sourceActivityName,
+      partOfSpeech: item.partOfSpeech,
+      cefrLevel: item.cefrLevel,
+      studentLevel: levelLabel,
+    });
   });
 
   // 5. Build Reading Passage & Comprehension (Part 4 - Mini-Story Coesa e Gramaticalmente Fluida)

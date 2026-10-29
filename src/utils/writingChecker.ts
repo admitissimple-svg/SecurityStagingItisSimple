@@ -1518,12 +1518,19 @@ function evaluateLocally(params: CheckWritingParams): WritingEvaluationResult {
     wordFeedbacks,
   } = analysis;
 
-  // Trigger check based on levelInstruction
+  // Trigger check based on levelInstruction (Phase 6: legacy generic triggers must NEVER penalize the student)
   let usedTrigger: boolean | undefined = undefined;
   let triggerFeedback = '';
   if (levelInstruction && levelInstruction.trim()) {
     const triggerLower = levelInstruction.toLowerCase();
-    if (triggerLower.includes('because') || triggerLower.includes('since')) {
+    const isLegacyGenericTrigger =
+      triggerLower.includes('connect two ideas using a connector') ||
+      triggerLower.includes('use complex clauses, conditionals') ||
+      triggerLower.includes('use a clear subject + verb + object structure');
+
+    if (isLegacyGenericTrigger) {
+      usedTrigger = true;
+    } else if (triggerLower.includes('because') || triggerLower.includes('since')) {
       usedTrigger = /\b(because|since)\b/i.test(lowerSentence);
       triggerFeedback = usedTrigger
         ? 'Gatilho cumprido: você usou "because" ou "since" para justificar o motivo.'

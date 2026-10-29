@@ -2221,6 +2221,24 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                         sentenceAnswers[promptWord.toLowerCase()] ??
                         '';
 
+                      const rawOrientation =
+                        currentLanguage === 'pt' && prompt.hintPt?.trim()
+                          ? prompt.hintPt.trim()
+                          : currentLanguage === 'en' && prompt.hintEn?.trim()
+                          ? prompt.hintEn.trim()
+                          : prompt.hint?.trim() || '';
+
+                      const isGenericLegacy =
+                        rawOrientation.includes('Formulate an advanced sentence') ||
+                        rawOrientation.includes('Write a realistic compound') ||
+                        rawOrientation.includes('Write a clear, direct English') ||
+                        rawOrientation.includes('Formule uma frase em nível avançado') ||
+                        rawOrientation.includes('Escreva uma frase intermediária') ||
+                        rawOrientation.includes('Escreva uma frase simples e direta') ||
+                        rawOrientation.includes('Escreva uma frase completa em inglês');
+
+                      const contextualOrientation = !isGenericLegacy ? rawOrientation : '';
+
                       return (
                         <div
                           key={idx}
@@ -2231,18 +2249,16 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                               <span className="px-2.5 py-0.5 rounded-md bg-[#9AB4FF]/20 text-[#000035] text-xs font-black uppercase tracking-wide border border-[#9AB4FF]/30">
                                 {prompt.word}
                               </span>
-                              <span className="text-[11px] text-slate-600">
-                                {currentLanguage === 'pt' && prompt.hintPt
-                                  ? prompt.hintPt
-                                  : currentLanguage === 'en' && prompt.hintEn
-                                  ? prompt.hintEn
-                                  : memT.part3.getPedagogicalPrompt(prompt.word, prompt.hint)}
-                              </span>
-                              {prompt.levelInstruction && (
-                                <span className="text-[10px] font-bold text-[#1C4C96] bg-slate-100 px-2 py-0.5 rounded-md border border-slate-200">
-                                  🎯 {prompt.levelInstruction}
+                              {contextualOrientation ? (
+                                <span className="text-[11px] text-slate-600">
+                                  {contextualOrientation}
                                 </span>
-                              )}
+                              ) : null}
+                              {prompt.levelInstruction?.trim() && !isGenericLegacy ? (
+                                <span className="text-[10px] font-bold text-[#1C4C96] bg-slate-100 px-2 py-0.5 rounded-md border border-slate-200">
+                                  🎯 {prompt.levelInstruction.trim()}
+                                </span>
+                              ) : null}
                             </div>
                           </div>
 

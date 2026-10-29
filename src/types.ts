@@ -666,6 +666,8 @@ export interface HomeworkVocabItem {
   studentEmail?: string;
   practiceCount?: number;
   lastPracticedAt?: string;
+  partOfSpeech?: string;
+  cefrLevel?: string;
 }
 
 export interface MatchingPair {
