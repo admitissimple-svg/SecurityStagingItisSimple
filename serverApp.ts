@@ -16700,6 +16700,8 @@ ${JSON.stringify(
     targetWord: p.word,
     studentSentence: (sentences[p.word] || sentences[p.word?.toLowerCase()] || sentences[p.word?.toUpperCase()] || '').trim(),
     promptHint: p.hintEn || p.hint,
+    levelInstruction: p.levelInstruction || '',
+    activityContext: (homework.wordOrigins || []).find((wo: any) => (wo.word || '').toLowerCase() === (p.word || '').toLowerCase())?.activityName || '',
   })),
   null,
   2
@@ -16718,11 +16720,16 @@ OTHER SECTIONS STATS:
 - Fill in Blanks (Part 2): ${fillCorrect}/${totalFill} correct
 
 CRITICAL EVALUATION INSTRUCTIONS:
-1. FOR PART 3 SENTENCES (MANDATORY PEDAGOGICAL RIGOR):
-   - Each sentence must be complete, grammatically sound, and use the target word properly.
-   - ZERO SYNTHETIC APPROVALS: Incomplete fragments, missing subjects, transitive verbs ending without direct or indirect objects (e.g. 'nobody told'), dangling trailing prepositions (e.g. 'anyone know about'), or short fragments (< 3 words) MUST NEVER be marked isCorrect: true.
-   - If incomplete or incorrect, set isCorrect: false and provide a genuine, natural correctedSentence along with clear pedagogical explanation in explanationPt and explanationEn.
-   - For complete, correct sentences matching the student's level (${levelMeta.labelEn}), set isCorrect: true with constructive praise.
+1. FOR PART 3 SENTENCES (MANDATORY PEDAGOGICAL RIGOR & CONTEXTUAL DISTINCTION):
+   - For each sentence, assess both Grammar & Accuracy and Contextual Improvement separately:
+     a) Grammar & Accuracy: Evaluate grammar, vocabulary, subject-verb agreement, and target word usage according to CEFR ${levelMeta.cefr}. If the sentence is grammatically sound, complete, and uses the target word properly, set isCorrect: true.
+     b) Contextual Improvement: Provide a natural, idiomatic sentence in "correctedSentence".
+   - CRITICAL RULE: A grammatically correct sentence must NEVER be marked isCorrect: false simply because a more sophisticated or native-like phrasing is possible. If the sentence is correct, set isCorrect: true and use "correctedSentence" for a richer contextual alternative.
+   - ZERO SYNTHETIC APPROVALS: Incomplete fragments, missing subjects, transitive verbs ending abruptly without objects (e.g. 'nobody told'), dangling trailing prepositions (e.g. 'anyone know about'), or short fragments (< 3 words) MUST ALWAYS be marked isCorrect: false with a corrected full sentence.
+   - In "explanationPt" and "explanationEn", clearly state:
+     * Grammar & Accuracy status (is the sentence grammatically correct, or what error was found).
+     * Contextual feedback explaining why the suggested phrasing sounds more natural or how it enriches the sentence.
+   - In "levelAdvicePt" and "levelAdviceEn", provide guidance on how the sentence fulfills the grammatical challenge for ${levelMeta.labelEn} (levelInstruction).
 
 2. FOR PART 4 READING COMPREHENSION:
    - Evaluate each answer against the actual story text provided above.

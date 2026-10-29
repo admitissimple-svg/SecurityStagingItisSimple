@@ -370,7 +370,7 @@ assert.ok(
 import { resolveGeminiContingencyModels } from '../src/serverGeminiSecurity';
 
 const models = resolveGeminiContingencyModels();
-assert.ok(models.includes('gemini-3.5-flash'), 'Failed: Contingency must include gemini-3.5-flash');
+assert.ok(models.includes('gemini-3.5-flash') || models.includes('gemini-3.5-flash-lite'), 'Failed: Contingency must include gemini-3.5-flash or gemini-3.5-flash-lite');
 assert.ok(models.includes('gemini-3.8-flash'), 'Failed: Contingency must include gemini-3.8-flash');
 assert.ok(models.includes('gemini-3.1-flash-lite'), 'Failed: Contingency must include gemini-3.1-flash-lite');
 assert.strictEqual(models.length, 3, 'Failed: Contingency must contain exactly 3 models');

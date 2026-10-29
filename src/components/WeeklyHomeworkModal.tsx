@@ -32,7 +32,6 @@ import {
   HomeworkPartProgress,
 } from '../types';
 import {
-  checkStudentWritingApi,
   evaluateWeeklyHomeworkApi,
   isSyntheticHomeworkEvaluation,
   isValidHomeworkEvaluation,
@@ -778,8 +777,6 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     handleGeneratePart4Story,
   ]);
 
-  const [sentenceFeedbacks, setSentenceFeedbacks] = useState<Record<string, any>>({});
-  const [isCheckingSentence, setIsCheckingSentence] = useState<Record<string, boolean>>({});
   const [submittedFeedbackToast, setSubmittedFeedbackToast] = useState<string | null>(null);
 
   // Check if each individual part has all questions answered
@@ -802,14 +799,9 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
         sentenceAnswers[p.word.toUpperCase()] ||
         sentenceAnswers[p.word.toLowerCase()] ||
         '';
-      const hasFeedback = Boolean(
-        sentenceFeedbacks[p.word] ||
-        sentenceFeedbacks[p.word.toUpperCase()] ||
-        sentenceFeedbacks[p.word.toLowerCase()]
-      );
-      return val.trim().length >= 3 || hasFeedback;
+      return val.trim().length >= 3;
     });
-  }, [safeSentenceWritingPrompts, sentenceAnswers, sentenceFeedbacks]);
+  }, [safeSentenceWritingPrompts, sentenceAnswers]);
 
   const isReadingComplete = useMemo(() => {
     const activePassage = activeDayActivity?.readingPassage || homework.readingPassage;
@@ -1376,111 +1368,86 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     }
   };
 
-  const handleCheckSentence = async (prompt: SentenceWritingPrompt, textOverride?: string) => {
-    const wordKey = prompt.word;
-    const directVal = textOverride !== undefined
-      ? textOverride
-      : (sentenceAnswers[wordKey] || sentenceAnswers[wordKey.trim()] || sentenceAnswers[wordKey.toUpperCase()] || sentenceAnswers[wordKey.toLowerCase()] || '');
-    const cleanText = directVal.trim();
+  const handleApplySuggestion = async (wordKey: string, suggestedSentence: string) => {
+    if (!suggestedSentence || !suggestedSentence.trim()) return;
+    const newText = suggestedSentence.trim();
+    const currentVal = (
+      sentenceAnswers[wordKey] ??
+      sentenceAnswers[wordKey.trim()] ??
+      sentenceAnswers[wordKey.toUpperCase()] ??
+      sentenceAnswers[wordKey.toLowerCase()] ??
+      ''
+    ).trim();
+    if (currentVal.toLowerCase() === newText.toLowerCase()) return;
 
-    if (!cleanText) {
-      setSubmittedFeedbackToast(
-        currentLanguage === 'en'
-          ? `Please write your sentence for "${wordKey}" before checking with AI.`
-          : `Por favor, digite sua frase para "${wordKey}" antes de verificar com a IA.`
-      );
-      setTimeout(() => setSubmittedFeedbackToast(null), 3500);
-      return;
+    // 1. Update only the corresponding sentence in state, preserving the other 4
+    const updatedSentences = {
+      ...sentenceAnswers,
+      [wordKey]: newText,
+    };
+    setSentenceAnswers(updatedSentences);
+
+    // 4. Invalidate previous evaluation for that sentence so old evaluation is not presented as current
+    let updatedAiEval = aiEvaluation;
+    if (aiEvaluation?.sentenceFeedback) {
+      updatedAiEval = {
+        ...aiEvaluation,
+        sentenceFeedback: aiEvaluation.sentenceFeedback.map((sf: any) =>
+          (sf.word || '').toLowerCase() === wordKey.toLowerCase()
+            ? { ...sf, isModified: true, isCorrect: false }
+            : sf
+        ),
+      };
+      setAiEvaluation(updatedAiEval);
     }
 
-    setIsCheckingSentence((prev) => ({
-      ...prev,
-      [wordKey]: true,
-      [wordKey.toUpperCase()]: true,
-      [wordKey.toLowerCase()]: true,
-    }));
+    // Update parts progress for writing while preserving other parts and S-Path state
+    const updatedPart: HomeworkPartProgress = {
+      partKey: 'writing',
+      partNumber: 3,
+      status: 'draft',
+      answers: updatedSentences,
+      evaluation: updatedAiEval,
+      updatedAt: new Date().toISOString(),
+    };
+    const updatedParts = {
+      ...partsProgress,
+      writing: updatedPart,
+    };
+    setPartsProgress(updatedParts);
+
+    // 3. Persist change to Firestore using existing onSaveProgress mechanism
+    const updatedHw: WeeklyHomeworkData = {
+      ...homework,
+      studentAnswers: {
+        ...(homework.studentAnswers || {}),
+        matching: matchingAnswers,
+        fillInBlanks: fillAnswers,
+        sentences: updatedSentences,
+        quizAnswers: quizAnswers,
+      },
+      partsProgress: updatedParts,
+      aiEvaluation: updatedAiEval,
+    };
 
     try {
-      const promptInstruction =
-        currentLanguage === 'pt' && prompt.hintPt
-          ? prompt.hintPt
-          : currentLanguage === 'en' && prompt.hintEn
-          ? prompt.hintEn
-          : prompt.hint || '';
-
-      const result = await checkStudentWritingApi({
-        sentence: cleanText,
-        targetWord: wordKey,
-        words: [wordKey],
-        instruction: promptInstruction,
-        levelInstruction: prompt.levelInstruction || '',
-        activityName: 'Weekly Memorization Activity - Part 3',
-        level: homework?.studentLevel || 'Intermediate',
-        language: currentLanguage,
-      });
-
-      setSentenceFeedbacks((prev) => ({
-        ...prev,
-        [wordKey]: result,
-        [wordKey.toUpperCase()]: result,
-        [wordKey.toLowerCase()]: result,
-      }));
-
-      // Update state & persist student answers
-      const updatedSentences = {
-        ...sentenceAnswers,
-        [wordKey]: cleanText,
-      };
-      setSentenceAnswers(updatedSentences);
-
       if (onSaveProgress) {
-        onSaveProgress({
-          ...homework,
-          studentAnswers: {
-            ...homework.studentAnswers,
-            sentences: {
-              ...(homework.studentAnswers?.sentences || {}),
-              ...updatedSentences,
-            },
-          },
-        });
+        await onSaveProgress(updatedHw);
       }
-
-      const isOk = result?.isCorrect ?? !result?.hasAnyError;
       setSubmittedFeedbackToast(
-        currentLanguage === 'en'
-          ? isOk ? `✓ Sentence evaluated for "${wordKey}"!` : `💡 Feedback ready for "${wordKey}".`
-          : isOk ? `✓ Frase analisada com sucesso para "${wordKey}"!` : `💡 Sugestões da IA prontas para "${wordKey}".`
+        isEn
+          ? `✓ Applied suggestion for "${wordKey}". Click "Save Part 3" to evaluate.`
+          : `✓ Sugestão aplicada para "${wordKey}". Clique em "Salvar Parte 3" para avaliar.`
       );
       setTimeout(() => setSubmittedFeedbackToast(null), 3500);
     } catch (err) {
-      console.error(`Check error for ${wordKey}:`, err);
-      const unavailableMsgPt = 'Serviço de avaliação pedagógica temporariamente indisponível após tentativa com os modelos de contingência. Sua frase foi preservada.';
-      const unavailableMsgEn = 'Pedagogical evaluation service temporarily unavailable after attempting contingency models. Your sentence has been preserved.';
-      const fallbackResult = {
-        hasAnyError: true,
-        isCorrect: false,
-        isAiUnavailable: true,
-        wordFeedbacks: [],
-        sentenceFeedback: {
-          original: cleanText,
-          hasError: true,
-          corrected: cleanText,
-          explanationPt: currentLanguage === 'en' ? unavailableMsgEn : unavailableMsgPt,
-          explanationEn: unavailableMsgEn,
-        },
-        correctedSentence: cleanText,
-        overallSummaryPt: unavailableMsgPt,
-        overallSummaryEn: unavailableMsgEn,
-      };
-      setSentenceFeedbacks((prev) => ({ ...prev, [wordKey]: fallbackResult }));
-    } finally {
-      setIsCheckingSentence((prev) => ({
-        ...prev,
-        [wordKey]: false,
-        [wordKey.toUpperCase()]: false,
-        [wordKey.toLowerCase()]: false,
-      }));
+      console.error('Failed to persist applied suggestion in Firestore:', err);
+      setSubmittedFeedbackToast(
+        isEn
+          ? 'Error saving suggestion to Firestore. Please try again.'
+          : 'Erro ao salvar sugestão no Firestore. Tente novamente.'
+      );
+      setTimeout(() => setSubmittedFeedbackToast(null), 3500);
     }
   };
 
@@ -2253,16 +2220,6 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                         sentenceAnswers[promptWord.toUpperCase()] ??
                         sentenceAnswers[promptWord.toLowerCase()] ??
                         '';
-                      const feedback =
-                        sentenceFeedbacks[promptWord] ||
-                        sentenceFeedbacks[promptWord.trim()] ||
-                        sentenceFeedbacks[promptWord.toUpperCase()] ||
-                        sentenceFeedbacks[promptWord.toLowerCase()];
-                      const isChecking = Boolean(
-                        isCheckingSentence[promptWord] ||
-                        isCheckingSentence[promptWord.trim()] ||
-                        isCheckingSentence[promptWord.toUpperCase()]
-                      );
 
                       return (
                         <div
@@ -2287,24 +2244,6 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                                 </span>
                               )}
                             </div>
-
-                            <button
-                              type="button"
-                              onClick={() => handleCheckSentence(prompt, val)}
-                              disabled={isChecking || !val.trim()}
-                              aria-label={`${memT.part3.checkWithAi} - ${prompt.word}`}
-                              className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition select-none cursor-pointer ${
-                                isChecking
-                                  ? 'bg-[#000035]/70 text-white cursor-wait opacity-90'
-                                  : val.trim()
-                                  ? 'bg-[#000035] text-white hover:bg-[#062863] active:scale-95 shadow-2xs'
-                                  : 'bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed'
-                              }`}
-                              title={!val.trim() ? (isEn ? 'Type a sentence first' : 'Digite uma frase primeiro') : ''}
-                            >
-                              <Sparkles className={`w-3.5 h-3.5 text-[#9AB4FF] ${isChecking ? 'animate-spin' : ''}`} />
-                              <span>{isChecking ? (memT.part3.checking || 'Checking...') : memT.part3.checkWithAi}</span>
-                            </button>
                           </div>
 
                           <textarea
@@ -2316,15 +2255,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                                 ...prev,
                                 [prompt.word]: newVal,
                               }));
-                              // Invalidate ONLY the evaluation for this altered sentence
-                              setSentenceFeedbacks((prev) => {
-                                if (!prev[prompt.word] && !prev[prompt.word.toLowerCase()]) return prev;
-                                const next = { ...prev };
-                                delete next[prompt.word];
-                                delete next[prompt.word.toLowerCase()];
-                                delete next[prompt.word.toUpperCase()];
-                                return next;
-                              });
+                              // Invalidate previous evaluation for this altered sentence
                               if (aiEvaluation?.sentenceFeedback) {
                                 setAiEvaluation((prev) => {
                                   if (!prev || !prev.sentenceFeedback) return prev;
@@ -2353,129 +2284,6 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                             placeholder={memT.part3.placeholder(prompt.word)}
                             className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs font-medium text-slate-900 focus:bg-white focus:outline-none focus:ring-1 focus:ring-[#1C4C96] focus:border-[#1C4C96] transition"
                           />
-
-                          {feedback && (
-                            <div
-                              className={`p-3.5 rounded-xl border text-xs space-y-2.5 transition animate-in fade-in duration-200 ${
-                                feedback.hasAnyError
-                                  ? 'bg-amber-50/90 border-amber-300 text-amber-950'
-                                  : 'bg-emerald-50/90 border-emerald-300 text-emerald-950'
-                              }`}
-                            >
-                              <div className="flex flex-wrap items-center justify-between gap-2">
-                                <div className="flex items-center gap-2 flex-wrap">
-                                  <div className="flex items-center gap-1.5 font-bold text-xs">
-                                    {feedback.hasAnyError ? (
-                                      <>
-                                        <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
-                                        <span>{memT.part3.suggestionLabel || (isEn ? 'AI Feedback' : 'Sugestões da IA')}</span>
-                                      </>
-                                    ) : (
-                                      <>
-                                        <CheckCircle className="w-4 h-4 text-emerald-600 shrink-0" />
-                                        <span>{memT.part3.greatSentence || (isEn ? 'Great sentence!' : 'Excelente frase!')}</span>
-                                      </>
-                                    )}
-                                  </div>
-
-                                  {feedback.usedTargetWord !== undefined && (
-                                    <span
-                                      className={`text-[10px] font-bold px-2 py-0.5 rounded-md border ${
-                                        feedback.usedTargetWord
-                                          ? 'bg-emerald-100 text-emerald-800 border-emerald-300'
-                                          : 'bg-amber-100 text-amber-900 border-amber-300'
-                                      }`}
-                                    >
-                                      {feedback.usedTargetWord
-                                        ? `✓ ${isEn ? `Word "${prompt.word}" used` : `Palavra "${prompt.word}" aplicada`}`
-                                        : `⚠ ${isEn ? `Use word "${prompt.word}"` : `Use a palavra "${prompt.word}"`}`}
-                                    </span>
-                                  )}
-
-                                  {prompt.levelInstruction && (
-                                    <span
-                                      className={`text-[10px] font-bold px-2 py-0.5 rounded-md border ${
-                                        feedback.usedTrigger === false
-                                          ? 'bg-amber-100 text-amber-900 border-amber-300'
-                                          : 'bg-blue-100/90 text-[#000035] border-blue-200'
-                                      }`}
-                                    >
-                                      🎯 {feedback.usedTrigger === false
-                                        ? (isEn ? 'Trigger missed' : 'Gatilho ausente')
-                                        : (isEn ? 'Trigger satisfied' : 'Gatilho cumprido')}
-                                    </span>
-                                  )}
-                                </div>
-
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setSentenceFeedbacks((prev) => {
-                                      const next = { ...prev };
-                                      delete next[prompt.word];
-                                      delete next[prompt.word.toLowerCase()];
-                                      delete next[prompt.word.toUpperCase()];
-                                      return next;
-                                    });
-                                  }}
-                                  className="text-slate-400 hover:text-slate-600 text-xs font-bold px-1 py-0.5 cursor-pointer"
-                                  title={isEn ? 'Dismiss feedback' : 'Ocultar feedback'}
-                                >
-                                  ✕
-                                </button>
-                              </div>
-
-                              {feedback.correctedSentence &&
-                                feedback.correctedSentence.trim().toLowerCase() !== val.trim().toLowerCase() && (
-                                  <div className="bg-white/95 p-2.5 rounded-lg border border-slate-200/80 space-y-1.5 shadow-2xs">
-                                    <div className="flex items-center justify-between gap-2">
-                                      <span className="text-[11px] font-bold text-slate-700">
-                                        {isEn ? 'Enhanced sentence suggestion:' : 'Sugestão aprimorada da IA:'}
-                                      </span>
-                                      <button
-                                        type="button"
-                                        onClick={() => {
-                                          setSentenceAnswers((prev) => ({
-                                            ...prev,
-                                            [prompt.word]: feedback.correctedSentence!,
-                                          }));
-                                        }}
-                                        className="text-[10px] font-bold text-[#1C4C96] hover:text-[#000035] underline cursor-pointer"
-                                      >
-                                        {isEn ? 'Apply suggestion' : 'Usar esta versão'}
-                                      </button>
-                                    </div>
-                                    <p className="text-xs font-semibold text-slate-900 italic">
-                                      "{feedback.correctedSentence}"
-                                    </p>
-                                  </div>
-                                )}
-
-                              <p className="text-[11px] leading-relaxed">
-                                {currentLanguage === 'en'
-                                  ? (feedback.overallSummaryEn || feedback.explanation || feedback.overallSummaryPt)
-                                  : (feedback.overallSummaryPt || feedback.explanation || feedback.overallSummaryEn)}
-                              </p>
-
-                              {(feedback.triggerFeedback || feedback.targetWordFeedback) && (
-                                <div className="text-[11px] text-slate-700 pt-1 border-t border-slate-200/60 space-y-0.5">
-                                  {feedback.targetWordFeedback && <p>• {feedback.targetWordFeedback}</p>}
-                                  {feedback.triggerFeedback && <p>• {feedback.triggerFeedback}</p>}
-                                </div>
-                              )}
-
-                              {(feedback.levelTipsPt || feedback.levelTipsEn) && (
-                                <p className="text-[11px] text-[#1C4C96] font-medium pt-1 border-t border-slate-200/60 flex items-center gap-1.5">
-                                  <Compass className="w-3.5 h-3.5 text-[#1C4C96] shrink-0" />
-                                  <span>
-                                    {isEn
-                                      ? (feedback.levelTipsEn || feedback.levelTipsPt)
-                                      : (feedback.levelTipsPt || feedback.levelTipsEn)}
-                                  </span>
-                                </p>
-                              )}
-                            </div>
-                          )}
                         </div>
                       );
                     })}
@@ -2589,30 +2397,61 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                         </span>
                       </div>
 
-                      <div className="space-y-2.5">
+                      <div className="space-y-3">
                         {safeSentenceWritingPrompts.map((prompt) => {
-                          const userSentence = (sentenceAnswers[prompt.word] || '').trim();
-                          const feedback = sentenceFeedbacks[prompt.word];
+                          const promptWord = prompt.word;
+                          const userSentence = (
+                            sentenceAnswers[promptWord] ??
+                            sentenceAnswers[promptWord.trim()] ??
+                            sentenceAnswers[promptWord.toUpperCase()] ??
+                            sentenceAnswers[promptWord.toLowerCase()] ??
+                            ''
+                          ).trim();
                           const evalItem = aiEvaluation?.sentenceFeedback?.find(
-                            (s) => s.word.toLowerCase() === prompt.word.toLowerCase()
+                            (s) => (s.word || '').toLowerCase() === promptWord.toLowerCase()
                           );
-                          const actName = wordToActivityMap[prompt.word.toLowerCase()];
+                          const actName = wordToActivityMap[promptWord.toLowerCase()];
 
-                          const isEvaluated = Boolean((evalItem && !evalItem.isModified) || feedback);
-                          const isSentenceOk = evalItem && !evalItem.isModified
-                            ? Boolean(evalItem.isCorrect)
-                            : feedback
-                            ? Boolean(feedback.isCorrect && !feedback.hasAnyError)
+                          // F. Deterministic target word usage check
+                          const cleanTarget = (promptWord || '').toLowerCase().trim();
+                          const lowerAns = userSentence.toLowerCase();
+                          const rootTarget = cleanTarget.replace(/(ing|ed|s|es|d)$/i, '');
+                          const usedTargetWord = cleanTarget
+                            ? lowerAns.includes(cleanTarget) || (rootTarget.length >= 4 && lowerAns.includes(rootTarget))
                             : false;
-                          const corrected = evalItem?.correctedSentence || feedback?.correctedSentence;
+
+                          // Evaluated status: invalidates if edited or isModified
+                          const isEvaluated = Boolean(
+                            evalItem &&
+                            !evalItem.isModified &&
+                            evalItem.originalSentence &&
+                            evalItem.originalSentence.trim().toLowerCase() === userSentence.toLowerCase()
+                          );
+                          const isSentenceOk = isEvaluated && Boolean(evalItem?.isCorrect);
+
+                          // B. Original sentence associated with this evaluation
+                          const displayedSentence = isEvaluated ? (evalItem?.originalSentence || userSentence) : userSentence;
+
+                          // D. Contextual suggestion
+                          const suggestion = (evalItem?.correctedSentence || '').trim();
+                          const hasValidSuggestion = Boolean(
+                            isEvaluated &&
+                            suggestion &&
+                            suggestion.toLowerCase() !== displayedSentence.toLowerCase()
+                          );
+
+                          // E. Pedagogical explanation and level advice
                           const explanation = isEn
-                            ? (evalItem?.explanationEn || feedback?.overallSummaryEn)
-                            : (evalItem?.explanationPt || feedback?.overallSummaryPt);
+                            ? (evalItem?.explanationEn || evalItem?.explanationPt)
+                            : (evalItem?.explanationPt || evalItem?.explanationEn);
+                          const levelAdvice = isEn
+                            ? (evalItem?.levelAdviceEn || evalItem?.levelAdvicePt)
+                            : (evalItem?.levelAdvicePt || evalItem?.levelAdviceEn);
 
                           return (
                             <div
-                              key={prompt.word}
-                              className={`p-3 rounded-xl border text-xs space-y-1.5 transition ${
+                              key={promptWord}
+                              className={`p-3.5 rounded-xl border text-xs space-y-2.5 transition ${
                                 !userSentence
                                   ? 'bg-slate-50/70 border-slate-200'
                                   : !isEvaluated
@@ -2622,17 +2461,32 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                                   : 'bg-amber-50/60 border-amber-200'
                               }`}
                             >
+                              {/* A. Palavra-alvo e contexto, F. Indicador de palavra-alvo, C. Resultado da avaliação */}
                               <div className="flex items-center justify-between gap-2 flex-wrap">
                                 <div className="flex items-center gap-2 flex-wrap">
-                                  <span className="font-bold text-[#000035] uppercase tracking-wide bg-[#9AB4FF]/20 px-2 py-0.5 rounded text-[10px]">
-                                    {prompt.word}
+                                  <span className="font-black text-[#000035] uppercase tracking-wide bg-[#9AB4FF]/20 px-2.5 py-0.5 rounded text-[11px] border border-[#9AB4FF]/30">
+                                    {promptWord.toUpperCase()}
                                   </span>
                                   {actName && (
-                                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-blue-100 text-[#000035] border border-blue-200">
+                                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-blue-100/80 text-[#000035] border border-blue-200">
                                       {isEn ? 'Activity:' : 'Atividade:'} {actName}
                                     </span>
                                   )}
+                                  {userSentence && (
+                                    <span
+                                      className={`text-[10px] font-bold px-2 py-0.5 rounded-md border ${
+                                        usedTargetWord
+                                          ? 'bg-emerald-100 text-emerald-800 border-emerald-300'
+                                          : 'bg-amber-100 text-amber-900 border-amber-300'
+                                      }`}
+                                    >
+                                      {usedTargetWord
+                                        ? `✓ ${isEn ? `Word "${promptWord}" used` : `Palavra "${promptWord}" aplicada`}`
+                                        : `⚠ ${isEn ? `Use word "${promptWord}"` : `Use a palavra "${promptWord}"`}`}
+                                    </span>
+                                  )}
                                 </div>
+
                                 <span className={`text-[11px] font-bold ${
                                   !userSentence
                                     ? 'text-slate-500'
@@ -2643,37 +2497,56 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                                     : 'text-amber-700'
                                 }`}>
                                   {!userSentence
-                                    ? `⏳ ${isEn ? 'Pending / Not answered' : 'Pendente / Não respondido'}`
+                                    ? `⏳ ${isEn ? 'Pending / Not answered' : 'Pendente / Não respondida'}`
                                     : !isEvaluated
-                                    ? `⏳ ${isEn ? 'Pending AI Evaluation' : 'Aguardando Avaliação da IA'}`
+                                    ? `⏳ ${isEn ? 'Pending AI evaluation (Click "Save Part 3")' : 'Aguardando avaliação (Clique em "Salvar Parte 3")'}`
                                     : isSentenceOk
-                                    ? (isEn ? '✓ Well Structured' : '✓ Bem Estruturada')
+                                    ? (isEn ? '✓ Well Structured / Correct' : '✓ Frase Correta / Bem Estruturada')
                                     : (isEn ? '⚠ Needs Review' : '⚠ Revisão Recomendada')}
                                 </span>
                               </div>
 
-                              <p className="text-[11px] text-slate-800 italic">
-                                <span className="text-slate-500 font-normal mr-1">{isEn ? 'Your sentence:' : 'Sua frase:'}</span>
-                                "{userSentence || (isEn ? '(no sentence provided yet)' : '(nenhuma frase enviada ainda)')}"
-                              </p>
+                              {/* B. Frase original */}
+                              <div className="text-[11px] text-slate-800 italic bg-white/80 p-2.5 rounded-lg border border-slate-200/80">
+                                <span className="text-slate-500 font-normal not-italic mr-1.5">{isEn ? 'Your sentence:' : 'Sua frase:'}</span>
+                                "{displayedSentence || (isEn ? '(no sentence provided yet)' : '(nenhuma frase enviada ainda)')}"
+                              </div>
 
-                              {corrected && corrected !== userSentence && (
-                                <p className="text-[11px] text-[#000035] bg-white/80 p-2 rounded-md border border-slate-200 font-medium">
-                                  <span className="text-slate-500 mr-1 font-normal">{isEn ? 'Recommended form:' : 'Forma recomendada:'}</span>
-                                  "{corrected}"
-                                </p>
+                              {/* D. Contextual suggestion & Section 9: Apply suggestion button */}
+                              {hasValidSuggestion && (
+                                <div className="bg-white/95 p-2.5 rounded-lg border border-blue-200/90 space-y-1.5 shadow-2xs">
+                                  <div className="flex items-center justify-between gap-2">
+                                    <span className="text-[11px] font-bold text-[#000035] flex items-center gap-1">
+                                      <Sparkles className="w-3.5 h-3.5 text-[#1C4C96]" />
+                                      <span>{isEn ? 'Suggested improvement:' : 'Melhoria sugerida:'}</span>
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleApplySuggestion(promptWord, suggestion)}
+                                      className="px-2.5 py-1 rounded-md text-[10px] font-bold bg-[#000035] text-white hover:bg-[#062863] active:scale-95 transition cursor-pointer shadow-2xs flex items-center gap-1"
+                                      title={isEn ? 'Apply this improved version to your sentence' : 'Aplicar esta versão aprimorada à sua frase'}
+                                    >
+                                      <Check className="w-3 h-3 text-[#9AB4FF]" />
+                                      <span>{isEn ? 'Apply suggestion' : 'Usar esta versão'}</span>
+                                    </button>
+                                  </div>
+                                  <p className="text-xs font-semibold text-slate-900 italic">
+                                    "{suggestion}"
+                                  </p>
+                                </div>
                               )}
 
-                              {explanation && (
-                                <p className="text-[11px] text-slate-600">
+                              {/* E. Explicação pedagógica */}
+                              {isEvaluated && explanation && (
+                                <p className="text-[11px] text-slate-700 leading-relaxed">
                                   {explanation}
                                 </p>
                               )}
 
-                              {evalItem && (evalItem.levelAdvicePt || evalItem.levelAdviceEn) && (
-                                <p className="text-[10px] text-[#1C4C96] font-medium flex items-center gap-1">
-                                  <Compass className="w-3 h-3 shrink-0" />
-                                  <span>{isEn ? evalItem.levelAdviceEn : evalItem.levelAdvicePt}</span>
+                              {isEvaluated && levelAdvice && (
+                                <p className="text-[10px] text-[#1C4C96] font-medium flex items-center gap-1.5 pt-1 border-t border-slate-200/60">
+                                  <Compass className="w-3.5 h-3.5 shrink-0 text-[#1C4C96]" />
+                                  <span>{levelAdvice}</span>
                                 </p>
                               )}
                             </div>
