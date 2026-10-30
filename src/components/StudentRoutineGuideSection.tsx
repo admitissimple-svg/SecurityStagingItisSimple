@@ -1621,9 +1621,9 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
   };
 
   return (
-    <div className="space-y-4" id="daily-routine-guide-section">
+    <div className="contents" id="daily-routine-guide-section">
       {/* 1. Header Banner with Week Counter & Start New Week */}
-      <div className="bg-gradient-to-br from-[#000035] via-[#062863] to-[#1C4C96] text-white rounded-3xl p-5 border border-[#1C4C96] shadow-md">
+      <div className="order-1 w-full bg-gradient-to-br from-[#000035] via-[#062863] to-[#1C4C96] text-white rounded-3xl p-5 border border-[#1C4C96] shadow-md">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-2xl bg-[#1C4C96] text-[#9AB4FF] flex items-center justify-center shrink-0 border border-[#9AB4FF]/40 shadow-xs">
@@ -1693,7 +1693,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
       </div>
 
       {/* 2. Top Controls Row: Day Selector + Activities Timeline (Definitive 2-Column Layout) */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-3.5 items-stretch">
+      <div className="order-2 w-full grid grid-cols-1 lg:grid-cols-12 gap-3.5 items-stretch">
         {/* Left: Day Selector with Today's Focus */}
         <div className="lg:col-span-4 bg-white rounded-3xl p-4 border border-[#607EC9]/30 shadow-xs flex flex-col justify-between space-y-2.5">
           <div className="flex items-center justify-between">
@@ -2466,7 +2466,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
       </div>
 
       {/* 3. Media & Practice Row: YouTube Video Player (Left) + 5 Key Words for this Moment (Right) */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-stretch">
+      <div className="order-3 w-full grid grid-cols-1 lg:grid-cols-12 gap-4 items-stretch">
         {/* Left: YouTube Video Player */}
         <div className="lg:col-span-6 bg-white rounded-3xl p-5 border border-[#607EC9]/30 shadow-xs space-y-3 flex flex-col justify-between">
           <div className="flex items-center justify-between border-b border-[#9AB4FF]/30 pb-2.5">
@@ -2585,8 +2585,8 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
         </div>
       </div>
 
-      {/* 4. Daily Wrap-up: Sentence of the Day (Top) + Teacher's Daily Listening • Spotify (Bottom) */}
-      <div className="bg-white rounded-3xl p-5 border border-[#607EC9]/30 shadow-xs space-y-4">
+      {/* 4. Daily Wrap-up: Sentence of the Day */}
+      <div className="order-4 w-full bg-white rounded-3xl p-5 border border-[#607EC9]/30 shadow-xs">
         <StudentDailySentenceCard
           isEn={isEn}
           reminderTime={reminderTime}
@@ -2607,29 +2607,30 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
           dictionaryEntries={dictionaryEntries}
           excludedWords={excludedWords}
         />
+      </div>
 
-        <div className="pt-2">
-          <StudentSpotifyCard
-            isEn={isEn}
-            selectedDay={selectedDay}
-            levelPlaylistConfig={levelPlaylistConfig}
-            isAudioListenedToday={isAudioListenedToday}
-            isRestDay={isRestDay}
-            currentDayTrack={currentDayTrack}
-            currentStudyDayIndex={currentStudyDayIndex}
-            activeDaysInOrder={activeDaysInOrder}
-            spotifyPlayerMode={spotifyPlayerMode}
-            setSpotifyPlayerMode={setSpotifyPlayerMode}
-            sanitizedEmbedUrl={sanitizedEmbedUrl}
-            effectiveDirectUrl={effectiveDirectUrl}
-            effectiveTrackTitle={effectiveTrackTitle}
-            effectiveArtist={effectiveArtist}
-            effectiveCoverUrl={effectiveCoverUrl}
-            teacherOverride={teacherOverride}
-            activeNativeFriendFeedback={activeNativeFriendFeedback}
-            triggerAudioCompletion={triggerAudioCompletion}
-          />
-        </div>
+      {/* 5. Teacher's Daily Listening • Spotify (Rendered below Memorization Activity as order-6) */}
+      <div id="student-spotify-section" className="order-6 w-full">
+        <StudentSpotifyCard
+          isEn={isEn}
+          selectedDay={selectedDay}
+          levelPlaylistConfig={levelPlaylistConfig}
+          isAudioListenedToday={isAudioListenedToday}
+          isRestDay={isRestDay}
+          currentDayTrack={currentDayTrack}
+          currentStudyDayIndex={currentStudyDayIndex}
+          activeDaysInOrder={activeDaysInOrder}
+          spotifyPlayerMode={spotifyPlayerMode}
+          setSpotifyPlayerMode={setSpotifyPlayerMode}
+          sanitizedEmbedUrl={sanitizedEmbedUrl}
+          effectiveDirectUrl={effectiveDirectUrl}
+          effectiveTrackTitle={effectiveTrackTitle}
+          effectiveArtist={effectiveArtist}
+          effectiveCoverUrl={effectiveCoverUrl}
+          teacherOverride={teacherOverride}
+          activeNativeFriendFeedback={activeNativeFriendFeedback}
+          triggerAudioCompletion={triggerAudioCompletion}
+        />
       </div>
 
       {/* Start New Week Configuration Modal */}

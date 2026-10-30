@@ -82,7 +82,7 @@ const DEMO_DAILY_STEPS: DemoRoutineStep[] = [
     subtitle: {
       pt: 'Assista ao vídeo e anote suas palavras-chave',
       en: 'Watch the video and note down your key words',
-      es: 'Mira el video y anota tus palabras clave',
+      es: 'Mira el video y anota tus palavras clave',
       fr: 'Regardez la vidéo et notez vos mots-clés',
       de: 'Schau das Video und notiere deine Schlüsselwörter',
       it: 'Guarda il video e annota le tue parole chiave',
@@ -92,6 +92,40 @@ const DEMO_DAILY_STEPS: DemoRoutineStep[] = [
       ru: 'Посмотрите видео и запишите ключевые слова',
       ar: 'شاهد الفيديو ودون كلماتك الأساسية',
       tr: 'Videoyu izleyin ve anahtar kelimelerinizi not edin',
+    },
+  },
+  {
+    id: 'memorization',
+    time: '21:30',
+    icon: BookOpen,
+    defaultChecked: false,
+    title: {
+      pt: 'Atividade de Memorização & Fixação',
+      en: 'Memorization Activity & Consolidation',
+      es: 'Actividad de Memorización y Fijación',
+      fr: 'Activité de Mémorisation et Fixation',
+      de: 'Merkaktivität & Festigung',
+      it: 'Attività di Memorizzazione e Fissaggio',
+      ja: '記憶定着アクティビティと振り返り',
+      ko: '암기 및 복습 활동',
+      zh: '记忆巩固活动与每日回顾',
+      ru: 'Упражнение на запоминание и закрепление',
+      ar: 'نشاط الحفظ والترسيخ',
+      tr: 'Ezberleme & Pekiştirme Aktivitesi',
+    },
+    subtitle: {
+      pt: 'Fixação leve das palavras do dia',
+      en: 'Light practice of the words of the day',
+      es: 'Fijación ligera de las palabras del día',
+      fr: 'Pratique légère des mots du jour',
+      de: 'Leichte Festigung der Tageswörter',
+      it: 'Consolidamento leggero delle parole del giorno',
+      ja: '今日学んだ単語を楽しく復習',
+      ko: '오늘의 단어를 가볍게 복습',
+      zh: '轻松复习今日所学单词',
+      ru: 'Легкое закрепление слов за день',
+      ar: 'ترسيخ خفيف لكلمات اليوم',
+      tr: 'Günün kelimelerini hafifçe pekiştirme',
     },
   },
   {
@@ -160,40 +194,6 @@ const DEMO_DAILY_STEPS: DemoRoutineStep[] = [
       ru: '25 или 50 минут живого общения о вашем дне',
       ar: '25 أو 50 دقيقة محادثة طبيعية عن يومك',
       tr: 'Gününüz hakkında 25 veya 50 dk doğal konuşma',
-    },
-  },
-  {
-    id: 'memorization',
-    time: '21:30',
-    icon: BookOpen,
-    defaultChecked: false,
-    title: {
-      pt: 'Atividade de Memorização & Fixação',
-      en: 'Memorization Activity & Consolidation',
-      es: 'Actividad de Memorización y Fijación',
-      fr: 'Activité de Mémorisation et Fixation',
-      de: 'Merkaktivität & Festigung',
-      it: 'Attività di Memorizzazione e Fissaggio',
-      ja: '記憶定着アクティビティと振り返り',
-      ko: '암기 및 복습 활동',
-      zh: '记忆巩固活动与每日回顾',
-      ru: 'Упражнение на запоминание и закрепление',
-      ar: 'نشاط الحفظ والترسيخ',
-      tr: 'Ezberleme & Pekiştirme Aktivitesi',
-    },
-    subtitle: {
-      pt: 'Fixação leve das palavras do dia',
-      en: 'Light practice of the words of the day',
-      es: 'Fijación ligera de las palabras del día',
-      fr: 'Pratique légère des mots du jour',
-      de: 'Leichte Festigung der Tageswörter',
-      it: 'Consolidamento leggero delle parole del giorno',
-      ja: '今日学んだ単語を楽しく復習',
-      ko: '오늘의 단어를 가볍게 복습',
-      zh: '轻松复习今日所学单词',
-      ru: 'Легкое закрепление слов за день',
-      ar: 'ترسيخ خفيف لكلمات اليوم',
-      tr: 'Günün kelimelerini hafifçe pekiştirme',
     },
   },
 ];
@@ -786,9 +786,6 @@ export const SFluencyTracker: React.FC<SFluencyTrackerProps> = ({
 
                     <div className="min-w-0">
                       <div className="flex items-center gap-2">
-                        <span className="text-[10px] font-mono font-bold text-[#9AB4FF] px-1.5 py-0.2 rounded bg-[#000035]/70 border border-[#9AB4FF]/20 shrink-0">
-                          {step.time}
-                        </span>
                         <h4
                           className={`text-xs sm:text-sm font-black truncate ${
                             isChecked ? 'text-white' : 'text-slate-300'

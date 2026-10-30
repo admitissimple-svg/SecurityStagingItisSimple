@@ -799,9 +799,9 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
   const strokeDashoffset = pathTotalLength - (progressPercent / 100) * pathTotalLength;
 
   return (
-    <div className="space-y-4" id="weekly-activity-section">
-      {/* 1. Memorization Activity Card */}
-      <div className="bg-gradient-to-br from-[#000035] via-[#062863] to-[#1C4C96] text-white rounded-3xl p-5 sm:p-6 border border-[#1C4C96] shadow-md space-y-5">
+    <div className="contents" id="weekly-activity-section">
+      {/* 1. Memorization Activity Card (Rendered below Video of the Day as order-5) */}
+      <div className="order-5 w-full bg-gradient-to-br from-[#000035] via-[#062863] to-[#1C4C96] text-white rounded-3xl p-5 sm:p-6 border border-[#1C4C96] shadow-md space-y-5">
         {/* Banner Header */}
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-[#607EC9]/40 pb-4">
           <div className="flex items-center gap-3.5">
@@ -947,8 +947,8 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
         </div>
       </div>
 
-      {/* 3. Bottom Card: 2-Column S-Fluency Path & 7-Day Checklist Grid */}
-      <div className="bg-gradient-to-br from-[#000035] via-[#062863] to-[#1C4C96] text-white rounded-3xl p-5 sm:p-6 border border-[#1C4C96] shadow-md space-y-5">
+      {/* 3. Bottom Card: 2-Column S-Fluency Path & 7-Day Checklist Grid (order-7) */}
+      <div className="order-7 w-full bg-gradient-to-br from-[#000035] via-[#062863] to-[#1C4C96] text-white rounded-3xl p-5 sm:p-6 border border-[#1C4C96] shadow-md space-y-5">
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
           {/* Left Column: S-Curve Vector & Weekly Progress */}
           <div className="lg:col-span-4 bg-[#000035]/70 rounded-2xl p-4 border border-[#607EC9]/40 flex flex-col justify-between space-y-4">
@@ -1162,9 +1162,11 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
               </div>
             </div>
 
-            {/* 4 Routine Rows */}
+            {/* 4 Routine Rows — Visual Order: Video -> Memorization -> Audio -> Native Friend; fixed times visually hidden */}
             <div className="space-y-2">
-              {ROUTINE_ROWS.map((row) => {
+              {(['video_day', 'memorization', 'audio_day', 'tutor_live'] as const).map((rowId) => {
+                const row = ROUTINE_ROWS.find((r) => r.id === rowId)!;
+                if (!row) return null;
                 const Icon = row.icon;
                 return (
                   <div
@@ -1177,19 +1179,6 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
                         <Icon className="w-4 h-4" />
                       </div>
                       <div className="min-w-0 flex items-center gap-2 flex-wrap">
-                        {(() => {
-                          const displayTime =
-                            row.id === 'video_day'
-                              ? userProfile?.routineVideoTime || row.time
-                              : row.id === 'audio_day'
-                              ? userProfile?.routineAudioTime || row.time
-                              : row.time;
-                          return (
-                            <span className="text-[11px] font-mono font-bold text-[#9AB4FF] px-1.5 py-0.5 rounded bg-[#000035]/70 border border-[#9AB4FF]/20 shrink-0">
-                              {displayTime}
-                            </span>
-                          );
-                        })()}
                         <h4 className="text-xs sm:text-sm font-black text-white truncate">
                           {isEn ? row.titleEn : row.titlePt}
                         </h4>

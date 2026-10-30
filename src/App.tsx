@@ -7234,7 +7234,7 @@ export default function App() {
               </div>
             ) : (
               /* STUDENT VIEW: Exactly Following the 3 User Model Sections */
-              <div className="space-y-6" id="student-model-dashboard">
+              <div className="flex flex-col gap-5 sm:gap-6" id="student-model-dashboard">
                 {/* Section 1: Contracted Lessons & Balance + Fixed Teacher Card + Live 1-on-1 Sessions Panel (Image 1) */}
                 <StudentHeaderSection
                   lessons={lessons}
