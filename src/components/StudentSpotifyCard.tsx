@@ -112,9 +112,9 @@ export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
 
           {/* Bottom Left: Playlist Title & Mode Toggle */}
           <div className="flex items-center gap-3 pt-1 border-t border-white/10 flex-wrap">
-            <span className="text-[11px] text-slate-300 font-semibold truncate max-w-[240px]">
+            {/*<span className="text-[11px] text-slate-300 font-semibold truncate max-w-[240px]">
               {levelPlaylistConfig.playlistTitle}
-            </span>
+            </span>*/}
 
             {/* Mode switch (App Player vs Web) */}
             <div className="flex items-center gap-0.5 bg-black/40 p-0.5 rounded-lg border border-white/10 text-[9px] shrink-0">
@@ -211,7 +211,7 @@ export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
                 className="px-3 py-1.5 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-400/40 rounded-xl text-xs font-bold flex items-center gap-1 transition cursor-pointer active:scale-95"
               >
                 <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                <span>{isEn ? 'Mark as Listened' : 'Marcar como Ouvido'}</span>
+                {/*<span>{isEn ? 'Mark as Listened' : 'Marcar como Ouvido'}</span>*/}
               </button>
             )}
 
