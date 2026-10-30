@@ -102,12 +102,12 @@ export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
 
           {/* Middle: Subtle Shuffle tip */}
           {!isRestDay && (
-            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#1DB954]/10 border border-[#1DB954]/20 text-[11px] text-emerald-200 w-fit">
+            {/*<div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#1DB954]/10 border border-[#1DB954]/20 text-[11px] text-emerald-200 w-fit">
               <Shuffle className="w-3 h-3 text-[#1DB954] shrink-0" />
-              {/*<span className="font-medium text-emerald-100 text-[10px] sm:text-[11px]">
+              <span className="font-medium text-emerald-100 text-[10px] sm:text-[11px]">
                 Try Shuffle mode to discover different songs!
-              </span>*/}
-            </div>
+              </span>
+            </div>*/}
           )}
 
           {/* Bottom Left: Playlist Title & Mode Toggle */}
