@@ -639,6 +639,10 @@ export default function App() {
 
   // 7. Weekly Homework State
   const [weeklyHomework, setWeeklyHomework] = useState<WeeklyHomeworkData | null>(null);
+  const weeklyHomeworkRef = useRef<WeeklyHomeworkData | null>(weeklyHomework);
+  useEffect(() => {
+    weeklyHomeworkRef.current = weeklyHomework;
+  }, [weeklyHomework]);
   const [homeworkTargetDay, setHomeworkTargetDay] = useState<DayOfWeek>(getTodayDayOfWeek());
 
   // 7b. S-Path (Gráfico S) Weekly Checks & Student Journal State (Multi-device Single Source of Truth)
@@ -672,10 +676,29 @@ export default function App() {
   const [excludedDictionaryWords, setExcludedDictionaryWords] = useState<string[]>(() => {
     return getCachedExcludedDictionaryWords(currentAccount?.uid, currentAccount?.email);
   });
+  // FASE 8.7: Canonical student identity validation & reactive references
+  const canonicalStudentUid = useMemo(() => {
+    const rawUid = currentAccount?.uid || userProfile?.id || (userProfile as any)?.uid || '';
+    const cleanEmail = (currentAccount?.email || userProfile?.email || '').toLowerCase().trim();
+    return normalizeUid(rawUid, cleanEmail) || rawUid.trim();
+  }, [currentAccount?.uid, currentAccount?.email, userProfile?.id, (userProfile as any)?.uid, userProfile?.email]);
+
+  const canonicalStudentEmail = useMemo(() => {
+    return (currentAccount?.email || userProfile?.email || '').toLowerCase().trim();
+  }, [currentAccount?.email, userProfile?.email]);
+
   // FASE 4B.3 & HOTFIX: Canonical student UID reference to discard out-of-order and cross-account async responses
   const activeStudentUidRef = useRef<string>(
-    currentAccount?.role === 'student' ? normalizeUid(currentAccount?.uid, currentAccount?.email) : ''
+    currentAccount?.role === 'student' ? canonicalStudentUid : ''
   );
+  useEffect(() => {
+    if (currentAccount?.role === 'student') {
+      activeStudentUidRef.current = canonicalStudentUid;
+    } else {
+      activeStudentUidRef.current = '';
+    }
+  }, [currentAccount?.role, canonicalStudentUid]);
+
   const [dictionaryHydrationStatus, setDictionaryHydrationStatus] = useState<
     StudentVocabularySubscriptionStatus | 'uninitialized'
   >('uninitialized');
@@ -1016,14 +1039,15 @@ export default function App() {
       wordsFromRoutines,
       excludedDictionaryWords,
       userProfile?.level,
-      currentAccount?.uid,
-      currentAccount?.email
+      canonicalStudentUid,
+      canonicalStudentEmail
     );
-  }, [studentDictionaryEntries, wordsFromRoutines, excludedDictionaryWords, userProfile?.level, currentAccount?.uid, currentAccount?.email]);
+  }, [studentDictionaryEntries, wordsFromRoutines, excludedDictionaryWords, userProfile?.level, canonicalStudentUid, canonicalStudentEmail]);
 
   // Generate Weekly Homework automatically whenever routines, dictionary, or targetDay change
   useEffect(() => {
-    // FASE 8.4: Bloquear a geração de homework enquanto a primeira hidratação do vocabulário e rotinas do Firestore não estiver concluída.
+    // FASE 8.7: Desacoplar a geração de homework da hidratação das rotinas.
+    // Se o My Dictionary estiver hidratado, o homework DEVE ser gerado mesmo com rotinas vazias ou indisponíveis.
     if (
       dictionaryHydrationStatus === 'uninitialized' ||
       dictionaryHydrationStatus === 'loading'
@@ -1034,12 +1058,9 @@ export default function App() {
     if (dictionaryHydrationStatus === 'error') {
       return;
     }
-    if (routinesHydrationStatus === 'uninitialized' || routinesHydrationStatus === 'loading') {
-      return;
-    }
-    if (routinesHydrationStatus === 'error') {
-      return;
-    }
+
+    const effectiveUid = canonicalStudentUid;
+    const effectiveEmail = canonicalStudentEmail;
 
     const customWordList = consolidatedActiveDictionary.map((e) => ({
       id: e.id,
@@ -1054,8 +1075,8 @@ export default function App() {
       firstSeenAt: (e as any).firstSeenAt,
       practiceCount: e.practiceCount,
       lastPracticedAt: e.lastPracticedAt,
-      studentUid: currentAccount?.uid || userProfile?.id || (userProfile as any)?.uid,
-      studentEmail: currentAccount?.email || userProfile?.email,
+      studentUid: effectiveUid,
+      studentEmail: effectiveEmail,
       origins: e.origins,
       lessonRefId: e.lessonRefId,
       partOfSpeech: e.partOfSpeech,
@@ -1069,7 +1090,8 @@ export default function App() {
       routinesByDay,
       studentName: userProfile.name,
       studentLevel: userProfile.level,
-      studentEmail: currentAccount?.email || userProfile.email,
+      studentEmail: effectiveEmail,
+      studentUid: effectiveUid,
       customWords: customWordList,
       targetDay: homeworkTargetDay,
       activityDate,
@@ -1077,7 +1099,7 @@ export default function App() {
       weeklyCycle: userProfile?.weeklyCycle || 1,
       userProfile,
       excludedWords: excludedDictionaryWords,
-      existingDailyActivities: weeklyHomework?.dailyActivities,
+      existingDailyActivities: weeklyHomeworkRef.current?.dailyActivities,
       lessons,
     });
 
@@ -1250,6 +1272,22 @@ export default function App() {
       }
 
       // Otherwise, the activity for homeworkTargetDay has not been started.
+      // If prev already has the identical unstarted vocabulary list for homeworkTargetDay, avoid creating a new object reference:
+      if (
+        !isTargetStarted &&
+        prev &&
+        isSameWeek &&
+        prev.targetDay === homeworkTargetDay &&
+        !prev.isEmpty &&
+        !generated.isEmpty &&
+        Array.isArray(prev.vocabularyList) &&
+        Array.isArray(generated.vocabularyList) &&
+        prev.vocabularyList.length === generated.vocabularyList.length &&
+        prev.vocabularyList.every((w, i) => (typeof w === 'string' ? w : w.word) === (typeof generated.vocabularyList[i] === 'string' ? generated.vocabularyList[i] : generated.vocabularyList[i].word))
+      ) {
+        return prev;
+      }
+
       // Use freshly generated activities with the newly saved/resolved vocabulary:
       const updatedDailyActivities = {
         ...combinedDaily,
@@ -1257,7 +1295,7 @@ export default function App() {
           id: `hw-${homeworkTargetDay}-${userProfile?.weeklyCycle || 1}`,
           day: homeworkTargetDay,
           weeklyCycle: userProfile?.weeklyCycle || 1,
-          studentUid: (currentAccount?.uid || userProfile?.id || (userProfile as any)?.uid || '').trim(),
+          studentUid: effectiveUid,
           selectedWords: generated.vocabularyList || [],
           wordOrigins: (generated as any).wordOrigins || [],
           matchingPairs: generated.matchingPairs || [],
@@ -1300,7 +1338,21 @@ export default function App() {
         dailyActivities: updatedDailyActivities,
       };
     });
-  }, [routinesByDay, routinesHydrationStatus, userProfile.name, userProfile.level, studentDictionaryEntries, excludedDictionaryWords, homeworkTargetDay, userProfile?.weeklyStudyDays, userProfile?.weeklyCycle, lessons]);
+  }, [
+    dictionaryHydrationStatus,
+    consolidatedActiveDictionary,
+    canonicalStudentUid,
+    canonicalStudentEmail,
+    homeworkTargetDay,
+    userProfile.name,
+    userProfile.level,
+    userProfile?.weeklyStudyDays,
+    userProfile?.weeklyCycle,
+    excludedDictionaryWords,
+    lessons,
+    routinesByDay,
+    routinesHydrationStatus,
+  ]);
 
   // Synchronize completedPartsByDay from weeklyChecks so memorization S-Path checks are always in sync
   useEffect(() => {
@@ -7487,6 +7539,7 @@ export default function App() {
       weeklyCycle={userProfile?.weeklyCycle || 1}
       weeklyChecks={weeklyChecks}
       routinesByDay={routinesByDay}
+      customWords={consolidatedActiveDictionary}
       onChangeDay={(day) => setHomeworkTargetDay(day)}
       onSaveProgress={(updated) => {
         const activeDay = updated.targetDay || homeworkTargetDay;

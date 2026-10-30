@@ -733,6 +733,35 @@ export function isActivityStartedOrAnswered(
  * - If fewer than 5 real words available, use only existing ones. Never invent words.
  * - Deduplication: normalize only for comparison without modifying original word spelling.
  */
+function normalizeStudentUid(rawId?: string | null, email?: string | null): string {
+  const cleanRawId = (rawId || '').trim();
+  const rawIsEmail = cleanRawId.includes('@');
+  const cleanEmail = (email || '').toLowerCase().trim();
+  const currentAuthUid = auth?.currentUser?.uid || '';
+  const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
+
+  if (
+    cleanRawId &&
+    !rawIsEmail &&
+    !cleanRawId.startsWith('usr-') &&
+    !cleanRawId.startsWith('tutor-') &&
+    cleanRawId !== 'user-default' &&
+    cleanRawId !== 'anonymous_student' &&
+    cleanRawId !== 'undefined' &&
+    cleanRawId !== 'null'
+  ) {
+    return cleanRawId;
+  }
+
+  if (currentAuthUid) {
+    if (!cleanEmail || (currentAuthEmail && cleanEmail === currentAuthEmail)) {
+      return currentAuthUid;
+    }
+  }
+
+  return cleanRawId && !rawIsEmail ? cleanRawId : '';
+}
+
 export function resolveDailyMemorizationVocabulary(params: {
   targetDay: DayOfWeek;
   activityDate?: string;
@@ -766,7 +795,7 @@ export function resolveDailyMemorizationVocabulary(params: {
     getIsoDateInTimeZone(activityDate || targetDate, timeZone) ||
     getDateForDayInCurrentWeek(targetDay, new Date(), timeZone);
 
-  const normTargetUid = (studentUid || '').trim();
+  const normTargetUid = normalizeStudentUid(studentUid, studentEmail) || (studentUid || '').trim();
   const normTargetEmail = (studentEmail || '').toLowerCase().trim();
 
   const parseTs = (iso?: any): number => {
@@ -790,9 +819,22 @@ export function resolveDailyMemorizationVocabulary(params: {
 
   const isTargetStudent = (item: any): boolean => {
     if (!item) return false;
-    const itemUid = (item.studentUid || item.uid || '').trim();
-    const itemEmail = (item.studentEmail || item.email || '').toLowerCase().trim();
-    if (normTargetUid && itemUid && itemUid !== normTargetUid) return false;
+    const rawItemUid = (item.studentUid || item.uid || '').trim();
+    const rawItemEmail = (item.studentEmail || item.email || '').toLowerCase().trim();
+
+    // If item doesn't have UID or email specified, it belongs to the student's personal dictionary loaded for this session
+    if (!rawItemUid && !rawItemEmail) return true;
+
+    const itemUid = normalizeStudentUid(rawItemUid, rawItemEmail) || rawItemUid;
+    const itemEmail = rawItemEmail;
+
+    if (normTargetUid && itemUid) {
+      if (itemUid === normTargetUid) return true;
+      // If UIDs differ due to userProfile vs currentAccount or legacy prefix, check if emails match
+      if (normTargetEmail && itemEmail && normTargetEmail === itemEmail) return true;
+      return false;
+    }
+
     if (normTargetEmail && itemEmail && itemEmail !== normTargetEmail) return false;
     return true;
   };
@@ -945,9 +987,9 @@ export function resolveDailyMemorizationVocabulary(params: {
     if (Array.isArray((cw as any).origins) && (cw as any).origins.length > 0) {
       for (const orig of (cw as any).origins) {
         if (!orig || !isNativeFriendOrigin(orig)) continue;
-        const origDate = getIsoDateInTimeZone(orig.date || orig.createdAt || orig.timestamp, timeZone);
+        const origDate = getIsoDateInTimeZone(orig.createdAt || orig.timestamp || orig.date, timeZone);
         if (origDate && origDate === resolvedActivityDate) {
-          const ts = parseTs(orig.date || orig.createdAt || orig.timestamp || (cw as any).learnedAt || (cw as any).firstSeenAt);
+          const ts = parseTs(orig.createdAt || orig.timestamp || orig.date || (cw as any).learnedAt || (cw as any).firstSeenAt);
           if (ts <= maxTs && ts >= bestOriginTs) {
             bestOriginTs = ts;
             bestMatchingOrigin = orig;
@@ -1538,11 +1580,16 @@ export function generateWeeklyHomework(
   lessons?: LiveLesson[],
   activityDate?: string,
   referenceTimestamp?: number | string,
-  timeZone?: string
+  timeZone?: string,
+  studentUid?: string
 ): WeeklyHomeworkData {
   const email = studentEmail || userProfile?.email || '';
   const name = studentName || userProfile?.name || (email ? email.split('@')[0] : 'Student');
   const rawLvl = (studentLevel || userProfile?.level || 'iniciante').toLowerCase();
+
+  const resolvedStudentUid =
+    normalizeStudentUid(studentUid || userProfile?.uid || userProfile?.id, email) ||
+    (studentUid || userProfile?.uid || userProfile?.id || '').trim();
 
   const isAdv = rawLvl.includes('avanc') || rawLvl.includes('advan') || rawLvl.includes('c1') || rawLvl.includes('c2');
   const isInter = !isAdv && (rawLvl.includes('intermed') || rawLvl.includes('b1') || rawLvl.includes('b2'));
@@ -1737,7 +1784,7 @@ export function generateWeeklyHomework(
         routinesByDay,
         customWords,
         lessons,
-        studentUid: userProfile?.id || (userProfile as any)?.uid,
+        studentUid: resolvedStudentUid,
         studentEmail: email,
         excludedWords,
         studentLevel: levelLabel,
@@ -1887,7 +1934,7 @@ export function generateWeeklyHomework(
       id: canonicalHwId,
       day: targetDay,
       weeklyCycle: userProfile?.weeklyCycle || 1,
-      studentUid: (userProfile?.uid || userProfile?.id || email || '').trim(),
+      studentUid: (resolvedStudentUid || userProfile?.uid || userProfile?.id || email || '').trim(),
       selectedWords: rawWords,
       wordOrigins,
       matchingPairs,
@@ -1913,6 +1960,7 @@ export function generateWeeklyHomework(
     assignedPartKey: schedule?.partKey,
     weekLabel,
     studentEmail: email,
+    studentUid: (resolvedStudentUid || userProfile?.uid || userProfile?.id || email || '').trim(),
     studentName: name,
     studentLevel: levelLabel,
     createdAt: new Date().toISOString(),
@@ -1935,6 +1983,7 @@ export function generateWeeklyHomeworkFromRoutines(params: {
   studentName?: string;
   studentLevel?: string;
   studentEmail?: string;
+  studentUid?: string;
   customWords?: Array<Partial<HomeworkVocabItem> & { word: string }>;
   targetDay?: DayOfWeek;
   activeStudyDays?: DayOfWeek[];
@@ -1955,6 +2004,8 @@ export function generateWeeklyHomeworkFromRoutines(params: {
     level: params.studentLevel,
     name: params.studentName,
     email: params.studentEmail,
+    uid: params.studentUid,
+    id: params.studentUid,
   } as any);
 
   const existingDaily =
@@ -1975,7 +2026,8 @@ export function generateWeeklyHomeworkFromRoutines(params: {
     params.lessons,
     params.activityDate || params.targetDate,
     params.referenceTimestamp,
-    params.timeZone
+    params.timeZone,
+    params.studentUid || params.userProfile?.id || (params.userProfile as any)?.uid
   );
 }
 

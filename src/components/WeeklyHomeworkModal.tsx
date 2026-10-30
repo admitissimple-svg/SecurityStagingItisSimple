@@ -30,6 +30,7 @@ import {
   SentenceWritingPrompt,
   DayOfWeek,
   HomeworkPartProgress,
+  HomeworkVocabItem,
 } from '../types';
 import {
   evaluateWeeklyHomeworkApi,
@@ -42,7 +43,9 @@ import {
   generatePart4StoryWithAi,
   deriveContextualSentencePrompt,
   isActivityStartedOrAnswered,
+  resolveDailyMemorizationVocabulary,
 } from '../utils/homeworkGenerator';
+import { getDateForDayInCurrentWeek } from '../utils/studentPersistence';
 import { isBadStoryText, synthesizeFillInBlanks } from '../utils/pedagogicalStorySynthesizer';
 import { speakText } from '../utils/audio';
 
@@ -63,6 +66,7 @@ interface WeeklyHomeworkModalProps {
   onCompleteTodayPart?: (partKey: 'matching' | 'fill' | 'writing' | 'reading', day: DayOfWeek) => void;
   onChangeDay?: (day: DayOfWeek) => void;
   routinesByDay?: Record<DayOfWeek, any>;
+  customWords?: Array<Partial<HomeworkVocabItem> & { word: string }>;
 }
 
 const WEEK_DAYS: { key: DayOfWeek; label: string }[] = [
@@ -240,6 +244,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
   onCompleteTodayPart,
   onChangeDay,
   routinesByDay,
+  customWords,
 }) => {
   const isEn = currentLanguage === 'en';
   const memT = useMemo(() => getMemorizationTranslations(currentLanguage), [currentLanguage]);
@@ -447,6 +452,26 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     }
     return [];
   }, [activeDayPassage?.questions, homework?.readingPassage?.questions]);
+  const resolvedFallbackWords = useMemo(() => {
+    if (Array.isArray(activeDayActivity?.selectedWords) && activeDayActivity.selectedWords.length > 0) {
+      return activeDayActivity.selectedWords;
+    }
+    if (Array.isArray(homework?.vocabularyList) && homework.vocabularyList.length > 0) {
+      return homework.vocabularyList;
+    }
+    if (Array.isArray(customWords) && customWords.length > 0) {
+      const targetDate = getDateForDayInCurrentWeek(targetDay);
+      return resolveDailyMemorizationVocabulary({
+        targetDay,
+        activityDate: targetDate,
+        customWords: customWords as any,
+        studentUid: homework?.studentUid,
+        studentEmail: homework?.studentEmail,
+      });
+    }
+    return [];
+  }, [activeDayActivity?.selectedWords, homework?.vocabularyList, customWords, targetDay, homework?.studentUid, homework?.studentEmail]);
+
   const safeMatchingPairs = useMemo(() => {
     if (Array.isArray(activeDayActivity?.matchingPairs) && activeDayActivity.matchingPairs.length > 0) {
       return activeDayActivity.matchingPairs;
@@ -454,11 +479,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     if (Array.isArray(homework?.matchingPairs) && homework.matchingPairs.length > 0) {
       return homework.matchingPairs;
     }
-    const words = (Array.isArray(activeDayActivity?.selectedWords) && activeDayActivity.selectedWords.length > 0)
-      ? activeDayActivity.selectedWords
-      : (Array.isArray(homework?.vocabularyList) && homework.vocabularyList.length > 0)
-      ? homework.vocabularyList
-      : [];
+    const words = resolvedFallbackWords;
     if (words.length > 0) {
       return words.map((v: any, idx: number) => ({
         id: `pair-${idx + 1}`,
@@ -468,7 +489,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       }));
     }
     return [];
-  }, [activeDayActivity?.matchingPairs, activeDayActivity?.selectedWords, homework?.matchingPairs, homework?.vocabularyList]);
+  }, [activeDayActivity?.matchingPairs, homework?.matchingPairs, resolvedFallbackWords]);
 
   const safeFillInBlanks = useMemo(() => {
     if (Array.isArray(activeDayActivity?.fillInBlanks) && activeDayActivity.fillInBlanks.length > 0) {
@@ -477,11 +498,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     if (Array.isArray(homework?.fillInBlanks) && homework.fillInBlanks.length > 0) {
       return homework.fillInBlanks;
     }
-    const words = (Array.isArray(activeDayActivity?.selectedWords) && activeDayActivity.selectedWords.length > 0)
-      ? activeDayActivity.selectedWords
-      : (Array.isArray(homework?.vocabularyList) && homework.vocabularyList.length > 0)
-      ? homework.vocabularyList
-      : [];
+    const words = resolvedFallbackWords;
     if (words.length > 0) {
       return synthesizeFillInBlanks(
         words.map((v: any) => typeof v === 'string' ? v : v.word),
@@ -489,7 +506,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       );
     }
     return [];
-  }, [activeDayActivity?.fillInBlanks, activeDayActivity?.selectedWords, homework?.fillInBlanks, homework?.vocabularyList]);
+  }, [activeDayActivity?.fillInBlanks, homework?.fillInBlanks, resolvedFallbackWords]);
 
   const safeSentenceWritingPrompts = useMemo(() => {
     if (Array.isArray(activeDayActivity?.sentenceWritingPrompts) && activeDayActivity.sentenceWritingPrompts.length > 0) {
@@ -498,11 +515,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     if (Array.isArray(homework?.sentenceWritingPrompts) && homework.sentenceWritingPrompts.length > 0) {
       return homework.sentenceWritingPrompts;
     }
-    const words = (Array.isArray(activeDayActivity?.selectedWords) && activeDayActivity.selectedWords.length > 0)
-      ? activeDayActivity.selectedWords
-      : (Array.isArray(homework?.vocabularyList) && homework.vocabularyList.length > 0)
-      ? homework.vocabularyList
-      : [];
+    const words = resolvedFallbackWords;
     if (words.length > 0) {
       return words.map((v: any) => deriveContextualSentencePrompt({
         word: typeof v === 'string' ? v : v.word,
@@ -515,7 +528,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
       }));
     }
     return [];
-  }, [activeDayActivity?.sentenceWritingPrompts, activeDayActivity?.selectedWords, homework?.sentenceWritingPrompts, homework?.vocabularyList]);
+  }, [activeDayActivity?.sentenceWritingPrompts, homework?.sentenceWritingPrompts, resolvedFallbackWords]);
 
   React.useEffect(() => {
     const dayAnswers =

@@ -49,6 +49,7 @@ import {
 import {
   isActivityStartedOrAnswered,
   deriveContextualSentencePrompt,
+  resolveDailyMemorizationVocabulary,
 } from './homeworkGenerator';
 
 export { getIsoDateInTimeZone };
@@ -4479,7 +4480,8 @@ export function subscribeToStudentJournal(
  */
 export function mergeDailyActivities(
   fallbackDays: Record<string, DailyHomeworkActivity> = {},
-  primaryDays: Record<string, DailyHomeworkActivity> = {}
+  primaryDays: Record<string, DailyHomeworkActivity> = {},
+  customWords?: Array<Partial<any> & { word: string }>
 ): Record<string, DailyHomeworkActivity> {
   const result: Record<string, DailyHomeworkActivity> = { ...(fallbackDays || {}) };
 
@@ -4491,12 +4493,21 @@ export function mergeDailyActivities(
       continue;
     }
 
-    const selectedWords =
+    let selectedWords =
       Array.isArray(primaryAct.selectedWords) && primaryAct.selectedWords.length > 0
         ? primaryAct.selectedWords
         : Array.isArray(fallbackAct.selectedWords) && fallbackAct.selectedWords.length > 0
         ? fallbackAct.selectedWords
         : [];
+
+    if (selectedWords.length === 0 && Array.isArray(customWords) && customWords.length > 0) {
+      selectedWords = resolveDailyMemorizationVocabulary({
+        targetDay: dayKey as any,
+        activityDate: getDateForDayInCurrentWeekTz(dayKey as any),
+        customWords: customWords as any,
+        studentUid: primaryAct.studentUid || fallbackAct.studentUid,
+      });
+    }
 
     const wordOrigins =
       Array.isArray(primaryAct.wordOrigins) && primaryAct.wordOrigins.length > 0
