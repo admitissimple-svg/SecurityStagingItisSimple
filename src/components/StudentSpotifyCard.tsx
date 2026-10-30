@@ -63,7 +63,7 @@ export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
     `https://open.spotify.com/playlist/${levelPlaylistConfig.playlistId || '5MMU9H5oXDd7FCWr0gkzHE'}`;
 
   return (
-    <div className="rounded-3xl bg-gradient-to-br from-slate-900 via-[#000035] to-[#062863] p-3.5 sm:p-4 text-white border border-[#1DB954]/30 shadow-xs">
+    <div className="rounded-3xl bg-gradient-to-br from-slate-900 via-[#000035] to-[#062863] p-2.5 sm:p-3 text-white border border-[#1DB954]/30 shadow-xs">
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         {/* Left Column: Metadata & Controls (matching image_3d4b54d3.png) */}
         <div className="flex-1 min-w-0 flex flex-col justify-between space-y-2.5">
