@@ -148,7 +148,7 @@ export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
         <div className="shrink-0 w-full md:w-[460px] lg:w-[500px] flex flex-col justify-between space-y-1">
           {/* Playlist Content / Player */}
           {isRestDay ? (
-            <div className="p-3 bg-white/5 rounded-2xl border border-white/10 flex items-center gap-3 h-[100px]">
+            <div className="p-3 bg-white/5 rounded-2xl border border-white/10 flex items-center gap-3 h-[95px]">
               <div className="w-8 h-8 rounded-xl bg-emerald-500/20 text-emerald-400 flex items-center justify-center shrink-0">
                 <Music className="w-4 h-4" />
               </div>
