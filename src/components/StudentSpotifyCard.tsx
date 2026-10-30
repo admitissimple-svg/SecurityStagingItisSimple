@@ -101,14 +101,14 @@ export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
           </div>
 
           {/* Middle: Subtle Shuffle tip */}
-          {!isRestDay && (
+          {/*{!isRestDay && (
             <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#1DB954]/10 border border-[#1DB954]/20 text-[11px] text-emerald-200 w-fit">
               <Shuffle className="w-3 h-3 text-[#1DB954] shrink-0" />
-              {/*<span className="font-medium text-emerald-100 text-[10px] sm:text-[11px]">
+              <span className="font-medium text-emerald-100 text-[10px] sm:text-[11px]">
                 Try Shuffle mode to discover different songs!
-              </span>*/}
+              </span>
             </div>
-          )}
+          )}*/}
 
           {/* Bottom Left: Playlist Title & Mode Toggle */}
           <div className="flex items-center gap-3 pt-1 border-t border-white/10 flex-wrap">
@@ -148,7 +148,7 @@ export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
         <div className="shrink-0 w-full md:w-[460px] lg:w-[500px] flex flex-col justify-between space-y-1">
           {/* Playlist Content / Player */}
           {isRestDay ? (
-            <div className="p-3 bg-white/5 rounded-2xl border border-white/10 flex items-center gap-3 h-[120px]">
+            <div className="p-3 bg-white/5 rounded-2xl border border-white/10 flex items-center gap-3 h-[100px]">
               <div className="w-8 h-8 rounded-xl bg-emerald-500/20 text-emerald-400 flex items-center justify-center shrink-0">
                 <Music className="w-4 h-4" />
               </div>
