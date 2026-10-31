@@ -1601,12 +1601,8 @@ export default function App() {
       }
     });
 
-    // Real-time synchronization for student journal (Sentence of the Day + Lesson Reviews)
-    const unsubJournal = role === 'student' && uid ? subscribeToStudentDailyJournal(uid, email, (realtimeJournal) => {
-      if (Array.isArray(realtimeJournal)) {
-        setDailyJournalEntries(realtimeJournal);
-      }
-    }) : () => {};
+    // Real-time synchronization for student daily journal is managed canonically by dedicated subscription below
+    const unsubJournal = () => {};
 
     // 2. Fetch user-isolated students list (for teachers and admin)
     if (role === 'teacher' || role === 'admin') {
@@ -2085,12 +2081,7 @@ export default function App() {
     if (role === 'student' && (email || uid)) {
       const dictEmail = email || userProfile?.email || '';
 
-      // Direct Firestore fetch for student journal (Firestore is exclusive canonical source of truth)
-      fetchStudentJournalFromFirestore(uid, dictEmail).then((fsJournal) => {
-        if (Array.isArray(fsJournal) && fsJournal.length > 0) {
-          setDailyJournalEntries(fsJournal);
-        }
-      });
+    // Student daily journal is continuously synchronized in real-time via dedicated subscribeToStudentDailyJournal hook
     }
 
     return () => {
@@ -2294,8 +2285,8 @@ export default function App() {
 
   // Real-time synchronization of daily journal entries (Daily Sentence & Reflections) across all devices
   useEffect(() => {
-    const uid = currentAccount?.uid || auth.currentUser?.uid || userProfile?.uid || userProfile?.id || '';
-    const email = currentAccount?.email || userProfile?.email || '';
+    const uid = auth.currentUser?.uid || currentAccount?.uid || userProfile?.uid || userProfile?.id || '';
+    const email = (auth.currentUser?.email || currentAccount?.email || userProfile?.email || '').toLowerCase().trim();
     if (!uid && !email) return;
 
     const unsub = subscribeToStudentDailyJournal(uid, email, (entries) => {
@@ -2305,7 +2296,7 @@ export default function App() {
     });
 
     return () => unsub();
-  }, [currentAccount?.uid, currentAccount?.email, userProfile?.id]);
+  }, [auth.currentUser?.uid, currentAccount?.uid, currentAccount?.email, userProfile?.id]);
 
   // Real-time synchronization of studentJournal across all devices (Mobile <-> Desktop)
   useEffect(() => {
@@ -6457,8 +6448,8 @@ export default function App() {
       dailyJournalEntries: (prev.dailyJournalEntries || []).filter((e) => e.id !== entryId),
     }));
 
-    const studentUid = currentAccount?.uid || userProfile?.id || '';
-    const studentEmail = (currentAccount?.email || userProfile?.email || '').toLowerCase().trim();
+    const studentUid = auth?.currentUser?.uid || currentAccount?.uid || userProfile?.id || '';
+    const studentEmail = (auth?.currentUser?.email || currentAccount?.email || userProfile?.email || '').toLowerCase().trim();
     if (studentUid || studentEmail) {
       const success = await deleteStudentJournalEntryFromFirestore(studentUid, entryId, studentEmail);
       if (!success) {

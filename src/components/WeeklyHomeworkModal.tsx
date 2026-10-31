@@ -428,6 +428,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
   const [partsProgress, setPartsProgress] = useState<NonNullable<WeeklyHomeworkData['partsProgress']>>(() => {
     return homework?.partsProgress || {};
   });
+  const [hasSavedPart4Locally, setHasSavedPart4Locally] = useState<boolean>(false);
   const [isSavingPart, setIsSavingPart] = useState<Record<string, boolean>>({
     matching: false,
     fill: false,
@@ -947,6 +948,12 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     partsProgress.reading?.status === 'completed' ||
     (dailySchedule.partKey === 'reading' && isTodayPartCompleted)
   );
+  const isPart4Saved = Boolean(
+    hasSavedPart4Locally ||
+    partsProgress.reading?.score !== undefined ||
+    partsProgress.reading?.status === 'completed' ||
+    (hasGenuineEvaluation && Array.isArray(homework?.aiEvaluation?.readingFeedback) && homework.aiEvaluation.readingFeedback.length > 0)
+  );
 
   // Event-driven helper to synchronously mark S-Path completed and persist to state/DB
   // Strictly records completion for the selected day executed, preserving rotation of parts
@@ -1289,22 +1296,65 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     setIsSavingPart((prev) => ({ ...prev, reading: true }));
     setEvalError(null);
 
-    // 1. Immediately persist typed student answers to Firestore so they are never lost
-    const inProgressPart: HomeworkPartProgress = {
+    // 1. Calculate objective score and results directly from questions and correctAnswer
+    const totalQ = Math.max(1, questionsList.length);
+    let correctCount = 0;
+    questionsList.forEach((q: any, idx: number) => {
+      const qId = q.id || `q-${idx + 1}`;
+      const chosen = quizAnswers[qId] !== undefined ? quizAnswers[qId] : quizAnswers[String(idx)];
+      if (chosen !== undefined && chosen !== null && Number(chosen) === Number(q.correctAnswer)) {
+        correctCount++;
+      }
+    });
+    const readingScore = Math.round((correctCount / totalQ) * 100);
+
+    // 2. Persist answers, score, and objective state to Firestore
+    const savedPart: HomeworkPartProgress = {
       partKey: 'reading',
       partNumber: 4,
       status: 'pending_evaluation',
       answers: quizAnswers,
+      score: readingScore,
       updatedAt: new Date().toISOString(),
     };
-    const inProgressParts = {
+    const nextPartsProgress = {
       ...partsProgress,
-      reading: inProgressPart,
+      reading: savedPart,
     };
-    setPartsProgress(inProgressParts);
+    setPartsProgress(nextPartsProgress);
+    setHasSavedPart4Locally(true);
+
+    const currentDaily = { ...(homework.dailyActivities || {}) };
+    currentDaily[targetDay] = {
+      ...(currentDaily[targetDay] || {}),
+      id: currentDaily[targetDay]?.id || `hw-${targetDay}-${weeklyCycle || 1}`,
+      day: targetDay,
+      weeklyCycle: weeklyCycle || 1,
+      studentUid: homework.studentUid || '',
+      selectedWords: activeDayActivity?.selectedWords || homework.vocabularyList || [],
+      wordOrigins: activeDayActivity?.wordOrigins || [],
+      matchingPairs: activeDayActivity?.matchingPairs || homework.matchingPairs || [],
+      fillInBlanks: activeDayActivity?.fillInBlanks || homework.fillInBlanks || [],
+      sentenceWritingPrompts: activeDayActivity?.sentenceWritingPrompts || homework.sentenceWritingPrompts || [],
+      readingPassage: activeDayActivity?.readingPassage || homework.readingPassage,
+      studentAnswers: {
+        ...(currentDaily[targetDay]?.studentAnswers || {}),
+        matching: matchingAnswers,
+        fillInBlanks: fillAnswers,
+        sentences: sentenceAnswers,
+        quizAnswers: quizAnswers,
+      },
+      partsProgress: nextPartsProgress,
+      aiEvaluation,
+      score: readingScore,
+      isCompleted: Boolean(homework.isCompleted),
+      isStarted: true,
+      updatedAt: new Date().toISOString(),
+    };
 
     const inProgressUpdate: WeeklyHomeworkData = {
       ...homework,
+      targetDay,
       studentAnswers: {
         ...(homework.studentAnswers || {}),
         matching: matchingAnswers,
@@ -1312,11 +1362,35 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
         sentences: sentenceAnswers,
         quizAnswers: quizAnswers,
       },
-      partsProgress: inProgressParts,
+      partsProgress: nextPartsProgress,
+      dailyActivities: currentDaily,
     };
-    onSaveProgress(inProgressUpdate);
 
-    // 2. Check if an authentic, genuine evaluation already exists matching current answers
+    // 3. Await confirmation of saving to Firestore
+    try {
+      if (onSaveProgress) {
+        await onSaveProgress(inProgressUpdate);
+      }
+    } catch (saveErr) {
+      console.error('Failed to persist Part 4 to Firestore:', saveErr);
+      setSubmittedFeedbackToast(
+        isEn
+          ? 'Error saving Part 4 answers to Firestore. Please try again.'
+          : 'Erro ao salvar respostas da Parte 4 no Firestore. Tente novamente.'
+      );
+      setTimeout(() => setSubmittedFeedbackToast(null), 3500);
+      setIsSavingPart((prev) => ({ ...prev, reading: false }));
+      return;
+    }
+
+    setSubmittedFeedbackToast(
+      isEn
+        ? `🎉 Part 4 saved! Score: ${readingScore}% (${correctCount}/${totalQ} correct).`
+        : `🎉 Parte 4 salva! Pontuação: ${readingScore}% (${correctCount}/${totalQ} corretas).`
+    );
+    setTimeout(() => setSubmittedFeedbackToast(null), 3500);
+
+    // 4. Check if an authentic, genuine evaluation already exists matching current answers
     const activeEval = aiEvaluation || homework?.aiEvaluation;
     const existingReadingMatches = Boolean(
       activeEval &&
@@ -1332,11 +1406,6 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
     if (existingReadingMatches && activeEval) {
       setAiEvaluation(activeEval);
-      const totalQ = Math.max(1, questionsList.length);
-      const readingScore = activeEval.readingFeedback
-        ? Math.round((activeEval.readingFeedback.filter((r: any) => r.isCorrect).length / totalQ) * 100)
-        : 100;
-
       const completedPart: HomeworkPartProgress = {
         partKey: 'reading',
         partNumber: 4,
@@ -1352,17 +1421,11 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
       markSPathCompleted(targetDay, 'reading', finalParts);
 
-      setSubmittedFeedbackToast(
-        isEn
-          ? '🎉 Part 4 evaluation verified and recorded on S-Path!'
-          : '🎉 Avaliação da Parte 4 verificada e gravada no S-Path!'
-      );
-      setTimeout(() => setSubmittedFeedbackToast(null), 3500);
       setIsSavingPart((prev) => ({ ...prev, reading: false }));
       return;
     }
 
-    // 3. Request genuine AI evaluation from server endpoint (Gemini 3-model contingency)
+    // 5. Complementary Gemini AI evaluation (preserving existing contingency model integration)
     try {
       const currentAnswers = {
         matching: matchingAnswers,
@@ -1379,76 +1442,65 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
         currentLanguage,
       });
 
-      if (!evalResult || !isValidHomeworkEvaluation(evalResult) || isSyntheticHomeworkEvaluation(evalResult)) {
-        throw new Error(
-          isEn
-            ? 'The pedagogical evaluation could not be completed at this moment. No synthetic scores have been created.'
-            : 'A correção pedagógica não pôde ser concluída neste momento. Nenhuma pontuação sintética foi gerada.'
-        );
-      }
+      if (evalResult && isValidHomeworkEvaluation(evalResult) && !isSyntheticHomeworkEvaluation(evalResult)) {
+        setAiEvaluation(evalResult);
 
-      setAiEvaluation(evalResult);
-
-      const totalQ = Math.max(1, questionsList.length);
-      const readingScore = Array.isArray(evalResult.readingFeedback) && totalQ > 0
-        ? Math.round((evalResult.readingFeedback.filter((r: any) => r.isCorrect).length / totalQ) * 100)
-        : 100;
-
-      const completedPart: HomeworkPartProgress = {
-        partKey: 'reading',
-        partNumber: 4,
-        status: 'completed',
-        answers: quizAnswers,
-        evaluation: evalResult,
-        score: readingScore,
-        completedAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-      const finalParts = { ...partsProgress, reading: completedPart };
-      setPartsProgress(finalParts);
-
-      markSPathCompleted(targetDay, 'reading', finalParts);
-
-      // Check if all 4 parts are now completed
-      const allPartsCompleted = Boolean(
-        finalParts.matching?.status === 'completed' &&
-        finalParts.fill?.status === 'completed' &&
-        finalParts.writing?.status === 'completed' &&
-        finalParts.reading?.status === 'completed'
-      );
-
-      if (allPartsCompleted) {
-        const s1 = finalParts.matching?.score ?? 100;
-        const s2 = finalParts.fill?.score ?? 100;
-        const s3 = finalParts.writing?.score ?? (evalResult.overallScore ?? 100);
-        const s4 = readingScore;
-        const overallScore = Math.round((s1 * 0.2) + (s2 * 0.25) + (s3 * 0.35) + (s4 * 0.2));
-
-        const fullHw: WeeklyHomeworkData = {
-          ...homework,
-          partsProgress: finalParts,
-          studentAnswers: currentAnswers,
-          aiEvaluation: evalResult,
-          isCompleted: true,
-          score: overallScore,
-          submittedAt: homework.submittedAt || new Date().toISOString(),
+        const completedPart: HomeworkPartProgress = {
+          partKey: 'reading',
+          partNumber: 4,
+          status: 'completed',
+          answers: quizAnswers,
+          evaluation: evalResult,
+          score: readingScore,
+          completedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
         };
-        onSaveProgress(fullHw);
-      }
+        const finalParts = { ...nextPartsProgress, reading: completedPart };
+        setPartsProgress(finalParts);
 
-      setSubmittedFeedbackToast(
-        isEn
-          ? '🎉 Part 4 evaluated by AI and recorded on S-Path!'
-          : '🎉 Parte 4 corrigida pela IA e gravada no S-Path com sucesso!'
-      );
-      setTimeout(() => setSubmittedFeedbackToast(null), 3500);
+        markSPathCompleted(targetDay, 'reading', finalParts);
+
+        // Check if all 4 parts are now completed
+        const allPartsCompleted = Boolean(
+          finalParts.matching?.status === 'completed' &&
+          finalParts.fill?.status === 'completed' &&
+          finalParts.writing?.status === 'completed' &&
+          finalParts.reading?.status === 'completed'
+        );
+
+        if (allPartsCompleted) {
+          const s1 = finalParts.matching?.score ?? 100;
+          const s2 = finalParts.fill?.score ?? 100;
+          const s3 = finalParts.writing?.score ?? (evalResult.overallScore ?? 100);
+          const s4 = readingScore;
+          const overallScore = Math.round((s1 * 0.2) + (s2 * 0.25) + (s3 * 0.35) + (s4 * 0.2));
+
+          const fullHw: WeeklyHomeworkData = {
+            ...homework,
+            partsProgress: finalParts,
+            studentAnswers: currentAnswers,
+            aiEvaluation: evalResult,
+            isCompleted: true,
+            score: overallScore,
+            submittedAt: homework.submittedAt || new Date().toISOString(),
+          };
+          onSaveProgress(fullHw);
+        }
+
+        setSubmittedFeedbackToast(
+          isEn
+            ? '🎉 Part 4 evaluated by AI and recorded on S-Path!'
+            : '🎉 Parte 4 avaliada pela IA e gravada no S-Path com sucesso!'
+        );
+        setTimeout(() => setSubmittedFeedbackToast(null), 3500);
+      }
     } catch (err: any) {
-      console.warn('AI evaluation error in Part 4, preserving answers in Firestore with status pending_evaluation:', err);
+      console.warn('AI evaluation error in Part 4, preserving objective correction in Firestore:', err);
       const friendlyMsg =
         err?.message ||
         (isEn
-          ? 'The pedagogical grading AI is temporarily unavailable after checking contingency models. Your answers have been safely preserved in Firestore. Please click "Retry Evaluation" to try again.'
-          : 'A IA de correção pedagógica está temporariamente indisponível após verificação dos modelos de contingência. Suas respostas foram salvas no Firestore. Por favor, clique em "Tentar Novamente".');
+          ? 'AI complementary feedback is temporarily unavailable after checking contingency models. Your objective correction has been safely preserved.'
+          : 'O feedback complementar da IA está temporariamente indisponível após verificação dos modelos de contingência. Sua correção objetiva foi salva com sucesso no Firestore.');
       setEvalError(friendlyMsg);
     } finally {
       setIsSavingPart((prev) => ({ ...prev, reading: false }));
@@ -2852,6 +2904,7 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                                             ...prev,
                                             [qId]: optIdx,
                                           }));
+                                          setHasSavedPart4Locally(false);
                                           if (aiEvaluation?.readingFeedback) {
                                             setAiEvaluation((prev) => {
                                               if (!prev || !prev.readingFeedback) return prev;
@@ -2865,12 +2918,13 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                                               };
                                             });
                                           }
-                                          if (partsProgress.reading?.status === 'completed') {
+                                          if (partsProgress.reading?.status === 'completed' || partsProgress.reading?.score !== undefined) {
                                             setPartsProgress((prev) => ({
                                               ...prev,
                                               reading: {
                                                 ...prev.reading!,
                                                 status: 'draft',
+                                                score: undefined,
                                                 answers: { ...quizAnswers, [qId]: optIdx },
                                                 updatedAt: new Date().toISOString(),
                                               },
@@ -3019,11 +3073,11 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
 
                           return (
                             <div
-                              key={q.id}
+                              key={qId}
                               className={`p-3 rounded-xl border text-xs space-y-1.5 transition ${
                                 !isAnswered
                                   ? 'bg-slate-50/70 border-slate-200'
-                                  : !isEvaluated
+                                  : !isPart4Saved
                                   ? 'bg-blue-50/50 border-blue-200'
                                   : isQuizCorrect
                                   ? 'bg-emerald-50/60 border-emerald-200'
@@ -3038,9 +3092,9 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                                   <span className="text-[11px] font-semibold text-slate-500">
                                     ⏳ {isEn ? 'Pending / Not answered' : 'Pendente / Não respondido'}
                                   </span>
-                                ) : !isEvaluated ? (
+                                ) : !isPart4Saved ? (
                                   <span className="text-[11px] font-semibold text-blue-700 bg-blue-50 px-2 py-0.5 rounded border border-blue-200">
-                                    ⏳ {isEn ? 'Pending AI Evaluation' : 'Aguardando Avaliação da IA'}
+                                    ⏳ {isEn ? 'Answered (Click "Save Part 4" to verify)' : 'Respondida (Clique em "Salvar Parte 4" para verificar)'}
                                   </span>
                                 ) : (
                                   <span className={isQuizCorrect ? 'text-emerald-700 font-bold' : 'text-amber-700 font-bold'}>
@@ -3049,8 +3103,14 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                                       : `✗ ${isEn ? 'Your choice' : 'Sua escolha'}: ${chosenText} → ${isEn ? 'Correct' : 'Correta'}: ${correctText}`}
                                   </span>
                                 )}
+                                {isPart4Saved && isEvaluated && (
+                                  <span className="text-[10px] font-bold text-[#1C4C96] bg-blue-50 px-2 py-0.5 rounded border border-blue-200 flex items-center gap-1">
+                                    <Sparkles className="w-3 h-3 text-[#1C4C96]" />
+                                    <span>{isEn ? 'AI Verified' : 'Validado por IA'}</span>
+                                  </span>
+                                )}
                               </div>
-                              {explanation && (
+                              {isPart4Saved && explanation && (
                                 <p className="text-[11px] text-slate-600 italic">
                                   {explanation}
                                 </p>

@@ -99,7 +99,11 @@ interface StudentRoutineGuideSectionProps {
   onUpdateTimeActivity?: (activityId: string, newTime: string) => void;
   onSaveLearnedWords: (activityId: string, words: string[]) => void;
   userProfile: UserProfile;
-  onSaveDailySentence: (sentence: string, wordsUsed: string[], evaluationResult?: WritingEvaluationResult | null) => void;
+  onSaveDailySentence: (
+    sentence: string,
+    wordsUsed: string[],
+    evaluationResult?: WritingEvaluationResult | null
+  ) => Promise<boolean | void> | boolean | void;
   onOpenJournalModal?: () => void;
   onOpenEmailModal?: () => void;
   onTest30MinReminder?: () => void;
@@ -660,7 +664,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     }
   };
 
-  const handleApplySentenceCorrection = () => {
+  const handleApplySentenceCorrection = async () => {
     if (sentenceEvaluation?.correctedSentence) {
       const corrected = sentenceEvaluation.correctedSentence;
       const updatedEval: WritingEvaluationResult = {
@@ -682,11 +686,13 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
         accumulatedWords.length > 0
           ? accumulatedWords
           : updatedEval.usedWords || displayRoutineWords;
-      onSaveDailySentence(corrected, finalWordsToSave, updatedEval);
-      setSentenceSavedSuccess(true);
-      setTimeout(() => {
-        setSentenceSavedSuccess(false);
-      }, 2500);
+      const ok = await onSaveDailySentence(corrected, finalWordsToSave, updatedEval);
+      if (ok !== false) {
+        setSentenceSavedSuccess(true);
+        setTimeout(() => {
+          setSentenceSavedSuccess(false);
+        }, 2500);
+      }
     }
   };
 
@@ -708,19 +714,6 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
       }
     }
 
-    // If the AI detected grammar, capitalization, spelling, or tense errors,
-    // keep the AI Grammar Analysis & Feedback card visible so the student can review or click "Apply & Use".
-    if (
-      activeEval &&
-      (activeEval.hasAnyError ||
-        activeEval.isCorrect === false ||
-        (activeEval.correctedSentence &&
-          activeEval.correctedSentence.trim().replace(/[.!?]+$/, '') !==
-            clean.replace(/[.!?]+$/, '')))
-    ) {
-      return;
-    }
-
     const dictMatchedWords = (dictionaryEntries || [])
       .filter((e) => {
         const w = (e.word || '').trim().toLowerCase();
@@ -729,11 +722,13 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
       .map((e) => e.word.trim());
     const accumulatedWords = Array.from(new Set([...matchedSentenceWords, ...dictMatchedWords]));
     const finalWordsToSave = accumulatedWords.length > 0 ? accumulatedWords : (activeEval?.usedWords || displayRoutineWords);
-    onSaveDailySentence(clean, finalWordsToSave, activeEval);
-    setSentenceSavedSuccess(true);
-    setTimeout(() => {
-      setSentenceSavedSuccess(false);
-    }, 2500);
+    const ok = await onSaveDailySentence(clean, finalWordsToSave, activeEval);
+    if (ok !== false) {
+      setSentenceSavedSuccess(true);
+      setTimeout(() => {
+        setSentenceSavedSuccess(false);
+      }, 2500);
+    }
   };
 
   // Automated level-based Spotify & YouTube curriculum sequential distribution

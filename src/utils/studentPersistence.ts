@@ -1173,7 +1173,7 @@ export function subscribeToStudentVocabulary(
 
 /**
  * Persist student daily journal entry directly to Firestore.
- * Saves to users/{studentUID} and subcollection users/{studentUID}/journal/{entryId}.
+ * Subcollection users/{cleanUid}/journal/{entryId} is the exclusive canonical source of truth.
  * Propagates real write failures, awaits confirmation, and enforces strict timeout without swallowing errors.
  */
 export async function saveStudentJournalEntryToFirestore(
@@ -1201,7 +1201,7 @@ export async function saveStudentJournalEntryToFirestore(
       })
     );
 
-    // 1. Save in dedicated canonical subcollection
+    // Save exclusively to canonical subcollection users/{cleanUid}/journal/{entryId}
     const stampedEntry = stampSchemaVersion(sanitizedEntry);
     assertSafeFirestoreWrite(`users/${cleanUid}/journal/${sanitizedEntry.id}`, stampedEntry, undefined, true);
     const entryRef = doc(db, 'users', cleanUid, 'journal', sanitizedEntry.id);
@@ -1211,43 +1211,6 @@ export async function saveStudentJournalEntryToFirestore(
       'Saving journal entry to subcollection timed out'
     );
 
-    // 2. Also retrieve and update list in user profile doc for single-fetch efficiency
-    const userRef = doc(db, 'users', cleanUid);
-    const userSnap = await withStrictTimeout(
-      getDoc(userRef),
-      3500,
-      'Reading user document timed out'
-    );
-    let existingList: DailyJournalEntry[] = [];
-    let existingDeleted: string[] = [];
-    if (userSnap && userSnap.exists()) {
-      const data = userSnap.data();
-      if (Array.isArray(data?.dailyJournalEntries)) {
-        existingList = data.dailyJournalEntries;
-      }
-      if (Array.isArray(data?.deletedJournalEntryIds)) {
-        existingDeleted = data.deletedJournalEntryIds;
-      }
-    }
-
-    // Ensure re-saved entry is removed from tombstones if it was previously deleted
-    const updatedDeleted = existingDeleted.filter((id) => id !== sanitizedEntry.id);
-    const filtered = existingList.filter((e) => e.id !== sanitizedEntry.id);
-    const updatedList = [sanitizedEntry, ...filtered];
-    const stampedUserUpdate = stampSchemaVersion({
-      dailyJournalEntries: updatedList,
-      deletedJournalEntryIds: updatedDeleted,
-      updatedAt: new Date().toISOString(),
-    });
-    assertSafeFirestoreWrite(`users/${cleanUid}`, stampedUserUpdate, userSnap?.data(), true);
-
-    await withStrictTimeout(
-      setDoc(userRef, stampedUserUpdate, { merge: true }),
-      3500,
-      'Updating user journal entry list timed out'
-    );
-
-    // Journal is 100% Firestore-authoritative (users/{cleanUid}/journal and users/{cleanUid})
     return true;
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, `users/${cleanUid}/journal/${entry.id}`);
@@ -1257,9 +1220,7 @@ export async function saveStudentJournalEntryToFirestore(
 
 /**
  * Fetch student daily journal entries directly from Firestore.
- * Subcollection users/{cleanUid}/journal is the canonical source of truth.
- * Legacy array users/{cleanUid}.dailyJournalEntries is only used as fallback for historical
- * unmigrated entries and respects deletedJournalEntryIds tombstones.
+ * Subcollection users/{cleanUid}/journal is the exclusive canonical source of truth.
  */
 export async function fetchStudentJournalFromFirestore(
   studentUid: string,
@@ -1272,67 +1233,16 @@ export async function fetchStudentJournalFromFirestore(
 
   try {
     const journalMap = new Map<string, DailyJournalEntry>();
-    const deletedIds = new Set<string>();
-
-    // 1. Load user doc first to check tombstone deletedJournalEntryIds
-    const userRef = doc(db, 'users', cleanUid);
-    const userSnap = await withFirestoreTimeout(getDoc(userRef), 2500, null);
-    let legacyEntries: DailyJournalEntry[] = [];
-    if (userSnap && userSnap.exists()) {
-      const data = userSnap.data();
-      if (Array.isArray(data?.deletedJournalEntryIds)) {
-        data.deletedJournalEntryIds.forEach((id: string) => deletedIds.add(id));
-      }
-      if (Array.isArray(data?.dailyJournalEntries)) {
-        legacyEntries = data.dailyJournalEntries;
-      }
-    }
-
-    // 2. Canonical subcollection users/{cleanUid}/journal
     const colRef = collection(db, 'users', cleanUid, 'journal');
-    const colSnap = await withFirestoreTimeout(getDocs(colRef), 3000, null);
-    let hasSubcollectionEntries = false;
+    const colSnap = await withFirestoreTimeout(getDocs(colRef), 3500, null);
     if (colSnap && !colSnap.empty) {
-      hasSubcollectionEntries = true;
       colSnap.forEach((d) => {
         const item = d.data() as DailyJournalEntry;
-        if (item?.id && !deletedIds.has(item.id)) {
-          journalMap.set(item.id, item);
+        if (item) {
+          const id = item.id || d.id;
+          journalMap.set(id, { ...item, id });
         }
       });
-    }
-
-    // 3. Fallback to unmigrated historical entries from legacy array only if not deleted
-    legacyEntries.forEach((item: DailyJournalEntry) => {
-      if (item?.id && !deletedIds.has(item.id)) {
-        // If the subcollection is active, entries deleted from subcollection must NOT be resurrected
-        // Only include legacy items if the subcollection has not yet been populated for this student
-        if (!hasSubcollectionEntries && !journalMap.has(item.id)) {
-          journalMap.set(item.id, item);
-        }
-      }
-    });
-
-    // Check email doc if UID doc was empty
-    if (journalMap.size === 0 && studentEmail) {
-      const emailDocId = normalizeUid(null, studentEmail);
-      if (emailDocId !== cleanUid) {
-        const altRef = doc(db, 'users', emailDocId);
-        const altSnap = await withFirestoreTimeout(getDoc(altRef), 2000, null);
-        if (altSnap && altSnap.exists()) {
-          const altData = altSnap.data();
-          if (Array.isArray(altData?.deletedJournalEntryIds)) {
-            altData.deletedJournalEntryIds.forEach((id: string) => deletedIds.add(id));
-          }
-          if (Array.isArray(altData?.dailyJournalEntries)) {
-            altData.dailyJournalEntries.forEach((item: DailyJournalEntry) => {
-              if (item?.id && !deletedIds.has(item.id) && !journalMap.has(item.id)) {
-                journalMap.set(item.id, item);
-              }
-            });
-          }
-        }
-      }
     }
 
     // Sort newest first
@@ -5619,99 +5529,41 @@ export function subscribeToStudentDailyJournal(
   const cleanUid = normalizeUid(studentUid, cleanEmail);
   if (!db || !cleanUid) return () => {};
 
-  const unsubscribers: (() => void)[] = [];
-  const subColMap = new Map<string, DailyJournalEntry>();
-  const userDocMap = new Map<string, DailyJournalEntry>();
-  const deletedIdsSet = new Set<string>();
-
-  const rebuildAndNotify = () => {
-    const combined = new Map<string, DailyJournalEntry>();
-    // Canonical subcollection entries take absolute authority
-    subColMap.forEach((val, id) => {
-      if (!deletedIdsSet.has(id)) combined.set(id, val);
-    });
-    // Legacy array only acts as fallback for historical unmigrated entries if subcollection has no entries
-    if (subColMap.size === 0) {
-      userDocMap.forEach((val, id) => {
-        if (!deletedIdsSet.has(id) && !combined.has(id)) {
-          combined.set(id, val);
-        }
-      });
-    }
-    const list = Array.from(combined.values());
-    list.sort((a, b) => {
-      const timeA = new Date(a.createdAt || a.date).getTime();
-      const timeB = new Date(b.createdAt || b.date).getTime();
-      return timeB - timeA;
-    });
-    callback(list);
-  };
-
   try {
     const subCol = collection(db, 'users', cleanUid, 'journal');
-    unsubscribers.push(
-      onSnapshot(
-        subCol,
-        (snap) => {
-          snap.docChanges().forEach((change) => {
-            if (change.type === 'removed') {
-              deletedIdsSet.add(change.doc.id);
-              subColMap.delete(change.doc.id);
-            }
-          });
-          subColMap.clear();
-          snap.forEach((d) => {
-            const item = d.data() as DailyJournalEntry;
-            if (item?.id && !deletedIdsSet.has(item.id)) {
-              subColMap.set(item.id, item);
-            }
-          });
-          rebuildAndNotify();
-        },
-        (err) => {
-          console.warn('Real-time journal subcollection notice:', err);
-        }
-      )
-    );
-
-    const userRef = doc(db, 'users', cleanUid);
-    unsubscribers.push(
-      onSnapshot(
-        userRef,
-        (snap) => {
-          userDocMap.clear();
-          if (snap.exists()) {
-            const data = snap.data();
-            if (Array.isArray(data?.deletedJournalEntryIds)) {
-              data.deletedJournalEntryIds.forEach((id: string) => deletedIdsSet.add(id));
-            }
-            if (Array.isArray(data?.dailyJournalEntries)) {
-              data.dailyJournalEntries.forEach((item: DailyJournalEntry) => {
-                if (item?.id && !deletedIdsSet.has(item.id)) {
-                  userDocMap.set(item.id, item);
-                }
-              });
-            }
+    return onSnapshot(
+      subCol,
+      (snap) => {
+        const list: DailyJournalEntry[] = [];
+        snap.forEach((d) => {
+          const item = d.data() as DailyJournalEntry;
+          if (item) {
+            list.push({
+              ...item,
+              id: item.id || d.id,
+            });
           }
-          rebuildAndNotify();
-        },
-        (err) => {
-          console.warn('Real-time journal userDoc notice:', err);
-        }
-      )
+        });
+        list.sort((a, b) => {
+          const timeA = new Date(a.createdAt || a.date).getTime();
+          const timeB = new Date(b.createdAt || b.date).getTime();
+          return timeB - timeA;
+        });
+        callback(list);
+      },
+      (err) => {
+        console.warn('Real-time journal subcollection notice:', err);
+      }
     );
-  } catch {}
-
-  return () => {
-    unsubscribers.forEach((u) => u());
-  };
+  } catch (err) {
+    console.warn('Error subscribing to journal subcollection:', err);
+    return () => {};
+  }
 }
 
 /**
  * Delete a student daily journal entry directly from Cloud Firestore and sync across all devices.
- * Strictly deletes from subcollection users/{cleanUid}/journal/{entryId}, filters the entry from
- * users/{cleanUid}.dailyJournalEntries, and registers a persistent tombstone in deletedJournalEntryIds
- * to permanently prevent legacy reintroduction.
+ * Strictly deletes from canonical subcollection users/{cleanUid}/journal/{entryId}.
  */
 export async function deleteStudentJournalEntryFromFirestore(
   studentUid: string,
@@ -5725,36 +5577,8 @@ export async function deleteStudentJournalEntryFromFirestore(
   if (!cleanUid) return false;
 
   try {
-    // 1. Delete from canonical subcollection
     const entryRef = doc(db, 'users', cleanUid, 'journal', entryId);
     await withStrictTimeout(deleteDoc(entryRef), 4000, 'Deleting journal entry from subcollection timed out');
-
-    // 2. Remove from user profile doc dailyJournalEntries array and record tombstone
-    const userRef = doc(db, 'users', cleanUid);
-    const userSnap = await withStrictTimeout(getDoc(userRef), 3000, 'Reading user document timed out');
-    if (userSnap && userSnap.exists()) {
-      const data = userSnap.data();
-      const existingList = Array.isArray(data?.dailyJournalEntries) ? data.dailyJournalEntries : [];
-      const filtered = existingList.filter((e: DailyJournalEntry) => e.id !== entryId);
-      const existingDeleted = Array.isArray(data?.deletedJournalEntryIds) ? data.deletedJournalEntryIds : [];
-      const updatedDeleted = Array.from(new Set([...existingDeleted, entryId]));
-
-      await withStrictTimeout(
-        setDoc(
-          userRef,
-          {
-            dailyJournalEntries: filtered,
-            deletedJournalEntryIds: updatedDeleted,
-            updatedAt: new Date().toISOString(),
-          },
-          { merge: true }
-        ),
-        3500,
-        'Updating user doc journal tombstones timed out'
-      );
-    }
-
-    // Journal deletion is 100% Firestore-authoritative (users/{cleanUid}/journal and users/{cleanUid})
     return true;
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, `users/${cleanUid}/journal/${entryId}`);
@@ -5762,10 +5586,6 @@ export async function deleteStudentJournalEntryFromFirestore(
   }
 }
 
-/**
- * Fetch student daily routines directly from Cloud Firestore once.
- * Distinguishes between loading, success (with or without words), and network/read errors.
- */
 export async function fetchStudentDailyRoutinesFromFirestore(
   studentUid: string
 ): Promise<{ success: boolean; routines: Partial<Record<DayOfWeek, any>>; error?: any }> {
