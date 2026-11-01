@@ -104,7 +104,11 @@ export const DailySentenceModal: React.FC<DailySentenceModalProps> = ({
     try {
       const result = await checkDailySentenceAi(
         sentenceInput.trim(),
-        allWords
+        allWords,
+        {
+          level: userProfile?.level,
+          language: currentLanguage,
+        }
       );
       setEvaluation(result);
     } catch {
@@ -123,7 +127,10 @@ export const DailySentenceModal: React.FC<DailySentenceModalProps> = ({
     if (!activeEval) {
       setIsChecking(true);
       try {
-        activeEval = await checkDailySentenceAi(clean, allWords);
+        activeEval = await checkDailySentenceAi(clean, allWords, {
+          level: userProfile?.level,
+          language: currentLanguage,
+        });
         setEvaluation(activeEval);
       } catch {
         // API has fallback
@@ -380,16 +387,53 @@ export const DailySentenceModal: React.FC<DailySentenceModalProps> = ({
 
                 {/* Word adjustments */}
                 {evaluation.wordFeedbacks && evaluation.wordFeedbacks.some((wf) => wf.hasError) && (
-                  <div className="flex flex-wrap gap-1.5 pt-0.5">
-                    {evaluation.wordFeedbacks.filter((wf) => wf.hasError).map((wf, idx) => (
-                      <span
-                        key={idx}
-                        className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-white border border-amber-300 text-amber-950 font-bold"
-                        title={isEn ? wf.explanationEn : wf.explanationPt}
-                      >
-                        <span className="line-through text-rose-400">{wf.original}</span> → <span className="text-emerald-700">{wf.corrected}</span>
-                      </span>
-                    ))}
+                  <div className="space-y-1.5 pt-0.5">
+                    <span className="text-[10px] font-bold text-amber-950 block">
+                      {isEn ? 'Identified Adjustments:' : 'Ajustes Identificados:'}
+                    </span>
+                    <div className="flex flex-col gap-1.5">
+                      {evaluation.wordFeedbacks.filter((wf) => wf.hasError).map((wf, idx) => {
+                        const isImprovement = wf.classification === 'Improvement' || (!wf.classification && wf.category === 'collocation');
+                        const isAlternative = wf.classification === 'Alternative';
+                        const badgeLabel = isAlternative
+                          ? (isEn ? 'Alternative' : 'Alternativa')
+                          : isImprovement
+                          ? (isEn ? 'Improvement' : 'Melhoria')
+                          : (isEn ? 'Error' : 'Erro');
+                        const badgeStyle = isAlternative
+                          ? 'bg-sky-100 text-sky-800 border-sky-300'
+                          : isImprovement
+                          ? 'bg-amber-100 text-amber-900 border-amber-300'
+                          : 'bg-rose-100 text-rose-800 border-rose-300';
+
+                        return (
+                          <div
+                            key={idx}
+                            className="p-2 rounded-lg bg-white/90 border border-amber-200/70 text-xs space-y-1"
+                          >
+                            <div className="flex items-center justify-between gap-1 flex-wrap">
+                              <span className="font-mono text-[11px] font-bold">
+                                <span className="line-through text-rose-400">{wf.original}</span> →{' '}
+                                <span className="text-emerald-700">{wf.corrected}</span>
+                              </span>
+                              <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full border ${badgeStyle}`}>
+                                {badgeLabel}
+                              </span>
+                            </div>
+                            {(wf.explanationPt || wf.explanationEn) && (
+                              <p className="text-[10px] text-slate-700 leading-relaxed">
+                                {isEn ? (wf.explanationEn || wf.explanationPt) : (wf.explanationPt || wf.explanationEn)}
+                              </p>
+                            )}
+                            {wf.example && (
+                              <p className="text-[10px] text-slate-600 italic bg-amber-50/50 px-2 py-0.5 rounded border border-amber-100">
+                                💬 <span className="font-semibold">{isEn ? 'Example:' : 'Exemplo:'}</span> "{wf.example}"
+                              </p>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
                   </div>
                 )}
 

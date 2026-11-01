@@ -175,7 +175,7 @@ import {
   getWeeklyYouTubeVideosForLevel,
   getDailyYouTubeVideoForStudent,
 } from './src/utils/youtube';
-import { DayOfWeek } from './src/types';
+import { DayOfWeek, EnglishLevel, WordFeedback } from './src/types';
 import {
   synthesizeCohesiveStoryAndQuestions,
   synthesizeFillInBlanks,
@@ -15578,6 +15578,8 @@ export async function evaluateDailySentenceIsolated(
   options?: {
     correlationId?: string;
     callerRole?: string;
+    level?: EnglishLevel | string;
+    language?: string;
     modelsOverride?: string[];
     attemptExecutor?: (model: string, params: any) => Promise<any>;
   }
@@ -15594,7 +15596,12 @@ export async function evaluateDailySentenceIsolated(
     )
   );
 
-  const cacheKey = `v3::${rawClean}::${cleanDailyWords.map((w) => w.toLowerCase()).sort().join(',')}`;
+  const userLevel = options?.level || 'intermediario';
+  const cefrInfo = resolveCefrLevel(userLevel);
+  const langKey = options?.language || 'pt';
+  const targetLang = LANGUAGE_NAMES[langKey] || { nameEn: 'Portuguese', nameNative: 'Português' };
+
+  const cacheKey = `v4::${cefrInfo.cefr}::${langKey}::${rawClean}::${cleanDailyWords.map((w) => w.toLowerCase()).sort().join(',')}`;
   const cached = dailySentenceEvaluationCache.get(cacheKey);
   if (cached && cached.expiry > Date.now()) {
     const diag: DailySentenceDiagnostics = {
@@ -15661,27 +15668,79 @@ export async function evaluateDailySentenceIsolated(
     };
   }
 
-  // 2. Concise, token-optimized Gemini API call strictly for Sentence of the Day
+  // 2. Cambridge/CELTA Pedagogical English Assessor prompt for Sentence of the Day
   const apiKey = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
-  const concisePrompt = `You are a strict English grammar checker for "Sentence of the Day".
-Evaluate the student's sentence with zero-tolerance for errors:
-1. Capitalization: Standalone pronoun "i" MUST be "I" (e.g. "because i pass" -> "because I passed", "now i will" -> "now I will"). First word of sentence must be capitalized.
-2. Verb Tense & Agreement: Check tense consistency across clauses (e.g. if the sentence starts in past tense like "Today was a perfect day", causal/subordinate clauses like "because i pass the test" MUST use past tense "because I passed the test"). Check 3rd-person singular, modals, and auxiliaries.
-3. Articles, Prepositions, Spelling & Punctuation: Fix any unnatural phrasing, comma splices (remove unnecessary comma before "because"), article errors (a/an), or typos.
-4. Daily Vocabulary: Identify which of Daily Words are used and which are missing.
+  const pedagogicalSystemInstruction = `You are an expert, Cambridge/CELTA-certified Pedagogical English Assessor and Native Friend Teacher for "Sentence of the Day".
+Evaluate student sentences with deep pedagogical fidelity, just like an experienced Native Friend tutor analyzing spoken and written production.
 
+EVALUATE ACROSS 6 DISTINCT DIMENSIONS:
+1. GRAMMAR: Subject-verb agreement, verb tenses (past/present narrative consistency), modal verbs, auxiliaries, pronouns, clause syntax.
+2. PUNCTUATION & STRUCTURE: Run-on sentences, comma splices (joining independent clauses with only a comma without conjunction or semicolon), missing terminal punctuation, coordinating/subordinating clause links.
+3. COLLOCATIONS: Authentic, natural English word combinations (e.g. "build rapport" or "develop rapport" instead of "make a rapport"; "do homework" instead of "make homework"; "make a decision" instead of "take a decision"; "have breakfast" instead of "take breakfast").
+4. WORD CHOICE & L1 INTERFERENCE: Vocabulary suitability and nuance, eliminating false cognates or unnatural direct translations from Portuguese / the student's native language.
+5. PREPOSITIONS: Contextual usage and dependent prepositions (e.g. "listen to", "depend on", "good at", "arrive at/in", "on Monday").
+6. NATURALNESS & FLUENCY: Idiomatic expressions, conversational rhythm, eliminating clunky phrasing and redundancies (e.g. "keep closeness in my friendships" -> "maintain close relationships with them" or "stay close to them").
+
+MANDATORY CLASSIFICATION IN wordFeedbacks:
+For each feedback item, strictly classify:
+- "Error": Grammatical mistake, spelling error, incorrect preposition, or punctuation rule violation (e.g., comma splice).
+- "Improvement": Understandable and grammatical, but unnatural, clunky, or non-idiomatic phrasing (e.g., unnatural collocations like "make a good rapport", or clunky phrasing like "keep closeness in my friendships").
+- "Alternative": Another natural, valid phrasing for the student to express the same idea.
+NEVER classify stylistic preferences or natural alternatives as grammatical errors!
+
+PRESERVE STUDENT INTENT:
+- Preserve the original meaning and core idea of the student. Do NOT invent new facts or arbitrary context.
+- Adapt all pedagogical explanations and vocabulary suggestions to CEFR level ${cefrInfo.cefr} (${cefrInfo.labelEn}).
+
+HOLISTIC CORRECTION:
+- Propose a "correctedSentence" that fixes all identified issues cohesively, considering the whole sentence so no awkward phrasing remains.
+
+IF THE SENTENCE IS ALREADY ACCURATE AND NATURAL:
+- Set hasAnyError: false, isCorrect: true, wordFeedbacks: [], and keep correctedSentence equal to the student's original sentence (with capitalization/punctuation if needed). Do NOT invent imaginary errors!
+
+EXPLANATIONS & EXAMPLES:
+- Provide explanationPt in ${targetLang.nameEn} (${targetLang.nameNative}) adapted to CEFR ${cefrInfo.cefr}.
+- Provide explanationEn in natural English.
+- Provide a concise example sentence illustrating the natural usage.
+
+Return strict JSON conforming to:
+{
+  "hasAnyError": boolean,
+  "isCorrect": boolean,
+  "usedWords": [string],
+  "missingWords": [string],
+  "correctedSentence": string,
+  "explanationPt": string,
+  "explanationEn": string,
+  "overallSummaryPt": string,
+  "overallSummaryEn": string,
+  "wordFeedbacks": [
+    {
+      "original": string,
+      "corrected": string,
+      "hasError": boolean,
+      "classification": "Error" | "Improvement" | "Alternative",
+      "category": "grammar" | "punctuation" | "collocation" | "word_choice" | "preposition" | "naturalness",
+      "explanationPt": string,
+      "explanationEn": string,
+      "example": string
+    }
+  ]
+}`;
+
+  const pedagogicalPrompt = `Student Level: CEFR ${cefrInfo.cefr} (${cefrInfo.labelEn})
+Target Language for explanations: ${targetLang.nameEn} (${targetLang.nameNative})
 Student Sentence: "${rawClean}"
-Daily Words: ${JSON.stringify(cleanDailyWords)}
+Daily Routine Words: ${JSON.stringify(cleanDailyWords)}
 
-Return strict JSON:
-{"hasAnyError":boolean,"isCorrect":boolean,"usedWords":[string],"missingWords":[string],"correctedSentence":string,"explanationPt":string,"explanationEn":string,"wordFeedbacks":[{"original":string,"hasError":boolean,"corrected":string,"explanationPt":string,"explanationEn":string}]}`;
+Analyze the sentence thoroughly according to all 6 pedagogical criteria. Identify any comma splices, unnatural collocations (e.g., "make a rapport"), awkward phrasing (e.g., "keep closeness"), or redundancies, while preserving student intent. If the sentence is already correct and natural, confirm it with hasAnyError: false and isCorrect: true. Return strict JSON only.`;
 
   // HOTFIX 3-MODEL CONTINGENCY: Sequential failover across up to 3 verified models on recoverable errors
   const contingencyResult = await executeGeminiWithContingency(
     {
       feature: 'check_daily_sentence',
-      systemInstruction: 'You are an ultra-rigorous English grammar checker for Sentence of the Day. Respond strictly in valid JSON.',
-      untrustedUserDataPrompt: concisePrompt,
+      systemInstruction: pedagogicalSystemInstruction,
+      untrustedUserDataPrompt: pedagogicalPrompt,
       callerRole: options?.callerRole || 'student',
       apiKey,
       temperature: 0.1,
@@ -15718,12 +15777,72 @@ Return strict JSON:
         ? parsed.missingWords
         : missingWords;
 
+    // Merge wordFeedbacks from deterministic check and Gemini
+    const combinedWordFeedbacks: WordFeedback[] = [];
+
+    wordFeedbacks.forEach((wf) => {
+      combinedWordFeedbacks.push({
+        ...wf,
+        classification: wf.classification || 'Error',
+        category: wf.category || 'grammar',
+      });
+    });
+
+    if (Array.isArray(parsed.wordFeedbacks)) {
+      parsed.wordFeedbacks.forEach((wf: any) => {
+        if (
+          wf &&
+          (wf.hasError === true || wf.classification === 'Error' || wf.classification === 'Improvement') &&
+          wf.original &&
+          wf.corrected
+        ) {
+          const origClean = String(wf.original).trim();
+          const corrClean = String(wf.corrected).trim();
+          if (!origClean || !corrClean) return;
+
+          const origLower = origClean.toLowerCase();
+          const existingIdx = combinedWordFeedbacks.findIndex(
+            (existing) => existing.original.toLowerCase().trim() === origLower
+          );
+          const feedbackObj: WordFeedback = {
+            original: origClean,
+            hasError: true,
+            corrected: corrClean,
+            classification:
+              wf.classification === 'Improvement' || wf.classification === 'Alternative'
+                ? wf.classification
+                : 'Error',
+            category:
+              wf.category && ['grammar', 'punctuation', 'collocation', 'word_choice', 'preposition', 'naturalness'].includes(wf.category)
+                ? wf.category
+                : 'grammar',
+            explanationPt: wf.explanationPt || wf.explanation || '',
+            explanationEn: wf.explanationEn || wf.explanation || '',
+            example: wf.example ? String(wf.example).trim() : undefined,
+          };
+
+          if (existingIdx >= 0) {
+            combinedWordFeedbacks[existingIdx] = {
+              ...combinedWordFeedbacks[existingIdx],
+              ...feedbackObj,
+              explanationPt: feedbackObj.explanationPt || combinedWordFeedbacks[existingIdx].explanationPt,
+              explanationEn: feedbackObj.explanationEn || combinedWordFeedbacks[existingIdx].explanationEn,
+            };
+          } else {
+            combinedWordFeedbacks.push(feedbackObj);
+          }
+        }
+      });
+    }
+
+    const hasAnyWordFeedbackIssue = combinedWordFeedbacks.some((wf) => wf.hasError);
     const finalHasError = Boolean(
       hasProgrammaticError ||
         hasDiff ||
         parsed.hasAnyError === true ||
         parsed.isCorrect === false ||
-        !usedTargetWord
+        hasAnyWordFeedbackIssue ||
+        (hasWordConstraint && !usedTargetWord)
     );
 
     const aiExplPt = parsed.explanationPt || parsed.explanation || '';
@@ -15734,7 +15853,7 @@ Return strict JSON:
         .join(' ')
         .trim() ||
       (finalHasError
-        ? 'Ajustes gramaticais sugeridos para tornar sua frase correta e natural.'
+        ? 'Ajustes pedagógicos sugeridos para tornar sua frase correta e natural.'
         : 'Sua frase está gramaticalmente correta e natural.');
 
     const combinedExplEn =
@@ -15742,27 +15861,8 @@ Return strict JSON:
         .join(' ')
         .trim() ||
       (finalHasError
-        ? 'Suggested grammar adjustments to make your sentence accurate and natural.'
+        ? 'Suggested pedagogical adjustments to make your sentence accurate and natural.'
         : 'Your sentence is grammatically accurate and natural.');
-
-    // Merge wordFeedbacks from deterministic check and Gemini
-    const combinedWordFeedbacks = [...wordFeedbacks];
-    if (Array.isArray(parsed.wordFeedbacks)) {
-      parsed.wordFeedbacks.forEach((wf: any) => {
-        if (
-          wf &&
-          wf.hasError &&
-          wf.original &&
-          wf.corrected &&
-          !combinedWordFeedbacks.some(
-            (existing) =>
-              existing.original.toLowerCase() === String(wf.original).toLowerCase()
-          )
-        ) {
-          combinedWordFeedbacks.push(wf);
-        }
-      });
-    }
 
     const targetWordFeedback = hasWordConstraint
       ? usedTargetWord
@@ -15771,6 +15871,10 @@ Return strict JSON:
           : `Palavras da rotina utilizadas (${finalUsedWords.length}/${cleanDailyWords.length}): ${finalUsedWords.join(', ')}.`
         : `Inclua pelo menos uma palavra da sua rotina na frase (${cleanDailyWords.slice(0, 5).join(', ')}).`
       : '';
+
+    const isAllImprovements =
+      combinedWordFeedbacks.length > 0 &&
+      combinedWordFeedbacks.every((wf) => wf.classification === 'Improvement');
 
     const resultPayload = {
       hasAnyError: finalHasError,
@@ -15786,15 +15890,17 @@ Return strict JSON:
         corrected: finalCorrected,
         explanationPt: combinedExplPt,
         explanationEn: combinedExplEn,
+        classification: isAllImprovements ? 'Improvement' : 'Error',
       },
       correctedSentence: finalCorrected,
       explanation: combinedExplPt,
       overallSummaryPt: finalHasError
         ? combinedExplPt
-        : `Excelente! Frase natural com o vocabulário da sua rotina (${finalUsedWords.join(', ') || 'palavras de hoje'}).`,
+        : (parsed.overallSummaryPt || `Excelente! Frase natural com o vocabulário da sua rotina (${finalUsedWords.join(', ') || 'palavras de hoje'}).`),
       overallSummaryEn: finalHasError
         ? combinedExplEn
-        : `Outstanding! Natural sentence using your daily vocabulary (${finalUsedWords.join(', ') || 'today’s words'}).`,
+        : (parsed.overallSummaryEn || `Outstanding! Natural sentence using your daily vocabulary (${finalUsedWords.join(', ') || 'today’s words'}).`),
+      improvements: combinedWordFeedbacks.filter((wf) => wf.classification === 'Improvement'),
     };
 
     if (dailySentenceEvaluationCache.size > 200) {
@@ -15900,7 +16006,14 @@ app.post('/api/check-daily-sentence', firebaseAuthMiddleware, async (req, res) =
     const caller = req.user!;
     const callerUid = caller.uid;
     const callerEmail = (caller.email || '').toLowerCase().trim();
-    const { sentence = '', dailyWords = [], studentUid = '', studentEmail = '' } = req.body || {};
+    const {
+      sentence = '',
+      dailyWords = [],
+      studentUid = '',
+      studentEmail = '',
+      level = '',
+      language = 'pt',
+    } = req.body || {};
 
     if (caller.role === 'student') {
       if (studentUid && studentUid !== callerUid) {
@@ -15914,6 +16027,19 @@ app.post('/api/check-daily-sentence', firebaseAuthMiddleware, async (req, res) =
           error: 'Forbidden',
           message: 'Unauthorized access: student email does not match authenticated user.',
         });
+      }
+    }
+
+    // Resolve student CEFR level if not passed in request body
+    let effectiveLevel = level;
+    if (!effectiveLevel && callerUid) {
+      try {
+        const userDoc = await fetchUserDocumentFromFirestore(callerUid, 500);
+        if (userDoc?.level) {
+          effectiveLevel = userDoc.level;
+        }
+      } catch {
+        // non-blocking
       }
     }
 
@@ -15975,6 +16101,8 @@ app.post('/api/check-daily-sentence', firebaseAuthMiddleware, async (req, res) =
       evalOutcome = await evaluateDailySentenceIsolated(sentence, dailyWords, {
         correlationId,
         callerRole: caller.role,
+        level: effectiveLevel,
+        language: language || 'pt',
       });
     } finally {
       await flightLock.release();

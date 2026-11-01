@@ -862,6 +862,9 @@ export interface WordFeedback {
   corrected: string;
   explanationPt: string;
   explanationEn: string;
+  classification?: 'Error' | 'Improvement' | 'Alternative';
+  category?: 'grammar' | 'punctuation' | 'collocation' | 'word_choice' | 'preposition' | 'naturalness';
+  example?: string;
 }
 
 export interface SentenceFeedback {
@@ -870,6 +873,8 @@ export interface SentenceFeedback {
   corrected: string;
   explanationPt: string;
   explanationEn: string;
+  classification?: 'Error' | 'Improvement' | 'Alternative';
+  examples?: string[];
 }
 
 export interface WritingEvaluationResult {
@@ -890,4 +895,5 @@ export interface WritingEvaluationResult {
   targetWordFeedback?: string;
   triggerFeedback?: string;
   isAiUnavailable?: boolean;
+  improvements?: WordFeedback[];
 }

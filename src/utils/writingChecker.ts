@@ -3,7 +3,7 @@ import { auth } from '../firebase';
 
 export const GEMINI_PROJECT_ID = 'itissimple-security-staging';
 
-const DAILY_SENTENCE_CACHE_VERSION = 'v3';
+const DAILY_SENTENCE_CACHE_VERSION = 'v4';
 
 // Isolated client-side cache for Sentence of the Day to prevent redundant API calls and quota exhaustion
 const dailySentenceClientCache = new Map<string, WritingEvaluationResult>();
@@ -844,7 +844,11 @@ export function analyzeSentenceGrammarDeterministic(
  */
 export async function checkDailySentenceAi(
   sentence: string,
-  dailyWords: string[] = []
+  dailyWords: string[] = [],
+  options?: {
+    level?: EnglishLevel | string;
+    language?: string;
+  }
 ): Promise<WritingEvaluationResult> {
   const cleanSentence = (sentence || '').trim();
   const cleanDailyWords = Array.from(
@@ -859,7 +863,9 @@ export async function checkDailySentenceAi(
     return evaluateLocally({ sentence: '', dailyWords: cleanDailyWords });
   }
 
-  const cacheKey = `${DAILY_SENTENCE_CACHE_VERSION}::${cleanSentence}::${cleanDailyWords.map((w) => w.toLowerCase()).sort().join(',')}`;
+  const userLevel = options?.level || 'B1';
+  const langKey = options?.language || 'pt';
+  const cacheKey = `${DAILY_SENTENCE_CACHE_VERSION}::${userLevel}::${langKey}::${cleanSentence}::${cleanDailyWords.map((w) => w.toLowerCase()).sort().join(',')}`;
   const cachedResult = dailySentenceClientCache.get(cacheKey);
   if (cachedResult) {
     return cachedResult;
@@ -887,6 +893,8 @@ export async function checkDailySentenceAi(
         dailyWords: cleanDailyWords,
         studentUid: currentUid,
         studentEmail: currentEmail,
+        level: userLevel,
+        language: langKey,
         projectId: GEMINI_PROJECT_ID,
       }),
     });
@@ -941,27 +949,41 @@ export async function checkDailySentenceAi(
             hasDiff ||
             data.hasAnyError === true ||
             data.isCorrect === false ||
+            (Array.isArray(data.wordFeedbacks) && data.wordFeedbacks.some((wf: WordFeedback) => wf.hasError)) ||
             !localAnalysis.usedTargetWord
         );
 
         const mergedWordFeedbacks =
           Array.isArray(data.wordFeedbacks) && data.wordFeedbacks.some((wf: WordFeedback) => wf.hasError)
-            ? data.wordFeedbacks
-            : localAnalysis.wordFeedbacks;
+            ? data.wordFeedbacks.map((wf: any) => ({
+                original: String(wf.original || '').trim(),
+                hasError: true,
+                corrected: String(wf.corrected || '').trim(),
+                classification: wf.classification || (wf.category === 'collocation' ? 'Improvement' : 'Error'),
+                category: wf.category || 'grammar',
+                explanationPt: wf.explanationPt || wf.explanation || '',
+                explanationEn: wf.explanationEn || wf.explanation || '',
+                example: wf.example ? String(wf.example).trim() : undefined,
+              }))
+            : localAnalysis.wordFeedbacks.map((wf: any) => ({
+                ...wf,
+                classification: 'Error' as const,
+                category: 'grammar' as const,
+              }));
 
         const explanationPt =
           data.sentenceFeedback?.explanationPt ||
           data.explanation ||
           localAnalysis.errorsPt.join(' ') ||
           (hasAnyError
-            ? 'Identificamos ajustes gramaticais para deixar sua frase natural e correta.'
+            ? 'Identificamos ajustes pedagógicos para tornar sua frase natural e precisa.'
             : 'Sua frase está gramaticalmente correta e natural.');
 
         const explanationEn =
           data.sentenceFeedback?.explanationEn ||
           localAnalysis.errorsEn.join(' ') ||
           (hasAnyError
-            ? 'Suggested grammar adjustments to make your sentence natural and accurate.'
+            ? 'Suggested pedagogical adjustments to make your sentence natural and accurate.'
             : 'Your sentence is grammatically accurate and natural.');
 
         const usedWords =
@@ -998,9 +1020,15 @@ export async function checkDailySentenceAi(
             corrected: effectiveCorrected,
             explanationPt,
             explanationEn,
+            classification: mergedWordFeedbacks.every((wf: WordFeedback) => wf.classification === 'Improvement')
+              ? 'Improvement'
+              : 'Error',
           },
           explanation: explanationPt,
           correctedSentence: effectiveCorrected,
+          overallSummaryPt: data.overallSummaryPt || explanationPt,
+          overallSummaryEn: data.overallSummaryEn || explanationEn,
+          improvements: mergedWordFeedbacks.filter((wf: WordFeedback) => wf.classification === 'Improvement'),
         };
 
         if (dailySentenceClientCache.size > 100) {

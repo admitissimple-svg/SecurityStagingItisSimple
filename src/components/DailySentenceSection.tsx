@@ -115,7 +115,11 @@ export const DailySentenceSection: React.FC<DailySentenceSectionProps> = ({
     try {
       const evaluation = await checkDailySentenceAi(
         sentenceInput.trim(),
-        allLearnedWordsToday
+        allLearnedWordsToday,
+        {
+          level: userProfile?.level,
+          language: currentLanguage,
+        }
       );
       setSentenceEvaluation(evaluation);
     } catch (err) {
@@ -151,7 +155,11 @@ export const DailySentenceSection: React.FC<DailySentenceSectionProps> = ({
     try {
       const evaluation = await checkDailySentenceAi(
         cleanText,
-        allLearnedWordsToday
+        allLearnedWordsToday,
+        {
+          level: userProfile?.level,
+          language: currentLanguage,
+        }
       );
       setSentenceEvaluation(evaluation);
 
@@ -441,20 +449,53 @@ export const DailySentenceSection: React.FC<DailySentenceSectionProps> = ({
 
           {/* Word-level adjustments */}
           {sentenceEvaluation.wordFeedbacks && sentenceEvaluation.wordFeedbacks.some((wf) => wf.hasError) && (
-            <div className="space-y-1">
+            <div className="space-y-1.5">
               <span className="text-[10px] font-bold text-slate-600 block">
                 {currentLanguage === 'en' ? 'Identified Adjustments:' : 'Ajustes Identificados:'}
               </span>
-              <div className="flex flex-wrap gap-1.5">
-                {sentenceEvaluation.wordFeedbacks.filter((wf) => wf.hasError).map((wf, i) => (
-                  <span
-                    key={i}
-                    className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-white border border-rose-300 text-rose-900 font-bold"
-                    title={currentLanguage === 'en' ? wf.explanationEn : wf.explanationPt}
-                  >
-                    <span className="line-through text-rose-400">{wf.original}</span> → <span className="text-emerald-700">{wf.corrected}</span>
-                  </span>
-                ))}
+              <div className="flex flex-col gap-1.5">
+                {sentenceEvaluation.wordFeedbacks.filter((wf) => wf.hasError).map((wf, i) => {
+                  const isImprovement = wf.classification === 'Improvement' || (!wf.classification && wf.category === 'collocation');
+                  const isAlternative = wf.classification === 'Alternative';
+                  const badgeLabel = isAlternative
+                    ? (currentLanguage === 'en' ? 'Alternative' : 'Alternativa')
+                    : isImprovement
+                    ? (currentLanguage === 'en' ? 'Improvement' : 'Melhoria')
+                    : (currentLanguage === 'en' ? 'Error' : 'Erro');
+                  const badgeStyle = isAlternative
+                    ? 'bg-sky-100 text-sky-800 border-sky-300'
+                    : isImprovement
+                    ? 'bg-amber-100 text-amber-900 border-amber-300'
+                    : 'bg-rose-100 text-rose-800 border-rose-300';
+
+                  return (
+                    <div
+                      key={i}
+                      className="p-2.5 bg-white rounded-xl border border-rose-200 text-xs shadow-2xs space-y-1"
+                    >
+                      <div className="flex items-center justify-between gap-1 flex-wrap">
+                        <div className="font-mono text-[11px] font-bold">
+                          <span className="line-through text-rose-400">{wf.original}</span>
+                          <span className="text-slate-400 mx-1">→</span>
+                          <span className="text-emerald-700 font-extrabold">{wf.corrected}</span>
+                        </div>
+                        <span className={`text-[9px] font-extrabold uppercase px-1.5 py-0.5 rounded-full border ${badgeStyle}`}>
+                          {badgeLabel}
+                        </span>
+                      </div>
+                      {(wf.explanationPt || wf.explanationEn) && (
+                        <p className="text-[10px] text-slate-600 leading-relaxed">
+                          {currentLanguage === 'en' ? (wf.explanationEn || wf.explanationPt) : (wf.explanationPt || wf.explanationEn)}
+                        </p>
+                      )}
+                      {wf.example && (
+                        <p className="text-[10px] text-slate-500 italic bg-slate-50 px-2 py-0.5 rounded-md border border-slate-100">
+                          💬 <span className="font-semibold">{currentLanguage === 'en' ? 'Example:' : 'Exemplo:'}</span> "{wf.example}"
+                        </p>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}

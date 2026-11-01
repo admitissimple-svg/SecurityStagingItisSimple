@@ -655,7 +655,10 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     if (!clean) return;
     setIsCheckingSentence(true);
     try {
-      const evaluation = await checkDailySentenceAi(clean, displayRoutineWords);
+      const evaluation = await checkDailySentenceAi(clean, displayRoutineWords, {
+        level: userProfile?.level,
+        language: currentLanguage,
+      });
       setSentenceEvaluation(evaluation);
     } catch (err) {
       console.warn('Sentence check error:', err);
@@ -705,7 +708,10 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     if (!activeEval) {
       setIsCheckingSentence(true);
       try {
-        activeEval = await checkDailySentenceAi(clean, displayRoutineWords);
+        activeEval = await checkDailySentenceAi(clean, displayRoutineWords, {
+          level: userProfile?.level,
+          language: currentLanguage,
+        });
         setSentenceEvaluation(activeEval);
       } catch (err) {
         console.warn('Sentence check error on save:', err);
