@@ -1172,90 +1172,110 @@ export function subscribeToStudentVocabulary(
 }
 
 /**
- * Persist student daily journal entry directly to Firestore.
- * Subcollection users/{cleanUid}/journal/{entryId} is the exclusive canonical source of truth.
- * Propagates real write failures, awaits confirmation, and enforces strict timeout without swallowing errors.
+/**
+ * Persist student daily journal entry directly via secure backend API.
+ * Uses POST /api/student-journal with verified Firebase ID Token.
+ * Propagates real write failures, awaits confirmation, and avoids client-side rule denials.
  */
 export async function saveStudentJournalEntryToFirestore(
   studentUid: string,
   entry: DailyJournalEntry,
   studentEmail?: string
 ): Promise<boolean> {
-  const db = getDb();
-  if (!db) {
-    throw new Error('Firestore database is not initialized');
-  }
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
   const cleanUid = normalizeUid(studentUid, cleanEmail);
   if (!cleanUid) {
     throw new Error('Valid student UID is required to save journal entry');
   }
 
-  try {
-    const sanitizedEntry: DailyJournalEntry = JSON.parse(
-      JSON.stringify({
-        ...entry,
-        studentUid: cleanUid,
-        studentEmail: cleanEmail,
-        createdAt: entry.createdAt || new Date().toISOString(),
-      })
-    );
-
-    // Save exclusively to canonical subcollection users/{cleanUid}/journal/{entryId}
-    const stampedEntry = stampSchemaVersion(sanitizedEntry);
-    assertSafeFirestoreWrite(`users/${cleanUid}/journal/${sanitizedEntry.id}`, stampedEntry, undefined, true);
-    const entryRef = doc(db, 'users', cleanUid, 'journal', sanitizedEntry.id);
-    await withStrictTimeout(
-      setDoc(entryRef, stampedEntry, { merge: true }),
-      4500,
-      'Saving journal entry to subcollection timed out'
-    );
-
-    return true;
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, `users/${cleanUid}/journal/${entry.id}`);
-    throw error;
+  const currentUser = auth.currentUser;
+  let idToken: string | null = null;
+  if (currentUser) {
+    idToken = await currentUser.getIdToken().catch(() => null);
   }
+  if (!idToken) {
+    throw new Error('User must be authenticated with Firebase to save journal entry');
+  }
+
+  const sanitizedEntry: DailyJournalEntry = JSON.parse(
+    JSON.stringify({
+      ...entry,
+      studentUid: cleanUid,
+      studentEmail: cleanEmail,
+      createdAt: entry.createdAt || new Date().toISOString(),
+    })
+  );
+
+  const response = await fetch('/api/student-journal', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${idToken}`,
+    },
+    body: JSON.stringify({
+      studentUid: cleanUid,
+      studentEmail: cleanEmail,
+      entry: sanitizedEntry,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData?.message || errorData?.error || `Failed to save journal entry (HTTP ${response.status})`);
+  }
+
+  const resJson = await response.json().catch(() => null);
+  if (!resJson || !resJson.success) {
+    throw new Error('Server did not confirm journal entry persistence');
+  }
+
+  return true;
 }
 
 /**
- * Fetch student daily journal entries directly from Firestore.
- * Subcollection users/{cleanUid}/journal is the exclusive canonical source of truth.
+ * Fetch student daily journal entries directly via secure backend API.
+ * Uses GET /api/student-journal with verified Firebase ID Token.
  */
 export async function fetchStudentJournalFromFirestore(
   studentUid: string,
   studentEmail?: string
 ): Promise<DailyJournalEntry[]> {
-  const db = getDb();
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
   const cleanUid = normalizeUid(studentUid, cleanEmail);
-  if (!db || !cleanUid) return [];
+  if (!cleanUid) return [];
 
   try {
-    const journalMap = new Map<string, DailyJournalEntry>();
-    const colRef = collection(db, 'users', cleanUid, 'journal');
-    const colSnap = await withFirestoreTimeout(getDocs(colRef), 3500, null);
-    if (colSnap && !colSnap.empty) {
-      colSnap.forEach((d) => {
-        const item = d.data() as DailyJournalEntry;
-        if (item) {
-          const id = item.id || d.id;
-          journalMap.set(id, { ...item, id });
-        }
-      });
+    const currentUser = auth.currentUser;
+    if (!currentUser) return [];
+    const idToken = await currentUser.getIdToken().catch(() => null);
+    if (!idToken) return [];
+
+    const response = await fetch('/api/student-journal', {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${idToken}`,
+        'Cache-Control': 'no-cache',
+      },
+    });
+
+    if (!response.ok) {
+      console.warn('[studentPersistence] Failed to fetch student journal:', response.status);
+      return [];
     }
 
+    const data = await response.json();
+    if (!Array.isArray(data)) return [];
+
     // Sort newest first
-    const list = Array.from(journalMap.values());
-    list.sort((a, b) => {
+    data.sort((a: DailyJournalEntry, b: DailyJournalEntry) => {
       const timeA = new Date(a.createdAt || a.date).getTime();
       const timeB = new Date(b.createdAt || b.date).getTime();
       return timeB - timeA;
     });
 
-    return list;
+    return data;
   } catch (error) {
-    handleFirestoreError(error, OperationType.GET, `users/${cleanUid}/journal`);
+    console.warn('[studentPersistence] fetchStudentJournalFromFirestore error:', error);
     return [];
   }
 }
@@ -3888,6 +3908,26 @@ export function deriveWeeklyChecksFromJournal(
 }
 
 /**
+ * Recursively eliminates undefined properties from an object or array.
+ * Ensures Firestore setDoc never encounters unsupported undefined values.
+ */
+export function eliminateUndefinedFields<T>(obj: T): T {
+  if (obj === null || obj === undefined || typeof obj !== 'object') {
+    return obj;
+  }
+  if (Array.isArray(obj)) {
+    return obj.map((item) => eliminateUndefinedFields(item)) as unknown as T;
+  }
+  const result: Record<string, any> = {};
+  for (const [key, val] of Object.entries(obj)) {
+    if (val !== undefined) {
+      result[key] = eliminateUndefinedFields(val);
+    }
+  }
+  return result as T;
+}
+
+/**
  * Persist an activity record directly to the student profile document: users/{studentUID}
  * Maintains an array and subcollection `studentJournal`.
  * Each completed activity record saves: { id, type, date, week, timestamp, dayOfWeek, ... }
@@ -3954,17 +3994,18 @@ export async function recordActivityInStudentJournal(
       type: entry.type,
       date: entry.date || getTodayIsoDate(),
       timestamp: Number(entry.timestamp) || Date.now(),
-      dayOfWeek: entry.dayOfWeek,
-      title: entry.title ? String(entry.title).trim() : undefined,
-      artist: entry.artist ? String(entry.artist).trim() : undefined,
-      partNumber: entry.partNumber !== undefined ? Number(entry.partNumber) : undefined,
-      url: entry.url ? String(entry.url).trim() : undefined,
-      details: entry.details ? String(entry.details).trim() : undefined,
       studentUid: cleanUid,
-      studentEmail: cleanEmail,
-      ...(entry as any),
+      ...(entry.dayOfWeek ? { dayOfWeek: entry.dayOfWeek } : {}),
+      ...(cleanEmail ? { studentEmail: cleanEmail } : {}),
       week: resolvedWeek,
     };
+
+    if (entry.title) sanitizedEntry.title = String(entry.title).trim();
+    if (entry.artist) sanitizedEntry.artist = String(entry.artist).trim();
+    if (entry.partNumber !== undefined && entry.partNumber !== null) sanitizedEntry.partNumber = Number(entry.partNumber);
+    if (entry.url) sanitizedEntry.url = String(entry.url).trim();
+    if (entry.details) sanitizedEntry.details = String(entry.details).trim();
+    if ((entry as any).completedAt) (sanitizedEntry as any).completedAt = (entry as any).completedAt;
 
     if (db && cleanUid && userRef) {
       // Check if entry for same type + dayOfWeek + week already exists, or same id
@@ -4016,22 +4057,22 @@ export async function recordActivityInStudentJournal(
             [checkKey]: true,
           };
 
+          const cleanWeekChecksPayload = eliminateUndefinedFields(
+            stampSchemaVersion({
+              id: targetWeekId,
+              weekId: targetWeekId,
+              weeklyCycle: entryCycle,
+              checks: updatedWeekChecks,
+              weeklyChecks: updatedWeekChecks,
+              sPathChecks: updatedWeekChecks,
+              updatedAt: new Date().toISOString(),
+              studentUid: cleanUid,
+              studentEmail: cleanEmail || null,
+            })
+          );
+
           await withFirestoreTimeout(
-            setDoc(
-              weekDocRef,
-              stampSchemaVersion({
-                id: targetWeekId,
-                weekId: targetWeekId,
-                weeklyCycle: entryCycle,
-                checks: updatedWeekChecks,
-                weeklyChecks: updatedWeekChecks,
-                sPathChecks: updatedWeekChecks,
-                updatedAt: new Date().toISOString(),
-                studentUid: cleanUid,
-                studentEmail: cleanEmail || null,
-              }),
-              { merge: true }
-            ),
+            setDoc(weekDocRef, cleanWeekChecksPayload, { merge: true }),
             2000,
             null
           );
@@ -4067,14 +4108,17 @@ export async function recordActivityInStudentJournal(
         }
       }
 
+      const cleanUserPayload = eliminateUndefinedFields(payload);
+      const cleanSanitizedEntry = eliminateUndefinedFields(sanitizedEntry);
+
       // Direct write to users/{cleanUid} with safe fallback
       if (cleanUid && isValidCanonicalUid(cleanUid) && userRef) {
         try {
-          await withFirestoreTimeout(setDoc(userRef, payload, { merge: true }), 3500, null);
+          await withFirestoreTimeout(setDoc(userRef, cleanUserPayload, { merge: true }), 3500, null);
 
           // Write discrete entry to subcollection users/{cleanUid}/studentJournal/{entryId}
-          const entryRef = doc(db, 'users', cleanUid, 'studentJournal', sanitizedEntry.id);
-          await withFirestoreTimeout(setDoc(entryRef, sanitizedEntry, { merge: true }), 2000, null);
+          const entryRef = doc(db, 'users', cleanUid, 'studentJournal', cleanSanitizedEntry.id);
+          await withFirestoreTimeout(setDoc(entryRef, cleanSanitizedEntry, { merge: true }), 2000, null);
         } catch (fsErr) {
           console.warn('[studentPersistence] Firestore journal direct write notice:', fsErr);
         }
@@ -5513,75 +5557,73 @@ export function subscribeToStudentHomeworkProgress(
 }
 
 /**
- * Real-time subscription to student daily journal entries (Sentence of the Day).
- * Synchronizes instantly across devices when sentences are created, edited, or deleted.
- * Subcollection users/{cleanUid}/journal is the canonical source of truth.
- * Legacy array users/{cleanUid}.dailyJournalEntries is only used as fallback if subcollection has no entries,
- * and deleted entries recorded in deletedJournalEntryIds are never resurrected.
+ * Retrieve student daily journal entries via secure backend API.
+ * Avoids client-side onSnapshot rule blocking while providing consistent data.
  */
 export function subscribeToStudentDailyJournal(
   studentUid: string,
   studentEmail: string | undefined,
   callback: (entries: DailyJournalEntry[]) => void
 ): () => void {
-  const db = getDb();
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
   const cleanUid = normalizeUid(studentUid, cleanEmail);
-  if (!db || !cleanUid) return () => {};
+  if (!cleanUid) return () => {};
 
-  try {
-    const subCol = collection(db, 'users', cleanUid, 'journal');
-    return onSnapshot(
-      subCol,
-      (snap) => {
-        const list: DailyJournalEntry[] = [];
-        snap.forEach((d) => {
-          const item = d.data() as DailyJournalEntry;
-          if (item) {
-            list.push({
-              ...item,
-              id: item.id || d.id,
-            });
-          }
-        });
-        list.sort((a, b) => {
-          const timeA = new Date(a.createdAt || a.date).getTime();
-          const timeB = new Date(b.createdAt || b.date).getTime();
-          return timeB - timeA;
-        });
-        callback(list);
-      },
-      (err) => {
-        console.warn('Real-time journal subcollection notice:', err);
+  let isSubscribed = true;
+  fetchStudentJournalFromFirestore(cleanUid, cleanEmail)
+    .then((entries) => {
+      if (isSubscribed && Array.isArray(entries)) {
+        callback(entries);
       }
-    );
-  } catch (err) {
-    console.warn('Error subscribing to journal subcollection:', err);
-    return () => {};
-  }
+    })
+    .catch((err) => {
+      console.warn('Initial journal load notice:', err);
+    });
+
+  return () => {
+    isSubscribed = false;
+  };
 }
 
 /**
- * Delete a student daily journal entry directly from Cloud Firestore and sync across all devices.
- * Strictly deletes from canonical subcollection users/{cleanUid}/journal/{entryId}.
+ * Delete a student daily journal entry directly via secure backend API.
+ * Uses DELETE /api/student-journal with verified Firebase ID Token.
  */
 export async function deleteStudentJournalEntryFromFirestore(
   studentUid: string,
   entryId: string,
   studentEmail?: string
 ): Promise<boolean> {
-  const db = getDb();
-  if (!db || !entryId) return false;
+  if (!entryId) return false;
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
   const cleanUid = normalizeUid(studentUid, cleanEmail);
   if (!cleanUid) return false;
 
   try {
-    const entryRef = doc(db, 'users', cleanUid, 'journal', entryId);
-    await withStrictTimeout(deleteDoc(entryRef), 4000, 'Deleting journal entry from subcollection timed out');
-    return true;
+    const currentUser = auth.currentUser;
+    let idToken: string | null = null;
+    if (currentUser) {
+      idToken = await currentUser.getIdToken().catch(() => null);
+    }
+    if (!idToken) {
+      console.warn('deleteStudentJournalEntryFromFirestore: unauthenticated');
+      return false;
+    }
+
+    const response = await fetch(`/api/student-journal?id=${encodeURIComponent(entryId)}`, {
+      method: 'DELETE',
+      headers: {
+        'Authorization': `Bearer ${idToken}`,
+      },
+    });
+
+    if (!response.ok) {
+      return false;
+    }
+    const resJson = await response.json().catch(() => null);
+    return Boolean(resJson && resJson.success);
   } catch (error) {
-    handleFirestoreError(error, OperationType.DELETE, `users/${cleanUid}/journal/${entryId}`);
+    console.warn('deleteStudentJournalEntryFromFirestore error:', error);
     return false;
   }
 }

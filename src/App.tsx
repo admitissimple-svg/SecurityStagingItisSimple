@@ -2283,20 +2283,57 @@ export default function App() {
     return () => unsub();
   }, [currentAccount?.uid, currentAccount?.email, userProfile?.id]);
 
-  // Real-time synchronization of daily journal entries (Daily Sentence & Reflections) across all devices
-  useEffect(() => {
-    const uid = auth.currentUser?.uid || currentAccount?.uid || userProfile?.uid || userProfile?.id || '';
-    const email = (auth.currentUser?.email || currentAccount?.email || userProfile?.email || '').toLowerCase().trim();
-    if (!uid && !email) return;
+  // Synchronize student daily journal entries via secure GET /api/student-journal
+  const activeJournalLoadUidRef = useRef<string>('');
 
-    const unsub = subscribeToStudentDailyJournal(uid, email, (entries) => {
-      if (Array.isArray(entries)) {
-        setDailyJournalEntries(entries);
+  const loadDailyJournalEntries = useCallback(async (targetUid?: string) => {
+    const currentUser = auth.currentUser;
+    const uid = targetUid || currentUser?.uid || currentAccount?.uid || '';
+    if (!uid || !currentUser) {
+      activeJournalLoadUidRef.current = '';
+      setDailyJournalEntries([]);
+      return;
+    }
+
+    const currentLoadTarget = uid;
+    activeJournalLoadUidRef.current = currentLoadTarget;
+
+    try {
+      const idToken = await currentUser.getIdToken().catch(() => null);
+      if (!idToken) return;
+
+      const res = await fetch('/api/student-journal', {
+        headers: {
+          'Authorization': `Bearer ${idToken}`,
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+        },
+      });
+
+      if (!res.ok) {
+        console.warn('[App] Failed to load student journal:', res.status);
+        return;
       }
-    });
 
-    return () => unsub();
-  }, [auth.currentUser?.uid, currentAccount?.uid, currentAccount?.email, userProfile?.id]);
+      const data = await res.json();
+      // Guard against race conditions: only update state if user is still the current active user
+      if (activeJournalLoadUidRef.current === currentLoadTarget && Array.isArray(data)) {
+        setDailyJournalEntries(data);
+      }
+    } catch (err) {
+      console.warn('[App] Error loading student journal:', err);
+    }
+  }, [currentAccount?.uid]);
+
+  useEffect(() => {
+    const uid = auth.currentUser?.uid || currentAccount?.uid || '';
+    if (!uid) {
+      activeJournalLoadUidRef.current = '';
+      setDailyJournalEntries([]);
+      return;
+    }
+
+    loadDailyJournalEntries(uid);
+  }, [auth.currentUser?.uid, currentAccount?.uid, loadDailyJournalEntries]);
 
   // Real-time synchronization of studentJournal across all devices (Mobile <-> Desktop)
   useEffect(() => {
@@ -3387,10 +3424,12 @@ export default function App() {
       firebaseSignOutAuth(auth).catch(() => {});
     } catch {}
     activeStudentUidRef.current = '';
+    activeJournalLoadUidRef.current = '';
     clearDictionaryMemoryCache();
     clearAllLocalPersistenceCaches();
     setCurrentAccount(null);
     setUserProfile(createDefaultStudentProfile(null));
+    setDailyJournalEntries([]);
     setStudentDictionaryEntries([]);
     setExcludedDictionaryWords([]);
     setLessons([]);
@@ -6403,6 +6442,9 @@ export default function App() {
         ],
       }));
 
+      // Background sync to ensure complete alignment with server
+      loadDailyJournalEntries(studentUid);
+
       // 3. Notify user of success WITHOUT exposing personal sentence text in notification or logs
       setNotifications((prev) => [
         {
@@ -6472,8 +6514,16 @@ export default function App() {
           },
           ...prev,
         ]);
+      } else {
+        // Background sync to ensure complete alignment with server
+        loadDailyJournalEntries(studentUid);
       }
     }
+  };
+
+  const handleOpenJournalModal = () => {
+    loadDailyJournalEntries();
+    setIsJournalModalOpen(true);
   };
 
   // Comprehensive Teachers list for scheduling dropdowns, matching, and controls
@@ -6766,7 +6816,7 @@ export default function App() {
             onFindTutors={() => setViewMode('find-tutors')}
             onLogout={handleLogout}
             timeZone={isTeacher ? DEFAULT_TEACHER_TIMEZONE : DEFAULT_STUDENT_TIMEZONE}
-            onOpenJournal={() => setIsJournalModalOpen(true)}
+            onOpenJournal={handleOpenJournalModal}
             tutors={tutors}
             lessons={lessons}
             students={studentsList}
@@ -6871,7 +6921,7 @@ export default function App() {
             onFindTutors={() => setViewMode('find-tutors')}
             onLogout={handleLogout}
             timeZone={isTeacher ? DEFAULT_TEACHER_TIMEZONE : DEFAULT_STUDENT_TIMEZONE}
-            onOpenJournal={() => setIsJournalModalOpen(true)}
+            onOpenJournal={handleOpenJournalModal}
             tutors={tutors}
             lessons={lessons}
             students={studentsList}
@@ -7257,7 +7307,7 @@ export default function App() {
                       consolidateDictionaryEntries(prev, syncedEntries, excludedDictionaryWordsRef.current)
                     );
                   }}
-                  onOpenJournal={() => setIsJournalModalOpen(true)}
+                  onOpenJournal={handleOpenJournalModal}
                 />
 
                 {/* Activity Reminders Manager (5-minute alerts based on registered times) */}
@@ -7298,7 +7348,7 @@ export default function App() {
                   onUpdateTimeActivity={handleUpdateActivityTime}
                   userProfile={userProfile}
                   onSaveDailySentence={handleSaveDailySentence}
-                  onOpenJournalModal={() => setIsJournalModalOpen(true)}
+                  onOpenJournalModal={handleOpenJournalModal}
                   onOpenEmailModal={() => setIsEmailModalOpen(true)}
                   onTest30MinReminder={() => {
                     setNotifications((prev) => [
@@ -7349,7 +7399,7 @@ export default function App() {
                   studentJournal={studentJournal}
                   onOpenHomeworkModal={handleOpenHomeworkModal}
                   onOpenDictionaryModal={() => setIsPersonalDictionaryOpen(true)}
-                  onOpenJournalModal={() => setIsJournalModalOpen(true)}
+                  onOpenJournalModal={handleOpenJournalModal}
                   journalEntriesCount={dailyJournalEntries.length}
                   currentLanguage={currentLanguage}
                   dictionaryEntries={consolidatedActiveDictionary}
@@ -7915,7 +7965,7 @@ export default function App() {
         userProfile={userProfile}
         currentLanguage={currentLanguage}
         onSaveDailySentence={handleSaveDailySentence}
-        onOpenJournalModal={() => setIsJournalModalOpen(true)}
+        onOpenJournalModal={handleOpenJournalModal}
         dictionaryEntries={consolidatedActiveDictionary}
         excludedWords={excludedDictionaryWords}
       />
@@ -7982,7 +8032,7 @@ export default function App() {
         studentLevel={userProfile?.level}
         onSaveCustomEntry={handleSaveCustomDictionaryEntry}
         onDeleteEntry={handleDeleteCustomDictionaryEntry}
-        onOpenJournalModal={() => setIsJournalModalOpen(true)}
+        onOpenJournalModal={handleOpenJournalModal}
         currentLanguage={currentLanguage}
       />
 

@@ -10777,14 +10777,23 @@ ${batchToEnrich.map((w, i) => `${i + 1}. ${w}`).join('\n')}`;
 
 
 // Endpoint: Get student journal entries (Requires authentication; strictly uses caller UID)
+// Endpoint: Get student journal entries (Requires authentication; strictly uses caller UID)
 app.get('/api/student-journal', firebaseAuthMiddleware, async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   const caller = req.user!;
   const callerUid = caller.uid;
-  const requestedUid = ((req.query.uid as string) || '').trim();
+  const callerEmail = (caller.email || '').toLowerCase().trim();
 
-  if (caller.role !== 'admin' && requestedUid && requestedUid !== callerUid) {
-    return res.status(403).json({ error: 'Forbidden', message: 'Cannot access journal of another user.' });
+  const requestedUid = ((req.query.uid as string) || (req.query.studentUid as string) || '').trim();
+  const requestedEmail = ((req.query.email as string) || (req.query.studentEmail as string) || '').toLowerCase().trim();
+
+  if (caller.role !== 'admin') {
+    if (requestedUid && requestedUid !== callerUid) {
+      return res.status(403).json({ error: 'Forbidden', message: 'Cannot access journal of another user.' });
+    }
+    if (requestedEmail && callerEmail && requestedEmail !== callerEmail) {
+      return res.status(403).json({ error: 'Forbidden', message: 'Cannot access journal of another user.' });
+    }
   }
 
   const targetUid = (caller.role === 'admin' && requestedUid) ? requestedUid : callerUid;
@@ -10796,35 +10805,55 @@ app.get('/api/student-journal', firebaseAuthMiddleware, async (req, res) => {
 app.post('/api/student-journal', firebaseAuthMiddleware, async (req, res) => {
   const caller = req.user!;
   const callerUid = caller.uid;
-  const { studentUid, entry } = req.body || {};
+  const callerEmail = (caller.email || '').toLowerCase().trim();
+  const { studentUid, studentEmail, entry } = req.body || {};
+  const cleanUid = (studentUid || '').trim();
+  const cleanEmail = (studentEmail || '').toLowerCase().trim();
 
-  if (caller.role !== 'admin' && studentUid && studentUid !== callerUid) {
-    return res.status(403).json({ error: 'Forbidden', message: 'Cannot write journal of another user.' });
+  if (caller.role !== 'admin') {
+    if (cleanUid && cleanUid !== callerUid) {
+      return res.status(403).json({ error: 'Forbidden', message: 'Cannot write journal of another user.' });
+    }
+    if (cleanEmail && callerEmail && cleanEmail !== callerEmail) {
+      return res.status(403).json({ error: 'Forbidden', message: 'Cannot write journal of another user.' });
+    }
   }
 
   if (!entry || !entry.id) {
     return res.status(400).json({ error: 'Valid entry with id is required' });
   }
 
-  const targetUid = (caller.role === 'admin' && studentUid) ? studentUid : callerUid;
+  const targetUid = (caller.role === 'admin' && cleanUid) ? cleanUid : callerUid;
   const db = getFirestoreDb();
-  if (db) {
-    try {
-      const userRef = db.collection('users').doc(targetUid);
-      await userRef.collection('journal').doc(entry.id).set(entry, { merge: true });
-      const userSnap = await userRef.get().catch(() => null);
-      if (userSnap && userSnap.exists) {
-        const uData = userSnap.data();
-        const currentList = Array.isArray(uData?.dailyJournalEntries) ? uData.dailyJournalEntries : [];
-        const filtered = currentList.filter((e: any) => e.id !== entry.id);
-        await userRef.set({ dailyJournalEntries: [entry, ...filtered], updatedAt: new Date().toISOString() }, { merge: true });
-      }
-    } catch (fsErr) {
-      console.warn('save journal error:', fsErr);
-    }
+  if (!db) {
+    return res.status(500).json({ error: 'Firestore database not available' });
   }
 
-  return res.json({ success: true, entry });
+  try {
+    const cleanEntry = removeUndefinedFields({
+      ...entry,
+      studentUid: targetUid,
+      updatedAt: new Date().toISOString(),
+    });
+
+    const userRef = db.collection('users').doc(targetUid);
+    await userRef.collection('journal').doc(cleanEntry.id).set(cleanEntry, { merge: true });
+
+    const userSnap = await userRef.get().catch(() => null);
+    if (userSnap && userSnap.exists) {
+      const uData = userSnap.data();
+      const currentList = Array.isArray(uData?.dailyJournalEntries) ? uData.dailyJournalEntries : [];
+      const filtered = currentList.filter((e: any) => e.id !== cleanEntry.id);
+      await userRef.set({ dailyJournalEntries: [cleanEntry, ...filtered], updatedAt: new Date().toISOString() }, { merge: true });
+    } else {
+      await userRef.set({ dailyJournalEntries: [cleanEntry], updatedAt: new Date().toISOString() }, { merge: true });
+    }
+
+    return res.json({ success: true, entry: cleanEntry });
+  } catch (fsErr: any) {
+    console.warn('save journal error:', fsErr);
+    return res.status(500).json({ error: 'Failed to save journal entry to Firestore', details: fsErr?.message });
+  }
 });
 
 // Endpoint: Delete student journal entry with strict Firebase Auth and canonical UID verification
@@ -10833,8 +10862,8 @@ app.delete('/api/student-journal', firebaseAuthMiddleware, async (req, res) => {
   const callerUid = caller.uid;
   const callerEmail = (caller.email || '').toLowerCase().trim();
 
-  const requestedUid = ((req.query.uid as string) || (req.body?.studentUid as string) || (req.body?.uid as string) || '').trim();
-  const requestedEmail = ((req.query.studentEmail as string) || (req.query.email as string) || (req.body?.studentEmail as string) || '').toLowerCase().trim();
+  const requestedUid = ((req.query.uid as string) || (req.query.studentUid as string) || (req.body?.studentUid as string) || (req.body?.uid as string) || '').trim();
+  const requestedEmail = ((req.query.studentEmail as string) || (req.query.email as string) || (req.body?.studentEmail as string) || (req.body?.email as string) || '').toLowerCase().trim();
 
   // Security Gate: Non-admin users can ONLY delete entries from their own canonical UID
   if (caller.role !== 'admin') {
@@ -10859,19 +10888,10 @@ app.delete('/api/student-journal', firebaseAuthMiddleware, async (req, res) => {
     return res.status(400).json({ error: 'id is required' });
   }
 
-  // 1. Authoritative Cloud Firestore deletion
-  await deleteStudentJournalEntryFromServerFirestore(targetUid, entryId);
-
-  // 2. Clear any legacy in-memory / db.json references to prevent resurrection
-  const db = readDb();
-  if (db.studentJournalMap) {
-    if (targetUid && Array.isArray(db.studentJournalMap[targetUid])) {
-      db.studentJournalMap[targetUid] = db.studentJournalMap[targetUid].filter((e: any) => e.id !== entryId);
-    }
-    if (callerEmail && Array.isArray(db.studentJournalMap[callerEmail])) {
-      db.studentJournalMap[callerEmail] = db.studentJournalMap[callerEmail].filter((e: any) => e.id !== entryId);
-    }
-    await writeDbSync(db);
+  // Authoritative Cloud Firestore deletion
+  const success = await deleteStudentJournalEntryFromServerFirestore(targetUid, entryId);
+  if (!success) {
+    return res.status(500).json({ error: 'Failed to delete journal entry from Firestore' });
   }
 
   return res.json({ success: true, deletedId: entryId });
