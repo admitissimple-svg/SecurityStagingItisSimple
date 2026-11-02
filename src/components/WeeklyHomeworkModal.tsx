@@ -473,6 +473,46 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     return [];
   }, [activeDayActivity?.selectedWords, homework?.vocabularyList, customWords, targetDay, homework?.studentUid, homework?.studentEmail]);
 
+  const { storyUsedWords, storyUnusedWords } = useMemo(() => {
+    const allDayWords = resolvedFallbackWords
+      .map((w: any) => (typeof w === 'string' ? w : w.word))
+      .filter(Boolean);
+    if (allDayWords.length === 0) return { storyUsedWords: [] as string[], storyUnusedWords: [] as string[] };
+
+    const storyText = activeDayPassage?.text || '';
+    const storyLower = storyText.toLowerCase();
+
+    // If activeDayPassage explicitly provides usedWords / unusedWords, match against allDayWords
+    if (Array.isArray(activeDayPassage?.usedWords) && activeDayPassage.usedWords.length > 0) {
+      const used = activeDayPassage.usedWords.filter((w) =>
+        allDayWords.some((dw) => dw.toLowerCase() === w.toLowerCase())
+      );
+      const unused = allDayWords.filter(
+        (dw) => !used.some((uw) => uw.toLowerCase() === dw.toLowerCase())
+      );
+      return { storyUsedWords: used, storyUnusedWords: unused };
+    }
+
+    // Otherwise derive from text content
+    const used: string[] = [];
+    const unused: string[] = [];
+    for (const rawWord of allDayWords) {
+      const clean = rawWord.trim();
+      const lower = clean.toLowerCase();
+      const base = lower.replace(/ed$|s$|ing$/, '');
+      if (
+        storyLower.includes(`**${lower}**`) ||
+        storyLower.includes(lower) ||
+        (base.length >= 3 && storyLower.includes(base))
+      ) {
+        used.push(clean);
+      } else {
+        unused.push(clean);
+      }
+    }
+    return { storyUsedWords: used, storyUnusedWords: unused };
+  }, [resolvedFallbackWords, activeDayPassage?.text, activeDayPassage?.usedWords, activeDayPassage?.unusedWords]);
+
   const safeMatchingPairs = useMemo(() => {
     if (Array.isArray(activeDayActivity?.matchingPairs) && activeDayActivity.matchingPairs.length > 0) {
       return activeDayActivity.matchingPairs;
@@ -2872,6 +2912,46 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
                           <p className="text-xs sm:text-sm text-slate-700 leading-relaxed whitespace-pre-wrap font-normal">
                             {renderHighlightedPassage(activeDayPassage?.text || '')}
                           </p>
+
+                          {/* Target Expressions in Story: Organic Usage Badges & Discreet Informative Note */}
+                          {(storyUsedWords.length > 0 || storyUnusedWords.length > 0) && (
+                            <div className="pt-2.5 mt-2 border-t border-slate-200/80 space-y-2">
+                              {storyUsedWords.length > 0 && (
+                                <div className="flex items-center gap-1.5 flex-wrap text-xs">
+                                  <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">
+                                    {isEn ? 'Expressions used:' : 'Expressões na história:'}
+                                  </span>
+                                  <div className="flex items-center gap-1.5 flex-wrap">
+                                    {storyUsedWords.map((word, wIdx) => (
+                                      <span
+                                        key={wIdx}
+                                        className="font-bold text-[#000035] bg-[#9AB4FF]/25 px-2 py-0.5 rounded-md border border-[#9AB4FF]/40 text-xs inline-flex items-center gap-1"
+                                      >
+                                        <Check className="w-3 h-3 text-[#1C4C96]" />
+                                        <span>{word}</span>
+                                      </span>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+
+                              {storyUnusedWords.length > 0 && (
+                                <div className="flex items-center gap-1.5 flex-wrap text-[11px] text-slate-500 pt-0.5">
+                                  <span className="font-medium text-slate-600">
+                                    {isEn ? 'Not used in this context:' : 'Não utilizadas neste contexto:'}
+                                  </span>
+                                  <span className="font-semibold text-slate-700">
+                                    {storyUnusedWords.join(', ')}
+                                  </span>
+                                  <span className="text-slate-500 italic">
+                                    {isEn
+                                      ? '(omitted to preserve a natural, realistic narrative)'
+                                      : '(omitidas para preservar a fluidez natural da história)'}
+                                  </span>
+                                </div>
+                              )}
+                            </div>
+                          )}
                         </div>
 
                         {/* Questions */}

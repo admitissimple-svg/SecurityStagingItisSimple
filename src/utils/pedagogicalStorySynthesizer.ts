@@ -924,11 +924,7 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
     translationPt?: string;
     exampleSentence?: string;
   }>;
-}): {
-  title: string;
-  text: string;
-  questions: ReadingQuestion[];
-} {
+}): ReadingPassage {
   const { words, studentLevel = 'Intermediate', studentName = 'Student', wordDetails = [] } = params;
 
   const profiles: LexicalWordProfile[] = words.map((w) => {
@@ -941,6 +937,8 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
       title: 'Awaiting Weekly Vocabulary',
       text: 'Add new vocabulary to your daily routine to generate your personalized story and comprehension activity.',
       questions: [],
+      usedWords: [],
+      unusedWords: [],
     };
   }
 
@@ -1289,33 +1287,32 @@ export function synthesizeCohesiveStoryAndQuestions(params: {
     });
   }
 
-  // Ensure all words are present in the final story text across exactly 4 paragraphs
-  let fullStoryText = [p1, p2, p3, p4].filter(Boolean).join('\n\n');
+  // Exactly 4 cohesive paragraphs without artificial forced sentence appends
+  const fullStoryText = [p1, p2, p3, p4].filter(Boolean).join('\n\n');
 
-  // Verify all words have been highlighted; if any missing, append naturally
-  const missingWords = profiles.filter(
-    (p) => !fullStoryText.toLowerCase().includes(p.word.toLowerCase())
-  );
-  if (missingWords.length > 0) {
-    const extraSentences: string[] = [];
-    missingWords.forEach((m) => {
-      if (m.partOfSpeech === 'verb') {
-        extraSentences.push(`Taking time to **${m.word}** during the day helped ${protagonist} stay refreshed and focused.`);
-      } else if (m.partOfSpeech === 'adverb') {
-        extraSentences.push(`Approaching daily tasks **${m.word}** made every conversation much more effective.`);
-      } else if (m.partOfSpeech === 'adjective') {
-        extraSentences.push(`Maintaining an **${m.word}** outlook kept team morale high throughout the afternoon.`);
-      } else {
-        extraSentences.push(`Additionally, paying close attention to the **${m.word}** ensured that nothing was overlooked.`);
-      }
-    });
-    fullStoryText += `\n\n${extraSentences.join(' ')}`;
-  }
+  // Determine organically used and unused expressions without forcing artificial sentences
+  const usedWords: string[] = [];
+  const unusedWords: string[] = [];
+  profiles.forEach((p) => {
+    const lower = p.word.toLowerCase();
+    const base = lower.replace(/ed$|s$|ing$/, '');
+    const isUsed =
+      fullStoryText.toLowerCase().includes(`**${lower}**`) ||
+      fullStoryText.toLowerCase().includes(lower) ||
+      (base.length >= 3 && fullStoryText.toLowerCase().includes(base));
+    if (isUsed) {
+      usedWords.push(p.word);
+    } else {
+      unusedWords.push(p.word);
+    }
+  });
 
   return {
     title,
     text: fullStoryText,
     questions,
+    usedWords,
+    unusedWords,
   };
 }
 

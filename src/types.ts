@@ -713,6 +713,8 @@ export interface ReadingPassage {
   text: string;
   questions: ReadingQuestion[];
   isAiGenerated?: boolean;
+  usedWords?: string[];
+  unusedWords?: string[];
 }
 
 export interface HomeworkItemFeedback {

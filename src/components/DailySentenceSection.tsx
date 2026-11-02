@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef } from 'react';
 import {
   PenTool,
   Sparkles,
@@ -146,31 +146,42 @@ export const DailySentenceSection: React.FC<DailySentenceSectionProps> = ({
     }, 2000);
   };
 
+  const isSavingSectionRef = useRef<boolean>(false);
+
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSavingSectionRef.current) return;
     const cleanText = sentenceInput.trim();
     if (!cleanText || cleanText.length < 5) return;
 
-    setIsCheckingSentence(true);
+    isSavingSectionRef.current = true;
     try {
-      const evaluation = await checkDailySentenceAi(
-        cleanText,
-        allLearnedWordsToday,
-        {
-          level: userProfile?.level,
-          language: currentLanguage,
+      let evaluation = sentenceEvaluation;
+      // Re-run check only if not already evaluated or text changed
+      if (!evaluation || (evaluation.correctedSentence && evaluation.correctedSentence.trim() !== cleanText && cleanText !== sentenceInput.trim())) {
+        setIsCheckingSentence(true);
+        try {
+          evaluation = await checkDailySentenceAi(
+            cleanText,
+            allLearnedWordsToday,
+            {
+              level: userProfile?.level,
+              language: currentLanguage,
+            }
+          );
+          setSentenceEvaluation(evaluation);
+        } catch (err) {
+          console.warn('Error during writing check:', err);
+        } finally {
+          setIsCheckingSentence(false);
         }
-      );
-      setSentenceEvaluation(evaluation);
+      }
 
-      if (!evaluation.hasAnyError && evaluation.isCorrect !== false) {
+      if (!evaluation || (!evaluation.hasAnyError && evaluation.isCorrect !== false)) {
         handleSaveConfirmed(cleanText, evaluation);
       }
-    } catch (err) {
-      console.warn('Error during writing check:', err);
-      handleSaveConfirmed(cleanText);
     } finally {
-      setIsCheckingSentence(false);
+      isSavingSectionRef.current = false;
     }
   };
 
@@ -183,9 +194,9 @@ export const DailySentenceSection: React.FC<DailySentenceSectionProps> = ({
         isCorrect: true,
         correctedSentence: corrected,
       };
+      // Apply & Use strictly updates the text input and evaluation state without triggering database persistence
       setSentenceInput(corrected);
       setSentenceEvaluation(updatedEval);
-      handleSaveConfirmed(corrected, updatedEval);
     }
   };
 
@@ -420,7 +431,7 @@ export const DailySentenceSection: React.FC<DailySentenceSectionProps> = ({
                 className="px-3 py-1.5 bg-[#DC2626] hover:bg-[#B91C1C] text-white text-[11px] font-bold rounded-xl transition flex items-center gap-1 shrink-0 shadow-xs cursor-pointer"
               >
                 <Wand2 className="w-3 h-3 text-[#FDE047]" />
-                <span>{currentLanguage === 'en' ? 'Apply & Save' : 'Aplicar e Salvar'}</span>
+                <span>{currentLanguage === 'en' ? 'Apply & Use' : 'Aplicar Frase'}</span>
               </button>
             )}
           </div>

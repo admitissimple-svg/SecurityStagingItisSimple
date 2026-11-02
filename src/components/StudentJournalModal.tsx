@@ -37,17 +37,37 @@ export const StudentJournalModal: React.FC<StudentJournalModalProps> = ({
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
+  // Deduplicate strictly by entry.id, preserving legitimate distinct entries with identical text
+  const uniqueEntries = useMemo(() => {
+    if (!Array.isArray(entries)) return [];
+    const seen = new Set<string>();
+    const res: DailyJournalEntry[] = [];
+    for (const entry of entries) {
+      if (!entry) continue;
+      const id = String(entry.id || '').trim();
+      if (!id) {
+        res.push(entry);
+        continue;
+      }
+      if (!seen.has(id)) {
+        seen.add(id);
+        res.push(entry);
+      }
+    }
+    return res;
+  }, [entries]);
+
   const filteredEntries = useMemo(() => {
-    if (!searchTerm.trim()) return entries;
+    if (!searchTerm.trim()) return uniqueEntries;
     const term = searchTerm.toLowerCase().trim();
-    return entries.filter((e) => {
+    return uniqueEntries.filter((e) => {
       const inSentence = (e.sentence || '').toLowerCase().includes(term);
       const inCorrected = (e.correctedSentence || '').toLowerCase().includes(term);
       const inWords = (e.wordsUsed || []).some((w) => (w || '').toLowerCase().includes(term));
       const inDate = (e.date || '').includes(term);
       return inSentence || inCorrected || inWords || inDate;
     });
-  }, [entries, searchTerm]);
+  }, [uniqueEntries, searchTerm]);
 
   const handleCopy = (id: string, text: string) => {
     navigator.clipboard.writeText(text);
@@ -92,7 +112,7 @@ export const StudentJournalModal: React.FC<StudentJournalModalProps> = ({
                   {isEn ? 'Student Journal & Saved Sentences' : 'Diário & Frases Salvas'}
                 </h3>
                 <span className="text-[11px] font-mono font-bold px-2 py-0.5 rounded-full bg-[#F4CA54] text-[#000035]">
-                  {entries.length} {isEn ? (entries.length === 1 ? 'entry' : 'entries') : (entries.length === 1 ? 'frase' : 'frases')}
+                  {uniqueEntries.length} {isEn ? (uniqueEntries.length === 1 ? 'entry' : 'entries') : (uniqueEntries.length === 1 ? 'frase' : 'frases')}
                 </span>
               </div>
               <p className="text-xs text-[#9AB4FF] mt-0.5">

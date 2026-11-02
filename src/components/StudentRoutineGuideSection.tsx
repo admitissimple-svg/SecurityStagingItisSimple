@@ -667,7 +667,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     }
   };
 
-  const handleApplySentenceCorrection = async () => {
+  const handleApplySentenceCorrection = () => {
     if (sentenceEvaluation?.correctedSentence) {
       const corrected = sentenceEvaluation.correctedSentence;
       const updatedEval: WritingEvaluationResult = {
@@ -676,64 +676,55 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
         isCorrect: true,
         correctedSentence: corrected,
       };
+      // Apply & Use strictly updates the text input and evaluation state without triggering database persistence
       setSentenceInput(corrected);
       setSentenceEvaluation(updatedEval);
+    }
+  };
+
+  const isSavingSentenceRef = useRef<boolean>(false);
+
+  const handleSaveSentence = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (isSavingSentenceRef.current) return;
+    const clean = sentenceInput.trim();
+    if (!clean) return;
+
+    isSavingSentenceRef.current = true;
+    try {
+      let activeEval = sentenceEvaluation;
+      if (!activeEval) {
+        setIsCheckingSentence(true);
+        try {
+          activeEval = await checkDailySentenceAi(clean, displayRoutineWords, {
+            level: userProfile?.level,
+            language: currentLanguage,
+          });
+          setSentenceEvaluation(activeEval);
+        } catch (err) {
+          console.warn('Sentence check error on save:', err);
+        } finally {
+          setIsCheckingSentence(false);
+        }
+      }
+
       const dictMatchedWords = (dictionaryEntries || [])
         .filter((e) => {
           const w = (e.word || '').trim().toLowerCase();
-          return w.length >= 2 && corrected.toLowerCase().includes(w);
+          return w.length >= 2 && clean.toLowerCase().includes(w);
         })
         .map((e) => e.word.trim());
       const accumulatedWords = Array.from(new Set([...matchedSentenceWords, ...dictMatchedWords]));
-      const finalWordsToSave =
-        accumulatedWords.length > 0
-          ? accumulatedWords
-          : updatedEval.usedWords || displayRoutineWords;
-      const ok = await onSaveDailySentence(corrected, finalWordsToSave, updatedEval);
+      const finalWordsToSave = accumulatedWords.length > 0 ? accumulatedWords : (activeEval?.usedWords || displayRoutineWords);
+      const ok = await onSaveDailySentence(clean, finalWordsToSave, activeEval);
       if (ok !== false) {
         setSentenceSavedSuccess(true);
         setTimeout(() => {
           setSentenceSavedSuccess(false);
         }, 2500);
       }
-    }
-  };
-
-  const handleSaveSentence = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    const clean = sentenceInput.trim();
-    if (!clean) return;
-
-    let activeEval = sentenceEvaluation;
-    if (!activeEval) {
-      setIsCheckingSentence(true);
-      try {
-        activeEval = await checkDailySentenceAi(clean, displayRoutineWords, {
-          level: userProfile?.level,
-          language: currentLanguage,
-        });
-        setSentenceEvaluation(activeEval);
-      } catch (err) {
-        console.warn('Sentence check error on save:', err);
-      } finally {
-        setIsCheckingSentence(false);
-      }
-    }
-
-    const dictMatchedWords = (dictionaryEntries || [])
-      .filter((e) => {
-        const w = (e.word || '').trim().toLowerCase();
-        return w.length >= 2 && clean.toLowerCase().includes(w);
-      })
-      .map((e) => e.word.trim());
-    const accumulatedWords = Array.from(new Set([...matchedSentenceWords, ...dictMatchedWords]));
-    const finalWordsToSave = accumulatedWords.length > 0 ? accumulatedWords : (activeEval?.usedWords || displayRoutineWords);
-    const ok = await onSaveDailySentence(clean, finalWordsToSave, activeEval);
-    if (ok !== false) {
-      setSentenceSavedSuccess(true);
-      setTimeout(() => {
-        setSentenceSavedSuccess(false);
-      }, 2500);
+    } finally {
+      isSavingSentenceRef.current = false;
     }
   };
 

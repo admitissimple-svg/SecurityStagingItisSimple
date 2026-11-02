@@ -14633,19 +14633,18 @@ export function validatePart4StoryResponse(json: any, targetWords?: string[]): b
     .filter((p: string) => p.length > 25);
   if (paragraphs.length !== 4) return false;
 
-  // 2. Target words must appear in text
+  // 2. Target words: At least 1 target expression must be integrated organically into the narrative.
+  // It is NOT required that all 5 expressions be forced into the text (prioritizes natural narrative and CEFR over forcing vocabulary).
   if (Array.isArray(targetWords) && targetWords.length > 0) {
     const textLower = json.text.toLowerCase();
-    for (const w of targetWords) {
+    const hasAtLeastOne = targetWords.some((w) => {
       const clean = (w || '').trim().toLowerCase();
-      if (!clean) continue;
-      if (!textLower.includes(clean)) {
-        // Allow inflected form or root (e.g., needed -> need, starting -> start)
-        const base = clean.replace(/ed$|s$|ing$/, '');
-        if (base.length >= 3 && textLower.includes(base)) continue;
-        return false;
-      }
-    }
+      if (!clean) return false;
+      if (textLower.includes(clean)) return true;
+      const base = clean.replace(/ed$|s$|ing$/, '');
+      return base.length >= 3 && textLower.includes(base);
+    });
+    if (!hasAtLeastOne) return false;
   }
 
   // 3. Exactly 2 or 3 questions
@@ -14712,7 +14711,7 @@ export function validateDirectMemorizationAiResponse(json: any, targetWords?: st
 }
 
 // Dedicated Generator for Part 4: Mini-Story / Routine Reading & Interpretation with Gemini API
-// HOTFIX 2.3.5K: Contextual, Natural Narrative with Word Grammar Profiles and Authentic Comprehension Questions
+// HOTFIX 2.3.5K & IT'S SIMPLE PART 4 NATURALITY: Contextual, Natural Narrative with Word Grammar Profiles and Authentic Comprehension Questions
 async function generatePart4StoryWithGemini(
   words: string[],
   studentLevel: string,
@@ -14727,7 +14726,7 @@ async function generatePart4StoryWithGemini(
   // Profile words to give Gemini exact part of speech and authentic meaning
   const profiledWordsList = words.map((w) => {
     const prof = profileWord(w);
-    return `* "${w}" (${prof.partOfSpeech.toUpperCase()}): Definition: "${prof.definitionEn}". Must be used with correct grammatical syntax (e.g. if verb, conjugate or use as natural action/state; if adjective, modify noun or follow linking verb; if noun, act as subject/object).`;
+    return `* "${w}" (${prof.partOfSpeech.toUpperCase()}): Authentic meaning: "${prof.definitionEn}". Grammatical function: if verb, conjugate or express natural action/state; if adjective, modify noun or follow linking verb; if noun, act as subject/object; if adverb, modify action or clause smoothly.`;
   }).join('\n');
 
   const videoInstruction = videoContext && videoContext.hasVideo && videoContext.videoTitle ? `
@@ -14754,7 +14753,7 @@ Your mission is to craft an ORIGINAL, NATURAL, and COHESIVE 4-paragraph mini-sto
 CRITICAL MANDATORY RULES (STRICTLY ENFORCED):
 
 1. ESTRUTURA MANDATÓRIA DE EXATAMENTE 4 PARÁGRAFOS CONECTADOS (ZERO TEMPLATES):
-   - The story MUST consist of exactly 4 cohesive paragraphs separated by double newlines (\`\n\n\`):
+   - The story MUST consist of exactly 4 cohesive paragraphs separated by double newlines (\`\\n\\n\`):
      * Paragraph 1: Setup, situation context, and introducing a relatable protagonist (e.g. Alex, Elena, Marcus, or Maya).
      * Paragraph 2: Challenge, conflict, tension, or pivotal incident.
      * Paragraph 3: Decisive action, turning point, or teamwork collaboration.
@@ -14766,14 +14765,14 @@ CRITICAL MANDATORY RULES (STRICTLY ENFORCED):
      * "The project breakthrough..."
    - DO NOT assume personal names, professions, or private facts about the student. Feature a neutral, relatable protagonist.
 
-2. INTEGRAÇÃO GRAMATICALMENTE CORRETA E NATURAL DAS 5 PALAVRAS:
-   - Every single word from the day's vocabulary list MUST be integrated into the story naturally and with grammatical precision.
-   - Respect real-world parts of speech and authentic meaning:
-     * VERBS (e.g. "need", "start", "watch", "learn") must express authentic actions or states with appropriate syntax (e.g. "They needed more information before making a decision", "Alex started the preparation early"). NEVER write broken phrases like "to need every detail".
-     * ADJECTIVES (e.g. "small", "clear", "productive") must modify nouns or follow linking verbs (e.g. "even a small adjustment made a difference", "the instructions were clear"). NEVER force an adjective into a noun slot like "delivery of the small".
-     * NOUNS (e.g. "business", "break", "routine", "environment") must act as subjects, direct objects, or prepositional objects (e.g. "understanding how the local business operated").
-     * ADVERBS (e.g. "nowadays", "always", "already") must modify verbs or clauses smoothly.
-   - Highlight every target word in markdown bold: **word**.
+2. NOVA REGRA PEDAGÓGICA — PRIORIDADE ABSOLUTA PARA A NATURALIDADE DA NARRATIVA:
+   - PRIORITIZE a completely natural, plausible, and engaging narrative suited to the student's CEFR level (${levelMeta.labelEn} - CEFR ${levelMeta.cefr}).
+   - ORGANIC INTEGRATION ONLY: Include ONLY expressions from the target vocabulary list that fit organically and effortlessly into the storyline and situation.
+   - ZERO FORCED VOCABULARY: Do NOT create artificial situations, contrived comparisons, forced analogies, or awkward dialogues to force vocabulary into the story.
+   - ADMISSIBILITY OF PARTIAL EXPRESSION SET: If some expressions do not combine naturally with the chosen plot, DO NOT force them! It is completely expected and preferred to use 2, 3, or 4 expressions when the remaining expressions would make the story sound robotic or strained. If all 5 expressions naturally fit, you may use all 5; but narrative coherence, authenticity, and natural English ALWAYS take precedence over using all 5 words.
+   - PRESERVE AUTHENTIC MEANINGS: Every expression effectively used in the story MUST preserve its genuine dictionary meaning and correct grammatical part of speech. Never distort or misrepresent a word's meaning to make it fit.
+   - VISUAL HIGHLIGHT: Highlight every expression effectively used in the story in markdown bold: **expression**. Do NOT bold expressions that were omitted.
+   - REPORT USED AND UNUSED EXPRESSIONS: In your JSON output, return "usedWords" (array of expressions naturally integrated) and "unusedWords" (array of expressions that were omitted to preserve narrative naturalness).
 
 3. RIGOROSA QUALIDADE GRAMATICAL E ZERO FRAGMENTOS DE FRASES:
    - Every single sentence must be complete and grammatically sound in English, containing an explicit subject and a finite main verb.
@@ -14795,7 +14794,9 @@ ${videoInstruction}
 Output format must be a strict JSON object:
 {
   "title": "A captivating, story-specific title",
-  "text": "The 100% original narrative (exactly 4 cohesive paragraphs separated by \\n\\n) with each target word highlighted as **word**.",
+  "text": "The 100% natural and original narrative (exactly 4 cohesive paragraphs separated by \\n\\n) with each organically used expression highlighted as **expression**.",
+  "usedWords": ["expression1", "expression2"],
+  "unusedWords": ["expression3"],
   "questions": [
     {
       "id": "q-1",
@@ -14819,14 +14820,18 @@ Setting Inspiration: Everyday professional, creative, or community scenario.
   const userPrompt = `Generate the 4-paragraph mini-story and 2-3 reading questions for:
 Protagonist: "Alex"
 Proficiency Level: ${levelMeta.labelEn} (CEFR ${levelMeta.cefr})
-Target Words of the Day to weave in organically with **word**:
+Available Target Expressions of the Day:
 ${profiledWordsList}
 ${videoPromptSnippet}
-MANDATORY RULES:
-1. Exactly 4 connected paragraphs separated by double newlines (\n\n).
-2. Complete grammatical sentences only: zero sentence fragments like "During the session, pausing to..." or "Before concluding, delivering...".
-3. All 5 target words must be used with natural grammatical function and highlighted as **word**. No awkward slot-filling!
-4. Exactly 2 or 3 comprehension questions testing concrete story events.
+PEDAGOGICAL INSTRUCTIONS:
+1. Prioritize a completely natural, coherent, and realistic narrative.
+2. Weave in ONLY expressions that organically fit into the context. Do NOT force vocabulary or create artificial dialogues/comparisons. Omit any expressions that do not fit naturally.
+3. Preserve the genuine meaning and correct grammatical role of each expression.
+4. Highlight effectively used expressions as **expression**.
+5. Return "usedWords" and "unusedWords" in the JSON.
+6. Exactly 4 connected paragraphs separated by double newlines (\\n\\n).
+7. Complete grammatical sentences only with explicit subjects and finite verbs (zero dangling fragments).
+8. Exactly 2 or 3 comprehension questions testing concrete story events.
 Return strict JSON only.`;
 
   // HOTFIX 2.3.5L: Sequential 3-Model Contingency Failover (gemini-3.5-flash -> gemini-3.8-flash -> gemini-3.1-flash-lite)
@@ -14868,6 +14873,44 @@ Return strict JSON only.`;
           correctAnswer: corrIdx,
         };
       });
+
+      // Derive accurately which target expressions were used vs unused
+      const textLower = parsed.text.toLowerCase();
+      const detectedUsed: string[] = [];
+      const detectedUnused: string[] = [];
+
+      for (const w of words) {
+        const clean = (w || '').trim();
+        if (!clean) continue;
+        const lower = clean.toLowerCase();
+        const base = lower.replace(/ed$|s$|ing$/, '');
+        const isUsed =
+          textLower.includes(`**${lower}**`) ||
+          textLower.includes(lower) ||
+          (base.length >= 3 && textLower.includes(base));
+        if (isUsed) {
+          detectedUsed.push(clean);
+        } else {
+          detectedUnused.push(clean);
+        }
+      }
+
+      parsed.usedWords = Array.isArray(parsed.usedWords) && parsed.usedWords.length > 0
+        ? Array.from(new Set(parsed.usedWords.map((w: string) => String(w).trim()).filter((w: string) => words.some((tw) => tw.toLowerCase() === w.toLowerCase()))))
+        : detectedUsed;
+
+      parsed.unusedWords = Array.isArray(parsed.unusedWords)
+        ? Array.from(new Set(parsed.unusedWords.map((w: string) => String(w).trim()).filter((w: string) => words.some((tw) => tw.toLowerCase() === w.toLowerCase()))))
+        : detectedUnused;
+
+      // Ensure expressions missing from usedWords are listed in unusedWords
+      for (const w of words) {
+        const clean = w.trim();
+        const inUsed = parsed.usedWords.some((uw: string) => uw.toLowerCase() === clean.toLowerCase());
+        if (!inUsed && !parsed.unusedWords.some((uw: string) => uw.toLowerCase() === clean.toLowerCase())) {
+          parsed.unusedWords.push(clean);
+        }
+      }
 
       return {
         ...parsed,
@@ -17369,15 +17412,14 @@ export async function startServer() {
   // Preload local database into memory immediately
   readDb();
 
-  // Hydrate from Cloud Firestore first with safety timeout so server always starts quickly
-  await Promise.race([
-    initCloudPersistence(),
-    new Promise((resolve) => setTimeout(resolve, 3500)),
-  ]).catch((err) => {
-    console.warn('Initial cloud persistence notice:', err);
-  }).finally(() => {
-    isCloudHydrated = true;
-  });
+  // Hydrate from Cloud Firestore in background without delaying server port readiness
+  initCloudPersistence()
+    .catch((err) => {
+      console.warn('Initial cloud persistence notice:', err);
+    })
+    .finally(() => {
+      isCloudHydrated = true;
+    });
 
   const isStandalone = process.env.STANDALONE_BACKEND === 'true' || process.env.BACKEND_ONLY === 'true';
 

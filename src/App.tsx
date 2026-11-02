@@ -2317,7 +2317,19 @@ export default function App() {
       const data = await res.json();
       // Guard against race conditions: only update state if user is still the current active user
       if (activeJournalLoadUidRef.current === currentLoadTarget && Array.isArray(data)) {
-        setDailyJournalEntries(data);
+        const seen = new Set<string>();
+        const uniqueData: DailyJournalEntry[] = [];
+        data.forEach((item: any) => {
+          if (!item) return;
+          const id = String(item.id || '').trim();
+          if (!id) {
+            uniqueData.push(item);
+          } else if (!seen.has(id)) {
+            seen.add(id);
+            uniqueData.push(item);
+          }
+        });
+        setDailyJournalEntries(uniqueData);
       }
     } catch (err) {
       console.warn('[App] Error loading student journal:', err);
@@ -6373,111 +6385,120 @@ export default function App() {
   }, [tutors]);
 
   // Handler: Save Daily Sentence and persist in Firestore Journal
+  const isSavingDailySentenceRef = useRef<boolean>(false);
   const handleSaveDailySentence = async (
     sentence: string,
     wordsUsed: string[],
     evaluationResult?: WritingEvaluationResult | null
   ): Promise<boolean> => {
-    const studentUid = auth?.currentUser?.uid || currentAccount?.uid || userProfile?.id || '';
-    const studentEmail = (auth?.currentUser?.email || currentAccount?.email || userProfile?.email || '').toLowerCase().trim();
-
-    if (!studentUid && !studentEmail) {
-      setNotifications((prev) => [
-        {
-          id: `err_journal_${Date.now()}`,
-          title: currentLanguage === 'en' ? 'Save Failed' : 'Falha ao Salvar',
-          message: currentLanguage === 'en'
-            ? 'User identity required to save journal entry.'
-            : 'Identificação de usuário necessária para salvar no diário.',
-          type: 'error',
-          timestamp: new Date().toISOString(),
-          read: false,
-        },
-        ...prev,
-      ]);
-      return false;
-    }
-
-    const effectiveWords = (wordsUsed && wordsUsed.length > 0)
-      ? wordsUsed
-      : (evaluationResult?.usedWords && evaluationResult.usedWords.length > 0)
-      ? evaluationResult.usedWords
-      : [];
-
-    const newJournalEntry: DailyJournalEntry = {
-      id: `journal_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-      date: new Date().toISOString().split('T')[0],
-      sentence,
-      wordsUsed: effectiveWords,
-      usedWords: effectiveWords,
-      correctedSentence: evaluationResult?.correctedSentence,
-      explanation:
-        evaluationResult?.explanation ||
-        evaluationResult?.sentenceFeedback?.explanationPt ||
-        evaluationResult?.sentenceFeedback?.explanationEn ||
-        evaluationResult?.overallSummaryPt ||
-        '',
-      hasErrors: evaluationResult?.hasAnyError,
-      evaluationResult: evaluationResult || null,
-      createdAt: new Date().toISOString(),
-      studentUid,
-      studentEmail,
-    };
+    if (isSavingDailySentenceRef.current) return false;
+    isSavingDailySentenceRef.current = true;
 
     try {
-      // 1. Await Firestore confirmation BEFORE updating state or showing success
-      const success = await saveStudentJournalEntryToFirestore(studentUid, newJournalEntry, studentEmail);
-      if (!success) {
-        throw new Error('Save to Firestore was not confirmed');
+      const studentUid = auth?.currentUser?.uid || currentAccount?.uid || userProfile?.id || '';
+      const studentEmail = (auth?.currentUser?.email || currentAccount?.email || userProfile?.email || '').toLowerCase().trim();
+
+      if (!studentUid && !studentEmail) {
+        setNotifications((prev) => [
+          {
+            id: `err_journal_${Date.now()}`,
+            title: currentLanguage === 'en' ? 'Save Failed' : 'Falha ao Salvar',
+            message: currentLanguage === 'en'
+              ? 'User identity required to save journal entry.'
+              : 'Identificação de usuário necessária para salvar no diário.',
+            type: 'error',
+            timestamp: new Date().toISOString(),
+            read: false,
+          },
+          ...prev,
+        ]);
+        return false;
       }
 
-      // 2. Only update state upon confirmed Firestore write
-      setDailyJournalEntries((prev) => [newJournalEntry, ...prev.filter((e) => e.id !== newJournalEntry.id)]);
+      const effectiveWords = (wordsUsed && wordsUsed.length > 0)
+        ? wordsUsed
+        : (evaluationResult?.usedWords && evaluationResult.usedWords.length > 0)
+        ? evaluationResult.usedWords
+        : [];
 
-      setUserProfile((prev) => ({
-        ...prev,
-        dailyJournalEntries: [
-          newJournalEntry,
-          ...(prev.dailyJournalEntries || []).filter((e) => e.id !== newJournalEntry.id),
-        ],
-      }));
+      const newJournalEntry: DailyJournalEntry = {
+        id: `journal_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        date: new Date().toISOString().split('T')[0],
+        sentence,
+        wordsUsed: effectiveWords,
+        usedWords: effectiveWords,
+        correctedSentence: evaluationResult?.correctedSentence,
+        explanation:
+          evaluationResult?.explanation ||
+          evaluationResult?.sentenceFeedback?.explanationPt ||
+          evaluationResult?.sentenceFeedback?.explanationEn ||
+          evaluationResult?.overallSummaryPt ||
+          '',
+        hasErrors: evaluationResult?.hasAnyError,
+        evaluationResult: evaluationResult || null,
+        createdAt: new Date().toISOString(),
+        studentUid,
+        studentEmail,
+      };
 
-      // Background sync to ensure complete alignment with server
-      loadDailyJournalEntries(studentUid);
+      try {
+        // 1. Await Firestore confirmation BEFORE updating state or showing success
+        const success = await saveStudentJournalEntryToFirestore(studentUid, newJournalEntry, studentEmail);
+        if (!success) {
+          throw new Error('Save to Firestore was not confirmed');
+        }
 
-      // 3. Notify user of success WITHOUT exposing personal sentence text in notification or logs
-      setNotifications((prev) => [
-        {
-          id: `notif-${Date.now()}`,
-          title: currentLanguage === 'en' ? 'Sentence Saved to Journal!' : 'Frase Salva no Diário!',
-          message: currentLanguage === 'en'
-            ? 'Your daily sentence was securely recorded in your journal.'
-            : 'Sua frase do dia foi registrada com segurança no seu diário.',
-          type: 'success',
-          timestamp: new Date().toISOString(),
-          read: false,
-        },
-        ...prev,
-      ]);
+        // 2. Only update state upon confirmed Firestore write
+        setDailyJournalEntries((prev) => [newJournalEntry, ...prev.filter((e) => e.id !== newJournalEntry.id)]);
 
-      return true;
-    } catch {
-      setNotifications((prev) => [
-        {
-          id: `err_journal_${Date.now()}`,
-          title: currentLanguage === 'en' ? 'Save Failed' : 'Falha ao Salvar',
-          message: currentLanguage === 'en'
-            ? 'Unable to save your sentence to Firestore. Please try again.'
-            : 'Não foi possível salvar sua frase no Firestore. Por favor, tente novamente.',
-          type: 'error',
-          timestamp: new Date().toISOString(),
-          read: false,
-        },
-        ...prev,
-      ]);
-      return false;
+        setUserProfile((prev) => ({
+          ...prev,
+          dailyJournalEntries: [
+            newJournalEntry,
+            ...(prev.dailyJournalEntries || []).filter((e) => e.id !== newJournalEntry.id),
+          ],
+        }));
+
+        // Background sync to ensure complete alignment with server
+        loadDailyJournalEntries(studentUid);
+
+        // 3. Notify user of success WITHOUT exposing personal sentence text in notification or logs
+        setNotifications((prev) => [
+          {
+            id: `notif-${Date.now()}`,
+            title: currentLanguage === 'en' ? 'Sentence Saved to Journal!' : 'Frase Salva no Diário!',
+            message: currentLanguage === 'en'
+              ? 'Your daily sentence was securely recorded in your journal.'
+              : 'Sua frase do dia foi registrada com segurança no seu diário.',
+            type: 'success',
+            timestamp: new Date().toISOString(),
+            read: false,
+          },
+          ...prev,
+        ]);
+
+        return true;
+      } catch {
+        setNotifications((prev) => [
+          {
+            id: `err_journal_${Date.now()}`,
+            title: currentLanguage === 'en' ? 'Save Failed' : 'Falha ao Salvar',
+            message: currentLanguage === 'en'
+              ? 'Unable to save your sentence to Firestore. Please try again.'
+              : 'Não foi possível salvar sua frase no Firestore. Tente novamente.',
+            type: 'error',
+            timestamp: new Date().toISOString(),
+            read: false,
+          },
+          ...prev,
+        ]);
+        return false;
+      }
+    } finally {
+      isSavingDailySentenceRef.current = false;
     }
   };
+
 
   const handleDeleteJournalEntry = async (entryId: string) => {
     const prevJournalEntries = [...dailyJournalEntries];

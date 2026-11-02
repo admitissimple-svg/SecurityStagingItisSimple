@@ -4020,7 +4020,12 @@ export async function fetchStudentDailyJournalFromServerFirestore(docId: string)
     if (!subCol.empty) {
       subCol.forEach((docSnap) => {
         const d = docSnap.data();
-        if (d && d.id) map.set(d.id, d);
+        if (d) {
+          const entryId = (d.id && String(d.id).trim()) || docSnap.id;
+          if (entryId) {
+            map.set(entryId, { ...d, id: entryId });
+          }
+        }
       });
     }
     const userSnap = await userRef.get();
@@ -4028,7 +4033,12 @@ export async function fetchStudentDailyJournalFromServerFirestore(docId: string)
       const data = userSnap.data();
       if (Array.isArray(data?.dailyJournalEntries)) {
         data.dailyJournalEntries.forEach((e: any) => {
-          if (e && e.id) map.set(e.id, e);
+          if (e) {
+            const entryId = (e.id && String(e.id).trim()) || '';
+            if (entryId && !map.has(entryId)) {
+              map.set(entryId, { ...e, id: entryId });
+            }
+          }
         });
       }
     }
