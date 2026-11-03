@@ -12672,14 +12672,190 @@ app.get('/api/student-video-assignments', (req, res) => {
   });
 });
 
-app.post('/api/student-video-assignments/assign', async (req, res) => {
-  const db = readDb();
-  const { studentEmail, studentUid, teacherUid, teacherEmail, playlistId, activityId, day, teacherNotes, videoUrl } = req.body;
-  const { email: cleanEmail, uid } = resolveStudentIdentifiers(db, studentEmail, studentUid);
-
-  if (!cleanEmail && !uid) {
-    return res.status(400).json({ error: 'studentEmail or studentUid is required' });
+/**
+ * Hardening Fase 2B: Authoritatively verifies if an authenticated caller is an approved Native Friend (Teacher).
+ * Checks Firestore /tutors and /users collections, canonical identity resolver, and local DB authoritative tutors.
+ * Validates active/approved status.
+ */
+async function verifyActiveApprovedTeacher(
+  uid: string,
+  email?: string,
+  emailVerified?: boolean,
+  dbState?: any
+): Promise<{ isTeacher: boolean; canonicalUid?: string; email?: string; name?: string }> {
+  if (!uid || !isValidCanonicalUid(uid)) {
+    return { isTeacher: false };
   }
+
+  const firestore = getFirestoreDb();
+  if (firestore) {
+    try {
+      const fsTeacher = await verifyTeacherIdentityInFirestore(firestore, uid, email, emailVerified);
+      if (fsTeacher.isTeacher) {
+        return {
+          isTeacher: true,
+          canonicalUid: fsTeacher.authUid || uid,
+          email: fsTeacher.email || email,
+          name: fsTeacher.name,
+        };
+      }
+    } catch {}
+  }
+
+  try {
+    const teacherRes = await resolveTeacherCanonicalIdentity({
+      teacherUid: uid,
+      teacherEmail: email,
+      dbState: dbState,
+    });
+    if (teacherRes && teacherRes.canonicalUid && teacherRes.isApproved) {
+      return {
+        isTeacher: true,
+        canonicalUid: teacherRes.canonicalUid,
+        email: teacherRes.email || email,
+        name: teacherRes.name,
+      };
+    }
+  } catch {}
+
+  if (dbState) {
+    const cleanEmail = (email || '').toLowerCase().trim();
+    const allTutors = [...(dbState.teachers || []), ...(dbState.tutorsList || [])];
+    const found = allTutors.find((t: any) => {
+      const matchUid = (t.uid && t.uid === uid) || (t.id && (t.id === uid || t.id === `tutor-${uid}`)) || (t.authUid && t.authUid === uid);
+      const matchEmail = cleanEmail && t.email && t.email.toLowerCase().trim() === cleanEmail;
+      return matchUid || matchEmail;
+    });
+    if (found) {
+      const isApproved = Boolean(
+        found.approvalStatus === 'approved' ||
+        found.isApproved === true ||
+        found.approved === true ||
+        found.status === 'approved'
+      );
+      if (isApproved) {
+        return {
+          isTeacher: true,
+          canonicalUid: found.uid || found.authUid || uid,
+          email: found.email || email,
+          name: found.name,
+        };
+      }
+    }
+  }
+
+  return { isTeacher: false };
+}
+
+app.post('/api/student-video-assignments/assign', firebaseAuthMiddleware, async (req, res) => {
+  const db = readDb();
+  const caller = req.user;
+  if (!caller || !caller.uid) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required: verified user token missing.' });
+  }
+
+  const cleanCallerUid = caller.uid.trim();
+  const cleanCallerEmail = (caller.email || '').toLowerCase().trim();
+  const isAdmin = caller.role === 'admin';
+
+  // Validate Native Friend identity and active/approved status if caller is a teacher or has teacher records
+  const teacherStatus = await verifyActiveApprovedTeacher(cleanCallerUid, cleanCallerEmail, caller.email_verified, db);
+  const isCallerApprovedTeacher = teacherStatus.isTeacher;
+
+  // Check if caller is registered as tutor but not approved/active
+  const allTutors = [...(db.teachers || []), ...(db.tutorsList || [])];
+  const matchedTutorRecord = allTutors.find((t: any) => {
+    const cleanTutorEmail = (t.email || '').toLowerCase().trim();
+    return (
+      (t.uid && t.uid === cleanCallerUid) ||
+      (t.id && (t.id === cleanCallerUid || t.id === `tutor-${cleanCallerUid}`)) ||
+      (t.authUid && t.authUid === cleanCallerUid) ||
+      (cleanCallerEmail && cleanTutorEmail === cleanCallerEmail)
+    );
+  });
+  if (matchedTutorRecord && !isCallerApprovedTeacher && !isAdmin) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Native Friend is not approved or active.',
+    });
+  }
+
+  const effectiveRole = isAdmin ? 'admin' : (isCallerApprovedTeacher ? 'teacher' : 'student');
+
+  // Validate canonical student identity and pedagogical link
+  const studentResolution = await resolveCanonicalStudentIdentity({
+    caller: {
+      uid: cleanCallerUid,
+      email: cleanCallerEmail,
+      role: effectiveRole,
+    },
+    studentEmail: req.body.studentEmail,
+    studentUid: req.body.studentUid || req.body.uid,
+  });
+
+  if (!studentResolution.authorized) {
+    return res.status(studentResolution.statusCode || 403).json({
+      error: studentResolution.statusCode === 401 ? 'Unauthorized' : 'Forbidden',
+      message: studentResolution.error || 'Access denied.',
+    });
+  }
+
+  const canonicalStudentUid = studentResolution.canonicalStudentUid;
+  const canonicalStudentEmail = (studentResolution.studentEmail || '').toLowerCase().trim();
+
+  if (!isValidCanonicalUid(canonicalStudentUid)) {
+    return res.status(422).json({
+      error: 'Unprocessable Entity',
+      message: 'Invalid or non-canonical student UID.',
+    });
+  }
+
+  // Derive teacher authorization strictly:
+  let effectiveTeacherUid = '';
+  let effectiveTeacherEmail = '';
+
+  if (isCallerApprovedTeacher) {
+    // Authenticated teacher UID only
+    effectiveTeacherUid = cleanCallerUid;
+    effectiveTeacherEmail = cleanCallerEmail;
+  } else if (isAdmin) {
+    // Admin can specify teacher, validate if provided
+    if (req.body.teacherUid || req.body.teacherEmail) {
+      const teacherRes = await resolveTeacherCanonicalIdentity({
+        teacherUid: req.body.teacherUid,
+        teacherEmail: req.body.teacherEmail,
+        dbState: db,
+      });
+      if (teacherRes && teacherRes.canonicalUid && teacherRes.isApproved) {
+        effectiveTeacherUid = teacherRes.canonicalUid;
+        effectiveTeacherEmail = teacherRes.email || '';
+      }
+    }
+  } else {
+    // Student: CANNOT arbitrarily assign another teacher
+    const studentProfile = db.userProfiles?.[canonicalStudentUid] || db.userProfiles?.[canonicalStudentEmail];
+    const registeredStudent = (db.students || []).find((s: any) =>
+      (canonicalStudentUid && (s.uid === canonicalStudentUid || s.id === canonicalStudentUid)) ||
+      (canonicalStudentEmail && (s.email || '').toLowerCase().trim() === canonicalStudentEmail)
+    );
+    effectiveTeacherUid = (
+      studentProfile?.assignedNativeFriendUID ||
+      studentProfile?.teacherUid ||
+      registeredStudent?.assignedTeacherId ||
+      registeredStudent?.teacherUid ||
+      ''
+    ).trim();
+    effectiveTeacherEmail = (
+      studentProfile?.teacherEmail ||
+      registeredStudent?.teacherEmail ||
+      ''
+    ).trim();
+  }
+
+  const cleanEmail = canonicalStudentEmail;
+  const uid = canonicalStudentUid;
+
+  const { playlistId, activityId, day, teacherNotes, videoUrl } = req.body;
 
   const studentLevel = normalizeStudentLevel(resolveStudentLevel(db, cleanEmail, uid)).key;
   const levelCurriculum = YOUTUBE_LEVEL_PLAYLISTS[studentLevel] || YOUTUBE_LEVEL_PLAYLISTS.beginner;
@@ -12934,8 +13110,8 @@ app.post('/api/student-video-assignments/assign', async (req, res) => {
     activityId: activityId || 'act-1',
     studentEmail: cleanEmail,
     studentUid: uid || '',
-    teacherUid: (teacherUid || '').trim(),
-    teacherEmail: (teacherEmail || '').trim(),
+    teacherUid: effectiveTeacherUid,
+    teacherEmail: effectiveTeacherEmail,
     day: targetDay,
     playlistId: assignedVideoObj.playlistId,
     playlistTitle: assignedVideoObj.playlistTitle,
@@ -13064,32 +13240,173 @@ app.post('/api/student-video-assignments/assign', async (req, res) => {
 });
 
 // Endpoint to distribute exclusive sequential YouTube videos for student active days (or Monday to Sunday)
-app.post('/api/student-video-assignments/distribute-week', (req, res) => {
+app.post('/api/student-video-assignments/distribute-week', firebaseAuthMiddleware, async (req, res) => {
   const db = readDb();
-  const { studentEmail, studentUid, teacherUid, teacherEmail, level, days } = req.body;
-  const { email: cleanEmail, uid } = resolveStudentIdentifiers(db, studentEmail, studentUid);
+  const caller = req.user;
+  if (!caller || !caller.uid) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required: verified user token missing.' });
+  }
 
-  if (!cleanEmail && !uid) {
-    return res.status(400).json({ error: 'studentEmail or studentUid is required' });
+  const cleanCallerUid = caller.uid.trim();
+  const cleanCallerEmail = (caller.email || '').toLowerCase().trim();
+  const isAdmin = caller.role === 'admin';
+
+  const teacherStatus = await verifyActiveApprovedTeacher(cleanCallerUid, cleanCallerEmail, caller.email_verified, db);
+  const isCallerApprovedTeacher = teacherStatus.isTeacher;
+
+  // Check if caller is registered as tutor but not approved/active
+  const allTutors = [...(db.teachers || []), ...(db.tutorsList || [])];
+  const matchedTutorRecord = allTutors.find((t: any) => {
+    const cleanTutorEmail = (t.email || '').toLowerCase().trim();
+    return (
+      (t.uid && t.uid === cleanCallerUid) ||
+      (t.id && (t.id === cleanCallerUid || t.id === `tutor-${cleanCallerUid}`)) ||
+      (t.authUid && t.authUid === cleanCallerUid) ||
+      (cleanCallerEmail && cleanTutorEmail === cleanCallerEmail)
+    );
+  });
+  if (matchedTutorRecord && !isCallerApprovedTeacher && !isAdmin) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Native Friend is not approved or active.',
+    });
+  }
+
+  const effectiveRole = isAdmin ? 'admin' : (isCallerApprovedTeacher ? 'teacher' : 'student');
+
+  // Handle Batch Distribution
+  if (Array.isArray(req.body.students)) {
+    if (effectiveRole === 'student') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Batch distribution not permitted for students.',
+      });
+    }
+
+    const batchStudents = req.body.students;
+    if (batchStudents.length === 0) {
+      return res.status(400).json({ error: 'students array is empty' });
+    }
+
+    // Phase 1: Validate authorization for EVERY student in the batch before any writes
+    const validatedStudents: { canonicalUid: string; canonicalEmail: string; level?: string; days?: string[] }[] = [];
+    for (const item of batchStudents) {
+      const sRes = await resolveCanonicalStudentIdentity({
+        caller: {
+          uid: cleanCallerUid,
+          email: cleanCallerEmail,
+          role: effectiveRole,
+        },
+        studentEmail: item.studentEmail || item.email,
+        studentUid: item.studentUid || item.uid,
+      });
+
+      if (!sRes.authorized || !isValidCanonicalUid(sRes.canonicalStudentUid)) {
+        return res.status(sRes.statusCode || 403).json({
+          error: 'Forbidden',
+          message: sRes.error || `Unauthorized distribution for student ${item.studentEmail || item.studentUid || ''}`,
+        });
+      }
+
+      validatedStudents.push({
+        canonicalUid: sRes.canonicalStudentUid,
+        canonicalEmail: (sRes.studentEmail || '').toLowerCase().trim(),
+        level: item.level || req.body.level,
+        days: item.days || req.body.days,
+      });
+    }
+
+    // Phase 2: All verified, perform distributions using validated canonical IDs
+    const batchResults: any[] = [];
+    for (const vStudent of validatedStudents) {
+      const teacherUidToUse = isCallerApprovedTeacher ? cleanCallerUid : (req.body.teacherUid || '');
+      const teacherEmailToUse = isCallerApprovedTeacher ? cleanCallerEmail : (req.body.teacherEmail || '');
+      const assignments = distributeWeeklyYouTubeForStudent(
+        db,
+        vStudent.canonicalEmail,
+        vStudent.canonicalUid,
+        vStudent.level,
+        teacherUidToUse,
+        teacherEmailToUse,
+        Array.isArray(vStudent.days) ? vStudent.days : undefined
+      );
+      batchResults.push({
+        studentUid: vStudent.canonicalUid,
+        studentEmail: vStudent.canonicalEmail,
+        count: assignments.length,
+      });
+    }
+
+    writeDb(db);
+    return res.json({
+      success: true,
+      batch: true,
+      results: batchResults,
+      message: `Distribuição em lote concluída com sucesso para ${batchResults.length} alunos!`,
+    });
+  }
+
+  // Handle Single Student Distribution
+  const { studentEmail, studentUid, level, days } = req.body;
+  const studentResolution = await resolveCanonicalStudentIdentity({
+    caller: {
+      uid: cleanCallerUid,
+      email: cleanCallerEmail,
+      role: effectiveRole,
+    },
+    studentEmail,
+    studentUid: studentUid || req.body.uid,
+  });
+
+  if (!studentResolution.authorized) {
+    return res.status(studentResolution.statusCode || 403).json({
+      error: studentResolution.statusCode === 401 ? 'Unauthorized' : 'Forbidden',
+      message: studentResolution.error || 'Access denied.',
+    });
+  }
+
+  const canonicalStudentUid = studentResolution.canonicalStudentUid;
+  const canonicalStudentEmail = (studentResolution.studentEmail || '').toLowerCase().trim();
+
+  if (!isValidCanonicalUid(canonicalStudentUid)) {
+    return res.status(422).json({
+      error: 'Unprocessable Entity',
+      message: 'Invalid or non-canonical student UID.',
+    });
+  }
+
+  let effectiveTeacherUid = '';
+  let effectiveTeacherEmail = '';
+  if (isCallerApprovedTeacher) {
+    effectiveTeacherUid = cleanCallerUid;
+    effectiveTeacherEmail = cleanCallerEmail;
+  } else if (isAdmin) {
+    effectiveTeacherUid = (req.body.teacherUid || '').trim();
+    effectiveTeacherEmail = (req.body.teacherEmail || '').trim();
+  } else {
+    // Student: preserve existing teacher, cannot inject arbitrary teacher
+    const studentProfile = db.userProfiles?.[canonicalStudentUid] || db.userProfiles?.[canonicalStudentEmail];
+    effectiveTeacherUid = (studentProfile?.assignedNativeFriendUID || studentProfile?.teacherUid || '').trim();
+    effectiveTeacherEmail = (studentProfile?.teacherEmail || '').trim();
   }
 
   const assignments = distributeWeeklyYouTubeForStudent(
     db,
-    cleanEmail,
-    uid,
+    canonicalStudentEmail,
+    canonicalStudentUid,
     level,
-    teacherUid,
-    teacherEmail,
+    effectiveTeacherUid,
+    effectiveTeacherEmail,
     Array.isArray(days) ? days : undefined
   );
 
   writeDb(db);
 
-  res.json({
+  return res.json({
     success: true,
     assignments,
-    studentEmail: cleanEmail,
-    studentUid: uid,
+    studentEmail: canonicalStudentEmail,
+    studentUid: canonicalStudentUid,
     message: `Semana de ${assignments.length} vídeos exclusivos do YouTube atribuída com sucesso!`,
   });
 });
@@ -13299,7 +13616,18 @@ app.post('/api/routines/daily-video', async (req, res) => {
     }
   }
 
-  // 2. Update local in-memory DB
+  // Phase 3B: Do not return success or treat in-memory write as definitive if Firestore write failed
+  if (!effectiveUid || !firestoreSaved) {
+    return res.status(500).json({
+      success: false,
+      error: 'FirestorePersistenceFailed',
+      message: 'Falha ao confirmar persistência do vídeo diário no Firestore.',
+      studentUid: effectiveUid || null,
+      day: targetDay,
+    });
+  }
+
+  // 2. Update local in-memory DB strictly after confirmed Firestore persistence
   targetKeys.forEach((k) => {
     if (!db.studentVideoAssignments) db.studentVideoAssignments = {};
     if (!Array.isArray(db.studentVideoAssignments[k])) db.studentVideoAssignments[k] = [];
@@ -13339,7 +13667,7 @@ app.post('/api/routines/daily-video', async (req, res) => {
   res.json({
     success: true,
     savedRoutine: videoObj,
-    firestoreConfirmed: firestoreSaved,
+    firestoreConfirmed: true,
     studentUid: effectiveUid,
     day: targetDay,
   });
@@ -14347,52 +14675,66 @@ app.post('/api/routines/weekly-checks', async (req, res) => {
     }
   }
 
-  await writeDbSync(db);
-
-  // Firestore persistence
+  // Phase 3B: Explicitly await Firestore persistence before in-memory commit and success confirmation
   const docId = cleanUid || cleanEmail;
-  if (docId) {
-    // 1. Write week-specific document: users/{docId}/weeklyChecks/week-${cycle}
-    const weekDocPayload: Record<string, any> = {
-      id: canonicalWeekId,
-      weekId: canonicalWeekId,
-      weeklyCycle: cycle,
-      checks: db.studentWeeklyChecks[weekScopedKey] || {},
-      weeklyChecks: db.studentWeeklyChecks[weekScopedKey] || {},
-      sPathChecks: db.studentWeeklyChecks[weekScopedKey] || {},
-      updatedAt: new Date().toISOString(),
-      studentUid: cleanUid || null,
-      studentEmail: cleanEmail || null,
-    };
-    if (typeof weeklyNativeLessonsTarget === 'number') {
-      weekDocPayload.weeklyNativeLessonsTarget = weeklyNativeLessonsTarget;
-    }
-    if (typeof weeklyStudyDaysTarget === 'number') {
-      weekDocPayload.weeklyStudyDaysTarget = weeklyStudyDaysTarget;
-    }
-
-    // 2. Root document users/{docId}: targets and current week checks
-    const fsRootPayload: Record<string, any> = {
-      updatedAt: new Date().toISOString(),
-      weeklyChecks: db.studentWeeklyChecks[weekScopedKey] || {},
-      sPathChecks: db.studentWeeklyChecks[weekScopedKey] || {},
-    };
-    if (typeof weeklyNativeLessonsTarget === 'number') {
-      fsRootPayload.weeklyNativeLessonsTarget = weeklyNativeLessonsTarget;
-    }
-    if (typeof weeklyStudyDaysTarget === 'number') {
-      fsRootPayload.weeklyStudyDaysTarget = weeklyStudyDaysTarget;
-    }
-    if (Array.isArray(weeklyStudyDays)) {
-      fsRootPayload.weeklyStudyDays = weeklyStudyDays;
-    }
-
-    saveWeeklyChecksToFirestore(docId, canonicalWeekId, weekDocPayload, fsRootPayload).catch(() => {});
+  if (!docId) {
+    return res.status(400).json({
+      success: false,
+      error: 'MissingStudentIdentity',
+      message: 'Identificador canônico do aluno ausente para gravação dos checks semanais.',
+    });
   }
+
+  // 1. Write week-specific document: users/{docId}/weeklyChecks/week-${cycle}
+  const weekDocPayload: Record<string, any> = {
+    id: canonicalWeekId,
+    weekId: canonicalWeekId,
+    weeklyCycle: cycle,
+    checks: db.studentWeeklyChecks[weekScopedKey] || {},
+    weeklyChecks: db.studentWeeklyChecks[weekScopedKey] || {},
+    sPathChecks: db.studentWeeklyChecks[weekScopedKey] || {},
+    updatedAt: new Date().toISOString(),
+    studentUid: cleanUid || null,
+    studentEmail: cleanEmail || null,
+  };
+  if (typeof weeklyNativeLessonsTarget === 'number') {
+    weekDocPayload.weeklyNativeLessonsTarget = weeklyNativeLessonsTarget;
+  }
+  if (typeof weeklyStudyDaysTarget === 'number') {
+    weekDocPayload.weeklyStudyDaysTarget = weeklyStudyDaysTarget;
+  }
+
+  // 2. Root document users/{docId}: targets and current week checks
+  const fsRootPayload: Record<string, any> = {
+    updatedAt: new Date().toISOString(),
+    weeklyChecks: db.studentWeeklyChecks[weekScopedKey] || {},
+    sPathChecks: db.studentWeeklyChecks[weekScopedKey] || {},
+  };
+  if (typeof weeklyNativeLessonsTarget === 'number') {
+    fsRootPayload.weeklyNativeLessonsTarget = weeklyNativeLessonsTarget;
+  }
+  if (typeof weeklyStudyDaysTarget === 'number') {
+    fsRootPayload.weeklyStudyDaysTarget = weeklyStudyDaysTarget;
+  }
+  if (Array.isArray(weeklyStudyDays)) {
+    fsRootPayload.weeklyStudyDays = weeklyStudyDays;
+  }
+
+  const fsOk = await saveWeeklyChecksToFirestore(docId, canonicalWeekId, weekDocPayload, fsRootPayload);
+  if (!fsOk) {
+    return res.status(500).json({
+      success: false,
+      error: 'FirestorePersistenceFailed',
+      message: 'Falha ao confirmar persistência dos checks semanais no Firestore.',
+    });
+  }
+
+  await writeDbSync(db);
 
   const savedChecks = db.studentWeeklyChecks[weekScopedKey] || {};
   res.json({
     success: true,
+    firestoreConfirmed: true,
     weekId: canonicalWeekId,
     weeklyCycle: cycle,
     checks: savedChecks,

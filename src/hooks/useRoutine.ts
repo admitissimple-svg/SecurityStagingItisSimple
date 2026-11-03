@@ -555,6 +555,7 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
   const [lastSavedDay, setLastSavedDay] = useState<DayOfWeek | null>(null);
 
   const activeCycleRef = useRef<number>(activeWeeklyCycle || 1);
+  const isCycleAuthoritativeRef = useRef<boolean>(typeof activeWeeklyCycle === 'number' && activeWeeklyCycle > 1);
   const fetchVersionRef = useRef<number>(0);
 
   /**
@@ -564,6 +565,7 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
    */
   const resetAllDaysImmediately = useCallback((newCycle: number) => {
     activeCycleRef.current = newCycle;
+    isCycleAuthoritativeRef.current = true;
     fetchVersionRef.current += 1;
     const clean = createClean7DayRoutines(newCycle);
     setRoutinesByDay(clean);
@@ -594,7 +596,13 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
 
     try {
       const headers = await getAuthHeaders();
-      const res = await fetch(`/api/routines/daily-video?studentUid=${encodeURIComponent(uid)}&weeklyCycle=${encodeURIComponent(cycleToFetch)}`, {
+      // Phase 3B: If cycle is unconfirmed default 1, query without forced weeklyCycle so server resolves canonical cycle from users/{uid}
+      const isUnconfirmedCycle = !isCycleAuthoritativeRef.current && cycleToFetch === 1;
+      const url = isUnconfirmedCycle
+        ? `/api/routines/daily-video?studentUid=${encodeURIComponent(uid)}`
+        : `/api/routines/daily-video?studentUid=${encodeURIComponent(uid)}&weeklyCycle=${encodeURIComponent(cycleToFetch)}`;
+
+      const res = await fetch(url, {
         method: 'GET',
         headers,
       });
@@ -607,25 +615,48 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
       if (res.ok) {
         const data = await res.json();
 
-        // Discard response if server cycle does not match the active cycle
-        if (data.weeklyCycle !== undefined && data.weeklyCycle !== activeCycleRef.current) {
-          // HOTFIX 2.3.5H: Block response from older cycle, but ensure active cycle loading is concluded cleanly
-          setLoadedUid(uid);
-          setLoadedCycle(activeCycleRef.current);
-          setIsLoading(false);
-          setIsInitialized(true);
+        // 1. Cross-user protection: discard response if student UID does not match current effective student
+        if (data.studentUid && uid && data.studentUid !== uid) {
           return;
         }
 
+        // 2. Weekly cycle synchronization:
+        // Do NOT treat default initial weeklyCycle: 1 as authoritative
+        let resolvedCycle = activeCycleRef.current;
+        if (typeof data.weeklyCycle === 'number' && data.weeklyCycle > 0) {
+          if (data.weeklyCycle < activeCycleRef.current) {
+            // Discard response from an older cycle to prevent stale overwrites
+            setLoadedUid(uid);
+            setLoadedCycle(activeCycleRef.current);
+            setIsLoading(false);
+            setIsInitialized(true);
+            return;
+          }
+          if (data.weeklyCycle > activeCycleRef.current) {
+            // Server has confirmed an advanced canonical cycle (e.g. Cycle 2+ after F5): adopt it
+            activeCycleRef.current = data.weeklyCycle;
+            isCycleAuthoritativeRef.current = true;
+            resolvedCycle = data.weeklyCycle;
+            setWeeklyCycle(data.weeklyCycle);
+          } else {
+            // Cycle matches
+            isCycleAuthoritativeRef.current = true;
+            resolvedCycle = data.weeklyCycle;
+          }
+        }
+
         if (data.routinesByDay && typeof data.routinesByDay === 'object') {
-          // Strictly filter routines to ensure they belong to activeCycleRef.current
+          // Strictly filter routines to ensure they belong to resolvedCycle
           const filtered: Partial<Record<DayOfWeek, SavedRoutineVideo>> = {};
           ALL_DAYS_OF_WEEK.forEach((d) => {
             const item = data.routinesByDay[d];
             if (item && typeof item === 'object') {
-              const itemCycle = item.weeklyCycle !== undefined ? Number(item.weeklyCycle) : activeCycleRef.current;
-              if (itemCycle === activeCycleRef.current && item.videoId && item.videoId.trim() !== '') {
-                filtered[d] = item;
+              const itemCycle = item.weeklyCycle !== undefined ? Number(item.weeklyCycle) : resolvedCycle;
+              if (itemCycle === resolvedCycle && item.videoId && item.videoId.trim() !== '') {
+                filtered[d] = {
+                  ...item,
+                  weeklyCycle: resolvedCycle,
+                };
               } else {
                 filtered[d] = {
                   videoId: '',
@@ -641,7 +672,7 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
                   duration: '',
                   completed: false,
                   completedToday: false,
-                  weeklyCycle: activeCycleRef.current,
+                  weeklyCycle: resolvedCycle,
                   updatedAt: new Date().toISOString(),
                 };
               }
@@ -660,24 +691,21 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
                 duration: '',
                 completed: false,
                 completedToday: false,
-                weeklyCycle: activeCycleRef.current,
+                weeklyCycle: resolvedCycle,
                 updatedAt: new Date().toISOString(),
               };
             }
           });
           setRoutinesByDay(filtered);
         } else {
-          setRoutinesByDay(createClean7DayRoutines(activeCycleRef.current));
+          setRoutinesByDay(createClean7DayRoutines(resolvedCycle));
         }
 
         if (Array.isArray(data.watchedVideosHistory)) {
           setWatchedHistory(data.watchedVideosHistory);
         }
-        if (typeof data.weeklyCycle === 'number' && data.weeklyCycle === activeCycleRef.current) {
-          setWeeklyCycle(data.weeklyCycle);
-        }
         setLoadedUid(uid);
-        setLoadedCycle(activeCycleRef.current);
+        setLoadedCycle(resolvedCycle);
         setNetworkError(null);
       } else {
         console.warn(`[useRoutine] Server returned non-ok status ${res.status}`);
@@ -701,6 +729,9 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
   // React strictly to external activeWeeklyCycle changes (e.g. from Start a New Week)
   useEffect(() => {
     if (activeWeeklyCycle && activeWeeklyCycle > 0) {
+      if (activeWeeklyCycle > 1) {
+        isCycleAuthoritativeRef.current = true;
+      }
       const prev = activeCycleRef.current;
       activeCycleRef.current = activeWeeklyCycle;
       setWeeklyCycle(activeWeeklyCycle);
@@ -752,7 +783,7 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
       const cleanVidId = extractYouTubeVideoId(videoData.videoId || videoData.url || '') || videoData.videoId;
       const cleanTitle = videoData.title || videoData.videoTitle || 'Daily Video Practice';
       const cleanUrl = videoData.url || (cleanVidId ? `https://www.youtube.com/watch?v=${cleanVidId}` : '');
-      const targetCycle = videoData.weeklyCycle || activeWeeklyCycle || weeklyCycle || 1;
+      const targetCycle = videoData.weeklyCycle || activeCycleRef.current || activeWeeklyCycle || weeklyCycle || 1;
 
       const savedObj: SavedRoutineVideo = {
         videoId: cleanVidId,

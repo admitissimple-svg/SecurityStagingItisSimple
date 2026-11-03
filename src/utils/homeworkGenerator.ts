@@ -1086,8 +1086,11 @@ export function resolveDailyMemorizationVocabulary(params: {
     }
 
     // Ordenar estritamente das mais recentes para as mais antigas (descending)
+    // Em caso de empate de timestamp, priorizar palavras Native Friend sobre palavras 5words
     priority2Candidates.sort((a, b) => {
       if (a.timestamp !== b.timestamp) return b.timestamp - a.timestamp;
+      if (a.isNf && !b.isNf) return -1;
+      if (!a.isNf && b.isNf) return 1;
       return a.word.localeCompare(b.word);
     });
 

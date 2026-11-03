@@ -780,19 +780,24 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
         });
 
         if (activeStudentEmail || activeStudentUid) {
-          fetch('/api/student-video-assignments/assign', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              studentEmail: activeStudentEmail,
-              studentUid: activeStudentUid,
-              teacherUid: currentAccount?.uid,
-              teacherEmail: currentAccount?.email,
-              playlistId: 'repeat_previous_video',
-              activityId: targetActivity.id,
-              day: dayId,
-              videoUrl: prevUrl,
-            }),
+          getAccessToken().then((token) => {
+            fetch('/api/student-video-assignments/assign', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                ...(token ? { Authorization: `Bearer ${token}` } : {}),
+              },
+              body: JSON.stringify({
+                studentEmail: activeStudentEmail,
+                studentUid: activeStudentUid,
+                teacherUid: currentAccount?.uid,
+                teacherEmail: currentAccount?.email,
+                playlistId: 'repeat_previous_video',
+                activityId: targetActivity.id,
+                day: dayId,
+                videoUrl: prevUrl,
+              }),
+            }).catch(() => {});
           }).catch(() => {});
         }
 
@@ -909,9 +914,13 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
     setAssignFeedback(null);
 
     try {
+      const token = await getAccessToken();
       const res = await fetch('/api/student-video-assignments/assign', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: JSON.stringify({
           studentEmail: activeStudentEmail,
           studentUid: activeStudentUid,
@@ -1358,9 +1367,13 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
     setIsDistributingYtWeek(true);
     setAssignFeedback(null);
     try {
+      const token = await getAccessToken();
       const res = await fetch('/api/student-video-assignments/distribute-week', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: JSON.stringify({
           studentEmail: activeStudentEmail,
           studentUid: activeStudentUid,

@@ -1,0 +1,100 @@
+{
+  "metadata": {
+    "timestamp": "2026-11-03T16:02:40.324Z",
+    "projectId": "itissimple-security-staging",
+    "databaseId": "(default)",
+    "targetStudentUid": "test-student-account",
+    "isReadOnly": true,
+    "iamAdminIdentity": "ais-sandbox@ais-us-east5-40614d14be3e4b598.iam.gserviceaccount.com"
+  },
+  "firestoreExistence": {
+    "userRootDoc": {
+      "path": "users/test-student-account",
+      "status": "PERMISSION_DENIED",
+      "exists": false,
+      "error": "7 PERMISSION_DENIED: Missing or insufficient permissions."
+    },
+    "currentRoutineWeekData": {
+      "path": "users/test-student-account/currentRoutine/weekData",
+      "status": "PERMISSION_DENIED",
+      "exists": false,
+      "error": "7 PERMISSION_DENIED: Missing or insufficient permissions."
+    },
+    "currentRoutineSubcollection": {
+      "path": "users/test-student-account/currentRoutine",
+      "status": "PERMISSION_DENIED",
+      "exists": false,
+      "error": "7 PERMISSION_DENIED: Missing or insufficient permissions."
+    },
+    "weeklyChecks": {
+      "path": "users/test-student-account/weeklyChecks",
+      "status": "PERMISSION_DENIED",
+      "exists": false,
+      "error": "7 PERMISSION_DENIED: Missing or insufficient permissions."
+    },
+    "homework": {
+      "path": "users/test-student-account/homework",
+      "status": "PERMISSION_DENIED",
+      "exists": false,
+      "error": "7 PERMISSION_DENIED: Missing or insufficient permissions."
+    },
+    "routinesSubcollection": {
+      "path": "users/test-student-account/routines",
+      "status": "PERMISSION_DENIED",
+      "exists": false,
+      "error": "7 PERMISSION_DENIED: Missing or insufficient permissions."
+    },
+    "memorizationSubcollection": {
+      "path": "users/test-student-account/memorization",
+      "status": "PERMISSION_DENIED",
+      "exists": false,
+      "error": "7 PERMISSION_DENIED: Missing or insufficient permissions."
+    },
+    "studentAssignmentsDoc": {
+      "path": "student_assignments/test-student-account",
+      "status": "PERMISSION_DENIED",
+      "exists": false,
+      "error": "7 PERMISSION_DENIED: Missing or insufficient permissions."
+    },
+    "studentHomeworkDoc": {
+      "path": "student_homework/test-student-account",
+      "status": "PERMISSION_DENIED",
+      "exists": false,
+      "error": "7 PERMISSION_DENIED: Missing or insufficient permissions."
+    },
+    "appStateAssignmentsForStudent": {
+      "path": "app_state/assignments",
+      "status": "PERMISSION_DENIED",
+      "exists": false,
+      "error": "7 PERMISSION_DENIED: Missing or insufficient permissions."
+    },
+    "studentRoutinesDoc": {
+      "path": "student_routines/test-student-account",
+      "status": "PERMISSION_DENIED",
+      "exists": false,
+      "error": "7 PERMISSION_DENIED: Missing or insufficient permissions."
+    },
+    "studentVideoAssignments": {
+      "path": "student_video_assignments/test-student-account",
+      "status": "PERMISSION_DENIED",
+      "exists": false,
+      "error": "7 PERMISSION_DENIED: Missing or insufficient permissions."
+    }
+  },
+  "analysis": {
+    "weeklyCycleInferred": 1,
+    "currentRoutineVideoReference": null,
+    "weeklyChecksCycle1Status": null,
+    "homeworkCycle1Status": null,
+    "pathDivergences": [
+      "Leitura de 'users/test-student-account/currentRoutine/weekData' negada por PERMISSION_DENIED.",
+      "Leitura da subcoleção 'users/test-student-account/weeklyChecks' negada por PERMISSION_DENIED."
+    ],
+    "permissionVulnerabilityNotes": [
+      "1. Regras publicadas no Cloud Firestore (default): `allow read, write: if false;` bloqueiam 100% das leituras e escritas diretas do Firebase Client SDK no navegador.",
+      "2. O frontend executa `onSnapshot` e `setDoc` diretamente em: `users/{uid}/currentRoutine/weekData` (src/utils/routineSync.ts) e `users/{uid}/weeklyChecks/week-1` (src/utils/studentPersistence.ts).",
+      "3. No ambiente backend/Admin SDK, a credencial ADC pertence a `ais-sandbox@ais-us-east5-40614d14be3e4b598.iam.gserviceaccount.com`. Sem concessão de IAM Role ('Cloud Datastore User' / 'Firebase Admin') no projeto `itissimple-security-staging`, operações Admin SDK também retornam `7 PERMISSION_DENIED`.",
+      "4. Ao recarregar a página (F5), o cache em memória do Client SDK (memoryLocalCache) é completamente esvaziado. Os listeners em tempo real disparam erro de permissão e o estado do aluno retrocede para vazio ou valores padrão."
+    ]
+  }
+}

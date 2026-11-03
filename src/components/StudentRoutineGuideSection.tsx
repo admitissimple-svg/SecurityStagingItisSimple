@@ -62,6 +62,7 @@ import {
   SpotifyDailyTrack,
 } from '../utils/spotify';
 import { auth } from '../firebase';
+import { getAccessToken } from '../utils/auth';
 import { isValidCanonicalUid } from '../utils/tutorConsolidation';
 import { useStudentSpotifySync } from '../hooks/useStudentSpotifySync';
 import { useRoutine } from '../hooks/useRoutine';
@@ -1208,11 +1209,17 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
 
       const studentEmail = userProfile?.email || 'aluno@itssimple.com';
       try {
+        const token = await getAccessToken();
         const res = await fetch('/api/student-video-assignments/assign', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
           body: JSON.stringify({
             studentEmail,
+            studentUid: effectiveStudentUid,
+            uid: effectiveStudentUid,
             playlistId: 'repeat_previous_video',
             activityId,
             day: selectedDay,
@@ -1322,9 +1329,13 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     const studentEmail = userProfile?.email || 'aluno@itssimple.com';
 
     try {
+      const token = await getAccessToken();
       const res = await fetch('/api/student-video-assignments/assign', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: JSON.stringify({
           studentEmail,
           studentUid: effectiveStudentUid,
