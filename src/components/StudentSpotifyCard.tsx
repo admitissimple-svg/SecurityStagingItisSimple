@@ -26,6 +26,7 @@ interface StudentSpotifyCardProps {
   };
   isAudioListenedToday: boolean;
   isRestDay: boolean;
+  isLoading?: boolean;
   currentDayTrack?: any;
   currentStudyDayIndex: number;
   activeDaysInOrder: DayOfWeek[];
@@ -47,6 +48,7 @@ export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
   levelPlaylistConfig,
   isAudioListenedToday,
   isRestDay,
+  isLoading = false,
   currentStudyDayIndex,
   activeDaysInOrder,
   spotifyPlayerMode,
@@ -55,6 +57,28 @@ export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
   activeNativeFriendFeedback,
   triggerAudioCompletion,
 }) => {
+  if (isLoading) {
+    return (
+      <div className="rounded-3xl bg-gradient-to-br from-slate-900 via-[#000035] to-[#062863] p-4 text-white border border-[#1DB954]/20 shadow-xs flex items-center justify-center min-h-[160px] animate-in fade-in duration-200">
+        <div className="flex items-center gap-3 text-slate-300">
+          <div className="w-9 h-9 rounded-xl bg-[#1DB954]/20 text-[#1DB954] flex items-center justify-center shrink-0 border border-[#1DB954]/30 shadow-xs">
+            <Headphones className="w-4 h-4 animate-pulse" />
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs sm:text-sm font-black text-white">
+                {isEn ? 'Loading your playlist...' : 'Carregando sua playlist...'}
+              </span>
+            </div>
+            <p className="text-[11px] text-slate-400 mt-0.5">
+              {isEn ? 'Syncing your personalized listening routine' : 'Sincronizando sua rotina de áudio personalizada'}
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   const embedUrl =
     levelPlaylistConfig.embedPlaylistUrl ||
     `https://open.spotify.com/embed/playlist/${levelPlaylistConfig.playlistId || '5MMU9H5oXDd7FCWr0gkzHE'}?utm_source=generator&theme=0`;

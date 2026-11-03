@@ -579,6 +579,8 @@ export interface LiveLesson {
   };
   createdAt?: string;
   updatedAt?: string;
+  dayOfWeek?: DayOfWeek;
+  weeklyCycle?: number;
 
   // In-Session Notes & Recommendations
   liveNotes?: string;

@@ -427,7 +427,7 @@ async function runFase3BTests() {
   // ---------------------------------------------------------------------------
   console.log('\n--- Test 9: Start New Week mantém comportamento original ---');
   {
-    let endpointInvoked = false;
+    let endpointInvoked: boolean = false;
     globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       const urlStr = String(input);
       if (urlStr.includes('/api/student-routines/start-new-week')) {
@@ -452,7 +452,7 @@ async function runFase3BTests() {
       weeklyStudyDaysTarget: 7,
     });
 
-    assert(endpointInvoked === true, 'Start New Week invoca endpoint /api/student-routines/start-new-week');
+    assert((endpointInvoked as boolean) === true, 'Start New Week invoca endpoint /api/student-routines/start-new-week');
     assert(snwResult?.success === true && snwResult?.weeklyCycle === 3, 'Start New Week avança ciclo corretamente para 3');
   }
 

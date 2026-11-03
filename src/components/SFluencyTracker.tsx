@@ -293,7 +293,7 @@ export const SFluencyTracker: React.FC<SFluencyTrackerProps> = ({
     );
 
     // 4. Live lessons completed with Native Friend (completed sessions only, never pending bookings or trials)
-    const hasLiveLessonsScheduled = lessons.some((l) => l.status === 'scheduled' || l.status === 'pending');
+    const hasLiveLessonsScheduled = lessons.some((l) => l.status === 'scheduled' || (l.status as any) === 'pending');
     const completedLiveLessons = lessons.filter((l) => l.status === 'completed' && !l.cancelledAt).length;
 
     // 5. Weekly Homework / Memorization Activity

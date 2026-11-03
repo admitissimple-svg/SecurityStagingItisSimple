@@ -301,8 +301,8 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
         fetchStudentWeeklyChecksFromFirestore(studentUid, studentEmail, activeWeekCycle)
           .then((data) => {
             if (isMounted && data) {
-              if (data.checks) {
-                setLocalWeeklyChecks((prev) => ({ ...prev, ...data.checks }));
+              if (data.checks !== undefined) {
+                setLocalWeeklyChecks(data.checks || {});
               }
               if (typeof data.weeklyNativeLessonsTarget === 'number' && data.weeklyNativeLessonsTarget > 0) {
                 setWeeklyNativeTarget(data.weeklyNativeLessonsTarget);
@@ -322,8 +322,8 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
         studentUid,
         studentEmail,
         (data) => {
-          if (isMounted && data && data.checks && Object.keys(data.checks).length > 0) {
-            setLocalWeeklyChecks((prev) => ({ ...prev, ...data.checks }));
+          if (isMounted && data && data.checks !== undefined) {
+            setLocalWeeklyChecks(data.checks || {});
           }
           if (isMounted && typeof data?.weeklyNativeLessonsTarget === 'number' && data.weeklyNativeLessonsTarget > 0) {
             setWeeklyNativeTarget(data.weeklyNativeLessonsTarget);
@@ -360,8 +360,8 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
           .then((res) => (res.ok ? res.json() : null))
           .then((data) => {
             if (isMounted && data) {
-              if (propWeeklyChecks === undefined && data.checks && Object.keys(data.checks).length > 0) {
-                setLocalWeeklyChecks((prev) => ({ ...prev, ...data.checks }));
+              if (propWeeklyChecks === undefined && data.checks !== undefined) {
+                setLocalWeeklyChecks(data.checks || {});
               }
               if (typeof data.weeklyNativeLessonsTarget === 'number' && data.weeklyNativeLessonsTarget > 0) {
                 setWeeklyNativeTarget(data.weeklyNativeLessonsTarget);
@@ -484,8 +484,13 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
       if (rowId === 'memorization') {
         // Direct weeklyChecks checkmark
         if (weeklyChecks && Boolean(weeklyChecks[checkKey])) return true;
-        // Direct homework completed parts by day
-        if (homework?.completedPartsByDay && Boolean(homework.completedPartsByDay[dayKey])) return true;
+        // Direct homework completed parts by day (strictly for active cycle)
+        if (homework?.completedPartsByDay && Boolean(homework.completedPartsByDay[dayKey])) {
+          const hwCycle = parseWeekCycleNumber((homework as any)?.weeklyCycle ?? (homework as any)?.weekId);
+          if (hwCycle === null ? activeWeekCycle === 1 : hwCycle === activeWeekCycle) {
+            return true;
+          }
+        }
         // Check activeJournal specifically for this day and active week
         const hasMemoInJournal = activeJournal.some((entry) => {
           if (!entry) return false;
@@ -629,7 +634,10 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
         if (Array.isArray(lessons) && lessons.length > 0) {
           const hasCompleted = lessons.some((l) => {
             if (!l || l.status !== 'completed' || l.cancelledAt) return false;
-            return l.dayOfWeek && l.dayOfWeek.toLowerCase() === dayKey.toLowerCase();
+            const lessonCycle = (l as any).weeklyCycle ? parseWeekCycleNumber((l as any).weeklyCycle) : null;
+            if (lessonCycle !== null && lessonCycle !== activeWeekCycle) return false;
+            const lessonDay = l.dayOfWeek || (l.startDateTime ? new Date(l.startDateTime).toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase() : '');
+            return lessonDay === dayKey.toLowerCase();
           });
           if (hasCompleted) return true;
         }

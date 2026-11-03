@@ -13,6 +13,7 @@ import { fetchAllWeeklyHistories, saveWeeklyHistory } from '../hooks/useStudentH
 import {
   fetchStudentJournalActivitiesFromFirestore,
   saveStudentVocabularyToFirestore,
+  cacheWeeklyChecksLocally,
 } from '../utils/studentPersistence';
 import { StudentDictionaryEntry } from '../types';
 import {
@@ -502,6 +503,8 @@ export async function executeStartNewWeek(
             learnedWords: [],
             completed: false,
             completedToday: false,
+            completedVideoToday: false,
+            completedAudioToday: false,
             isRepeatVideo: false,
             repeatVideo: false,
           };
@@ -512,6 +515,8 @@ export async function executeStartNewWeek(
           learnedWords: [],
           completed: false,
           completedToday: false,
+          completedVideoToday: false,
+          completedAudioToday: false,
           isRepeatVideo: false,
           repeatVideo: false,
         };
@@ -519,13 +524,19 @@ export async function executeStartNewWeek(
     });
 
     const finalCycle = data?.weeklyCycle !== undefined ? data.weeklyCycle : fallbackCycle;
+    const finalWeekId = `week-${finalCycle}`;
+
+    // HOTFIX 3B.1: Invalidate and initialize local weeklyChecks in-memory cache for the new cycle
+    if (cleanUid) {
+      cacheWeeklyChecksLocally(cleanUid, !isPlaceholder ? params.studentEmail : undefined, {}, finalWeekId);
+    }
 
     // Initialize new weeklyHistory document for the new cycle
     if (cleanUid) {
-      saveWeeklyHistory(cleanUid, `week-${finalCycle}`, {
+      saveWeeklyHistory(cleanUid, finalWeekId, {
         studentUid: cleanUid,
         studentEmail: !isPlaceholder ? params.studentEmail : '',
-        weekId: `week-${finalCycle}`,
+        weekId: finalWeekId,
         weeklyCycle: finalCycle,
         consumedVideoIds: [],
         consumedTrackIds: [],

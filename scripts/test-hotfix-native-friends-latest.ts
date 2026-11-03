@@ -87,7 +87,7 @@ async function runTests() {
   // 5. Test close and reopen modal (simulating state reset with isFreshOpenRef)
   isFreshOpen = true; // reset on modal close/reopen
   onModalOpen(sorted);
-  if (selectedSessionKey !== 'session-new-3') {
+  if ((selectedSessionKey as string) !== 'session-new-3') {
     throw new Error(`Expected reopen to select latest session again, got ${selectedSessionKey}`);
   }
   console.log('✓ Test 4 Passed: Reopening modal resets to latest lesson without stale state sticking.');

@@ -6842,6 +6842,8 @@ app.post(['/api/student-routines/start-new-week', '/api/student/reset-week'], as
               act.learnedWords = [];
               act.completed = false;
               act.completedToday = false;
+              act.completedVideoToday = false;
+              act.completedAudioToday = false;
               act.isRepeatVideo = false;
               act.repeatVideo = false;
               const isVideoAct =
@@ -6925,6 +6927,8 @@ app.post(['/api/student-routines/start-new-week', '/api/student/reset-week'], as
           learnedWords: [],
           completed: false,
           completedToday: false,
+          completedVideoToday: false,
+          completedAudioToday: false,
           isRepeatVideo: false,
           repeatVideo: false,
           ...(shouldResetVideo ? {

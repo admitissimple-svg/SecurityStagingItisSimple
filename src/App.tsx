@@ -121,6 +121,8 @@ import {
   saveStudentWeeklyChecksToFirestore,
   fetchStudentWeeklyChecksFromFirestore,
   subscribeToStudentWeeklyChecks,
+  getCachedWeeklyChecks,
+  cacheWeeklyChecksLocally,
   subscribeToStudentDailyJournal,
   subscribeToStudentDailyRoutines,
   fetchStudentDailyRoutinesFromFirestore,
@@ -2141,8 +2143,8 @@ export default function App() {
       uid,
       email,
       (data) => {
-        if (data && data.checks && Object.keys(data.checks).length > 0) {
-          setWeeklyChecks((prev) => ({ ...prev, ...data.checks }));
+        if (data && typeof data.checks === 'object') {
+          setWeeklyChecks(data.checks || {});
         }
         if (typeof data.weeklyNativeLessonsTarget === 'number' && data.weeklyNativeLessonsTarget > 0) {
           setUserProfile((prev) => ({
@@ -2362,7 +2364,8 @@ export default function App() {
         setStudentJournal(journal);
         if (activeCycle !== null) {
           const derivedChecks = deriveWeeklyChecksFromJournal(journal, activeCycle);
-          setWeeklyChecks((prev) => ({ ...prev, ...derivedChecks }));
+          const currentCached = getCachedWeeklyChecks(uid, email, activeCycle);
+          setWeeklyChecks({ ...currentCached, ...derivedChecks });
         }
       }
     });
@@ -4322,8 +4325,15 @@ export default function App() {
         const effectiveCycle = result.weeklyCycle;
         const effectiveStudyTarget = result.weeklyStudyDaysTarget;
         const effectiveStudyDays = result.weeklyStudyDays;
+        const effectiveWeekId = normalizeWeekId(effectiveCycle) || `week-${effectiveCycle}`;
 
         activeCycleRef.current = effectiveCycle;
+
+        // HOTFIX 3B.1: Invalidate and initialize in-memory weekly checks cache for new canonical weekId
+        cacheWeeklyChecksLocally(uid, studentEmail, {}, effectiveWeekId);
+
+        // Immediate visual reset of S-Path in React state
+        setWeeklyChecks({});
 
         setUserProfile((prev) => ({
           ...prev,
@@ -4333,9 +4343,11 @@ export default function App() {
         }));
 
         setWeeklyHomework(null);
+        if (weeklyHomeworkRef.current) {
+          weeklyHomeworkRef.current = null;
+        }
 
-        // Reset S-Path checks for the new week in memory and Firestore users/{studentUID}
-        setWeeklyChecks({});
+        // Reset S-Path checks for the new week in Firestore users/{studentUID} with reset: true
         saveStudentWeeklyChecksToFirestore(
           uid,
           {},
@@ -4345,37 +4357,6 @@ export default function App() {
           effectiveCycle,
           true
         );
-
-        // Persist weekly checks and study targets via weekly-checks endpoint as well
-        const effectiveWeekId = normalizeWeekId(effectiveCycle);
-        if (effectiveCycle && effectiveWeekId) {
-          getAccessToken().then((token) => {
-            if (!token) return;
-            const canonicalUid = auth.currentUser?.uid || (isValidCanonicalUid(uid) ? uid : '');
-            if (!canonicalUid && !studentEmail) return;
-
-            const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
-            const safeEmail = (studentEmail && (!currentAuthEmail || currentAuthEmail === studentEmail.toLowerCase().trim())) ? studentEmail : undefined;
-
-            fetch('/api/routines/weekly-checks', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${token}`,
-              },
-              body: JSON.stringify({
-                ...(canonicalUid ? { studentUid: canonicalUid } : {}),
-                ...(safeEmail ? { studentEmail: safeEmail } : {}),
-                checks: {},
-                weekId: effectiveWeekId,
-                weeklyCycle: effectiveCycle,
-                weeklyNativeLessonsTarget: userProfile?.weeklyNativeLessonsTarget || 1,
-                weeklyStudyDaysTarget: effectiveStudyTarget,
-                weeklyStudyDays: effectiveStudyDays,
-              }),
-            }).catch(() => {});
-          }).catch(() => {});
-        }
 
         // Automatic positioning on Today if in active study plan, otherwise first active study day
         const today = getTodayDayOfWeek();
@@ -7395,6 +7376,7 @@ export default function App() {
                   weeklyCycle={userProfile?.weeklyCycle || 1}
                   onStartNewWeek={handleStartNewWeek}
                   isStarting={isStartingNewWeek}
+                  isRoutinesLoading={routinesHydrationStatus === 'loading'}
                   weeklyChecks={weeklyChecks}
                   studentJournal={studentJournal}
                   onUpdateSPathCheck={handleUpdateSPathCheck}

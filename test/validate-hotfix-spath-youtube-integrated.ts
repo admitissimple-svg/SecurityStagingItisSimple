@@ -171,6 +171,8 @@ async function runIntegratedValidation() {
     {
       id: 'j-sent-1',
       type: 'sentence',
+      date: '2026-11-03',
+      timestamp: Date.now(),
       dayOfWeek: 'monday',
       week: 1,
       title: 'I love studying English',
@@ -178,6 +180,8 @@ async function runIntegratedValidation() {
     {
       id: 'j-vid-1',
       type: 'video',
+      date: '2026-11-03',
+      timestamp: Date.now(),
       dayOfWeek: 'tuesday',
       week: 1,
       title: 'Daily Video',
@@ -185,6 +189,8 @@ async function runIntegratedValidation() {
     {
       id: 'j-aud-1',
       type: 'audio',
+      date: '2026-11-03',
+      timestamp: Date.now(),
       dayOfWeek: 'wednesday',
       week: 1,
       title: 'Daily Podcast',
@@ -192,6 +198,8 @@ async function runIntegratedValidation() {
     {
       id: 'j-mem-1',
       type: 'memorization',
+      date: '2026-11-03',
+      timestamp: Date.now(),
       dayOfWeek: 'thursday',
       week: 1,
       title: 'Weekly Memorization',

@@ -163,7 +163,7 @@ export function useNativeFriendsNotesReminder({
                 startDateTime: l.startDateTime,
                 id: l.id,
               });
-              const key = l.id || `lesson_${datePart}`;
+              const key = l.id || (dateStr ? `lesson_${dateStr}` : `lesson_${timestamp}`);
 
               sessionsMap.set(key, {
                 key,

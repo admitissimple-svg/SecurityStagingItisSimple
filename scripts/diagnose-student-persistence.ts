@@ -259,7 +259,7 @@ export async function runDiagnostics(targetUid?: string): Promise<DiagnosticResu
         filteredAssignments = raw.assignments
           .filter((a: any) => a.studentId === studentUid || a.studentUid === studentUid || a.uid === studentUid)
           .map((a: any) => sanitizeObject(a));
-      } else if (raw[studentUid]) {
+      } else if (studentUid && raw[studentUid]) {
         filteredAssignments = [sanitizeObject(raw[studentUid])];
       }
       appStateCheck = {
@@ -308,7 +308,7 @@ export async function runDiagnostics(targetUid?: string): Promise<DiagnosticResu
       timestamp: new Date().toISOString(),
       projectId,
       databaseId: CANONICAL_DB_ID,
-      targetStudentUid: studentUid,
+      targetStudentUid: studentUid || '',
       isReadOnly: true,
       iamAdminIdentity: adminIdentity,
     },

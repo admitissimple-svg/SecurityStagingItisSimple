@@ -3689,8 +3689,14 @@ export function deriveWeeklyChecksFromJournal(
   journal.forEach((entry) => {
     if (!entry || !entry.type) return;
     if (entry.type === 'sentence' || (entry as any).type === 'daily_sentence') return;
-    if (targetWeek !== undefined && entry.week !== undefined && Number(entry.week) !== Number(targetWeek)) {
-      return;
+    if (targetWeek !== undefined) {
+      const entryCycle = parseWeekCycleNumber(entry.week);
+      if (entryCycle !== null) {
+        if (entryCycle !== Number(targetWeek)) return;
+      } else if (Number(targetWeek) !== 1) {
+        // Unversioned legacy entries strictly belong to Week 1 and never leak to Week 2+
+        return;
+      }
     }
     const stepId = mapJournalTypeToStepId(entry.type);
     if (stepId && entry.dayOfWeek) {
@@ -4024,10 +4030,12 @@ export async function removeActivityFromStudentJournal(
               ...(wData?.sPathChecks || {}),
             };
           }
-          const updatedWeekChecks = {
-            ...existingWeekChecks,
-            [checkKey]: false,
-          };
+          const updatedWeekChecks = checkKey
+            ? {
+                ...existingWeekChecks,
+                [checkKey]: false,
+              }
+            : existingWeekChecks;
           await withFirestoreTimeout(
             setDoc(
               weekDocRef,

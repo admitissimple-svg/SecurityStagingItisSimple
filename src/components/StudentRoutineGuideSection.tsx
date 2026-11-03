@@ -143,6 +143,7 @@ interface StudentRoutineGuideSectionProps {
   dictionaryEntries?: StudentDictionaryEntry[];
   excludedWords?: string[];
   isDictionaryHydrated?: boolean;
+  isRoutinesLoading?: boolean;
   hasConfirmedTrialLesson?: boolean;
   onScheduleTrialLesson?: () => void;
 }
@@ -177,6 +178,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
   dictionaryEntries = [],
   excludedWords = [],
   isDictionaryHydrated = true,
+  isRoutinesLoading = false,
   hasConfirmedTrialLesson,
   onScheduleTrialLesson,
 }) => {
@@ -2171,10 +2173,10 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
                               }
                             >
                                 <option value="" className="text-slate-600 bg-white font-medium">
-                                {routineStatus === 'loading'
+                                {routineStatus === 'loading' || isRoutinesLoading
                                   ? (isEn ? '⏳ Loading routine...' : '⏳ Carregando rotina...')
                                   : isLoadingPlaylists
-                                  ? (isEn ? '⏳ Loading videos...' : '⏳ Carregando vídeos...')
+                                  ? (isEn ? '⏳ Loading your playlist...' : '⏳ Carregando sua playlist...')
                                   : loadingPlaylistAssignId === act.id
                                   ? (isEn ? '⏳ Assigning Video...' : '⏳ Injetando Vídeo...')
                                   : isRepeatVideo
@@ -2622,6 +2624,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
           levelPlaylistConfig={levelPlaylistConfig}
           isAudioListenedToday={isAudioListenedToday}
           isRestDay={isRestDay}
+          isLoading={Boolean(isStarting || isStartingNewWeek || isRoutinesLoading || !userProfile?.id || isLoadingSpotify)}
           currentDayTrack={currentDayTrack}
           currentStudyDayIndex={currentStudyDayIndex}
           activeDaysInOrder={activeDaysInOrder}
