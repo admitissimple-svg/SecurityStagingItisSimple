@@ -75,16 +75,18 @@ export async function authenticateYouTubeAccount(hintEmail = YOUTUBE_ASSOCIATED_
     setGoogleOAuthToken(token);
 
     // Register token immediately with backend to authorize backend-wide synchronization
-    fetch('/api/youtube-playlists/authorize', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({ token }),
-    }).catch((err) => {
+    try {
+      await fetch('/api/youtube-playlists/authorize', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ token }),
+      });
+    } catch (err) {
       console.warn('Notice: Background token authorization on backend:', err);
-    });
+    }
 
     return token;
   } catch (err: any) {
@@ -95,17 +97,17 @@ export async function authenticateYouTubeAccount(hintEmail = YOUTUBE_ASSOCIATED_
 
 /**
  * Directly queries YouTube Data API v3 playlists.list for all playlists owned by adm.itissimple@gmail.com
- * using the authenticated OAuth 2.0 access token (with `mine=true`), supporting full pagination.
+ * using the authenticated OAuth 2.0 access token (with `mine=true` and channelId), supporting full pagination.
  */
 export async function fetchPlaylistsFromYouTubeApi(accessToken: string): Promise<YouTubePlaylistItem[]> {
   if (!accessToken) {
     throw new Error('OAuth access token is required to fetch YouTube playlists.');
   }
 
-  // 1. Fetch all playlists owned by the authenticated account with pagination
-  const rawPlaylists: any[] = [];
-  let pageToken: string | undefined = undefined;
+  const rawPlaylistsMap = new Map<string, any>();
 
+  // 1A. Fetch all playlists owned by the authenticated account with pagination (mine=true)
+  let pageToken: string | undefined = undefined;
   while (true) {
     const pageParam: string = pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : '';
     const listUrl: string = `https://www.googleapis.com/youtube/v3/playlists?part=snippet,contentDetails,status&mine=true&maxResults=50${pageParam}`;
@@ -123,17 +125,50 @@ export async function fetchPlaylistsFromYouTubeApi(accessToken: string): Promise
     if (!listRes.ok) {
       const errorText: string = await listRes.text();
       console.warn(`YouTube API playlists.list failed [${listRes.status}]:`, errorText);
-      throw new Error(`YouTube API error: ${listRes.status}`);
+      break;
     }
 
     const listData: any = await listRes.json();
     if (Array.isArray(listData.items)) {
-      rawPlaylists.push(...listData.items);
+      for (const item of listData.items) {
+        if (item?.id) rawPlaylistsMap.set(item.id, item);
+      }
     }
     pageToken = listData.nextPageToken || undefined;
     if (!pageToken) break;
   }
 
+  // 1B. Fetch playlists directly from channel UCdimJysdxd2Hu9YmlVHB98A with pagination
+  try {
+    let chanPageToken: string | undefined = undefined;
+    while (true) {
+      const pageParam: string = chanPageToken ? `&pageToken=${encodeURIComponent(chanPageToken)}` : '';
+      const chanUrl: string = `https://www.googleapis.com/youtube/v3/playlists?part=snippet,contentDetails,status&channelId=UCdimJysdxd2Hu9YmlVHB98A&maxResults=50${pageParam}`;
+      const chanRes: Response = await fetch(chanUrl, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Accept: 'application/json',
+        },
+      });
+
+      if (!chanRes.ok) break;
+
+      const chanData: any = await chanRes.json();
+      if (Array.isArray(chanData.items)) {
+        for (const item of chanData.items) {
+          if (item?.id && !rawPlaylistsMap.has(item.id)) {
+            rawPlaylistsMap.set(item.id, item);
+          }
+        }
+      }
+      chanPageToken = chanData.nextPageToken || undefined;
+      if (!chanPageToken) break;
+    }
+  } catch (chanErr) {
+    console.warn('Channel playlists fetch notice:', chanErr);
+  }
+
+  const rawPlaylists = Array.from(rawPlaylistsMap.values());
   if (rawPlaylists.length === 0) {
     return [];
   }
@@ -265,33 +300,9 @@ export async function fetchDynamicYouTubePlaylists(options?: {
   const force = Boolean(options?.force);
   const token = getGoogleOAuthToken();
 
-  // 1. Query centralized backend endpoint
-  try {
-    const headers: Record<string, string> = { Accept: 'application/json' };
-    if (token) {
-      headers['Authorization'] = `Bearer ${token}`;
-    }
-
-    const serverUrl = `/api/youtube-playlists?_t=${Date.now()}${force ? '&force=true' : ''}`;
-    const serverRes = await fetch(serverUrl, { headers });
-
-    if (serverRes.ok) {
-      const serverPlaylists = await serverRes.json();
-      if (Array.isArray(serverPlaylists) && serverPlaylists.length > 0) {
-        return {
-          playlists: serverPlaylists,
-          source: 'server',
-          reauthRequired: false,
-          error: null,
-        };
-      }
-    }
-  } catch (serverErr) {
-    console.warn('Error fetching playlists from /api/youtube-playlists:', serverErr);
-  }
-
-  // 2. Direct client fallback ONLY if token exists and server was unreachable
-  if (token) {
+  // 1. If force=true and client holds an active OAuth token:
+  // Directly sync with live YouTube Data API from the browser to immediately capture newly created playlists
+  if (force && token) {
     try {
       const directPlaylists = await fetchPlaylistsFromYouTubeApi(token);
       if (directPlaylists.length > 0) {
@@ -305,6 +316,7 @@ export async function fetchDynamicYouTubePlaylists(options?: {
     } catch (apiErr: any) {
       const errMsg = apiErr?.message || '';
       if (errMsg.includes('AUTH_EXPIRED') || errMsg.includes('401')) {
+        setGoogleOAuthToken(null);
         return {
           playlists: DEFAULT_CURATED_PLAYLISTS,
           reauthRequired: true,
@@ -312,14 +324,67 @@ export async function fetchDynamicYouTubePlaylists(options?: {
           source: 'fallback',
         };
       }
-      console.warn('Direct YouTube API fetch notice:', apiErr);
+      console.warn('Direct YouTube API fetch notice on force refresh:', apiErr);
     }
   }
 
-  // 3. Fallback to default authentic channel playlists without demanding student auth
+  // 2. Query centralized backend endpoint
+  try {
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const serverUrl = `/api/youtube-playlists?_t=${Date.now()}${force ? '&force=true' : ''}`;
+    const serverRes = await fetch(serverUrl, { headers });
+
+    if (serverRes.ok) {
+      const serverPlaylists = await serverRes.json();
+      const upstreamSuccessHeader = serverRes.headers.get('X-Upstream-Success');
+      const catalogSourceHeader = (serverRes.headers.get('X-Catalog-Source') || 'server') as 'api' | 'server' | 'cache' | 'fallback';
+      const upstreamErrorHeader = serverRes.headers.get('X-Upstream-Error');
+
+      // If user explicitly forced a refresh, but upstream sync failed, signal failure
+      if (force && upstreamSuccessHeader === 'false') {
+        const isAuthIssue = upstreamErrorHeader === 'AUTH_EXPIRED' || upstreamErrorHeader === 'NO_AUTH_TOKEN';
+        return {
+          playlists: Array.isArray(serverPlaylists) && serverPlaylists.length > 0 ? serverPlaylists : DEFAULT_CURATED_PLAYLISTS,
+          source: 'fallback',
+          reauthRequired: isAuthIssue,
+          error: isAuthIssue
+            ? 'Sessão do YouTube da conta institucional desconectada. Conecte adm.itissimple@gmail.com para atualizar o catálogo.'
+            : 'Falha ao sincronizar com a API do YouTube na origem. Catálogo preservado.',
+        };
+      }
+
+      if (Array.isArray(serverPlaylists) && serverPlaylists.length > 0) {
+        return {
+          playlists: serverPlaylists,
+          source: catalogSourceHeader,
+          reauthRequired: false,
+          error: null,
+        };
+      }
+    }
+  } catch (serverErr) {
+    console.warn('Error fetching playlists from /api/youtube-playlists:', serverErr);
+  }
+
+  // 3. Fallback when forced but no token is present
+  if (force && !token) {
+    return {
+      playlists: DEFAULT_CURATED_PLAYLISTS,
+      reauthRequired: true,
+      error: 'Conta do YouTube não conectada. Conecte adm.itissimple@gmail.com para sincronizar playlists.',
+      source: 'fallback',
+    };
+  }
+
+  // 4. Default baseline for initial non-forced load
   return {
     playlists: DEFAULT_CURATED_PLAYLISTS,
     reauthRequired: false,
     source: 'fallback',
+    error: null,
   };
 }

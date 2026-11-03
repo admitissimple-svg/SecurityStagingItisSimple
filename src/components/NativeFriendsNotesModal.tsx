@@ -80,6 +80,94 @@ const inFlightVocabSyncPromises = new Map<string, Promise<StudentDictionaryEntry
 // Completed synchronization keys for canonical UID + session key + content hash to prevent redundant background syncs
 const completedVocabSyncKeys = new Set<string>();
 
+/**
+ * Extracts real lesson date and timestamp strictly distinguished from analysis creation/update dates.
+ * Never uses updatedAt or createdAt to simulate or override actual lesson timing.
+ */
+export function extractRealLessonDateAndTimestamp(item: {
+  sessionDate?: string;
+  startDateTime?: string;
+  dateStr?: string;
+  id?: string;
+  key?: string;
+}): { timestamp: number; dateStr: string } {
+  // 1. Exact startDateTime with hour/minute
+  if (item.startDateTime && typeof item.startDateTime === 'string') {
+    const t = new Date(item.startDateTime).getTime();
+    if (!isNaN(t) && t > 0) {
+      const datePart = item.startDateTime.includes('T') ? item.startDateTime.split('T')[0] : '';
+      return { timestamp: t, dateStr: item.sessionDate || datePart || item.dateStr || '' };
+    }
+  }
+
+  // 2. sessionDate or dateStr formatted as YYYY-MM-DD
+  const candidate = item.sessionDate || item.dateStr || '';
+  const match = typeof candidate === 'string' ? candidate.match(/\d{4}-\d{2}-\d{2}/) : null;
+  if (match) {
+    const t = new Date(match[0] + 'T00:00:00Z').getTime();
+    if (!isNaN(t) && t > 0) {
+      return { timestamp: t, dateStr: match[0] };
+    }
+  }
+
+  // 3. Fallback: extract date from session key / doc ID (e.g. session_2026-10-25_...)
+  const keyCandidate = item.key || item.id || '';
+  const keyMatch = typeof keyCandidate === 'string' ? keyCandidate.match(/\d{4}-\d{2}-\d{2}/) : null;
+  if (keyMatch) {
+    const t = new Date(keyMatch[0] + 'T00:00:00Z').getTime();
+    if (!isNaN(t) && t > 0) {
+      return { timestamp: t, dateStr: keyMatch[0] };
+    }
+  }
+
+  return { timestamp: 0, dateStr: candidate || 'Recent Session' };
+}
+
+/**
+ * Merges session options deduplicating strictly by lessonId and key to avoid split / duplicate records.
+ */
+function mergeSessionOption(
+  map: Map<string, SessionOption>,
+  newItem: SessionOption
+) {
+  let existingKey: string | null = null;
+  if (map.has(newItem.key)) {
+    existingKey = newItem.key;
+  } else if (newItem.lessonId) {
+    const cleanNew = newItem.lessonId.replace(/^lesson_/, '');
+    for (const [k, v] of map.entries()) {
+      if (v.lessonId) {
+        const cleanExisting = v.lessonId.replace(/^lesson_/, '');
+        if (cleanNew === cleanExisting) {
+          existingKey = k;
+          break;
+        }
+      }
+    }
+  }
+
+  if (existingKey) {
+    const existing = map.get(existingKey)!;
+    const bestTimestamp = Math.max(existing.timestamp || 0, newItem.timestamp || 0);
+    const bestContent = (newItem.rawContent?.length || 0) > (existing.rawContent?.length || 0)
+      ? newItem.rawContent
+      : existing.rawContent;
+    const bestDateStr = (newItem.dateStr && /\d{4}-\d{2}-\d{2}/.test(newItem.dateStr))
+      ? newItem.dateStr
+      : existing.dateStr;
+
+    map.set(existingKey, {
+      ...existing,
+      lessonId: existing.lessonId || newItem.lessonId,
+      dateStr: bestDateStr,
+      rawContent: bestContent,
+      timestamp: bestTimestamp,
+    });
+  } else {
+    map.set(newItem.key, newItem);
+  }
+}
+
 export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = ({
   isOpen,
   onClose,
@@ -164,6 +252,7 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
   const [sessionOptions, setSessionOptions] = useState<SessionOption[]>([]);
   const [selectedSessionKey, setSelectedSessionKey] = useState<string>('');
   const [isLoadingSessions, setIsLoadingSessions] = useState<boolean>(true);
+  const isFreshOpenRef = useRef<boolean>(true);
 
   const [isSyncingVocab, setIsSyncingVocab] = useState<boolean>(false);
   const [vocabSyncError, setVocabSyncError] = useState<string | null>(null);
@@ -214,13 +303,18 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
     }
   }, [activeTab, TABS_ORDER]);
 
+  const handleClose = useCallback(() => {
+    isFreshOpenRef.current = true;
+    onClose();
+  }, [onClose]);
+
   const handleMarkAsRead = useCallback(() => {
     if (onAdvanceSequentialStep) {
       onAdvanceSequentialStep();
     }
     // Only close the panel without directing to the next activity (1 tab per day)
-    onClose();
-  }, [onAdvanceSequentialStep, onClose]);
+    handleClose();
+  }, [onAdvanceSequentialStep, handleClose]);
 
   // Load and consolidate sessions for this isolated student (sorted strictly descending: newest first)
   const fetchStudentSessions = useCallback(async () => {
@@ -235,15 +329,17 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
     const sessionsMap = new Map<string, SessionOption>();
 
     try {
-      // 1. In-memory / passed lessons strictly matching authenticated student canonical UID
+      // 1. In-memory / passed lessons strictly matching authenticated student canonical UID or email
       if (Array.isArray(lessons)) {
         lessons.forEach((l) => {
           if (!l) return;
           const lStudentUid = l.studentUid || (l as any)?.studentId || '';
+          const lStudentEmail = (l.studentEmail || (l as any)?.email || '').toLowerCase().trim();
 
           const matchesUid = resolvedUid && lStudentUid && lStudentUid === resolvedUid;
+          const matchesEmail = resolvedEmail && lStudentEmail && lStudentEmail === resolvedEmail;
 
-          if (matchesUid) {
+          if (matchesUid || matchesEmail) {
             const raw =
               l.sessionNotesDocument ||
               l.liveNotes ||
@@ -253,18 +349,17 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                 : '');
 
             if (raw && raw.trim()) {
-              const datePart =
-                l.sessionDate ||
-                (l.startDateTime && typeof l.startDateTime === 'string'
-                  ? l.startDateTime.split('T')[0]
-                  : '');
-              const timestamp = l.startDateTime ? new Date(l.startDateTime).getTime() : 0;
-              const key = l.id || `lesson_${datePart}`;
+              const { timestamp, dateStr } = extractRealLessonDateAndTimestamp({
+                sessionDate: l.sessionDate,
+                startDateTime: l.startDateTime,
+                id: l.id,
+              });
+              const key = l.id || (dateStr ? `lesson_${dateStr}` : 'recent_session');
 
-              sessionsMap.set(key, {
+              mergeSessionOption(sessionsMap, {
                 key,
                 lessonId: l.id,
-                dateStr: datePart || 'Recent Session',
+                dateStr: dateStr || 'Recent Session',
                 topic: l.title || 'Conversation & Fluency',
                 teacherName: l.teacherName || (l as any)?.tutorName || 'Native Friend',
                 rawContent: raw,
@@ -283,14 +378,19 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
         const snap = await getDocs(userNotesCol);
         const docs: SessionOption[] = [];
         snap.forEach((docSnap) => {
+          if (docSnap.id === 'review_cycle') return;
           const data = docSnap.data();
           if (data && data.content && data.content.trim()) {
-            const dateStr = data.sessionDate || docSnap.id.replace('session_', '').slice(0, 10);
-            const timestamp = new Date(dateStr || data.updatedAt || 0).getTime();
+            const { timestamp, dateStr } = extractRealLessonDateAndTimestamp({
+              sessionDate: data.sessionDate,
+              startDateTime: data.startDateTime,
+              id: docSnap.id,
+              key: docSnap.id,
+            });
             docs.push({
               key: docSnap.id,
               lessonId: data.lessonId,
-              dateStr,
+              dateStr: dateStr || 'Session',
               topic: data.topic || 'In-Session Coaching',
               teacherName: data.teacherName || 'Native Friend',
               rawContent: data.content,
@@ -305,6 +405,7 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
         if (!resolvedUid) return [];
         const queryParams = new URLSearchParams();
         queryParams.set('studentUid', resolvedUid);
+        if (resolvedEmail) queryParams.set('studentEmail', resolvedEmail);
 
         const res = await fetch(`/api/session-notes?${queryParams.toString()}`);
         if (!res.ok) {
@@ -315,12 +416,17 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
         if (Array.isArray(serverNotes)) {
           serverNotes.forEach((n: any) => {
             if (n && n.content && n.content.trim()) {
-              const key = n.id || `session_${n.sessionDate}`;
-              const timestamp = new Date(n.sessionDate || n.updatedAt || 0).getTime();
+              const { timestamp, dateStr } = extractRealLessonDateAndTimestamp({
+                sessionDate: n.sessionDate,
+                startDateTime: n.startDateTime,
+                id: n.id,
+                key: n.id,
+              });
+              const key = n.id || (dateStr ? `session_${dateStr}` : 'session');
               docs.push({
                 key,
                 lessonId: n.lessonId,
-                dateStr: n.sessionDate || 'Session',
+                dateStr: dateStr || 'Session',
                 topic: n.topic || 'In-Session Notes',
                 teacherName: n.teacherName || 'Native Friend',
                 rawContent: n.content,
@@ -337,9 +443,7 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
       // Process Firestore results first (preserving priority/deduplication order)
       if (firestoreResult.status === 'fulfilled') {
         firestoreResult.value.forEach((item) => {
-          if (!sessionsMap.has(item.key)) {
-            sessionsMap.set(item.key, item);
-          }
+          mergeSessionOption(sessionsMap, item);
         });
       } else {
         console.warn('NativeFriendsNotes: Firestore /users query notice:', firestoreResult.reason);
@@ -348,29 +452,28 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
       // Process REST API results next
       if (apiResult.status === 'fulfilled') {
         apiResult.value.forEach((item) => {
-          if (!sessionsMap.has(item.key)) {
-            sessionsMap.set(item.key, item);
-          }
+          mergeSessionOption(sessionsMap, item);
         });
       } else {
         console.warn('NativeFriendsNotes: Server notes query notice:', apiResult.reason);
       }
 
-      // 4. Convert to array and sort STRICTLY DESCENDING (newest / most recent first)
+      // 4. Convert to array and sort STRICTLY DESCENDING by real lesson timestamp (newest / most recent first)
       const list = Array.from(sessionsMap.values()).sort((a, b) => {
-        const timeA = a.timestamp || (a.dateStr ? new Date(a.dateStr).getTime() : 0);
-        const timeB = b.timestamp || (b.dateStr ? new Date(b.dateStr).getTime() : 0);
-        return timeB - timeA; // Descending: newest first
+        const timeA = a.timestamp || 0;
+        const timeB = b.timestamp || 0;
+        return timeB - timeA; // Descending: newest real lesson first
       });
 
       setSessionOptions(list);
 
-      // Auto-select the most recent session if not selected yet
+      // Auto-select: When modal freshly opens, or no session is selected yet, or selected session is no longer in list:
+      // Select list[0].key (the newest available lesson)
       if (list.length > 0) {
-        setSelectedSessionKey((prev) => {
-          if (prev && list.some((item) => item.key === prev)) return prev;
-          return list[0].key;
-        });
+        if (isFreshOpenRef.current || !selectedSessionKey || !list.some((item) => item.key === selectedSessionKey)) {
+          setSelectedSessionKey(list[0].key);
+          isFreshOpenRef.current = false;
+        }
       } else {
         setSelectedSessionKey('');
       }
@@ -379,11 +482,12 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
     } finally {
       setIsLoadingSessions(false);
     }
-  }, [resolvedUid, resolvedEmail, lessons]);
+  }, [resolvedUid, resolvedEmail, lessons, hasValidAuth, selectedSessionKey]);
 
   // Load sessions whenever modal opens or student identity changes
   useEffect(() => {
     if (isOpen) {
+      isFreshOpenRef.current = true;
       fetchStudentSessions();
     }
   }, [isOpen, fetchStudentSessions]);
@@ -505,12 +609,23 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
       }
 
       const cacheKey = `${activeSession.key}__${currentLanguage}`;
-      if (!forceRegenerate && sessionNotesModalMemoryCache.has(cacheKey)) {
+      if (forceRegenerate) {
+        sessionNotesModalMemoryCache.delete(cacheKey);
+        if (activeSession.lessonId) {
+          sessionNotesModalMemoryCache.delete(`${activeSession.lessonId}__${currentLanguage}`);
+        }
+      } else if (sessionNotesModalMemoryCache.has(cacheKey)) {
         const cached = sessionNotesModalMemoryCache.get(cacheKey)!;
         setTransformation(cached);
         // Instant visual unlock: notes display immediately from cache
         setIsLoadingTransformation(false);
         // Trigger vocabulary sync asynchronously in background without delaying UI display
+        performVocabularySync(cached, activeSession, false);
+        return;
+      } else if (activeSession.lessonId && sessionNotesModalMemoryCache.has(`${activeSession.lessonId}__${currentLanguage}`)) {
+        const cached = sessionNotesModalMemoryCache.get(`${activeSession.lessonId}__${currentLanguage}`)!;
+        setTransformation(cached);
+        setIsLoadingTransformation(false);
         performVocabularySync(cached, activeSession, false);
         return;
       }
@@ -537,6 +652,12 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
         setTransformation(result);
         if (result && result.isAiGenerated && !result.isProvisional) {
           sessionNotesModalMemoryCache.set(cacheKey, result);
+          if (activeSession.lessonId) {
+            sessionNotesModalMemoryCache.set(`${activeSession.lessonId}__${currentLanguage}`, result);
+          }
+          if (result.sessionKey) {
+            sessionNotesModalMemoryCache.set(`${result.sessionKey}__${currentLanguage}`, result);
+          }
         }
       } catch (err) {
         console.warn('Failed to load pedagogical notes:', err);
@@ -571,6 +692,10 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
     ) {
       // Content has not changed and promptVersion matches; avoid redundant network requests
       return;
+    }
+    // When active session changes, clear previous session's transformation immediately to avoid visual leakage
+    if (lastLoadedSessionRef.current && lastLoadedSessionRef.current.sessionKey !== activeSession.key) {
+      setTransformation(null);
     }
     loadPedagogicalNotes(false).then(() => {
       lastLoadedSessionRef.current = {
@@ -670,7 +795,7 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
 
             <button
               type="button"
-              onClick={onClose}
+              onClick={handleClose}
               className="w-9 h-9 rounded-xl bg-white/10 hover:bg-white/20 text-white flex items-center justify-center transition cursor-pointer border border-white/15"
               aria-label="Close"
             >
@@ -692,7 +817,10 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                 <select
                   id="session-date-selector"
                   value={selectedSessionKey}
-                  onChange={(e) => setSelectedSessionKey(e.target.value)}
+                  onChange={(e) => {
+                    setSelectedSessionKey(e.target.value);
+                    isFreshOpenRef.current = false;
+                  }}
                   className="w-full bg-white border border-[#607EC9]/40 rounded-xl px-3 py-1.5 text-xs font-bold text-[#000035] pr-8 focus:outline-none focus:ring-2 focus:ring-[#1C4C96] cursor-pointer shadow-2xs"
                 >
                   {sessionOptions.map((opt, idx) => (

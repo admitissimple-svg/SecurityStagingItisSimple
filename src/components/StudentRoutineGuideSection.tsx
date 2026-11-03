@@ -224,6 +224,13 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
       const result = await fetchDynamicYouTubePlaylists({ force });
       if (result.playlists && result.playlists.length > 0) {
         setPlaylists(result.playlists);
+      }
+      if (result.reauthRequired || result.error) {
+        setReauthRequired(Boolean(result.reauthRequired));
+        setPlaylistsError(result.error || (isEn ? 'Failed to sync YouTube playlists.' : 'Falha ao sincronizar playlists do YouTube.'));
+      } else {
+        setReauthRequired(false);
+        setPlaylistsError(null);
         if (force) {
           setPlaylistFeedback({
             activityId: selectedActivityId || '',
@@ -234,13 +241,6 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
           });
           setTimeout(() => setPlaylistFeedback(null), 3500);
         }
-      }
-      if (result.reauthRequired) {
-        setReauthRequired(true);
-        if (result.error) setPlaylistsError(result.error);
-      } else {
-        setReauthRequired(false);
-        setPlaylistsError(null);
       }
     } catch (err: any) {
       console.warn('Error fetching playlists for timeline selector:', err);

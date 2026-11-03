@@ -452,7 +452,7 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 
 // In-memory runtime state hydrated exclusively from Cloud Firestore
@@ -8709,8 +8709,9 @@ app.get('/api/session-notes', async (req, res) => {
       const matchUid = studentUid && n.studentUid && n.studentUid === studentUid;
       const matchEmail = studentEmail && (n.studentEmail || '').toLowerCase().trim() === studentEmail;
       if (matchUid || matchEmail) {
-        const key = n.id || n.sessionDate || n.lessonId;
-        if (key) map.set(key, n);
+        const cleanLessonId = n.lessonId ? n.lessonId.replace(/^lesson_/, '') : '';
+        const mapKey = cleanLessonId ? `lesson_${cleanLessonId}` : (n.id || n.sessionDate);
+        if (mapKey) map.set(mapKey, n);
       }
     });
 
@@ -8722,12 +8723,14 @@ app.get('/api/session-notes', async (req, res) => {
         const noteContent = l.sessionNotesDocument || l.liveNotes || l.recommendations || '';
         if ((matchUid || matchEmail) && noteContent && noteContent.trim()) {
           const lDate = l.sessionDate || (l.startDateTime ? l.startDateTime.split('T')[0] : '');
-          const lKey = l.id || `session_${lDate}_${studentEmail}`;
-          if (!map.has(lKey)) {
-            map.set(lKey, {
-              id: lKey,
+          const cleanLessonId = l.id ? l.id.replace(/^lesson_/, '') : '';
+          const mapKey = cleanLessonId ? `lesson_${cleanLessonId}` : (l.id || `session_${lDate}_${studentEmail}`);
+          if (!map.has(mapKey)) {
+            map.set(mapKey, {
+              id: mapKey,
               sessionDate: lDate,
               lessonId: l.id,
+              startDateTime: l.startDateTime,
               studentEmail: l.studentEmail || studentEmail,
               studentUid: l.studentUid || studentUid,
               teacherEmail: l.teacherEmail || l.tutorEmail || '',
@@ -8740,15 +8743,39 @@ app.get('/api/session-notes', async (req, res) => {
               driveLastSyncedAt: l.driveLastSyncedAt,
               updatedAt: l.updatedAt || l.notesLastSavedAt || new Date().toISOString(),
             });
+          } else {
+            const existing = map.get(mapKey);
+            if (l.startDateTime && !existing.startDateTime) {
+              existing.startDateTime = l.startDateTime;
+            }
           }
         }
       });
     }
 
+    const getRealLessonTimestamp = (item: any): number => {
+      if (item?.startDateTime && typeof item.startDateTime === 'string') {
+        const t = new Date(item.startDateTime).getTime();
+        if (!isNaN(t) && t > 0) return t;
+      }
+      const rawDate = item?.sessionDate || item?.lessonDate || '';
+      const match = typeof rawDate === 'string' ? rawDate.match(/\d{4}-\d{2}-\d{2}/) : null;
+      if (match) {
+        const t = new Date(match[0] + 'T00:00:00Z').getTime();
+        if (!isNaN(t) && t > 0) return t;
+      }
+      const idMatch = typeof item?.id === 'string' ? item.id.match(/\d{4}-\d{2}-\d{2}/) : null;
+      if (idMatch) {
+        const t = new Date(idMatch[0] + 'T00:00:00Z').getTime();
+        if (!isNaN(t) && t > 0) return t;
+      }
+      return 0;
+    };
+
     const results = Array.from(map.values()).sort((a: any, b: any) => {
-      const timeA = new Date(a.sessionDate || a.updatedAt || 0).getTime();
-      const timeB = new Date(b.sessionDate || b.updatedAt || 0).getTime();
-      return timeB - timeA; // Descending: newest first
+      const timeA = getRealLessonTimestamp(a);
+      const timeB = getRealLessonTimestamp(b);
+      return timeB - timeA; // Descending: newest real lesson first
     });
 
     if (sessionDate) {
@@ -9741,6 +9768,7 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
 app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
   const db = readDb();
   const sessionKey = (req.query.sessionKey as string) || (req.query.id as string) || '';
+  const queryLessonId = (req.query.lessonId as string) || '';
   const studentUid = (req.query.studentUid as string) || '';
   const language = ((req.query.language as string) || (req.query.lang as string) || '').toLowerCase().trim();
   const contentHash = ((req.query.contentHash as string) || '').trim();
@@ -9752,14 +9780,21 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
     }
   }
 
-  if (sessionKey) {
+  if (sessionKey || queryLessonId) {
     const canonicalKey = getCanonicalSessionKey({
-      lessonId: sessionKey,
+      lessonId: queryLessonId || undefined,
       sessionKey,
       studentUid: caller.uid,
       studentEmail: caller.email,
     });
-    const candidateKeys = Array.from(new Set([sessionKey, canonicalKey, sessionKey.replace(/^session_/, '').replace(/^lesson_/, '')].filter(Boolean)));
+    const candidateKeys = Array.from(new Set([
+      sessionKey,
+      canonicalKey,
+      queryLessonId,
+      queryLessonId ? `lesson_${queryLessonId.replace(/^lesson_/, '')}` : '',
+      queryLessonId ? queryLessonId.replace(/^lesson_/, '') : '',
+      sessionKey ? sessionKey.replace(/^session_/, '').replace(/^lesson_/, '') : '',
+    ].filter(Boolean)));
 
     let transformation: any = null;
     // 1. Check in-memory pedagogicalTransformationsMap across candidate keys
@@ -9767,8 +9802,10 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
       if (db.pedagogicalTransformationsMap?.[key]) {
         const candidate = db.pedagogicalTransformationsMap[key];
         if (candidate && candidate.isAiGenerated && !candidate.isProvisional && !isLegacyGenericTransformation(candidate)) {
-          transformation = candidate;
-          break;
+          if (!contentHash || candidate.contentHash === contentHash) {
+            transformation = candidate;
+            break;
+          }
         }
       }
       const match = Object.entries(db.pedagogicalTransformationsMap || {}).find(([k, v]: [string, any]) => {
@@ -9790,10 +9827,11 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
           const fsMatch = await fetchPedagogicalTransformationFromFirestoreServer(key, { language, contentHash });
           if (fsMatch && fsMatch.isAiGenerated && !fsMatch.isProvisional && !isLegacyGenericTransformation(fsMatch)) {
             transformation = fsMatch;
-            const storeKey = fsMatch.cacheKey || `${sessionKey}__hash_${fsMatch.contentHash || 'any'}__lang_${fsMatch.language || language || 'pt'}`;
+            const storeKey = fsMatch.cacheKey || `${sessionKey || queryLessonId}__hash_${fsMatch.contentHash || 'any'}__lang_${fsMatch.language || language || 'pt'}`;
             if (!db.pedagogicalTransformationsMap) db.pedagogicalTransformationsMap = {};
             db.pedagogicalTransformationsMap[storeKey] = fsMatch;
-            db.pedagogicalTransformationsMap[sessionKey] = fsMatch;
+            if (sessionKey) db.pedagogicalTransformationsMap[sessionKey] = fsMatch;
+            if (queryLessonId) db.pedagogicalTransformationsMap[queryLessonId] = fsMatch;
             break;
           }
         } catch (fsErr) {
@@ -9809,10 +9847,11 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
           const reconstructed = await reconstructTransformationFromJournalAndDictionaryServer(caller.uid, key);
           if (reconstructed && (reconstructed.vocabularyAndExpressions?.length > 0 || reconstructed.mistakesAnalysis?.length > 0 || reconstructed.grammarPoints?.length > 0)) {
             transformation = reconstructed;
-            const storeKey = `${sessionKey}__reconstructed__lang_${language || 'pt'}`;
+            const storeKey = `${sessionKey || queryLessonId}__reconstructed__lang_${language || 'pt'}`;
             if (!db.pedagogicalTransformationsMap) db.pedagogicalTransformationsMap = {};
             db.pedagogicalTransformationsMap[storeKey] = reconstructed;
-            db.pedagogicalTransformationsMap[sessionKey] = reconstructed;
+            if (sessionKey) db.pedagogicalTransformationsMap[sessionKey] = reconstructed;
+            if (queryLessonId) db.pedagogicalTransformationsMap[queryLessonId] = reconstructed;
             break;
           }
         } catch (recErr) {
@@ -9832,6 +9871,9 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
       }
       return res.json(transformation);
     }
+
+    // When a specific session was queried and no transformation exists yet, return null
+    return res.json(null);
   }
 
   if (caller.role === 'student') {
@@ -11908,10 +11950,10 @@ let institutionalYouTubeTokenUpdatedAt = 0;
 async function fetchYouTubePlaylistsFromDataApi(token: string): Promise<any[]> {
   if (!token) return [];
 
-  // 1. Paginate through all playlists owned by the authenticated account (mine=true)
-  const rawPlaylists: any[] = [];
-  let pageToken: string | undefined = undefined;
+  const rawPlaylistsMap = new Map<string, any>();
 
+  // 1A. Paginate through all playlists owned by the authenticated account (mine=true)
+  let pageToken: string | undefined = undefined;
   do {
     const pageParam = pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : '';
     const plUrl = `https://www.googleapis.com/youtube/v3/playlists?part=snippet,contentDetails,status&mine=true&maxResults=50${pageParam}`;
@@ -11934,11 +11976,41 @@ async function fetchYouTubePlaylistsFromDataApi(token: string): Promise<any[]> {
 
     const plData = (await plRes.json()) as any;
     if (Array.isArray(plData.items)) {
-      rawPlaylists.push(...plData.items);
+      for (const item of plData.items) {
+        if (item?.id) rawPlaylistsMap.set(item.id, item);
+      }
     }
     pageToken = plData.nextPageToken || undefined;
   } while (pageToken);
 
+  // 1B. Also paginate through channel playlists for UCdimJysdxd2Hu9YmlVHB98A
+  try {
+    let chanPageToken: string | undefined = undefined;
+    do {
+      const pageParam = chanPageToken ? `&pageToken=${encodeURIComponent(chanPageToken)}` : '';
+      const chanUrl = `https://www.googleapis.com/youtube/v3/playlists?part=snippet,contentDetails,status&channelId=UCdimJysdxd2Hu9YmlVHB98A&maxResults=50${pageParam}`;
+      const chanRes = await fetch(chanUrl, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/json',
+        },
+      });
+      if (!chanRes.ok) break;
+      const chanData = (await chanRes.json()) as any;
+      if (Array.isArray(chanData.items)) {
+        for (const item of chanData.items) {
+          if (item?.id && !rawPlaylistsMap.has(item.id)) {
+            rawPlaylistsMap.set(item.id, item);
+          }
+        }
+      }
+      chanPageToken = chanData.nextPageToken || undefined;
+    } while (chanPageToken);
+  } catch (chanErr) {
+    console.warn('[YouTube Data API] Channel playlists fetch notice:', chanErr);
+  }
+
+  const rawPlaylists = Array.from(rawPlaylistsMap.values());
   if (rawPlaylists.length === 0) return [];
 
   // 2. Paginate through all videos for each playlist
@@ -12178,8 +12250,15 @@ async function fetchPlaylistsDirectlyFromChannel(): Promise<any[]> {
  * - Temporary failures do NOT overwrite existing valid data with fake/empty data (Requirement 9).
  * - Existing student weekly video assignments are NEVER modified by playlist updates (Requirement 10).
  */
-async function syncYouTubePlaylistsFromApi(force = false, oauthToken?: string): Promise<any[]> {
+async function syncYouTubePlaylistsFromApi(force = false, oauthToken?: string): Promise<{
+  playlists: any[];
+  upstreamSuccess: boolean;
+  source: 'api' | 'channel' | 'cache' | 'fallback';
+  error?: string | null;
+}> {
   const db = readDb();
+  let upstreamSuccess = false;
+  let upstreamError: string | null = null;
 
   // 1. Ingest and persist institutional token if provided
   if (oauthToken) {
@@ -12204,7 +12283,12 @@ async function syncYouTubePlaylistsFromApi(force = false, oauthToken?: string): 
     Date.now() - lastYouTubeSyncTime < YOUTUBE_CACHE_TTL_MS;
 
   if (!force && isMemoryFresh) {
-    return db.youtubePlaylists;
+    return {
+      playlists: db.youtubePlaylists,
+      upstreamSuccess: true,
+      source: 'cache',
+      error: null,
+    };
   }
 
   // 3. If NOT force, check Firestore (default) freshness
@@ -12221,7 +12305,12 @@ async function syncYouTubePlaylistsFromApi(force = false, oauthToken?: string): 
             ? new Date(firestoreDoc.updatedAt).getTime()
             : Date.now();
           writeDb(db);
-          return firestoreDoc.playlists;
+          return {
+            playlists: firestoreDoc.playlists,
+            upstreamSuccess: true,
+            source: 'cache',
+            error: null,
+          };
         }
       }
     } catch (e) {
@@ -12235,7 +12324,6 @@ async function syncYouTubePlaylistsFromApi(force = false, oauthToken?: string): 
     institutionalYouTubeToken ||
     process.env.YOUTUBE_TOKEN ||
     process.env.GOOGLE_ACCESS_TOKEN ||
-    (await getPlatformGoogleAccessToken()) ||
     undefined;
 
   let freshPlaylists: any[] = [];
@@ -12244,18 +12332,29 @@ async function syncYouTubePlaylistsFromApi(force = false, oauthToken?: string): 
   if (effectiveToken) {
     try {
       freshPlaylists = await fetchYouTubePlaylistsFromDataApi(effectiveToken);
+      if (freshPlaylists.length > 0) {
+        upstreamSuccess = true;
+      }
     } catch (err: any) {
       console.warn('[YouTube Sync] Data API sync notice:', err?.message || err);
       if (String(err?.message || '').includes('AUTH_EXPIRED') || String(err?.message || '').includes('401')) {
         institutionalYouTubeToken = null;
+        upstreamError = 'AUTH_EXPIRED';
+      } else {
+        upstreamError = 'UPSTREAM_API_ERROR';
       }
     }
+  } else {
+    upstreamError = 'NO_AUTH_TOKEN';
   }
 
   // 4B. If Data API didn't produce items, use public channel scraper
   if (freshPlaylists.length === 0) {
     try {
       freshPlaylists = await fetchPlaylistsDirectlyFromChannel();
+      if (freshPlaylists.length > 0) {
+        upstreamSuccess = true;
+      }
     } catch (err) {
       console.warn('[YouTube Sync] Channel fetch error:', err);
     }
@@ -12263,28 +12362,44 @@ async function syncYouTubePlaylistsFromApi(force = false, oauthToken?: string): 
 
   // 4C. If fresh sync succeeded, persist to in-memory DB and Firestore (default)
   if (freshPlaylists.length > 0) {
-    // Merge any missing video lists from previous valid state if scraper only found playlist headers
+    // Merge fresh playlists with existing valid catalog so newly added or authenticated playlists are not dropped
+    const playlistMap = new Map<string, any>();
     if (db.youtubePlaylists && Array.isArray(db.youtubePlaylists)) {
-      freshPlaylists = freshPlaylists.map((freshPl) => {
-        if (!freshPl.videos || freshPl.videos.length === 0) {
-          const prev = db.youtubePlaylists.find((p: any) => p.id === freshPl.id);
-          if (prev?.videos?.length) {
-            return { ...freshPl, videos: prev.videos, itemCount: prev.videos.length };
-          }
-        }
-        return freshPl;
+      for (const p of db.youtubePlaylists) {
+        if (p?.id) playlistMap.set(p.id, p);
+      }
+    }
+
+    for (const freshPl of freshPlaylists) {
+      if (!freshPl?.id) continue;
+      const prev = playlistMap.get(freshPl.id);
+      if ((!freshPl.videos || freshPl.videos.length === 0) && prev?.videos?.length) {
+        freshPl.videos = prev.videos;
+        freshPl.itemCount = prev.videos.length;
+      }
+      playlistMap.set(freshPl.id, {
+        ...prev,
+        ...freshPl,
+        videos: freshPl.videos?.length ? freshPl.videos : (prev?.videos || []),
+        itemCount: freshPl.videos?.length || prev?.itemCount || 0,
       });
     }
 
-    db.youtubePlaylists = freshPlaylists;
+    const mergedPlaylists = Array.from(playlistMap.values());
+    db.youtubePlaylists = mergedPlaylists;
     writeDb(db);
     lastYouTubeSyncTime = Date.now();
-    saveYouTubePlaylistsToFirestore(freshPlaylists).catch((err) => {
+    saveYouTubePlaylistsToFirestore(mergedPlaylists).catch((err) => {
       if (!isPermissionError(err)) {
         console.warn('Firestore saveYouTubePlaylists error:', err);
       }
     });
-    return freshPlaylists;
+    return {
+      playlists: mergedPlaylists,
+      upstreamSuccess: true,
+      source: effectiveToken ? 'api' : 'channel',
+      error: null,
+    };
   }
 
   // 4D. Temporary upstream failure: Preserve last valid catalog (Requirement 9)
@@ -12296,7 +12411,12 @@ async function syncYouTubePlaylistsFromApi(force = false, oauthToken?: string): 
     if (Array.isArray(persisted) && persisted.length > 0) {
       db.youtubePlaylists = persisted;
       writeDb(db);
-      return persisted;
+      return {
+        playlists: persisted,
+        upstreamSuccess: false,
+        source: 'fallback',
+        error: upstreamError || 'UPSTREAM_FAILED',
+      };
     }
   } catch (err) {
     console.warn('[YouTube Sync] Fallback Firestore read notice:', err);
@@ -12304,11 +12424,21 @@ async function syncYouTubePlaylistsFromApi(force = false, oauthToken?: string): 
 
   // Next preserve in-memory catalog
   if (Array.isArray(db.youtubePlaylists) && db.youtubePlaylists.length > 0) {
-    return db.youtubePlaylists;
+    return {
+      playlists: db.youtubePlaylists,
+      upstreamSuccess: false,
+      source: 'fallback',
+      error: upstreamError || 'UPSTREAM_FAILED',
+    };
   }
 
   // Absolute fallback: authentic curated playlists baseline (never fake data)
-  return DEFAULT_CURATED_PLAYLISTS;
+  return {
+    playlists: DEFAULT_CURATED_PLAYLISTS,
+    upstreamSuccess: false,
+    source: 'fallback',
+    error: upstreamError || 'UPSTREAM_FAILED',
+  };
 }
 
 // Automatically detect new playlists and videos added to the YouTube channel every 15 minutes
@@ -12360,12 +12490,17 @@ app.get('/api/youtube-playlists', async (req, res) => {
   const force = req.query.refresh === 'true' || req.query.force === 'true';
   const authHeader = req.headers.authorization || '';
   const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.substring(7).trim() : undefined;
-  const playlists = await syncYouTubePlaylistsFromApi(force, bearerToken);
+  const { playlists, upstreamSuccess, source, error } = await syncYouTubePlaylistsFromApi(force, bearerToken);
   const sortedPlaylists = [...playlists].sort((a, b) =>
     (a.title || '').localeCompare(b.title || '', undefined, { sensitivity: 'base' })
   );
   // Never expose tokens or administrative details to students
-  res.setHeader('Cache-Control', 'public, max-age=300');
+  res.setHeader('Cache-Control', force ? 'no-cache, no-store, must-revalidate' : 'public, max-age=300');
+  res.setHeader('X-Upstream-Success', String(upstreamSuccess));
+  res.setHeader('X-Catalog-Source', source);
+  if (error) {
+    res.setHeader('X-Upstream-Error', error);
+  }
   res.json(sortedPlaylists);
 });
 
@@ -12374,8 +12509,8 @@ app.post('/api/youtube-playlists/sync', async (req, res) => {
   const bearerToken =
     (authHeader.startsWith('Bearer ') ? authHeader.substring(7).trim() : undefined) ||
     req.body?.token;
-  const playlists = await syncYouTubePlaylistsFromApi(true, bearerToken);
-  res.json({ success: true, count: playlists.length, playlists });
+  const { playlists, upstreamSuccess, source, error } = await syncYouTubePlaylistsFromApi(true, bearerToken);
+  res.json({ success: upstreamSuccess, count: playlists.length, playlists, source, error });
 });
 
 app.post('/api/youtube-playlists/authorize', async (req, res) => {
@@ -12386,8 +12521,8 @@ app.post('/api/youtube-playlists/authorize', async (req, res) => {
   if (!token) {
     return res.status(400).json({ error: 'OAuth token is required for YouTube authorization' });
   }
-  const playlists = await syncYouTubePlaylistsFromApi(true, token);
-  res.json({ success: true, count: playlists.length, playlists });
+  const { playlists, upstreamSuccess, source, error } = await syncYouTubePlaylistsFromApi(true, token);
+  res.json({ success: upstreamSuccess, count: playlists.length, playlists, source, error });
 });
 
 app.post('/api/youtube-playlists/save', async (req, res) => {

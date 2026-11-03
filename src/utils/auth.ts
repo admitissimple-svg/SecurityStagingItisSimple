@@ -13,11 +13,30 @@ let inMemoryToken: string | null = null;
 let inMemoryGoogleAccessToken: string | null = null;
 
 export function getGoogleOAuthToken(): string | null {
-  return inMemoryGoogleAccessToken;
+  if (inMemoryGoogleAccessToken) return inMemoryGoogleAccessToken;
+  try {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      const stored = window.sessionStorage.getItem('google_oauth_token');
+      if (stored && stored.trim().length > 10) {
+        inMemoryGoogleAccessToken = stored.trim();
+        return inMemoryGoogleAccessToken;
+      }
+    }
+  } catch {}
+  return null;
 }
 
 export function setGoogleOAuthToken(token: string | null) {
   inMemoryGoogleAccessToken = token;
+  try {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      if (token && token.trim().length > 10) {
+        window.sessionStorage.setItem('google_oauth_token', token.trim());
+      } else {
+        window.sessionStorage.removeItem('google_oauth_token');
+      }
+    }
+  } catch {}
 }
 
 /**
@@ -350,6 +369,7 @@ export async function firebaseSignUpWithEmail(email: string, pass: string): Prom
  */
 export async function firebaseSignOut(): Promise<void> {
   inMemoryToken = null;
+  setGoogleOAuthToken(null);
   await firebaseAuthSignOut(auth).catch(() => null);
 }
 

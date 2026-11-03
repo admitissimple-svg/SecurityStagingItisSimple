@@ -1013,7 +1013,7 @@ export async function fetchPedagogicalTransformation(params: {
     // Security Hotfix (Etapa 2 & FASE 4B.9): If not an explicit regeneration, check server cache first!
     if (!forceRegenerate && effectiveKey) {
       try {
-        const cacheUrl = `/api/pedagogical-notes?sessionKey=${encodeURIComponent(effectiveKey)}&language=${encodeURIComponent(language)}&contentHash=${encodeURIComponent(contentHash)}${effectiveUid ? `&studentUid=${encodeURIComponent(effectiveUid)}` : ''}`;
+        const cacheUrl = `/api/pedagogical-notes?sessionKey=${encodeURIComponent(effectiveKey)}&language=${encodeURIComponent(language)}&contentHash=${encodeURIComponent(contentHash)}${lessonId ? `&lessonId=${encodeURIComponent(lessonId)}` : ''}${effectiveUid ? `&studentUid=${encodeURIComponent(effectiveUid)}` : ''}`;
         const cacheRes = await fetch(cacheUrl, { headers });
 
         if (cacheRes.status === 401 || cacheRes.status === 403) {

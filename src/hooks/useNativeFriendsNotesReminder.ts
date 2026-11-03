@@ -53,6 +53,42 @@ export interface UseNativeFriendsNotesReminderParams {
   simulatedTodayDate?: string;
 }
 
+function extractRealLessonDateAndTimestamp(item: {
+  sessionDate?: string;
+  startDateTime?: string;
+  dateStr?: string;
+  id?: string;
+  key?: string;
+}): { timestamp: number; dateStr: string } {
+  if (item.startDateTime && typeof item.startDateTime === 'string') {
+    const t = new Date(item.startDateTime).getTime();
+    if (!isNaN(t) && t > 0) {
+      const datePart = item.startDateTime.includes('T') ? item.startDateTime.split('T')[0] : '';
+      return { timestamp: t, dateStr: item.sessionDate || datePart || item.dateStr || '' };
+    }
+  }
+
+  const candidate = item.sessionDate || item.dateStr || '';
+  const match = typeof candidate === 'string' ? candidate.match(/\d{4}-\d{2}-\d{2}/) : null;
+  if (match) {
+    const t = new Date(match[0] + 'T00:00:00Z').getTime();
+    if (!isNaN(t) && t > 0) {
+      return { timestamp: t, dateStr: match[0] };
+    }
+  }
+
+  const keyCandidate = item.key || item.id || '';
+  const keyMatch = typeof keyCandidate === 'string' ? keyCandidate.match(/\d{4}-\d{2}-\d{2}/) : null;
+  if (keyMatch) {
+    const t = new Date(keyMatch[0] + 'T00:00:00Z').getTime();
+    if (!isNaN(t) && t > 0) {
+      return { timestamp: t, dateStr: keyMatch[0] };
+    }
+  }
+
+  return { timestamp: 0, dateStr: candidate || 'Recent Session' };
+}
+
 export function useNativeFriendsNotesReminder({
   studentUid,
   studentEmail,
@@ -122,18 +158,17 @@ export function useNativeFriendsNotesReminder({
                 : '');
 
             if (raw && raw.trim()) {
-              const datePart =
-                l.sessionDate ||
-                (l.startDateTime && typeof l.startDateTime === 'string'
-                  ? l.startDateTime.split('T')[0]
-                  : '');
-              const timestamp = l.startDateTime ? new Date(l.startDateTime).getTime() : 0;
+              const { timestamp, dateStr } = extractRealLessonDateAndTimestamp({
+                sessionDate: l.sessionDate,
+                startDateTime: l.startDateTime,
+                id: l.id,
+              });
               const key = l.id || `lesson_${datePart}`;
 
               sessionsMap.set(key, {
                 key,
                 lessonId: l.id,
-                dateStr: datePart || 'Recent Session',
+                dateStr: dateStr || 'Recent Session',
                 topic: l.title || 'Conversation & Fluency',
                 teacherName: l.teacherName || (l as any)?.tutorName || 'Native Friend',
                 rawContent: raw,
@@ -154,14 +189,18 @@ export function useNativeFriendsNotesReminder({
             if (docSnap.id === 'review_cycle') return; // Skip internal cycle document
             const data = docSnap.data();
             if (data && data.content && data.content.trim()) {
-              const dateStr = data.sessionDate || docSnap.id.replace('session_', '').slice(0, 10);
-              const timestamp = new Date(dateStr || data.updatedAt || 0).getTime();
+              const { timestamp, dateStr } = extractRealLessonDateAndTimestamp({
+                sessionDate: data.sessionDate,
+                startDateTime: data.startDateTime,
+                id: docSnap.id,
+                key: docSnap.id,
+              });
               const key = docSnap.id;
               if (!sessionsMap.has(key)) {
                 sessionsMap.set(key, {
                   key,
                   lessonId: data.lessonId,
-                  dateStr,
+                  dateStr: dateStr || 'Session',
                   topic: data.topic || 'In-Session Coaching',
                   teacherName: data.teacherName || 'Native Friend',
                   rawContent: data.content,
@@ -187,13 +226,18 @@ export function useNativeFriendsNotesReminder({
           if (Array.isArray(serverNotes)) {
             serverNotes.forEach((n: any) => {
               if (n && n.content && n.content.trim()) {
-                const key = n.id || `session_${n.sessionDate}`;
-                const timestamp = new Date(n.sessionDate || n.updatedAt || 0).getTime();
+                const { timestamp, dateStr } = extractRealLessonDateAndTimestamp({
+                  sessionDate: n.sessionDate,
+                  startDateTime: n.startDateTime,
+                  id: n.id,
+                  key: n.id,
+                });
+                const key = n.id || (dateStr ? `session_${dateStr}` : 'session');
                 if (!sessionsMap.has(key)) {
                   sessionsMap.set(key, {
                     key,
                     lessonId: n.lessonId,
-                    dateStr: n.sessionDate || 'Session',
+                    dateStr: dateStr || 'Session',
                     topic: n.topic || 'In-Session Notes',
                     teacherName: n.teacherName || 'Native Friend',
                     rawContent: n.content,
@@ -208,10 +252,10 @@ export function useNativeFriendsNotesReminder({
         console.warn('useNativeFriendsNotesReminder: Server API notice:', apiErr);
       }
 
-      // Sort strictly descending: newest first
+      // Sort strictly descending: newest real lesson first
       const sorted = Array.from(sessionsMap.values()).sort((a, b) => {
-        const timeA = a.timestamp || (a.dateStr ? new Date(a.dateStr).getTime() : 0);
-        const timeB = b.timestamp || (b.dateStr ? new Date(b.dateStr).getTime() : 0);
+        const timeA = a.timestamp || 0;
+        const timeB = b.timestamp || 0;
         return timeB - timeA;
       });
 
