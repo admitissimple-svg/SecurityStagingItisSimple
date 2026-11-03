@@ -3109,7 +3109,8 @@ export async function saveStudentWeeklyChecksToFirestore(
   studentEmail?: string,
   weeklyNativeLessonsTarget?: number,
   weeklyStudyDaysTarget?: number,
-  week?: string | number | null
+  week?: string | number | null,
+  isNewWeekReset?: boolean
 ): Promise<boolean> {
   const db = getDb();
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
@@ -3117,6 +3118,12 @@ export async function saveStudentWeeklyChecksToFirestore(
 
   try {
     const sanitizedChecks: Record<string, boolean> = JSON.parse(JSON.stringify(checks || {}));
+
+    const isChecksEmpty = Object.keys(sanitizedChecks).length === 0;
+    if (isChecksEmpty && !isNewWeekReset) {
+      // Guard against race conditions and empty overwrites: do not wipe persisted checks without explicit new week reset
+      return true;
+    }
 
     let targetWeekId = normalizeWeekId(week);
     let targetCycle = parseWeekCycleNumber(week);
@@ -3143,50 +3150,56 @@ export async function saveStudentWeeklyChecksToFirestore(
 
     // In-memory cache fallback as baseline
     const localCached = getCachedWeeklyChecks(cleanUid, cleanEmail, targetWeekId);
-    let existingWeekChecks: Record<string, boolean> = { ...localCached };
-    let mergedChecks: Record<string, boolean> = {
-      ...existingWeekChecks,
-      ...sanitizedChecks,
-    };
+    let existingWeekChecks: Record<string, boolean> = isNewWeekReset ? {} : { ...localCached };
+    let mergedChecks: Record<string, boolean> = isNewWeekReset
+      ? sanitizedChecks
+      : {
+          ...existingWeekChecks,
+          ...sanitizedChecks,
+        };
 
     if (db && cleanUid) {
       const weekDocRef = doc(db, 'users', cleanUid, 'weeklyChecks', targetWeekId);
 
       // Fetch existing checks for THIS WEEK ONLY to prevent previous weeks from being merged
-      try {
-        const weekSnap = await withFirestoreTimeout(getDoc(weekDocRef), 2000, null);
-        if (weekSnap && weekSnap.exists()) {
-          const wData = weekSnap.data();
-          existingWeekChecks = {
-            ...existingWeekChecks,
-            ...(wData?.checks || {}),
-            ...(wData?.weeklyChecks || {}),
-            ...(wData?.sPathChecks || {}),
-          };
-        } else if (targetCycle === 1) {
-          // Backward compatibility for Week 1 only when no week-1 document exists yet
-          const userRef = doc(db, 'users', cleanUid);
-          const uSnap = await withFirestoreTimeout(getDoc(userRef), 2000, null);
-          if (uSnap && uSnap.exists()) {
-            const uData = uSnap.data();
+      if (!isNewWeekReset) {
+        try {
+          const weekSnap = await withFirestoreTimeout(getDoc(weekDocRef), 2000, null);
+          if (weekSnap && weekSnap.exists()) {
+            const wData = weekSnap.data();
             existingWeekChecks = {
               ...existingWeekChecks,
-              ...(uData?.weeklyChecks || {}),
-              ...(uData?.sPathChecks || {}),
+              ...(wData?.checks || {}),
+              ...(wData?.weeklyChecks || {}),
+              ...(wData?.sPathChecks || {}),
             };
-            if (uData?.weeklyHomework?.completedPartsByDay) {
-              Object.entries(uData.weeklyHomework.completedPartsByDay).forEach(([day, isDone]) => {
-                if (isDone) existingWeekChecks[`memorization_${day}`] = true;
-              });
+          } else if (targetCycle === 1) {
+            // Backward compatibility for Week 1 only when no week-1 document exists yet
+            const userRef = doc(db, 'users', cleanUid);
+            const uSnap = await withFirestoreTimeout(getDoc(userRef), 2000, null);
+            if (uSnap && uSnap.exists()) {
+              const uData = uSnap.data();
+              existingWeekChecks = {
+                ...existingWeekChecks,
+                ...(uData?.weeklyChecks || {}),
+                ...(uData?.sPathChecks || {}),
+              };
+              if (uData?.weeklyHomework?.completedPartsByDay) {
+                Object.entries(uData.weeklyHomework.completedPartsByDay).forEach(([day, isDone]) => {
+                  if (isDone) existingWeekChecks[`memorization_${day}`] = true;
+                });
+              }
             }
           }
-        }
-      } catch {}
+        } catch {}
+      }
 
-      mergedChecks = {
-        ...existingWeekChecks,
-        ...sanitizedChecks,
-      };
+      mergedChecks = isNewWeekReset
+        ? sanitizedChecks
+        : {
+            ...existingWeekChecks,
+            ...sanitizedChecks,
+          };
 
       const weekPayload: Record<string, any> = {
         id: targetWeekId,
@@ -3863,7 +3876,7 @@ export function mapStepIdToJournalType(
  */
 export function mapJournalTypeToStepId(
   type: StudentJournalActivityType | string
-): 'video_day' | 'audio_day' | 'tutor_live' | 'memorization' {
+): 'video_day' | 'audio_day' | 'tutor_live' | 'memorization' | null {
   switch (type) {
     case 'video':
     case 'video_day':
@@ -3878,8 +3891,11 @@ export function mapJournalTypeToStepId(
     case 'memorization':
     case 'homework':
       return 'memorization';
+    case 'sentence':
+    case 'daily_sentence':
+      return null;
     default:
-      return 'video_day';
+      return null;
   }
 }
 
@@ -3895,11 +3911,12 @@ export function deriveWeeklyChecksFromJournal(
 
   journal.forEach((entry) => {
     if (!entry || !entry.type) return;
+    if (entry.type === 'sentence' || (entry as any).type === 'daily_sentence') return;
     if (targetWeek !== undefined && entry.week !== undefined && Number(entry.week) !== Number(targetWeek)) {
       return;
     }
     const stepId = mapJournalTypeToStepId(entry.type);
-    if (entry.dayOfWeek) {
+    if (stepId && entry.dayOfWeek) {
       checks[`${stepId}_${entry.dayOfWeek.toLowerCase()}`] = true;
     }
   });
@@ -4028,7 +4045,7 @@ export async function recordActivityInStudentJournal(
 
       // Prepare updated weeklyChecks and watched/listened arrays for complete cross-compatibility
       const stepId = mapJournalTypeToStepId(sanitizedEntry.type);
-      const checkKey = sanitizedEntry.dayOfWeek ? `${stepId}_${sanitizedEntry.dayOfWeek.toLowerCase()}` : null;
+      const checkKey = stepId && sanitizedEntry.dayOfWeek ? `${stepId}_${sanitizedEntry.dayOfWeek.toLowerCase()}` : null;
       const currentChecks = userData?.weeklyChecks || {};
       const updatedChecks = checkKey ? { ...currentChecks, [checkKey]: true } : currentChecks;
 
@@ -4213,9 +4230,9 @@ export async function removeActivityFromStudentJournal(
         });
 
         const stepId = mapJournalTypeToStepId(type);
-        const checkKey = `${stepId}_${dayOfWeek}`;
+        const checkKey = stepId && dayOfWeek ? `${stepId}_${dayOfWeek}` : null;
         const curChecks = data.weeklyChecks || {};
-        const updatedChecks = { ...curChecks, [checkKey]: false };
+        const updatedChecks = checkKey ? { ...curChecks, [checkKey]: false } : curChecks;
 
         // Update week-specific weeklyChecks document
         try {

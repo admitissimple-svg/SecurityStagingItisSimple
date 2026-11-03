@@ -706,23 +706,13 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
       setWeeklyCycle(activeWeeklyCycle);
 
       if (prev !== activeWeeklyCycle) {
-        // Immediate in-memory clean reset of all 7 days for the new weeklyCycle
         fetchVersionRef.current += 1;
-        const clean = createClean7DayRoutines(activeWeeklyCycle);
-        setRoutinesByDay(clean);
-        // HOTFIX 2.3.5H: Explicitly terminate loading on cycle advance
-        setIsLoading(false);
-        setLoadedUid(effectiveUid);
-        setLoadedCycle(activeWeeklyCycle);
-        setIsInitialized(true);
-        setNetworkError(null);
-
         if (effectiveUid) {
           loadData(effectiveUid, activeWeeklyCycle);
         }
       }
     }
-  }, [activeWeeklyCycle, effectiveUid, loadData, createClean7DayRoutines]);
+  }, [activeWeeklyCycle, effectiveUid, loadData]);
 
   useEffect(() => {
     setRoutinesByDay(createClean7DayRoutines(activeCycleRef.current || 1));

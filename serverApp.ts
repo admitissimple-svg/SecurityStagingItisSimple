@@ -12016,6 +12016,10 @@ async function fetchYouTubePlaylistsFromDataApi(token: string): Promise<any[]> {
   // 2. Paginate through all videos for each playlist
   const syncedPlaylists: any[] = [];
   for (const pl of rawPlaylists) {
+    // Only synchronize public playlists (never private)
+    if (pl.status?.privacyStatus === 'private') {
+      continue;
+    }
     const plId = pl.id;
     const title = pl.snippet?.title || 'English Practice';
     const description = pl.snippet?.description || '';
@@ -12351,12 +12355,19 @@ async function syncYouTubePlaylistsFromApi(force = false, oauthToken?: string): 
   // 4B. If Data API didn't produce items, use public channel scraper
   if (freshPlaylists.length === 0) {
     try {
-      freshPlaylists = await fetchPlaylistsDirectlyFromChannel();
-      if (freshPlaylists.length > 0) {
+      const scraped = await fetchPlaylistsDirectlyFromChannel();
+      const totalVideos = scraped.reduce((acc, p) => acc + (p.videos?.length || 0), 0);
+      // Reject incomplete scraper results (e.g. 0 items or no videos) so they never overwrite the valid catalog
+      if (scraped.length > 0 && totalVideos > 0) {
+        freshPlaylists = scraped;
         upstreamSuccess = true;
+      } else if (scraped.length > 0 && totalVideos === 0) {
+        console.warn('[YouTube Sync] Incomplete scraper results without videos; preserving existing catalog.');
+        upstreamError = 'INCOMPLETE_SCRAPER_RESULTS';
       }
     } catch (err) {
       console.warn('[YouTube Sync] Channel fetch error:', err);
+      upstreamError = 'CHANNEL_SCRAPER_ERROR';
     }
   }
 

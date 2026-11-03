@@ -292,9 +292,9 @@ export const SFluencyTracker: React.FC<SFluencyTrackerProps> = ({
       userProfile?.dailyJournalSentence && userProfile.dailyJournalSentence.trim().length > 5
     );
 
-    // 4. Live lessons scheduled or completed with Native Friend
-    const hasLiveLessonsScheduled = lessons.length > 0;
-    const completedLiveLessons = lessons.filter((l) => l.status === 'completed').length;
+    // 4. Live lessons completed with Native Friend (completed sessions only, never pending bookings or trials)
+    const hasLiveLessonsScheduled = lessons.some((l) => l.status === 'scheduled' || l.status === 'pending');
+    const completedLiveLessons = lessons.filter((l) => l.status === 'completed' && !l.cancelledAt).length;
 
     // 5. Weekly Homework / Memorization Activity
     const isHomeworkSubmitted = Boolean(weeklyHomework?.status === 'submitted' || weeklyHomework?.status === 'graded');
@@ -358,14 +358,14 @@ export const SFluencyTracker: React.FC<SFluencyTrackerProps> = ({
         id: 'native_friend_milestone',
         icon: Users,
         title: isEn ? 'Live Native Friend Chat' : 'Conversa com Amigo Nativo',
-        subtitle: hasLiveLessonsScheduled
+        subtitle: completedLiveLessons > 0
           ? isEn
-            ? `${lessons.length}/${userProfile?.weeklyNativeLessonsTarget || 1} session(s) booked / completed`
-            : `${lessons.length}/${userProfile?.weeklyNativeLessonsTarget || 1} aula(s) agendada(s) no Google Meet`
+            ? `${completedLiveLessons}/${userProfile?.weeklyNativeLessonsTarget || 1} session(s) completed`
+            : `${completedLiveLessons}/${userProfile?.weeklyNativeLessonsTarget || 1} aula(s) concluída(s)`
           : isEn
-          ? `Schedule your session (Goal: ${userProfile?.weeklyNativeLessonsTarget || 1}x/wk)`
-          : `Agende sua sessão (Meta: ${userProfile?.weeklyNativeLessonsTarget || 1}x/sem)`,
-        isCompleted: hasLiveLessonsScheduled,
+          ? `Complete your session (Goal: ${userProfile?.weeklyNativeLessonsTarget || 1}x/wk)`
+          : `Conclua sua sessão (Meta: ${userProfile?.weeklyNativeLessonsTarget || 1}x/sem)`,
+        isCompleted: completedLiveLessons > 0 && completedLiveLessons >= (userProfile?.weeklyNativeLessonsTarget || 1),
         percentContribution: 15,
         actionLabel: isEn ? 'Schedule meet' : 'Agendar aula',
         onAction: onOpenScheduleLesson,

@@ -23,6 +23,7 @@ import {
   UserProfile,
   StudentDictionaryEntry,
   StudentJournalEntry,
+  LiveLesson,
 } from '../types';
 import { Translations, getTranslations } from '../utils/i18n';
 import { DAYS_OF_WEEK, getTodayDayOfWeek } from '../utils/notifications';
@@ -53,6 +54,7 @@ import {
 interface StudentWeeklyActivitySectionProps {
   homework: WeeklyHomeworkData | null;
   routinesByDay: Record<DayOfWeek, RoutineItem[]>;
+  lessons?: LiveLesson[];
   userProfile?: UserProfile;
   studentJournal?: StudentJournalEntry[];
   onOpenHomeworkModal: (targetDay?: DayOfWeek) => void;
@@ -120,6 +122,7 @@ const ROUTINE_ROWS: WeeklyRoutineRow[] = [
 export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySectionProps> = ({
   homework,
   routinesByDay,
+  lessons,
   userProfile,
   studentJournal: propStudentJournal,
   onOpenHomeworkModal,
@@ -619,14 +622,23 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
         return false;
       }
 
-      // 4. Live Tutor Lessons
+      // 4. Live Tutor Lessons (strictly completed lessons only, never scheduled bookings or pending trials)
       if (rowId === 'tutor_live') {
         if (weeklyChecks && Boolean(weeklyChecks[checkKey])) return true;
+
+        if (Array.isArray(lessons) && lessons.length > 0) {
+          const hasCompleted = lessons.some((l) => {
+            if (!l || l.status !== 'completed' || l.cancelledAt) return false;
+            return l.dayOfWeek && l.dayOfWeek.toLowerCase() === dayKey.toLowerCase();
+          });
+          if (hasCompleted) return true;
+        }
 
         const hasMatchingLesson = activeJournal.some((entry) => {
           if (!entry) return false;
           const isLesson = entry.type === 'lesson' || (entry as any).type === 'tutor_live';
           if (!isLesson) return false;
+          if ((entry as any).status && (entry as any).status !== 'completed') return false;
           if (entry.dayOfWeek && entry.dayOfWeek.toLowerCase() === dayKey.toLowerCase()) {
             const entryWeek = entry.week !== undefined && entry.week !== null ? Number(entry.week) : null;
             if (entryWeek !== null) return entryWeek === activeWeekCycle;
@@ -651,6 +663,7 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
       weeklyChecks,
       routinesByDay,
       homework?.completedPartsByDay,
+      lessons,
       studentUid,
       studentEmail,
       activeStudyDays,

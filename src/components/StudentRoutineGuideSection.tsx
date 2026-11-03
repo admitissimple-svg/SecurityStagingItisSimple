@@ -228,6 +228,10 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
       if (result.reauthRequired || result.error) {
         setReauthRequired(Boolean(result.reauthRequired));
         setPlaylistsError(result.error || (isEn ? 'Failed to sync YouTube playlists.' : 'Falha ao sincronizar playlists do YouTube.'));
+      } else if (result.source === 'fallback') {
+        // Upstream sync failed; preserve existing catalog and report status without presenting false success
+        setReauthRequired(false);
+        setPlaylistsError(isEn ? 'Could not connect to YouTube. Preserved current catalog.' : 'Não foi possível conectar ao YouTube. Catálogo atual preservado.');
       } else {
         setReauthRequired(false);
         setPlaylistsError(null);
@@ -252,6 +256,16 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
       setIsSyncingPlaylists(false);
     }
   }, [isEn]);
+
+  const lastSelectorSyncRef = useRef<number>(0);
+  const handleOpenTopicSelector = useCallback(() => {
+    const now = Date.now();
+    // Throttle sync on selector open (at most once every 15s)
+    if (now - lastSelectorSyncRef.current > 15000 && !isSyncingPlaylists && !isLoadingPlaylists) {
+      lastSelectorSyncRef.current = now;
+      loadPlaylists(true);
+    }
+  }, [loadPlaylists, isSyncingPlaylists, isLoadingPlaylists]);
 
   useEffect(() => {
     loadPlaylists(false);
@@ -360,28 +374,14 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     setWordsSaveFeedback(false);
   }, [activeActivity?.id, selectedDay, weeklyCycle, activeActivity?.learnedWords?.join(',')]);
 
-  // HOTFIX 2.3.5G: Immediate UI reset of all active 5 words & sentence inputs upon cycle advance
+  // Track cycle without destructive in-memory wiping on F5 / auth hydration
   const prevCycleTrackerRef = useRef<number>(weeklyCycle || userProfile?.weeklyCycle || 1);
   useEffect(() => {
     const curCycle = weeklyCycle || userProfile?.weeklyCycle || 1;
     if (prevCycleTrackerRef.current !== curCycle) {
-      if (typeof resetAllDaysImmediately === 'function') {
-        resetAllDaysImmediately(curCycle);
-      }
-      setWords(['', '', '', '', '']);
-      setWordDefinitions({});
-      setWordsSaveFeedback(false);
-      setSentenceInput('');
-      setSentenceSavedSuccess(false);
-      setSentenceEvaluation(null);
-      setSelectedTopicByDay({});
-      setCustomSuggestionActivities({});
-      setSuggestingUrlActivityId(null);
-      setSuggestingUrlValues({});
-      setSavedTopicsBeforeRepeat({});
       prevCycleTrackerRef.current = curCycle;
     }
-  }, [weeklyCycle, userProfile?.weeklyCycle, resetAllDaysImmediately]);
+  }, [weeklyCycle, userProfile?.weeklyCycle]);
 
   // Keep English definitions synchronized using Native Friend Notes unified pedagogical standard
   // Reuses My Dictionary definitions (2.2B.2)
@@ -795,9 +795,9 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
       : null;
 
   // Active YouTube video extraction: priority given to Firestore persisted video, then activeActivity, then day activities
-  // If persistedVideo explicitly has empty videoId (''), no video was chosen by the student yet
+  // If persistedVideo explicitly has empty videoId (''), no video was chosen by the student yet for this week
   const hasPersistedVideoId = Boolean(persistedVideo && persistedVideo.videoId && persistedVideo.videoId.trim() !== '');
-  const isPersistedClean = !persistedVideo || Boolean(persistedVideo.videoId === '');
+  const isPersistedClean = Boolean(persistedVideo && persistedVideo.videoId === '');
 
   const rawAssignedVideo: TeacherAssignedVideo | null =
     hasPersistedVideoId
@@ -2136,6 +2136,8 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
                             <select
                               value={isRepeatVideo ? '' : safePlaylistValue}
                               onChange={(e) => handleSelectPlaylistForActivity(act.id, e.target.value)}
+                              onFocus={handleOpenTopicSelector}
+                              onClick={handleOpenTopicSelector}
                               disabled={isRepeatVideo || loadingPlaylistAssignId === act.id || isLoadingPlaylists || isRoutineLoading}
                               aria-label={isEn ? 'Playlist Topic / Routine name' : 'Tópico da Playlist / Nome da Rotina'}
                               className={`text-xs font-bold py-1 pl-2.5 pr-7 rounded-xl border appearance-none transition focus:outline-hidden max-w-[180px] sm:max-w-[240px] truncate shadow-2xs ${

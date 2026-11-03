@@ -525,6 +525,7 @@ export default function App() {
               level: existingKnownLevel as EnglishLevel,
               englishLevel: existingKnownLevel as EnglishLevel,
               userLevel: existingKnownLevel as EnglishLevel,
+              weeklyCycle: typeof firestoreDoc?.weeklyCycle === 'number' ? firestoreDoc.weeklyCycle : (userProfile?.weeklyCycle || 1),
               learningGoal: firestoreDoc?.learningGoal || '',
               weeklyStudyDaysTarget: typeof firestoreDoc?.weeklyStudyDaysTarget === 'number' ? firestoreDoc.weeklyStudyDaysTarget : 4,
               weeklyStudyDays: firestoreDoc?.weeklyStudyDays || ['monday', 'tuesday', 'wednesday', 'thursday'],
@@ -1621,7 +1622,8 @@ export default function App() {
       activeRoutinesHydrationUidRef.current = uid;
       setRoutinesHydrationStatus('loading');
       setDictionaryHydrationStatus('loading');
-      setWeeklyChecks({});
+      // Preserve existing weeklyChecks during hydration to prevent race conditions and F5 zeroing
+      setWeeklyChecks((prev) => prev);
       setStudentJournal([]);
       setWeeklyHomework(null);
       setStudentDictionaryEntries([]);
@@ -4340,7 +4342,8 @@ export default function App() {
           studentEmail,
           userProfile?.weeklyNativeLessonsTarget || 1,
           effectiveStudyTarget,
-          effectiveCycle
+          effectiveCycle,
+          true
         );
 
         // Persist weekly checks and study targets via weekly-checks endpoint as well
@@ -7416,6 +7419,7 @@ export default function App() {
                   key={`weekly-activity-${normalizeWeekId(userProfile?.weeklyCycle) || 'loading'}`}
                   homework={weeklyHomework}
                   routinesByDay={routinesByDay}
+                  lessons={lessons}
                   userProfile={userProfile}
                   studentJournal={studentJournal}
                   onOpenHomeworkModal={handleOpenHomeworkModal}
