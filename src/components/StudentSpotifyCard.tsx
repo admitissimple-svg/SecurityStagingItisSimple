@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import {
   Headphones,
   CheckCircle2,
@@ -9,6 +9,7 @@ import {
 } from 'lucide-react';
 import { DayOfWeek } from '../types';
 import { getDayLabel } from '../utils/notifications';
+import { calculateWeeklyFocusTrack, WeeklyFocusTrackInfo } from '../utils/spotify';
 
 interface StudentSpotifyCardProps {
   isEn: boolean;
@@ -23,10 +24,13 @@ interface StudentSpotifyCardProps {
     embedPlaylistUrl?: string;
     descriptionEn?: string;
     descriptionPt?: string;
+    pool?: any[];
+    tracks?: any;
   };
   isAudioListenedToday: boolean;
   isRestDay: boolean;
   isLoading?: boolean;
+  isLevelLoading?: boolean;
   currentDayTrack?: any;
   currentStudyDayIndex: number;
   activeDaysInOrder: DayOfWeek[];
@@ -40,6 +44,15 @@ interface StudentSpotifyCardProps {
   teacherOverride?: any;
   activeNativeFriendFeedback?: any;
   triggerAudioCompletion: () => void;
+  weeklyCycle?: number;
+  playlistTracks?: Array<{
+    id?: string;
+    trackId?: string;
+    title: string;
+    artist: string;
+    url?: string;
+    embedUrl?: string;
+  }>;
 }
 
 export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
@@ -49,6 +62,7 @@ export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
   isAudioListenedToday,
   isRestDay,
   isLoading = false,
+  isLevelLoading = false,
   currentStudyDayIndex,
   activeDaysInOrder,
   spotifyPlayerMode,
@@ -56,8 +70,22 @@ export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
   teacherOverride,
   activeNativeFriendFeedback,
   triggerAudioCompletion,
+  weeklyCycle = 1,
+  playlistTracks,
 }) => {
-  if (isLoading) {
+  // Focus song of the week calculation (rule: songIndex = (weeklyCycle - 1) % totalTracks)
+  // If track list is not accessible or level is still loading, returns null without inventing fake songs
+  const weeklyFocusTrack: WeeklyFocusTrackInfo | null = useMemo(() => {
+    const candidateTracks = playlistTracks || levelPlaylistConfig?.pool || (Array.isArray(levelPlaylistConfig?.tracks) ? levelPlaylistConfig.tracks : null);
+    return calculateWeeklyFocusTrack({
+      tracks: candidateTracks,
+      weeklyCycle,
+      isLevelLoading,
+    });
+  }, [playlistTracks, levelPlaylistConfig, weeklyCycle, isLevelLoading]);
+
+  // While level or routines are loading, show neutral state to prevent provisional Beginner fallback
+  if (isLoading || isLevelLoading) {
     return (
       <div className="rounded-3xl bg-gradient-to-br from-slate-900 via-[#000035] to-[#062863] p-4 text-white border border-[#1DB954]/20 shadow-xs flex items-center justify-center min-h-[160px] animate-in fade-in duration-200">
         <div className="flex items-center gap-3 text-slate-300">
@@ -89,7 +117,7 @@ export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
   return (
     <div className="rounded-3xl bg-gradient-to-br from-slate-900 via-[#000035] to-[#062863] p-2.5 sm:p-3 text-white border border-[#1DB954]/30 shadow-xs">
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-        {/* Left Column: Metadata & Controls (matching image_3d4b54d3.png) */}
+        {/* Left Column: Metadata & Controls */}
         <div className="flex-1 min-w-0 flex flex-col justify-between space-y-2.5">
           {/* Top: Icon, Title, Level, Listened Status & Day info */}
           <div className="space-y-1">
@@ -102,7 +130,7 @@ export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
                   {isEn ? "Teacher's Daily Listening • Spotify" : 'Sugestão Diária do Teacher • Spotify'}
                 </h4>
                 <span className="px-2 py-0.5 rounded-full text-[9px] font-bold bg-[#1DB954]/20 text-[#1DB954] border border-[#1DB954]/40 shrink-0">
-                  {isEn ? levelPlaylistConfig.levelLabelEn : levelPlaylistConfig.levelLabelPt}
+                  {isEn ? (levelPlaylistConfig.levelLabelEn || 'Personalized Level') : (levelPlaylistConfig.levelLabelPt || 'Nível Personalizado')}
                 </span>
                 {isAudioListenedToday && (
                   <span className="inline-flex items-center gap-1 px-1.5 py-0.2 rounded-md text-[9px] font-bold bg-emerald-500/20 border border-emerald-400/30 text-emerald-300 shrink-0">
@@ -124,17 +152,52 @@ export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
             </p>
           </div>
 
-          {/* Middle: Subtle Shuffle tip */}
-          {/*{!isRestDay && (
-            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#1DB954]/10 border border-[#1DB954]/20 text-[11px] text-emerald-200 w-fit">
-              <Shuffle className="w-3 h-3 text-[#1DB954] shrink-0" />
-              <span className="font-medium text-emerald-100 text-[10px] sm:text-[11px]">
+          {/* Weekly Focus Song (rendered when valid tracks are available) */}
+          {weeklyFocusTrack && (
+            <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl bg-white/5 border border-[#1DB954]/25 text-xs">
+              <Sparkles className="w-3.5 h-3.5 text-[#1DB954] shrink-0" />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-1.5 text-[9px] text-emerald-300 font-bold uppercase tracking-wider">
+                  <span>{isEn ? 'Focus Song of the Week' : 'Música de Foco da Semana'}</span>
+                  <span>•</span>
+                  <span>
+                    {isEn
+                      ? `Track #${weeklyFocusTrack.position} of ${weeklyFocusTrack.totalTracks}`
+                      : `Música #${weeklyFocusTrack.position} de ${weeklyFocusTrack.totalTracks}`}
+                  </span>
+                </div>
+                <div className="text-[11px] font-black text-white truncate flex items-center gap-1.5">
+                  <span className="truncate">{weeklyFocusTrack.title}</span>
+                  <span className="text-slate-400 font-normal shrink-0">•</span>
+                  <span className="text-slate-300 font-medium truncate">{weeklyFocusTrack.artist}</span>
+                </div>
+              </div>
+              {weeklyFocusTrack.url && (
+                <a
+                  href={weeklyFocusTrack.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-2 py-0.5 rounded-lg bg-[#1DB954]/20 hover:bg-[#1DB954]/30 text-[#1DB954] text-[10px] font-bold transition flex items-center gap-1 shrink-0"
+                  title={isEn ? 'Open song on Spotify' : 'Abrir música no Spotify'}
+                >
+                  <span>Track</span>
+                  <ExternalLink className="w-2.5 h-2.5" />
+                </a>
+              )}
+            </div>
+          )}
+
+          {/* Subtle Shuffle orientation tip */}
+          {!isRestDay && (
+            <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-lg bg-[#1DB954]/10 border border-[#1DB954]/20 text-[10px] text-emerald-200 w-fit">
+              <Shuffle className="w-2.5 h-2.5 text-[#1DB954] shrink-0" />
+              <span className="font-medium text-emerald-100 text-[10px]">
                 Try Shuffle mode to discover different songs!
               </span>
             </div>
-          )}*/}
+          )}
 
-          {/* Bottom Left: Playlist Title & Mode Toggle */}
+          {/* Bottom Left: Mode Toggle */}
           <div className="flex items-center gap-3 pt-1 border-t border-white/10 flex-wrap">
             {/*<span className="text-[11px] text-slate-300 font-semibold truncate max-w-[240px]">
               {levelPlaylistConfig.playlistTitle}

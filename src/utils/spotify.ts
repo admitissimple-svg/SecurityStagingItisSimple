@@ -264,6 +264,15 @@ export async function fetchTracksForStudentLevel(
   return null;
 }
 
+export function resolveCanonicalStudentLevel(rawLevel?: string | EnglishLevel | null): NormalizedStudentLevel | null {
+  if (!rawLevel) return null;
+  const l = String(rawLevel).toLowerCase().trim();
+  if (l.includes('inter') || l.includes('b1') || l.includes('b2')) return 'intermediate';
+  if (l.includes('avan') || l.includes('adv') || l.includes('c1') || l.includes('c2')) return 'advanced';
+  if (l.includes('inici') || l.includes('beg') || l.includes('a1') || l.includes('a2')) return 'beginner';
+  return 'beginner';
+}
+
 /**
  * Normalizes any variation of student level into 'beginner' | 'intermediate' | 'advanced'
  */
@@ -273,6 +282,66 @@ export function normalizeStudentLevel(rawLevel?: string | EnglishLevel | null): 
   if (l.includes('inter') || l.includes('b1') || l.includes('b2')) return 'intermediate';
   if (l.includes('avan') || l.includes('adv') || l.includes('c1') || l.includes('c2')) return 'advanced';
   return 'beginner';
+}
+
+export interface WeeklyFocusTrackInfo {
+  trackId: string;
+  title: string;
+  artist: string;
+  position: number;
+  totalTracks: number;
+  url?: string;
+  embedUrl?: string;
+}
+
+/**
+ * HOTFIX 3D — Focus Song of the Week
+ * Calculates track position based on rule:
+ * songIndex = (weeklyCycle - 1) % totalTracks
+ * - Week 1 -> Track 1
+ * - Week 2 -> Track 2
+ * - Week 3 -> Track 3
+ * - Wraps to first song when playlist is exhausted
+ * - If track list is not accessible or level is still loading, returns null (zero fake tracks)
+ */
+export function calculateWeeklyFocusTrack(params: {
+  tracks?: Array<{
+    id?: string;
+    trackId?: string;
+    title: string;
+    artist: string;
+    url?: string;
+    embedUrl?: string;
+  }> | null;
+  weeklyCycle?: number;
+  isLevelLoading?: boolean;
+}): WeeklyFocusTrackInfo | null {
+  const { tracks, weeklyCycle = 1, isLevelLoading = false } = params;
+  if (isLevelLoading) return null;
+  if (!Array.isArray(tracks) || tracks.length === 0) return null;
+
+  const totalTracks = tracks.length;
+  const safeCycle = Math.max(1, Number(weeklyCycle) || 1);
+  const songIndex = (safeCycle - 1) % totalTracks;
+  const selected = tracks[songIndex];
+  if (!selected) return null;
+
+  const rawId = selected.trackId || selected.id || (selected.url ? extractSpotifyTrackId(selected.url) : null) || '';
+  const url = selected.url && isValidSpotifyUrl(selected.url)
+    ? selected.url
+    : rawId
+    ? `https://open.spotify.com/track/${rawId}`
+    : undefined;
+
+  return {
+    trackId: rawId,
+    title: selected.title || 'Focus Track',
+    artist: selected.artist || "It's simple",
+    position: songIndex + 1,
+    totalTracks,
+    url,
+    embedUrl: selected.embedUrl,
+  };
 }
 
 /**

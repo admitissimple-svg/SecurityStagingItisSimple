@@ -61,7 +61,8 @@ import {
   getCachedPlaylistTracks,
   SpotifyDailyTrack,
 } from '../utils/spotify';
-import { auth } from '../firebase';
+import { auth, getDb } from '../firebase';
+import { doc, getDoc } from 'firebase/firestore';
 import { getAccessToken } from '../utils/auth';
 import { isValidCanonicalUid } from '../utils/tutorConsolidation';
 import { useStudentSpotifySync } from '../hooks/useStudentSpotifySync';
@@ -731,8 +732,102 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     }
   };
 
+  // HOTFIX 3D — Canonical student level resolution with priority to authenticated profile
+  const [firestoreLevel, setFirestoreLevel] = useState<string | null>(null);
+  const [isLevelResolving, setIsLevelResolving] = useState<boolean>(() => {
+    return !Boolean(
+      userProfile?.englishLevel ||
+      userProfile?.userLevel ||
+      (userProfile as any)?.studentLevel ||
+      (userProfile as any)?.cefrLevel ||
+      userProfile?.enrollmentStatus ||
+      userProfile?.updatedAt
+    );
+  });
+
+  useEffect(() => {
+    // 1. Direct canonical fields from hydrated profile
+    const directCanonical =
+      userProfile?.englishLevel ||
+      userProfile?.userLevel ||
+      (userProfile as any)?.studentLevel ||
+      (userProfile as any)?.cefrLevel;
+
+    if (directCanonical) {
+      setFirestoreLevel(directCanonical);
+      setIsLevelResolving(false);
+      return;
+    }
+
+    if (userProfile?.enrollmentStatus || userProfile?.updatedAt) {
+      if (userProfile?.level) {
+        setFirestoreLevel(userProfile.level);
+      }
+      setIsLevelResolving(false);
+      return;
+    }
+
+    const currentUid = auth?.currentUser?.uid || userProfile?.id || (userProfile as any)?.uid;
+    const currentEmail = auth?.currentUser?.email || userProfile?.email;
+
+    if (!currentUid && !currentEmail) {
+      setIsLevelResolving(false);
+      return;
+    }
+
+    let isMounted = true;
+    const resolveLevelAsync = async () => {
+      try {
+        const db = getDb();
+        if (db && currentUid) {
+          const snap = await getDoc(doc(db, 'users', currentUid));
+          if (snap.exists() && isMounted) {
+            const data = snap.data();
+            const found = data?.englishLevel || data?.userLevel || data?.studentLevel || data?.cefrLevel || data?.level;
+            if (found) {
+              setFirestoreLevel(found);
+              setIsLevelResolving(false);
+              return;
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Notice resolving student level in routine guide:', err);
+      } finally {
+        if (isMounted) setIsLevelResolving(false);
+      }
+    };
+
+    resolveLevelAsync();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [
+    auth?.currentUser?.uid,
+    userProfile?.id,
+    userProfile?.email,
+    userProfile?.englishLevel,
+    userProfile?.userLevel,
+    (userProfile as any)?.studentLevel,
+    (userProfile as any)?.cefrLevel,
+    userProfile?.level,
+    userProfile?.enrollmentStatus,
+    userProfile?.updatedAt,
+  ]);
+
+  const effectiveCanonicalLevel =
+    firestoreLevel ||
+    userProfile?.englishLevel ||
+    userProfile?.userLevel ||
+    (userProfile as any)?.studentLevel ||
+    (userProfile as any)?.cefrLevel ||
+    (isLevelResolving ? null : userProfile?.level);
+
+  const isLevelLoading = isLevelResolving && !effectiveCanonicalLevel;
+
   // Automated level-based Spotify & YouTube curriculum sequential distribution
-  const normalizedLevel = normalizeStudentLevel(userProfile?.level);
+  const normalizedLevel = normalizeStudentLevel(effectiveCanonicalLevel);
   const levelPlaylistConfig = getSpotifyPlaylistForLevel(normalizedLevel);
   const [liveSpotifyTracks, setLiveSpotifyTracks] = useState<SpotifyDailyTrack[] | null>(() => {
     return getCachedPlaylistTracks(normalizedLevel);
@@ -2625,6 +2720,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
           isAudioListenedToday={isAudioListenedToday}
           isRestDay={isRestDay}
           isLoading={Boolean(isStarting || isStartingNewWeek || isRoutinesLoading || !userProfile?.id || isLoadingSpotify)}
+          isLevelLoading={isLevelLoading}
           currentDayTrack={currentDayTrack}
           currentStudyDayIndex={currentStudyDayIndex}
           activeDaysInOrder={activeDaysInOrder}
@@ -2638,6 +2734,8 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
           teacherOverride={teacherOverride}
           activeNativeFriendFeedback={activeNativeFriendFeedback}
           triggerAudioCompletion={triggerAudioCompletion}
+          weeklyCycle={weeklyCycle || userProfile?.weeklyCycle || 1}
+          playlistTracks={liveSpotifyTracks || undefined}
         />
       </div>
 
