@@ -6,10 +6,11 @@ import {
   Music,
   Shuffle,
   Sparkles,
+  ChevronDown,
 } from 'lucide-react';
 import { DayOfWeek } from '../types';
 import { getDayLabel } from '../utils/notifications';
-import { calculateWeeklyFocusTrack, WeeklyFocusTrackInfo } from '../utils/spotify';
+import { calculateWeeklyFocusTrack, WeeklyFocusTrackInfo, NormalizedStudentLevel } from '../utils/spotify';
 
 interface StudentSpotifyCardProps {
   isEn: boolean;
@@ -41,9 +42,11 @@ interface StudentSpotifyCardProps {
   effectiveTrackTitle?: string;
   effectiveArtist?: string;
   effectiveCoverUrl?: string;
+  effectiveTeacherTip?: string;
+  onMarkAudioListened?: () => void;
   teacherOverride?: any;
   activeNativeFriendFeedback?: any;
-  triggerAudioCompletion: () => void;
+  triggerAudioCompletion?: () => void;
   weeklyCycle?: number;
   playlistTracks?: Array<{
     id?: string;
@@ -53,6 +56,7 @@ interface StudentSpotifyCardProps {
     url?: string;
     embedUrl?: string;
   }>;
+  onSelectLevel?: (level: NormalizedStudentLevel) => void;
 }
 
 export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
@@ -67,11 +71,17 @@ export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
   activeDaysInOrder,
   spotifyPlayerMode,
   setSpotifyPlayerMode,
+  sanitizedEmbedUrl,
+  effectiveDirectUrl,
+  effectiveCoverUrl,
+  effectiveTeacherTip,
+  onMarkAudioListened,
   teacherOverride,
   activeNativeFriendFeedback,
   triggerAudioCompletion,
   weeklyCycle = 1,
   playlistTracks,
+  onSelectLevel,
 }) => {
   // Focus song of the week calculation (rule: songIndex = (weeklyCycle - 1) % totalTracks)
   // If track list is not accessible or level is still loading, returns null without inventing fake songs
@@ -129,9 +139,31 @@ export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
                 <h4 className="font-black text-xs sm:text-sm text-white tracking-tight truncate">
                   {isEn ? "Teacher's Daily Listening • Spotify" : 'Sugestão Diária do Teacher • Spotify'}
                 </h4>
-                <span className="px-2 py-0.5 rounded-full text-[9px] font-bold bg-[#1DB954]/20 text-[#1DB954] border border-[#1DB954]/40 shrink-0">
-                  {isEn ? (levelPlaylistConfig.levelLabelEn || 'Personalized Level') : (levelPlaylistConfig.levelLabelPt || 'Nível Personalizado')}
-                </span>
+                {onSelectLevel ? (
+                  <div className="relative inline-flex items-center shrink-0">
+                    <select
+                      value={levelPlaylistConfig.level || 'intermediate'}
+                      onChange={(e) => onSelectLevel(e.target.value as NormalizedStudentLevel)}
+                      className="appearance-none pl-2.5 pr-5 py-0.5 rounded-full text-[9px] font-bold bg-[#1DB954]/20 hover:bg-[#1DB954]/30 text-[#1DB954] border border-[#1DB954]/40 cursor-pointer focus:outline-none focus:ring-1 focus:ring-[#1DB954] transition tracking-wide"
+                      title={isEn ? 'Select your English level' : 'Selecione o seu nível de inglês'}
+                    >
+                      <option value="beginner" className="bg-[#000035] text-white">
+                        {isEn ? 'Beginner' : 'Iniciante'}
+                      </option>
+                      <option value="intermediate" className="bg-[#000035] text-white">
+                        {isEn ? 'Intermediate' : 'Intermediário'}
+                      </option>
+                      <option value="advanced" className="bg-[#000035] text-white">
+                        {isEn ? 'Advanced' : 'Avançado'}
+                      </option>
+                    </select>
+                    <ChevronDown className="w-2.5 h-2.5 text-[#1DB954] absolute right-1.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  </div>
+                ) : (
+                  <span className="px-2 py-0.5 rounded-full text-[9px] font-bold bg-[#1DB954]/20 text-[#1DB954] border border-[#1DB954]/40 shrink-0">
+                    {isEn ? (levelPlaylistConfig.levelLabelEn || 'Personalized Level') : (levelPlaylistConfig.levelLabelPt || 'Nível Personalizado')}
+                  </span>
+                )}
                 {isAudioListenedToday && (
                   <span className="inline-flex items-center gap-1 px-1.5 py-0.2 rounded-md text-[9px] font-bold bg-emerald-500/20 border border-emerald-400/30 text-emerald-300 shrink-0">
                     <CheckCircle2 className="w-2.5 h-2.5 text-emerald-400" />
@@ -294,7 +326,7 @@ export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
             ) : (
               <button
                 type="button"
-                onClick={() => triggerAudioCompletion()}
+                onClick={() => triggerAudioCompletion?.()}
                 className="px-3 py-1.5 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-400/40 rounded-xl text-xs font-bold flex items-center gap-1 transition cursor-pointer active:scale-95"
               >
                 <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
@@ -306,7 +338,7 @@ export const StudentSpotifyCard: React.FC<StudentSpotifyCardProps> = ({
               href={playlistUrl}
               target="_blank"
               rel="noopener noreferrer"
-              onClick={() => triggerAudioCompletion()}
+              onClick={() => triggerAudioCompletion?.()}
               className="px-4 py-1.5 bg-[#1DB954] hover:bg-[#1ed760] text-[#000035] rounded-xl text-xs font-black flex items-center gap-1.5 transition shadow-xs cursor-pointer active:scale-95 shrink-0"
             >
               <span>Listen on Spotify</span>

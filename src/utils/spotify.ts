@@ -264,25 +264,78 @@ export async function fetchTracksForStudentLevel(
   return null;
 }
 
-export function resolveCanonicalStudentLevel(rawLevel?: string | EnglishLevel | null): NormalizedStudentLevel | null {
-  if (!rawLevel) return null;
-  const l = String(rawLevel).toLowerCase().trim();
-  if (l.includes('inter') || l.includes('b1') || l.includes('b2')) return 'intermediate';
-  if (l.includes('avan') || l.includes('adv') || l.includes('c1') || l.includes('c2')) return 'advanced';
-  if (l.includes('inici') || l.includes('beg') || l.includes('a1') || l.includes('a2')) return 'beginner';
+export const SPOTIFY_STUDENT_LEVEL_STORAGE_KEY_PREFIX = 'its_simple_spotify_level_pref_';
+
+export function getStoredStudentSpotifyLevel(studentKey?: string): NormalizedStudentLevel | null {
+  if (typeof window === 'undefined' || !window.localStorage) return null;
+  try {
+    const raw = studentKey
+      ? window.localStorage.getItem(`${SPOTIFY_STUDENT_LEVEL_STORAGE_KEY_PREFIX}${studentKey.toLowerCase().trim()}`)
+      : null;
+    const fallback = window.localStorage.getItem('its_simple_spotify_level_pref_current');
+    return resolveCanonicalStudentLevel(raw || fallback);
+  } catch {
+    return null;
+  }
+}
+
+export function setStoredStudentSpotifyLevel(studentKey: string | undefined, level: NormalizedStudentLevel): void {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  try {
+    if (studentKey) {
+      window.localStorage.setItem(`${SPOTIFY_STUDENT_LEVEL_STORAGE_KEY_PREFIX}${studentKey.toLowerCase().trim()}`, level);
+    }
+    window.localStorage.setItem('its_simple_spotify_level_pref_current', level);
+  } catch {}
+}
+
+/**
+ * Resolves student level from one or more candidates with strict priority:
+ * 1. Any non-default intermediate indicator (intermediario, intermediate, b1, b2)
+ * 2. Any non-default advanced indicator (avancado, advanced, c1, c2)
+ * 3. Any explicit beginner indicator
+ * Returns null if no valid level could be resolved (neutral state during loading).
+ */
+export function resolveCanonicalStudentLevel(
+  ...candidates: Array<string | EnglishLevel | null | undefined>
+): NormalizedStudentLevel | null {
+  const flattened: string[] = [];
+  candidates.forEach((c) => {
+    if (c && typeof c === 'string' && c.trim().length > 0) {
+      flattened.push(c.toLowerCase().trim());
+    }
+  });
+
+  if (flattened.length === 0) return null;
+
+  // Intermediate has highest priority if specified anywhere
+  if (flattened.some((l) => l.includes('inter') || l.includes('b1') || l.includes('b2'))) {
+    return 'intermediate';
+  }
+
+  // Advanced has next priority if specified anywhere
+  if (flattened.some((l) => l.includes('avan') || l.includes('adv') || l.includes('c1') || l.includes('c2'))) {
+    return 'advanced';
+  }
+
+  // Beginner if explicitly specified
+  if (flattened.some((l) => l.includes('inici') || l.includes('beg') || l.includes('a1') || l.includes('a2'))) {
+    return 'beginner';
+  }
+
   return 'beginner';
 }
 
 /**
  * Normalizes any variation of student level into 'beginner' | 'intermediate' | 'advanced'
  */
-export function normalizeStudentLevel(rawLevel?: string | EnglishLevel | null): NormalizedStudentLevel {
-  if (!rawLevel) return 'beginner';
-  const l = String(rawLevel).toLowerCase().trim();
-  if (l.includes('inter') || l.includes('b1') || l.includes('b2')) return 'intermediate';
-  if (l.includes('avan') || l.includes('adv') || l.includes('c1') || l.includes('c2')) return 'advanced';
-  return 'beginner';
+export function normalizeStudentLevel(
+  ...candidates: Array<string | EnglishLevel | null | undefined>
+): NormalizedStudentLevel {
+  const resolved = resolveCanonicalStudentLevel(...candidates);
+  return resolved || 'beginner';
 }
+
 
 export interface WeeklyFocusTrackInfo {
   trackId: string;

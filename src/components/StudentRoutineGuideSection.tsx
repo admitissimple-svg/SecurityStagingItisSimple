@@ -51,6 +51,10 @@ import {
   getSpotifyEmbedUrl,
   getSpotifyDirectUrl,
   normalizeStudentLevel,
+  resolveCanonicalStudentLevel,
+  getStoredStudentSpotifyLevel,
+  setStoredStudentSpotifyLevel,
+  NormalizedStudentLevel,
   getSpotifyPlaylistForLevel,
   getDailySpotifyTrackForStudent,
   selectCurrentDaySpotifyTrack,
@@ -732,37 +736,46 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     }
   };
 
-  // HOTFIX 3D — Canonical student level resolution with priority to authenticated profile
+  // HOTFIX 3D — Canonical student level resolution with priority to authenticated profile and local persistence
+  const [manualSpotifyLevel, setManualSpotifyLevel] = useState<NormalizedStudentLevel | null>(() => {
+    return getStoredStudentSpotifyLevel(effectiveStudentUid || userProfile?.email);
+  });
   const [firestoreLevel, setFirestoreLevel] = useState<string | null>(null);
   const [isLevelResolving, setIsLevelResolving] = useState<boolean>(() => {
     return !Boolean(
+      manualSpotifyLevel ||
       userProfile?.englishLevel ||
       userProfile?.userLevel ||
       (userProfile as any)?.studentLevel ||
       (userProfile as any)?.cefrLevel ||
-      userProfile?.enrollmentStatus ||
-      userProfile?.updatedAt
+      userProfile?.level
     );
   });
 
-  useEffect(() => {
-    // 1. Direct canonical fields from hydrated profile
-    const directCanonical =
-      userProfile?.englishLevel ||
-      userProfile?.userLevel ||
-      (userProfile as any)?.studentLevel ||
-      (userProfile as any)?.cefrLevel;
+  const handleSpotifyLevelChange = useCallback((newLevel: NormalizedStudentLevel) => {
+    setManualSpotifyLevel(newLevel);
+    setStoredStudentSpotifyLevel(effectiveStudentUid || userProfile?.email, newLevel);
+    setFirestoreLevel(newLevel);
+  }, [effectiveStudentUid, userProfile?.email]);
 
-    if (directCanonical) {
-      setFirestoreLevel(directCanonical);
+  useEffect(() => {
+    const stored = getStoredStudentSpotifyLevel(effectiveStudentUid || userProfile?.email);
+    if (stored) {
+      setManualSpotifyLevel(stored);
       setIsLevelResolving(false);
       return;
     }
 
-    if (userProfile?.enrollmentStatus || userProfile?.updatedAt) {
-      if (userProfile?.level) {
-        setFirestoreLevel(userProfile.level);
-      }
+    const resolved = resolveCanonicalStudentLevel(
+      userProfile?.englishLevel,
+      userProfile?.userLevel,
+      (userProfile as any)?.studentLevel,
+      (userProfile as any)?.cefrLevel,
+      userProfile?.level
+    );
+
+    if (resolved) {
+      setFirestoreLevel(resolved);
       setIsLevelResolving(false);
       return;
     }
@@ -783,7 +796,13 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
           const snap = await getDoc(doc(db, 'users', currentUid));
           if (snap.exists() && isMounted) {
             const data = snap.data();
-            const found = data?.englishLevel || data?.userLevel || data?.studentLevel || data?.cefrLevel || data?.level;
+            const found = resolveCanonicalStudentLevel(
+              data?.englishLevel,
+              data?.userLevel,
+              data?.studentLevel,
+              data?.cefrLevel,
+              data?.level
+            );
             if (found) {
               setFirestoreLevel(found);
               setIsLevelResolving(false);
@@ -804,6 +823,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
       isMounted = false;
     };
   }, [
+    effectiveStudentUid,
     auth?.currentUser?.uid,
     userProfile?.id,
     userProfile?.email,
@@ -812,17 +832,37 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     (userProfile as any)?.studentLevel,
     (userProfile as any)?.cefrLevel,
     userProfile?.level,
-    userProfile?.enrollmentStatus,
-    userProfile?.updatedAt,
   ]);
 
-  const effectiveCanonicalLevel =
-    firestoreLevel ||
-    userProfile?.englishLevel ||
-    userProfile?.userLevel ||
-    (userProfile as any)?.studentLevel ||
-    (userProfile as any)?.cefrLevel ||
-    (isLevelResolving ? null : userProfile?.level);
+  const effectiveCanonicalLevel = useMemo(() => {
+    if (manualSpotifyLevel) return manualSpotifyLevel;
+
+    const stored = getStoredStudentSpotifyLevel(effectiveStudentUid || userProfile?.email);
+    if (stored) return stored;
+
+    const fromProfile = resolveCanonicalStudentLevel(
+      userProfile?.englishLevel,
+      userProfile?.userLevel,
+      (userProfile as any)?.studentLevel,
+      (userProfile as any)?.cefrLevel,
+      userProfile?.level,
+      firestoreLevel
+    );
+    if (fromProfile) return fromProfile;
+
+    return isLevelResolving ? null : 'beginner';
+  }, [
+    manualSpotifyLevel,
+    effectiveStudentUid,
+    userProfile?.email,
+    userProfile?.englishLevel,
+    userProfile?.userLevel,
+    (userProfile as any)?.studentLevel,
+    (userProfile as any)?.cefrLevel,
+    userProfile?.level,
+    firestoreLevel,
+    isLevelResolving,
+  ]);
 
   const isLevelLoading = isLevelResolving && !effectiveCanonicalLevel;
 
@@ -2736,6 +2776,7 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
           triggerAudioCompletion={triggerAudioCompletion}
           weeklyCycle={weeklyCycle || userProfile?.weeklyCycle || 1}
           playlistTracks={liveSpotifyTracks || undefined}
+          onSelectLevel={handleSpotifyLevelChange}
         />
       </div>
 

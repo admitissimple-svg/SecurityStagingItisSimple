@@ -193,6 +193,23 @@ runTest('9. Lista de faixas inacessível -> não inventa faixas, títulos, posi�
   assert.strictEqual(nullRes, null, 'Lista null de faixas deve retornar null');
 });
 
+// 10. Seleção interativa de nível e prioridade intermediária
+runTest('10. Nível intermediário com prioridade e seletor interativo no Spotify Card', () => {
+  // Test candidate resolution: intermediate takes priority over provisional beginner
+  const resolved = resolveCanonicalStudentLevel('iniciante', 'intermediario');
+  assert.strictEqual(resolved, 'intermediate', 'Candidato intermediario deve prevalecer sobre iniciante provisório');
+
+  // Verify StudentSpotifyCard includes interactive selector and onSelectLevel
+  const cardCode = fs.readFileSync(path.resolve(process.cwd(), 'src/components/StudentSpotifyCard.tsx'), 'utf-8');
+  assert(cardCode.includes('onSelectLevel?: (level: NormalizedStudentLevel) => void;'), 'Card must have onSelectLevel prop');
+  assert(cardCode.includes('<select'), 'Card must render select dropdown for level switching');
+  assert(cardCode.includes('value="intermediate"'), 'Card must include intermediate option');
+
+  // Verify StudentRoutineGuideSection connects onSelectLevel
+  const guideCode = fs.readFileSync(path.resolve(process.cwd(), 'src/components/StudentRoutineGuideSection.tsx'), 'utf-8');
+  assert(guideCode.includes('onSelectLevel={handleSpotifyLevelChange}'), 'GuideSection must wire handleSpotifyLevelChange');
+});
+
 console.log(`\n================================================================`);
 console.log(` ALL ${passed} / ${total} TESTS PASSED FOR HOTFIX 3D!`);
 console.log(`================================================================\n`);
