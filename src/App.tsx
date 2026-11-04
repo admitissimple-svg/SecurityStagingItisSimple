@@ -41,7 +41,7 @@ import {
   deriveContextualSentencePrompt,
 } from './utils/homeworkGenerator';
 import { synthesizeFillInBlanks } from './utils/pedagogicalStorySynthesizer';
-import { normalizeStudentLevel, fetchTracksForStudentLevel } from './utils/spotify';
+import { normalizeStudentLevel, resolveCanonicalStudentLevel, fetchTracksForStudentLevel } from './utils/spotify';
 import { executeStartNewWeek } from './utils/StartNewWeekHandler';
 import {
   addVideoToWatchedHistoryInFirestore,
@@ -468,11 +468,23 @@ export default function App() {
           if (resolvedRole === 'student' && firestoreDoc?.role !== 'teacher' && firestoreDoc?.role !== 'native_friend') {
             const db = getDb();
             if (db && fbUser.uid) {
-              const existingStoredLevel =
-                firestoreDoc?.level ||
-                firestoreDoc?.englishLevel ||
-                firestoreDoc?.userLevel ||
-                firestoreDoc?.cefrLevel;
+              // HOTFIX 3D.2: Reutilizar resolveCanonicalStudentLevel priorizando englishLevel e userLevel sobre level legado
+              const canonicalLevelType =
+                resolveCanonicalStudentLevel(firestoreDoc?.englishLevel, firestoreDoc?.userLevel) ||
+                resolveCanonicalStudentLevel((firestoreDoc as any)?.studentLevel, (firestoreDoc as any)?.cefrLevel) ||
+                resolveCanonicalStudentLevel(firestoreDoc?.level);
+
+              const rawStoredLevelCandidate = [
+                firestoreDoc?.englishLevel,
+                firestoreDoc?.userLevel,
+                firestoreDoc?.level,
+              ].find((val) => {
+                if (typeof val !== 'string') return false;
+                if (canonicalLevelType === 'intermediate') return val.toLowerCase().includes('inter');
+                if (canonicalLevelType === 'advanced') return val.toLowerCase().includes('avan') || val.toLowerCase().includes('adv');
+                if (canonicalLevelType === 'beginner') return val.toLowerCase().includes('inici') || val.toLowerCase().includes('beg');
+                return false;
+              });
 
               const studentPayload: Record<string, any> = {
                 id: fbUser.uid,
@@ -490,11 +502,16 @@ export default function App() {
                 updatedAt: new Date().toISOString(),
               };
 
-              // Strictly preserve existing level in Firestore. Never overwrite with BEGINNER on login.
-              if (existingStoredLevel) {
-                studentPayload.level = existingStoredLevel;
+              // Strictly preserve existing canonical level in Firestore. Never overwrite with BEGINNER on login.
+              if (rawStoredLevelCandidate || canonicalLevelType) {
+                const preservedLevel = rawStoredLevelCandidate || canonicalLevelType;
+                studentPayload.level = preservedLevel;
+                studentPayload.englishLevel = preservedLevel;
+                studentPayload.userLevel = preservedLevel;
               } else {
                 delete studentPayload.level;
+                delete studentPayload.englishLevel;
+                delete studentPayload.userLevel;
               }
 
               setDoc(doc(db, 'users', fbUser.uid), studentPayload, { merge: true }).catch(() => null);
@@ -508,13 +525,36 @@ export default function App() {
                   ? firestoreDoc.nativeFriendUID
                   : undefined;
 
-            const existingKnownLevel =
-              firestoreDoc?.level ||
-              firestoreDoc?.englishLevel ||
-              firestoreDoc?.userLevel ||
-              firestoreDoc?.cefrLevel ||
-              userProfile?.level ||
-              EnglishLevel.BEGINNER;
+            // HOTFIX 3D.2: Reutilizar resolveCanonicalStudentLevel no perfil restaurado pós-login/F5
+            const authCanonicalLevelType =
+              resolveCanonicalStudentLevel(firestoreDoc?.englishLevel, firestoreDoc?.userLevel) ||
+              resolveCanonicalStudentLevel((firestoreDoc as any)?.studentLevel, (firestoreDoc as any)?.cefrLevel) ||
+              resolveCanonicalStudentLevel(firestoreDoc?.level) ||
+              resolveCanonicalStudentLevel(userProfile?.englishLevel, userProfile?.userLevel) ||
+              resolveCanonicalStudentLevel(userProfile?.level);
+
+            const rawAuthCandidate = [
+              firestoreDoc?.englishLevel,
+              firestoreDoc?.userLevel,
+              firestoreDoc?.level,
+              userProfile?.englishLevel,
+              userProfile?.userLevel,
+            ].find((val) => {
+              if (typeof val !== 'string') return false;
+              if (authCanonicalLevelType === 'intermediate') return val.toLowerCase().includes('inter');
+              if (authCanonicalLevelType === 'advanced') return val.toLowerCase().includes('avan') || val.toLowerCase().includes('adv');
+              if (authCanonicalLevelType === 'beginner') return val.toLowerCase().includes('inici') || val.toLowerCase().includes('beg');
+              return false;
+            });
+
+            const resolvedAuthEnglishLevel = rawAuthCandidate || (
+              authCanonicalLevelType === 'intermediate' ? 'intermediate' :
+              authCanonicalLevelType === 'advanced' ? 'advanced' :
+              authCanonicalLevelType === 'beginner' ? EnglishLevel.BEGINNER :
+              undefined
+            );
+
+            const resolvedAuthLevel = (resolvedAuthEnglishLevel || EnglishLevel.BEGINNER) as EnglishLevel;
 
             const restoredProfile: UserProfile = {
               ...createDefaultStudentProfile(account),
@@ -524,9 +564,11 @@ export default function App() {
               name: account.name,
               picture: account.picture,
               avatar: account.picture,
-              level: existingKnownLevel as EnglishLevel,
-              englishLevel: existingKnownLevel as EnglishLevel,
-              userLevel: existingKnownLevel as EnglishLevel,
+              level: resolvedAuthLevel,
+              ...(resolvedAuthEnglishLevel ? {
+                englishLevel: resolvedAuthEnglishLevel,
+                userLevel: resolvedAuthEnglishLevel,
+              } : {}),
               weeklyCycle: typeof firestoreDoc?.weeklyCycle === 'number' ? firestoreDoc.weeklyCycle : (userProfile?.weeklyCycle || 1),
               learningGoal: firestoreDoc?.learningGoal || '',
               weeklyStudyDaysTarget: typeof firestoreDoc?.weeklyStudyDaysTarget === 'number' ? firestoreDoc.weeklyStudyDaysTarget : 4,
@@ -1673,26 +1715,76 @@ export default function App() {
             apiProfileData?.enrollmentStatus ||
             (effectiveTeacherEmail ? 'active' : 'not_enrolled');
 
-          const effectiveLevel =
-            fsProfile?.level ||
-            fsProfile?.englishLevel ||
-            fsProfile?.userLevel ||
-            (fsProfile as any)?.cefrLevel ||
-            apiProfileData?.level ||
-            apiProfileData?.englishLevel ||
-            apiProfileData?.userLevel ||
-            (apiProfileData as any)?.cefrLevel ||
-            userProfile?.level ||
-            baseProfile.level;
+          // HOTFIX 3D.2: Reutilizar resolveCanonicalStudentLevel priorizando englishLevel e userLevel sobre level legado e valores provisórios
+          const canonicalFromCanonicalFields = resolveCanonicalStudentLevel(
+            fsProfile?.englishLevel,
+            fsProfile?.userLevel,
+            apiProfileData?.englishLevel,
+            apiProfileData?.userLevel
+          );
+
+          const canonicalFromSecondaryFields = resolveCanonicalStudentLevel(
+            (fsProfile as any)?.studentLevel,
+            (apiProfileData as any)?.studentLevel,
+            (fsProfile as any)?.cefrLevel,
+            (apiProfileData as any)?.cefrLevel
+          );
+
+          const canonicalFromLegacyFields = resolveCanonicalStudentLevel(
+            fsProfile?.level,
+            apiProfileData?.level
+          );
+
+          const canonicalFromCurrentProfile = resolveCanonicalStudentLevel(
+            userProfile?.englishLevel,
+            userProfile?.userLevel
+          );
+
+          const resolvedLevelType =
+            canonicalFromCanonicalFields ||
+            canonicalFromSecondaryFields ||
+            canonicalFromLegacyFields ||
+            canonicalFromCurrentProfile ||
+            resolveCanonicalStudentLevel(userProfile?.level);
+
+          const rawLevelCandidate = [
+            apiProfileData?.englishLevel,
+            apiProfileData?.userLevel,
+            fsProfile?.englishLevel,
+            fsProfile?.userLevel,
+            (apiProfileData as any)?.studentLevel,
+            (fsProfile as any)?.studentLevel,
+            apiProfileData?.level,
+            fsProfile?.level,
+            userProfile?.englishLevel,
+            userProfile?.userLevel,
+          ].find((val) => {
+            if (typeof val !== 'string') return false;
+            if (resolvedLevelType === 'intermediate') return val.toLowerCase().includes('inter');
+            if (resolvedLevelType === 'advanced') return val.toLowerCase().includes('avan') || val.toLowerCase().includes('adv');
+            if (resolvedLevelType === 'beginner') return val.toLowerCase().includes('inici') || val.toLowerCase().includes('beg');
+            return false;
+          });
+
+          const resolvedEffectiveEnglishLevel = rawLevelCandidate || (
+            resolvedLevelType === 'intermediate' ? 'intermediate' :
+            resolvedLevelType === 'advanced' ? 'advanced' :
+            resolvedLevelType === 'beginner' ? EnglishLevel.BEGINNER :
+            undefined
+          );
+
+          const resolvedEffectiveLevel = (resolvedEffectiveEnglishLevel || EnglishLevel.BEGINNER) as EnglishLevel;
 
           const effectiveStudentUid = currentAccount?.uid || auth.currentUser?.uid || uid;
           loadedProfile = {
             ...baseProfile,
             ...(apiProfileData || {}),
             ...(fsProfile || {}),
-            level: effectiveLevel,
-            englishLevel: effectiveLevel,
-            userLevel: effectiveLevel,
+            level: resolvedEffectiveLevel,
+            ...(resolvedEffectiveEnglishLevel ? {
+              englishLevel: resolvedEffectiveEnglishLevel,
+              userLevel: resolvedEffectiveEnglishLevel,
+            } : {}),
             id: effectiveStudentUid,
             uid: effectiveStudentUid,
             name: fsProfile?.name || apiProfileData?.name || currentAccount!.name || '',
@@ -2103,18 +2195,55 @@ export default function App() {
 
     const unsub = subscribeToStudentProfile(uid, email, (updated) => {
       if (updated) {
-        setUserProfile((prev) => ({
-          ...prev,
-          ...updated,
-          id: uid,
-          uid: uid,
-          teacherEmail: updated.teacherEmail !== undefined ? updated.teacherEmail : prev.teacherEmail,
-          teacherName: updated.teacherName !== undefined ? updated.teacherName : prev.teacherName,
-          teacherUid: updated.teacherUid !== undefined ? updated.teacherUid : prev.teacherUid,
-          assignedNativeFriendUID: updated.assignedNativeFriendUID !== undefined ? updated.assignedNativeFriendUID : prev.assignedNativeFriendUID,
-          nativeFriendUID: updated.nativeFriendUID !== undefined ? updated.nativeFriendUID : prev.nativeFriendUID,
-          enrollmentStatus: updated.enrollmentStatus || prev.enrollmentStatus,
-        }));
+        setUserProfile((prev) => {
+          // HOTFIX 3D.2: Reutilizar resolveCanonicalStudentLevel priorizando englishLevel e userLevel sobre level legado
+          const subCanonicalLevel =
+            resolveCanonicalStudentLevel(updated.englishLevel, updated.userLevel) ||
+            resolveCanonicalStudentLevel((updated as any).studentLevel, (updated as any).cefrLevel) ||
+            resolveCanonicalStudentLevel(prev.englishLevel, prev.userLevel) ||
+            resolveCanonicalStudentLevel(updated.level) ||
+            resolveCanonicalStudentLevel(prev.level);
+
+          const rawSubCandidate = [
+            updated.englishLevel,
+            updated.userLevel,
+            prev.englishLevel,
+            prev.userLevel,
+            updated.level,
+            prev.level,
+          ].find((val) => {
+            if (typeof val !== 'string') return false;
+            if (subCanonicalLevel === 'intermediate') return val.toLowerCase().includes('inter');
+            if (subCanonicalLevel === 'advanced') return val.toLowerCase().includes('avan') || val.toLowerCase().includes('adv');
+            if (subCanonicalLevel === 'beginner') return val.toLowerCase().includes('inici') || val.toLowerCase().includes('beg');
+            return false;
+          });
+
+          const resolvedSubEnglishLevel = rawSubCandidate || (
+            subCanonicalLevel === 'intermediate' ? 'intermediate' :
+            subCanonicalLevel === 'advanced' ? 'advanced' :
+            subCanonicalLevel === 'beginner' ? EnglishLevel.BEGINNER :
+            undefined
+          );
+
+          return {
+            ...prev,
+            ...updated,
+            id: uid,
+            uid: uid,
+            ...(resolvedSubEnglishLevel ? {
+              level: (resolvedSubEnglishLevel || EnglishLevel.BEGINNER) as EnglishLevel,
+              englishLevel: resolvedSubEnglishLevel,
+              userLevel: resolvedSubEnglishLevel,
+            } : {}),
+            teacherEmail: updated.teacherEmail !== undefined ? updated.teacherEmail : prev.teacherEmail,
+            teacherName: updated.teacherName !== undefined ? updated.teacherName : prev.teacherName,
+            teacherUid: updated.teacherUid !== undefined ? updated.teacherUid : prev.teacherUid,
+            assignedNativeFriendUID: updated.assignedNativeFriendUID !== undefined ? updated.assignedNativeFriendUID : prev.assignedNativeFriendUID,
+            nativeFriendUID: updated.nativeFriendUID !== undefined ? updated.nativeFriendUID : prev.nativeFriendUID,
+            enrollmentStatus: updated.enrollmentStatus || prev.enrollmentStatus,
+          };
+        });
         if (typeof updated.contractedLessons === 'number' && email) {
           setContractedLessons((prev) => ({
             ...prev,
@@ -3359,6 +3488,34 @@ export default function App() {
         (account.picture && account.picture.trim() !== '' ? account.picture : '') ||
         '';
 
+      // HOTFIX 3D.2: Reutilizar resolveCanonicalStudentLevel priorizando englishLevel e userLevel sobre level legado e valores provisórios
+      const loginCanonicalLevelType =
+        resolveCanonicalStudentLevel(initialProfile?.englishLevel, initialProfile?.userLevel) ||
+        resolveCanonicalStudentLevel((initialProfile as any)?.studentLevel, (initialProfile as any)?.cefrLevel) ||
+        resolveCanonicalStudentLevel(initialProfile?.level);
+
+      const rawLoginLevelCandidate = [
+        initialProfile?.englishLevel,
+        initialProfile?.userLevel,
+        (initialProfile as any)?.studentLevel,
+        initialProfile?.level,
+      ].find((val) => {
+        if (typeof val !== 'string') return false;
+        if (loginCanonicalLevelType === 'intermediate') return val.toLowerCase().includes('inter');
+        if (loginCanonicalLevelType === 'advanced') return val.toLowerCase().includes('avan') || val.toLowerCase().includes('adv');
+        if (loginCanonicalLevelType === 'beginner') return val.toLowerCase().includes('inici') || val.toLowerCase().includes('beg');
+        return false;
+      });
+
+      const resolvedLoginEnglishLevel = rawLoginLevelCandidate || (
+        loginCanonicalLevelType === 'intermediate' ? 'intermediate' :
+        loginCanonicalLevelType === 'advanced' ? 'advanced' :
+        loginCanonicalLevelType === 'beginner' ? EnglishLevel.BEGINNER :
+        undefined
+      );
+
+      const resolvedLoginLevel = (resolvedLoginEnglishLevel || EnglishLevel.BEGINNER) as EnglishLevel;
+
       const freshProfile: UserProfile = {
         ...createDefaultStudentProfile(safeAccount),
         ...(initialProfile || {}),
@@ -3368,9 +3525,11 @@ export default function App() {
         email: account.email,
         picture: cleanPic,
         avatar: cleanPic,
-        level: initialProfile?.level || (initialProfile as any)?.englishLevel || (initialProfile as any)?.userLevel || EnglishLevel.BEGINNER,
-        userLevel: initialProfile?.level || (initialProfile as any)?.englishLevel || (initialProfile as any)?.userLevel || EnglishLevel.BEGINNER,
-        englishLevel: initialProfile?.level || (initialProfile as any)?.englishLevel || (initialProfile as any)?.userLevel || EnglishLevel.BEGINNER,
+        level: resolvedLoginLevel,
+        ...(resolvedLoginEnglishLevel ? {
+          englishLevel: resolvedLoginEnglishLevel,
+          userLevel: resolvedLoginEnglishLevel,
+        } : {}),
         learningGoal: initialProfile?.learningGoal || '',
         weeklyStudyDaysTarget: (initialProfile as any)?.weeklyStudyDaysTarget ?? 7,
         weeklyStudyDays: (initialProfile as any)?.weeklyStudyDays || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'],
@@ -3462,7 +3621,12 @@ export default function App() {
 
   // Handler: Update student English level
   const handleLevelChange = (newLevel: EnglishLevel) => {
-    setUserProfile((prev) => ({ ...prev, level: newLevel }));
+    setUserProfile((prev) => ({
+      ...prev,
+      level: newLevel,
+      englishLevel: newLevel,
+      userLevel: newLevel,
+    }));
   };
 
   // Handler: Update contracted lessons
