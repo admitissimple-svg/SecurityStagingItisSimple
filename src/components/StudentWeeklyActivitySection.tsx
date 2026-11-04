@@ -49,6 +49,8 @@ import {
   normalizeWeekId,
   parseWeekCycleNumber,
   normalizeDictionaryWord,
+  getIsoDateInTimeZone,
+  DEFAULT_STUDENT_TIMEZONE,
 } from '../utils/studentPersistence';
 
 interface StudentWeeklyActivitySectionProps {
@@ -628,39 +630,50 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
       }
 
       // 4. Live Tutor Lessons (strictly completed lessons only, never scheduled bookings or pending trials)
+      // HOTFIX 3B.2: Consider completed ONLY a lesson belonging to this authenticated student,
+      // with status === 'completed', not cancelled, with startDateTime matching the active week's civil date,
+      // and linked to a legitimate Native Friend. Manual checkmarks, journal entries, or old week lessons NEVER count.
       if (rowId === 'tutor_live') {
-        if (weeklyChecks && Boolean(weeklyChecks[checkKey])) return true;
-
-        if (Array.isArray(lessons) && lessons.length > 0) {
-          const hasCompleted = lessons.some((l) => {
-            if (!l || l.status !== 'completed' || l.cancelledAt) return false;
-            const lessonCycle = (l as any).weeklyCycle ? parseWeekCycleNumber((l as any).weeklyCycle) : null;
-            if (lessonCycle !== null && lessonCycle !== activeWeekCycle) return false;
-            const lessonDay = l.dayOfWeek || (l.startDateTime ? new Date(l.startDateTime).toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase() : '');
-            return lessonDay === dayKey.toLowerCase();
-          });
-          if (hasCompleted) return true;
+        if (!Array.isArray(lessons) || lessons.length === 0) {
+          return false;
         }
 
-        const hasMatchingLesson = activeJournal.some((entry) => {
-          if (!entry) return false;
-          const isLesson = entry.type === 'lesson' || (entry as any).type === 'tutor_live';
-          if (!isLesson) return false;
-          if ((entry as any).status && (entry as any).status !== 'completed') return false;
-          if (entry.dayOfWeek && entry.dayOfWeek.toLowerCase() === dayKey.toLowerCase()) {
-            const entryWeek = entry.week !== undefined && entry.week !== null ? Number(entry.week) : null;
-            if (entryWeek !== null) return entryWeek === activeWeekCycle;
-            return activeWeekCycle === 1;
-          }
-          return false;
+        const cleanStudentUid = (studentUid || '').trim();
+        const cleanStudentEmail = (studentEmail || '').toLowerCase().trim();
+        const studentTimezone = userProfile?.timezone || DEFAULT_STUDENT_TIMEZONE;
+        const targetDayCivilDate = getDateForDayInCurrentWeek(dayKey, new Date(), studentTimezone);
+        const assignedTeacherEmail = (userProfile?.teacherEmail || '').toLowerCase().trim();
+        const assignedTeacherUid = (userProfile?.teacherUid || '').trim();
+
+        return lessons.some((l) => {
+          if (!l) return false;
+          // Must have completed status
+          if (l.status !== 'completed') return false;
+          // Must not be cancelled
+          if (Boolean(l.cancelledAt) || (l.status as string) === 'cancelled' || (l.status as string) === 'canceled') return false;
+
+          // Must belong to authenticated student
+          const lStudentUid = (l.studentUid || '').trim();
+          const lStudentEmail = (l.studentEmail || '').toLowerCase().trim();
+          const isStudentMatch =
+            (cleanStudentUid && lStudentUid && cleanStudentUid === lStudentUid) ||
+            (cleanStudentEmail && lStudentEmail && cleanStudentEmail === lStudentEmail);
+          if (!isStudentMatch) return false;
+
+          // Must match civil date of active week
+          if (!l.startDateTime) return false;
+          const lessonCivilDate = getIsoDateInTimeZone(l.startDateTime, studentTimezone);
+          if (lessonCivilDate !== targetDayCivilDate) return false;
+
+          // Must be linked to a legitimate Native Friend
+          const lTeacherUid = (l.teacherUid || (l as any).tutorUid || '').trim();
+          const lTeacherEmail = (l.teacherEmail || (l as any).tutorEmail || '').toLowerCase().trim();
+          if (!lTeacherUid && !lTeacherEmail) return false;
+          if (assignedTeacherUid && lTeacherUid && assignedTeacherUid !== lTeacherUid) return false;
+          if (assignedTeacherEmail && lTeacherEmail && assignedTeacherEmail !== lTeacherEmail) return false;
+
+          return true;
         });
-
-        if (hasMatchingLesson) return true;
-
-        const localCached = getCachedWeeklyChecks(studentUid, studentEmail, activeWeekCycle);
-        if (localCached && Boolean(localCached[checkKey])) return true;
-
-        return false;
       }
 
       return false;
@@ -675,12 +688,18 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
       studentUid,
       studentEmail,
       activeStudyDays,
+      userProfile?.timezone,
+      userProfile?.teacherEmail,
+      userProfile?.teacherUid,
     ]
   );
 
   const toggleCheck = (stepId: string, dayKey: DayOfWeek) => {
-    // Only allow marking days configured in the student's study plan (tutor_live remains independent)
-    if (stepId !== 'tutor_live' && !activeStudyDays.includes(dayKey)) return;
+    // HOTFIX 3B.2: tutor_live is strictly automatic based on completed lessons. Manual toggling is disabled.
+    if (stepId === 'tutor_live') return;
+
+    // Only allow marking days configured in the student's study plan
+    if (!activeStudyDays.includes(dayKey)) return;
 
     // Objective 5: If the active week is unavailable or invalid, prevent new weekly completion writes
     if (activeWeekCycle === null || !activeWeekId) {
@@ -1291,19 +1310,27 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
                           );
                         }
 
-                        if (row.id === 'video_day' || row.id === 'audio_day') {
+                        if (row.id === 'video_day' || row.id === 'audio_day' || row.id === 'tutor_live') {
                           return (
                             <div
                               key={d.key}
                               className="w-6 h-6 rounded-full flex items-center justify-center select-none"
                               title={
-                                isChecked
-                                  ? (isEn
-                                      ? `${row.titleEn} (${d.label}) • Completed`
-                                      : `${row.titlePt} (${d.label}) • Concluído`)
-                                  : (isEn
-                                      ? `${row.titleEn} (${d.label}) • Completed automatically upon watching/listening`
-                                      : `${row.titlePt} (${d.label}) • Concluído automaticamente ao praticar`)
+                                row.id === 'tutor_live'
+                                  ? isChecked
+                                    ? (isEn
+                                        ? `${row.titleEn} (${d.label}) • Completed lesson with Native Friend`
+                                        : `${row.titlePt} (${d.label}) • Aula com Amigo Nativo concluída`)
+                                    : (isEn
+                                        ? `${row.titleEn} (${d.label}) • Automatically completed upon finishing a live lesson`
+                                        : `${row.titlePt} (${d.label}) • Concluído automaticamente ao realizar a aula`)
+                                  : isChecked
+                                      ? (isEn
+                                          ? `${row.titleEn} (${d.label}) • Completed`
+                                          : `${row.titlePt} (${d.label}) • Concluído`)
+                                      : (isEn
+                                          ? `${row.titleEn} (${d.label}) • Completed automatically upon watching/listening`
+                                          : `${row.titlePt} (${d.label}) • Concluído automaticamente ao praticar`)
                               }
                             >
                               {isChecked ? (
@@ -1324,8 +1351,6 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
                             onClick={() => {
                               if (row.id === 'memorization') {
                                 onOpenHomeworkModal(d.key);
-                              } else if (row.id === 'tutor_live') {
-                                toggleCheck(row.id, d.key);
                               }
                             }}
                             className="w-6 h-6 rounded-full flex items-center justify-center cursor-pointer transition active:scale-95"

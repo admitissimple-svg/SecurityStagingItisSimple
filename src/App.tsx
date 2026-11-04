@@ -7417,6 +7417,7 @@ export default function App() {
                   }}
                   weeklyChecks={weeklyChecks}
                   onToggleWeeklyCheck={(stepId, dayKey, forcedChecked) => {
+                    if (stepId === 'tutor_live') return;
                     const isCompleted = typeof forcedChecked === 'boolean'
                       ? forcedChecked
                       : !Boolean(weeklyChecks[`${stepId}_${dayKey}`]);

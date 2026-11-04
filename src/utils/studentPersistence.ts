@@ -52,7 +52,7 @@ import {
   resolveDailyMemorizationVocabulary,
 } from './homeworkGenerator';
 
-export { getIsoDateInTimeZone };
+export { getIsoDateInTimeZone, DEFAULT_STUDENT_TIMEZONE };
 
 // Pure in-memory session caches to provide instant zero-delay UI rendering during active session
 // ZERO dependency on localStorage: 100% of persistent data is stored in Cloud Firestore
@@ -3699,7 +3699,7 @@ export function deriveWeeklyChecksFromJournal(
       }
     }
     const stepId = mapJournalTypeToStepId(entry.type);
-    if (stepId && entry.dayOfWeek) {
+    if (stepId && stepId !== 'tutor_live' && entry.dayOfWeek) {
       checks[`${stepId}_${entry.dayOfWeek.toLowerCase()}`] = true;
     }
   });
@@ -3828,7 +3828,7 @@ export async function recordActivityInStudentJournal(
 
       // Prepare updated weeklyChecks and watched/listened arrays for complete cross-compatibility
       const stepId = mapJournalTypeToStepId(sanitizedEntry.type);
-      const checkKey = stepId && sanitizedEntry.dayOfWeek ? `${stepId}_${sanitizedEntry.dayOfWeek.toLowerCase()}` : null;
+      const checkKey = stepId && stepId !== 'tutor_live' && sanitizedEntry.dayOfWeek ? `${stepId}_${sanitizedEntry.dayOfWeek.toLowerCase()}` : null;
       const currentChecks = userData?.weeklyChecks || {};
       const updatedChecks = checkKey ? { ...currentChecks, [checkKey]: true } : currentChecks;
 
