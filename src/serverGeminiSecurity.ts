@@ -583,26 +583,137 @@ export type GeminiFailureCategory =
   | string;
 
 /**
+ * Safely extracts a structured numeric HTTP status code from an error object.
+ * Prioritizes error.status, error.statusCode, and error.httpStatus.
+ * Accepts exact 3-digit HTTP status codes (100-599).
+ */
+export function extractStructuredHttpStatus(err: any): number | undefined {
+  if (!err) return undefined;
+  const candidate = err.status ?? err.statusCode ?? err.httpStatus;
+  if (typeof candidate === 'number' && Number.isInteger(candidate) && candidate >= 100 && candidate <= 599) {
+    return candidate;
+  }
+  if (typeof candidate === 'string') {
+    const trimmed = candidate.trim();
+    if (/^[1-5][0-9]{2}$/.test(trimmed)) {
+      const parsed = parseInt(trimmed, 10);
+      if (parsed >= 100 && parsed <= 599) return parsed;
+    }
+  }
+  if (typeof err.code === 'number' && Number.isInteger(err.code) && err.code >= 100 && err.code <= 599) {
+    return err.code;
+  }
+  if (typeof err.code === 'string' && /^[1-5][0-9]{2}$/.test(err.code.trim())) {
+    const parsed = parseInt(err.code.trim(), 10);
+    if (parsed >= 100 && parsed <= 599) return parsed;
+  }
+  return undefined;
+}
+
+/**
+ * Safely extracts an explicit, delimited HTTP status code from an error message string.
+ * Strictly ignores numbers embedded in durations (e.g. 14000ms, 7000ms, 400ms),
+ * counters, tokens, or arbitrary identifiers.
+ */
+export function extractDelimitedHttpStatusFromText(message: string): number | undefined {
+  if (!message || typeof message !== 'string') return undefined;
+
+  // 1. Explicit HTTP / Status prefixes: e.g. "HTTP 400", "status: 404", "status code 429", "code: 503", "error 401", "[400]", "(404)"
+  const prefixMatch = message.match(/(?:(?:HTTP(?:\/[0-9.]+)?|status(?:\s+code)?|code|error)\s*[:=\-]?\s*|\[|\()([1-5][0-9]{2})(?:\s*\]|\)|\b)/i);
+  if (prefixMatch && prefixMatch[1]) {
+    const code = parseInt(prefixMatch[1], 10);
+    if (code >= 100 && code <= 599) return code;
+  }
+
+  // 2. HTTP code followed by standard HTTP reason phrase: e.g. "400 Bad Request", "404 Not Found", "503 Service Unavailable", "429 Too Many Requests"
+  const phraseMatch = message.match(/\b(400\s+Bad\s+Request|400\s+Invalid\s+Argument|401\s+Unauthorized|403\s+Forbidden|404\s+Not\s+Found|408\s+Request\s+Timeout|429\s+Too\s+Many\s+Requests|500\s+Internal\s+Server\s+Error|502\s+Bad\s+Gateway|503\s+Service\s+Unavailable|504\s+Gateway\s+Timeout)\b/i);
+  if (phraseMatch && phraseMatch[1]) {
+    const code = parseInt(phraseMatch[1].slice(0, 3), 10);
+    if (code >= 100 && code <= 599) return code;
+  }
+
+  // 3. Isolated standalone 3-digit HTTP status code bounded by non-word/non-digit,
+  // strictly excluding numbers followed by units (ms, s, sec, tokens, items, chars, bytes, etc.) or preceded by digits/letters
+  const standaloneMatch = message.match(/(?<![\w\d])([1-5][0-9]{2})(?![\w\d]|\s*(?:ms|s|sec|seconds?|min|minutes?|tokens?|bytes?|chars?|items?|words?|px))/i);
+  if (standaloneMatch && standaloneMatch[1]) {
+    const code = parseInt(standaloneMatch[1], 10);
+    if ([400, 401, 403, 404, 408, 429, 500, 502, 503, 504].includes(code)) {
+      return code;
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Checks whether an error represents a client-side timeout, deadline exceeded, or request abort.
+ */
+export function isTimeoutError(err: any): boolean {
+  if (!err) return false;
+  if (typeof err === 'object' && err.category === 'TIMEOUT') {
+    return true;
+  }
+  if (
+    err?.name === 'AbortError' ||
+    err?.code === 'ETIMEDOUT' ||
+    err?.code === 'ECONNABORTED' ||
+    err?.code === 'DEADLINE_EXCEEDED'
+  ) {
+    return true;
+  }
+  const msg = (
+    err instanceof Error
+      ? err.message
+      : typeof err === 'object'
+      ? err?.rawMessage || err?.message || err?.safeReason || ''
+      : String(err)
+  ).toLowerCase();
+
+  if (
+    msg.includes('timeout') ||
+    msg.includes('timed out') ||
+    msg.includes('deadline exceeded') ||
+    msg.includes('deadline_exceeded') ||
+    msg.includes('aborterror') ||
+    msg.includes('operation aborted')
+  ) {
+    return true;
+  }
+
+  const structuredStatus = extractStructuredHttpStatus(err);
+  if (structuredStatus === 408 || structuredStatus === 504) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
  * Detects whether an error is specifically caused by an incompatible model configuration
  * (e.g. unsupported thinking parameters, unsupported fields for that specific model).
  * Does not classify safety, harm, or authentication violations as config errors.
  */
 export function isModelConfigIncompatibleError(error?: {
   statusCode?: number;
+  status?: number;
   category?: GeminiFailureCategory;
   rawMessage?: string;
-} | Error | null): boolean {
+  message?: string;
+  safeReason?: string;
+} | Error | any | null): boolean {
   if (!error) return false;
+  if (isTimeoutError(error)) return false;
+
   let rawMessage = '';
   let statusCode: number | undefined;
   let category: GeminiFailureCategory | undefined;
 
   if (error instanceof Error) {
     rawMessage = error.message || '';
-    statusCode = (error as any).status || (error as any).statusCode;
+    statusCode = extractStructuredHttpStatus(error);
   } else {
-    rawMessage = error.rawMessage || '';
-    statusCode = error.statusCode;
+    rawMessage = (error as any).rawMessage || (error as any).message || (error as any).safeReason || '';
+    statusCode = error.statusCode ?? extractStructuredHttpStatus(error);
     category = error.category;
   }
 
@@ -625,7 +736,9 @@ export function isModelConfigIncompatibleError(error?: {
     return false;
   }
 
-  const is400 = statusCode === 400 || raw.includes('400') || raw.includes('invalid_argument');
+  const textStatus = extractDelimitedHttpStatusFromText(rawMessage);
+  const effectiveStatus = statusCode ?? textStatus;
+  const is400 = effectiveStatus === 400 || raw.includes('invalid_argument');
   if (!is400) return false;
 
   // Specific parameter or model capability incompatibility patterns
@@ -650,6 +763,200 @@ export function isModelConfigIncompatibleError(error?: {
   }
 
   return false;
+}
+
+/**
+ * Unified, deterministic classifier for all Gemini errors:
+ * - Prioritizes structured HTTP status codes over arbitrary text numbers
+ * - Explicitly and safely recognizes delimited HTTP status codes from text
+ * - Classifies timeouts and deadline aborts with high precedence as recoverable
+ * - Preserves immediate non-recoverable abort for Auth, Safety/Policy, and Shared Quota
+ */
+export function classifyGeminiError(err: any): {
+  statusCode?: number;
+  category: GeminiFailureCategory;
+  safeReason: string;
+  rawMessage: string;
+  nonRecoverable: boolean;
+} {
+  const rawMessage = String(
+    err instanceof Error
+      ? err.message
+      : typeof err === 'object'
+      ? err?.rawMessage || err?.message || err?.safeReason || ''
+      : err || ''
+  );
+  const rawLower = rawMessage.toLowerCase();
+
+  const structuredStatus = extractStructuredHttpStatus(err);
+  const textStatus = extractDelimitedHttpStatusFromText(rawMessage);
+  const explicitHttpStatus = (err as any)?.statusCode ?? structuredStatus ?? textStatus;
+
+  // 1. Strict Authentication & Permissions errors (HTTP 401, 403, api_key issues)
+  const isAuth =
+    explicitHttpStatus === 401 ||
+    explicitHttpStatus === 403 ||
+    rawLower.includes('permission_denied') ||
+    rawLower.includes('permission denied') ||
+    rawLower.includes('api_key_invalid') ||
+    rawLower.includes('api key not valid') ||
+    rawLower.includes('apikey not found') ||
+    rawLower.includes('api_key') ||
+    rawLower.includes('apikey') ||
+    rawLower.includes('unauthenticated') ||
+    rawLower.includes('unauthorized') ||
+    rawLower.includes('billing is not enabled') ||
+    rawLower.includes('billing_not_enabled') ||
+    rawLower.includes('enable billing') ||
+    rawLower.includes('account_disabled');
+
+  if (isAuth) {
+    return {
+      statusCode: explicitHttpStatus === 401 ? 401 : 403,
+      category: 'AUTH_ERROR',
+      safeReason: 'Gemini authentication failed or invalid credentials.',
+      rawMessage: rawMessage.slice(0, 150),
+      nonRecoverable: true,
+    };
+  }
+
+  // 2. Strict Safety & Policy violations
+  const isSafety =
+    rawLower.includes('safety') ||
+    rawLower.includes('harm_category') ||
+    rawLower.includes('blocked by safety') ||
+    (rawLower.includes('blocked') && (rawLower.includes('policy') || rawLower.includes('harm')));
+
+  if (isSafety) {
+    return {
+      statusCode: 400,
+      category: 'POLICY_VIOLATION',
+      safeReason: 'Request could not be processed due to invalid parameters or policy.',
+      rawMessage: rawMessage.slice(0, 150),
+      nonRecoverable: true,
+    };
+  }
+
+  // 3. Shared/Project-wide quota exhaustion
+  const isSharedQuota =
+    (explicitHttpStatus === 429 || rawLower.includes('quota') || rawLower.includes('resource_exhausted')) &&
+    (rawLower.includes('project_quota') ||
+      rawLower.includes('shared_quota') ||
+      (rawLower.includes('project') && (rawLower.includes('perday') || rawLower.includes('limit') || rawLower.includes('billable'))));
+
+  if (isSharedQuota) {
+    return {
+      statusCode: 429,
+      category: 'QUOTA_EXCEEDED',
+      safeReason: 'Gemini quota or rate limit exceeded.',
+      rawMessage: rawMessage.slice(0, 150),
+      nonRecoverable: true,
+    };
+  }
+
+  // 4. Timeout & deadline aborts: classified with precedence before HTTP 400 / 503 / 500
+  if (isTimeoutError(err)) {
+    // Only assign HTTP status if structured HTTP 408/504 was explicitly provided;
+    // local/client timeouts have undefined statusCode (not an HTTP error status)
+    const statusCode = (structuredStatus === 408 || structuredStatus === 504) ? structuredStatus : undefined;
+    return {
+      statusCode,
+      category: 'TIMEOUT',
+      safeReason: 'Request timed out waiting for model response.',
+      rawMessage: rawMessage.slice(0, 150),
+      nonRecoverable: false, // Timeouts are explicitly recoverable as long as remaining time exists in total deadline
+    };
+  }
+
+  // 5. Per-model Quota (HTTP 429 / resource exhausted)
+  const isPerModelQuota =
+    explicitHttpStatus === 429 ||
+    rawLower.includes('resource_exhausted') ||
+    rawLower.includes('quota exceeded') ||
+    rawLower.includes('rate limit');
+
+  if (isPerModelQuota) {
+    return {
+      statusCode: 429,
+      category: 'QUOTA_EXCEEDED',
+      safeReason: 'Gemini quota or rate limit exceeded.',
+      rawMessage: rawMessage.slice(0, 150),
+      nonRecoverable: false, // Per-model quota is recoverable across contingency pool
+    };
+  }
+
+  // 6. Service Unavailable (HTTP 503 / 502 / high demand / overloaded)
+  const isServiceUnavailable =
+    explicitHttpStatus === 503 ||
+    explicitHttpStatus === 502 ||
+    rawLower.includes('high demand') ||
+    rawLower.includes('service unavailable') ||
+    rawLower.includes('temporarily unavailable') ||
+    rawLower.includes('overloaded') ||
+    rawLower.includes('model is experiencing high demand') ||
+    rawLower.includes('model is overloaded');
+
+  if (isServiceUnavailable) {
+    return {
+      statusCode: explicitHttpStatus === 502 ? 502 : 503,
+      category: 'SERVICE_UNAVAILABLE',
+      safeReason: 'Gemini model is temporarily experiencing high demand (HTTP 503).',
+      rawMessage: rawMessage.slice(0, 150),
+      nonRecoverable: false,
+    };
+  }
+
+  // 7. Model Not Found (HTTP 404)
+  const isNotFound =
+    explicitHttpStatus === 404 ||
+    (!rawLower.includes('apikey') &&
+      !rawLower.includes('api key') &&
+      (rawLower.includes('not found') || rawLower.includes('not_found')));
+
+  if (isNotFound) {
+    return {
+      statusCode: 404,
+      category: 'MODEL_NOT_FOUND',
+      safeReason: 'Gemini model was not found or is unavailable (HTTP 404).',
+      rawMessage: rawMessage.slice(0, 150),
+      nonRecoverable: false,
+    };
+  }
+
+  // 8. Model Incompatible Configuration (HTTP 400 parameter/thinking mismatch)
+  if (isModelConfigIncompatibleError(err)) {
+    return {
+      statusCode: 400,
+      category: 'MODEL_INCOMPATIBLE_CONFIG',
+      safeReason: 'Gemini model rejected request due to incompatible configuration parameter.',
+      rawMessage: rawMessage.slice(0, 150),
+      nonRecoverable: false,
+    };
+  }
+
+  // 9. True 400 Bad Request / Invalid Argument
+  const isPolicyViolation =
+    explicitHttpStatus === 400 ||
+    rawLower.includes('invalid_argument');
+
+  if (isPolicyViolation) {
+    return {
+      statusCode: 400,
+      category: 'POLICY_VIOLATION',
+      safeReason: 'Request could not be processed due to invalid parameters or policy.',
+      rawMessage: rawMessage.slice(0, 150),
+      nonRecoverable: true,
+    };
+  }
+
+  // 10. Default unclassified error
+  return {
+    statusCode: explicitHttpStatus ?? 500,
+    category: 'INVALID_RESPONSE',
+    safeReason: 'Gemini service encountered an internal error.',
+    rawMessage: rawMessage.slice(0, 150),
+    nonRecoverable: false,
+  };
 }
 
 export interface GeminiSingleAttemptResponse {
@@ -814,109 +1121,7 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
     return { text: rawText, parsedJson: parsed };
   } catch (err: any) {
     const durationMs = Date.now() - startTime;
-    const errMsg = String(err?.message || err);
-
-    const rawStatus = Number(err?.status || err?.statusCode || err?.code || 0);
-    const isServiceUnavailable =
-      rawStatus === 503 ||
-      errMsg.includes('503') ||
-      errMsg.toLowerCase().includes('high demand') ||
-      errMsg.toLowerCase().includes('service unavailable') ||
-      errMsg.toLowerCase().includes('temporarily unavailable') ||
-      errMsg.toLowerCase().includes('overloaded') ||
-      errMsg.toLowerCase().includes('model is experiencing high demand');
-
-    const isNotFound =
-      rawStatus === 404 ||
-      (!errMsg.toLowerCase().includes('apikey') &&
-        !errMsg.toLowerCase().includes('api key') &&
-        (errMsg.includes('404') ||
-          errMsg.toLowerCase().includes('not found') ||
-          errMsg.toLowerCase().includes('not_found')));
-
-    const isConfigIncompatible = isModelConfigIncompatibleError(err);
-
-    const statusCode = isServiceUnavailable
-      ? 503
-      : isNotFound
-      ? 404
-      : isConfigIncompatible
-      ? 400
-      : rawStatus ||
-        (errMsg.includes('429')
-          ? 429
-          : errMsg.includes('403')
-          ? 403
-          : errMsg.includes('401')
-          ? 401
-          : errMsg.includes('400')
-          ? 400
-          : 500);
-
-    const isQuota =
-      !isServiceUnavailable &&
-      !isNotFound &&
-      (statusCode === 429 ||
-        errMsg.toLowerCase().includes('quota') ||
-        errMsg.toLowerCase().includes('resource_exhausted'));
-
-    const isAuth =
-      !isServiceUnavailable &&
-      !isNotFound &&
-      (statusCode === 401 ||
-        statusCode === 403 ||
-        errMsg.toLowerCase().includes('permission_denied') ||
-        errMsg.toLowerCase().includes('permission denied') ||
-        errMsg.toLowerCase().includes('api_key') ||
-        errMsg.toLowerCase().includes('apikey'));
-
-    const isTimeout =
-      !isServiceUnavailable &&
-      !isNotFound &&
-      (errMsg.toLowerCase().includes('timeout') || statusCode === 408);
-
-    const isPolicyViolation =
-      !isConfigIncompatible &&
-      !isAuth &&
-      !isQuota &&
-      !isServiceUnavailable &&
-      !isNotFound &&
-      (statusCode === 400 ||
-        errMsg.toLowerCase().includes('invalid_argument') ||
-        errMsg.toLowerCase().includes('safety') ||
-        errMsg.toLowerCase().includes('harm_category'));
-
-    const category: GeminiFailureCategory = isServiceUnavailable
-      ? 'SERVICE_UNAVAILABLE'
-      : isNotFound
-      ? 'MODEL_NOT_FOUND'
-      : isConfigIncompatible
-      ? 'MODEL_INCOMPATIBLE_CONFIG'
-      : isQuota
-      ? 'QUOTA_EXCEEDED'
-      : isAuth
-      ? 'AUTH_ERROR'
-      : isTimeout
-      ? 'TIMEOUT'
-      : isPolicyViolation
-      ? 'POLICY_VIOLATION'
-      : 'INVALID_RESPONSE';
-
-    const safeReason = isServiceUnavailable
-      ? 'Gemini model is temporarily experiencing high demand (HTTP 503).'
-      : isNotFound
-      ? 'Gemini model was not found or is unavailable (HTTP 404).'
-      : isConfigIncompatible
-      ? 'Gemini model rejected request due to incompatible configuration parameter.'
-      : isQuota
-      ? 'Gemini quota or rate limit exceeded.'
-      : isAuth
-      ? 'Gemini authentication failed or invalid credentials.'
-      : isTimeout
-      ? 'Request timed out waiting for model response.'
-      : isPolicyViolation
-      ? 'Request could not be processed due to invalid parameters or policy.'
-      : 'Gemini service encountered an internal error.';
+    const classified = classifyGeminiError(err);
 
     logGeminiAudited({
       feature,
@@ -924,16 +1129,16 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
       callerRole,
       durationMs,
       model: modelToUse,
-      detail: errMsg.slice(0, 100),
+      detail: classified.rawMessage.slice(0, 100),
     });
 
     return {
       parsedJson: null,
       error: {
-        statusCode,
-        category,
-        safeReason,
-        rawMessage: errMsg.slice(0, 150),
+        statusCode: classified.statusCode,
+        category: classified.category,
+        safeReason: classified.safeReason,
+        rawMessage: classified.rawMessage,
       },
     };
   }
@@ -945,37 +1150,41 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
  */
 export function isNonRecoverableGeminiError(error?: {
   statusCode?: number;
+  status?: number;
   category?: GeminiFailureCategory;
   rawMessage?: string;
-} | Error | null): boolean {
+  message?: string;
+  safeReason?: string;
+  nonRecoverable?: boolean;
+} | Error | any | null): boolean {
   if (!error) return false;
 
-  let statusCode: number | undefined;
-  let category: GeminiFailureCategory | undefined;
-  let rawMessage = '';
+  if ((error as any).nonRecoverable !== undefined) {
+    return Boolean((error as any).nonRecoverable);
+  }
 
-  if (error instanceof Error) {
-    rawMessage = error.message || '';
-    if ((error as any).status || (error as any).statusCode) {
-      statusCode = (error as any).status || (error as any).statusCode;
-    }
-  } else {
-    statusCode = error.statusCode;
-    category = error.category;
-    rawMessage = error.rawMessage || '';
+  // Explicitly check timeout first: timeouts are always recoverable (within total deadline)
+  if (isTimeoutError(error)) {
+    return false;
   }
 
   // 1. Incompatible configuration error (HTTP 400 parameter mismatch): recoverable, proceed to next model
-  if (category === 'MODEL_INCOMPATIBLE_CONFIG' || isModelConfigIncompatibleError(error)) {
+  if ((error as any).category === 'MODEL_INCOMPATIBLE_CONFIG' || isModelConfigIncompatibleError(error)) {
     return false;
   }
 
   // 2. Model not found (HTTP 404): recoverable, proceed to next model (unless API key missing)
-  if (category === 'MODEL_NOT_FOUND') {
+  if ((error as any).category === 'MODEL_NOT_FOUND') {
     return false;
   }
+
+  let statusCode = extractStructuredHttpStatus(error) ?? (error as any).statusCode;
+  let rawMessage = error instanceof Error ? error.message : (error as any).rawMessage || (error as any).message || '';
   const raw = rawMessage.toLowerCase();
-  if (statusCode === 404) {
+  const textStatus = extractDelimitedHttpStatusFromText(rawMessage);
+  const effectiveStatus = statusCode ?? textStatus;
+
+  if (effectiveStatus === 404) {
     if (raw.includes('apikey not found') || raw.includes('api key not found')) {
       return true; // Auth error
     }
@@ -983,17 +1192,20 @@ export function isNonRecoverableGeminiError(error?: {
   }
 
   // 3. Strict non-recoverable checks (Auth, true Policy, general 400/401/403):
-  if (category === 'AUTH_ERROR') return true;
-  if (category === 'POLICY_VIOLATION') return true;
-  if (statusCode === 401 || statusCode === 403) return true;
-  if (statusCode === 400) {
+  if ((error as any).category === 'AUTH_ERROR') return true;
+  if ((error as any).category === 'POLICY_VIOLATION') return true;
+  if (effectiveStatus === 401 || effectiveStatus === 403) return true;
+  if (effectiveStatus === 400) {
     return true;
   }
 
   // Quota evaluation:
-  // If quota is per-model (e.g. GenerateRequestsPerDayPerProjectPerModel, free_tier_requests): recoverable on next model in contingency pool.
-  // If quota is shared/project-wide (e.g. daily limit for project): non-recoverable.
-  if (category === 'QUOTA_EXCEEDED' || statusCode === 429 || raw.includes('quota') || raw.includes('resource_exhausted')) {
+  if (
+    (error as any).category === 'QUOTA_EXCEEDED' ||
+    effectiveStatus === 429 ||
+    raw.includes('quota') ||
+    raw.includes('resource_exhausted')
+  ) {
     if (
       raw.includes('project_quota') ||
       raw.includes('shared_quota') ||
@@ -1013,7 +1225,7 @@ export function isNonRecoverableGeminiError(error?: {
     return false;
   }
 
-  // Non-recoverable account & billing directives (must not false-positive on standard quota advice "check your plan and billing details")
+  // Non-recoverable account & billing directives
   if (
     raw.includes('billing is not enabled') ||
     raw.includes('billing_not_enabled') ||
@@ -1023,6 +1235,7 @@ export function isNonRecoverableGeminiError(error?: {
     raw.includes('apikey not found') ||
     raw.includes('api key not valid') ||
     raw.includes('permission denied') ||
+    raw.includes('permission_denied') ||
     raw.includes('user location is not supported') ||
     raw.includes('disabled on project') ||
     raw.includes('project has been deleted') ||
@@ -1188,7 +1401,6 @@ export async function executeGeminiWithContingency(
         detail: `Contingency sequence interrupted: remaining time (${remainingTime}ms) insufficient for attempt ${i + 1}/${models.length}.`,
       });
       lastError = {
-        statusCode: 408,
         category: 'TIMEOUT',
         safeReason: 'Prazo total de contingência esgotado antes de tentar o próximo modelo.',
         rawMessage: 'TOTAL_DEADLINE_EXCEEDED',
@@ -1213,27 +1425,16 @@ export async function executeGeminiWithContingency(
         });
       }
     } catch (err: any) {
-      const isNonRec = isNonRecoverableGeminiError(err);
-      const isNotFound =
-        err?.status === 404 ||
-        err?.statusCode === 404 ||
-        (String(err?.message || '').toLowerCase().includes('not found') &&
-          !String(err?.message || '').toLowerCase().includes('apikey'));
-      const isConfigIncompat = isModelConfigIncompatibleError(err);
+      const classified = classifyGeminiError(err);
       attempt = {
         text: '',
         parsedJson: null,
         error: {
-          statusCode: err?.status || err?.statusCode || (isNotFound ? 404 : isConfigIncompat ? 400 : 500),
-          category: isNonRec
-            ? 'AUTH_ERROR'
-            : isNotFound
-            ? 'MODEL_NOT_FOUND'
-            : isConfigIncompat
-            ? 'MODEL_INCOMPATIBLE_CONFIG'
-            : 'SERVICE_UNAVAILABLE',
-          safeReason: err?.message || 'Execution failed',
-          rawMessage: err?.message || String(err),
+          statusCode: classified.statusCode,
+          category: classified.category,
+          safeReason: classified.safeReason,
+          rawMessage: classified.rawMessage,
+          nonRecoverable: classified.nonRecoverable,
         },
       };
     }
