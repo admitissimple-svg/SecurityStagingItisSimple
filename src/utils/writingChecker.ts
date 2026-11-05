@@ -1105,11 +1105,16 @@ export async function checkStudentWritingApi(
       headers['Authorization'] = `Bearer ${token}`;
     }
 
+    const controller = new AbortController();
+    const abortTimeout = setTimeout(() => controller.abort(), 24000);
+
     const res = await fetch('/api/check-writing', {
       method: 'POST',
       headers,
+      signal: controller.signal,
       body: JSON.stringify(params),
     });
+    clearTimeout(abortTimeout);
 
     if (res.status === 401 || res.status === 403) {
       console.warn(`Backend writing check rejected (${res.status}): unauthenticated or unauthorized.`);
@@ -1473,11 +1478,16 @@ export async function evaluateWeeklyHomeworkApi(params: {
       headers['Authorization'] = `Bearer ${token}`;
     }
 
+    const controller = new AbortController();
+    const abortTimeout = setTimeout(() => controller.abort(), 42000);
+
     res = await fetch('/api/homework/evaluate', {
       method: 'POST',
       headers,
+      signal: controller.signal,
       body: JSON.stringify(params),
     });
+    clearTimeout(abortTimeout);
 
     status = res.status;
 

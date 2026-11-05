@@ -146,6 +146,7 @@ export interface FeaturePolicy {
   rateLimitMaxRequests: number;
   maxInputLengthChars: number;
   timeoutMs: number;
+  totalDeadlineMs?: number;
 }
 
 export const GEMINI_POLICIES: Record<GeminiFeature, FeaturePolicy> = {
@@ -154,63 +155,72 @@ export const GEMINI_POLICIES: Record<GeminiFeature, FeaturePolicy> = {
     rateLimitWindowSeconds: 300,
     rateLimitMaxRequests: 5,
     maxInputLengthChars: 10000,
-    timeoutMs: 16000,
+    timeoutMs: 12000,
+    totalDeadlineMs: 30000,
   },
   homework_generate: {
-    maxOutputTokens: 2200,
+    maxOutputTokens: 4000,
     rateLimitWindowSeconds: 300,
     rateLimitMaxRequests: 6,
     maxInputLengthChars: 4000,
-    timeoutMs: 22000,
+    timeoutMs: 14000,
+    totalDeadlineMs: 38000,
   },
   homework_part4: {
-    maxOutputTokens: 850,
+    maxOutputTokens: 2200,
     rateLimitWindowSeconds: 300,
     rateLimitMaxRequests: 6,
     maxInputLengthChars: 2000,
-    timeoutMs: 15000,
+    timeoutMs: 10000,
+    totalDeadlineMs: 26000,
   },
   check_daily_sentence: {
     maxOutputTokens: 1500,
     rateLimitWindowSeconds: 60,
     rateLimitMaxRequests: 15,
     maxInputLengthChars: 500,
-    timeoutMs: 16000,
+    timeoutMs: 10000,
+    totalDeadlineMs: 25000,
   },
   check_writing: {
-    maxOutputTokens: 600,
+    maxOutputTokens: 1200,
     rateLimitWindowSeconds: 60,
     rateLimitMaxRequests: 15,
     maxInputLengthChars: 500,
-    timeoutMs: 6000,
+    timeoutMs: 7000,
+    totalDeadlineMs: 20000,
   },
   homework_evaluate: {
     maxOutputTokens: 2500,
     rateLimitWindowSeconds: 300,
     rateLimitMaxRequests: 6,
     maxInputLengthChars: 8000,
-    timeoutMs: 30000,
+    timeoutMs: 14000,
+    totalDeadlineMs: 38000,
   },
   dictionary_define: {
-    maxOutputTokens: 600,
+    maxOutputTokens: 800,
     rateLimitWindowSeconds: 60,
     rateLimitMaxRequests: 20,
     maxInputLengthChars: 1500,
-    timeoutMs: 12000,
+    timeoutMs: 8000,
+    totalDeadlineMs: 20000,
   },
   vocab_generate: {
     maxOutputTokens: 800,
     rateLimitWindowSeconds: 300,
     rateLimitMaxRequests: 10,
     maxInputLengthChars: 3000,
-    timeoutMs: 8000,
+    timeoutMs: 7000,
+    totalDeadlineMs: 18000,
   },
   lesson_insights: {
-    maxOutputTokens: 250,
+    maxOutputTokens: 500,
     rateLimitWindowSeconds: 60,
     rateLimitMaxRequests: 12,
     maxInputLengthChars: 3000,
-    timeoutMs: 12000,
+    timeoutMs: 8000,
+    totalDeadlineMs: 20000,
   },
 };
 
@@ -661,10 +671,12 @@ export async function executeGeminiSingleAttempt(params: {
   apiKey?: string;
   callerRole?: string;
   model?: string;
+  timeoutMs?: number;
 }): Promise<GeminiSingleAttemptResponse | null> {
   const { feature, systemInstruction, untrustedUserDataPrompt, temperature = 0.35, callerRole = 'student' } = params;
   const policy = GEMINI_POLICIES[feature];
   const apiKey = params.apiKey !== undefined ? params.apiKey : (process.env.GEMINI_API_KEY || process.env.API_KEY || '');
+  const timeoutMs = params.timeoutMs !== undefined ? params.timeoutMs : (policy?.timeoutMs || 15000);
 
   if (!apiKey) {
     logGeminiAudited({
@@ -723,7 +735,7 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
 
     let timerId: NodeJS.Timeout | null = null;
     const timeoutPromise = new Promise<never>((_, reject) => {
-      timerId = setTimeout(() => reject(new Error(`Timeout: Gemini generation exceeded ${policy.timeoutMs}ms deadline`)), policy.timeoutMs);
+      timerId = setTimeout(() => reject(new Error(`Timeout: Gemini generation exceeded ${timeoutMs}ms deadline`)), timeoutMs);
     });
 
     const generatePromise = ai.models.generateContent({
@@ -1153,23 +1165,51 @@ export async function executeGeminiWithContingency(
     ? params.modelsOverride.slice(0, 3)
     : resolveGeminiContingencyModels();
 
+  const policy = GEMINI_POLICIES[params.feature];
+  const totalDeadlineMs = policy?.totalDeadlineMs || (policy ? policy.timeoutMs * 2.5 : 35000);
+  const minAttemptMarginMs = 2500;
+
   const modelsAttempted: string[] = [];
   const attemptsDetails: GeminiAttemptDetail[] = [];
   let lastError: any = null;
 
   for (let i = 0; i < models.length; i++) {
+    const elapsedSoFar = Date.now() - cascadeStartTime;
+    const remainingTime = totalDeadlineMs - elapsedSoFar;
+
+    // Check if total deadline is already exhausted before starting subsequent attempts
+    if (i > 0 && remainingTime < minAttemptMarginMs) {
+      logGeminiAudited({
+        feature: params.feature,
+        status: 'GEMINI_ERROR',
+        callerRole: params.callerRole,
+        correlationId: params.correlationId,
+        durationMs: elapsedSoFar,
+        detail: `Contingency sequence interrupted: remaining time (${remainingTime}ms) insufficient for attempt ${i + 1}/${models.length}.`,
+      });
+      lastError = {
+        statusCode: 408,
+        category: 'TIMEOUT',
+        safeReason: 'Prazo total de contingência esgotado antes de tentar o próximo modelo.',
+        rawMessage: 'TOTAL_DEADLINE_EXCEEDED',
+      };
+      break;
+    }
+
     const currentModel = models[i];
     modelsAttempted.push(currentModel);
     const attemptStartTime = Date.now();
+    const attemptTimeoutMs = Math.min(policy?.timeoutMs || 15000, Math.max(1500, remainingTime));
 
     let attempt: any = null;
     try {
       if (attemptExecutor) {
-        attempt = await attemptExecutor(currentModel, params);
+        attempt = await attemptExecutor(currentModel, { ...params, timeoutMs: attemptTimeoutMs });
       } else {
         attempt = await executeGeminiSingleAttempt({
           ...params,
           model: currentModel,
+          timeoutMs: attemptTimeoutMs,
         });
       }
     } catch (err: any) {

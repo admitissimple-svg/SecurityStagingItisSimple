@@ -15326,7 +15326,7 @@ PEDAGOGICAL INSTRUCTIONS:
 8. Exactly 2 or 3 comprehension questions testing concrete story events.
 Return strict JSON only.`;
 
-  // HOTFIX 2.3.5L: Sequential 3-Model Contingency Failover (gemini-3.5-flash -> gemini-3.8-flash -> gemini-3.1-flash-lite)
+  // HOTFIX IA.2A: Centralized 3-Model Contingency Failover via resolveGeminiContingencyModels()
   const contingencyResult = await executeGeminiWithContingency({
     feature: 'homework_part4',
     systemInstruction,
@@ -15334,7 +15334,6 @@ Return strict JSON only.`;
     callerRole: 'student',
     apiKey,
     temperature: 0.7,
-    modelsOverride: ['gemini-3.5-flash', 'gemini-3.8-flash', 'gemini-3.1-flash-lite'],
     validator: (json) => validatePart4StoryResponse(json, words),
   });
 

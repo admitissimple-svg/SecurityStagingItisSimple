@@ -2069,7 +2069,7 @@ export async function generateWeeklyHomeworkWithAi(params: {
     );
 
     const controller = new AbortController();
-    const abortTimeout = setTimeout(() => controller.abort(), 35000);
+    const abortTimeout = setTimeout(() => controller.abort(), 42000);
 
     const currentUid = auth?.currentUser?.uid || params.studentUid || '';
     const currentEmail = (auth?.currentUser?.email || params.studentEmail || '').toLowerCase().trim();
@@ -2161,7 +2161,7 @@ export async function generatePart4StoryWithAi(params: {
 
   try {
     const controller = new AbortController();
-    const abortTimeout = setTimeout(() => controller.abort(), 25000);
+    const abortTimeout = setTimeout(() => controller.abort(), 30000);
 
     const currentUid = auth?.currentUser?.uid || params.studentUid || '';
     const currentEmail = (auth?.currentUser?.email || params.studentEmail || '').toLowerCase().trim();
