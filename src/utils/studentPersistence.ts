@@ -27,7 +27,7 @@ import {
 export type { StudentJournalEntry };
 import { handleFirestoreError, OperationType, withFirestoreTimeout } from './routineSync';
 import { DAYS_OF_WEEK, getTodayDayOfWeek } from './notifications';
-import { getAccessToken } from './auth';
+import { getAccessToken, waitForAuthUser, isAuthorizedAdminUser } from './auth';
 import { normalizeDictionaryWord, consolidateDictionaryEntries } from './studentDictionaryLibrary';
 import {
   assertSafeFirestoreWrite,
@@ -1988,13 +1988,34 @@ export async function saveStudentNativeFriendToFirestore(
   }
 
   if (typeof window !== 'undefined') {
+    const authUser = (await waitForAuthUser(3000).catch(() => null)) || auth.currentUser;
+    if (!authUser || !authUser.uid || !isValidCanonicalUid(authUser.uid)) {
+      console.warn(`[StudentPersistence] Unauthenticated Native Friend write blocked: No valid Firebase session for ${cleanUid}`);
+      return false;
+    }
+
     let token: string | null = null;
     try {
-      token = (await getAccessToken().catch(() => null)) || (await auth.currentUser?.getIdToken().catch(() => null)) || null;
+      token = (await authUser.getIdToken(true).catch(() => null)) || (await getAccessToken(true).catch(() => null));
     } catch {}
 
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (token) headers['Authorization'] = `Bearer ${token}`;
+    if (!token || typeof token !== 'string' || token.trim().length === 0) {
+      console.warn(`[StudentPersistence] Unauthenticated Native Friend write blocked: Missing Firebase ID token for ${cleanUid}`);
+      return false;
+    }
+
+    if (authUser.uid !== cleanUid) {
+      const isAuthorized = await isAuthorizedAdminUser(authUser).catch(() => false);
+      if (!isAuthorized) {
+        console.warn(`[StudentPersistence] Security violation: Session UID ${authUser.uid} does not match profile UID ${cleanUid}`);
+        return false;
+      }
+    }
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token.trim()}`,
+    };
 
     try {
       const res = await fetch('/api/user-profile', {
@@ -2127,13 +2148,35 @@ export async function saveStudentProfileToFirestore(
 
   // Authenticated persistence strictly via backend API with Firebase Admin SDK
   if (typeof window !== 'undefined') {
+    const authUser = (await waitForAuthUser(3000).catch(() => null)) || auth.currentUser;
+    if (!authUser || !authUser.uid || !isValidCanonicalUid(authUser.uid)) {
+      console.warn(`[StudentPersistence Error] Unauthenticated write blocked: No active Firebase session for ${cleanUid}`);
+      return false;
+    }
+
     let token: string | null = null;
     try {
-      token = (await getAccessToken().catch(() => null)) || (await auth.currentUser?.getIdToken().catch(() => null)) || null;
+      token = (await authUser.getIdToken(true).catch(() => null)) || (await getAccessToken(true).catch(() => null));
     } catch {}
 
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (token) headers['Authorization'] = `Bearer ${token}`;
+    if (!token || typeof token !== 'string' || token.trim().length === 0) {
+      console.warn(`[StudentPersistence Error] Unauthenticated write blocked: Missing Firebase ID token for ${cleanUid}`);
+      return false;
+    }
+
+    // Invariant: token user must match profile UID unless authorized admin
+    if (authUser.uid !== cleanUid) {
+      const isAuthorized = await isAuthorizedAdminUser(authUser).catch(() => false);
+      if (!isAuthorized) {
+        console.warn(`[StudentPersistence Error] Security violation: Session UID ${authUser.uid} does not match profile UID ${cleanUid}`);
+        return false;
+      }
+    }
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token.trim()}`,
+    };
 
     try {
       const res = await fetch('/api/user-profile', {

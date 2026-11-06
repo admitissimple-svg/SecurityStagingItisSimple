@@ -39,7 +39,7 @@ import {
   GoogleAccount,
   EnglishLevel,
 } from '../types';
-import { firebaseSignUpWithEmail, firebaseSignInWithEmail, googleSignIn } from '../utils/auth';
+import { firebaseSignUpWithEmail, firebaseSignInWithEmail, googleSignIn, waitForAuthUser } from '../utils/auth';
 import { auth } from '../firebase';
 import { consolidateTutorsList, isGenericTutorId, normalizeTutorName, isValidCanonicalUid } from '../utils/tutorConsolidation';
 
@@ -579,99 +579,144 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
     setErrorMessage(null);
 
     const cleanEmail = (studentEmail.trim() || currentAccount?.email || auth?.currentUser?.email || '').toLowerCase().trim();
-    const isGoogleAuthUser = Boolean(
-      (authenticatedStudentUid && isValidCanonicalUid(authenticatedStudentUid)) ||
-      (auth?.currentUser && (auth.currentUser.email || '').toLowerCase().trim() === cleanEmail && isValidCanonicalUid(auth.currentUser.uid))
+
+    // Check if the current Firebase session is already authenticated for this email
+    let currentAuthUser = (await waitForAuthUser(500).catch(() => null)) || auth?.currentUser || null;
+    const isAlreadyAuthenticated = Boolean(
+      currentAuthUser &&
+      (currentAuthUser.email || '').toLowerCase().trim() === cleanEmail &&
+      isValidCanonicalUid(currentAuthUser.uid)
     );
 
-    // Validation for guest
-    if (!currentAccount && !isGoogleAuthUser) {
-      if (!studentName.trim()) {
-        setErrorMessage(isEn ? 'Please enter your name.' : 'Por favor, informe seu nome completo.');
-        return;
-      }
-      if (!studentEmail.trim() || !studentEmail.includes('@')) {
-        setErrorMessage(isEn ? 'Please enter a valid email address.' : 'Por favor, informe um email válido.');
-        return;
-      }
-      if (authMode === 'signup' && (!studentPassword || studentPassword.length < 6)) {
-        setErrorMessage(isEn ? 'Password must be at least 6 characters.' : 'A senha deve conter no mínimo 6 caracteres.');
-        return;
-      }
-    } else if (!studentEmail.trim() || !studentEmail.includes('@')) {
-      setErrorMessage(isEn ? 'Please enter a valid email address.' : 'Por favor, informe um email válido.');
-      return;
-    }
-
+    // Validation
     if (!selectedTutor) {
       setErrorMessage(isEn ? 'Please select a Native Friend.' : 'Por favor, selecione um Amigo Nativo.');
       return;
     }
 
-    const isNewRegistration = !currentAccount || currentAccount.role !== 'student' || cleanEmail !== (currentAccount.email || '').toLowerCase();
+    if (!cleanEmail || !cleanEmail.includes('@')) {
+      setErrorMessage(isEn ? 'Please enter a valid email address.' : 'Por favor, informe um email válido.');
+      return;
+    }
+
+    if (!isAlreadyAuthenticated) {
+      if (authMode === 'signup') {
+        if (!studentName.trim()) {
+          setErrorMessage(isEn ? 'Please enter your name.' : 'Por favor, informe seu nome completo.');
+          return;
+        }
+        if (!studentPassword || studentPassword.length < 6) {
+          setErrorMessage(isEn ? 'Password must be at least 6 characters.' : 'A senha deve conter no mínimo 6 caracteres.');
+          return;
+        }
+      } else {
+        if (!studentPassword) {
+          setErrorMessage(isEn ? 'Please enter your password.' : 'Por favor, informe sua senha.');
+          return;
+        }
+      }
+    }
 
     setIsSubmitting(true);
 
     try {
-      // 1. Resolve canonical Firebase Auth UID strictly from verified authenticated identity
-      let canonicalStudentUid = '';
-
-      if (authenticatedStudentUid && isValidCanonicalUid(authenticatedStudentUid)) {
-        canonicalStudentUid = authenticatedStudentUid;
-      } else if (auth?.currentUser && (auth.currentUser.email || '').toLowerCase().trim() === cleanEmail && isValidCanonicalUid(auth.currentUser.uid)) {
-        canonicalStudentUid = auth.currentUser.uid;
-      } else if (currentAccount?.role === 'student' && (currentAccount.email || '').toLowerCase() === cleanEmail && isValidCanonicalUid(currentAccount.uid)) {
-        canonicalStudentUid = currentAccount.uid || '';
-      } else if (isNewRegistration && studentPassword) {
+      // 1. Guarantee Firebase Authentication completes successfully before profile persistence
+      if (!isAlreadyAuthenticated) {
         if (authMode === 'signup') {
           try {
-            const authRes = await firebaseSignUpWithEmail(cleanEmail, studentPassword);
-            canonicalStudentUid = authRes.user.uid;
-            setAuthenticatedStudentUid(authRes.user.uid);
+            await firebaseSignUpWithEmail(cleanEmail, studentPassword);
           } catch (signupErr: any) {
+            setIsSubmitting(false);
             if (signupErr?.code === 'auth/email-already-in-use') {
-              try {
-                const loginRes = await firebaseSignInWithEmail(cleanEmail, studentPassword);
-                canonicalStudentUid = loginRes.user.uid;
-                setAuthenticatedStudentUid(loginRes.user.uid);
-              } catch (loginErr: any) {
-                setIsSubmitting(false);
-                setErrorMessage(
-                  isEn
-                    ? 'This email is already registered. Please check your password or choose Login.'
-                    : 'Este e-mail já possui uma conta cadastrada. Por favor, verifique sua senha ou escolha Entrar.'
-                );
-                return;
-              }
-            } else {
-              setIsSubmitting(false);
-              setErrorMessage(signupErr?.message || (isEn ? 'Failed to create student account.' : 'Falha ao criar conta de aluno.'));
+              // Rule 3: Do not presume password is valid; switch to login mode and offer clear guidance
+              setAuthMode('login');
+              setErrorMessage(
+                isEn
+                  ? 'This email is already registered. Please enter your password to log in or reset your access.'
+                  : 'Este e-mail já possui uma conta cadastrada. Por favor, informe sua senha para entrar ou recupere seu acesso.'
+              );
               return;
             }
+            if (signupErr?.code === 'auth/weak-password') {
+              setErrorMessage(isEn ? 'Password must be at least 6 characters.' : 'A senha deve conter no mínimo 6 caracteres.');
+              return;
+            }
+            if (signupErr?.code === 'auth/invalid-email') {
+              setErrorMessage(isEn ? 'Please enter a valid email address.' : 'Por favor, informe um email válido.');
+              return;
+            }
+            setErrorMessage(signupErr?.message || (isEn ? 'Failed to create student account.' : 'Falha ao criar conta de aluno.'));
+            return;
           }
         } else {
           // Login mode
           try {
-            const loginRes = await firebaseSignInWithEmail(cleanEmail, studentPassword);
-            canonicalStudentUid = loginRes.user.uid;
-            setAuthenticatedStudentUid(loginRes.user.uid);
+            await firebaseSignInWithEmail(cleanEmail, studentPassword);
           } catch (loginErr: any) {
             setIsSubmitting(false);
+            if (
+              loginErr?.code === 'auth/wrong-password' ||
+              loginErr?.code === 'auth/invalid-credential' ||
+              loginErr?.code === 'auth/invalid-login-credentials'
+            ) {
+              setErrorMessage(
+                isEn
+                  ? 'Incorrect password. Please verify your credentials or reset your password.'
+                  : 'Senha incorreta para esta conta. Verifique sua senha ou recupere seu acesso.'
+              );
+              return;
+            }
+            if (loginErr?.code === 'auth/user-not-found') {
+              setAuthMode('signup');
+              setErrorMessage(
+                isEn
+                  ? 'No account found with this email. Please create your student account.'
+                  : 'Nenhuma conta encontrada com este e-mail. Por favor, crie seu cadastro.'
+              );
+              return;
+            }
             setErrorMessage(loginErr?.message || (isEn ? 'Invalid email or password.' : 'E-mail ou senha inválidos.'));
             return;
           }
         }
       }
 
-      if (!canonicalStudentUid || !isValidCanonicalUid(canonicalStudentUid)) {
+      // 2. Resolve verified Firebase session
+      currentAuthUser = (await waitForAuthUser(3000).catch(() => null)) || auth?.currentUser || null;
+      if (!currentAuthUser || !isValidCanonicalUid(currentAuthUser.uid)) {
         setIsSubmitting(false);
         setErrorMessage(
           isEn
-            ? 'Canonical Student UID missing. Please authenticate with Firebase before continuing.'
-            : 'UID canônico do Aluno ausente. Por favor, autentique-se com o Firebase para continuar.'
+            ? 'Firebase authentication session not initialized. Please try again.'
+            : 'Sessão de autenticação Firebase não inicializada. Por favor, tente novamente.'
         );
         return;
       }
+
+      if (currentAuthUser.email && currentAuthUser.email.toLowerCase().trim() !== cleanEmail) {
+        setIsSubmitting(false);
+        setErrorMessage(
+          isEn
+            ? 'Authenticated user does not match the registration email.'
+            : 'O usuário autenticado não corresponde ao e-mail informado.'
+        );
+        return;
+      }
+
+      // 3. Verify fresh ID token can be retrieved before invoking protected profile persistence
+      const sessionToken = await currentAuthUser.getIdToken(true).catch(() => null);
+      if (!sessionToken) {
+        setIsSubmitting(false);
+        setErrorMessage(
+          isEn
+            ? 'Failed to obtain security token. Please try again.'
+            : 'Falha ao obter o token de segurança. Por favor, tente novamente.'
+        );
+        return;
+      }
+
+      const canonicalStudentUid = currentAuthUser.uid;
+      setAuthenticatedStudentUid(canonicalStudentUid);
 
       const safeCanonicalUid =
         (selectedTutor?.uid && isValidCanonicalUid(selectedTutor.uid) ? selectedTutor.uid.trim() : null) ||

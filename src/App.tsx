@@ -2881,21 +2881,28 @@ export default function App() {
 
       // 3. Mirror to server API
       try {
-        await fetch('/api/user-profile', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            email: currentAccount.email,
-            profile: {
-              teacherEmail: cleanTeacherEmail,
-              teacherName: cleanTeacherName,
-              teacherUid: resolvedTeacherUid,
-              assignedNativeFriendUID: resolvedTeacherUid,
-              nativeFriendUID: resolvedTeacherUid,
-              enrollmentStatus: newEnrollmentStatus,
+        const idToken = await (auth.currentUser?.getIdToken().catch(() => null) || getAccessToken().catch(() => null));
+        if (idToken) {
+          await fetch('/api/user-profile', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${idToken}`,
             },
-          }),
-        });
+            body: JSON.stringify({
+              uid: currentAccount.uid,
+              email: currentAccount.email,
+              profile: {
+                teacherEmail: cleanTeacherEmail,
+                teacherName: cleanTeacherName,
+                teacherUid: resolvedTeacherUid,
+                assignedNativeFriendUID: resolvedTeacherUid,
+                nativeFriendUID: resolvedTeacherUid,
+                enrollmentStatus: newEnrollmentStatus,
+              },
+            }),
+          });
+        }
       } catch (err) {
         console.warn('Failed to update subscription:', err);
       }
@@ -2996,34 +3003,33 @@ export default function App() {
         ? (data.studentAccount!.name || data.studentAccount!.email.split('@')[0]).trim()
         : (currentAccount?.role === 'student' && currentAccount.name ? currentAccount.name.trim() : (userProfile.name || currentAccount?.name || 'Aluno'));
 
-      // Resolve canonical Student UID directly from verified Firebase identity
-      let studentUid =
-        (data.studentAccount?.uid && isValidCanonicalUid(data.studentAccount.uid) ? data.studentAccount.uid.trim() : '') ||
-        (auth.currentUser && (auth.currentUser.email || '').toLowerCase().trim() === cleanEmail && isValidCanonicalUid(auth.currentUser.uid) ? auth.currentUser.uid : '') ||
-        (currentAccount?.role === 'student' && (currentAccount.email || '').toLowerCase().trim() === cleanEmail && isValidCanonicalUid(currentAccount.uid) ? currentAccount.uid : '');
-
-      // If still missing and registration credentials provided, authenticate with Firebase Auth immediately
-      if (!studentUid && isRegisteringStudent && data.studentAccount?.password) {
-        try {
-          const authRes = await firebaseSignUpWithEmail(cleanEmail, data.studentAccount.password);
-          studentUid = authRes.user.uid;
-        } catch (signupErr: any) {
-          if (signupErr?.code === 'auth/email-already-in-use') {
-            try {
-              const loginRes = await firebaseSignInWithEmail(cleanEmail, data.studentAccount.password);
-              studentUid = loginRes.user.uid;
-            } catch (loginErr) {
-              console.warn('Firebase login attempt failed during onboarding reconciliation:', loginErr);
-            }
-          }
-        }
-      }
-
-      if (!studentUid || !isValidCanonicalUid(studentUid)) {
+      // Resolve canonical Student UID strictly from verified active Firebase session
+      const activeAuthUser = (await waitForAuthUser(3000).catch(() => null)) || auth.currentUser;
+      if (!activeAuthUser || !isValidCanonicalUid(activeAuthUser.uid)) {
         throw new Error(
           currentLanguage === 'en'
-            ? 'Canonical Student UID missing. Please authenticate with Firebase before completing onboarding.'
-            : 'UID canônico do Aluno ausente. Por favor, autentique-se com o Firebase antes de concluir o onboarding.'
+            ? 'Firebase authentication session not initialized. Please authenticate before completing onboarding.'
+            : 'Sessão de autenticação Firebase não inicializada. Por favor, autentique-se antes de concluir o onboarding.'
+        );
+      }
+
+      if (activeAuthUser.email && activeAuthUser.email.toLowerCase().trim() !== cleanEmail) {
+        throw new Error(
+          currentLanguage === 'en'
+            ? 'Authenticated user does not match the registration email.'
+            : 'O usuário autenticado não corresponde ao e-mail informado.'
+        );
+      }
+
+      const studentUid = activeAuthUser.uid;
+
+      // Obtain fresh ID token immediately before protected API calls
+      const idToken = await activeAuthUser.getIdToken(true).catch(() => null);
+      if (!idToken) {
+        throw new Error(
+          currentLanguage === 'en'
+            ? 'Failed to obtain valid Firebase ID token.'
+            : 'Falha ao obter token de autenticação Firebase válido.'
         );
       }
 
@@ -3096,13 +3102,12 @@ export default function App() {
 
       // 3. Sync with backend API — backend resolves canonical UID, verifies approval and enforces student link
       if (isRegisteringStudent) {
-        const idToken = await auth.currentUser?.getIdToken().catch(() => null);
         const effectiveTeacherId = !isGenericTutorId(targetTeacherPublicId) ? targetTeacherPublicId : (canonicalTutorUid || undefined);
         const signupRes = await fetch('/api/auth/signup', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+            'Authorization': `Bearer ${idToken}`,
           },
           body: JSON.stringify({
             uid: studentUid,
