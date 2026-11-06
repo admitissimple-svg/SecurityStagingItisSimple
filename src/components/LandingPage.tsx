@@ -47,6 +47,7 @@ interface LandingPageProps {
   pendingApprovalsCount?: number;
   onLogout?: () => void;
   onStartLivingInEnglish?: () => void;
+  onStartLivingWithTutor?: (tutor: NativeFriendTutor) => void;
 }
 
 export const LandingPage: React.FC<LandingPageProps> = ({
@@ -65,6 +66,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   pendingApprovalsCount = 0,
   onLogout,
   onStartLivingInEnglish,
+  onStartLivingWithTutor,
 }) => {
   const isEn = currentLanguage === 'en';
   const isPt = currentLanguage === 'pt';
@@ -366,10 +368,15 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       <FindTutorsSection
         currentLanguage={currentLanguage}
         tutors={tutors}
+        onStartLivingWithTutor={onStartLivingWithTutor}
         onBookLesson={onBookLessonWithTutor}
         onSendMessage={onSendMessageToTutor}
         onSelectMentor={(tutor) => {
-          if (onBookLessonWithTutor) onBookLessonWithTutor(tutor);
+          if (onStartLivingWithTutor) {
+            onStartLivingWithTutor(tutor);
+          } else if (onBookLessonWithTutor) {
+            onBookLessonWithTutor(tutor);
+          }
         }}
       />
 

@@ -72,6 +72,7 @@ export interface OnboardingWizardModalProps {
   initialEmail?: string;
   initialStep?: number;
   initialTutorId?: string;
+  isTutorPreselected?: boolean;
   hasCompletedTrialLesson?: boolean;
   onEmailAlreadyExists?: (email: string) => void;
   onCompleteOnboarding: (onboardingData: OnboardingResultData) => void | Promise<void>;
@@ -263,6 +264,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
   initialEmail,
   initialStep,
   initialTutorId,
+  isTutorPreselected = false,
   hasCompletedTrialLesson,
   onEmailAlreadyExists,
   onCompleteOnboarding,
@@ -276,6 +278,9 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
   const [isClosing, setIsClosing] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const wasOpenRef = React.useRef<boolean>(false);
+
+  // Preselected tutor state (transported safely from showcase vitrine)
+  const [tutorPreselected, setTutorPreselected] = useState<boolean>(() => Boolean(isTutorPreselected && initialTutorId));
 
   // English Level selection: Beginner | Intermediate | Advanced
   const [studentLevel, setStudentLevel] = useState<EnglishLevel>(() => {
@@ -313,17 +318,13 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
     const consolidated = consolidateTutorsList(tutorsList || []);
     return consolidated.filter((t) => (t.approvalStatus || 'approved') === 'approved') as NativeFriendTutor[];
   }, [tutorsList]);
+
+  // Strict non-regression rule: When entering without a pre-selected Native Friend, DO NOT auto-select
   const [selectedTutorId, setSelectedTutorId] = useState<string>(() => {
     if (initialTutorId && !isGenericTutorId(initialTutorId)) {
       return initialTutorId.trim();
     }
-    const first = approvedTutors[0];
-    if (!first) return '';
-    const firstCanonicalUid = (first.uid && isValidCanonicalUid(first.uid) ? first.uid.trim() : null) ||
-      (first.id && isValidCanonicalUid(first.id) ? first.id.trim() : null);
-    const validPublicSlug = (first.publicTutorId && !isGenericTutorId(first.publicTutorId) ? first.publicTutorId.trim() : null) ||
-      (first.id && !isGenericTutorId(first.id) ? first.id.trim() : null);
-    return firstCanonicalUid || validPublicSlug || first.email || '';
+    return '';
   });
   const [previewTutorModal, setPreviewTutorModal] = useState<NativeFriendTutor | null>(null);
 
@@ -425,8 +426,60 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                 (matchTutor.uid && isValidCanonicalUid(matchTutor.uid) ? matchTutor.uid : null) ||
                 (matchTutor.id && isValidCanonicalUid(matchTutor.id) ? matchTutor.id : null);
               setSelectedTutorId(canonicalUid || matchTutor.publicTutorId || matchTutor.id);
+              setTutorPreselected(true);
+            } else {
+              // Scenario C: Invalid, unapproved or non-existent tutor
+              setSelectedTutorId('');
+              setTutorPreselected(false);
+              setErrorMessage(
+                isEn
+                  ? 'The selected Native Friend is currently unavailable. Please choose another Native Friend below.'
+                  : 'O Amigo Nativo selecionado não está disponível no momento. Por favor, escolha seu Amigo Nativo na lista abaixo.'
+              );
+              setCurrentStep(4);
+              if (typeof window !== 'undefined' && window.sessionStorage) {
+                window.sessionStorage.removeItem('its_simple_preselected_tutor_id');
+              }
+            }
+          } else {
+            // Scenario B: Traditional entry with no preselected tutor
+            setSelectedTutorId('');
+            setTutorPreselected(false);
+          }
+        } else if (initialTutorId && !isGenericTutorId(initialTutorId)) {
+          const matchTutor = approvedTutors.find(
+            (t) =>
+              (t?.id && t.id.toLowerCase() === initialTutorId.toLowerCase().trim()) ||
+              (t?.uid && t.uid.toLowerCase() === initialTutorId.toLowerCase().trim()) ||
+              (t?.authUid && t.authUid.toLowerCase() === initialTutorId.toLowerCase().trim()) ||
+              (t?.publicTutorId && t.publicTutorId.toLowerCase() === initialTutorId.toLowerCase().trim()) ||
+              (t?.email && t.email.toLowerCase() === initialTutorId.toLowerCase().trim()) ||
+              (t?.name && normalizeTutorName(t.name) === normalizeTutorName(initialTutorId))
+          );
+          if (matchTutor) {
+            const canonicalUid =
+              (matchTutor.uid && isValidCanonicalUid(matchTutor.uid) ? matchTutor.uid : null) ||
+              (matchTutor.id && isValidCanonicalUid(matchTutor.id) ? matchTutor.id : null);
+            setSelectedTutorId(canonicalUid || matchTutor.publicTutorId || matchTutor.id);
+            setTutorPreselected(true);
+          } else {
+            // Scenario C: Invalid tutor
+            setSelectedTutorId('');
+            setTutorPreselected(false);
+            setErrorMessage(
+              isEn
+                ? 'The selected Native Friend is currently unavailable. Please choose another Native Friend below.'
+                : 'O Amigo Nativo selecionado não está disponível no momento. Por favor, escolha seu Amigo Nativo na lista abaixo.'
+            );
+            setCurrentStep(4);
+            if (typeof window !== 'undefined' && window.sessionStorage) {
+              window.sessionStorage.removeItem('its_simple_preselected_tutor_id');
             }
           }
+        } else {
+          // Scenario B: No preselection
+          setSelectedTutorId('');
+          setTutorPreselected(false);
         }
 
         if (currentAccount) {
@@ -439,11 +492,11 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
       setIsClosing(false);
       setIsSubmitting(false);
     }
-  }, [isOpen, currentUserProfile, currentAccount, tutorsList, initialTutorId]);
+  }, [isOpen, currentUserProfile, currentAccount, tutorsList, initialTutorId, isTutorPreselected, approvedTutors, isEn, initialStep]);
 
   if (!isOpen || isClosing) return null;
 
-  // Selected tutor object: never accepts generic 'tutor'
+  // Selected tutor object: never accepts generic 'tutor' or unselected fallback
   const selectedTutor =
     approvedTutors.find((t) => {
       if (!selectedTutorId || isGenericTutorId(selectedTutorId)) return false;
@@ -455,8 +508,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
         (t.email && !isGenericTutorId(t.email) && t.email.toLowerCase() === selectedTutorId.toLowerCase()) ||
         (t.name && normalizeTutorName(t.name) === normalizeTutorName(selectedTutorId))
       );
-    }) ||
-    approvedTutors[0];
+    }) || null;
 
   // Frequency preset handlers
   const handleSelectFrequencyPreset = (target: number) => {
@@ -725,7 +777,11 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                   {isEn ? 'Welcome Wizard' : 'Assistente de Boas-Vindas'}
                 </span>
                 <span className="text-[11px] font-bold text-[#F4CA54]">
-                  {isEn ? `Step ${currentStep} of 6` : `Passo ${currentStep} de 6`}
+                  {tutorPreselected && selectedTutor
+                    ? (isEn
+                        ? `Step ${currentStep === 1 ? 1 : currentStep === 2 ? 2 : currentStep === 3 ? 3 : currentStep === 5 ? 4 : 5} of 5`
+                        : `Passo ${currentStep === 1 ? 1 : currentStep === 2 ? 2 : currentStep === 3 ? 3 : currentStep === 5 ? 4 : 5} de 5`)
+                    : (isEn ? `Step ${currentStep} of 6` : `Passo ${currentStep} de 6`)}
                 </span>
               </div>
               <h2 className="text-base sm:text-lg font-black text-white mt-0.5">
@@ -752,15 +808,50 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
 
         {/* Step Progress Bar */}
         <div className="w-full bg-[#062863] h-1.5 flex">
-          {[1, 2, 3, 4, 5, 6].map((st) => (
-            <div
-              key={st}
-              className={`flex-1 h-full transition-all duration-300 ${
-                st <= currentStep ? 'bg-gradient-to-r from-[#9AB4FF] to-[#F4CA54]' : 'bg-transparent'
-              } ${st < 6 ? 'border-r border-[#000035]' : ''}`}
-            />
-          ))}
+          {tutorPreselected && selectedTutor
+            ? [1, 2, 3, 5, 6].map((st, idx) => (
+                <div
+                  key={st}
+                  className={`flex-1 h-full transition-all duration-300 ${
+                    st <= currentStep ? 'bg-gradient-to-r from-[#9AB4FF] to-[#F4CA54]' : 'bg-transparent'
+                  } ${idx < 4 ? 'border-r border-[#000035]' : ''}`}
+                />
+              ))
+            : [1, 2, 3, 4, 5, 6].map((st) => (
+                <div
+                  key={st}
+                  className={`flex-1 h-full transition-all duration-300 ${
+                    st <= currentStep ? 'bg-gradient-to-r from-[#9AB4FF] to-[#F4CA54]' : 'bg-transparent'
+                  } ${st < 6 ? 'border-r border-[#000035]' : ''}`}
+                />
+              ))}
         </div>
+
+        {/* Selected Native Friend Notification Banner (When preselected from showcase vitrine) */}
+        {tutorPreselected && selectedTutor && currentStep <= 3 && (
+          <div className="mx-5 sm:mx-6 mt-3 p-2.5 rounded-xl bg-[#062863]/70 border border-[#F4CA54]/40 flex items-center justify-between text-xs">
+            <div className="flex items-center gap-2">
+              <span className="text-base">{selectedTutor.flag || '🇺🇸'}</span>
+              <span className="text-blue-100 font-medium">
+                {isEn ? 'Chosen Native Friend:' : 'Amigo Nativo selecionado:'}{' '}
+                <strong className="text-white font-extrabold">{selectedTutor.name}</strong>
+                <span className="text-emerald-400 font-bold ml-1.5">
+                  ({isEn ? '1st Trial: 25 min Free' : '1ª Aula Teste Grátis'})
+                </span>
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setTutorPreselected(false);
+                setCurrentStep(4);
+              }}
+              className="text-[11px] font-bold text-[#F4CA54] hover:underline cursor-pointer shrink-0 ml-2"
+            >
+              {isEn ? 'Change' : 'Alterar'}
+            </button>
+          </div>
+        )}
 
         {/* Error Notification */}
         {errorMessage && (
@@ -1786,8 +1877,18 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                     </span>
                     <span className="font-extrabold text-white flex items-center gap-1.5 mt-0.5">
                       <span>{selectedTutor?.flag || '🇺🇸'}</span>
-                      <span className="truncate">{selectedTutor?.name || 'Native Friend'}</span>
+                      <span className="truncate">{selectedTutor?.name || (isEn ? 'Choose Native Friend' : 'Escolha seu Amigo Nativo')}</span>
                     </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setTutorPreselected(false);
+                        setCurrentStep(4);
+                      }}
+                      className="text-[10px] text-[#F4CA54] hover:underline font-bold mt-1 block cursor-pointer"
+                    >
+                      {isEn ? 'Change Native Friend' : 'Alterar Amigo Nativo'}
+                    </button>
                   </div>
 
                   <div className="p-2.5 rounded-xl bg-[#000035]/70 border border-[#607EC9]/30">
@@ -1903,7 +2004,11 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
               id="onboarding-back-btn"
               onClick={() => {
                 setErrorMessage(null);
-                setCurrentStep((prev) => Math.max(1, prev - 1));
+                if (currentStep === 5 && tutorPreselected) {
+                  setCurrentStep(3);
+                } else {
+                  setCurrentStep((prev) => Math.max(1, prev - 1));
+                }
               }}
               className="px-4 py-2 rounded-xl bg-white/10 hover:bg-white/15 text-slate-200 font-bold text-xs transition cursor-pointer flex items-center gap-1.5"
             >
@@ -1930,7 +2035,27 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
               id="onboarding-next-btn"
               onClick={() => {
                 setErrorMessage(null);
-                setCurrentStep((prev) => Math.min(6, prev + 1));
+                if (currentStep === 3) {
+                  if (tutorPreselected && selectedTutor) {
+                    // Preselected Native Friend: advance directly to account activation (Step 5), skipping Step 4!
+                    setCurrentStep(5);
+                  } else {
+                    setCurrentStep(4);
+                  }
+                } else if (currentStep === 4) {
+                  // Guard step 4: must have explicitly selected a tutor!
+                  if (!selectedTutorId || !selectedTutor || isGenericTutorId(selectedTutorId)) {
+                    setErrorMessage(
+                      isEn
+                        ? 'Please select your Native Friend before proceeding.'
+                        : 'Por favor, selecione seu Amigo Nativo antes de prosseguir.'
+                    );
+                    return;
+                  }
+                  setCurrentStep(5);
+                } else {
+                  setCurrentStep((prev) => Math.min(6, prev + 1));
+                }
               }}
               className="px-6 py-2.5 rounded-xl bg-[#F4CA54] hover:bg-amber-400 text-[#000035] font-black text-xs sm:text-sm transition cursor-pointer shadow-md flex items-center gap-1.5"
             >

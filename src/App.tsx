@@ -163,6 +163,8 @@ import { clearDictionaryMemoryCache } from './utils/dictionaryService';
 import {
   isGenericTutorId,
   normalizeTutorName,
+  consolidateTutorsList,
+  CanonicalTutorRecord,
 } from './utils/tutorConsolidation';
 import { FirestoreSchemaAlertBanner } from './components/FirestoreSchemaAlertBanner';
 import { StudentJournalEntry } from './types';
@@ -770,6 +772,18 @@ export default function App() {
   const [isOnboardingCompleting, setIsOnboardingCompleting] = useState<boolean>(false);
   const [isStartLivingModalOpen, setIsStartLivingModalOpen] = useState<boolean>(false);
   const [onboardingInitialEmail, setOnboardingInitialEmail] = useState<string>('');
+  const [onboardingInitialTutorId, setOnboardingInitialTutorId] = useState<string>(() => {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      return window.sessionStorage.getItem('its_simple_preselected_tutor_id') || '';
+    }
+    return '';
+  });
+  const [isTutorPreselected, setIsTutorPreselected] = useState<boolean>(() => {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      return Boolean(window.sessionStorage.getItem('its_simple_preselected_tutor_id'));
+    }
+    return false;
+  });
   const [authInitialEmail, setAuthInitialEmail] = useState<string>('');
   const [isStartingNewWeek, setIsStartingNewWeek] = useState<boolean>(false);
 
@@ -2888,13 +2902,85 @@ export default function App() {
     }
   };
 
-  // Handler: Start Living in English (Opens Email Verification Modal or redirects if student is logged in)
+  // Handler: Start Living in English (Traditional entry without preselected tutor)
   const handleStartLivingInEnglish = () => {
+    // Clear any residual preselected tutor
+    setOnboardingInitialTutorId('');
+    setIsTutorPreselected(false);
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      window.sessionStorage.removeItem('its_simple_preselected_tutor_id');
+    }
+
     if (currentAccount?.role === 'student') {
       setViewMode('dashboard');
       return;
     }
     setIsStartLivingModalOpen(true);
+  };
+
+  // Handler: Start Living in English with a Preselected Native Friend (Vitrine Discovery Card)
+  const handleStartLivingWithTutor = (tutor: NativeFriendTutor) => {
+    // 1. Resolve canonical identity using verified identifiers
+    const canonicalUid =
+      (tutor.uid && isValidCanonicalUid(tutor.uid) ? tutor.uid.trim() : null) ||
+      (tutor.authUid && isValidCanonicalUid(tutor.authUid) ? tutor.authUid.trim() : null) ||
+      (tutor.id && isValidCanonicalUid(tutor.id) ? tutor.id.trim() : null);
+
+    const validPublicSlug =
+      (tutor.publicTutorId && !isGenericTutorId(tutor.publicTutorId) ? tutor.publicTutorId.trim() : null) ||
+      (tutor.id && !isValidCanonicalUid(tutor.id) && !isGenericTutorId(tutor.id) ? tutor.id.trim() : null) ||
+      (tutor.name && !isGenericTutorId(tutor.name) ? normalizeTutorName(tutor.name).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') : null);
+
+    const tutorIdentifier =
+      canonicalUid ||
+      validPublicSlug ||
+      (tutor.email && !isGenericTutorId(tutor.email) ? tutor.email.trim() : '') ||
+      tutor.id;
+
+    // 2. Validate that tutor exists in approved list
+    const consolidated = consolidateTutorsList(tutors || []);
+    const matchingTutor = consolidated.find((t: CanonicalTutorRecord) => {
+      if (!isTutorApproved(t as any)) return false;
+      return (
+        (canonicalUid && (t.uid === canonicalUid || t.authUid === canonicalUid || t.id === canonicalUid)) ||
+        (validPublicSlug && (t.publicTutorId === validPublicSlug || t.id === validPublicSlug)) ||
+        (tutor.email && t.email && t.email.toLowerCase() === tutor.email.toLowerCase()) ||
+        (t.name && normalizeTutorName(t.name) === normalizeTutorName(tutor.name)) ||
+        (t.id && t.id === tutorIdentifier)
+      );
+    });
+
+    if (!matchingTutor) {
+      setNotifications((prev) => [
+        {
+          id: `toast-err-${Date.now()}`,
+          title: currentLanguage === 'en' ? 'Native Friend Unavailable' : 'Amigo Nativo Indisponível',
+          message: currentLanguage === 'en'
+            ? 'The selected Native Friend is currently unavailable. Please choose another Native Friend.'
+            : 'O Amigo Nativo selecionado não está disponível no momento. Por favor, escolha outro Amigo Nativo.',
+          type: 'warning',
+          timestamp: new Date().toISOString(),
+          read: false,
+        },
+        ...prev,
+      ]);
+      return;
+    }
+
+    // 3. Transport selection safely via transient state and session storage
+    const effectiveTutorId = canonicalUid || validPublicSlug || matchingTutor.publicTutorId || matchingTutor.id;
+    setOnboardingInitialTutorId(effectiveTutorId);
+    setIsTutorPreselected(true);
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      window.sessionStorage.setItem('its_simple_preselected_tutor_id', effectiveTutorId);
+    }
+
+    // 4. Direct user to existing Start Living in English flow
+    if (currentAccount?.role === 'student') {
+      setIsOnboardingModalOpen(true);
+    } else {
+      setIsStartLivingModalOpen(true);
+    }
   };
 
   // Handler: Complete Onboarding Wizard (Multi-step Assistant)
@@ -3611,6 +3697,11 @@ export default function App() {
     setLessons([]);
     setStudents([]);
     setNotifications([]);
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      window.sessionStorage.removeItem('its_simple_preselected_tutor_id');
+    }
+    setIsTutorPreselected(false);
+    setOnboardingInitialTutorId('');
     setViewMode('landing');
     if (typeof window !== 'undefined') {
       try {
@@ -6923,6 +7014,7 @@ export default function App() {
           pendingApprovalsCount={pendingApprovalsCount}
           onLogout={handleLogout}
           onStartLivingInEnglish={handleStartLivingInEnglish}
+          onStartLivingWithTutor={handleStartLivingWithTutor}
           onOpenAuthModal={(mode, role = 'student') => {
             setAuthModalMode(mode);
             setAuthModalRole(role);
@@ -7019,6 +7111,7 @@ export default function App() {
             <FindTutorsSection
               tutors={tutors}
               currentLanguage={currentLanguage}
+              onStartLivingWithTutor={handleStartLivingWithTutor}
               onBookLesson={(tutor) => {
                 const targetIdentifier = tutor.email || tutor.id;
                 setTeacherEmailForConfig(targetIdentifier);
@@ -8039,7 +8132,14 @@ export default function App() {
       {/* Pre-onboarding Email Verification Modal */}
       <StartLivingEmailModal
         isOpen={isStartLivingModalOpen}
-        onClose={() => setIsStartLivingModalOpen(false)}
+        onClose={() => {
+          setIsStartLivingModalOpen(false);
+          setIsTutorPreselected(false);
+          setOnboardingInitialTutorId('');
+          if (typeof window !== 'undefined' && window.sessionStorage) {
+            window.sessionStorage.removeItem('its_simple_preselected_tutor_id');
+          }
+        }}
         currentLanguage={currentLanguage}
         onEmailProceed={(cleanEmail) => {
           setIsStartLivingModalOpen(false);
@@ -8082,6 +8182,8 @@ export default function App() {
       <OnboardingWizardModal
         isOpen={isOnboardingModalOpen}
         initialEmail={onboardingInitialEmail}
+        initialTutorId={onboardingInitialTutorId}
+        isTutorPreselected={isTutorPreselected}
         onEmailAlreadyExists={(existingEmail) => {
           setIsOnboardingModalOpen(false);
           setNotifications((prev) => [
@@ -8102,6 +8204,11 @@ export default function App() {
         }}
         onClose={() => {
           setIsOnboardingModalOpen(false);
+          setIsTutorPreselected(false);
+          setOnboardingInitialTutorId('');
+          if (typeof window !== 'undefined' && window.sessionStorage) {
+            window.sessionStorage.removeItem('its_simple_preselected_tutor_id');
+          }
           // If student closed onboarding before completing mandatory trial lesson, return to initial landing page
           if (!hasConfirmedTrialLesson && (!currentAccount || currentAccount.role === 'student')) {
             setViewMode('landing');
@@ -8115,6 +8222,11 @@ export default function App() {
         initialStep={userProfile?.teacherEmail || userProfile?.teacherId || userProfile?.teacherUid ? 6 : 1}
         hasCompletedTrialLesson={hasConfirmedTrialLesson}
         onOpenScheduleTrialLesson={(tutor, studentInfo) => {
+          setIsTutorPreselected(false);
+          setOnboardingInitialTutorId('');
+          if (typeof window !== 'undefined' && window.sessionStorage) {
+            window.sessionStorage.removeItem('its_simple_preselected_tutor_id');
+          }
           setTeacherEmailForConfig(tutor.email || tutor.id);
           if (studentInfo && studentInfo.email) {
             setScheduleStudentInfo({ ...studentInfo, isTrialLesson: true });
