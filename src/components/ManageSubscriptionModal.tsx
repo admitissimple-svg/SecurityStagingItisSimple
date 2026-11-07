@@ -23,6 +23,8 @@ import {
   ArrowLeftRight,
   RefreshCw,
   CalendarCheck,
+  Lock,
+  AlertCircle,
 } from 'lucide-react';
 import { GoogleAccount, Language, NativeFriendTutor, UserProfile } from '../types';
 import { isValidCanonicalUid } from '../utils/tutorConsolidation';
@@ -369,65 +371,14 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
   };
 
   const handleConfirmPurchase = async () => {
-    if (!selectedTutorForPurchase) return;
-
-    const pkg = selectedPkg;
-    setIsProcessing(true);
-    try {
-      const canonicalTeacherUid =
-        (selectedTutorForPurchase.uid && isValidCanonicalUid(selectedTutorForPurchase.uid) ? selectedTutorForPurchase.uid.trim() : '') ||
-        (selectedTutorForPurchase.id && isValidCanonicalUid(selectedTutorForPurchase.id) ? selectedTutorForPurchase.id.trim() : '') ||
-        (selectedTutorForPurchase.authUid && isValidCanonicalUid(selectedTutorForPurchase.authUid) ? selectedTutorForPurchase.authUid.trim() : '');
-
-      const resolvedTeacherId =
-        canonicalTeacherUid ||
-        selectedTutorForPurchase.id ||
-        selectedTutorForPurchase.publicTutorId;
-
-      const resolvedPublicTutorId =
-        selectedTutorForPurchase.publicTutorId ||
-        (!isValidCanonicalUid(selectedTutorForPurchase.id) ? selectedTutorForPurchase.id : undefined);
-
-      if (onPurchasePackage) {
-        await onPurchasePackage({
-          teacherEmail: selectedTutorForPurchase.email || '',
-          teacherName: selectedTutorForPurchase.name,
-          teacherId: resolvedTeacherId || undefined,
-          teacherUid: canonicalTeacherUid || undefined,
-          publicTutorId: resolvedPublicTutorId || undefined,
-          packageLessons: pkg.lessonsCount,
-          packagePriceBrl: pkg.priceBrl,
-          packagePriceUsd: pkg.priceUsd,
-          paymentMethod: selectedPaymentMethod,
-          isRecurringMonthly: pkg.isRecurringMonthly,
-          monthlyFrequency: pkg.frequency,
-        });
-      } else {
-        // Fallback: update subscription directly
-        await onUpdateSubscription(selectedTutorForPurchase.email || resolvedTeacherId || null, selectedTutorForPurchase.name);
-      }
-
-      setPurchaseCompleted(true);
-      setFeedbackMsg({
-        type: 'success',
-        text: isEn
-          ? `Package of ${pkg.lessonsCount} lessons purchased! ${selectedTutorForPurchase.name} is now your fixed Native Friend.`
-          : `Pacote de ${pkg.lessonsCount} aulas adquirido com sucesso! ${selectedTutorForPurchase.name} agora é seu Amigo Nativo fixo.`,
-      });
-
-      setTimeout(() => {
-        setPurchaseCompleted(false);
-        setSelectedTutorForPurchase(null);
-        onClose();
-      }, 2500);
-    } catch (err) {
-      setFeedbackMsg({
-        type: 'error',
-        text: isEn ? 'Payment processing failed. Please try again.' : 'Erro ao processar compra. Tente novamente.',
-      });
-    } finally {
-      setIsProcessing(false);
-    }
+    // FASE FIN.2A.2B: Modo pré-comercialização — Contratações temporariamente indisponíveis sem gateway real.
+    // Impede estritamente a chamada à API de compra conforme Requisito 8.
+    setFeedbackMsg({
+      type: 'error',
+      text: isEn
+        ? 'Package purchases are temporarily unavailable in pre-commercialization mode.'
+        : 'As contratações de pacotes estão temporariamente indisponíveis no momento (modo pré-comercialização).',
+    });
   };
 
   if (!isOpen) return null;
@@ -759,6 +710,19 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
 
               {/* Order Summary & Purchase CTA */}
               <div className="bg-[#000035] text-white rounded-2xl p-4 space-y-3">
+                {/* Pre-commercialization notice banner */}
+                <div className="bg-amber-500/15 border border-amber-400/30 rounded-xl p-3 flex items-start gap-2.5 text-amber-200">
+                  <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                  <div className="text-[11px] leading-relaxed">
+                    <strong className="block text-amber-300 font-bold mb-0.5">
+                      {isEn ? 'Purchases Temporarily Unavailable' : 'Contratações Temporariamente Indisponíveis'}
+                    </strong>
+                    {isEn
+                      ? 'The platform is currently operating in pre-commercialization mode without an active payment gateway. You can view all package pricing above, and schedule your free 25-minute trial lesson below.'
+                      : 'O It\'s Simple está operando em modo pré-comercialização sem gateway de pagamento ativo. Você pode consultar os valores e pacotes acima, e agendar sua aula experimental gratuita de 25 minutos.'}
+                  </div>
+                </div>
+
                 <div className="flex items-center justify-between text-xs border-b border-[#1C4C96] pb-2">
                   <span className="text-[#9AB4FF] font-medium">
                     {isEn ? 'Tutor to be assigned:' : 'Amigo Nativo a vincular:'}
@@ -779,7 +743,7 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
                   </span>
                 </div>
 
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
                   <div>
                     <span className="text-[10px] text-[#9AB4FF] font-bold uppercase block">Total</span>
                     <div className="flex items-baseline gap-1.5 flex-wrap">
@@ -800,30 +764,36 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
                     </span>
                   </div>
 
-                  <button
-                    type="button"
-                    disabled={isProcessing || purchaseCompleted}
-                    onClick={handleConfirmPurchase}
-                    className="px-5 py-2.5 bg-emerald-500 hover:bg-emerald-400 text-[#000035] rounded-xl font-black text-xs transition flex items-center gap-2 cursor-pointer shadow-md disabled:opacity-50"
-                  >
-                    {isProcessing ? (
-                      <span>{isEn ? 'Processing...' : 'Processando...'}</span>
-                    ) : purchaseCompleted ? (
-                      <>
-                        <CheckCircle className="w-4 h-4 text-[#000035]" />
-                        <span>{isEn ? 'Purchased!' : 'Comprado com Sucesso!'}</span>
-                      </>
-                    ) : (
-                      <>
-                        <Sparkles className="w-4 h-4 text-[#000035]" />
-                        <span>
-                          {isEn
-                            ? `Confirm & Link ${selectedTutorForPurchase.name}`
-                            : `Confirmar Compra & Vincular ${selectedTutorForPurchase.name}`}
-                        </span>
-                      </>
+                  <div className="flex items-center gap-2">
+                    {onScheduleTrialLessonWithTutor && selectedTutorForPurchase && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const tutorToTrial = selectedTutorForPurchase;
+                          setSelectedTutorForPurchase(null);
+                          onClose();
+                          onScheduleTrialLessonWithTutor(tutorToTrial);
+                        }}
+                        className="px-3.5 py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-bold text-xs transition flex items-center gap-1.5 cursor-pointer shadow-xs"
+                      >
+                        <CalendarCheck className="w-3.5 h-3.5 text-[#9AB4FF]" />
+                        <span>{isEn ? 'Free Trial (25 min)' : 'Aula Experimental (25 min)'}</span>
+                      </button>
                     )}
-                  </button>
+
+                    <button
+                      type="button"
+                      disabled={true}
+                      aria-disabled="true"
+                      className="px-4 py-2.5 bg-slate-700/80 text-slate-300 rounded-xl font-bold text-xs flex items-center gap-2 cursor-not-allowed border border-slate-600/50 shadow-xs"
+                      title={isEn ? 'Purchases temporarily unavailable' : 'Contratações temporariamente indisponíveis'}
+                    >
+                      <Lock className="w-4 h-4 text-amber-400" />
+                      <span>
+                        {isEn ? 'Purchases Unavailable' : 'Contratações Indisponíveis'}
+                      </span>
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>

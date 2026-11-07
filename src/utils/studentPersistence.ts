@@ -1473,6 +1473,7 @@ export interface PurchasePackageTransactionParams {
   publicTutorId?: string | null;
   packageLessons: number;
   idempotencyKey?: string;
+  isAdminAuditGrant?: boolean;
 }
 
 /**
@@ -1572,6 +1573,14 @@ export async function purchasePackageWithTransaction(params: PurchasePackageTran
     }
   } else {
     // NODE.JS TEST ENVIRONMENT: Execute atomic transaction via Firebase Admin SDK
+    // FASE FIN.2A.2B: Em modo pré-comercialização, somente concessão administrativa auditada é permitida
+    if (process.env.PAYMENTS_ENABLED !== 'true' && !params.isAdminAuditGrant) {
+      return {
+        success: false,
+        error: 'A contratação de pacotes está temporariamente indisponível (modo pré-comercialização). Nenhum crédito gerado.',
+      };
+    }
+
     try {
       const serverModule = '../' + 'serverFirestore';
       const { getFirestoreDb, resolveTeacherCanonicalIdentity } = await import(/* @vite-ignore */ serverModule);

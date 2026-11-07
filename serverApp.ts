@@ -5690,6 +5690,30 @@ app.post('/api/user-profile', async (req, res) => {
   res.json({ success: true, profile: fullProfileWithAuthoritativeCredits, persistedToFirestore });
 });
 
+// FASE FIN.2A.2B: Pre-commercialization Payment Gating Configuration
+// Safe default is strictly false (any value other than exact string 'true' evaluates to false).
+export const isPaymentsEnabled = (): boolean => {
+  return process.env.PAYMENTS_ENABLED === 'true';
+};
+
+// Authoritative check whether a real payment gateway (Stripe/Pix webhook verification) is active.
+// In the current pre-commercialization phase, no real gateway exists.
+export const hasRealPaymentGatewayIntegrated = (): boolean => {
+  return false;
+};
+
+// Public endpoint to query payments & commercialization status
+app.get('/api/payments/status', (_req, res) => {
+  res.json({
+    paymentsEnabled: isPaymentsEnabled(),
+    hasPaymentGateway: hasRealPaymentGatewayIntegrated(),
+    mode: 'pre_commercialization',
+    message: isPaymentsEnabled() && hasRealPaymentGatewayIntegrated()
+      ? 'Pagamentos habilitados'
+      : 'Contratações temporariamente indisponíveis (modo pré-comercialização)',
+  });
+});
+
 // Purchase Lesson Package with a specific Native Friend (binds tutor as fixed + adds lessons)
 app.post('/api/students/purchase-package', async (req, res) => {
   // 1. Authenticate caller strictly via server-verified Firebase ID token
@@ -5699,6 +5723,32 @@ app.post('/api/students/purchase-package', async (req, res) => {
       error: 'Unauthorized',
       message: 'Token de autenticação obrigatório para contratação de pacote.',
     });
+  }
+
+  const isAdminCaller = verifiedCaller.role === 'admin';
+
+  // FASE FIN.2A.2B: Modo pré-comercialização — Proteção da rota de compra
+  // 1. Alunos comuns são estritamente impedidos de adquirir pacotes sem gateway de pagamento ativo.
+  // 2. PAYMENTS_ENABLED possui padrão seguro false.
+  // 3. Mesmo com PAYMENTS_ENABLED=true, a concessão de créditos exige confirmação real do provedor (não implementada).
+  if (!isAdminCaller) {
+    if (!isPaymentsEnabled()) {
+      return res.status(403).json({
+        success: false,
+        error: 'PAYMENTS_DISABLED',
+        message: 'A contratação de pacotes de aulas pagas está temporariamente indisponível no momento. O sistema está em modo pré-comercialização sem gateway de pagamento ativo.',
+      });
+    }
+
+    if (!hasRealPaymentGatewayIntegrated()) {
+      return res.status(403).json({
+        success: false,
+        error: 'PAYMENT_GATEWAY_NOT_CONFIGURED',
+        message: 'Gateway de pagamento não integrado. A concessão de créditos pagos requer confirmação real e autoritativa do provedor de pagamento. Estados de pagamento informados pelo cliente não autorizam créditos.',
+      });
+    }
+  } else {
+    console.warn(`[AUDIT - ADMIN PACKAGE ALLOCATION] Admin ${verifiedCaller.email || verifiedCaller.uid} executing manual package credit assignment.`);
   }
 
   const db = readDb();
@@ -6003,6 +6053,7 @@ app.post('/api/students/purchase-package', async (req, res) => {
     paymentMethod: paymentMethod || 'credit_card',
     timestamp: nowIso,
     status: 'completed',
+    ...(isAdminCaller ? { adminGrantBy: verifiedCaller.email || verifiedCaller.uid, isAdministrativeOperation: true } : {}),
   };
   if (!isIdempotentReplay) {
     db.transactions.unshift(transaction);

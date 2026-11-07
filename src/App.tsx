@@ -3405,6 +3405,16 @@ export default function App() {
       const cleanTeacherName = matchedTutor?.name || (params.teacherName ? params.teacherName.trim() : 'Native Friend');
       const cleanTeacherEmail = (matchedTutor?.email || rawTeacherEmail || '').toLowerCase().trim();
 
+      // FASE FIN.2A.2B: Bloqueio estrito no cliente durante pré-comercialização (sem gateway de pagamento)
+      if (import.meta.env.VITE_PAYMENTS_ENABLED !== 'true') {
+        alert(
+          currentLanguage === 'en'
+            ? 'Package purchases are temporarily unavailable in pre-commercialization mode.'
+            : 'As contratações de pacotes estão temporariamente indisponíveis no momento (modo pré-comercialização).'
+        );
+        return;
+      }
+
       // Atomic backend transaction via Firebase Admin SDK
       const txResult = await purchasePackageWithTransaction({
         studentUid: stUid,
