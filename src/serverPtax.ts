@@ -42,6 +42,8 @@ export interface PtaxQuoteResult {
   pricingDate?: string;
   /** Data e hora exata do registro retornado pelo BACEN */
   dataHoraCotacao?: string;
+  /** Tipo de boletim retornado pelo BACEN ('Fechamento', etc.) */
+  tipoBoletim?: string;
   /** Identificação da fonte oficial */
   source: string;
   /** Timestamp ISO do momento da consulta */
@@ -158,6 +160,7 @@ function getBrazilianBankHolidays(year: number): Set<string> {
   add(11, 15); // Proclamação da República
   add(11, 20); // Consciência Negra (Lei 14.759/2023)
   add(12, 25); // Natal
+  add(12, 31); // Último dia útil do ano - sem expediente bancário / sem mercado de câmbio (Resolução CMN 4.880/2020)
 
   // Feriados móveis derivados da Páscoa
   const easter = getEasterSunday(year);
@@ -174,6 +177,36 @@ function getBrazilianBankHolidays(year: number): Set<string> {
   addOffset(60); // Corpus Christi
 
   return holidays;
+}
+
+/**
+ * Determina se o tipo de boletim corresponde a um fechamento oficial do BACEN.
+ *
+ * Regras:
+ * - Se tipoBoletim for omitido/undefined/null: aceito (ex: endpoint CotacaoDolarPeriodo do BACEN
+ *   que por especificação OData TipoCotacaoDolar só emite a cotação oficial diária de fechamento).
+ * - Se fornecido como string:
+ *   - Deve conter 'fechamento' (case-insensitive, ex: 'Fechamento', 'Fechamento PTAX').
+ *   - Rejeita explicitamente 'Abertura', 'Intermediário', '1º boletim', etc.
+ */
+export function isOfficialClosingBulletin(tipoBoletim?: unknown): boolean {
+  if (tipoBoletim === undefined || tipoBoletim === null) {
+    return true;
+  }
+  if (typeof tipoBoletim !== 'string') {
+    return false;
+  }
+  const normalized = tipoBoletim.trim().toLowerCase();
+  if (
+    normalized.includes('abertura') ||
+    normalized.includes('intermedi') ||
+    normalized.includes('1º') ||
+    normalized.includes('2º') ||
+    normalized.includes('3º')
+  ) {
+    return false;
+  }
+  return normalized.includes('fechamento');
 }
 
 /**
@@ -243,7 +276,14 @@ export async function getPtaxClosingD1(options: GetPtaxOptions = {}): Promise<Pt
     const memEntry = memoryCache.get(pricingDate);
     if (memEntry && Date.now() - memEntry.cachedAt < MEMORY_CACHE_TTL_MS) {
       const q = memEntry.quote;
-      if (q.success && q.quoteDate && q.quoteDate === expectedRefDate) {
+      if (
+        q.success &&
+        q.quoteDate &&
+        q.quoteDate === expectedRefDate &&
+        q.quoteDate < pricingDate &&
+        isValidPtaxNumber(q.ptaxRate) &&
+        isOfficialClosingBulletin(q.tipoBoletim)
+      ) {
         return {
           ...q,
           fromCache: true,
@@ -264,7 +304,10 @@ export async function getPtaxClosingD1(options: GetPtaxOptions = {}): Promise<Pt
           if (
             isValidPtaxNumber(data.cotacaoVenda) &&
             data.quoteDate === expectedRefDate &&
-            data.quoteDate < pricingDate
+            data.quoteDate < pricingDate &&
+            typeof data.dataHoraCotacao === 'string' &&
+            data.dataHoraCotacao.slice(0, 10) === data.quoteDate &&
+            isOfficialClosingBulletin(data.tipoBoletim)
           ) {
             const cachedResult: PtaxQuoteResult = {
               success: true,
@@ -273,6 +316,7 @@ export async function getPtaxClosingD1(options: GetPtaxOptions = {}): Promise<Pt
               quoteDate: data.quoteDate,
               pricingDate,
               dataHoraCotacao: data.dataHoraCotacao,
+              tipoBoletim: typeof data.tipoBoletim === 'string' ? data.tipoBoletim : 'Fechamento',
               source: data.source || PTAX_SOURCE_LABEL,
               queriedAt: data.queriedAt || nowIso,
               fromCache: true,
@@ -378,18 +422,26 @@ export async function getPtaxClosingD1(options: GetPtaxOptions = {}): Promise<Pt
     }
 
     // Filtrar cotações:
+    // Regra 1: Rejeitar cotações intermediárias ou de abertura (apenas fechamento oficial).
     // Regra 5: NUNCA aceitar cotação com data igual ou posterior à data de precificação.
-    // Filtrar cotações inválidas (não numéricas, negativas ou zero).
+    // Filtrar cotações inválidas (não numéricas, negativas ou zero, ou dataHoraCotacao malformada).
     const validQuotes = items.filter((it: any) => {
       if (!it || typeof it.dataHoraCotacao !== 'string') return false;
+      if (!/^\d{4}-\d{2}-\d{2}/.test(it.dataHoraCotacao)) return false;
+
       const quoteDateStr = it.dataHoraCotacao.slice(0, 10);
 
-      // Invariante estrita: a data da cotação DEVE ser estritamente anterior à data de precificação
+      // Invariante estrita: a data da cotação DEVE ser estritamente anterior à data de precificação em America/Sao_Paulo
       if (quoteDateStr >= pricingDate) {
         return false;
       }
 
-      // Validação numérica
+      // Validação de tipo de boletim: não aceitar boletins intermediários ou abertura
+      if (!isOfficialClosingBulletin(it.tipoBoletim)) {
+        return false;
+      }
+
+      // Validação numérica estrita
       if (!isValidPtaxNumber(it.cotacaoVenda)) {
         return false;
       }
@@ -408,11 +460,28 @@ export async function getPtaxClosingD1(options: GetPtaxOptions = {}): Promise<Pt
       };
     }
 
-    // O primeiro item (ordenação desc) é o fechamento oficial mais recente anterior à precificação
+    // Ordenar deterministicamente para não depender exclusivamente da ordenação da API externa:
+    // 1) Data da cotação desc (YYYY-MM-DD)
+    // 2) Horário da cotação desc (dataHoraCotacao)
+    validQuotes.sort((a: any, b: any) => {
+      const dateA = a.dataHoraCotacao.slice(0, 10);
+      const dateB = b.dataHoraCotacao.slice(0, 10);
+      if (dateB !== dateA) {
+        return dateB.localeCompare(dateA);
+      }
+      const timeA = new Date(a.dataHoraCotacao.replace(' ', 'T')).getTime() || 0;
+      const timeB = new Date(b.dataHoraCotacao.replace(' ', 'T')).getTime() || 0;
+      if (timeB !== timeA) {
+        return timeB - timeA;
+      }
+      return String(b.dataHoraCotacao).localeCompare(String(a.dataHoraCotacao));
+    });
+
     const chosen = validQuotes[0];
     const chosenQuoteDate = chosen.dataHoraCotacao.slice(0, 10);
     const chosenVenda = Number(chosen.cotacaoVenda);
     const chosenCompra = isValidPtaxNumber(chosen.cotacaoCompra) ? Number(chosen.cotacaoCompra) : undefined;
+    const chosenTipoBoletim = typeof chosen.tipoBoletim === 'string' ? chosen.tipoBoletim : 'Fechamento';
 
     const finalResult: PtaxQuoteResult = {
       success: true,
@@ -421,13 +490,14 @@ export async function getPtaxClosingD1(options: GetPtaxOptions = {}): Promise<Pt
       quoteDate: chosenQuoteDate,
       pricingDate,
       dataHoraCotacao: chosen.dataHoraCotacao,
+      tipoBoletim: chosenTipoBoletim,
       source: PTAX_SOURCE_LABEL,
       queriedAt: nowIso,
       fromCache: false,
       status: 'SUCCESS',
     };
 
-    // 4. Salvar no Firestore '(default)'
+    // 4. Salvar no Firestore '(default)' — gravação cirúrgica apenas na coleção de cache oficial
     if (!options.skipFirestoreCache) {
       try {
         const db = options.firestoreDb || getFirestoreDb();
@@ -439,21 +509,7 @@ export async function getPtaxClosingD1(options: GetPtaxOptions = {}): Promise<Pt
               cotacaoVenda: chosenVenda,
               cotacaoCompra: chosenCompra || null,
               dataHoraCotacao: chosen.dataHoraCotacao,
-              source: PTAX_SOURCE_LABEL,
-              queriedAt: nowIso,
-              updatedAt: nowIso,
-            },
-            { merge: true }
-          );
-
-          // Salvar também índice de referência mais recente
-          await db.collection(PTAX_CACHE_COLLECTION).doc('latest_d1').set(
-            {
-              pricingDate,
-              quoteDate: chosenQuoteDate,
-              cotacaoVenda: chosenVenda,
-              cotacaoCompra: chosenCompra || null,
-              dataHoraCotacao: chosen.dataHoraCotacao,
+              tipoBoletim: chosenTipoBoletim,
               source: PTAX_SOURCE_LABEL,
               queriedAt: nowIso,
               updatedAt: nowIso,

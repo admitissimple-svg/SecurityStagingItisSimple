@@ -5715,21 +5715,60 @@ app.get('/api/payments/status', (_req, res) => {
   });
 });
 
+// Rate limiter em memória específico para a rota pública PTAX (proteção contra flooding e DoS)
+const ptaxRateLimitMap = new Map<string, { count: number; resetTime: number }>();
+const PTAX_RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minuto
+const PTAX_RATE_LIMIT_MAX_REQUESTS = 60; // 60 requisições por minuto por IP
+
 // FASE FIN.2A.2C: Endpoint isolado para consulta da cotação oficial PTAX D-1 do BACEN
-app.get('/api/financial/ptax', async (_req, res) => {
+app.get('/api/financial/ptax', async (req, res) => {
+  // 1. Segurança: rejeição de parâmetros arbitrários na rota pública
+  if (req.query && Object.keys(req.query).length > 0) {
+    return res.status(400).json({
+      success: false,
+      status: 'ERROR',
+      error: 'PARAMETROS_INVALIDOS',
+      details: 'A rota de cotação PTAX não aceita parâmetros de consulta.',
+    });
+  }
+
+  // 2. Segurança: controle de frequência de chamadas (rate limiting por IP)
+  const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.socket?.remoteAddress || 'unknown';
+  const now = Date.now();
+  const clientRecord = ptaxRateLimitMap.get(clientIp);
+
+  if (clientRecord && now < clientRecord.resetTime) {
+    clientRecord.count++;
+    if (clientRecord.count > PTAX_RATE_LIMIT_MAX_REQUESTS) {
+      const retryAfterSec = Math.ceil((clientRecord.resetTime - now) / 1000);
+      res.setHeader('Retry-After', String(retryAfterSec));
+      return res.status(429).json({
+        success: false,
+        status: 'ERROR',
+        error: 'RATE_LIMIT_EXCEEDED',
+        details: `Limite de consultas cambiais excedido. Tente novamente em ${retryAfterSec}s.`,
+      });
+    }
+  } else {
+    ptaxRateLimitMap.set(clientIp, { count: 1, resetTime: now + PTAX_RATE_LIMIT_WINDOW_MS });
+  }
+
   try {
     const result = await getPtaxClosingD1();
     if (!result.success) {
       const statusCode = result.status === 'UNAVAILABLE' ? 404 : 503;
       return res.status(statusCode).json(result);
     }
+    res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300');
     return res.json(result);
   } catch (err: any) {
+    console.error('[GET /api/financial/ptax] Erro interno:', err);
+    // 3. Segurança: resposta padronizada sem vazamento de detalhes internos do Firestore/servidor
     return res.status(500).json({
       success: false,
       status: 'ERROR',
       error: 'ERRO_INTERNO_PTAX',
-      details: err?.message || String(err),
+      details: 'Falha interna ao processar consulta da cotação PTAX.',
     });
   }
 });
