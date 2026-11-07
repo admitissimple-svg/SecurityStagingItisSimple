@@ -215,6 +215,7 @@ import {
   markAsVerifiedUser,
 } from './src/middleware/firebaseAuth';
 import { getFirebaseAdminAuth } from './src/serverFirebaseAdmin';
+import { getPtaxClosingD1 } from './src/serverPtax';
 import {
   isDiagnosticMode,
   isAuthorizedOriginStrict,
@@ -5712,6 +5713,25 @@ app.get('/api/payments/status', (_req, res) => {
       ? 'Pagamentos habilitados'
       : 'Contratações temporariamente indisponíveis (modo pré-comercialização)',
   });
+});
+
+// FASE FIN.2A.2C: Endpoint isolado para consulta da cotação oficial PTAX D-1 do BACEN
+app.get('/api/financial/ptax', async (_req, res) => {
+  try {
+    const result = await getPtaxClosingD1();
+    if (!result.success) {
+      const statusCode = result.status === 'UNAVAILABLE' ? 404 : 503;
+      return res.status(statusCode).json(result);
+    }
+    return res.json(result);
+  } catch (err: any) {
+    return res.status(500).json({
+      success: false,
+      status: 'ERROR',
+      error: 'ERRO_INTERNO_PTAX',
+      details: err?.message || String(err),
+    });
+  }
 });
 
 // Purchase Lesson Package with a specific Native Friend (binds tutor as fixed + adds lessons)
