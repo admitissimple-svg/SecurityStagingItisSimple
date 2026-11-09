@@ -1,10 +1,10 @@
 import { EnglishLevel, LiveLesson } from '../types';
 import { NATIVE_FRIENDS_DICTIONARY_DATABASE } from '../data/dictionaryDatabase';
-import { parseNotesHtml, ParsedNotesResult } from './notesHtmlParser';
+import { parseNotesHtml, ParsedNotesResult, isPedagogicalTermMatch, hasValidPedagogicalContent } from './notesHtmlParser';
 import { isGenericPedagogicalDefinition, isGenericPedagogicalExample } from './dictionaryService';
 import { auth } from '../firebase';
 
-export { parseNotesHtml, isGenericPedagogicalDefinition, isGenericPedagogicalExample };
+export { parseNotesHtml, isGenericPedagogicalDefinition, isGenericPedagogicalExample, isPedagogicalTermMatch, hasValidPedagogicalContent };
 export type { ParsedNotesResult };
 
 export interface PedagogicalMistakeAnalysis {
@@ -319,7 +319,7 @@ export function validatePedagogicalAiResponse(
       const cleanTarget = newWord.toLowerCase().trim();
       const found = vocabList.find((v: any) => {
         const vTerm = String(v?.term || '').toLowerCase().trim();
-        return vTerm === cleanTarget || vTerm.includes(cleanTarget) || cleanTarget.includes(vTerm);
+        return isPedagogicalTermMatch(vTerm, cleanTarget);
       });
 
       if (!found) {
@@ -360,7 +360,7 @@ export function validatePedagogicalAiResponse(
       const cleanTarget = pItem.toLowerCase().trim();
       const found = vocabList.find((v: any) => {
         const vTerm = String(v?.term || '').toLowerCase().trim();
-        return vTerm === cleanTarget || vTerm.includes(cleanTarget) || cleanTarget.includes(vTerm);
+        return isPedagogicalTermMatch(vTerm, cleanTarget);
       });
 
       if (!found) {
@@ -388,8 +388,32 @@ export function validatePedagogicalAiResponse(
     }
   }
 
-  // If teacher had NEITHER Alt+W NOR Alt+P, check that vocabList does not contain synthetic words
-  if (!hasNewWords && !hasPronounce) {
+  // 4. Validate Untagged Vocab Items (when teacher provided notes without explicit Alt+W/P stamps)
+  const hasUntaggedVocab = Array.isArray(markings.vocabItems) && markings.vocabItems.length > 0;
+  if (!hasNewWords && !hasPronounce && hasUntaggedVocab) {
+    if (vocabList.length === 0) {
+      return { valid: false, reason: 'AI omitted vocabularyAndExpressions although teacher provided vocabulary notes' };
+    }
+
+    for (const vItem of markings.vocabItems) {
+      const cleanTarget = vItem.toLowerCase().trim();
+      const found = vocabList.find((v: any) => {
+        const vTerm = String(v?.term || '').toLowerCase().trim();
+        return isPedagogicalTermMatch(vTerm, cleanTarget);
+      });
+
+      if (!found) {
+        return { valid: false, reason: `AI response missed teacher note item: "${vItem}"` };
+      }
+
+      if (!found.simpleDefinition || typeof found.simpleDefinition !== 'string' || isGenericPedagogicalDefinition(found.simpleDefinition)) {
+        return { valid: false, reason: `AI provided generic or missing simpleDefinition for: "${vItem}"` };
+      }
+    }
+  }
+
+  // If teacher had NEITHER Alt+W, Alt+P, NOR untagged vocab items, check that vocabList does not contain synthetic words
+  if (!hasNewWords && !hasPronounce && !hasUntaggedVocab) {
     for (const v of vocabList) {
       const termLower = String(v?.term || '').toLowerCase().trim();
       if (termLower === 'catch up' || termLower === 'workload' || termLower === 'streamline' || termLower === 'make sense') {
@@ -398,7 +422,19 @@ export function validatePedagogicalAiResponse(
     }
   }
 
-  // 4. Validate Quick Review Summary
+  // 5. Validate Grammar Points: if notes had no errors, grammarPoints must be empty (no invented grammar rules)
+  const grammar = Array.isArray(parsed.grammarPoints) ? parsed.grammarPoints : [];
+  if (!hasErrors && grammar.length > 0) {
+    // Check if synthetic rules were fabricated
+    for (const g of grammar) {
+      const topicLower = String(g?.topic || '').toLowerCase();
+      if (topicLower.includes('agree') || topicLower.includes('age') || topicLower.includes('to be')) {
+        return { valid: false, reason: 'AI inserted synthetic grammar rules when notes had no errors' };
+      }
+    }
+  }
+
+  // 6. Validate Quick Review Summary
   if (!parsed.reviewSummary || typeof parsed.reviewSummary !== 'object') {
     return { valid: false, reason: 'AI response missing reviewSummary' };
   }

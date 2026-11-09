@@ -1366,8 +1366,8 @@ export async function executeGeminiWithContingency(
     temperature?: number;
     apiKey?: string;
     callerRole?: string;
-    validator?: (json: any) => boolean;
-    jsonValidator?: (json: any) => boolean;
+    validator?: (json: any) => boolean | { valid: boolean; reason?: string };
+    jsonValidator?: (json: any) => boolean | { valid: boolean; reason?: string };
     modelsOverride?: string[];
     correlationId?: string;
   },
@@ -1443,7 +1443,18 @@ export async function executeGeminiWithContingency(
 
     if (attempt?.parsedJson) {
       const validatorFn = params.jsonValidator || params.validator;
-      const isValid = validatorFn ? validatorFn(attempt.parsedJson) : true;
+      let isValid = true;
+      let validationReason = '';
+      if (validatorFn) {
+        const valRes: any = validatorFn(attempt.parsedJson);
+        if (typeof valRes === 'boolean') {
+          isValid = valRes;
+        } else if (valRes && typeof valRes === 'object') {
+          isValid = Boolean(valRes.valid);
+          validationReason = valRes.reason || '';
+        }
+      }
+
       if (isValid) {
         attemptsDetails.push({
           attemptNumber: i + 1,
@@ -1478,8 +1489,8 @@ export async function executeGeminiWithContingency(
         attempt.error = {
           statusCode: 502,
           category: 'INVALID_RESPONSE',
-          safeReason: `Model ${currentModel} output did not conform to pedagogical schema contract.`,
-          rawMessage: 'VALIDATION_FAILED',
+          safeReason: validationReason || `Model ${currentModel} output did not conform to pedagogical schema contract.`,
+          rawMessage: validationReason ? `VALIDATION_FAILED: ${validationReason}` : 'VALIDATION_FAILED',
         };
       }
     }

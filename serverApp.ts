@@ -189,7 +189,7 @@ import {
 } from './src/utils/writingChecker';
 import { sanitizeTimeZone } from './src/utils/timezone';
 import crypto from 'crypto';
-import { parseNotesHtml } from './src/utils/notesHtmlParser';
+import { parseNotesHtml, hasValidPedagogicalContent, isPedagogicalTermMatch } from './src/utils/notesHtmlParser';
 import {
   generateLocalPedagogicalTransformation,
   getCanonicalSessionKey,
@@ -9509,12 +9509,23 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
     const newWordCount = markings.newWordCount;
     const pronounceCount = markings.pronounceCount;
 
+    // FASE NF-NOTES.2: Semantic validation — reject empty notes or markup without pedagogical content
+    if (!hasValidPedagogicalContent(rawNotes, markings)) {
+      return res.status(400).json({
+        success: false,
+        error: 'InvalidNotesContent',
+        message: language === 'pt'
+          ? 'As anotações enviadas estão vazias ou não contêm termos pedagógicos válidos para análise.'
+          : 'The submitted notes are empty or contain no valid pedagogical content for analysis.',
+      });
+    }
+
     const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || '';
     const isCooldownActive = Date.now() < geminiQuotaCooldownUntil;
     let lastFailureCategory: GeminiFailureCategory | null = isCooldownActive ? 'QUOTA_EXCEEDED' : null;
     let contingencyResult: any = null;
 
-    if (apiKey && rawNotes.trim().length > 15 && !isCooldownActive) {
+    if (apiKey && !isCooldownActive) {
       const targetLang = LANGUAGE_NAMES[language] || { nameEn: 'Portuguese', nameNative: 'Português' };
       const pendingText = getPendingConfirmationText(language);
 
@@ -9533,18 +9544,30 @@ CRITICAL INSTRUCTIONS ON TEACHER SHORTCUT MARKINGS & TAB ROUTING:
      a) "mistakesAnalysis" (Tab 1: Analyze Mistakes): student's original faulty utterance, natural native correction (resolving spelling, phrasing, or grammatical slips into polished English), category, grammatical explanation (addressing L1 interference), two natural examples, and common pitfalls. Even if the teacher wrote an isolated mistake without explicit correction (e.g. spelling slips or words marked with ✗), deduce and provide the accurate, natural native correction.
      b) "grammarPoints" (Tab 2: Grammar Points): whenever an error involves a systemic grammatical rule/structure (e.g. verb tenses, stative verbs, auxiliary verbs, dependent prepositions, conditionals, modals, word order), elaborate the corresponding rule with syntax (FORM), usage, examples, and comparisons. Ensure at least 2 relevant, high-impact grammar points are provided, connecting to the session errors or CEFR ${cefr} speaking goals.
 2. Alt + W (New Word) & Alt + P (Pronunciation Markings):
-   - Items stamped with 'data-tag-type="new-word"', '[New Word]', 'data-tag-type="pronounce"', '[Pronounce]' MUST be directed and processed into:
+   - Items stamped with 'data-tag-type="new-word"', '[New Word]', 'data-tag-type="pronounce"', '[Pronounce]' or standalone vocabulary words MUST be directed and processed into:
      "vocabularyAndExpressions" (Tab 3: Vocabulary & Expressions).
-   - For Alt+W: provide part of speech, register, simple definition adapted to CEFR ${cefr}, collocations, real examples, and synonyms.
+   - For Alt+W / vocabulary: provide part of speech, register, simple definition adapted to CEFR ${cefr}, collocations, real examples, and synonyms.
    - For Alt+P: mark partOfSpeech as "Pronunciation Focus", provide clear syllable stress breakdown, phonetic guide with IPA, common pronunciation slips to avoid, and conversational examples.
-3. CEFR LEVEL ADAPTATION:
+3. CRITICAL RULES FOR VOCABULARY-ONLY OR SHORT NOTES:
+   - If the notes contain ONLY vocabulary or pronunciation items (and NO student sentence errors):
+     * "mistakesAnalysis" MUST be an empty array []. NEVER fabricate non-existent student errors, sentences, or phrases!
+     * "grammarPoints" MUST be an empty array []. NEVER fabricate synthetic grammar rules when there are no systemic grammar errors!
+     * In "vocabularyAndExpressions", provide rich, authentic pedagogical analysis calibrated to CEFR ${cefr}.
+     * If a term contains a spelling slip (e.g. the teacher recorded "blury", which is standardly spelled "blurry"), evaluate and identify the correct spelling "blurry", explain the spelling rule/distinction, provide accurate CEFR ${cefr} definitions in English and ${targetLang.nameEn}, natural real-world examples, collocations, and register.
+     * In "reviewSummary", ALWAYS generate a complete object:
+       - "estimatedMinutes": "3–5 minutes"
+       - "keyRules": []
+       - "mustKnowVocabulary": include all vocabulary items with their definitions in ${targetLang.nameEn}
+       - "essentialCorrections": []
+       - "rememberThis": an inspiring, memorable golden takeaway rule in ${targetLang.nameEn} (at least 15 characters), focusing on the vocabulary item or spelling distinction.
+4. CEFR LEVEL ADAPTATION:
    - There is NO separate CEFR tab. Instead, ALL tabs (Complete Report, 1. Analyze Mistakes, 2. Grammar Points, 3. Vocabulary & Expressions, and Quick Review) MUST be intelligently and deeply elaborated respecting and adapting to the student's current CEFR level (${cefr}).
-4. QUICK REVIEW MANDATE:
+5. QUICK REVIEW MANDATE:
    - ALL session notes, corrections, and processed terms MUST compose the Quick Review ("reviewSummary").
    - "essentialCorrections": MUST contain ALL items from mistakesAnalysis.
    - "mustKnowVocabulary": MUST contain ALL terms from vocabularyAndExpressions (both Alt+W and Alt+P).
    - "keyRules": MUST contain ALL grammar rules from grammarPoints.
-   - "rememberThis": High-impact golden takeaway rule for the student.
+   - "rememberThis": High-impact golden takeaway rule for the student (at least 15 characters).
 
 You MUST produce a JSON object strictly conforming to this schema:
 {
@@ -9613,7 +9636,7 @@ Raw In-Session Notes to transform:
 ${rawNotes}
 """
 
-Please synthesize and transform these notes according to the Alt+N, Alt+W, and Alt+P routing rules, adapting deeply to CEFR ${cefr}, and ensuring ALL items are included in the Quick Review. Provide all explanations and pedagogical rules in ${targetLang.nameEn} (${targetLang.nameNative}).`;
+Please synthesize and transform these notes according to the Alt+N, Alt+W, and Alt+P routing rules, adapting deeply to CEFR ${cefr}. If the notes contain only vocabulary (such as a single word like "blury"), evaluate the term (including spelling accuracy like "blurry"), leave mistakesAnalysis and grammarPoints empty without fabricating errors, and ensure reviewSummary and rememberThis are fully provided in ${targetLang.nameEn} (${targetLang.nameNative}). Provide all explanations and pedagogical rules in ${targetLang.nameEn} (${targetLang.nameNative}).`;
 
       // HOTFIX 3-MODEL CONTINGENCY: Sequential failover across up to 3 verified models on recoverable errors
       contingencyResult = await executeGeminiWithContingency({
@@ -9623,7 +9646,7 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
         callerRole: caller.role,
         apiKey,
         temperature: 0.35,
-        validator: (json) => validatePedagogicalAiResponse(json, markings, cefr, language).valid,
+        validator: (json) => validatePedagogicalAiResponse(json, markings, cefr, language),
       });
 
       if (contingencyResult.success && contingencyResult.parsedJson) {
@@ -9661,10 +9684,11 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
             });
           }
 
-          // Strict validation of vocabulary: terms MUST be in markings.newWords or markings.pronounceItems
+          // Strict validation of vocabulary: terms MUST be in markings.newWords, markings.pronounceItems, or markings.vocabItems
           const validTermsSet = new Set<string>([
             ...markings.newWords.map((w) => w.toLowerCase().trim()),
             ...markings.pronounceItems.map((p) => p.toLowerCase().trim()),
+            ...markings.vocabItems.map((v) => v.toLowerCase().trim()),
           ]);
 
           const validatedVocab: any[] = [];
@@ -9672,14 +9696,16 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
             (parsed.vocabularyAndExpressions || []).forEach((v: any) => {
               const termKey = String(v?.term || '').toLowerCase().trim();
               const matchedTarget = Array.from(validTermsSet).find(
-                (target) => termKey === target || termKey.includes(target) || target.includes(termKey)
+                (target) => isPedagogicalTermMatch(termKey, target)
               );
               if (matchedTarget) {
                 const isPronounce = markings.pronounceItems.some(
-                  (p) => matchedTarget.includes(p.toLowerCase().trim()) || p.toLowerCase().trim().includes(matchedTarget)
+                  (p) => isPedagogicalTermMatch(p, matchedTarget)
                 );
                 const isNewWord = markings.newWords.some(
-                  (w) => matchedTarget.includes(w.toLowerCase().trim()) || w.toLowerCase().trim().includes(matchedTarget)
+                  (w) => isPedagogicalTermMatch(w, matchedTarget)
+                ) || markings.vocabItems.some(
+                  (w) => isPedagogicalTermMatch(w, matchedTarget)
                 );
 
                 const rawExamples = Array.isArray(v.realExamples) ? v.realExamples : [];

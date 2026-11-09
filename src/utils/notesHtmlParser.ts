@@ -94,6 +94,7 @@ function isTemplateHeaderLine(line: string): boolean {
   const norm = line.toLowerCase().trim();
   if (!norm) return true;
   if (norm.includes('native friend in-session notes')) return true;
+  if (norm.includes('session notes with')) return true;
   if (norm.startsWith('date:') && (norm.includes('student:') || norm.includes('|'))) return true;
   if (norm.startsWith('topic:')) return true;
   if (norm === 'in-session coaching notes:' || norm === 'coaching notes:') return true;
@@ -394,10 +395,29 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
       continue;
     }
 
-    // Case 7: Bulleted notes without explicit coaching tag
+    // Case 7: Bulleted notes or standalone untagged expressions without explicit coaching tag
     if (line.startsWith('•') || line.startsWith('-') || line.startsWith('*')) {
       const item = cleanExpressionTerm(line);
-      if (item && item.length > 1 && !item.toLowerCase().includes('in-session notes')) {
+      if (item && item.length >= 1 && !item.toLowerCase().includes('in-session notes')) {
+        vocabItems.push(item);
+      }
+    } else {
+      const item = cleanExpressionTerm(line);
+      // Only treat as standalone untagged vocab if it is an isolated term/expression (not a full narrative sentence)
+      const wordCount = item.split(/\s+/).filter(Boolean).length;
+      const isSentence = item.includes('.') || item.includes('?') || item.includes('!') || wordCount > 4;
+      if (
+        item &&
+        item.length >= 1 &&
+        !isSentence &&
+        !isTemplateHeaderLine(item) &&
+        !isBadgeLabel(item) &&
+        !item.toLowerCase().includes('in-session notes') &&
+        !seenNewWords.has(item.toLowerCase()) &&
+        !seenPronounce.has(item.toLowerCase()) &&
+        !seenErrors.has(item.toLowerCase()) &&
+        !seenPositives.has(item.toLowerCase())
+      ) {
         vocabItems.push(item);
       }
     }
@@ -412,9 +432,12 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
   // Final tag count evaluation
   const correctCount = Math.max(tagCorrect + plainCorrect, positives.length);
   const incorrectCount = Math.max(tagIncorrect + plainIncorrect, errors.length);
-  const newWordCount = Math.max(tagNewWord, newWords.length);
+  const newWordCount = Math.max(
+    tagNewWord,
+    newWords.length,
+    errors.length === 0 && pronounceItems.length === 0 ? vocabItems.length : 0
+  );
   const pronounceCount = Math.max(tagPronounce, pronounceItems.length);
-
 
   return {
     errors,
@@ -428,4 +451,101 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
     newWordCount,
     pronounceCount,
   };
+}
+
+/**
+ * Calculates Levenshtein edit distance between two strings.
+ */
+export function levenshteinDistance(s1: string, s2: string): number {
+  const m = s1.length;
+  const n = s2.length;
+  const d: number[][] = [];
+  for (let i = 0; i <= m; i++) d[i] = [i];
+  for (let j = 0; j <= n; j++) d[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = s1[i - 1] === s2[j - 1] ? 0 : 1;
+      d[i][j] = Math.min(
+        d[i - 1][j] + 1,
+        d[i][j - 1] + 1,
+        d[i - 1][j - 1] + cost
+      );
+    }
+  }
+  return d[m][n];
+}
+
+/**
+ * Robust pedagogical matcher that determines if an AI generated term corresponds
+ * to a teacher note expression, supporting:
+ * 1. Exact string match
+ * 2. Substring inclusion
+ * 3. Spelling correction & doubled consonant variations (e.g. blury <-> blurry)
+ * 4. Close edit distance (Levenshtein <= 1 or 2 for longer terms)
+ */
+export function isPedagogicalTermMatch(termA: string, termB: string): boolean {
+  if (!termA || !termB) return false;
+  const a = termA.toLowerCase().trim();
+  const b = termB.toLowerCase().trim();
+  if (a === b) return true;
+  if (a.includes(b) || b.includes(a)) return true;
+
+  const cleanA = a.replace(/[^a-z0-9]/g, '');
+  const cleanB = b.replace(/[^a-z0-9]/g, '');
+  if (!cleanA || !cleanB) return false;
+  if (cleanA === cleanB) return true;
+  if (cleanA.includes(cleanB) || cleanB.includes(cleanA)) return true;
+
+  // Collapsed consecutive duplicate characters (e.g. "blurry" -> "blury")
+  const collapsedA = cleanA.replace(/(.)\1+/g, '$1');
+  const collapsedB = cleanB.replace(/(.)\1+/g, '$1');
+  if (collapsedA === collapsedB) return true;
+
+  const minLen = Math.min(cleanA.length, cleanB.length);
+  const maxLen = Math.max(cleanA.length, cleanB.length);
+  if (maxLen - minLen <= 2 && minLen >= 3) {
+    const maxAllowedDist = minLen >= 7 ? 2 : 1;
+    if (levenshteinDistance(cleanA, cleanB) <= maxAllowedDist) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Evaluates whether raw teacher notes contain actionable pedagogical content.
+ * Rejects empty input, whitespace, and markup-only inputs (e.g. empty spans/tags).
+ * Accepts single valid words (e.g. "blury"), Alt+W, Alt+P, or Alt+N markings.
+ */
+export function hasValidPedagogicalContent(
+  rawNotes: string,
+  markings?: ParsedNotesResult
+): boolean {
+  if (!rawNotes || typeof rawNotes !== 'string') return false;
+  const trimmed = rawNotes.trim();
+  if (!trimmed) return false;
+
+  const parsed = markings || parseNotesHtml(rawNotes);
+
+  if (
+    parsed.errors.length > 0 ||
+    parsed.newWords.length > 0 ||
+    parsed.pronounceItems.length > 0 ||
+    parsed.positives.length > 0 ||
+    parsed.vocabItems.length > 0
+  ) {
+    return true;
+  }
+
+  const clean = (parsed.cleanText || '').trim();
+  if (!clean) return false;
+
+  const withoutBadges = clean
+    .replace(/\b(New Word|Pronounce|Correct|Incorrect|Date|Topic|Student|Session Notes)\b/gi, '')
+    .replace(/[^a-zA-ZÀ-ÿ0-9]/g, ' ')
+    .trim();
+
+  const words = withoutBadges.split(/\s+/).filter((w) => w.length >= 2);
+  return words.length > 0;
 }
