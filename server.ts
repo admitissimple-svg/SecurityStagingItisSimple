@@ -152,7 +152,7 @@ if (!isTsx) {
 
   const child = spawn(
     process.execPath,
-    ['--import', 'tsx', currentFilePath],
+    ['--import', 'tsx', currentFilePath, ...process.argv.slice(2)],
     {
       stdio: 'inherit',
       env: {
