@@ -281,11 +281,14 @@ export function validatePedagogicalAiResponse(
         return { valid: false, reason: `AI explanation too short or missing for: "${rawErr.original}"` };
       }
 
-      // Check examples
-      if (!Array.isArray(found.twoExamples) || found.twoExamples.length === 0) {
+      // Check examples (supports 2-4 natural examples)
+      const rawExamples = Array.isArray(found.twoExamples) && found.twoExamples.length > 0
+        ? found.twoExamples
+        : (Array.isArray(found.examples) ? found.examples : []);
+      if (rawExamples.length === 0) {
         return { valid: false, reason: `AI omitted examples for mistake: "${rawErr.original}"` };
       }
-      for (const ex of found.twoExamples) {
+      for (const ex of rawExamples) {
         if (typeof ex !== 'string' || isGenericPedagogicalExample(ex)) {
           return { valid: false, reason: `AI provided generic example for mistake: "${rawErr.original}"` };
         }

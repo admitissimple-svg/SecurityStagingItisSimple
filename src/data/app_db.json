@@ -150,9 +150,6 @@
   "weeklyNativeTargets": {},
   "weeklyStudyDaysTargets": {},
   "weeklyStudyDays": {},
-  "studentDictionaryMap": {},
-  "studentJournalMap": {},
-  "studentActivityJournal": {},
   "transactions": [],
   "studentVideoAssignments": {},
   "studentWatchedVideos": {},
@@ -160,9 +157,6 @@
   "studentListenedTracks": {},
   "studentAwaitingTopicSelection": {},
   "spotifyPlaylists": {},
-  "sessionNotesMap": {},
-  "sessionNotesProgressMap": {},
-  "pedagogicalTransformationsMap": {},
   "authUsers": {},
   "youtubePlaylists": [
     {

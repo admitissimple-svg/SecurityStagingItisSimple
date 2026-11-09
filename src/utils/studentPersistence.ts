@@ -3608,8 +3608,8 @@ export async function fetchStudentWeeklyChecksFromFirestore(
     }
   }
 
-  // 3. Server API sync / fallback (persisted in backend disk app_db.json)
-  // ALWAYS query backend server API to ensure all checks persisted on disk are loaded and merged
+  // 3. Server API sync / fallback (hydrated from authoritative Cloud Firestore)
+  // ALWAYS query backend server API to ensure all checks persisted in Firestore are loaded and merged
   if (cleanUid || cleanEmail) {
     try {
       const qParams = new URLSearchParams();

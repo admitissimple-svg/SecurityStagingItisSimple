@@ -636,7 +636,12 @@ export async function deleteTutorFromFirestore(tutorId: string): Promise<boolean
     const delPromise = Promise.all([delFromUsers, delFromTutors]).then(() => true);
     const result = await withTimeout(delPromise, 6000);
     return !!result;
-  } catch (err) {
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+      console.info('[serverFirestore] Remote tutor delete restricted by cloud IAM credentials, continuing with local state.');
+      return false;
+    }
     console.warn('Firestore deleteTutor error:', err);
     return false;
   }
@@ -866,6 +871,7 @@ export async function fetchYouTubePlaylistsDocFromFirestore(): Promise<{
   updatedAt?: string;
   lastSyncSuccess?: string;
 } | null> {
+  if (isCloudWriteDisabled) return null;
   const db = getFirestoreDb();
   if (!db) return null;
   try {
@@ -886,7 +892,12 @@ export async function fetchYouTubePlaylistsDocFromFirestore(): Promise<{
       return null;
     };
     return await withTimeout(fetchPromise(), 4000);
-  } catch (err) {
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+      console.info('[serverFirestore] Remote YouTube playlists access restricted by cloud IAM credentials, continuing with local state.');
+      return null;
+    }
     console.warn('Firestore fetchYouTubePlaylistsDoc error:', err);
     return null;
   }
@@ -3158,7 +3169,11 @@ export async function fetchStudentVocabularyFromFirestoreServer(
         return Boolean(norm && !excludedSet.has(norm));
       })
       .sort((a, b) => (a.word || '').localeCompare(b.word || ''));
-  } catch (err) {
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+      return [];
+    }
     console.warn('fetchStudentVocabularyFromFirestoreServer error:', err);
     return [];
   }
@@ -3189,7 +3204,11 @@ export async function fetchExcludedDictionaryWordsServer(
       }
     }
     return [];
-  } catch (err) {
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+      return [];
+    }
     console.warn('fetchExcludedDictionaryWordsServer error:', err);
     return [];
   }
@@ -3632,7 +3651,11 @@ export async function savePedagogicalTransformationToFirestoreServer(
       { merge: true }
     );
     return true;
-  } catch (err) {
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+      return false;
+    }
     console.warn('Firestore savePedagogicalTransformation error:', err);
     return false;
   }
@@ -3781,6 +3804,8 @@ export async function recordLessonReviewInStudentJournalServer(params: {
     keyCorrections: essentialCorrections,
     grammarRules: keyRules,
     pronunciationPoints,
+    mistakesAnalysis: Array.isArray(transformation.mistakesAnalysis) ? transformation.mistakesAnalysis : [],
+    grammarPoints: Array.isArray(transformation.grammarPoints) ? transformation.grammarPoints : [],
   };
 
   const sanitized = removeUndefinedFields(journalEntry);
@@ -4050,7 +4075,11 @@ export async function fetchStudentDailyJournalFromServerFirestore(docId: string)
       return tB - tA;
     });
     return list;
-  } catch (err) {
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+      return [];
+    }
     console.warn('fetchStudentDailyJournalFromServerFirestore error:', err);
     return [];
   }
@@ -4085,7 +4114,11 @@ export async function deleteStudentJournalEntryFromServerFirestore(
       }
     }
     return true;
-  } catch (err) {
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+      return false;
+    }
     console.warn('deleteStudentJournalEntryFromServerFirestore error:', err);
     return false;
   }

@@ -458,11 +458,14 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
         console.warn('NativeFriendsNotes: Server notes query notice:', apiResult.reason);
       }
 
-      // 4. Convert to array and sort STRICTLY DESCENDING by real lesson timestamp (newest / most recent first)
+      // 4. Convert to array and sort STRICTLY DESCENDING by real lesson timestamp (newest / most recent first with deterministic tie-breaker)
       const list = Array.from(sessionsMap.values()).sort((a, b) => {
         const timeA = a.timestamp || 0;
         const timeB = b.timestamp || 0;
-        return timeB - timeA; // Descending: newest real lesson first
+        if (timeB !== timeA) return timeB - timeA; // Descending: newest real lesson first
+        const dateCmp = (b.dateStr || '').localeCompare(a.dateStr || '');
+        if (dateCmp !== 0) return dateCmp;
+        return (b.key || '').localeCompare(a.key || '');
       });
 
       setSessionOptions(list);

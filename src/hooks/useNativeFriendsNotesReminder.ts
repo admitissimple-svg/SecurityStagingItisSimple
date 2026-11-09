@@ -5,6 +5,7 @@ import {
   extractNotesMarkings,
   fetchPedagogicalTransformation,
   PedagogicalLessonTransformation,
+  hasValidPedagogicalContent,
 } from '../utils/pedagogicalTransformer';
 import { getDb } from '../firebase';
 import { collection, doc, getDoc, getDocs, setDoc, onSnapshot } from 'firebase/firestore';
@@ -252,11 +253,14 @@ export function useNativeFriendsNotesReminder({
         console.warn('useNativeFriendsNotesReminder: Server API notice:', apiErr);
       }
 
-      // Sort strictly descending: newest real lesson first
+      // Sort strictly descending: newest real lesson first with deterministic tie-breaking
       const sorted = Array.from(sessionsMap.values()).sort((a, b) => {
         const timeA = a.timestamp || 0;
         const timeB = b.timestamp || 0;
-        return timeB - timeA;
+        if (timeB !== timeA) return timeB - timeA;
+        const dateCmp = (b.dateStr || '').localeCompare(a.dateStr || '');
+        if (dateCmp !== 0) return dateCmp;
+        return (b.key || '').localeCompare(a.key || '');
       });
 
       setSessions(sorted);
@@ -707,7 +711,13 @@ export function useNativeFriendsNotesReminder({
   // 10. Compute Dynamic Reminder based on the 4 Strict Rules
   const reminder = useMemo<NativeFriendsNotesReminder | null>(() => {
     // Regra 1: Se o aluno nunca teve nenhuma aula com o amigo nativo, nenhum lembrete será exibido.
-    if (!hasHadAnyLesson || !latestSession) {
+    // Regra 6 (Ausência de conteúdo): Se não existir anotação válida ou o conteúdo for vazio/inválido, não apresentar lembrete vazio.
+    if (!hasHadAnyLesson || !latestSession || !latestSession.rawContent || !latestSession.rawContent.trim()) {
+      return null;
+    }
+
+    const rawMarkings = extractNotesMarkings(latestSession.rawContent);
+    if (!hasValidPedagogicalContent(latestSession.rawContent, rawMarkings)) {
       return null;
     }
 

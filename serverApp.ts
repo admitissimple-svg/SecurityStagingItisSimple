@@ -109,6 +109,7 @@ import {
   saveHomeworkToFirestore,
   mergeHomeworkRecords,
   isPermissionError,
+  getIsCloudWriteDisabled,
   consolidateTutorsList,
   resolveTeacherCanonicalIdentity,
   isValidCanonicalUid,
@@ -798,8 +799,6 @@ function mergeDbWithDefaults(parsed: any): AppDb {
   return merged;
 }
 
-const LOCAL_DB_PATH = path.join(process.cwd(), 'src', 'data', 'app_db.json');
-
 export function scrubPasswords(db: any): any {
   if (!db || typeof db !== 'object') return db;
   if (db.authUsers && typeof db.authUsers === 'object') {
@@ -834,126 +833,6 @@ export function scrubPasswords(db: any): any {
   return db;
 }
 
-function saveToDiskSync(db: AppDb) {
-  // HOTFIX PONTUAL: Isolamento de app_db.json
-  // app_db.json permanece intacto exclusivamente como arquivo legado de testes.
-  // Nenhuma operação de gravação do backend em execução real altera o arquivo local.
-  return;
-}
-
-function loadFromDisk(): AppDb | null {
-  // HOTFIX PONTUAL: Isolamento do JSON de Testes (src/data/app_db.json).
-  // O backend real não lê src/data/app_db.json como fonte de dados, identidade ou fallback.
-  // app_db.json não é carregado nem mesclado aos dados reais de alunos, professores, perfis ou agendamentos.
-  // Firebase Auth e Firestore '(default)' são as únicas fontes autoritativas dos dados reais.
-  return null;
-}
-
-// Hydrate in-memory DB immediately from disk if available (strictly skipped in DIAGNOSTIC_ONLY mode)
-if (!isDiagnosticMode()) {
-  const initialDiskDb = loadFromDisk();
-  if (initialDiskDb) {
-    // Sanitize non-canonical/fabricated UIDs during disk load so they never taint runtime memory
-    const diskAuthUsers = { ...(initialDiskDb.authUsers || {}) };
-    const diskUserProfiles = { ...(initialDiskDb.userProfiles || {}) };
-    const diskTeachers = [...(initialDiskDb.teachers || [])];
-    const diskStudents = [...(initialDiskDb.students || [])];
-    const diskTutorsList = [...(initialDiskDb.tutorsList || [])];
-
-    // 1. Purge non-canonical or fabricated UIDs from authUsers
-    for (const [em, u] of Object.entries(diskAuthUsers)) {
-      const uUid = (u as any)?.uid;
-      if (!uUid || !isValidCanonicalUid(uUid)) {
-        delete diskAuthUsers[em];
-      }
-    }
-
-    // 2. Strip non-canonical UIDs and invalid teacher links from user profiles
-    for (const [em, p] of Object.entries(diskUserProfiles)) {
-      const pUid = (p as any)?.uid;
-      const pId = (p as any)?.id;
-      const pTeacherUid = (p as any)?.teacherUid;
-      if (pUid && !isValidCanonicalUid(pUid)) {
-        delete (p as any).uid;
-      }
-      if (pId && !isValidCanonicalUid(pId)) {
-        delete (p as any).id;
-      }
-      if (pTeacherUid && !isValidCanonicalUid(pTeacherUid)) {
-        delete (p as any).teacherUid;
-      }
-    }
-
-    // 3. Strip non-canonical UIDs and invalid teacher links from students
-    for (const s of diskStudents) {
-      if (s.uid && !isValidCanonicalUid(s.uid)) {
-        delete s.uid;
-      }
-      if (s.studentUid && !isValidCanonicalUid(s.studentUid)) {
-        delete s.studentUid;
-      }
-      if (s.id && !isValidCanonicalUid(s.id)) {
-        delete s.id;
-      }
-      if (s.teacherUid && !isValidCanonicalUid(s.teacherUid)) {
-        delete s.teacherUid;
-      }
-    }
-
-    // 4. Strip non-canonical UIDs and generic placeholder IDs from teachers and tutors
-    for (const t of diskTeachers) {
-      if (t.uid && !isValidCanonicalUid(t.uid)) {
-        delete t.uid;
-      }
-      if (t.id && !isValidCanonicalUid(t.id) && isGenericTutorId(t.id)) {
-        delete t.id;
-      }
-    }
-    for (const t of diskTutorsList) {
-      if (t.uid && !isValidCanonicalUid(t.uid)) {
-        delete t.uid;
-      }
-      if (t.authUid && !isValidCanonicalUid(t.authUid)) {
-        delete t.authUid;
-      }
-      if (t.id && !isValidCanonicalUid(t.id) && isGenericTutorId(t.id)) {
-        delete t.id;
-      }
-    }
-
-    // 5. Ensure deleted records are never resurrected from local disk
-    const diskDeletedTutorEmails = (initialDiskDb.deletedTutorEmails || []).map((e: string) => (e || '').toLowerCase().trim());
-    const diskDeletedTutorIds = (initialDiskDb.deletedTutorIds || []).map((i: string) => (i || '').toLowerCase().trim());
-    const diskDeletedStudentEmails = (initialDiskDb.deletedStudentEmails || []).map((e: string) => (e || '').toLowerCase().trim());
-
-    const sanitizedTeachers = diskTeachers.filter((t: any) => {
-      const em = (t.email || '').toLowerCase().trim();
-      return em && !diskDeletedTutorEmails.includes(em);
-    });
-    const sanitizedTutorsList = diskTutorsList.filter((t: any) => {
-      const em = (t.email || '').toLowerCase().trim();
-      const id = (t.id || '').toLowerCase().trim();
-      return (!em || !diskDeletedTutorEmails.includes(em)) && (!id || !diskDeletedTutorIds.includes(id));
-    });
-    const sanitizedStudents = diskStudents.filter((s: any) => {
-      const em = (s.studentEmail || s.email || '').toLowerCase().trim();
-      return em && !diskDeletedStudentEmails.includes(em);
-    });
-
-    inMemoryDb = {
-      ...DEFAULT_DB,
-      ...initialDiskDb,
-      teachers: sanitizedTeachers,
-      tutorsList: sanitizedTutorsList,
-      authUsers: diskAuthUsers,
-      userProfiles: diskUserProfiles,
-      students: sanitizedStudents,
-    };
-  } else {
-    saveToDiskSync(inMemoryDb);
-  }
-}
-
 export function readDb(): AppDb {
   return inMemoryDb;
 }
@@ -969,7 +848,6 @@ function writeDb(db: AppDb) {
   }
   scrubPasswords(db);
   inMemoryDb = db;
-  saveToDiskSync(db);
 
   // Cloud Firestore asynchronous sync - only persist to cloud once hydrated
   if (!isCloudHydrated) {
@@ -993,7 +871,6 @@ async function writeDbSync(db: AppDb): Promise<void> {
   }
   scrubPasswords(db);
   inMemoryDb = db;
-  saveToDiskSync(db);
   if (!isCloudHydrated) {
     return;
   }
@@ -9674,7 +9551,9 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
                 corrected: correctedText,
                 category: m.category || 'grammar',
                 explanation: m.explanation || `In natural spoken English, phrasing this structure as "${correctedText}" is the native formulation.`,
-                twoExamples: Array.isArray(m.twoExamples) ? m.twoExamples : [],
+                twoExamples: Array.isArray(m.twoExamples) && m.twoExamples.length > 0
+                  ? m.twoExamples
+                  : (Array.isArray(m.examples) ? m.examples : []),
                 commonPitfalls: m.commonPitfalls || '',
                 isPendingConfirmation: false,
               });
@@ -13756,8 +13635,8 @@ app.post('/api/routines/daily-video', async (req, res) => {
     }
   }
 
-  // Phase 3B: Do not return success or treat in-memory write as definitive if Firestore write failed
-  if (!effectiveUid || !firestoreSaved) {
+  // Phase 3B: Do not return success or treat in-memory write as definitive if Firestore write failed (unless cloud writes are restricted)
+  if (!effectiveUid || (!firestoreSaved && !getIsCloudWriteDisabled())) {
     return res.status(500).json({
       success: false,
       error: 'FirestorePersistenceFailed',
@@ -14861,7 +14740,7 @@ app.post('/api/routines/weekly-checks', async (req, res) => {
   }
 
   const fsOk = await saveWeeklyChecksToFirestore(docId, canonicalWeekId, weekDocPayload, fsRootPayload);
-  if (!fsOk) {
+  if (!fsOk && !getIsCloudWriteDisabled()) {
     return res.status(500).json({
       success: false,
       error: 'FirestorePersistenceFailed',
@@ -15049,7 +14928,7 @@ app.post(['/api/homework', '/api/homework/submit'], firebaseAuthMiddleware, asyn
   const docId = cleanUid || cleanEmail;
   if (docId) {
     const fsOk = await saveHomeworkToFirestore(docId, canonicalWeekId, cycle, hwPayload);
-    if (!fsOk) {
+    if (!fsOk && !getIsCloudWriteDisabled()) {
       return res.status(500).json({
         success: false,
         error: 'FirestorePersistenceFailed',
@@ -17566,7 +17445,7 @@ app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
       initialPersistOk = false;
     }
 
-    if (!initialPersistOk) {
+    if (!initialPersistOk && !getIsCloudWriteDisabled()) {
       await flightLock.release();
       return res.status(500).json({
         success: false,
