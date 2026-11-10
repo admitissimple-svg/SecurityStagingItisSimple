@@ -1372,21 +1372,58 @@ app.get('/api/auth/verify-session', firebaseAuthMiddleware, async (req, res) => 
   }
 
   const callerUid = req.user.uid;
-  const callerEmail = req.user.email;
+  const callerEmail = (req.user.email || '').toLowerCase().trim();
+
+  const isMemoryApprovedTeacher = Boolean(
+    !firestoreDoc &&
+    (db.teachers || []).some(
+      (t: any) =>
+        (t.uid === callerUid || t.id === callerUid || (t.email || '').toLowerCase() === callerEmail) &&
+        t.role === 'teacher' &&
+        t.approvalStatus === 'approved' &&
+        t.isApproved === true
+    )
+  );
+
+  // Rule 4: Check if canonically registered as a student in Firestore or local state
+  const isRegisteredStudent = !isMemoryApprovedTeacher && (
+    firestoreRole === 'student' ||
+    (db.students || []).some((s: any) => s.uid === callerUid || (s.email || s.studentEmail || '').toLowerCase() === callerEmail) ||
+    Boolean(callerEmail && db.userProfiles?.[callerEmail]?.role === 'student') ||
+    Boolean(callerEmail && db.authUsers?.[callerEmail]?.role === 'student')
+  );
 
   let finalRole: 'student' | 'teacher' | 'admin' = 'student';
   if (tokenRole === 'admin' || (db.teachers || []).some((t: any) => t.role === 'admin' && (t.uid === callerUid || t.id === callerUid))) {
+    if (firestoreRole === 'student' || isRegisteredStudent) {
+      return res.status(403).json({
+        authenticated: false,
+        error: 'ROLE_INCONSISTENCY',
+        message: 'Inconsistência de permissões detectada. Acesso privilegiado bloqueado.',
+      });
+    }
     finalRole = 'admin';
-  } else {
+  } else if (!isRegisteredStudent) {
+    // Rule 2 & 5: Teacher requires canonical users/{uid} role === 'teacher' AND administrative approval
+    const isApprovedInFirestore = Boolean(
+      firestoreDoc &&
+      (firestoreRole === 'teacher' || firestoreRole === 'native_friend') &&
+      firestoreDoc?.approvalStatus === 'approved' &&
+      firestoreDoc?.isApproved === true
+    );
     let teacherRes: any = null;
-    try {
-      teacherRes = await resolveTeacherCanonicalIdentity({ teacherUid: callerUid, teacherEmail: callerEmail, dbState: db });
-    } catch {}
-    if (teacherRes && teacherRes.isApproved && firestoreRole !== 'student') {
+    if (isApprovedInFirestore || isMemoryApprovedTeacher) {
+      try {
+        teacherRes = await resolveTeacherCanonicalIdentity({ teacherUid: callerUid, teacherEmail: callerEmail, dbState: db });
+      } catch {}
+    }
+    if ((isApprovedInFirestore || isMemoryApprovedTeacher) && teacherRes && teacherRes.isApproved) {
       finalRole = 'teacher';
     } else {
       finalRole = 'student';
     }
+  } else {
+    finalRole = 'student';
   }
 
   return res.json({
@@ -1528,9 +1565,37 @@ app.post('/api/auth/login', async (req, res) => {
     });
   }
 
+  const isMemoryApprovedTeacher = Boolean(
+    !firestoreDoc &&
+    (db.teachers || []).some(
+      (t: any) =>
+        (t.uid === authenticatedUid || t.id === authenticatedUid || (t.email || '').toLowerCase() === cleanEmail) &&
+        t.role === 'teacher' &&
+        t.approvalStatus === 'approved' &&
+        t.isApproved === true
+    )
+  );
+
+  // Rule 4: Canonical student check from Firestore and local state
+  const isRegisteredStudent = !isMemoryApprovedTeacher && (
+    firestoreRole === 'student' ||
+    (db.students || []).some((s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail || s.uid === authenticatedUid) ||
+    Boolean(db.userProfiles?.[cleanEmail]?.role === 'student') ||
+    Boolean(db.authUsers?.[cleanEmail]?.role === 'student')
+  );
+
+  // Rule 2 & 5: Approved teacher requires canonical users/{uid} role === 'teacher' AND administrative approval
+  const isApprovedInFirestore = Boolean(
+    firestoreDoc &&
+    !isRegisteredStudent &&
+    (firestoreRole === 'teacher' || firestoreRole === 'native_friend') &&
+    firestoreDoc?.approvalStatus === 'approved' &&
+    firestoreDoc?.isApproved === true
+  );
+
   // 3. Resolve Teacher authorization strictly from verified sources (Firestore / canonical records)
   let teacherResolution: any = null;
-  if (!isServerVerifiedAdmin) {
+  if (!isServerVerifiedAdmin && (isApprovedInFirestore || isMemoryApprovedTeacher)) {
     try {
       teacherResolution = await resolveTeacherCanonicalIdentity({
         teacherUid: authenticatedUid,
@@ -1540,12 +1605,11 @@ app.post('/api/auth/login', async (req, res) => {
     } catch {}
   }
 
-  const hasTutorApplication = Boolean(
-    teacherResolution?.rawDoc ||
-    (db.tutorsList || []).some((t: any) => (t.uid && t.uid === authenticatedUid) || ((t.email || '').toLowerCase() === cleanEmail))
+  const isApprovedTeacher = !isServerVerifiedAdmin && !isRegisteredStudent && (isApprovedInFirestore || isMemoryApprovedTeacher) && Boolean(teacherResolution && teacherResolution.isApproved);
+  const isPendingTeacher = !isServerVerifiedAdmin && !isRegisteredStudent && !isApprovedTeacher && (
+    (firestoreRole === 'teacher' && !isApprovedTeacher) ||
+    (db.tutorsList || []).some((t: any) => ((t.uid === authenticatedUid) || ((t.email || '').toLowerCase() === cleanEmail)) && t.approvalStatus !== 'approved' && t.role !== 'student')
   );
-  const isApprovedTeacher = !isServerVerifiedAdmin && Boolean(teacherResolution && teacherResolution.isApproved);
-  const isPendingTeacher = !isServerVerifiedAdmin && hasTutorApplication && !isApprovedTeacher;
 
   // If a pending tutor attempts to log into the teacher space, reject with 403
   if (isPendingTeacher && requestedRole === 'teacher') {
@@ -1559,7 +1623,7 @@ app.post('/api/auth/login', async (req, res) => {
 
   // 4. Inconsistency check between Firebase Auth claims, bootstrap and Firestore
   if (isServerVerifiedAdmin) {
-    if (firestoreRole === 'student') {
+    if (firestoreRole === 'student' || isRegisteredStudent) {
       console.warn(`[RBAC] Inconsistency detected: admin claim vs student in Firestore for ${cleanEmail}. Blocking privileged access.`);
       return res.status(403).json({
         error: 'Forbidden',
@@ -1580,7 +1644,7 @@ app.post('/api/auth/login', async (req, res) => {
         adminAuth.setCustomUserClaims(authenticatedUid, { role: 'admin' }).catch(() => {});
       } catch {}
     }
-  } else if (isApprovedTeacher && firestoreRole !== 'student') {
+  } else if (isApprovedTeacher && !isRegisteredStudent) {
     // Canonical approved teacher cannot be downgraded to student
     role = 'teacher';
     const tutorObj = (db.tutorsList || []).find(
@@ -1606,7 +1670,7 @@ app.post('/api/auth/login', async (req, res) => {
       teacherObj.uid = authenticatedUid;
     }
   } else {
-    // Registered student or new student
+    // Registered student, unapproved tutor or default safe role: student
     role = 'student';
     const studentMatch = (db.students || []).find((s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail);
     name = studentMatch?.name || studentMatch?.studentName || db.userProfiles?.[cleanEmail]?.name || db.authUsers?.[cleanEmail]?.name || name;
@@ -2583,9 +2647,38 @@ app.post('/api/auth/google', async (req, res) => {
   const firestoreRole = (firestoreDoc?.role || '').toLowerCase();
   const authRecordRole = (authRecord?.role || '').toLowerCase();
 
+  const isMemoryApprovedTeacher = Boolean(
+    !firestoreDoc &&
+    (db.teachers || []).some(
+      (t: any) =>
+        (t.uid === targetUid || t.id === targetUid || (t.email || '').toLowerCase() === cleanEmail) &&
+        t.role === 'teacher' &&
+        t.approvalStatus === 'approved' &&
+        t.isApproved === true
+    )
+  );
+
+  // Rule 4: Identify existing student accounts: an existing student CANNOT have their role overwritten during login
+  const isRegisteredStudent = !isServerVerifiedAdmin && !isMemoryApprovedTeacher && (
+    firestoreRole === 'student' ||
+    authRecordRole === 'student' ||
+    (db.students || []).some((s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail || s.uid === targetUid) ||
+    Boolean(db.userProfiles?.[cleanEmail]?.role === 'student') ||
+    Boolean(firestoreRole === 'student' && (firestoreDoc?.learningGoal || firestoreDoc?.studentLevel || firestoreDoc?.contractedLessons !== undefined))
+  );
+
+  // Rule 2 & 5: Teacher requires canonical users/{uid} role === 'teacher' AND administrative approval
+  const isApprovedInFirestore = Boolean(
+    firestoreDoc &&
+    !isRegisteredStudent &&
+    (firestoreRole === 'teacher' || firestoreRole === 'native_friend') &&
+    firestoreDoc?.approvalStatus === 'approved' &&
+    firestoreDoc?.isApproved === true
+  );
+
   // Resolve Teacher authorization strictly from verified sources (Firestore / canonical records)
   let teacherResolution: any = null;
-  if (!isServerVerifiedAdmin) {
+  if (!isServerVerifiedAdmin && (isApprovedInFirestore || isMemoryApprovedTeacher)) {
     try {
       teacherResolution = await resolveTeacherCanonicalIdentity({
         teacherUid: targetUid,
@@ -2595,12 +2688,11 @@ app.post('/api/auth/google', async (req, res) => {
     } catch {}
   }
 
-  const hasTutorApplication = Boolean(
-    teacherResolution?.rawDoc ||
-    (db.tutorsList || []).some((t: any) => (t.uid && t.uid === targetUid) || ((t.email || '').toLowerCase() === cleanEmail))
+  const isApprovedTeacher = !isServerVerifiedAdmin && !isRegisteredStudent && (isApprovedInFirestore || isMemoryApprovedTeacher) && Boolean(teacherResolution && teacherResolution.isApproved);
+  const isPendingTeacher = !isServerVerifiedAdmin && !isRegisteredStudent && !isApprovedTeacher && (
+    (firestoreRole === 'teacher' && !isApprovedTeacher) ||
+    (db.tutorsList || []).some((t: any) => ((t.uid === targetUid) || ((t.email || '').toLowerCase() === cleanEmail)) && t.approvalStatus !== 'approved' && t.role !== 'student')
   );
-  const isApprovedTeacher = !isServerVerifiedAdmin && Boolean(teacherResolution && teacherResolution.isApproved);
-  const isPendingTeacher = !isServerVerifiedAdmin && hasTutorApplication && !isApprovedTeacher;
 
   // If a pending tutor attempts to access the teacher space, reject with 403
   if (isPendingTeacher && requestedRole === 'teacher') {
@@ -2612,20 +2704,11 @@ app.post('/api/auth/google', async (req, res) => {
     });
   }
 
-  // Identify existing student accounts: an existing student CANNOT have their role overwritten during login
-  const isRegisteredStudent = !isServerVerifiedAdmin && (
-    firestoreRole === 'student' ||
-    authRecordRole === 'student' ||
-    (db.students || []).some((s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail) ||
-    Boolean(db.userProfiles?.[cleanEmail]) ||
-    Boolean(firestoreDoc?.learningGoal || firestoreDoc?.studentLevel || firestoreDoc?.contractedLessons !== undefined)
-  );
-
   let role: string = 'student';
   let isRoleEnforced = false;
 
   if (isServerVerifiedAdmin) {
-    if (firestoreRole === 'student') {
+    if (firestoreRole === 'student' || isRegisteredStudent) {
       console.warn(`[RBAC Google] Inconsistency detected: admin claim vs student in Firestore for ${cleanEmail}. Blocking privileged access.`);
       return res.status(403).json({
         error: 'Forbidden',
@@ -2636,7 +2719,7 @@ app.post('/api/auth/google', async (req, res) => {
     role = 'admin';
     const adminTeacher = (db.teachers || []).find((t: any) => t.role === 'admin' && (t.uid === targetUid || t.id === targetUid));
     displayName = adminTeacher?.name || name || "Admin";
-  } else if (isApprovedTeacher && firestoreRole !== 'student') {
+  } else if (isApprovedTeacher && !isRegisteredStudent) {
     // Canonical approved teacher cannot be downgraded to student
     role = 'teacher';
     displayName = teacherResolution.name || displayName;
@@ -2644,15 +2727,8 @@ app.post('/api/auth/google', async (req, res) => {
       isRoleEnforced = true;
       console.warn(`[RBAC Google] Blocked teacher ${cleanEmail} from accessing admin panel.`);
     }
-  } else if (firestoreRole === 'student' || isRegisteredStudent) {
-    // STRICT RBAC: If registered as a student, session is strictly locked to student space
-    role = 'student';
-    if (requestedRole && requestedRole !== 'student') {
-      isRoleEnforced = true;
-      console.warn(`[RBAC Google] Blocked user ${cleanEmail} from accessing ${requestedRole} panel. Locked to student space.`);
-    }
   } else {
-    // Default safe role: student. requestedRole NEVER grants teacher permissions.
+    // STRICT RBAC: If registered as a student or not an approved teacher, session is strictly locked to student space
     role = 'student';
     if (requestedRole && requestedRole !== 'student') {
       isRoleEnforced = true;
@@ -2664,14 +2740,24 @@ app.post('/api/auth/google', async (req, res) => {
   if (!db.authUsers) db.authUsers = {};
   if (!db.authUsers[cleanEmail]) {
     db.authUsers[cleanEmail] = {
-      uid: uid || `google-${Date.now()}`,
+      uid: targetUid || uid || `google-${Date.now()}`,
       email: cleanEmail,
       name: displayName,
       role,
       createdAt: new Date().toISOString(),
     };
-  } else if (uid && !db.authUsers[cleanEmail].uid) {
-    db.authUsers[cleanEmail].uid = uid;
+  } else {
+    const existingAuthRole = db.authUsers[cleanEmail].role;
+    if (existingAuthRole === 'student') {
+      db.authUsers[cleanEmail].role = 'student';
+    } else if (existingAuthRole === 'teacher' && isApprovedTeacher) {
+      db.authUsers[cleanEmail].role = 'teacher';
+    } else {
+      db.authUsers[cleanEmail].role = role;
+    }
+    if (targetUid && !db.authUsers[cleanEmail].uid) {
+      db.authUsers[cleanEmail].uid = targetUid;
+    }
   }
 
   // If new student, add to students list

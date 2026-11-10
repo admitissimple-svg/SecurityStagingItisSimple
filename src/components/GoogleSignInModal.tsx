@@ -183,16 +183,16 @@ export const GoogleSignInModal: React.FC<GoogleSignInModalProps> = ({
         }
       }
 
-      // Guarantee student profile is saved under doc(db, 'users', user.uid) with UID as document key
-      if (verifiedRole === 'student' && user.uid) {
+      // Identity Hardening: Eliminate automatic client writes capable of promoting users to teachers.
+      // Backend /api/auth/google is the authoritative entity for persistence and role assignment.
+      if (authoritativeRole === 'student' && user.uid) {
         const db = getDb();
         if (db) {
-          const studentProfilePayload = {
+          const studentProfilePayload: Record<string, any> = {
             id: user.uid,
             uid: user.uid,
             email: cleanEmail,
             name: account.name || user.displayName || cleanEmail.split('@')[0],
-            role: 'student',
             picture: account.picture || user.photoURL || '',
             avatar: account.picture || user.photoURL || '',
             level: firestoreUserDoc?.level || data?.profile?.level || 'iniciante',
@@ -200,45 +200,26 @@ export const GoogleSignInModal: React.FC<GoogleSignInModalProps> = ({
             ...(data?.profile || {}),
             updatedAt: new Date().toISOString(),
           };
+          delete studentProfilePayload.role;
+          delete studentProfilePayload.userRole;
           setDoc(doc(db, 'users', user.uid), studentProfilePayload, { merge: true }).catch(() => null);
         }
       }
 
-      // Guarantee teacher/Native Friend profile is linked under doc(db, 'users', user.uid) & doc(db, 'tutors', user.uid)
-      if (verifiedRole === 'teacher' && user.uid) {
-        const db = getDb();
-        if (db) {
-          const teacherProfilePayload = {
-            id: user.uid,
-            uid: user.uid,
-            email: cleanEmail,
-            name: account.name || user.displayName || cleanEmail.split('@')[0],
-            role: 'teacher',
-            picture: account.picture || user.photoURL || '',
-            avatar: account.picture || user.photoURL || '',
-            ...(firestoreUserDoc || {}),
-            ...(data?.tutor || {}),
-            updatedAt: new Date().toISOString(),
-          };
-          setDoc(doc(db, 'users', user.uid), teacherProfilePayload, { merge: true }).catch(() => null);
-          setDoc(doc(db, 'tutors', user.uid), teacherProfilePayload, { merge: true }).catch(() => null);
-        }
-      }
-
-      // 3. Redirection
-      if (verifiedRole === 'student') {
+      // 3. Redirection based strictly on authoritative backend role
+      if (authoritativeRole === 'student') {
         if (typeof window !== 'undefined') {
           try {
             window.history.replaceState({ page: 'dashboard' }, '', '/dashboard');
           } catch {}
         }
-      } else if (verifiedRole === 'teacher') {
+      } else if (authoritativeRole === 'teacher') {
         if (typeof window !== 'undefined') {
           try {
             window.history.replaceState({ page: 'teacher' }, '', '/teacher');
           } catch {}
         }
-      } else if (verifiedRole === 'admin') {
+      } else if (authoritativeRole === 'admin') {
         if (typeof window !== 'undefined') {
           try {
             window.history.replaceState({ page: 'admin' }, '', '/admin');

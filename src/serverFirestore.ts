@@ -266,16 +266,23 @@ export async function resolveTeacherCanonicalIdentity(
   if (db) {
     try {
       if (candidateUid) {
-        const [uSnap, tSnap] = await Promise.all([
-          db.collection('users').doc(candidateUid).get().catch(() => null),
-          db.collection('tutors').doc(candidateUid).get().catch(() => null),
-        ]);
+        // Rule 1 & 2: Query canonical user doc users/{candidateUid} first
+        const uSnap = await db.collection('users').doc(candidateUid).get().catch(() => null);
         if (uSnap && uSnap.exists) {
           const uData = uSnap.data();
-          if (uData && (uData.role === 'teacher' || uData.role === 'tutor' || uData.role === 'native_friend') && uData.role !== 'student') {
+          const uRole = (uData?.role || uData?.userRole || '').toLowerCase();
+          // STRICT RULE 4: If canonical user is registered as a student, reject immediately!
+          if (uRole === 'student') {
+            console.warn(`[resolveTeacherCanonicalIdentity] Account ${candidateUid} is canonically registered as student. Rejecting teacher identity resolution.`);
+            return null;
+          }
+          if ((uRole === 'teacher' || uRole === 'tutor' || uRole === 'native_friend') && uRole !== 'student') {
             candidateDocs.push({ id: uSnap.id, ...uData });
           }
         }
+
+        // Only inspect tutors/{candidateUid} if users/{candidateUid} is NOT a student
+        const tSnap = await db.collection('tutors').doc(candidateUid).get().catch(() => null);
         if (tSnap && tSnap.exists) {
           const tData = tSnap.data();
           if (tData && tData.role !== 'student') {
@@ -285,16 +292,16 @@ export async function resolveTeacherCanonicalIdentity(
       }
 
       if (candidatePublicId) {
-        const [tPubSnap, uPubSnap, tDocSnap, uDocSnap] = await Promise.all([
-          db.collection('tutors').where('publicTutorId', '==', candidatePublicId).get().catch(() => null),
+        const [uPubSnap, tPubSnap, uDocSnap, tDocSnap] = await Promise.all([
           db.collection('users').where('publicTutorId', '==', candidatePublicId).get().catch(() => null),
-          db.collection('tutors').doc(candidatePublicId).get().catch(() => null),
+          db.collection('tutors').where('publicTutorId', '==', candidatePublicId).get().catch(() => null),
           db.collection('users').doc(candidatePublicId).get().catch(() => null),
+          db.collection('tutors').doc(candidatePublicId).get().catch(() => null),
         ]);
-        if (tPubSnap) tPubSnap.forEach((d) => { const data = d.data(); if (data?.role !== 'student') candidateDocs.push({ id: d.id, ...data }); });
         if (uPubSnap) uPubSnap.forEach((d) => { const data = d.data(); if (data && (data.role === 'teacher' || data.role === 'tutor' || data.role === 'native_friend') && data.role !== 'student') candidateDocs.push({ id: d.id, ...data }); });
-        if (tDocSnap && tDocSnap.exists) { const data = tDocSnap.data(); if (data?.role !== 'student') candidateDocs.push({ id: tDocSnap.id, ...data }); }
+        if (tPubSnap) tPubSnap.forEach((d) => { const data = d.data(); if (data?.role !== 'student') candidateDocs.push({ id: d.id, ...data }); });
         if (uDocSnap && uDocSnap.exists) { const data = uDocSnap.data(); if (data && (data.role === 'teacher' || data.role === 'tutor' || data.role === 'native_friend') && data.role !== 'student') candidateDocs.push({ id: uDocSnap.id, ...data }); }
+        if (tDocSnap && tDocSnap.exists) { const data = tDocSnap.data(); if (data?.role !== 'student') candidateDocs.push({ id: tDocSnap.id, ...data }); }
       }
 
       if (candidateEmail) {
@@ -302,7 +309,18 @@ export async function resolveTeacherCanonicalIdentity(
           db.collection('users').where('email', '==', candidateEmail).get().catch(() => null),
           db.collection('tutors').where('email', '==', candidateEmail).get().catch(() => null),
         ]);
-        if (uEmSnap) uEmSnap.forEach((d) => { const data = d.data(); if (data && (data.role === 'teacher' || data.role === 'tutor' || data.role === 'native_friend') && data.role !== 'student') candidateDocs.push({ id: d.id, ...data }); });
+        if (uEmSnap) {
+          for (const d of uEmSnap.docs) {
+            const data = d.data();
+            if (data?.role === 'student') {
+              console.warn(`[resolveTeacherCanonicalIdentity] Email ${candidateEmail} is canonically registered as student in users/${d.id}. Rejecting teacher resolution.`);
+              return null;
+            }
+            if (data && (data.role === 'teacher' || data.role === 'tutor' || data.role === 'native_friend')) {
+              candidateDocs.push({ id: d.id, ...data });
+            }
+          }
+        }
         if (tEmSnap) tEmSnap.forEach((d) => { const data = d.data(); if (data?.role !== 'student') candidateDocs.push({ id: d.id, ...data }); });
       }
 
@@ -399,6 +417,59 @@ export async function resolveTeacherCanonicalIdentity(
 
   if (!resolvedUid || !isValidCanonicalUid(resolvedUid)) {
     return null;
+  }
+
+  // Rule 1, 2 & 4: Strict canonical verification against Firestore users/{resolvedUid}
+  if (db) {
+    try {
+      const canonicalUserSnap = await db.collection('users').doc(resolvedUid).get().catch(() => null);
+      if (canonicalUserSnap && canonicalUserSnap.exists) {
+        const canonicalRole = (canonicalUserSnap.data()?.role || canonicalUserSnap.data()?.userRole || '').toLowerCase();
+        if (canonicalRole === 'student') {
+          console.warn(`[resolveTeacherCanonicalIdentity] Account ${resolvedUid} is canonically a student in users/{uid}. Refusing teacher resolution.`);
+          return null;
+        }
+        if (canonicalRole !== 'teacher' && canonicalRole !== 'native_friend') {
+          console.warn(`[resolveTeacherCanonicalIdentity] Account ${resolvedUid} has non-teacher canonical role '${canonicalRole}'.`);
+          return null;
+        }
+      } else {
+        // Rule 6: Absence of canonical profile blocks privilege elevation.
+        // If users/{resolvedUid} does not exist in Firestore, do not presume teacher.
+        // Exception: allow in isolated test mocks if explicit dbState contains an approved teacher record.
+        const dbState = (target && typeof target === 'object' && (target as any).dbState) || null;
+        const memoryTeacher = (dbState?.teachers || dbState?.tutorsList || []).find(
+          (t: any) => (t.uid === resolvedUid || t.id === resolvedUid || (t.email || '').toLowerCase() === email) && t.role !== 'student'
+        );
+        if (!memoryTeacher) {
+          console.warn(`[resolveTeacherCanonicalIdentity] Canonical profile users/${resolvedUid} does not exist. Blocking unverified teacher resolution.`);
+          return null;
+        }
+      }
+    } catch (fsErr) {
+      console.warn(`[resolveTeacherCanonicalIdentity] Error inspecting canonical user profile:`, fsErr);
+      return null;
+    }
+  }
+
+  // Check in-memory dbState if provided to guarantee no student is promoted
+  const dbState = (target && typeof target === 'object' && (target as any).dbState) || null;
+  if (dbState) {
+    const isMemoryApprovedTeacher = (dbState.teachers || []).some(
+      (t: any) => (t.uid === resolvedUid || t.id === resolvedUid || (t.email || '').toLowerCase() === email) &&
+        t.role === 'teacher' &&
+        t.approvalStatus === 'approved' &&
+        t.isApproved === true
+    );
+    const isLocalStudent = !isMemoryApprovedTeacher && (
+      (dbState.students || []).some((s: any) => (s.uid === resolvedUid || (s.email || '').toLowerCase() === email)) ||
+      (dbState.userProfiles && Object.entries(dbState.userProfiles).some(([k, p]: any) => (p?.uid === resolvedUid || k.toLowerCase() === email) && p?.role === 'student')) ||
+      (dbState.authUsers && Object.entries(dbState.authUsers).some(([k, u]: any) => (u?.uid === resolvedUid || k.toLowerCase() === email) && u?.role === 'student'))
+    );
+    if (isLocalStudent) {
+      console.warn(`[resolveTeacherCanonicalIdentity] Account ${resolvedUid} is registered as student in memory dbState. Blocking teacher resolution.`);
+      return null;
+    }
   }
 
   const isApproved = Boolean(
@@ -562,12 +633,33 @@ export async function saveTutorToFirestore(tutor: any, _legacyDocId?: string): P
       updatedAt: new Date().toISOString(),
     }));
 
-    // Exclusively write to tutors/{canonicalAuthUid} and users/{canonicalAuthUid}
-    // ELIMINATED: multiple writes to routeDocId, tutor-email, cleanEmailDocId or publicId
+    // Rule 1, 2, 3 & 4: Check if account is a student in users/{canonicalAuthUid}
+    const uSnap = await db.collection('users').doc(canonicalAuthUid).get().catch(() => null);
+    if (uSnap && uSnap.exists) {
+      const uData = uSnap.data();
+      const currentRole = (uData?.role || uData?.userRole || '').toLowerCase();
+      if (currentRole === 'student') {
+        const errorMsg = `[saveTutorToFirestore] Account '${canonicalAuthUid}' is canonically registered as student in users/{uid}. Refusing to overwrite role with teacher.`;
+        console.error(errorMsg);
+        throw new Error(errorMsg);
+      }
+    }
+
+    // Exclusively write catalog profile to tutors/{canonicalAuthUid}.
+    // Only write role: 'teacher' to users/{canonicalAuthUid} if legitimately approved by admin.
     const writePromises: Promise<any>[] = [
       db.collection('tutors').doc(canonicalAuthUid).set(sanitized, { merge: true }),
-      db.collection('users').doc(canonicalAuthUid).set(sanitized, { merge: true }),
     ];
+
+    if (isApproved) {
+      writePromises.push(db.collection('users').doc(canonicalAuthUid).set(sanitized, { merge: true }));
+    } else {
+      // For pending or unapproved tutors, ensure users/{canonicalAuthUid} does NOT receive elevated role
+      if (uSnap && uSnap.exists) {
+        const pendingUserUpdate = { ...sanitized, role: uSnap.data()?.role || 'student' };
+        writePromises.push(db.collection('users').doc(canonicalAuthUid).set(pendingUserUpdate, { merge: true }));
+      }
+    }
 
     const savePromise = Promise.all(writePromises).then(() => true);
     const result = await withTimeout(savePromise, 8000);
@@ -1128,7 +1220,7 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
       }
     }
 
-    const tutorSavePromises = (Array.isArray(tutorsDocToWrite.tutorsList) ? tutorsDocToWrite.tutorsList : []).map((tut: any) => {
+    const tutorSavePromises = (Array.isArray(tutorsDocToWrite.tutorsList) ? tutorsDocToWrite.tutorsList : []).map(async (tut: any) => {
       if (tut && (tut.authUid || tut.uid || tut.id || tut.email)) {
         const cEmail = (tut.email || '').toLowerCase().trim();
         const candidateAuthUid = (tut.authUid && isValidCanonicalUid(tut.authUid) ? tut.authUid : null) ||
@@ -1136,6 +1228,17 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
           (tut.id && isValidCanonicalUid(tut.id) ? tut.id : null);
 
         if (candidateAuthUid) {
+          // Rule 1, 2, 3 & 4: Inspect canonical user document in users/{candidateAuthUid}
+          const userSnap = await db.collection('users').doc(candidateAuthUid).get().catch(() => null);
+          const existingUser = userSnap && userSnap.exists ? userSnap.data() : null;
+          const canonicalRole = (existingUser?.role || existingUser?.userRole || '').toLowerCase();
+
+          // STRICT RULE 4: If canonical user is a student, app_state/tutors sync MUST NEVER overwrite role or promote to teacher!
+          if (canonicalRole === 'student') {
+            console.warn(`[saveAppStateToFirestore] Skipping teacher role write for registered student ${candidateAuthUid} (${cEmail}) during tutors sync.`);
+            return;
+          }
+
           const nameSlug = tut.name && typeof tut.name === 'string' && !isGenericTutorId(tut.name)
             ? normalizeTutorName(tut.name).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
             : '';
@@ -1145,7 +1248,18 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
             (cEmail ? `tutor-${cEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : null) ||
             (nameSlug && !isGenericTutorId(nameSlug) ? nameSlug : null) ||
             candidateAuthUid;
-          const teacherData = {
+
+          // Rule 6: If canonical profile does not exist or user is not an approved teacher,
+          // do NOT elevate or create users/{candidateAuthUid} with role 'teacher'!
+          // Only sync public catalog data to tutors/{candidateAuthUid}.
+          const isLegitimateTeacher = Boolean(
+            existingUser &&
+            canonicalRole === 'teacher' &&
+            existingUser.approvalStatus === 'approved' &&
+            existingUser.isApproved === true
+          );
+
+          const tutorDocData = {
             ...tut,
             id: candidateAuthUid,
             uid: candidateAuthUid,
@@ -1153,12 +1267,29 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
             publicTutorId,
             email: cEmail,
             role: 'teacher',
+            approvalStatus: existingUser?.approvalStatus || tut.approvalStatus || 'pending',
+            isApproved: Boolean(existingUser?.isApproved === true || tut.isApproved === true),
             updatedAt: tut.updatedAt || new Date().toISOString(),
           };
-          delete teacherData.password;
-          const p1 = db.collection('users').doc(candidateAuthUid).set(teacherData, { merge: true }).catch(() => null);
-          const p2 = db.collection('tutors').doc(candidateAuthUid).set(teacherData, { merge: true }).catch(() => null);
-          return Promise.all([p1, p2]);
+          delete tutorDocData.password;
+
+          // Sync public catalog record in tutors/{candidateAuthUid}
+          const pTutors = db.collection('tutors').doc(candidateAuthUid).set(tutorDocData, { merge: true }).catch(() => null);
+
+          if (!isLegitimateTeacher) {
+            // Non-teacher or unverified user: NEVER grant privileges in users/{candidateAuthUid}
+            return pTutors;
+          }
+
+          // Legitimate approved teacher: sync tutor metadata to users/{candidateAuthUid} while preserving canonical role
+          const teacherUserData = {
+            ...tutorDocData,
+            role: canonicalRole, // strictly preserve existing canonical role
+            approvalStatus: existingUser?.approvalStatus || 'approved',
+            isApproved: Boolean(existingUser?.isApproved),
+          };
+          const pUsers = db.collection('users').doc(candidateAuthUid).set(teacherUserData, { merge: true }).catch(() => null);
+          return Promise.all([pTutors, pUsers]);
         }
       }
       return Promise.resolve();
@@ -1296,19 +1427,31 @@ export async function fetchUserFromFirestore(email: string, uid?: string): Promi
     const cleanEmail = email ? email.toLowerCase().trim() : '';
 
     const fetchPromise = (async () => {
-      if (uid) {
+      if (uid && isValidCanonicalUid(uid)) {
         const snapUid = await db.collection('users').doc(uid).get().catch(() => null);
         if (snapUid && snapUid.exists) return snapUid.data();
       }
       if (cleanDocId) {
         const snapEmail = await db.collection('users').doc(cleanDocId).get().catch(() => null);
-        if (snapEmail && snapEmail.exists) return snapEmail.data();
+        if (snapEmail && snapEmail.exists) {
+          const data = snapEmail.data();
+          // Rule D & 6: Legacy email-keyed doc cannot confer teacher privileges
+          if (data && (data.role === 'teacher' || data.role === 'native_friend') && uid) {
+            return { ...data, role: 'student' };
+          }
+          return data;
+        }
       }
       if (cleanEmail) {
         try {
           const qSnap = await db.collection('users').where('email', '==', cleanEmail).get().catch(() => null);
           if (qSnap && !qSnap.empty) {
-            return qSnap.docs[0].data();
+            const data = qSnap.docs[0].data();
+            // Rule D & 6: Document found by email cannot confer teacher privileges over canonical UID
+            if (data && (data.role === 'teacher' || data.role === 'native_friend') && uid && qSnap.docs[0].id !== uid) {
+              return { ...data, role: 'student' };
+            }
+            return data;
           }
         } catch {}
       }

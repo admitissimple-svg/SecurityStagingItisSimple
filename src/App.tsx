@@ -352,64 +352,13 @@ export default function App() {
                 );
                 resolvedRole = isApproved ? 'teacher' : 'student';
               }
-            }
-
-            const cleanDocId = cleanEmail.replace(/[^a-zA-Z0-9]/g, '-');
-            // If user doc not found or role unconfirmed, check fallback records only if NOT already a confirmed student
-            if (!firestoreDoc && resolvedRole !== 'teacher' && !isVerifiedAdmin && cleanEmail) {
-              const snapEmail = await Promise.race([
-                getDoc(doc(db, 'users', cleanDocId)),
-                new Promise<null>((r) => setTimeout(() => r(null), 2500)),
-              ]);
-              if (snapEmail && snapEmail.exists()) {
-                const emailData = snapEmail.data();
-                const r = (emailData.role || emailData.userRole || '').toLowerCase();
-                if (r === 'student') {
-                  firestoreDoc = emailData;
-                  resolvedRole = 'student';
-                } else if (r === 'teacher' || r === 'native_friend' || r === 'tutor') {
-                  const isApproved = Boolean(
-                    (r === 'teacher' || r === 'native_friend') &&
-                    emailData.approvalStatus === 'approved' &&
-                    emailData.isApproved === true
-                  );
-                  if (isApproved) {
-                    firestoreDoc = emailData;
-                    resolvedRole = 'teacher';
-                  }
-                }
-                // Migrate to Auth UID document
-                setDoc(
-                  doc(db, 'users', fbUser.uid),
-                  { ...emailData, id: fbUser.uid, uid: fbUser.uid, email: cleanEmail, updatedAt: new Date().toISOString() },
-                  { merge: true }
-                ).catch(() => null);
-              }
-
-              // If not already resolved as a student or admin, check tutors doc ONLY if user is not a student
-              if (resolvedRole !== 'teacher' && !isVerifiedAdmin && firestoreDoc?.role !== 'student') {
-                const cleanTutorId = `tutor-${cleanDocId}`;
-                const [tutorSnap, authUidTutorSnap] = await Promise.all([
-                  getDoc(doc(db, 'tutors', cleanTutorId)).catch(() => null),
-                  getDoc(doc(db, 'tutors', fbUser.uid)).catch(() => null),
-                ]);
-                const tSnap = (authUidTutorSnap && authUidTutorSnap.exists()) ? authUidTutorSnap : ((tutorSnap && tutorSnap.exists()) ? tutorSnap : null);
-                if (tSnap && tSnap.exists()) {
-                  const tData = tSnap.data();
-                  const isApproved = Boolean(
-                    (tData?.role === 'teacher' || tData?.role === 'native_friend') &&
-                    tData?.approvalStatus === 'approved' &&
-                    tData?.isApproved === true
-                  );
-                  if (isApproved) {
-                    firestoreDoc = { ...(firestoreDoc || {}), ...tData, role: 'teacher' };
-                    resolvedRole = 'teacher';
-                  }
-                }
-              }
+            } else {
+              // Rule 6: Absence, error or unavailability of canonical profile blocks privilege elevation
+              resolvedRole = isVerifiedAdmin ? 'admin' : 'student';
             }
           } catch (e) {
             console.warn('Notice hydrating Firebase Auth user in App:', e);
+            resolvedRole = isVerifiedAdmin ? 'admin' : 'student';
           }
 
           if (resolvedRole === 'teacher') {
@@ -971,9 +920,14 @@ export default function App() {
 
         // 2. Guard Native Friend / Teacher route (/teacher or #teacher)
         if (path === '/teacher' || hash === '#teacher') {
-          if (currentAccount?.role === 'teacher' || currentAccount?.role === 'admin') {
-            setViewMode('dashboard');
-          } else if (currentAccount?.role === 'student') {
+          if (!currentAccount) {
+            setAuthModalMode('login');
+            setAuthModalRole('student');
+            setIsAuthModalOpen(true);
+            return;
+          }
+
+          if (currentAccount.role === 'student') {
             // STRICT RBAC: Block registered student from accessing Native Friend space
             setIsEditTutorProfileOpen(false);
             try {
@@ -993,10 +947,63 @@ export default function App() {
               },
               ...prev,
             ]);
-          } else if (!currentAccount) {
-            setAuthModalMode('login');
-            setAuthModalRole('student');
-            setIsAuthModalOpen(true);
+            return;
+          }
+
+          if (currentAccount.role === 'teacher') {
+            // Rule: Verify effective backend authorization before granting access to /teacher
+            auth.currentUser?.getIdToken().then(async (token) => {
+              try {
+                const res = await fetch('/api/auth/verify-session', {
+                  headers: token ? { Authorization: `Bearer ${token}` } : {},
+                });
+                if (res.ok) {
+                  const data = await res.json();
+                  if (data.role !== 'teacher' && data.role !== 'admin') {
+                    // Backend denied teacher authorization!
+                    setCurrentAccount((prev) => (prev ? { ...prev, role: 'student' } : null));
+                    setIsEditTutorProfileOpen(false);
+                    try {
+                      window.history.replaceState({ page: 'dashboard' }, '', '/dashboard');
+                    } catch {}
+                    setViewMode('dashboard');
+                    setNotifications((prev) => [
+                      {
+                        id: `rbac-teacher-backend-guard-${Date.now()}`,
+                        title: currentLanguage === 'en' ? 'Access Restricted' : 'Acesso Restrito',
+                        message: currentLanguage === 'en'
+                          ? 'Access denied: your account is not authorized as an approved Native Friend by the backend.'
+                          : 'Acesso negado: sua conta não possui autorização de Amigo Nativo aprovado pelo backend.',
+                        type: 'warning',
+                        timestamp: new Date().toISOString(),
+                        read: false,
+                      },
+                      ...prev,
+                    ]);
+                  } else {
+                    setViewMode('dashboard');
+                  }
+                } else {
+                  // Verification endpoint failed -> block privilege elevation (Rule 6)
+                  setCurrentAccount((prev) => (prev ? { ...prev, role: 'student' } : null));
+                  setIsEditTutorProfileOpen(false);
+                  try {
+                    window.history.replaceState({ page: 'dashboard' }, '', '/dashboard');
+                  } catch {}
+                  setViewMode('dashboard');
+                }
+              } catch {
+                // Network or server error -> block privilege elevation (Rule 6)
+                setCurrentAccount((prev) => (prev ? { ...prev, role: 'student' } : null));
+                setIsEditTutorProfileOpen(false);
+                try {
+                  window.history.replaceState({ page: 'dashboard' }, '', '/dashboard');
+                } catch {}
+                setViewMode('dashboard');
+              }
+            }).catch(() => {});
+          } else if (currentAccount.role === 'admin') {
+            setViewMode('dashboard');
           }
         }
 
