@@ -71,11 +71,12 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
  */
 export function isTutorApproved(t: any): boolean {
   if (!t) return false;
-  return (
-    t.approvalStatus === 'approved' ||
-    t.isApproved === true ||
-    t.status === 'approved' ||
-    t.approved === true
+  const role = (t.role || '').toLowerCase().trim();
+  const isTeacher = role === 'teacher' || role === 'native_friend' || role === 'tutor' || role === '';
+  return Boolean(
+    isTeacher &&
+    t.approvalStatus === 'approved' &&
+    t.isApproved === true
   );
 }
 

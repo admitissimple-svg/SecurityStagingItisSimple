@@ -123,8 +123,9 @@ export const GoogleSignInModal: React.FC<GoogleSignInModalProps> = ({
       } else if (docRole === 'student') {
         verifiedRole = 'student';
       } else if (
-        (docRole === 'teacher' || docRole === 'native_friend' || docRole === 'tutor') &&
-        (firestoreUserDoc?.approvalStatus === 'approved' || firestoreUserDoc?.isApproved === true)
+        docRole === 'teacher' &&
+        firestoreUserDoc?.approvalStatus === 'approved' &&
+        firestoreUserDoc?.isApproved === true
       ) {
         verifiedRole = 'teacher';
       } else {

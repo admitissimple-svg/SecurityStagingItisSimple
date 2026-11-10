@@ -284,19 +284,17 @@ export function areSameTutor(a: any, b: any): boolean {
  * Merges two records for the same Native Friend, strictly preserving approval status,
  * biography, images, availability, pricing, and canonical IDs.
  */
-export function mergeTutors(existing: any, incoming: any): CanonicalTutorRecord {
+export function mergeTutors(existing: any, incoming: any): any {
   const isApproved = Boolean(
-    existing.approvalStatus === 'approved' ||
-    existing.isApproved === true ||
-    existing.status === 'approved' ||
-    existing.approved === true ||
-    incoming.approvalStatus === 'approved' ||
-    incoming.isApproved === true ||
-    incoming.status === 'approved' ||
-    incoming.approved === true
+    ((existing.role === 'teacher' || existing.role === 'native_friend') &&
+      existing.approvalStatus === 'approved' &&
+      existing.isApproved === true) ||
+    ((incoming.role === 'teacher' || incoming.role === 'native_friend') &&
+      incoming.approvalStatus === 'approved' &&
+      incoming.isApproved === true)
   );
 
-  const approvalStatus = isApproved ? 'approved' : (existing.approvalStatus || incoming.approvalStatus || 'pending');
+  const approvalStatus = isApproved ? 'approved' : (existing.approvalStatus === 'rejected' || incoming.approvalStatus === 'rejected' ? 'rejected' : 'pending');
 
   const email = (existing.email || incoming.email || '').toLowerCase().trim();
 

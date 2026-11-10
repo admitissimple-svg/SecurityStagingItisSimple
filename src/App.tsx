@@ -5037,7 +5037,8 @@ export default function App() {
 
     // Ensure active student session, profile, and fixed assigned Native Friend are locked in
     if (finalStudentEmail) {
-      if (!currentAccount || currentAccount.role !== 'teacher' || scheduleStudentInfo) {
+      const isTeacherOrAdmin = currentAccount && (currentAccount.role === 'teacher' || currentAccount.role === 'admin');
+      if (!isTeacherOrAdmin) {
         const studentAccount: GoogleAccount = {
           uid: finalStudentUid,
           id: finalStudentUid,
@@ -5048,25 +5049,25 @@ export default function App() {
           avatar: '',
         };
         setCurrentAccount(studentAccount);
-      }
 
-      setUserProfile((prev) => ({
-        ...prev,
-        id: finalStudentUid,
-        uid: finalStudentUid,
-        name: finalStudentName,
-        email: finalStudentEmail,
-        teacherEmail: lessonData.teacherEmail,
-        teacherName: lessonData.teacherName,
-        teacherUid: finalTeacherUid,
-        assignedNativeFriendUID: finalTeacherUid,
-        nativeFriendUID: finalTeacherUid,
-        enrollmentStatus: 'active',
-        hasCompletedTrialLesson: isTrialBooking ? true : Boolean(prev?.hasCompletedTrialLesson),
-        onboardingCompleted: isTrialBooking ? true : Boolean(prev?.onboardingCompleted),
-        contractedLessons: txResult.contractedLessons ?? Math.max(prev?.contractedLessons || 0, 1),
-        availableLessons: txResult.remainingLessons !== undefined ? txResult.remainingLessons : prev?.availableLessons,
-      }));
+        setUserProfile((prev) => ({
+          ...prev,
+          id: finalStudentUid,
+          uid: finalStudentUid,
+          name: finalStudentName,
+          email: finalStudentEmail,
+          teacherEmail: lessonData.teacherEmail,
+          teacherName: lessonData.teacherName,
+          teacherUid: finalTeacherUid,
+          assignedNativeFriendUID: finalTeacherUid,
+          nativeFriendUID: finalTeacherUid,
+          enrollmentStatus: 'active',
+          hasCompletedTrialLesson: isTrialBooking ? true : Boolean(prev?.hasCompletedTrialLesson),
+          onboardingCompleted: isTrialBooking ? true : Boolean(prev?.onboardingCompleted),
+          contractedLessons: txResult.contractedLessons ?? Math.max(prev?.contractedLessons || 0, 1),
+          availableLessons: txResult.remainingLessons !== undefined ? txResult.remainingLessons : prev?.availableLessons,
+        }));
+      }
 
       setContractedLessons((prev) => ({
         ...prev,
@@ -5589,12 +5590,22 @@ export default function App() {
     }
 
     try {
+      const idToken = await auth.currentUser?.getIdToken().catch(() => null);
+      const targetStudent = studentsList.find((s) => (s.email || '').toLowerCase().trim() === (targetStudentEmail || '').toLowerCase().trim());
+      const studentUid = targetLesson?.studentUid || (targetLesson as any)?.studentId || targetStudent?.uid || targetStudent?.id;
+      const rawContent = notes.liveNotes || notes.sessionNotesDocument || notes.recommendations || notes.topic || '';
+
       await fetch(`/api/lessons/${lessonId}/notes`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+        },
         body: JSON.stringify({
           ...notes,
           studentEmail: targetStudentEmail,
+          studentUid,
+          rawContent,
           teacherEmail: currentAccount?.email,
           teacherName: currentAccount?.name,
         }),
@@ -6679,10 +6690,8 @@ export default function App() {
   const pendingApprovalsCount = useMemo(() => {
     return tutors.filter((t) => {
       const isApproved =
-        t.approvalStatus === 'approved' ||
-        t.isApproved === true ||
-        (t as any).status === 'approved' ||
-        (t as any).approved === true;
+        t.approvalStatus === 'approved' &&
+        t.isApproved === true;
       const isRejected =
         !isApproved &&
         (t.approvalStatus === 'rejected' || (t as any).status === 'rejected');
@@ -6869,10 +6878,8 @@ export default function App() {
     tutors.forEach((t) => {
       if (!t) return;
       const isApproved =
-        t.approvalStatus === 'approved' ||
-        t.isApproved === true ||
-        (t as any).status === 'approved' ||
-        (t as any).approved === true;
+        t.approvalStatus === 'approved' &&
+        t.isApproved === true;
       if (isApproved) {
         const key = (t.email || t.id || '').toLowerCase().trim();
         if (key) {

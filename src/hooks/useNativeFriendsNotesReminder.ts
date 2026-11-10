@@ -7,7 +7,7 @@ import {
   PedagogicalLessonTransformation,
   hasValidPedagogicalContent,
 } from '../utils/pedagogicalTransformer';
-import { getDb } from '../firebase';
+import { getDb, auth } from '../firebase';
 import { collection, doc, getDoc, getDocs, setDoc, onSnapshot } from 'firebase/firestore';
 
 export interface SessionNoteSummary {
@@ -221,7 +221,12 @@ export function useNativeFriendsNotesReminder({
         if (resolvedUid) queryParams.set('studentUid', resolvedUid);
         if (resolvedEmail) queryParams.set('studentEmail', resolvedEmail);
 
-        const res = await fetch(`/api/session-notes?${queryParams.toString()}`);
+        const idToken = await auth?.currentUser?.getIdToken().catch(() => null);
+        const res = await fetch(`/api/session-notes?${queryParams.toString()}`, {
+          headers: {
+            ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+          },
+        });
         if (res.ok) {
           const serverNotes = await res.json();
           if (Array.isArray(serverNotes)) {

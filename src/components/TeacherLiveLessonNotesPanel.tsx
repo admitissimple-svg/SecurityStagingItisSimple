@@ -44,7 +44,7 @@ import {
 import { isValidCanonicalUid } from '../utils/studentPersistence';
 import { formatDateInTimeZone, formatTimeInTimeZone } from '../utils/timezone';
 import { doc, setDoc } from 'firebase/firestore';
-import { getDb } from '../firebase';
+import { getDb, auth } from '../firebase';
 import { assertSafeFirestoreWrite, stampSchemaVersion } from '../utils/firestoreSchemaValidator';
 import { useAuth } from '../context/AuthContext';
 import { getGoogleOAuthToken, setGoogleOAuthToken, requestGoogleDriveAuth } from '../utils/auth';
@@ -594,9 +594,16 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         if (selectedLessonId) queryParams.set('lessonId', selectedLessonId);
         if (currentSessionKey) queryParams.set('id', currentSessionKey);
         if (selectedStudentEmail) queryParams.set('studentEmail', selectedStudentEmail);
+        const resolvedStudentUid = ((activeStudent as any)?.studentUid || activeStudent?.uid || activeStudent?.id || '').trim();
+        if (resolvedStudentUid) queryParams.set('studentUid', resolvedStudentUid);
         if (sessionDate) queryParams.set('sessionDate', sessionDate);
 
-        const res = await fetch(`/api/session-notes?${queryParams.toString()}`);
+        const idToken = await auth.currentUser?.getIdToken().catch(() => null);
+        const res = await fetch(`/api/session-notes?${queryParams.toString()}`, {
+          headers: {
+            ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+          },
+        });
         if (res.ok && !cancelled) {
           const data = await res.json();
           const savedNote = Array.isArray(data) ? data[0] : data;
@@ -915,7 +922,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           // 2. Server API sync with Drive metadata (skipDriveSync prevents duplicate Google Drive operations)
           try {
             const idToken = await auth.currentUser?.getIdToken().catch(() => null);
-            const resolvedStudentUid = (activeStudent?.studentUid || activeStudent?.uid || activeStudent?.id || '').trim();
+            const resolvedStudentUid = ((activeStudent as any)?.studentUid || activeStudent?.uid || activeStudent?.id || '').trim();
             fetch('/api/session-notes', {
               method: 'POST',
               headers: {
@@ -1050,8 +1057,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               merge: true,
             }).catch((err) => console.warn('Firestore /session_notes notice:', err));
 
-            const userDocId = (activeStudent?.studentUid && isValidCanonicalUid(activeStudent.studentUid))
-              ? activeStudent.studentUid
+            const userDocId = ((activeStudent as any)?.studentUid && isValidCanonicalUid((activeStudent as any).studentUid))
+              ? (activeStudent as any).studentUid
               : ((activeStudent?.uid && isValidCanonicalUid(activeStudent.uid))
                 ? activeStudent.uid
                 : ((activeStudent?.id && isValidCanonicalUid(activeStudent.id)) ? activeStudent.id : ''));
@@ -1091,7 +1098,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         // 2. Server API Persistence (ensures clean database and Firestore sync without touching Google Drive)
         try {
           const idToken = await auth.currentUser?.getIdToken().catch(() => null);
-          const resolvedStudentUid = (activeStudent?.studentUid || activeStudent?.uid || activeStudent?.id || '').trim();
+          const resolvedStudentUid = ((activeStudent as any)?.studentUid || activeStudent?.uid || activeStudent?.id || '').trim();
           await fetch('/api/session-notes', {
             method: 'POST',
             headers: {

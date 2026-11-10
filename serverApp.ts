@@ -1361,9 +1361,9 @@ app.get('/api/auth/verify-session', firebaseAuthMiddleware, async (req, res) => 
   const firestoreRole = (firestoreDoc?.role || '').toLowerCase();
   const tokenRole = req.user.role;
 
-  // Inconsistency check: token claims admin but Firestore registers student
-  if (tokenRole === 'admin' && firestoreRole === 'student') {
-    console.warn(`[verify-session] Inconsistency detected for ${req.user.uid}: token role admin vs firestore student.`);
+  // Inconsistency check: token claims privileged role (admin/teacher) but Firestore registers student
+  if ((tokenRole === 'admin' || tokenRole === 'teacher') && firestoreRole === 'student') {
+    console.warn(`[verify-session] Inconsistency detected for ${req.user.uid}: token role ${tokenRole} vs firestore student.`);
     return res.status(403).json({
       authenticated: false,
       error: 'ROLE_INCONSISTENCY',
@@ -1371,13 +1371,16 @@ app.get('/api/auth/verify-session', firebaseAuthMiddleware, async (req, res) => 
     });
   }
 
-  let finalRole: UserRole = 'student';
-  if (tokenRole === 'admin' || (db.teachers || []).some((t: any) => t.role === 'admin' && (t.uid === req.user.uid || t.id === req.user.uid))) {
+  const callerUid = req.user.uid;
+  const callerEmail = req.user.email;
+
+  let finalRole: 'student' | 'teacher' | 'admin' = 'student';
+  if (tokenRole === 'admin' || (db.teachers || []).some((t: any) => t.role === 'admin' && (t.uid === callerUid || t.id === callerUid))) {
     finalRole = 'admin';
   } else {
     let teacherRes: any = null;
     try {
-      teacherRes = await resolveTeacherCanonicalIdentity({ teacherUid: req.user.uid, teacherEmail: req.user.email, dbState: db });
+      teacherRes = await resolveTeacherCanonicalIdentity({ teacherUid: callerUid, teacherEmail: callerEmail, dbState: db });
     } catch {}
     if (teacherRes && teacherRes.isApproved && firestoreRole !== 'student') {
       finalRole = 'teacher';
@@ -1495,6 +1498,9 @@ app.post('/api/auth/login', async (req, res) => {
 
   const cleanEmail = verifiedEmail || (req.body.email ? req.body.email.toLowerCase().trim() : '');
   const requestedRole = (req.body.role || '').toLowerCase();
+  let role: string = 'student';
+  let isRoleEnforced = false;
+  let name: string = (req.body.name || '').trim() || cleanEmail.split('@')[0];
 
   // 1. Authoritative Firestore document inspection
   let firestoreDoc: any = null;
@@ -1534,8 +1540,12 @@ app.post('/api/auth/login', async (req, res) => {
     } catch {}
   }
 
+  const hasTutorApplication = Boolean(
+    teacherResolution?.rawDoc ||
+    (db.tutorsList || []).some((t: any) => (t.uid && t.uid === authenticatedUid) || ((t.email || '').toLowerCase() === cleanEmail))
+  );
   const isApprovedTeacher = !isServerVerifiedAdmin && Boolean(teacherResolution && teacherResolution.isApproved);
-  const isPendingTeacher = !isServerVerifiedAdmin && Boolean(teacherResolution && !teacherResolution.isApproved);
+  const isPendingTeacher = !isServerVerifiedAdmin && hasTutorApplication && !isApprovedTeacher;
 
   // If a pending tutor attempts to log into the teacher space, reject with 403
   if (isPendingTeacher && requestedRole === 'teacher') {
@@ -1598,7 +1608,8 @@ app.post('/api/auth/login', async (req, res) => {
   } else {
     // Registered student or new student
     role = 'student';
-    name = studentObjInDb?.name || studentObjInDb?.studentName || db.userProfiles?.[cleanEmail]?.name || db.authUsers?.[cleanEmail]?.name || name;
+    const studentMatch = (db.students || []).find((s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail);
+    name = studentMatch?.name || studentMatch?.studentName || db.userProfiles?.[cleanEmail]?.name || db.authUsers?.[cleanEmail]?.name || name;
 
     if (requestedRole && requestedRole !== 'student') {
       isRoleEnforced = true;
@@ -2584,8 +2595,12 @@ app.post('/api/auth/google', async (req, res) => {
     } catch {}
   }
 
+  const hasTutorApplication = Boolean(
+    teacherResolution?.rawDoc ||
+    (db.tutorsList || []).some((t: any) => (t.uid && t.uid === targetUid) || ((t.email || '').toLowerCase() === cleanEmail))
+  );
   const isApprovedTeacher = !isServerVerifiedAdmin && Boolean(teacherResolution && teacherResolution.isApproved);
-  const isPendingTeacher = !isServerVerifiedAdmin && Boolean(teacherResolution && !teacherResolution.isApproved);
+  const isPendingTeacher = !isServerVerifiedAdmin && hasTutorApplication && !isApprovedTeacher;
 
   // If a pending tutor attempts to access the teacher space, reject with 403
   if (isPendingTeacher && requestedRole === 'teacher') {
@@ -2610,22 +2625,31 @@ app.post('/api/auth/google', async (req, res) => {
   let isRoleEnforced = false;
 
   if (isServerVerifiedAdmin) {
+    if (firestoreRole === 'student') {
+      console.warn(`[RBAC Google] Inconsistency detected: admin claim vs student in Firestore for ${cleanEmail}. Blocking privileged access.`);
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'ROLE_INCONSISTENCY_BLOCKED',
+        message: 'Inconsistência de permissões detectada entre autenticação e base canônica. Acesso privilegiado bloqueado.',
+      });
+    }
     role = 'admin';
     const adminTeacher = (db.teachers || []).find((t: any) => t.role === 'admin' && (t.uid === targetUid || t.id === targetUid));
     displayName = adminTeacher?.name || name || "Admin";
-  } else if (isRegisteredStudent) {
-    // STRICT RBAC: If registered as a student, session is strictly locked to student space
-    role = 'student';
-    if (requestedRole && requestedRole !== 'student') {
-      isRoleEnforced = true;
-      console.warn(`[RBAC Google] Blocked user ${cleanEmail} from accessing ${requestedRole} panel. Locked to student space.`);
-    }
-  } else if (isApprovedTeacher) {
+  } else if (isApprovedTeacher && firestoreRole !== 'student') {
+    // Canonical approved teacher cannot be downgraded to student
     role = 'teacher';
     displayName = teacherResolution.name || displayName;
     if (requestedRole === 'admin') {
       isRoleEnforced = true;
       console.warn(`[RBAC Google] Blocked teacher ${cleanEmail} from accessing admin panel.`);
+    }
+  } else if (firestoreRole === 'student' || isRegisteredStudent) {
+    // STRICT RBAC: If registered as a student, session is strictly locked to student space
+    role = 'student';
+    if (requestedRole && requestedRole !== 'student') {
+      isRoleEnforced = true;
+      console.warn(`[RBAC Google] Blocked user ${cleanEmail} from accessing ${requestedRole} panel. Locked to student space.`);
     }
   } else {
     // Default safe role: student. requestedRole NEVER grants teacher permissions.
@@ -2970,11 +2994,12 @@ app.get('/api/tutors', async (req, res) => {
 
   // Helper to determine if a tutor record is approved
   const isApprovedTutor = (t: any) => {
+    const role = (t?.role || '').toLowerCase().trim();
+    const isTeacherRole = role === 'teacher' || role === 'native_friend' || role === 'tutor' || !role;
     return Boolean(
-      t.approvalStatus === 'approved' ||
-      t.isApproved === true ||
-      t.status === 'approved' ||
-      t.approved === true
+      isTeacherRole &&
+      t?.approvalStatus === 'approved' &&
+      t?.isApproved === true
     );
   };
 
@@ -3079,10 +3104,46 @@ app.post('/api/tutors', async (req, res) => {
     });
   }
 
+  // Prevent role mutation: existing students cannot register as Native Friends to self-elevate
+  let existingStudentDoc: any = null;
+  try {
+    const fs = getFirestoreDb();
+    if (fs) {
+      if (verifiedCaller?.uid && isValidCanonicalUid(verifiedCaller.uid)) {
+        const uDoc = await fs.collection('users').doc(verifiedCaller.uid).get().catch(() => null);
+        if (uDoc && uDoc.exists && (uDoc.data()?.role === 'student' || uDoc.data()?.learningGoal || uDoc.data()?.studentLevel)) {
+          existingStudentDoc = uDoc.data();
+        }
+      }
+      if (!existingStudentDoc && cleanEmail) {
+        const cleanDocId = cleanEmail.replace(/[^a-zA-Z0-9]/g, '-');
+        const emailDoc = await fs.collection('users').doc(cleanDocId).get().catch(() => null);
+        if (emailDoc && emailDoc.exists && (emailDoc.data()?.role === 'student' || emailDoc.data()?.learningGoal || emailDoc.data()?.studentLevel)) {
+          existingStudentDoc = emailDoc.data();
+        }
+      }
+    }
+  } catch {}
+
+  const isExistingStudent = Boolean(
+    existingStudentDoc ||
+    (db.students || []).some((s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail) ||
+    Boolean(db.userProfiles?.[cleanEmail])
+  );
+
+  if (isExistingStudent && !isAdminCaller) {
+    return res.status(409).json({
+      error: 'ROLE_MUTATION_FORBIDDEN',
+      message: 'Esta conta já está registrada como Aluno. Não é permitido converter contas de alunos em Amigos Nativos.',
+      duplicateField: 'role',
+      isExistingUser: true,
+    });
+  }
+
   // Reject attempts to update or overwrite existing tutors by email, UID or ID
   const incomingUid = (rawTutor.uid && typeof rawTutor.uid === 'string') ? rawTutor.uid.trim() : '';
   const incomingId = (rawTutor.id && typeof rawTutor.id === 'string') ? rawTutor.id.trim() : '';
-  const verifiedUidForMatch = verifiedCaller?.uid || '';
+  const verifiedUidForMatch = (!isAdminCaller && verifiedCaller?.uid) ? verifiedCaller.uid : '';
 
   const existingEmailIdx = (db.tutorsList || []).findIndex(
     (t: any) =>
@@ -3133,7 +3194,9 @@ app.post('/api/tutors', async (req, res) => {
 
   // Identity audit: Resolve canonical Firebase Auth UID via Admin SDK or verified token
   let canonicalAuthUid = '';
-  if (verifiedCaller?.uid && isValidCanonicalUid(verifiedCaller.uid)) {
+  if (isAdminCaller && incomingUid && isValidCanonicalUid(incomingUid)) {
+    canonicalAuthUid = incomingUid;
+  } else if (!isAdminCaller && verifiedCaller?.uid && isValidCanonicalUid(verifiedCaller.uid)) {
     canonicalAuthUid = verifiedCaller.uid;
   }
   if (!canonicalAuthUid && cleanEmail) {
@@ -3319,12 +3382,14 @@ app.post('/api/tutors', async (req, res) => {
     db.deletedTutorEmails = db.deletedTutorEmails.filter((em) => em !== cleanEmail);
   }
 
-  // Purge any accidental student profile entry for this teacher
-  if (db.userProfiles && db.userProfiles[cleanEmail]) {
-    delete db.userProfiles[cleanEmail];
-  }
-  if (db.students) {
-    db.students = db.students.filter((s: any) => (s.email || s.studentEmail || '').toLowerCase() !== cleanEmail);
+  // Purge any accidental student profile entry for this teacher ONLY if explicitly registered by administrator
+  if (isAdminCaller) {
+    if (db.userProfiles && db.userProfiles[cleanEmail]) {
+      delete db.userProfiles[cleanEmail];
+    }
+    if (db.students) {
+      db.students = db.students.filter((s: any) => (s.email || s.studentEmail || '').toLowerCase() !== cleanEmail);
+    }
   }
 
   // Persist directly to Cloud Firestore exclusively in tutors/{canonicalAuthUid} and users/{canonicalAuthUid}
@@ -3795,7 +3860,7 @@ app.post('/api/tutors/:id/approve', firebaseAuthMiddleware, requireAdmin, async 
 
   // 1. Search in local db.tutorsList
   db.tutorsList = (db.tutorsList || []).map((t) => {
-    if (t.id === tutorId || t.email?.toLowerCase() === tutorId.toLowerCase()) {
+    if (t.id === tutorId || t.uid === tutorId || t.authUid === tutorId || t.email?.toLowerCase() === tutorId.toLowerCase()) {
       approvedEmail = (t.email || '').toLowerCase().trim();
       approvedTutor = {
         ...t,
@@ -3813,7 +3878,7 @@ app.post('/api/tutors/:id/approve', firebaseAuthMiddleware, requireAdmin, async 
   // 2. If not found in db.tutorsList, check db.teachers
   if (!approvedTutor) {
     const teacher = (db.teachers || []).find(
-      (tc: any) => tc.id === tutorId || (tc.email && tc.email.toLowerCase() === tutorId.toLowerCase())
+      (tc: any) => tc.id === tutorId || tc.uid === tutorId || tc.authUid === tutorId || (tc.email && tc.email.toLowerCase() === tutorId.toLowerCase())
     );
     if (teacher) {
       approvedEmail = (teacher.email || '').toLowerCase().trim();
@@ -7325,10 +7390,8 @@ async function verifyTeacherIdentityInFirestore(
       role === 'native_friend' ||
       data.isTeacher === true;
     const isApproved =
-      data.approvalStatus === 'approved' ||
-      data.isApproved === true ||
-      data.approved === true ||
-      data.status === 'approved';
+      data.approvalStatus === 'approved' &&
+      data.isApproved === true;
     return Boolean(isTeacherRole && isApproved);
   };
 
@@ -7934,13 +7997,32 @@ app.post('/api/lessons/schedule', firebaseAuthMiddleware, async (req, res) => {
   }
 });
 
-app.post(['/api/lessons', '/api/live-lessons'], async (req, res) => {
+app.post(['/api/lessons', '/api/live-lessons'], firebaseAuthMiddleware, async (req, res) => {
+  if (!req.user || !req.user.uid) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Autenticação necessária para registrar aulas.' });
+  }
+  const callerUid = req.user.uid;
+  const isCallerAdmin = req.user.role === 'admin';
   const db = readDb();
   const { lesson, lessons } = req.body;
   const newLesson = lesson || (req.body.id ? req.body : null);
   if (Array.isArray(lessons)) {
+    if (!isCallerAdmin) {
+      return res.status(403).json({ error: 'Forbidden', message: 'Apenas administradores podem atualizar a lista completa de aulas.' });
+    }
     db.liveLessons = lessons;
   } else if (newLesson && newLesson.id) {
+    // If caller is student, strictly lock studentUid to caller's authenticated UID
+    if (!isCallerAdmin) {
+      let isCallerTeacher = false;
+      try {
+        const tRes = await resolveTeacherCanonicalIdentity({ teacherUid: callerUid, teacherEmail: req.user.email, dbState: db });
+        if (tRes && tRes.isApproved) isCallerTeacher = true;
+      } catch {}
+      if (!isCallerTeacher) {
+        newLesson.studentUid = callerUid;
+      }
+    }
     // Auto-resolve studentEmail if blank
     if (!newLesson.studentEmail || newLesson.studentEmail.trim() === '') {
       if (req.query.email || req.query.studentEmail) {
@@ -8401,192 +8483,225 @@ export function invalidatePedagogicalCache(
   });
 }
 
-// Save live lesson notes & automatically migrate vocabulary to student's personal dictionary
-app.post('/api/lessons/:id/notes', async (req, res) => {
-  const db = readDb();
-  const id = decodeURIComponent(req.params.id);
-  const { topic, liveNotes, recommendations, pronunciationNotes, grammarAndPhrasing, vocabularyNotes, sessionNotesDocument, sessionDate } = req.body || {};
+async function handleSaveSessionNotesInternal(req: any, res: any, explicitLessonId?: string) {
+  if (!req.user || !req.user.uid) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      code: 'UNAUTHORIZED',
+      message: 'Autenticação mandatória para salvar anotações pedagógicas.',
+    });
+  }
 
-  let targetStudentEmail = (req.body?.studentEmail || '').toLowerCase().trim();
-  let targetStudentUid = req.body?.studentUid || '';
-  if ((!targetStudentUid || !isValidCanonicalUid(targetStudentUid)) && targetStudentEmail) {
-    const foundStudent = (db.students || []).find((s: any) => (s.email || '').toLowerCase().trim() === targetStudentEmail);
-    if (foundStudent && foundStudent.uid && isValidCanonicalUid(foundStudent.uid)) {
-      targetStudentUid = foundStudent.uid;
+  const callerUid = req.user.uid;
+  const isCallerAdmin = req.user.role === 'admin';
+  const db = readDb();
+
+  // 1. Authorize teacher or admin
+  let teacherResolution: any = null;
+  let isCallerTeacher = false;
+  if (!isCallerAdmin) {
+    try {
+      teacherResolution = await resolveTeacherCanonicalIdentity({
+        teacherUid: callerUid,
+        teacherEmail: req.user.email,
+        dbState: db,
+      });
+      if (teacherResolution && teacherResolution.isApproved) {
+        isCallerTeacher = true;
+      }
+    } catch {}
+
+    if (!teacherResolution || !teacherResolution.isApproved) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'FORBIDDEN',
+        message: 'Apenas Amigos Nativos aprovados ou administradores possuem autorização para registrar anotações pedagógicas.',
+      });
     }
   }
-  let teacherName = req.body?.teacherName || '';
-  let teacherEmail = (req.body?.teacherEmail || '').toLowerCase().trim();
 
-  const effectiveDocument = sessionNotesDocument || liveNotes || recommendations || '';
+  // 2. Derive teacherUid strictly from verified token
+  const teacherUid = callerUid;
 
-  db.liveLessons = (db.liveLessons || []).map((l: any) => {
-    if (l.id === id) {
-      if (!targetStudentEmail && l.studentEmail) targetStudentEmail = (l.studentEmail || '').toLowerCase().trim();
-      if (!targetStudentUid && l.studentUid) targetStudentUid = l.studentUid || '';
-      if (!teacherName && (l.teacherName || l.tutorName)) teacherName = l.teacherName || l.tutorName || '';
-      if (!teacherEmail && (l.teacherEmail || l.tutorEmail)) teacherEmail = (l.teacherEmail || l.tutorEmail || '').toLowerCase().trim();
-      return {
-        ...l,
-        title: topic || l.title,
-        liveNotes: liveNotes || effectiveDocument,
-        recommendations: recommendations || effectiveDocument,
-        pronunciationNotes,
-        grammarAndPhrasing,
-        sessionNotesDocument: effectiveDocument,
-        vocabularyNotes: Array.isArray(vocabularyNotes) ? vocabularyNotes : l.vocabularyNotes,
-        notesLastSavedAt: new Date().toISOString(),
-      };
+  // 3. Resolve and validate studentUid (reject empty or non-canonical)
+  const incomingStudentUid = (req.body?.studentUid || '').trim();
+  if (!incomingStudentUid || !isValidCanonicalUid(incomingStudentUid)) {
+    return res.status(400).json({
+      error: 'CANONICAL_STUDENT_UID_REQUIRED',
+      code: 'CANONICAL_STUDENT_UID_REQUIRED',
+      message: 'UID canônico do aluno é obrigatório para registrar anotações pedagógicas.',
+    });
+  }
+  const studentUid = incomingStudentUid;
+
+  // 4. Verify student identity exists in canonical persistence (do NOT auto-create mock users)
+  let studentDoc: any = null;
+  try {
+    const fs = getFirestoreDb();
+    if (fs) {
+      const uSnap = await fs.collection('users').doc(studentUid).get().catch(() => null);
+      if (uSnap && uSnap.exists) {
+        studentDoc = uSnap.data();
+      }
     }
-    return l;
-  });
+  } catch {}
 
-  // Automatically persist session notes document to Firestore keyed by date / session ID
-  const effectiveSessionDate = sessionDate || new Date().toISOString().split('T')[0];
-  const cleanEmail = (targetStudentEmail || '').replace(/[^a-zA-Z0-9_-]/g, '_');
-  const sessionKey = id ? id : `session_${effectiveSessionDate}_${cleanEmail}`;
+  if (!studentDoc) {
+    const localMatch = (db.students || []).find((s: any) => s.uid === studentUid || s.id === studentUid) ||
+      Object.values(db.authUsers || {}).find((u: any) => u.uid === studentUid);
+    if (localMatch) {
+      studentDoc = localMatch;
+    }
+  }
 
-  if (!db.sessionNotesMap) db.sessionNotesMap = {};
-  db.sessionNotesMap[sessionKey] = {
-    id: sessionKey,
-    sessionDate: effectiveSessionDate,
-    lessonId: id,
-    studentEmail: targetStudentEmail,
-    studentUid: targetStudentUid,
-    teacherEmail,
-    teacherName,
-    topic: topic || '',
-    content: effectiveDocument,
-    updatedAt: new Date().toISOString(),
-  };
+  if (!studentDoc) {
+    return res.status(400).json({
+      error: 'STUDENT_NOT_FOUND',
+      code: 'STUDENT_NOT_FOUND',
+      message: 'Identidade canônica do aluno não foi encontrada no Firestore.',
+    });
+  }
 
-  saveSessionNotesToFirestoreServer(sessionKey, {
-    id: sessionKey,
-    sessionDate: effectiveSessionDate,
-    lessonId: id,
-    studentEmail: targetStudentEmail,
-    studentUid: targetStudentUid,
-    teacherEmail,
-    teacherName,
-    topic: topic || '',
-    content: effectiveDocument,
-    updatedAt: new Date().toISOString(),
-  }).catch((err) => {
-    console.warn('Backend Firestore session notes auto-save notice:', err);
-  });
+  // 5. Verify pedagogical link and lesson student match
+  const lessonId = explicitLessonId || req.body?.lessonId || (req.body?.id && !req.body.id.startsWith('session_') ? req.body.id : '');
+  let lesson: any = null;
+  if (lessonId) {
+    lesson = (db.liveLessons || []).find((l: any) => l.id === lessonId);
+    if (!lesson) {
+      try {
+        const fs = getFirestoreDb();
+        if (fs) {
+          const lSnap = await fs.collection('lessons').doc(lessonId).get().catch(() => null);
+          if (lSnap && lSnap.exists) {
+            lesson = lSnap.data();
+          }
+        }
+      } catch {}
+    }
+  }
 
-  // Invalidate all versions (languages, CEFR levels, hashes) of cached pedagogical transformation for this session
-  // Teacher saving notes does NOT generate Gemini and does NOT write directly to student's dictionary
-  invalidatePedagogicalCache(db, {
-    canonicalSessionKey: sessionKey,
-    sessionKey,
-    lessonId: id,
-    id,
-  });
+  if (lesson) {
+    if (lesson.studentUid && lesson.studentUid !== studentUid) {
+      return res.status(403).json({
+        error: 'STUDENT_LESSON_MISMATCH',
+        code: 'STUDENT_LESSON_MISMATCH',
+        message: 'A aula especificada pertence a outro aluno. Gravação bloqueada.',
+      });
+    }
+    if (!isCallerAdmin && lesson.teacherUid && lesson.teacherUid !== teacherUid) {
+      return res.status(403).json({
+        error: 'TEACHER_LESSON_MISMATCH',
+        code: 'TEACHER_LESSON_MISMATCH',
+        message: 'Amigo Nativo não autorizado para lecionar ou registrar esta aula.',
+      });
+    }
+  }
 
-  await writeDbSync(db);
-  res.json({ success: true, liveLessons: db.liveLessons });
-});
+  // 6. Session date & stable canonical session key
+  const rawDate = (
+    req.body?.sessionDate ||
+    (lesson?.sessionDate || (lesson?.startDateTime ? lesson.startDateTime.split('T')[0] : '')) ||
+    new Date().toISOString().split('T')[0]
+  ).trim();
+  const dateMatch = rawDate.match(/^\d{4}-\d{2}-\d{2}$/);
+  const sessionDate = dateMatch ? rawDate : new Date().toISOString().split('T')[0];
 
-// Save Native Friend In-Session Notes & Recommendations document keyed by session date/ID
-app.post('/api/session-notes', async (req, res) => {
-  const db = readDb();
-  const {
-    id,
-    sessionDate,
-    lessonId,
-    studentEmail,
-    studentName,
-    studentUid,
-    teacherEmail,
-    teacherName,
-    topic,
-    content,
-    driveFileId,
-    driveFileUrl,
-    driveFolderName,
-    driveLastSyncedAt,
-    skipDriveSync,
-  } = req.body || {};
+  const sessionKey = lessonId
+    ? lessonId
+    : (req.body?.id && typeof req.body.id === 'string' && req.body.id.trim()
+        ? req.body.id.trim()
+        : `session_${sessionDate}_${studentUid}`);
 
-  const cleanDate = sessionDate || new Date().toISOString().split('T')[0];
-  const cleanEmail = (studentEmail || '').toLowerCase().trim();
-  const sessionKey = id || (lessonId ? lessonId : `session_${cleanDate}_${cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_')}`);
-  const targetTeacherEmail = (teacherEmail || '').toLowerCase().trim();
+  // 7. Extract rawContent & content
+  const rawContent = (
+    req.body?.rawContent !== undefined
+      ? req.body.rawContent
+      : (req.body?.content || req.body?.sessionNotesDocument || req.body?.liveNotes || req.body?.recommendations || '')
+  );
+  const topic = req.body?.topic || lesson?.title || 'Live Coaching Session';
+  const targetStudentEmail = (studentDoc?.email || req.body?.studentEmail || '').toLowerCase().trim();
 
-  // Store Drive sync metadata if provided by explicit teacher action
-  let finalDriveFileId = driveFileId || db.sessionNotesMap?.[sessionKey]?.driveFileId || '';
-  let finalDriveFileUrl = driveFileUrl || db.sessionNotesMap?.[sessionKey]?.driveFileUrl || '';
-  let finalDriveFolderName = driveFolderName || db.sessionNotesMap?.[sessionKey]?.driveFolderName || GOOGLE_DRIVE_SESSION_FOLDER;
-  let finalDriveLastSyncedAt = driveLastSyncedAt || db.sessionNotesMap?.[sessionKey]?.driveLastSyncedAt || '';
-
-  if (!db.sessionNotesMap) db.sessionNotesMap = {};
+  // 8. Construct canonical note document
   const noteDoc = {
     id: sessionKey,
-    sessionDate: cleanDate,
+    sessionKey,
+    sessionDate,
     lessonId: lessonId || '',
-    studentEmail: cleanEmail,
-    studentUid: studentUid || '',
-    teacherEmail: targetTeacherEmail,
-    teacherName: teacherName || '',
-    topic: topic || '',
-    content: content || '',
-    driveFileId: finalDriveFileId,
-    driveFileUrl: finalDriveFileUrl,
-    driveFolderName: finalDriveFolderName,
-    driveLastSyncedAt: finalDriveLastSyncedAt,
+    studentUid,
+    studentEmail: targetStudentEmail,
+    teacherUid,
+    teacherEmail: (req.user.email || '').toLowerCase().trim(),
+    teacherName: teacherResolution?.name || req.body?.teacherName || req.user.name || 'Native Friend',
+    topic,
+    content: rawContent,
+    rawContent,
+    pronunciationNotes: req.body?.pronunciationNotes,
+    grammarAndPhrasing: req.body?.grammarAndPhrasing,
+    vocabularyNotes: req.body?.vocabularyNotes,
+    driveFileId: req.body?.driveFileId || '',
+    driveFileUrl: req.body?.driveFileUrl || '',
+    driveFolderName: req.body?.driveFolderName || GOOGLE_DRIVE_SESSION_FOLDER,
+    driveLastSyncedAt: req.body?.driveLastSyncedAt || '',
     updatedAt: new Date().toISOString(),
+    lastSavedByUid: teacherUid,
   };
 
-  db.sessionNotesMap[sessionKey] = noteDoc;
-
-  // Also sync with liveLessons if lessonId is provided
+  // 9. Synchronize liveLessons in memory if lesson exists
   if (lessonId && Array.isArray(db.liveLessons)) {
     db.liveLessons = db.liveLessons.map((l: any) => {
       if (l.id === lessonId) {
         return {
           ...l,
           title: topic || l.title,
-          liveNotes: content,
-          recommendations: content,
-          sessionNotesDocument: content,
+          liveNotes: rawContent,
+          recommendations: rawContent,
+          sessionNotesDocument: rawContent,
+          pronunciationNotes: req.body?.pronunciationNotes ?? l.pronunciationNotes,
+          grammarAndPhrasing: req.body?.grammarAndPhrasing ?? l.grammarAndPhrasing,
+          vocabularyNotes: Array.isArray(req.body?.vocabularyNotes) ? req.body.vocabularyNotes : l.vocabularyNotes,
           notesLastSavedAt: new Date().toISOString(),
-          driveFileId: noteDoc.driveFileId,
-          driveFileUrl: noteDoc.driveFileUrl,
-          driveFolderName: noteDoc.driveFolderName,
-          driveLastSyncedAt: noteDoc.driveLastSyncedAt,
+          studentUid,
+          teacherUid,
+          driveFileId: noteDoc.driveFileId || l.driveFileId,
+          driveFileUrl: noteDoc.driveFileUrl || l.driveFileUrl,
+          driveFolderName: noteDoc.driveFolderName || l.driveFolderName,
+          driveLastSyncedAt: noteDoc.driveLastSyncedAt || l.driveLastSyncedAt,
         };
       }
       return l;
     });
   }
 
-  // Invalidate cached pedagogical transformation for this session to ensure next fetch re-analyzes fresh notes
-  const canonicalSessionKey = getCanonicalSessionKey({
-    lessonId,
-    sessionKey,
-    id,
-    studentUid,
-    studentEmail: cleanEmail,
-    sessionDate: cleanDate,
-  });
+  if (!db.sessionNotesMap) db.sessionNotesMap = {};
+  db.sessionNotesMap[sessionKey] = noteDoc;
 
-  // Invalidate all versions (languages, CEFR levels, hashes) of cached pedagogical transformation for this session
+  // Invalidate cached pedagogical transformations
   invalidatePedagogicalCache(db, {
-    canonicalSessionKey,
+    canonicalSessionKey: sessionKey,
     sessionKey,
     lessonId,
-    id,
+    id: sessionKey,
   });
 
   await writeDbSync(db);
 
-  // Asynchronously persist to Cloud Firestore under /session_notes/{sessionKey} and /users/{studentId}/session_notes
-  saveSessionNotesToFirestoreServer(sessionKey, noteDoc).catch((err) => {
+  // 10. Persist canonically to Firestore (default) under session_notes/{sessionKey} and users/{studentUid}/session_notes
+  await saveSessionNotesToFirestoreServer(sessionKey, noteDoc).catch((err) => {
     console.warn('Backend Firestore session notes save notice:', err);
   });
 
-  res.json({ success: true, sessionNote: noteDoc });
+  return res.json({ success: true, sessionNote: noteDoc, liveLessons: db.liveLessons });
+}
+
+// Save live lesson notes & automatically migrate vocabulary to student's personal dictionary
+app.post('/api/lessons/:id/notes', firebaseAuthMiddleware, async (req, res) => {
+  const explicitLessonId = decodeURIComponent(req.params.id);
+  return handleSaveSessionNotesInternal(req, res, explicitLessonId);
+});
+
+// Save Native Friend In-Session Notes & Recommendations document keyed by session date/ID
+app.post('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
+  return handleSaveSessionNotesInternal(req, res);
 });
 
 // Dedicated Google Drive Session Notes Sync Endpoint (uses platform credentials mapped to teacher's email)
@@ -8793,105 +8908,180 @@ app.get('/api/drive/files/:fileId/download', (req, res) => {
 });
 
 // Retrieve Native Friend In-Session Notes & Recommendations
-app.get('/api/session-notes', async (req, res) => {
+app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
+  if (!req.user || !req.user.uid) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Autenticação mandatória para consultar anotações.' });
+  }
+
+  const callerUid = req.user.uid;
+  const isCallerAdmin = req.user.role === 'admin';
   const db = readDb();
+
+  let isCallerTeacher = false;
+  if (!isCallerAdmin) {
+    try {
+      const tRes = await resolveTeacherCanonicalIdentity({ teacherUid: callerUid, teacherEmail: req.user.email, dbState: db });
+      if (tRes && tRes.isApproved) isCallerTeacher = true;
+    } catch {}
+  }
+
   const id = (req.query.id as string) || '';
   const lessonId = (req.query.lessonId as string) || '';
-  const studentEmail = ((req.query.studentEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
-  const studentUid = ((req.query.studentUid as string) || (req.query.uid as string) || '').trim();
+  const queryStudentUid = ((req.query.studentUid as string) || (req.query.uid as string) || '').trim();
   const sessionDate = (req.query.sessionDate as string) || '';
 
-  // Direct lookup by id, lessonId, or canonical key
+  // 1. Determine target student and enforce strict student isolation
+  let targetStudentUid = '';
+  if (!isCallerAdmin && !isCallerTeacher) {
+    // Caller is a student: strictly lock to caller's own UID
+    if (queryStudentUid && queryStudentUid !== callerUid) {
+      return res.status(403).json({ error: 'Forbidden', message: 'Alunos só podem acessar suas próprias anotações.' });
+    }
+    targetStudentUid = callerUid;
+  } else {
+    // Admin or Teacher caller
+    targetStudentUid = queryStudentUid;
+  }
+
+  // 2. Direct lookup by id or lessonId
   if (id || lessonId) {
     const targetKey = id || lessonId;
     const cleanId = targetKey.replace(/^lesson_/, '');
-    if (db.sessionNotesMap?.[targetKey]) {
-      return res.json(db.sessionNotesMap[targetKey]);
+
+    // First check Firestore canonical storage
+    let firestoreNote: any = null;
+    if (targetStudentUid) {
+      try {
+        const studentNotes = await fetchSessionNotesForStudentServer(targetStudentUid, targetKey);
+        if (studentNotes && studentNotes.length > 0) {
+          firestoreNote = studentNotes[0];
+        }
+      } catch {}
     }
-    if (db.sessionNotesMap?.[`lesson_${cleanId}`]) {
-      return res.json(db.sessionNotesMap[`lesson_${cleanId}`]);
+    if (!firestoreNote) {
+      try {
+        firestoreNote = await fetchSessionNotesFromFirestoreServer(targetKey);
+      } catch {}
     }
-    if (db.sessionNotesMap?.[cleanId]) {
-      return res.json(db.sessionNotesMap[cleanId]);
+
+    let foundDoc = firestoreNote;
+    if (!foundDoc) {
+      foundDoc = db.sessionNotesMap?.[targetKey] ||
+        db.sessionNotesMap?.[`lesson_${cleanId}`] ||
+        db.sessionNotesMap?.[cleanId] ||
+        Object.values(db.sessionNotesMap || {}).find(
+          (n: any) => n.id === targetKey || n.lessonId === targetKey || n.lessonId === cleanId || n.id === `lesson_${cleanId}`
+        );
     }
-    const foundDoc = Object.values(db.sessionNotesMap || {}).find(
-      (n: any) => n.id === targetKey || n.lessonId === targetKey || n.lessonId === cleanId || n.id === `lesson_${cleanId}`
-    );
-    if (foundDoc) {
-      return res.json(foundDoc);
-    }
-    // Also check liveLessons
-    if (Array.isArray(db.liveLessons)) {
+
+    if (!foundDoc && Array.isArray(db.liveLessons)) {
       const matchLesson = db.liveLessons.find((l: any) => l.id === targetKey || l.id === cleanId);
       if (matchLesson && (matchLesson.sessionNotesDocument || matchLesson.liveNotes || matchLesson.recommendations)) {
         const lDate = matchLesson.sessionDate || (matchLesson.startDateTime ? matchLesson.startDateTime.split('T')[0] : '');
-        return res.json({
+        const rawContent = matchLesson.sessionNotesDocument || matchLesson.liveNotes || matchLesson.recommendations || '';
+        foundDoc = {
           id: matchLesson.id,
+          sessionKey: matchLesson.id,
           sessionDate: lDate,
           lessonId: matchLesson.id,
           studentEmail: matchLesson.studentEmail,
           studentUid: matchLesson.studentUid,
           teacherEmail: matchLesson.teacherEmail || matchLesson.tutorEmail || '',
           teacherName: matchLesson.teacherName || matchLesson.tutorName || 'Native Friend',
+          teacherUid: matchLesson.teacherUid || '',
           topic: matchLesson.title || 'Conversation & Fluency',
-          content: matchLesson.sessionNotesDocument || matchLesson.liveNotes || matchLesson.recommendations || '',
+          content: rawContent,
+          rawContent,
           driveFileId: matchLesson.driveFileId,
           driveFileUrl: matchLesson.driveFileUrl,
           driveFolderName: matchLesson.driveFolderName,
           driveLastSyncedAt: matchLesson.driveLastSyncedAt,
           updatedAt: matchLesson.updatedAt || matchLesson.notesLastSavedAt || new Date().toISOString(),
-        });
+        };
       }
     }
+
+    if (foundDoc) {
+      // Authorization check for single document
+      if (!isCallerAdmin && !isCallerTeacher) {
+        if (foundDoc.studentUid && foundDoc.studentUid !== callerUid) {
+          return res.status(403).json({ error: 'Forbidden', message: 'Acesso negado a anotações de outro aluno.' });
+        }
+      } else if (isCallerTeacher && !isCallerAdmin) {
+        if (foundDoc.teacherUid && foundDoc.teacherUid !== callerUid) {
+          return res.status(403).json({ error: 'Forbidden', message: 'Acesso negado: professor não autorizado para esta anotação.' });
+        }
+      }
+      const rawContent = foundDoc.rawContent || foundDoc.content || '';
+      return res.json({
+        ...foundDoc,
+        rawContent,
+        content: foundDoc.content || rawContent,
+      });
+    }
+
+    return res.status(404).json({ error: 'Session note not found' });
   }
 
-  if (studentUid || studentEmail) {
-    const allNotes: any[] = Object.values(db.sessionNotesMap || {});
+  // 3. Query notes for student (either caller or queried by teacher/admin)
+  if (targetStudentUid) {
     const map = new Map<string, any>();
 
-    // 1. Collect from sessionNotesMap matching studentUid or studentEmail
+    // 3a. Retrieve from canonical Firestore
+    try {
+      const fsNotes = await fetchSessionNotesForStudentServer(targetStudentUid);
+      if (Array.isArray(fsNotes)) {
+        fsNotes.forEach((n: any) => {
+          const rawContent = n.rawContent || n.content || '';
+          const key = n.id || n.sessionKey || (n.sessionDate ? `session_${n.sessionDate}` : 'session');
+          map.set(key, { ...n, rawContent, content: n.content || rawContent });
+        });
+      }
+    } catch {}
+
+    // 3b. Overlay in-memory sessionNotesMap matching targetStudentUid
+    const allNotes: any[] = Object.values(db.sessionNotesMap || {});
     allNotes.forEach((n: any) => {
-      const matchUid = studentUid && n.studentUid && n.studentUid === studentUid;
-      const matchEmail = studentEmail && (n.studentEmail || '').toLowerCase().trim() === studentEmail;
-      if (matchUid || matchEmail) {
+      if (n.studentUid === targetStudentUid) {
         const cleanLessonId = n.lessonId ? n.lessonId.replace(/^lesson_/, '') : '';
         const mapKey = cleanLessonId ? `lesson_${cleanLessonId}` : (n.id || n.sessionDate);
-        if (mapKey) map.set(mapKey, n);
+        if (mapKey && !map.has(mapKey)) {
+          const rawContent = n.rawContent || n.content || '';
+          map.set(mapKey, { ...n, rawContent, content: n.content || rawContent });
+        }
       }
     });
 
-    // 2. Also collect from db.liveLessons matching studentUid or studentEmail that have notes
+    // 3c. Overlay liveLessons notes matching targetStudentUid
     if (Array.isArray(db.liveLessons)) {
       db.liveLessons.forEach((l: any) => {
-        const matchUid = studentUid && l.studentUid && l.studentUid === studentUid;
-        const matchEmail = studentEmail && (l.studentEmail || '').toLowerCase().trim() === studentEmail;
-        const noteContent = l.sessionNotesDocument || l.liveNotes || l.recommendations || '';
-        if ((matchUid || matchEmail) && noteContent && noteContent.trim()) {
-          const lDate = l.sessionDate || (l.startDateTime ? l.startDateTime.split('T')[0] : '');
-          const cleanLessonId = l.id ? l.id.replace(/^lesson_/, '') : '';
-          const mapKey = cleanLessonId ? `lesson_${cleanLessonId}` : (l.id || `session_${lDate}_${studentEmail}`);
-          if (!map.has(mapKey)) {
-            map.set(mapKey, {
-              id: mapKey,
-              sessionDate: lDate,
-              lessonId: l.id,
-              startDateTime: l.startDateTime,
-              studentEmail: l.studentEmail || studentEmail,
-              studentUid: l.studentUid || studentUid,
-              teacherEmail: l.teacherEmail || l.tutorEmail || '',
-              teacherName: l.teacherName || l.tutorName || 'Native Friend',
-              topic: l.title || 'Conversation & Fluency',
-              content: noteContent,
-              driveFileId: l.driveFileId,
-              driveFileUrl: l.driveFileUrl,
-              driveFolderName: l.driveFolderName,
-              driveLastSyncedAt: l.driveLastSyncedAt,
-              updatedAt: l.updatedAt || l.notesLastSavedAt || new Date().toISOString(),
-            });
-          } else {
-            const existing = map.get(mapKey);
-            if (l.startDateTime && !existing.startDateTime) {
-              existing.startDateTime = l.startDateTime;
+        if (l.studentUid === targetStudentUid) {
+          const noteContent = l.sessionNotesDocument || l.liveNotes || l.recommendations || '';
+          if (noteContent && noteContent.trim()) {
+            const lDate = l.sessionDate || (l.startDateTime ? l.startDateTime.split('T')[0] : '');
+            const cleanLessonId = l.id ? l.id.replace(/^lesson_/, '') : '';
+            const mapKey = cleanLessonId ? `lesson_${cleanLessonId}` : (l.id || `session_${lDate}_${targetStudentUid}`);
+            if (!map.has(mapKey)) {
+              map.set(mapKey, {
+                id: mapKey,
+                sessionKey: mapKey,
+                sessionDate: lDate,
+                lessonId: l.id,
+                startDateTime: l.startDateTime,
+                studentEmail: l.studentEmail,
+                studentUid: l.studentUid,
+                teacherEmail: l.teacherEmail || l.tutorEmail || '',
+                teacherName: l.teacherName || l.tutorName || 'Native Friend',
+                teacherUid: l.teacherUid || '',
+                topic: l.title || 'Conversation & Fluency',
+                content: noteContent,
+                rawContent: noteContent,
+                driveFileId: l.driveFileId,
+                driveFileUrl: l.driveFileUrl,
+                driveFolderName: l.driveFolderName,
+                driveLastSyncedAt: l.driveLastSyncedAt,
+                updatedAt: l.updatedAt || l.notesLastSavedAt || new Date().toISOString(),
+              });
             }
           }
         }
@@ -8920,7 +9110,7 @@ app.get('/api/session-notes', async (req, res) => {
     const results = Array.from(map.values()).sort((a: any, b: any) => {
       const timeA = getRealLessonTimestamp(a);
       const timeB = getRealLessonTimestamp(b);
-      return timeB - timeA; // Descending: newest real lesson first
+      return timeB - timeA;
     });
 
     if (sessionDate) {
@@ -8931,7 +9121,30 @@ app.get('/api/session-notes', async (req, res) => {
     return res.json(results);
   }
 
-  res.json(Object.values(db.sessionNotesMap || {}));
+  // 4. Admin listing all notes if no filter
+  if (isCallerAdmin) {
+    const all = Object.values(db.sessionNotesMap || {}).map((n: any) => ({
+      ...n,
+      rawContent: n.rawContent || n.content || '',
+      content: n.content || n.rawContent || '',
+    }));
+    return res.json(all);
+  }
+
+  // Teacher listing notes for their lessons
+  if (isCallerTeacher) {
+    const callerEmail = (req.user?.email || '').toLowerCase();
+    const teacherNotes = Object.values(db.sessionNotesMap || {})
+      .filter((n: any) => n.teacherUid === callerUid || (callerEmail && n.teacherEmail?.toLowerCase() === callerEmail))
+      .map((n: any) => ({
+        ...n,
+        rawContent: n.rawContent || n.content || '',
+        content: n.content || n.rawContent || '',
+      }));
+    return res.json(teacherNotes);
+  }
+
+  return res.json([]);
 });
 
 // Retrieve Native Friends Notes Sequential Review Progress
@@ -13038,11 +13251,12 @@ async function verifyActiveApprovedTeacher(
       return matchUid || matchEmail;
     });
     if (found) {
+      const role = (found.role || '').toLowerCase().trim();
+      const isTeacherRole = role === 'teacher' || role === 'tutor' || role === 'native_friend' || !role;
       const isApproved = Boolean(
-        found.approvalStatus === 'approved' ||
-        found.isApproved === true ||
-        found.approved === true ||
-        found.status === 'approved'
+        isTeacherRole &&
+        found.approvalStatus === 'approved' &&
+        found.isApproved === true
       );
       if (isApproved) {
         return {

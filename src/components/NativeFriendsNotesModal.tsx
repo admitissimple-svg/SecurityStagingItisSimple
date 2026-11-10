@@ -405,9 +405,12 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
         if (!resolvedUid) return [];
         const queryParams = new URLSearchParams();
         queryParams.set('studentUid', resolvedUid);
-        if (resolvedEmail) queryParams.set('studentEmail', resolvedEmail);
-
-        const res = await fetch(`/api/session-notes?${queryParams.toString()}`);
+        const idToken = await auth?.currentUser?.getIdToken().catch(() => null);
+        const res = await fetch(`/api/session-notes?${queryParams.toString()}`, {
+          headers: {
+            ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+          },
+        });
         if (!res.ok) {
           throw new Error(`Server returned HTTP ${res.status}`);
         }

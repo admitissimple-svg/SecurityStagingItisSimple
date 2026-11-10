@@ -393,6 +393,10 @@ export async function resolveTeacherCanonicalIdentity(
     }
   }
 
+  if (!resolvedUid && candidateUid && isValidCanonicalUid(candidateUid)) {
+    resolvedUid = candidateUid;
+  }
+
   if (!resolvedUid || !isValidCanonicalUid(resolvedUid)) {
     return null;
   }
@@ -525,8 +529,8 @@ export async function saveTutorToFirestore(tutor: any, _legacyDocId?: string): P
   }
 
   try {
-    const approvalStatus = tutor.approvalStatus || (tutor.isApproved ? 'approved' : 'pending');
-    const isApproved = approvalStatus === 'approved' || tutor.isApproved === true || tutor.status === 'approved' || tutor.approved === true;
+    const approvalStatus = tutor.approvalStatus === 'approved' ? 'approved' : (tutor.approvalStatus || 'pending');
+    const isApproved = Boolean(approvalStatus === 'approved' && tutor.isApproved === true);
 
     // Public ID and legacy IDs preserved strictly as metadata inside the document
     const publicTutorId =
@@ -620,7 +624,7 @@ export async function fetchTutorsFromFirestore(): Promise<any[]> {
 
     const results = consolidateTutorsList(rawList);
     const approvedIds = results
-      .filter((t) => t.approvalStatus === 'approved' || t.isApproved === true)
+      .filter((t) => t.approvalStatus === 'approved' && t.isApproved === true)
       .map((t) => t.publicTutorId || t.id || t.email);
     console.log('[NativeFriends Server] Retrieved consolidated Firestore tutor IDs:', approvedIds);
     return results;

@@ -44,10 +44,7 @@ export const AdminApprovalsModal: React.FC<AdminApprovalsModalProps> = ({
   authError,
 }) => {
   const isTutorApproved = (t: NativeFriendTutor) =>
-    t.approvalStatus === 'approved' ||
-    t.isApproved === true ||
-    (t as any).status === 'approved' ||
-    (t as any).approved === true;
+    t.approvalStatus === 'approved' && t.isApproved === true;
 
   const isTutorRejected = (t: NativeFriendTutor) =>
     !isTutorApproved(t) &&
