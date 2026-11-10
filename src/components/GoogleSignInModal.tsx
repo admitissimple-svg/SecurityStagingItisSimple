@@ -155,16 +155,21 @@ export const GoogleSignInModal: React.FC<GoogleSignInModalProps> = ({
       account.uid = user.uid;
       account.id = user.uid;
 
-      // Ensure teacher role is preserved if user logged in as teacher or backend confirmed teacher
-      if (verifiedRole === 'teacher' || data.account?.role === 'teacher') {
-        verifiedRole = 'teacher';
-        account.role = 'teacher';
-      } else if (isVerifiedAdmin) {
-        verifiedRole = 'admin';
-        account.role = 'admin';
-      } else {
-        verifiedRole = 'student';
-        account.role = 'student';
+      // Authoritative role resolution strictly from backend verification
+      const authoritativeRole: UserRole = isVerifiedAdmin ? 'admin' : (data.account?.role || data.role || 'student');
+      verifiedRole = authoritativeRole;
+      account.role = authoritativeRole;
+
+      if (authoritativeRole === 'student') {
+        if (typeof window !== 'undefined') {
+          const p = window.location.pathname;
+          const h = window.location.hash;
+          if (p === '/admin' || p === '/teacher' || h === '#admin' || h === '#teacher') {
+            try {
+              window.history.replaceState({ page: 'dashboard' }, '', '/dashboard');
+            } catch {}
+          }
+        }
       }
 
       // Guarantee student profile is saved under doc(db, 'users', user.uid) with UID as document key

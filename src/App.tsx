@@ -283,6 +283,7 @@ export default function App() {
   // 2. Authentication & Accounts - 100% in-memory React state (ZERO localStorage)
   const [currentAccount, setCurrentAccount] = useState<GoogleAccount | null>(null);
   const [availableAccounts, setAvailableAccounts] = useState<GoogleAccount[]>([]);
+  const [isAuthReady, setIsAuthReady] = useState<boolean>(false);
 
   // Authoritative Native Friends hook syncing with Firestore unified collections across production and preview
   const {
@@ -328,14 +329,7 @@ export default function App() {
 
         // Check if currentAccount matches the active Firebase Auth user and has the verified UID
         if (!currentAccount || currentAccount.email.toLowerCase() !== cleanEmail || currentAccount.uid !== fbUser.uid) {
-          // If an authentication attempt is actively underway in LoginModal/AuthModal, do NOT eagerly hydrate as student
-          if (isAuthModalOpen) {
-            return;
-          }
-
-          // If currentAccount already knows this user is a teacher, keep it as high priority default
-          const existingRole = currentAccount?.email?.toLowerCase() === cleanEmail ? currentAccount.role : undefined;
-          let resolvedRole: UserRole = isVerifiedAdmin ? 'admin' : (existingRole === 'teacher' ? 'teacher' : 'student');
+          let resolvedRole: UserRole = isVerifiedAdmin ? 'admin' : 'student';
           let firestoreDoc: any = null;
           try {
             const db = getDb();
@@ -346,13 +340,24 @@ export default function App() {
             if (snap && snap.exists()) {
               firestoreDoc = snap.data();
               const r = (firestoreDoc.role || firestoreDoc.userRole || '').toLowerCase();
-              if (r === 'admin' || isVerifiedAdmin) resolvedRole = isVerifiedAdmin ? 'admin' : 'student';
-              else if (r === 'teacher' || r === 'native_friend' || r === 'tutor') resolvedRole = 'teacher';
+              if (r === 'admin' || isVerifiedAdmin) {
+                resolvedRole = isVerifiedAdmin ? 'admin' : 'student';
+              } else if (r === 'student') {
+                resolvedRole = 'student';
+              } else if (r === 'teacher' || r === 'native_friend' || r === 'tutor') {
+                const isApproved = Boolean(
+                  firestoreDoc.approvalStatus === 'approved' ||
+                  firestoreDoc.isApproved === true ||
+                  firestoreDoc.status === 'approved' ||
+                  firestoreDoc.approved === true
+                );
+                resolvedRole = isApproved ? 'teacher' : 'student';
+              }
             }
 
             const cleanDocId = cleanEmail.replace(/[^a-zA-Z0-9]/g, '-');
-            // If role is still not teacher or admin, check email doc ID and tutor collections in Firestore
-            if (resolvedRole !== 'teacher' && !isVerifiedAdmin && cleanEmail) {
+            // If user doc not found or role unconfirmed, check fallback records only if NOT already a confirmed student
+            if (!firestoreDoc && resolvedRole !== 'teacher' && !isVerifiedAdmin && cleanEmail) {
               const snapEmail = await Promise.race([
                 getDoc(doc(db, 'users', cleanDocId)),
                 new Promise<null>((r) => setTimeout(() => r(null), 2500)),
@@ -360,9 +365,20 @@ export default function App() {
               if (snapEmail && snapEmail.exists()) {
                 const emailData = snapEmail.data();
                 const r = (emailData.role || emailData.userRole || '').toLowerCase();
-                if (r === 'teacher' || r === 'native_friend' || r === 'tutor') {
-                  firestoreDoc = { ...(firestoreDoc || {}), ...emailData };
-                  resolvedRole = 'teacher';
+                if (r === 'student') {
+                  firestoreDoc = emailData;
+                  resolvedRole = 'student';
+                } else if (r === 'teacher' || r === 'native_friend' || r === 'tutor') {
+                  const isApproved = Boolean(
+                    emailData.approvalStatus === 'approved' ||
+                    emailData.isApproved === true ||
+                    emailData.status === 'approved' ||
+                    emailData.approved === true
+                  );
+                  if (isApproved) {
+                    firestoreDoc = emailData;
+                    resolvedRole = 'teacher';
+                  }
                 }
                 // Migrate to Auth UID document
                 setDoc(
@@ -374,59 +390,41 @@ export default function App() {
 
               if (resolvedRole !== 'teacher') {
                 const cleanTutorId = `tutor-${cleanDocId}`;
-                const [tutorSnap, userTutorSnap, authUidTutorSnap] = await Promise.all([
+                const [tutorSnap, authUidTutorSnap] = await Promise.all([
                   getDoc(doc(db, 'tutors', cleanTutorId)).catch(() => null),
-                  getDoc(doc(db, 'users', cleanTutorId)).catch(() => null),
                   getDoc(doc(db, 'tutors', fbUser.uid)).catch(() => null),
                 ]);
-                if (authUidTutorSnap && authUidTutorSnap.exists()) {
-                  firestoreDoc = { ...(firestoreDoc || {}), ...authUidTutorSnap.data(), role: 'teacher' };
-                  resolvedRole = 'teacher';
-                } else if (tutorSnap && tutorSnap.exists()) {
-                  firestoreDoc = { ...(firestoreDoc || {}), ...tutorSnap.data(), role: 'teacher' };
-                  resolvedRole = 'teacher';
-                } else if (userTutorSnap && userTutorSnap.exists()) {
-                  firestoreDoc = { ...(firestoreDoc || {}), ...userTutorSnap.data(), role: 'teacher' };
-                  resolvedRole = 'teacher';
-                }
-              }
-
-              // Also check tutors collection by email query in Firestore
-              if (resolvedRole !== 'teacher') {
-                try {
-                  const qSnap = await Promise.race([
-                    getDocs(query(collection(db, 'tutors'), where('email', '==', cleanEmail))),
-                    new Promise<null>((r) => setTimeout(() => r(null), 2500)),
-                  ]);
-                  if (qSnap && !qSnap.empty) {
-                    const tData = qSnap.docs[0].data();
+                const tSnap = (authUidTutorSnap && authUidTutorSnap.exists()) ? authUidTutorSnap : ((tutorSnap && tutorSnap.exists()) ? tutorSnap : null);
+                if (tSnap && tSnap.exists()) {
+                  const tData = tSnap.data();
+                  const isApproved = Boolean(
+                    tData?.approvalStatus === 'approved' ||
+                    tData?.isApproved === true ||
+                    tData?.status === 'approved' ||
+                    tData?.approved === true
+                  );
+                  if (isApproved) {
                     firestoreDoc = { ...(firestoreDoc || {}), ...tData, role: 'teacher' };
                     resolvedRole = 'teacher';
                   }
-                } catch {}
-              }
-
-              // Also check memory tutors list
-              if (resolvedRole !== 'teacher') {
-                const inMemoryTutor = tutors.find((t) => (t.email || '').toLowerCase().trim() === cleanEmail);
-                if (inMemoryTutor) {
-                  firestoreDoc = { ...(firestoreDoc || {}), ...inMemoryTutor, role: 'teacher' };
-                  resolvedRole = 'teacher';
                 }
               }
 
-              // Also check backend user profile to confirm role
-              if (resolvedRole !== 'teacher' && !isVerifiedAdmin) {
-                try {
-                  const profRes = await fetch(`/api/user-profile?email=${encodeURIComponent(cleanEmail)}&uid=${encodeURIComponent(fbUser.uid)}`);
-                  if (profRes.ok) {
-                    const profData = await profRes.json();
-                    if (profData?.isTeacher || profData?.role === 'teacher') {
-                      firestoreDoc = { ...(firestoreDoc || {}), ...(profData.tutor || {}), role: 'teacher' };
-                      resolvedRole = 'teacher';
-                    }
+              // Also check memory tutors list - strictly requiring approval
+              if (resolvedRole !== 'teacher') {
+                const inMemoryTutor = tutors.find((t) => (t.email || '').toLowerCase().trim() === cleanEmail);
+                if (inMemoryTutor) {
+                  const isApproved = Boolean(
+                    inMemoryTutor.approvalStatus === 'approved' ||
+                    inMemoryTutor.isApproved === true ||
+                    (inMemoryTutor as any).status === 'approved' ||
+                    (inMemoryTutor as any).approved === true
+                  );
+                  if (isApproved) {
+                    firestoreDoc = { ...(firestoreDoc || {}), ...inMemoryTutor, role: 'teacher' };
+                    resolvedRole = 'teacher';
                   }
-                } catch {}
+                }
               }
             }
           } catch (e) {
@@ -639,6 +637,10 @@ export default function App() {
             }),
           }).catch(() => {});
         }
+        setIsAuthReady(true);
+      } else {
+        setCurrentAccount(null);
+        setIsAuthReady(true);
       }
     });
 
@@ -946,6 +948,11 @@ export default function App() {
   useEffect(() => {
     const handleRbacRouteCheck = () => {
       if (typeof window !== 'undefined') {
+        // Wait until initial Firebase Auth resolution is ready before applying route guards
+        if (!isAuthReady) {
+          return;
+        }
+
         const path = window.location.pathname;
         const hash = window.location.hash;
 
@@ -961,6 +968,7 @@ export default function App() {
             try {
               window.history.replaceState({ page: 'dashboard' }, '', '/dashboard');
             } catch {}
+            setViewMode('dashboard');
             setNotifications((prev) => [
               {
                 id: `rbac-admin-guard-${Date.now()}`,
@@ -983,7 +991,6 @@ export default function App() {
             } catch {}
           } else if (!currentAccount) {
             setAuthModalMode('login');
-            setAuthModalRole('admin');
             setIsAuthModalOpen(true);
           }
         }
@@ -998,6 +1005,7 @@ export default function App() {
             try {
               window.history.replaceState({ page: 'dashboard' }, '', '/dashboard');
             } catch {}
+            setViewMode('dashboard');
             setNotifications((prev) => [
               {
                 id: `rbac-teacher-guard-${Date.now()}`,
@@ -1013,7 +1021,6 @@ export default function App() {
             ]);
           } else if (!currentAccount) {
             setAuthModalMode('login');
-            setAuthModalRole('teacher');
             setIsAuthModalOpen(true);
           }
         }
@@ -1029,7 +1036,7 @@ export default function App() {
     handleRbacRouteCheck();
     window.addEventListener('popstate', handleRbacRouteCheck);
     return () => window.removeEventListener('popstate', handleRbacRouteCheck);
-  }, [currentAccount, currentLanguage]);
+  }, [currentAccount, currentLanguage, isAuthReady]);
 
   // Active RBAC enforcement: If user is a student, ensure admin/tutor modals are closed and url is student space
   useEffect(() => {

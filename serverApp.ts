@@ -1461,6 +1461,15 @@ app.post('/api/auth/login', async (req, res) => {
   const cleanEmail = verifiedEmail || (req.body.email ? req.body.email.toLowerCase().trim() : '');
   const requestedRole = (req.body.role || '').toLowerCase();
 
+  // 1. Authoritative Firestore document inspection
+  let firestoreDoc: any = null;
+  try {
+    firestoreDoc = await fetchUserFromFirestore(cleanEmail, authenticatedUid);
+  } catch (fsErr) {
+    console.warn('Firestore fetch notice in login auth:', fsErr);
+  }
+  const firestoreRole = (firestoreDoc?.role || '').toLowerCase();
+
   // 2. Strict Server-Side Role-Based Access Control (RBAC)
   // Admin privileges require cryptographically verified custom claim or trusted server bootstrap record
   const isServerVerifiedAdmin =
@@ -1478,23 +1487,44 @@ app.post('/api/auth/login', async (req, res) => {
     });
   }
 
-  const tutorObj = (db.tutorsList || []).find(
-    (t: any) => t.uid === authenticatedUid || t.authUid === authenticatedUid || (t.email || '').toLowerCase() === cleanEmail
-  );
-  const teacherObj = (db.teachers || []).find(
-    (t: any) => (t.uid === authenticatedUid || (t.email || '').toLowerCase() === cleanEmail) && t.role !== 'admin'
-  );
-  const isRegisteredTeacher = !isServerVerifiedAdmin && Boolean(tutorObj || teacherObj || requestedRole === 'teacher');
+  // 3. Resolve Teacher authorization strictly from verified sources (Firestore / canonical records)
+  let teacherResolution: any = null;
+  if (!isServerVerifiedAdmin) {
+    try {
+      teacherResolution = await resolveTeacherCanonicalIdentity({
+        teacherUid: authenticatedUid,
+        teacherEmail: cleanEmail,
+        dbState: db,
+      });
+    } catch {}
+  }
 
+  const isApprovedTeacher = !isServerVerifiedAdmin && Boolean(teacherResolution && teacherResolution.isApproved);
+  const isPendingTeacher = !isServerVerifiedAdmin && Boolean(teacherResolution && !teacherResolution.isApproved);
+
+  // If a pending tutor attempts to log into the teacher space, reject with 403
+  if (isPendingTeacher && requestedRole === 'teacher') {
+    return res.status(403).json({
+      error: 'Forbidden',
+      code: 'TEACHER_APPROVAL_PENDING',
+      message: 'Seu cadastro de Amigo Nativo está em análise e aguarda aprovação da administração.',
+      approvalStatus: 'pending',
+    });
+  }
+
+  // 4. Identify existing student accounts: an existing student CANNOT have their role overwritten during login
   const studentObjInDb = (db.students || []).find(
     (s: any) => s.uid === authenticatedUid || s.id === authenticatedUid || (s.email || s.studentEmail || '').toLowerCase() === cleanEmail
   );
-  const isRegisteredStudent = !isServerVerifiedAdmin && !isRegisteredTeacher && Boolean(studentObjInDb || db.userProfiles?.[cleanEmail]);
+  const hasStudentProfile = Boolean(db.userProfiles?.[cleanEmail]);
+  const isExistingStudent = !isServerVerifiedAdmin && (
+    firestoreRole === 'student' ||
+    Boolean(studentObjInDb || hasStudentProfile)
+  );
 
   let role: string = 'student';
   let name = cleanEmail.split('@')[0];
   let isRoleEnforced = false;
-  let effectiveTutor: any = null;
 
   if (isServerVerifiedAdmin) {
     role = 'admin';
@@ -1510,63 +1540,33 @@ app.post('/api/auth/login', async (req, res) => {
         adminAuth.setCustomUserClaims(authenticatedUid, { role: 'admin' }).catch(() => {});
       } catch {}
     }
-  } else if (isRegisteredTeacher) {
+  } else if (isApprovedTeacher && !isExistingStudent) {
+    // Verified approved teacher with no conflicting student record
     role = 'teacher';
-    name = tutorObj?.name || teacherObj?.name || db.authUsers?.[cleanEmail]?.name || name;
+    const tutorObj = (db.tutorsList || []).find(
+      (t: any) => t.uid === authenticatedUid || t.authUid === authenticatedUid || (t.email || '').toLowerCase() === cleanEmail
+    );
+    const teacherObj = (db.teachers || []).find(
+      (t: any) => (t.uid === authenticatedUid || (t.email || '').toLowerCase() === cleanEmail) && t.role !== 'admin'
+    );
+    name = teacherResolution.name || tutorObj?.name || teacherObj?.name || db.authUsers?.[cleanEmail]?.name || name;
 
     if (requestedRole === 'admin') {
       isRoleEnforced = true;
       console.warn(`[RBAC] Blocked teacher ${cleanEmail} from accessing admin panel.`);
     }
 
-    // Link real Firebase Auth UID to tutor record
-    const publicTutorId = tutorObj?.id || teacherObj?.id || `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
-    effectiveTutor = tutorObj || teacherObj || {
-      id: publicTutorId,
-      publicTutorId,
-      uid: authenticatedUid,
-      authUid: authenticatedUid,
-      email: cleanEmail,
-      name,
-      role: 'teacher',
-      approvalStatus: 'approved',
-      isApproved: true,
-      status: 'approved',
-      approved: true,
-      avatar: '',
-      picture: '',
-      headline: 'Native Friend & English Mentor',
-      bio: '',
-      availableDays: ['monday', 'tuesday', 'wednesday', 'thursday', 'friday'],
-    };
-
+    // Link real Firebase Auth UID to tutor record without creating generic mock records
     if (tutorObj) {
       tutorObj.uid = authenticatedUid;
       tutorObj.authUid = authenticatedUid;
-      tutorObj.id = publicTutorId;
-    } else {
-      if (!db.tutorsList) db.tutorsList = [];
-      db.tutorsList.push(effectiveTutor);
+      if (teacherResolution.publicTutorId) tutorObj.id = teacherResolution.publicTutorId;
     }
     if (teacherObj) {
       teacherObj.uid = authenticatedUid;
-    } else {
-      if (!db.teachers) db.teachers = [];
-      db.teachers.push(effectiveTutor);
-    }
-
-    saveTutorToFirestore({ ...effectiveTutor, id: authenticatedUid, uid: authenticatedUid, authUid: authenticatedUid, publicTutorId, role: 'teacher' }).catch(() => {});
-    saveUserToFirestore({ ...effectiveTutor, id: authenticatedUid, uid: authenticatedUid, tutorId: publicTutorId, role: 'teacher' }).catch(() => {});
-
-    // Purge any accidental student profile entry for this teacher
-    if (db.userProfiles && db.userProfiles[cleanEmail]) {
-      delete db.userProfiles[cleanEmail];
-    }
-    if (db.students) {
-      db.students = db.students.filter((s: any) => (s.email || s.studentEmail || '').toLowerCase() !== cleanEmail);
     }
   } else {
-    // Registered or new student
+    // Registered student or new student
     role = 'student';
     name = studentObjInDb?.name || studentObjInDb?.studentName || db.userProfiles?.[cleanEmail]?.name || db.authUsers?.[cleanEmail]?.name || name;
 
@@ -1749,15 +1749,27 @@ app.post('/api/auth/login', async (req, res) => {
 
     writeDb(db);
   } else if (role === 'teacher') {
-    account.picture = tutorObj?.avatar || tutorObj?.picture || teacherObj?.avatar || effectiveTutor?.avatar || '';
+    const tutorObj = (db.tutorsList || []).find(
+      (t: any) => t.uid === authenticatedUid || t.authUid === authenticatedUid || (t.email || '').toLowerCase() === cleanEmail
+    );
+    const teacherObj = (db.teachers || []).find(
+      (t: any) => (t.uid === authenticatedUid || (t.email || '').toLowerCase() === cleanEmail) && t.role !== 'admin'
+    );
+    account.picture = tutorObj?.avatar || tutorObj?.picture || teacherObj?.avatar || '';
   }
+
+  const tutorResponseObj = role === 'teacher'
+    ? ((db.tutorsList || []).find((t: any) => t.uid === authenticatedUid || t.authUid === authenticatedUid || (t.email || '').toLowerCase() === cleanEmail) ||
+       (db.teachers || []).find((t: any) => (t.uid === authenticatedUid || (t.email || '').toLowerCase() === cleanEmail) && t.role !== 'admin') ||
+       teacherResolution?.rawDoc || null)
+    : null;
 
   res.json({
     success: true,
     account,
     profile: role === 'teacher' ? null : studentProfile,
     student: role === 'teacher' ? null : (studentObj || (db.students || []).find((s) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail) || null),
-    tutor: tutorObj || teacherObj || effectiveTutor || null,
+    tutor: tutorResponseObj,
     isRoleEnforced,
     enforcedRole: role,
   });
@@ -2511,19 +2523,37 @@ app.post('/api/auth/google', async (req, res) => {
   const firestoreRole = (firestoreDoc?.role || '').toLowerCase();
   const authRecordRole = (authRecord?.role || '').toLowerCase();
 
-  const isRegisteredTeacher = !isServerVerifiedAdmin && (
-    requestedRole === 'teacher' ||
-    firestoreRole === 'teacher' ||
-    firestoreRole === 'native_friend' ||
-    authRecordRole === 'teacher' ||
-    (db.teachers || []).some((t: any) => (t.email || '').toLowerCase() === cleanEmail && t.role !== 'admin') ||
-    (db.tutorsList || []).some((t: any) => (t.email || '').toLowerCase() === cleanEmail)
-  );
+  // Resolve Teacher authorization strictly from verified sources (Firestore / canonical records)
+  let teacherResolution: any = null;
+  if (!isServerVerifiedAdmin) {
+    try {
+      teacherResolution = await resolveTeacherCanonicalIdentity({
+        teacherUid: targetUid,
+        teacherEmail: cleanEmail,
+        dbState: db,
+      });
+    } catch {}
+  }
 
-  const isRegisteredStudent = !isServerVerifiedAdmin && !isRegisteredTeacher && (
+  const isApprovedTeacher = !isServerVerifiedAdmin && Boolean(teacherResolution && teacherResolution.isApproved);
+  const isPendingTeacher = !isServerVerifiedAdmin && Boolean(teacherResolution && !teacherResolution.isApproved);
+
+  // If a pending tutor attempts to access the teacher space, reject with 403
+  if (isPendingTeacher && requestedRole === 'teacher') {
+    return res.status(403).json({
+      error: 'Forbidden',
+      code: 'TEACHER_APPROVAL_PENDING',
+      message: 'Seu cadastro de Amigo Nativo está em análise e aguarda aprovação da administração.',
+      approvalStatus: 'pending',
+    });
+  }
+
+  // Identify existing student accounts: an existing student CANNOT have their role overwritten during login
+  const isRegisteredStudent = !isServerVerifiedAdmin && (
     firestoreRole === 'student' ||
     authRecordRole === 'student' ||
-    (db.students || []).some((s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail)
+    (db.students || []).some((s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail) ||
+    Boolean(db.userProfiles?.[cleanEmail])
   );
 
   let role: string = 'student';
@@ -2540,14 +2570,20 @@ app.post('/api/auth/google', async (req, res) => {
       isRoleEnforced = true;
       console.warn(`[RBAC Google] Blocked user ${cleanEmail} from accessing ${requestedRole} panel. Locked to student space.`);
     }
-  } else if (isRegisteredTeacher) {
+  } else if (isApprovedTeacher) {
     role = 'teacher';
+    displayName = teacherResolution.name || displayName;
     if (requestedRole === 'admin') {
       isRoleEnforced = true;
       console.warn(`[RBAC Google] Blocked teacher ${cleanEmail} from accessing admin panel.`);
     }
-  } else if (requestedRole) {
-    role = requestedRole === 'teacher' ? 'teacher' : 'student';
+  } else {
+    // Default safe role: student. requestedRole NEVER grants teacher permissions.
+    role = 'student';
+    if (requestedRole && requestedRole !== 'student') {
+      isRoleEnforced = true;
+      console.warn(`[RBAC Google] Blocked user ${cleanEmail} from accessing ${requestedRole} panel. Locked to student space.`);
+    }
   }
 
   // Update or record in authUsers
@@ -2633,50 +2669,15 @@ app.post('/api/auth/google', async (req, res) => {
       writeDb(db);
     }
   } else if (role === 'teacher' && uid) {
+    // Only link verified approved teacher's UID; never overwrite real profile data or student profiles
     const tutorEntry = (db.tutorsList || []).find((t: any) => (t.email || '').toLowerCase() === cleanEmail);
     const teacherEntry = (db.teachers || []).find((t: any) => (t.email || '').toLowerCase() === cleanEmail);
-    const publicTutorId = tutorEntry?.id || teacherEntry?.id || `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
-    const effectiveTutor = tutorEntry || teacherEntry || {
-      id: publicTutorId,
-      publicTutorId,
-      uid,
-      authUid: uid,
-      email: cleanEmail,
-      name: displayName,
-      role: 'teacher',
-      approvalStatus: 'approved',
-      isApproved: true,
-      status: 'approved',
-      approved: true,
-      avatar: picture || '',
-      picture: picture || '',
-      headline: 'Native Friend & English Mentor',
-      bio: '',
-      availableDays: ['monday', 'tuesday', 'wednesday', 'thursday', 'friday'],
-    };
-
     if (tutorEntry) {
       tutorEntry.uid = uid;
       tutorEntry.authUid = uid;
-      tutorEntry.id = publicTutorId;
-    } else {
-      if (!db.tutorsList) db.tutorsList = [];
-      db.tutorsList.push(effectiveTutor);
     }
     if (teacherEntry) {
       teacherEntry.uid = uid;
-    } else {
-      if (!db.teachers) db.teachers = [];
-      db.teachers.push(effectiveTutor);
-    }
-    saveTutorToFirestore({ ...effectiveTutor, id: uid, uid, authUid: uid, publicTutorId, role: 'teacher' }).catch(() => {});
-    saveUserToFirestore({ ...effectiveTutor, id: uid, uid, tutorId: publicTutorId, role: 'teacher' }).catch(() => {});
-
-    if (db.userProfiles && db.userProfiles[cleanEmail]) {
-      delete db.userProfiles[cleanEmail];
-    }
-    if (db.students) {
-      db.students = db.students.filter((s: any) => (s.email || s.studentEmail || '').toLowerCase() !== cleanEmail);
     }
     writeDb(db);
   }
@@ -4750,7 +4751,36 @@ app.get('/api/students', async (req, res) => {
   const paramUid = ((req.query.uid || req.query.studentUid) as string || '').trim();
 
   const isAdmin = verifiedCaller?.role === 'admin';
-  const isTeacher = verifiedCaller ? verifiedCaller.role === 'teacher' : (paramRole === 'teacher' && Boolean(paramEmail || paramUid));
+  let isTeacher = false;
+  if (verifiedCaller) {
+    if (verifiedCaller.role === 'teacher') {
+      isTeacher = true;
+    } else if (verifiedCaller.role === 'student') {
+      isTeacher = false; // Strictly prevent students from gaining teacher access via query parameters
+    } else if (!isAdmin) {
+      try {
+        const tRes = await resolveTeacherCanonicalIdentity({
+          teacherUid: verifiedCaller.uid,
+          teacherEmail: verifiedCaller.email,
+          dbState: db,
+        });
+        if (tRes && tRes.isApproved) {
+          isTeacher = true;
+        }
+      } catch {}
+    }
+  } else if (paramRole === 'teacher' && (paramEmail || paramUid)) {
+    try {
+      const tRes = await resolveTeacherCanonicalIdentity({
+        teacherUid: paramUid,
+        teacherEmail: paramEmail,
+        dbState: db,
+      });
+      if (tRes && tRes.isApproved) {
+        isTeacher = true;
+      }
+    } catch {}
+  }
 
   // Admin gets all active students directly
   if (isAdmin) {
@@ -5115,17 +5145,42 @@ app.get('/api/user-profile', async (req, res) => {
     return res.status(400).json({ error: 'Email or UID parameter is required' });
   }
 
-  // If user is a teacher / Native Friend, return their tutor profile directly
-  const isTeacherUser =
-    db.authUsers?.[email]?.role === 'teacher' ||
-    (db.tutorsList || []).some((t: any) => (t.email || '').toLowerCase() === email) ||
-    (db.teachers || []).some((t: any) => (t.email || '').toLowerCase() === email && t.role === 'teacher');
+  // 1. Authoritative Firestore document inspection
+  let fsUser: any = null;
+  if (email || uid) {
+    try {
+      fsUser = await fetchUserFromFirestore(email, uid);
+    } catch {}
+  }
 
-  if (isTeacherUser) {
+  // 2. Identify student identity: an account with student role or student history is locked to student profile
+  const studentInDb = (db.students || []).find(
+    (s: any) => (s.email || s.studentEmail || '').toLowerCase() === email || (uid && s.uid === uid)
+  );
+  const isStudentUser = fsUser?.role === 'student' || Boolean(db.userProfiles?.[email]) || Boolean(studentInDb);
+
+  // 3. Teacher profile check: Strictly requires verified administrative approval and no conflicting student status
+  let isApprovedTeacherUser = false;
+  let teacherResolution: any = null;
+  if (!isStudentUser) {
+    try {
+      teacherResolution = await resolveTeacherCanonicalIdentity({
+        teacherUid: uid,
+        teacherEmail: email,
+        dbState: db,
+      });
+      if (teacherResolution && teacherResolution.isApproved) {
+        isApprovedTeacherUser = true;
+      }
+    } catch {}
+  }
+
+  if (isApprovedTeacherUser && teacherResolution) {
     const tutor =
+      teacherResolution.rawDoc ||
       (db.tutorsList || []).find((t: any) => (t.email || '').toLowerCase() === email) ||
       (db.teachers || []).find((t: any) => (t.email || '').toLowerCase() === email) ||
-      db.authUsers?.[email];
+      fsUser;
     return res.json({
       success: true,
       role: 'teacher',
@@ -5133,23 +5188,6 @@ app.get('/api/user-profile', async (req, res) => {
       tutor: tutor || null,
       message: 'Native Friend profile retrieved successfully',
     });
-  }
-
-  // Also check Firestore for teacher/Native Friend record or authoritative student document
-  let fsUser: any = null;
-  if (email || uid) {
-    try {
-      fsUser = await fetchUserFromFirestore(email, uid);
-      if (fsUser && (fsUser.role === 'teacher' || fsUser.isTeacher || fsUser.role === 'native_friend' || fsUser.role === 'tutor')) {
-        return res.json({
-          success: true,
-          role: 'teacher',
-          isTeacher: true,
-          tutor: fsUser,
-          message: 'Native Friend profile retrieved successfully',
-        });
-      }
-    } catch {}
   }
 
   let profile = db.userProfiles?.[email] || null;
@@ -5308,10 +5346,24 @@ app.post('/api/user-profile', async (req, res) => {
     return res.status(400).json({ error: 'Email or UID is required' });
   }
 
-  const isTeacherUser =
-    db.authUsers?.[targetEmail]?.role === 'teacher' ||
-    (db.tutorsList || []).some((t: any) => (t.email || '').toLowerCase() === targetEmail) ||
-    (db.teachers || []).some((t: any) => (t.email || '').toLowerCase() === targetEmail && t.role !== 'admin');
+  const studentInDb = (db.students || []).find(
+    (s: any) => (s.email || s.studentEmail || '').toLowerCase() === targetEmail || (targetUid && s.uid === targetUid)
+  );
+  const isStudentUser = Boolean(db.userProfiles?.[targetEmail]) || Boolean(studentInDb);
+
+  let isTeacherUser = false;
+  if (!isStudentUser) {
+    try {
+      const teacherRes = await resolveTeacherCanonicalIdentity({
+        teacherUid: targetUid,
+        teacherEmail: targetEmail,
+        dbState: db,
+      });
+      if (teacherRes && teacherRes.isApproved) {
+        isTeacherUser = true;
+      }
+    } catch {}
+  }
 
   if (isTeacherUser) {
     const tutorIdx = (db.tutorsList || []).findIndex((t: any) => (t.email || '').toLowerCase() === targetEmail);
