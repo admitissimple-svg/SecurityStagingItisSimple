@@ -134,6 +134,7 @@ import {
   saveLastCycleResultToFirestore,
 } from './src/serverFirestore';
 import { normalizeDictionaryWord } from './src/utils/studentDictionaryLibrary';
+import { buildWeeklyLearningInsights } from './src/utils/weeklyLearningInsights';
 import { DEFAULT_CURATED_PLAYLISTS } from './src/utils/youtubeService';
 import {
   syncSessionNotesWithPlatformDrive,
@@ -9955,7 +9956,136 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
 });
 
 // ============================================================================
-// HOTFIX PONTUAL — Insights & Icebreakers Endpoints
+// FASE INSIGHTS.2 — Weekly Learning Insights Endpoint (Zero AI, Deterministic)
+// ============================================================================
+app.get('/api/weekly-learning-insights', firebaseAuthMiddleware, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  const caller = req.user;
+  if (!caller || !caller.uid) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required' });
+  }
+
+  const rawStudentUid = ((req.query.studentUid as string) || (req.query.uid as string) || '').trim();
+  const rawStudentEmail = ((req.query.studentEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
+  const lessonId = ((req.query.lessonId as string) || '').trim();
+  const referenceDateStr = ((req.query.referenceDate as string) || '').trim();
+  const referenceDate = referenceDateStr ? new Date(referenceDateStr) : new Date();
+
+  const db = readDb();
+  const callerUid = caller.uid.trim();
+  const callerEmail = (caller.email || '').toLowerCase().trim();
+
+  const isTeacherOrAdmin =
+    caller.role === 'teacher' ||
+    caller.role === 'admin' ||
+    (db.tutorsList || []).some((t: any) => (t.uid && t.uid === callerUid) || (t.id && (t.id === callerUid || t.id === `tutor-${callerUid}`)) || (t.authUid && t.authUid === callerUid) || (callerEmail && t.email && t.email.toLowerCase().trim() === callerEmail)) ||
+    (db.teachers || []).some((t: any) => (t.uid && t.uid === callerUid) || (t.id && (t.id === callerUid || t.id === `tutor-${callerUid}`)) || (t.authUid && t.authUid === callerUid) || (callerEmail && t.email && t.email.toLowerCase().trim() === callerEmail));
+
+  const effectiveCallerRole: 'admin' | 'teacher' | 'student' = caller.role === 'admin' ? 'admin' : (isTeacherOrAdmin ? 'teacher' : (caller.role as 'student'));
+  const callerForIdentity = { ...caller, role: effectiveCallerRole };
+
+  // Never allow teacher's own UID to masquerade as the student's UID
+  let canonicalStudentUid = (rawStudentUid && isValidCanonicalUid(rawStudentUid) && rawStudentUid !== callerUid && !rawStudentUid.startsWith('tutor-')) ? rawStudentUid : '';
+  let canonicalStudentEmail = rawStudentEmail || (rawStudentUid.includes('@') ? rawStudentUid.toLowerCase() : '');
+
+  // 1. Authorization check via resolveCanonicalStudentIdentity
+  if (effectiveCallerRole !== 'admin') {
+    const identityRes = await resolveCanonicalStudentIdentity({
+      caller: callerForIdentity,
+      studentEmail: canonicalStudentEmail || undefined,
+      studentUid: canonicalStudentUid || undefined,
+      lessonId: lessonId || undefined,
+    });
+
+    if (identityRes.authorized) {
+      if (identityRes.canonicalStudentUid && isValidCanonicalUid(identityRes.canonicalStudentUid) && identityRes.canonicalStudentUid !== callerUid) {
+        canonicalStudentUid = identityRes.canonicalStudentUid;
+      }
+      if (identityRes.studentEmail) {
+        canonicalStudentEmail = identityRes.studentEmail;
+      }
+    } else {
+      const isAuthorized = await verifyTeacherLessonAccessServer(
+        caller.uid,
+        caller.email,
+        canonicalStudentUid,
+        lessonId,
+        effectiveCallerRole,
+        canonicalStudentEmail
+      );
+      if (!isAuthorized) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: identityRes.error || 'Unauthorized access: you may only access learning insights for your assigned students.',
+        });
+      }
+    }
+  }
+
+  // Attempt resolution from all authoritative server sources if not yet resolved
+  if (!canonicalStudentUid && canonicalStudentEmail) {
+    try {
+      const fsDb = getFirestoreDb();
+      if (fsDb) {
+        const uSnap = await fsDb.collection('users').where('email', '==', canonicalStudentEmail).limit(1).get();
+        if (!uSnap.empty) {
+          const docId = uSnap.docs[0].id;
+          if (docId && docId !== callerUid && isValidCanonicalUid(docId)) {
+            canonicalStudentUid = docId;
+          }
+        }
+      }
+    } catch {}
+
+    if (!canonicalStudentUid) {
+      const profile = db.userProfiles?.[canonicalStudentEmail];
+      const student = (db.students || []).find((s: any) => (s.email || s.studentEmail || '').toLowerCase().trim() === canonicalStudentEmail);
+      const lesson = (db.liveLessons || []).find((l: any) => (l.studentEmail || '').toLowerCase().trim() === canonicalStudentEmail && l.studentUid && isValidCanonicalUid(l.studentUid) && l.studentUid !== callerUid);
+      const lUid = (profile?.uid && isValidCanonicalUid(profile.uid) && profile.uid !== callerUid ? profile.uid : '') ||
+        (student?.uid && isValidCanonicalUid(student.uid) && student.uid !== callerUid ? student.uid : '') ||
+        (student?.studentUid && isValidCanonicalUid(student.studentUid) && student.studentUid !== callerUid ? student.studentUid : '') ||
+        (lesson?.studentUid && isValidCanonicalUid(lesson.studentUid) && lesson.studentUid !== callerUid ? lesson.studentUid : '');
+      if (lUid) {
+        canonicalStudentUid = lUid;
+      }
+    }
+  }
+
+  if (!canonicalStudentUid && !canonicalStudentEmail) {
+    return res.status(400).json({ error: 'Bad Request', message: 'Valid student identifier required.' });
+  }
+
+  try {
+    const targetUid = canonicalStudentUid || callerUid;
+
+    // Fetch exclusively from the 2 canonical sources
+    // Source A: My Dictionary → My Words
+    const rawWords = await fetchStudentVocabularyFromFirestoreServer(targetUid, canonicalStudentEmail);
+
+    // Source B: View Journal → Your Sentence
+    const rawJournal = await fetchStudentDailyJournalFromServerFirestore(targetUid);
+
+    // Deterministic period calculation and payload construction
+    const insights = buildWeeklyLearningInsights({
+      rawWords,
+      rawSentences: rawJournal,
+      studentUid: targetUid,
+      studentEmail: canonicalStudentEmail,
+      referenceDate,
+    });
+
+    return res.json({
+      success: true,
+      ...insights,
+    });
+  } catch (err: any) {
+    console.warn('GET /api/weekly-learning-insights error:', err);
+    return res.status(500).json({ error: 'Internal Server Error', message: 'Failed to retrieve weekly learning insights.' });
+  }
+});
+
+// ============================================================================
+// HOTFIX PONTUAL — Insights & Icebreakers Endpoints (Preserved for backwards compatibility)
 // ============================================================================
 
 // 1. Retrieve saved lesson insights snapshot (Zero AI call)
@@ -10886,16 +11016,25 @@ app.get('/api/student-journal', firebaseAuthMiddleware, async (req, res) => {
   const requestedUid = ((req.query.uid as string) || (req.query.studentUid as string) || '').trim();
   const requestedEmail = ((req.query.email as string) || (req.query.studentEmail as string) || '').toLowerCase().trim();
 
-  if (caller.role !== 'admin') {
-    if (requestedUid && requestedUid !== callerUid) {
-      return res.status(403).json({ error: 'Forbidden', message: 'Cannot access journal of another user.' });
+  let targetUid = callerUid;
+  if (caller.role === 'admin') {
+    targetUid = requestedUid || callerUid;
+  } else {
+    const identityRes = await resolveCanonicalStudentIdentity({
+      caller,
+      studentEmail: requestedEmail,
+      studentUid: requestedUid,
+      lessonId: (req.query.lessonId as string) || undefined,
+    });
+    if (!identityRes.authorized) {
+      return res.status(identityRes.statusCode || 403).json({
+        error: 'Forbidden',
+        message: identityRes.error || 'Cannot access journal of another user.',
+      });
     }
-    if (requestedEmail && callerEmail && requestedEmail !== callerEmail) {
-      return res.status(403).json({ error: 'Forbidden', message: 'Cannot access journal of another user.' });
-    }
+    targetUid = identityRes.canonicalStudentUid || callerUid;
   }
 
-  const targetUid = (caller.role === 'admin' && requestedUid) ? requestedUid : callerUid;
   const fsEntries = await fetchStudentDailyJournalFromServerFirestore(targetUid);
   return res.json(fsEntries || []);
 });

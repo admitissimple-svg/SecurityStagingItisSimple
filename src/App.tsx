@@ -7470,7 +7470,7 @@ export default function App() {
                                 }`}
                               >
                                 <Sparkles className={`w-4 h-4 ${activeStudentActivity === 'insights' ? 'text-amber-300' : 'text-[#1C4C96]'}`} />
-                                <span>Insights & Icebreaks</span>
+                                <span>Weekly Learning Insights</span>
                                 {activeStudentActivity === 'insights' && (
                                   <span className="w-2 h-2 rounded-full bg-amber-300 animate-pulse" />
                                 )}

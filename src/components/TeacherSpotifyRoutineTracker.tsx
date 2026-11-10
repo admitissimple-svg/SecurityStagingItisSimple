@@ -19,7 +19,6 @@ import { DayOfWeek } from '../types';
 import { useNativeFriendStudentSync } from '../hooks/useNativeFriendStudentSync';
 import { getDayLabel } from '../utils/notifications';
 import { getSpotifyDirectUrl } from '../utils/spotify';
-import { NativeFriendLessonInsights } from './NativeFriendLessonInsights';
 
 export interface TeacherSpotifyRoutineTrackerProps {
   studentUid: string;
