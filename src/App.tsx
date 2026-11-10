@@ -29,6 +29,7 @@ import {
   formatDateInTimeZone,
   formatTimeInTimeZone,
   findTeacherLessonConflict,
+  getStudentCurrentDayOfWeek,
   DEFAULT_STUDENT_TIMEZONE,
   DEFAULT_TEACHER_TIMEZONE,
 } from './utils/timezone';
@@ -100,6 +101,7 @@ import { EditTutorProfileModal } from './components/EditTutorProfileModal';
 import { StudentProfileModal } from './components/StudentProfileModal';
 import { PersonalDictionaryModal } from './components/PersonalDictionaryModal';
 import { StudentJournalModal } from './components/StudentJournalModal';
+import { useLessonsRevalidation, DEFAULT_LESSONS_POLL_INTERVAL_MS } from './hooks/useLessonsRevalidation';
 import {
   saveStudentVocabularyToFirestore,
   fetchStudentVocabularyFromFirestore,
@@ -665,8 +667,14 @@ export default function App() {
     return todayActs && todayActs.length > 0 ? todayActs[0].id : 'm1';
   });
 
-  // 5. Live Lessons State
+  // 5. Live Lessons State & Revalidation
   const [lessons, setLessons] = useState<LiveLesson[]>([]);
+  const { revalidate: revalidateLessons } = useLessonsRevalidation({
+    user: currentAccount ? { uid: currentAccount.uid, email: currentAccount.email, role: currentAccount.role } : null,
+    setLessons,
+    intervalMs: DEFAULT_LESSONS_POLL_INTERVAL_MS,
+    enabled: Boolean(currentAccount?.uid),
+  });
   const [teacherMeetSettings, setTeacherMeetSettings] = useState<Record<string, TeacherMeetSettings>>({
     'itissimple.school@gmail.com': {
       teacherEmail: 'itissimple.school@gmail.com',
@@ -764,6 +772,9 @@ export default function App() {
   useEffect(() => {
     activeCycleRef.current = parseWeekCycleNumber(userProfile?.weeklyCycle) || 1;
   }, [userProfile?.weeklyCycle]);
+
+  // Reference tracking active lesson completion calls to prevent duplicates
+  const completingLessonsRef = useRef<Set<string>>(new Set());
   const [dailyJournalEntries, setDailyJournalEntries] = useState<DailyJournalEntry[]>([]);
   const [isJournalModalOpen, setIsJournalModalOpen] = useState<boolean>(false);
   const [isManageSubscriptionOpen, setIsManageSubscriptionOpen] = useState<boolean>(false);
@@ -1653,12 +1664,8 @@ export default function App() {
           .catch(() => {});
       });
 
-    // Real-time synchronization for lessons from Firestore
-    const unsubLessons = subscribeToStudentLessons(uid, email, isTeacherRole, (realtimeLessons) => {
-      if (Array.isArray(realtimeLessons)) {
-        setLessons(realtimeLessons);
-      }
-    });
+    // Real-time synchronization for lessons is handled by useLessonsRevalidation hook
+    const unsubLessons = () => {};
 
     // Real-time synchronization for student daily journal is managed canonically by dedicated subscription below
     const unsubJournal = () => {};
@@ -5122,50 +5129,113 @@ export default function App() {
     setScheduleStudentInfo(null);
   };
 
-  // Handler: Complete lesson (Automatically marks S-Path tutor_live for the lesson's day)
+  // Handler: Complete lesson (Confirmed by backend first, then updates local state and S-Path)
   const handleCompleteLesson = async (lessonId: string) => {
-    let completedLesson: LiveLesson | undefined;
-    const nowIso = new Date().toISOString();
-    setLessons((prev) => {
-      completedLesson = prev.find((l) => l.id === lessonId);
-      return prev.map((l) => (l.id === lessonId ? { ...l, status: 'completed', completedAt: nowIso } : l));
-    });
+    if (!lessonId) return;
 
-    const targetLesson = completedLesson || lessons.find((l) => l.id === lessonId);
-    const targetStudentUid = targetLesson?.studentUid || currentAccount?.uid || userProfile?.id || '';
-    const targetStudentEmail = targetLesson?.studentEmail || currentAccount?.email || userProfile?.email || '';
-    const targetTeacherUid = targetLesson?.teacherUid || (isTeacher ? currentAccount?.uid : undefined);
-
-    // Calculate lesson day of week
-    let lessonDay: DayOfWeek = 'monday';
-    if (targetLesson?.startDateTime) {
-      const d = new Date(targetLesson.startDateTime);
-      const dayNames: DayOfWeek[] = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
-      const idx = d.getDay();
-      if (dayNames[idx]) {
-        lessonDay = dayNames[idx];
-      }
-    } else {
-      lessonDay = selectedDay;
+    // Prevent duplicate concurrent completion calls
+    if (completingLessonsRef.current.has(lessonId)) {
+      return;
     }
 
-    // Auto-mark S-Path for Native Friend session
-    handleUpdateSPathCheck('tutor_live', lessonDay, true, targetStudentUid, targetStudentEmail);
+    const targetLessonBefore = lessons.find((l) => l.id === lessonId);
+    if (targetLessonBefore?.status === 'completed') {
+      return; // Already completed
+    }
 
-    // Persist status change in Firestore
-    await updateLiveLessonInFirestore(
-      lessonId,
-      { status: 'completed', completedAt: nowIso },
-      targetStudentUid || currentAccount?.uid,
-      targetTeacherUid,
-      targetLesson,
-      targetStudentEmail
-    );
+    completingLessonsRef.current.add(lessonId);
 
     try {
-      await fetch(`/api/lessons/${lessonId}/complete`, { method: 'POST' });
-    } catch {
-      // local fallback
+      // 1. Send completion to authoritative backend endpoint
+      const res = await apiClient.post<{
+        success: boolean;
+        lesson?: LiveLesson;
+        liveLessons?: LiveLesson[];
+        error?: string;
+      }>(`/api/lessons/${encodeURIComponent(lessonId)}/complete`, {});
+
+      if (!res || !res.success) {
+        throw new Error(res?.error || 'Failed to complete lesson on server');
+      }
+
+      const nowIso = new Date().toISOString();
+      const confirmedLesson =
+        res.lesson ||
+        (Array.isArray(res.liveLessons) ? res.liveLessons.find((l) => l.id === lessonId) : undefined) ||
+        targetLessonBefore;
+
+      const completedAt = confirmedLesson?.completedAt || nowIso;
+
+      // 2. Authoritative update of React lessons state
+      setLessons((prev) =>
+        prev.map((l) =>
+          l.id === lessonId
+            ? { ...l, ...confirmedLesson, status: 'completed', completedAt }
+            : l
+        )
+      );
+
+      const targetStudentUid =
+        confirmedLesson?.studentUid ||
+        targetLessonBefore?.studentUid ||
+        currentAccount?.uid ||
+        userProfile?.id ||
+        '';
+      const targetStudentEmail =
+        confirmedLesson?.studentEmail ||
+        targetLessonBefore?.studentEmail ||
+        currentAccount?.email ||
+        userProfile?.email ||
+        '';
+
+      // 3. Calculate lesson day of week in student timezone
+      let lessonDay: DayOfWeek = 'monday';
+      const lessonDateStr = confirmedLesson?.startDateTime || targetLessonBefore?.startDateTime;
+      if (lessonDateStr) {
+        const studentTz = userProfile?.timezone || DEFAULT_STUDENT_TIMEZONE;
+        lessonDay = getStudentCurrentDayOfWeek(studentTz, new Date(lessonDateStr));
+      } else {
+        lessonDay = selectedDay;
+      }
+
+      // 4. Auto-mark S-Path for Native Friend session
+      handleUpdateSPathCheck('tutor_live', lessonDay, true, targetStudentUid, targetStudentEmail);
+
+      // 5. Trigger immediate authenticated revalidation
+      revalidateLessons().catch(() => {});
+
+      setNotifications((prev) => [
+        {
+          id: `lesson-complete-${Date.now()}`,
+          title: currentLanguage === 'en' ? 'Lesson Completed' : 'Aula Concluída',
+          message:
+            currentLanguage === 'en'
+              ? 'Your Native Friend session has been completed!'
+              : 'Sua aula com Amigo Nativo foi marcada como concluída!',
+          type: 'success',
+          timestamp: new Date().toISOString(),
+          read: false,
+        },
+        ...prev,
+      ]);
+    } catch (err: any) {
+      console.error('[handleCompleteLesson] Error completing lesson:', err);
+      setNotifications((prev) => [
+        {
+          id: `complete-err-${Date.now()}`,
+          title: currentLanguage === 'en' ? 'Error' : 'Erro',
+          message:
+            currentLanguage === 'en'
+              ? 'Could not confirm lesson completion with server. Please try again.'
+              : 'Não foi possível confirmar a conclusão da aula com o servidor. Tente novamente.',
+          type: 'warning',
+          timestamp: new Date().toISOString(),
+          read: false,
+        },
+        ...prev,
+      ]);
+    } finally {
+      completingLessonsRef.current.delete(lessonId);
     }
   };
 

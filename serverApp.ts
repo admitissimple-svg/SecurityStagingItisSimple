@@ -8009,8 +8009,18 @@ async function syncLessonUpdateToFirestore(lessonId: string, updates: Record<str
     await firestore.collection('lessons').doc(lessonId).set(cleanUpdates, { merge: true });
 
     // 2. Resolve student and teacher doc IDs
-    const studentUid = (lessonMeta?.studentUid || '').trim();
-    const teacherUid = (lessonMeta?.teacherUid || lessonMeta?.tutorUid || '').trim();
+    let studentUid = (lessonMeta?.studentUid || '').trim();
+    let teacherUid = (lessonMeta?.teacherUid || lessonMeta?.tutorUid || '').trim();
+    if (!studentUid || !teacherUid) {
+      try {
+        const docSnap = await firestore.collection('lessons').doc(lessonId).get();
+        if (docSnap.exists) {
+          const d = docSnap.data() || {};
+          if (!studentUid) studentUid = (d.studentUid || '').trim();
+          if (!teacherUid) teacherUid = (d.teacherUid || d.tutorUid || '').trim();
+        }
+      } catch {}
+    }
 
     const studentDocs = [studentUid && isValidCanonicalUid(studentUid) ? studentUid : ''].filter(Boolean);
     const teacherDocs = [teacherUid && isValidCanonicalUid(teacherUid) ? teacherUid : ''].filter(Boolean);
@@ -8055,11 +8065,39 @@ app.post('/api/lessons/:id/complete', async (req, res) => {
   const db = readDb();
   const id = decodeURIComponent(req.params.id);
   const nowIso = new Date().toISOString();
-  db.liveLessons = db.liveLessons.map((l) => (l.id === id ? { ...l, status: 'completed', completedAt: l.completedAt || nowIso } : l));
+  let found = false;
+  db.liveLessons = (db.liveLessons || []).map((l) => {
+    if (l.id === id) {
+      found = true;
+      return { ...l, status: 'completed', completedAt: l.completedAt || nowIso, updatedAt: nowIso };
+    }
+    return l;
+  });
+  let target = (db.liveLessons || []).find((l: any) => l.id === id);
+  if (!found || !target) {
+    const firestore = getFirestoreDb();
+    if (firestore) {
+      try {
+        const snap = await firestore.collection('lessons').doc(id).get();
+        if (snap.exists) {
+          const fsData = snap.data() || {};
+          target = {
+            ...fsData,
+            id: snap.id,
+            status: 'completed',
+            completedAt: fsData.completedAt || nowIso,
+            updatedAt: nowIso,
+          };
+          db.liveLessons.push(target);
+        }
+      } catch (err) {
+        console.warn('[completeLesson] Firestore check notice:', err);
+      }
+    }
+  }
   await writeDbSync(db);
-  const target = (db.liveLessons || []).find((l: any) => l.id === id);
   await syncLessonUpdateToFirestore(id, { status: 'completed', completedAt: nowIso }, target);
-  res.json({ success: true, liveLessons: db.liveLessons });
+  res.json({ success: true, lesson: target, liveLessons: db.liveLessons });
 });
 
 app.post('/api/lessons/:id/not-completed', async (req, res) => {
