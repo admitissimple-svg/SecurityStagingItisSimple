@@ -49,7 +49,7 @@ import {
 } from '../utils/spotify';
 import { Translations, getActivityDisplayName } from '../utils/i18n';
 import { defaultRoutinesByDay } from '../data/defaultRoutines';
-import { NativeFriendSpotifyTable } from './NativeFriendSpotifyTable';
+import { NativeFriendSpotifyTable, SHOW_SPOTIFY_AUDIO_ASSIGNMENT } from './NativeFriendSpotifyTable';
 import { fetchWatchedVideosHistoryFromFirestore } from '../hooks/useRoutine';
 import { getAccessToken } from '../utils/auth';
 import { isValidCanonicalUid, normalizeWeekId, parseWeekCycleNumber } from '../utils/studentPersistence';
@@ -1861,7 +1861,8 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
       </div>
 
       {/* TABLE 2: Spotify Audio Assignment - Single Unified Source of Truth */}
-      {(activeStudentUid || activeStudentEmail) && (
+      {/* FASE UI-NF.1: Conditionally hidden from /teacher dashboard */}
+      {SHOW_SPOTIFY_AUDIO_ASSIGNMENT && (activeStudentUid || activeStudentEmail) && (
         <NativeFriendSpotifyTable
           studentUid={activeStudentUid || activeStudentEmail}
           studentEmail={activeStudentEmail}

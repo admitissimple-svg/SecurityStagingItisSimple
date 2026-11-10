@@ -143,6 +143,12 @@ const CURATED_LEVEL_TRACKS: Record<string, Array<{ title: string; artist: string
   ],
 };
 
+/**
+ * FASE UI-NF.1 - Feature flag to control visibility of Spotify Audio Assignment.
+ * Set to false to cleanly hide the section from the Native Friend panel.
+ */
+export const SHOW_SPOTIFY_AUDIO_ASSIGNMENT = false;
+
 export const NativeFriendSpotifyTable: React.FC<NativeFriendSpotifyTableProps> = ({
   studentUid,
   studentEmail,
@@ -189,7 +195,7 @@ export const NativeFriendSpotifyTable: React.FC<NativeFriendSpotifyTableProps> =
   const [isLoadingSync, setIsLoadingSync] = useState<boolean>(true);
 
   useEffect(() => {
-    if (!cleanStudentUid) {
+    if (!cleanStudentUid || !SHOW_SPOTIFY_AUDIO_ASSIGNMENT) {
       setIsLoadingSync(false);
       return;
     }
@@ -389,6 +395,11 @@ export const NativeFriendSpotifyTable: React.FC<NativeFriendSpotifyTableProps> =
     if (!previewTrackUrl) return '';
     return getSpotifyEmbedUrl(previewTrackUrl);
   }, [previewTrackUrl]);
+
+  // FASE UI-NF.1: Conditionally render null when hidden
+  if (!SHOW_SPOTIFY_AUDIO_ASSIGNMENT) {
+    return null;
+  }
 
   return (
     <div id="native-friend-spotify-table-container" className="space-y-4">
