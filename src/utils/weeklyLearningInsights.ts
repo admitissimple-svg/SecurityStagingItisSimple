@@ -18,6 +18,9 @@
 export const SAO_PAULO_TZ = 'America/Sao_Paulo';
 export const SAO_PAULO_OFFSET = '-03:00';
 
+export const MAX_WEEKLY_VOCABULARY = 6;
+export const MAX_WEEKLY_SENTENCES = 3;
+
 export interface WeeklyLearningWord {
   id: string;
   word: string;
@@ -344,14 +347,30 @@ export function buildWeeklyLearningInsights(params: {
   const prevWords = filterByRange(words, boundaries.previousWeek.startMs, boundaries.previousWeek.endMs);
   const prevSentences = filterByRange(sentences, boundaries.previousWeek.startMs, boundaries.previousWeek.endMs);
 
-  // Sorting helpers: newest first
-  const sortByNewest = <T extends { timestampMs: number | null; id: string }>(items: T[]): T[] => {
-    return [...items].sort((a, b) => (b.timestampMs || 0) - (a.timestampMs || 0));
+  // Sorting helpers: newest first with deterministic tie-breaking
+  const sortWordsByNewest = (items: WeeklyLearningWord[]): WeeklyLearningWord[] => {
+    return [...items].sort((a, b) => {
+      const timeDiff = (b.timestampMs || 0) - (a.timestampMs || 0);
+      if (timeDiff !== 0) return timeDiff;
+      const wordDiff = a.word.toLowerCase().localeCompare(b.word.toLowerCase());
+      if (wordDiff !== 0) return wordDiff;
+      return a.id.localeCompare(b.id);
+    });
+  };
+
+  const sortSentencesByNewest = (items: WeeklyLearningSentence[]): WeeklyLearningSentence[] => {
+    return [...items].sort((a, b) => {
+      const timeDiff = (b.timestampMs || 0) - (a.timestampMs || 0);
+      if (timeDiff !== 0) return timeDiff;
+      const sentDiff = a.sentence.localeCompare(b.sentence);
+      if (sentDiff !== 0) return sentDiff;
+      return a.id.localeCompare(b.id);
+    });
   };
 
   if (curWords.length > 0 || curSentences.length > 0) {
-    const selectedWords = sortByNewest(curWords);
-    const selectedSentences = sortByNewest(curSentences);
+    const selectedWords = sortWordsByNewest(curWords).slice(0, MAX_WEEKLY_VOCABULARY);
+    const selectedSentences = sortSentencesByNewest(curSentences).slice(0, MAX_WEEKLY_SENTENCES);
     return {
       studentUid,
       studentEmail,
@@ -372,8 +391,8 @@ export function buildWeeklyLearningInsights(params: {
   }
 
   if (prevWords.length > 0 || prevSentences.length > 0) {
-    const selectedWords = sortByNewest(prevWords);
-    const selectedSentences = sortByNewest(prevSentences);
+    const selectedWords = sortWordsByNewest(prevWords).slice(0, MAX_WEEKLY_VOCABULARY);
+    const selectedSentences = sortSentencesByNewest(prevSentences).slice(0, MAX_WEEKLY_SENTENCES);
     return {
       studentUid,
       studentEmail,

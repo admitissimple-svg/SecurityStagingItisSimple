@@ -16,6 +16,8 @@ import {
   WeeklyLearningInsightsResult,
   WeeklyLearningWord,
   WeeklyLearningSentence,
+  MAX_WEEKLY_VOCABULARY,
+  MAX_WEEKLY_SENTENCES,
 } from '../utils/weeklyLearningInsights';
 import { DayOfWeek } from '../types';
 
@@ -63,6 +65,15 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
   }, [studentUid, teacherUid, lessons]);
 
   const displayName = studentName || studentEmail?.split('@')[0] || 'Student';
+
+  // Defensive client-side bounding to enforce minimalist presentation
+  const displayedVocabulary = useMemo(() => {
+    return (data?.vocabulary || []).slice(0, MAX_WEEKLY_VOCABULARY);
+  }, [data?.vocabulary]);
+
+  const displayedSentences = useMemo(() => {
+    return (data?.sentences || []).slice(0, MAX_WEEKLY_SENTENCES);
+  }, [data?.sentences]);
 
   // Fetch deterministic weekly insights from authoritative canonical backend
   const loadInsights = useCallback(async (isManualRefresh = false) => {
@@ -275,7 +286,7 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
                     <span>SECTION 1 — Vocabulary Learned</span>
                   </span>
                   <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-[#1C4C96]/10 text-[#062863]">
-                    {data?.vocabulary?.length || 0} {data?.vocabulary?.length === 1 ? 'word' : 'words'}
+                    {displayedVocabulary.length} {displayedVocabulary.length === 1 ? 'word' : 'words'}
                   </span>
                 </div>
                 <span className="text-[10px] text-slate-400 font-medium hidden sm:inline">
@@ -283,9 +294,9 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
                 </span>
               </div>
 
-              {data?.vocabulary && data.vocabulary.length > 0 ? (
+              {displayedVocabulary.length > 0 ? (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                  {data.vocabulary.map((item: WeeklyLearningWord) => {
+                  {displayedVocabulary.map((item: WeeklyLearningWord) => {
                     const isCopied = copiedId === item.id;
                     return (
                       <div
@@ -363,7 +374,7 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
                     <span>SECTION 2 — Sentence Practice</span>
                   </span>
                   <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800">
-                    {data?.sentences?.length || 0} {data?.sentences?.length === 1 ? 'sentence' : 'sentences'}
+                    {displayedSentences.length} {displayedSentences.length === 1 ? 'sentence' : 'sentences'}
                   </span>
                 </div>
                 <span className="text-[10px] text-slate-400 font-medium hidden sm:inline">
@@ -371,9 +382,9 @@ export const NativeFriendLessonInsights: React.FC<NativeFriendLessonInsightsProp
                 </span>
               </div>
 
-              {data?.sentences && data.sentences.length > 0 ? (
+              {displayedSentences.length > 0 ? (
                 <div className="space-y-3">
-                  {data.sentences.map((sentenceItem: WeeklyLearningSentence) => {
+                  {displayedSentences.map((sentenceItem: WeeklyLearningSentence) => {
                     const isCopied = copiedId === sentenceItem.id;
                     const textToCopy = sentenceItem.correctedSentence || sentenceItem.sentence;
 
