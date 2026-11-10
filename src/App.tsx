@@ -346,10 +346,9 @@ export default function App() {
                 resolvedRole = 'student';
               } else if (r === 'teacher' || r === 'native_friend' || r === 'tutor') {
                 const isApproved = Boolean(
-                  firestoreDoc.approvalStatus === 'approved' ||
-                  firestoreDoc.isApproved === true ||
-                  firestoreDoc.status === 'approved' ||
-                  firestoreDoc.approved === true
+                  (r === 'teacher' || r === 'native_friend') &&
+                  firestoreDoc.approvalStatus === 'approved' &&
+                  firestoreDoc.isApproved === true
                 );
                 resolvedRole = isApproved ? 'teacher' : 'student';
               }
@@ -370,10 +369,9 @@ export default function App() {
                   resolvedRole = 'student';
                 } else if (r === 'teacher' || r === 'native_friend' || r === 'tutor') {
                   const isApproved = Boolean(
-                    emailData.approvalStatus === 'approved' ||
-                    emailData.isApproved === true ||
-                    emailData.status === 'approved' ||
-                    emailData.approved === true
+                    (r === 'teacher' || r === 'native_friend') &&
+                    emailData.approvalStatus === 'approved' &&
+                    emailData.isApproved === true
                   );
                   if (isApproved) {
                     firestoreDoc = emailData;
@@ -399,10 +397,9 @@ export default function App() {
                 if (tSnap && tSnap.exists()) {
                   const tData = tSnap.data();
                   const isApproved = Boolean(
-                    (tData?.approvalStatus === 'approved' || tData?.isApproved === true || tData?.status === 'approved' || tData?.approved === true) &&
-                    tData?.approvalStatus !== 'pending' &&
-                    tData?.approvalStatus !== 'rejected' &&
-                    tData?.role !== 'student'
+                    (tData?.role === 'teacher' || tData?.role === 'native_friend') &&
+                    tData?.approvalStatus === 'approved' &&
+                    tData?.isApproved === true
                   );
                   if (isApproved) {
                     firestoreDoc = { ...(firestoreDoc || {}), ...tData, role: 'teacher' };
@@ -477,7 +474,6 @@ export default function App() {
                 uid: fbUser.uid,
                 email: cleanEmail,
                 name: account.name,
-                role: 'student',
                 picture: account.picture,
                 avatar: account.picture,
                 learningGoal: firestoreDoc?.learningGoal || '',
@@ -487,6 +483,9 @@ export default function App() {
                 ...(firestoreDoc || {}),
                 updatedAt: new Date().toISOString(),
               };
+              // Identity Hardening: Client must never set or mutate role in Firestore
+              delete studentPayload.role;
+              delete studentPayload.userRole;
 
               // Strictly preserve existing canonical level in Firestore. Never overwrite with BEGINNER on login.
               if (rawStoredLevelCandidate || canonicalLevelType) {
@@ -7101,6 +7100,12 @@ export default function App() {
           onBookLessonWithTutor={(tutor) => {
             const targetIdentifier = tutor.email || tutor.id;
             setTeacherEmailForConfig(targetIdentifier);
+            if (!currentAccount || !auth.currentUser) {
+              setAuthModalMode('signup');
+              setAuthModalRole('student');
+              setIsAuthModalOpen(true);
+              return;
+            }
             if (currentAccount?.role === 'student') {
               handleUpdateSubscription(targetIdentifier, tutor.name);
             }
@@ -7183,6 +7188,12 @@ export default function App() {
               onBookLesson={(tutor) => {
                 const targetIdentifier = tutor.email || tutor.id;
                 setTeacherEmailForConfig(targetIdentifier);
+                if (!currentAccount || !auth.currentUser) {
+                  setAuthModalMode('signup');
+                  setAuthModalRole('student');
+                  setIsAuthModalOpen(true);
+                  return;
+                }
                 if (currentAccount?.role === 'student') {
                   handleUpdateSubscription(targetIdentifier, tutor.name);
                 }

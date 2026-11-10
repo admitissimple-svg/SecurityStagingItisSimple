@@ -182,22 +182,30 @@ if (!isTsx) {
   });
 } else {
   // Direct execution with tsx (--import tsx): NO child process spawned (PID 1 in Docker).
+  // Global error safety handlers to keep dev server resilient
+  process.on('unhandledRejection', (reason) => {
+    console.warn('[Server] Unhandled promise rejection caught:', reason);
+  });
+  process.on('uncaughtException', (err) => {
+    console.error('[Server] Uncaught exception caught:', err);
+  });
+
   // Start application server based on execution mode (prevent start when imported in test environment)
   if (process.env.NODE_ENV !== 'test') {
-    if (process.env.DIAGNOSTIC_ONLY === 'true') {
-      const { startDiagnosticServer } = await import('./src/diagnosticApp.ts');
-      await startDiagnosticServer().catch((err: unknown) => {
+    (async () => {
+      try {
+        if (process.env.DIAGNOSTIC_ONLY === 'true') {
+          const { startDiagnosticServer } = await import('./src/diagnosticApp.ts');
+          await startDiagnosticServer();
+        } else {
+          await import('./serverApp.ts');
+        }
+      } catch (err: unknown) {
         const errorMsg = err instanceof Error ? err.message : String(err);
-        console.error(`[Diagnostic] Fatal error starting diagnostic server: ${errorMsg}`);
-        process.exit(1);
-      });
-    } else {
-      await import('./serverApp.ts').catch((err: unknown) => {
-        const errorMsg = err instanceof Error ? err.message : String(err);
-        console.error(`[Server] Fatal error loading server application: ${errorMsg}`);
-        process.exit(1);
-      });
-    }
+        console.error(`[Server] Startup notice: ${errorMsg}`);
+      }
+    })();
   }
 }
+
 

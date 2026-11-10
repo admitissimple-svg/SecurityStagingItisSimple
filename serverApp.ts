@@ -89,6 +89,7 @@ import {
   resolveCanonicalStudentIdentity,
   saveSessionNotesToFirestoreServer,
   fetchSessionNotesFromFirestoreServer,
+  fetchSessionNotesForStudentServer,
   saveYouTubePlaylistsToFirestore,
   fetchYouTubePlaylistsFromFirestore,
   fetchYouTubePlaylistsDocFromFirestore,
@@ -1346,16 +1347,50 @@ app.use((req, res, next) => {
 });
 
 // Phase 1C-A: backend Firebase ID token verification and trusted role inspection
-app.get('/api/auth/verify-session', firebaseAuthMiddleware, (req, res) => {
+app.get('/api/auth/verify-session', firebaseAuthMiddleware, async (req, res) => {
   if (!req.user) {
     return res.status(401).json({ authenticated: false, error: 'Unauthorized' });
+  }
+
+  const db = readDb();
+  let firestoreDoc: any = null;
+  try {
+    firestoreDoc = await fetchUserFromFirestore(req.user.email || '', req.user.uid);
+  } catch {}
+
+  const firestoreRole = (firestoreDoc?.role || '').toLowerCase();
+  const tokenRole = req.user.role;
+
+  // Inconsistency check: token claims admin but Firestore registers student
+  if (tokenRole === 'admin' && firestoreRole === 'student') {
+    console.warn(`[verify-session] Inconsistency detected for ${req.user.uid}: token role admin vs firestore student.`);
+    return res.status(403).json({
+      authenticated: false,
+      error: 'ROLE_INCONSISTENCY',
+      message: 'Inconsistência de permissões detectada. Acesso privilegiado bloqueado.',
+    });
+  }
+
+  let finalRole: UserRole = 'student';
+  if (tokenRole === 'admin' || (db.teachers || []).some((t: any) => t.role === 'admin' && (t.uid === req.user.uid || t.id === req.user.uid))) {
+    finalRole = 'admin';
+  } else {
+    let teacherRes: any = null;
+    try {
+      teacherRes = await resolveTeacherCanonicalIdentity({ teacherUid: req.user.uid, teacherEmail: req.user.email, dbState: db });
+    } catch {}
+    if (teacherRes && teacherRes.isApproved && firestoreRole !== 'student') {
+      finalRole = 'teacher';
+    } else {
+      finalRole = 'student';
+    }
   }
 
   return res.json({
     authenticated: true,
     uid: req.user.uid,
     emailVerified: req.user.email_verified,
-    role: req.user.role,
+    role: finalRole,
   });
 });
 
@@ -1512,21 +1547,16 @@ app.post('/api/auth/login', async (req, res) => {
     });
   }
 
-  // 4. Identify existing student accounts: an existing student CANNOT have their role overwritten during login
-  const studentObjInDb = (db.students || []).find(
-    (s: any) => s.uid === authenticatedUid || s.id === authenticatedUid || (s.email || s.studentEmail || '').toLowerCase() === cleanEmail
-  );
-  const hasStudentProfile = Boolean(db.userProfiles?.[cleanEmail]);
-  const isExistingStudent = !isServerVerifiedAdmin && (
-    firestoreRole === 'student' ||
-    Boolean(studentObjInDb || hasStudentProfile)
-  );
-
-  let role: string = 'student';
-  let name = cleanEmail.split('@')[0];
-  let isRoleEnforced = false;
-
+  // 4. Inconsistency check between Firebase Auth claims, bootstrap and Firestore
   if (isServerVerifiedAdmin) {
+    if (firestoreRole === 'student') {
+      console.warn(`[RBAC] Inconsistency detected: admin claim vs student in Firestore for ${cleanEmail}. Blocking privileged access.`);
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'ROLE_INCONSISTENCY_BLOCKED',
+        message: 'Inconsistência de permissões detectada entre autenticação e base canônica. Acesso privilegiado bloqueado.',
+      });
+    }
     role = 'admin';
     const adminTeacher = (db.teachers || []).find(
       (t: any) => t.role === 'admin' && (t.uid === authenticatedUid || t.id === authenticatedUid)
@@ -1540,8 +1570,8 @@ app.post('/api/auth/login', async (req, res) => {
         adminAuth.setCustomUserClaims(authenticatedUid, { role: 'admin' }).catch(() => {});
       } catch {}
     }
-  } else if (isApprovedTeacher && !isExistingStudent) {
-    // Verified approved teacher with no conflicting student record
+  } else if (isApprovedTeacher && firestoreRole !== 'student') {
+    // Canonical approved teacher cannot be downgraded to student
     role = 'teacher';
     const tutorObj = (db.tutorsList || []).find(
       (t: any) => t.uid === authenticatedUid || t.authUid === authenticatedUid || (t.email || '').toLowerCase() === cleanEmail
@@ -1621,7 +1651,7 @@ app.post('/api/auth/login', async (req, res) => {
       }
       writeDb(db);
       const studentToPersist = db.userProfiles?.[cleanEmail] || studentObj;
-      if (studentToPersist) {
+      if (studentToPersist && firestoreRole !== 'teacher' && firestoreRole !== 'admin') {
         saveUserToFirestore({ ...studentToPersist, id: authenticatedUid, uid: authenticatedUid, role: 'student' }).catch(() => {});
       }
     }
@@ -1735,8 +1765,10 @@ app.post('/api/auth/login', async (req, res) => {
 
     account.picture = studentProfile.picture || studentProfile.avatar || studentObj?.picture || studentObj?.avatar || '';
 
-    // Persist to Firestore asynchronously
-    saveUserToFirestore(studentProfile).catch(() => {});
+    // Persist to Firestore asynchronously only for actual students
+    if (firestoreRole !== 'teacher' && firestoreRole !== 'admin') {
+      saveUserToFirestore(studentProfile).catch(() => {});
+    }
     saveStudentAssignmentsByUid(account.uid, {
       uid: account.uid,
       email: cleanEmail,
@@ -1938,6 +1970,19 @@ const handleRegistration = async (req: any, res: any) => {
     const existingTeacher = (db.teachers || []).find((t: any) => t.email?.toLowerCase() === cleanEmail && t.role !== 'admin');
     const existingAuth = db.authUsers?.[cleanEmail];
     const isExistingTutorEmail = Boolean(existingTutor || existingTeacher || existingAuth);
+
+    // Identity Hardening: An existing student cannot mutate their role by calling teacher register
+    let existingFirestoreDoc: any = null;
+    try {
+      existingFirestoreDoc = await fetchUserFromFirestore(cleanEmail, verifiedUid || undefined);
+    } catch {}
+    if (existingFirestoreDoc && existingFirestoreDoc.role === 'student') {
+      return res.status(409).json({
+        error: 'Este usuário já possui cadastro ativo como Aluno(a). O papel não pode ser alterado por formulário de cadastro. Para se tornar um Amigo Nativo, utilize o fluxo de candidatura.',
+        code: 'ROLE_MUTATION_FORBIDDEN',
+        isExistingUser: true,
+      });
+    }
 
     const existingTutorUid =
       (existingTutor?.uid && isValidCanonicalUid(existingTutor.uid) ? existingTutor.uid : null) ||
@@ -18231,13 +18276,15 @@ export async function startServer() {
 
   server.on('error', (err: any) => {
     if (err.code === 'EADDRINUSE') {
-      console.warn(`Port ${PORT} is already in use.`);
-      if (PORT !== 3000) {
-        console.log('Attempting fallback to port 3000...');
-        app.listen(3000, '0.0.0.0', () => {
-          console.log(`It's Simple Server running on fallback http://0.0.0.0:3000 (PORT=3000)`);
+      console.warn(`Port ${PORT} is currently in use. Retrying in 1s...`);
+      setTimeout(() => {
+        try {
+          server.close();
+        } catch {}
+        app.listen(PORT, '0.0.0.0', () => {
+          console.log(`It's Simple Server re-bound and running on http://0.0.0.0:${PORT} (PORT=${PORT})`);
         });
-      }
+      }, 1000);
     } else {
       console.error('Server error event:', err);
     }

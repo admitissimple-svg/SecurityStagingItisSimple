@@ -293,18 +293,27 @@ export async function getVerifiedUserFromRequest(req: Request): Promise<Authenti
     return req.user;
   }
 
-  // Untrusted req.user or unverified state is discarded; verify directly from authorization header
+  // Untrusted req.user or unverified state is discarded; verify directly from authorization header or request body
+  let idToken = '';
   const authHeader = req.headers.authorization;
-  if (!authHeader || typeof authHeader !== 'string') {
+  if (authHeader && typeof authHeader === 'string') {
+    const parts = authHeader.trim().split(/\s+/);
+    if (parts.length === 2 && parts[0]?.toLowerCase() === 'bearer' && parts[1]) {
+      idToken = parts[1];
+    }
+  }
+
+  if (!idToken && req.body && typeof req.body === 'object' && typeof (req.body as any).idToken === 'string') {
+    const bodyToken = (req.body as any).idToken.trim();
+    if (bodyToken) {
+      idToken = bodyToken;
+    }
+  }
+
+  if (!idToken) {
     return null;
   }
 
-  const parts = authHeader.trim().split(/\s+/);
-  if (parts.length !== 2 || parts[0]?.toLowerCase() !== 'bearer' || !parts[1]) {
-    return null;
-  }
-
-  const idToken = parts[1];
   try {
     const adminAuth = getFirebaseAdminAuth();
     const decodedToken = await adminAuth.verifyIdToken(idToken);

@@ -398,14 +398,9 @@ export async function resolveTeacherCanonicalIdentity(
   }
 
   const isApproved = Boolean(
-    (consolidated?.approvalStatus === 'approved' ||
-      consolidated?.isApproved === true ||
-      consolidated?.status === 'approved' ||
-      consolidated?.approved === true) &&
-    consolidated?.approvalStatus !== 'pending' &&
-    consolidated?.approvalStatus !== 'rejected' &&
-    consolidated?.isApproved !== false &&
-    consolidated?.role !== 'student'
+    (consolidated?.role === 'teacher' || consolidated?.role === 'native_friend') &&
+    consolidated?.approvalStatus === 'approved' &&
+    consolidated?.isApproved === true
   );
 
   const name = consolidated?.name || 'Native Friend';
@@ -1209,6 +1204,23 @@ export async function saveUserToFirestore(user: any): Promise<boolean> {
     sanitized.email = cleanEmail;
     sanitized.uid = docId;
     sanitized.id = docId;
+
+    // Identity Hardening: Prevent routine profile saves or client hydration from mutating established user roles
+    try {
+      const existingSnap = await db.collection('users').doc(docId).get();
+      if (existingSnap && existingSnap.exists) {
+        const existingData = existingSnap.data();
+        if (existingData?.role) {
+          sanitized.role = existingData.role;
+          if (existingData.approvalStatus !== undefined) {
+            sanitized.approvalStatus = existingData.approvalStatus;
+          }
+          if (existingData.isApproved !== undefined) {
+            sanitized.isApproved = existingData.isApproved;
+          }
+        }
+      }
+    } catch {}
 
     const savePromise = db.collection('users').doc(docId).set(sanitized, { merge: true });
     const result = await withTimeout(savePromise.then(() => true), 10000);
@@ -3398,13 +3410,17 @@ export async function saveSessionNotesToFirestoreServer(
     id?: string;
     sessionDate: string;
     lessonId?: string;
-    studentEmail: string;
+    studentEmail?: string;
     studentUid?: string;
     teacherEmail?: string;
+    teacherUid?: string;
     teacherName?: string;
     topic?: string;
     content: string;
+    rawContent?: string;
+    createdAt?: string;
     updatedAt?: string;
+    lastSavedByUid?: string;
     driveFileId?: string;
     driveFileUrl?: string;
     driveFolderName?: string;
@@ -3415,26 +3431,55 @@ export async function saveSessionNotesToFirestoreServer(
   const db = getFirestoreDb();
   if (!db || !sessionKey || !data) return false;
 
+  // Canonical Identity Contract: studentUid and teacherUid must be valid canonical UIDs
+  const studentUid = (data.studentUid || '').trim();
+  const teacherUid = (data.teacherUid || '').trim();
+
+  if (!studentUid || !isValidCanonicalUid(studentUid)) {
+    console.warn('[serverFirestore] saveSessionNotesToFirestoreServer rejected: studentUid is missing or non-canonical.');
+    return false;
+  }
+  if (!teacherUid || !isValidCanonicalUid(teacherUid)) {
+    console.warn('[serverFirestore] saveSessionNotesToFirestoreServer rejected: teacherUid is missing or non-canonical.');
+    return false;
+  }
+
   try {
     const cleanKey = sessionKey.replace(/[^a-zA-Z0-9_-]/g, '_');
+
+    // Idempotency check: preserve original createdAt if doc exists
+    let existingCreatedAt = data.createdAt;
+    try {
+      const existingDoc = await db.collection('session_notes').doc(cleanKey).get();
+      if (existingDoc && existingDoc.exists) {
+        existingCreatedAt = existingDoc.data()?.createdAt || existingCreatedAt;
+      }
+    } catch {}
+
+    const nowIso = new Date().toISOString();
+    const effectiveCreatedAt = existingCreatedAt || nowIso;
+    const rawContent = data.rawContent || data.content || '';
+
     const sanitized = JSON.parse(JSON.stringify({
       ...data,
       id: cleanKey,
-      updatedAt: data.updatedAt || new Date().toISOString(),
+      sessionKey: cleanKey,
+      lessonId: data.lessonId || '',
+      studentUid,
+      teacherUid,
+      sessionDate: data.sessionDate,
+      rawContent,
+      content: data.content,
+      topic: data.topic || '',
+      createdAt: effectiveCreatedAt,
+      updatedAt: data.updatedAt || nowIso,
+      lastSavedByUid: teacherUid,
     }));
 
     const savePromises: Promise<any>[] = [
       db.collection('session_notes').doc(cleanKey).set(sanitized, { merge: true }),
+      db.collection('users').doc(studentUid).collection('session_notes').doc(cleanKey).set(sanitized, { merge: true }),
     ];
-
-    const studentId = (data.studentUid && isValidCanonicalUid(data.studentUid))
-      ? data.studentUid
-      : (data.studentEmail ? data.studentEmail.toLowerCase().trim().replace(/[^a-zA-Z0-9_-]/g, '_') : '');
-    if (studentId) {
-      savePromises.push(
-        db.collection('users').doc(studentId).collection('session_notes').doc(cleanKey).set(sanitized, { merge: true })
-      );
-    }
 
     if (data.lessonId) {
       savePromises.push(
@@ -3446,6 +3491,8 @@ export async function saveSessionNotesToFirestoreServer(
             title: data.topic,
             notesLastSavedAt: sanitized.updatedAt,
             updatedAt: sanitized.updatedAt,
+            studentUid,
+            teacherUid,
             ...(data.driveFileId ? { driveFileId: data.driveFileId } : {}),
             ...(data.driveFileUrl ? { driveFileUrl: data.driveFileUrl } : {}),
             ...(data.driveFolderName ? { driveFolderName: data.driveFolderName } : {}),
@@ -3484,6 +3531,61 @@ export async function fetchSessionNotesFromFirestoreServer(sessionKey: string): 
       console.warn('Firestore fetch session notes notice:', err);
     }
     return null;
+  }
+}
+
+/**
+ * Canonical retrieval of session notes for a verified student directly from Firestore (default).
+ * Guarantees that rawContent is preserved regardless of AI status.
+ */
+export async function fetchSessionNotesForStudentServer(studentUid: string, sessionKey?: string): Promise<any[]> {
+  const db = getFirestoreDb();
+  if (!db || !studentUid || !isValidCanonicalUid(studentUid)) return [];
+  try {
+    if (sessionKey) {
+      const cleanKey = sessionKey.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const snap = await db.collection('users').doc(studentUid).collection('session_notes').doc(cleanKey).get();
+      if (snap && snap.exists) {
+        const d = snap.data();
+        if (d && d.studentUid === studentUid) {
+          return [{ ...d, rawContent: d.rawContent || d.content, content: d.content || d.rawContent }];
+        }
+      }
+      // Also check global session_notes with studentUid check
+      const globalSnap = await db.collection('session_notes').doc(cleanKey).get();
+      if (globalSnap && globalSnap.exists) {
+        const d = globalSnap.data();
+        if (d && d.studentUid === studentUid) {
+          return [{ ...d, rawContent: d.rawContent || d.content, content: d.content || d.rawContent }];
+        }
+      }
+      return [];
+    }
+
+    // List all notes for student from subcollection
+    const colSnap = await db.collection('users').doc(studentUid).collection('session_notes').get();
+    const results: any[] = [];
+    if (colSnap && !colSnap.empty) {
+      colSnap.forEach((docSnap) => {
+        if (docSnap.id === 'review_cycle') return;
+        const d = docSnap.data();
+        if (d && (d.studentUid === studentUid || !d.studentUid)) {
+          results.push({
+            id: docSnap.id,
+            ...d,
+            rawContent: d.rawContent || d.content || '',
+            content: d.content || d.rawContent || '',
+          });
+        }
+      });
+    }
+
+    return results;
+  } catch (err: any) {
+    if (!isPermissionError(err)) {
+      console.warn('[serverFirestore] fetchSessionNotesForStudentServer notice:', err);
+    }
+    return [];
   }
 }
 

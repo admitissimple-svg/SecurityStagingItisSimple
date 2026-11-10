@@ -914,16 +914,23 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
           // 2. Server API sync with Drive metadata (skipDriveSync prevents duplicate Google Drive operations)
           try {
+            const idToken = await auth.currentUser?.getIdToken().catch(() => null);
+            const resolvedStudentUid = (activeStudent?.studentUid || activeStudent?.uid || activeStudent?.id || '').trim();
             fetch('/api/session-notes', {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: {
+                'Content-Type': 'application/json',
+                ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+              },
               body: JSON.stringify({
                 id: sessionKey,
                 sessionDate: effDate,
                 lessonId: targetLessonId || undefined,
                 studentEmail: cleanEmail,
+                studentUid: resolvedStudentUid || undefined,
                 topic: topicToSync,
                 content: contentToSync,
+                rawContent: contentToSync,
                 teacherEmail: currentAccount?.email || '',
                 teacherName: currentAccount?.name || 'Native Friend',
                 skipDriveSync: true,
@@ -1043,7 +1050,11 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               merge: true,
             }).catch((err) => console.warn('Firestore /session_notes notice:', err));
 
-            const userDocId = activeStudent?.uid || activeStudent?.id || (cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : '');
+            const userDocId = (activeStudent?.studentUid && isValidCanonicalUid(activeStudent.studentUid))
+              ? activeStudent.studentUid
+              : ((activeStudent?.uid && isValidCanonicalUid(activeStudent.uid))
+                ? activeStudent.uid
+                : ((activeStudent?.id && isValidCanonicalUid(activeStudent.id)) ? activeStudent.id : ''));
             if (userDocId) {
               assertSafeFirestoreWrite(`users/${userDocId}/session_notes/${sessionKey}`, stampedPayload, undefined, true);
               setDoc(
@@ -1079,20 +1090,26 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
         // 2. Server API Persistence (ensures clean database and Firestore sync without touching Google Drive)
         try {
+          const idToken = await auth.currentUser?.getIdToken().catch(() => null);
+          const resolvedStudentUid = (activeStudent?.studentUid || activeStudent?.uid || activeStudent?.id || '').trim();
           await fetch('/api/session-notes', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+            },
             body: JSON.stringify({
               id: sessionKey,
               sessionDate: effectiveDate,
               lessonId: targetLessonId || undefined,
               studentEmail: cleanEmail,
               studentName: sName,
-              studentUid: activeStudent?.uid || activeStudent?.id || undefined,
+              studentUid: resolvedStudentUid || undefined,
               teacherEmail: currentAccount?.email || '',
               teacherName: currentAccount?.name || 'Native Friend',
               topic: topicToSave,
               content: contentToSave,
+              rawContent: contentToSave,
               driveFileId: driveFileId || undefined,
               driveFileUrl: driveFileUrl || undefined,
               driveFolderName: GOOGLE_DRIVE_SESSION_FOLDER,
