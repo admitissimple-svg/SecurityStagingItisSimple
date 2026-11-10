@@ -270,8 +270,18 @@ export async function resolveTeacherCanonicalIdentity(
           db.collection('users').doc(candidateUid).get().catch(() => null),
           db.collection('tutors').doc(candidateUid).get().catch(() => null),
         ]);
-        if (uSnap && uSnap.exists) candidateDocs.push({ id: uSnap.id, ...uSnap.data() });
-        if (tSnap && tSnap.exists) candidateDocs.push({ id: tSnap.id, ...tSnap.data() });
+        if (uSnap && uSnap.exists) {
+          const uData = uSnap.data();
+          if (uData && (uData.role === 'teacher' || uData.role === 'tutor' || uData.role === 'native_friend') && uData.role !== 'student') {
+            candidateDocs.push({ id: uSnap.id, ...uData });
+          }
+        }
+        if (tSnap && tSnap.exists) {
+          const tData = tSnap.data();
+          if (tData && tData.role !== 'student') {
+            candidateDocs.push({ id: tSnap.id, ...tData });
+          }
+        }
       }
 
       if (candidatePublicId) {
@@ -281,10 +291,10 @@ export async function resolveTeacherCanonicalIdentity(
           db.collection('tutors').doc(candidatePublicId).get().catch(() => null),
           db.collection('users').doc(candidatePublicId).get().catch(() => null),
         ]);
-        if (tPubSnap) tPubSnap.forEach((d) => candidateDocs.push({ id: d.id, ...d.data() }));
-        if (uPubSnap) uPubSnap.forEach((d) => candidateDocs.push({ id: d.id, ...d.data() }));
-        if (tDocSnap && tDocSnap.exists) candidateDocs.push({ id: tDocSnap.id, ...tDocSnap.data() });
-        if (uDocSnap && uDocSnap.exists) candidateDocs.push({ id: uDocSnap.id, ...uDocSnap.data() });
+        if (tPubSnap) tPubSnap.forEach((d) => { const data = d.data(); if (data?.role !== 'student') candidateDocs.push({ id: d.id, ...data }); });
+        if (uPubSnap) uPubSnap.forEach((d) => { const data = d.data(); if (data && (data.role === 'teacher' || data.role === 'tutor' || data.role === 'native_friend') && data.role !== 'student') candidateDocs.push({ id: d.id, ...data }); });
+        if (tDocSnap && tDocSnap.exists) { const data = tDocSnap.data(); if (data?.role !== 'student') candidateDocs.push({ id: tDocSnap.id, ...data }); }
+        if (uDocSnap && uDocSnap.exists) { const data = uDocSnap.data(); if (data && (data.role === 'teacher' || data.role === 'tutor' || data.role === 'native_friend') && data.role !== 'student') candidateDocs.push({ id: uDocSnap.id, ...data }); }
       }
 
       if (candidateEmail) {
@@ -292,8 +302,8 @@ export async function resolveTeacherCanonicalIdentity(
           db.collection('users').where('email', '==', candidateEmail).get().catch(() => null),
           db.collection('tutors').where('email', '==', candidateEmail).get().catch(() => null),
         ]);
-        if (uEmSnap) uEmSnap.forEach((d) => candidateDocs.push({ id: d.id, ...d.data() }));
-        if (tEmSnap) tEmSnap.forEach((d) => candidateDocs.push({ id: d.id, ...d.data() }));
+        if (uEmSnap) uEmSnap.forEach((d) => { const data = d.data(); if (data && (data.role === 'teacher' || data.role === 'tutor' || data.role === 'native_friend') && data.role !== 'student') candidateDocs.push({ id: d.id, ...data }); });
+        if (tEmSnap) tEmSnap.forEach((d) => { const data = d.data(); if (data?.role !== 'student') candidateDocs.push({ id: d.id, ...data }); });
       }
 
       if (candidateName && candidateDocs.length === 0) {
@@ -304,8 +314,8 @@ export async function resolveTeacherCanonicalIdentity(
             db.collection('users').where('name', '==', nm).get().catch(() => null),
             db.collection('tutors').where('name', '==', nm).get().catch(() => null),
           ]);
-          if (uNameSnap) uNameSnap.forEach((d) => candidateDocs.push({ id: d.id, ...d.data() }));
-          if (tNameSnap) tNameSnap.forEach((d) => candidateDocs.push({ id: d.id, ...d.data() }));
+          if (uNameSnap) uNameSnap.forEach((d) => { const data = d.data(); if (data && (data.role === 'teacher' || data.role === 'tutor' || data.role === 'native_friend') && data.role !== 'student') candidateDocs.push({ id: d.id, ...data }); });
+          if (tNameSnap) tNameSnap.forEach((d) => { const data = d.data(); if (data?.role !== 'student') candidateDocs.push({ id: d.id, ...data }); });
           if (candidateDocs.length > 0) break;
         }
       }
@@ -325,7 +335,7 @@ export async function resolveTeacherCanonicalIdentity(
       // O arquivo legado src/data/app_db.json nunca é lido no runtime.
       const allLocal = [...localTutors, ...localTeachers];
       for (const item of allLocal) {
-        if (!item) continue;
+        if (!item || item.role === 'student') continue;
         const itemEmail = (item.email || '').toLowerCase().trim();
         const itemPubId = (item.publicTutorId || item.id || '').toLowerCase().trim();
         const itemUid = (item.uid || item.authUid || '').trim();
@@ -388,10 +398,14 @@ export async function resolveTeacherCanonicalIdentity(
   }
 
   const isApproved = Boolean(
-    consolidated?.approvalStatus === 'approved' ||
-    consolidated?.isApproved === true ||
-    consolidated?.status === 'approved' ||
-    consolidated?.approved === true
+    (consolidated?.approvalStatus === 'approved' ||
+      consolidated?.isApproved === true ||
+      consolidated?.status === 'approved' ||
+      consolidated?.approved === true) &&
+    consolidated?.approvalStatus !== 'pending' &&
+    consolidated?.approvalStatus !== 'rejected' &&
+    consolidated?.isApproved !== false &&
+    consolidated?.role !== 'student'
   );
 
   const name = consolidated?.name || 'Native Friend';

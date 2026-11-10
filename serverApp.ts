@@ -1767,7 +1767,8 @@ app.post('/api/auth/login', async (req, res) => {
   res.json({
     success: true,
     account,
-    profile: role === 'teacher' ? null : studentProfile,
+    role: account.role,
+    profile: role === 'teacher' ? null : (studentProfile ? { ...studentProfile, role: 'student' } : null),
     student: role === 'teacher' ? null : (studentObj || (db.students || []).find((s) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail) || null),
     tutor: tutorResponseObj,
     isRoleEnforced,
@@ -2011,6 +2012,9 @@ const handleRegistration = async (req: any, res: any) => {
       availableDays: req.body.availableDays || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday'],
       availableHours: req.body.availableHours || ['08:00', '09:00', '10:00', '11:00', '14:00', '15:00', '16:00', '17:00'],
       approvalStatus: 'pending', // REQUIRED: All new Native Friends default strictly to pending approval
+      isApproved: false,
+      approved: false,
+      status: 'pending',
       appliedAt: new Date().toISOString(),
       registeredByAdmin: false,
       meetUrl: req.body.meetUrl || req.body.meetLink || '',
@@ -2099,7 +2103,7 @@ const handleRegistration = async (req: any, res: any) => {
       picture: tutorEntry.avatar,
     };
 
-    return res.json({
+    return res.status(201).json({
       success: true,
       account,
       tutor: tutorEntry,
@@ -2478,7 +2482,7 @@ const handleRegistration = async (req: any, res: any) => {
     picture: userAvatar,
   };
 
-  res.json({
+  return res.status(201).json({
     success: true,
     account,
     profile: db.userProfiles?.[cleanEmail] || null,
@@ -2553,7 +2557,8 @@ app.post('/api/auth/google', async (req, res) => {
     firestoreRole === 'student' ||
     authRecordRole === 'student' ||
     (db.students || []).some((s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail) ||
-    Boolean(db.userProfiles?.[cleanEmail])
+    Boolean(db.userProfiles?.[cleanEmail]) ||
+    Boolean(firestoreDoc?.learningGoal || firestoreDoc?.studentLevel || firestoreDoc?.contractedLessons !== undefined)
   );
 
   let role: string = 'student';
@@ -2641,6 +2646,7 @@ app.post('/api/auth/google', async (req, res) => {
           uid: uid || db.authUsers[cleanEmail]?.uid || canonicalStudentId,
           name: displayName,
           email: cleanEmail,
+          role: 'student',
           picture: picture || '',
           avatar: picture || '',
           level: 'iniciante',
@@ -2665,6 +2671,7 @@ app.post('/api/auth/google', async (req, res) => {
       if (db.userProfiles?.[cleanEmail]) {
         db.userProfiles[cleanEmail].id = uid;
         db.userProfiles[cleanEmail].uid = uid;
+        db.userProfiles[cleanEmail].role = 'student';
       }
       writeDb(db);
     }
@@ -2703,7 +2710,8 @@ app.post('/api/auth/google', async (req, res) => {
   res.json({
     success: true,
     account,
-    profile: db.userProfiles?.[cleanEmail] || null,
+    role: account.role,
+    profile: db.userProfiles?.[cleanEmail] ? { ...db.userProfiles[cleanEmail], role } : null,
     student: (db.students || []).find((s) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail) || null,
     tutor: (db.tutorsList || []).find((t) => t.email.toLowerCase() === cleanEmail) || null,
     isRoleEnforced,
@@ -5157,7 +5165,11 @@ app.get('/api/user-profile', async (req, res) => {
   const studentInDb = (db.students || []).find(
     (s: any) => (s.email || s.studentEmail || '').toLowerCase() === email || (uid && s.uid === uid)
   );
-  const isStudentUser = fsUser?.role === 'student' || Boolean(db.userProfiles?.[email]) || Boolean(studentInDb);
+  const isStudentUser =
+    fsUser?.role === 'student' ||
+    Boolean(db.userProfiles?.[email]) ||
+    Boolean(studentInDb) ||
+    Boolean(fsUser?.learningGoal || fsUser?.studentLevel || fsUser?.contractedLessons !== undefined);
 
   // 3. Teacher profile check: Strictly requires verified administrative approval and no conflicting student status
   let isApprovedTeacherUser = false;
@@ -5205,6 +5217,7 @@ app.get('/api/user-profile', async (req, res) => {
       id: canonicalResolvedUid,
       uid: canonicalResolvedUid,
       name: profile.name || student.name || student.studentName,
+      role: 'student',
       level: profile.level || student.level || student.studentLevel,
       learningGoal: profile.learningGoal || student.goal || student.learningGoal,
       routineVideoTime: profile.routineVideoTime || student.routineVideoTime || '09:00',
@@ -5226,6 +5239,7 @@ app.get('/api/user-profile', async (req, res) => {
       uid: canonicalResolvedUid,
       name: student.name || student.studentName,
       email,
+      role: 'student',
       level: student.level || student.studentLevel || 'iniciante',
       teacherEmail: fallbackTeacherEmail,
       teacherName: fallbackTeacherName,
@@ -5254,6 +5268,7 @@ app.get('/api/user-profile', async (req, res) => {
       id: fsUser.id || fsUser.uid || uid,
       uid: fsUser.uid || fsUser.id || uid,
       email: fsUser.email || email,
+      role: fsUser.role === 'teacher' ? 'teacher' : 'student',
     };
     if (!db.userProfiles) db.userProfiles = {};
     db.userProfiles[email] = profile;
@@ -5301,9 +5316,12 @@ app.get('/api/user-profile', async (req, res) => {
       profile.studentJournal ||
       [];
     profile.studentJournal = journalEntries;
+    if (!profile.role) {
+      profile.role = 'student';
+    }
   }
 
-  res.json({ success: true, profile });
+  res.json({ success: true, role: profile?.role || 'student', profile });
 });
 
 app.post('/api/user-profile', async (req, res) => {

@@ -120,11 +120,21 @@ export const GoogleSignInModal: React.FC<GoogleSignInModalProps> = ({
 
       if (isVerifiedAdmin) {
         verifiedRole = 'admin';
-      } else if (selectedRole === 'teacher' || preferredRole === 'teacher' || docRole === 'native_friend' || docRole === 'teacher') {
+      } else if (docRole === 'student') {
+        verifiedRole = 'student';
+      } else if (
+        (docRole === 'teacher' || docRole === 'native_friend' || docRole === 'tutor') &&
+        (firestoreUserDoc?.approvalStatus === 'approved' || firestoreUserDoc?.isApproved === true)
+      ) {
         verifiedRole = 'teacher';
       } else {
         verifiedRole = 'student';
       }
+
+      // requestedRole represents purely intent to navigate/register, never an authoritative permission
+      const requestedRole: UserRole = isVerifiedAdmin
+        ? 'admin'
+        : (verifiedRole === 'teacher' ? 'teacher' : (selectedRole || preferredRole || 'student'));
 
       // Synchronize authenticated user with backend profile and persistence
       const res = await fetch('/api/auth/google', {
@@ -137,7 +147,7 @@ export const GoogleSignInModal: React.FC<GoogleSignInModalProps> = ({
           uid: user.uid,
           email: user.email,
           name: user.displayName || user.email.split('@')[0],
-          role: verifiedRole,
+          role: requestedRole,
           picture: user.photoURL || undefined,
         }),
       });

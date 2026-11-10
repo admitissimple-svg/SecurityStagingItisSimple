@@ -388,7 +388,8 @@ export default function App() {
                 ).catch(() => null);
               }
 
-              if (resolvedRole !== 'teacher') {
+              // If not already resolved as a student or admin, check tutors doc ONLY if user is not a student
+              if (resolvedRole !== 'teacher' && !isVerifiedAdmin && firestoreDoc?.role !== 'student') {
                 const cleanTutorId = `tutor-${cleanDocId}`;
                 const [tutorSnap, authUidTutorSnap] = await Promise.all([
                   getDoc(doc(db, 'tutors', cleanTutorId)).catch(() => null),
@@ -398,30 +399,13 @@ export default function App() {
                 if (tSnap && tSnap.exists()) {
                   const tData = tSnap.data();
                   const isApproved = Boolean(
-                    tData?.approvalStatus === 'approved' ||
-                    tData?.isApproved === true ||
-                    tData?.status === 'approved' ||
-                    tData?.approved === true
+                    (tData?.approvalStatus === 'approved' || tData?.isApproved === true || tData?.status === 'approved' || tData?.approved === true) &&
+                    tData?.approvalStatus !== 'pending' &&
+                    tData?.approvalStatus !== 'rejected' &&
+                    tData?.role !== 'student'
                   );
                   if (isApproved) {
                     firestoreDoc = { ...(firestoreDoc || {}), ...tData, role: 'teacher' };
-                    resolvedRole = 'teacher';
-                  }
-                }
-              }
-
-              // Also check memory tutors list - strictly requiring approval
-              if (resolvedRole !== 'teacher') {
-                const inMemoryTutor = tutors.find((t) => (t.email || '').toLowerCase().trim() === cleanEmail);
-                if (inMemoryTutor) {
-                  const isApproved = Boolean(
-                    inMemoryTutor.approvalStatus === 'approved' ||
-                    inMemoryTutor.isApproved === true ||
-                    (inMemoryTutor as any).status === 'approved' ||
-                    (inMemoryTutor as any).approved === true
-                  );
-                  if (isApproved) {
-                    firestoreDoc = { ...(firestoreDoc || {}), ...inMemoryTutor, role: 'teacher' };
                     resolvedRole = 'teacher';
                   }
                 }
@@ -596,26 +580,6 @@ export default function App() {
             setUserProfile(restoredProfile);
           }
 
-          // Guarantee that teacher profile is saved under doc(db, 'users', fbUser.uid) and doc(db, 'tutors', fbUser.uid)
-          if (resolvedRole === 'teacher') {
-            const db = getDb();
-            if (db && fbUser.uid) {
-              const teacherPayload = {
-                id: fbUser.uid,
-                uid: fbUser.uid,
-                email: cleanEmail,
-                name: account.name,
-                role: 'teacher',
-                picture: account.picture,
-                avatar: account.picture,
-                ...(firestoreDoc || {}),
-                updatedAt: new Date().toISOString(),
-              };
-              setDoc(doc(db, 'users', fbUser.uid), teacherPayload, { merge: true }).catch(() => null);
-              setDoc(doc(db, 'tutors', fbUser.uid), teacherPayload, { merge: true }).catch(() => null);
-            }
-          }
-
           setCurrentAccount(account);
           setAvailableAccounts((prev) => {
             if (!prev.some((a) => a.email.toLowerCase() === cleanEmail)) {
@@ -624,7 +588,7 @@ export default function App() {
             return prev.map((a) => (a.email.toLowerCase() === cleanEmail ? account : a));
           });
 
-          // Sync with backend API
+          // Sync with backend API to obtain authoritative account role
           fetch('/api/auth/google', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -635,7 +599,17 @@ export default function App() {
               role: resolvedRole,
               picture: account.picture,
             }),
-          }).catch(() => {});
+          })
+            .then(async (res) => {
+              if (res.ok) {
+                const data = await res.json().catch(() => null);
+                if (data?.account?.role && data.account.role !== account.role) {
+                  const authoritativeRole: UserRole = data.account.role;
+                  setCurrentAccount((prev) => (prev ? { ...prev, role: authoritativeRole } : prev));
+                }
+              }
+            })
+            .catch(() => {});
         }
         setIsAuthReady(true);
       } else {
@@ -991,6 +965,7 @@ export default function App() {
             } catch {}
           } else if (!currentAccount) {
             setAuthModalMode('login');
+            setAuthModalRole('student');
             setIsAuthModalOpen(true);
           }
         }
@@ -1021,6 +996,7 @@ export default function App() {
             ]);
           } else if (!currentAccount) {
             setAuthModalMode('login');
+            setAuthModalRole('student');
             setIsAuthModalOpen(true);
           }
         }

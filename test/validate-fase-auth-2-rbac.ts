@@ -3,6 +3,7 @@ import http from 'http';
 import express from 'express';
 import { app as serverApp } from '../serverApp';
 import { resolveTeacherCanonicalIdentity } from '../src/serverFirestore';
+import { setFirebaseAdminAuthForTesting } from '../src/serverFirebaseAdmin';
 
 /**
  * FASE AUTH.2: Regression Test Suite for Role Integrity and Route Guard Protection
@@ -99,13 +100,13 @@ async function runRegressionSuite() {
     // TEST 1: Aluno acessando /teacher diretamente é bloqueado no Route Guard
     // ------------------------------------------------------------------------
     await test('1. Aluno autenticado acessando /teacher tem acesso restrito e redireciona para /dashboard', () => {
-      const studentAccount = {
+      const studentAccount: { uid: string; email: string; role: string; name: string } = {
         uid: 'fixture-student-uid-01',
         email: 'aluna.fixture01@example.com',
-        role: 'student' as const,
+        role: 'student',
         name: 'Aluna Fixture',
       };
-      const isTeacher = studentAccount.role === 'teacher' || (studentAccount as any).role === 'admin';
+      const isTeacher = studentAccount.role === 'teacher' || studentAccount.role === 'admin';
       assert.strictEqual(isTeacher, false, 'Aluno não possui papel de professor');
 
       // Simulando Route Guard de App.tsx:
@@ -187,8 +188,29 @@ async function runRegressionSuite() {
         bio: 'Certified tutor',
       });
 
-      // Admin aprova o professor
-      await makeRequest(server, 'POST', `/api/tutors/${approvedTutorUid}/approve`, {});
+      // Admin aprova o professor com credencial administrativa válida
+      setFirebaseAdminAuthForTesting({
+        verifyIdToken: async (token: string) => {
+          if (token === 'mock-admin-token') {
+            return {
+              uid: 'admin-tester-uid',
+              email: 'adm.itissimple@gmail.com',
+              email_verified: true,
+              role: 'admin',
+              admin: true,
+            };
+          }
+          throw new Error('Invalid token');
+        },
+      } as any);
+
+      await makeRequest(
+        server,
+        'POST',
+        `/api/tutors/${approvedTutorUid}/approve`,
+        {},
+        { Authorization: 'Bearer mock-admin-token' }
+      );
 
       // Login Google do professor aprovado
       const loginRes = await makeRequest(server, 'POST', '/api/auth/google', {
@@ -303,7 +325,13 @@ async function runRegressionSuite() {
         headline: 'Authentic English Mentorship',
         bio: 'Real biography here',
       });
-      await makeRequest(server, 'POST', `/api/tutors/${tutorUid}/approve`, {});
+      await makeRequest(
+        server,
+        'POST',
+        `/api/tutors/${tutorUid}/approve`,
+        {},
+        { Authorization: 'Bearer mock-admin-token' }
+      );
 
       const res = await makeRequest(server, 'POST', '/api/auth/google', {
         uid: tutorUid,
@@ -477,6 +505,7 @@ async function runRegressionSuite() {
   if (failed > 0) {
     process.exit(1);
   }
+  process.exit(0);
 }
 
 runRegressionSuite().catch((err) => {
