@@ -151,12 +151,12 @@ export interface FeaturePolicy {
 
 export const GEMINI_POLICIES: Record<GeminiFeature, FeaturePolicy> = {
   pedagogical_transform: {
-    maxOutputTokens: 2500,
+    maxOutputTokens: 4000,
     rateLimitWindowSeconds: 300,
     rateLimitMaxRequests: 5,
     maxInputLengthChars: 10000,
-    timeoutMs: 12000,
-    totalDeadlineMs: 30000,
+    timeoutMs: 15000,
+    totalDeadlineMs: 36000,
   },
   homework_generate: {
     maxOutputTokens: 4000,
@@ -963,6 +963,7 @@ export function classifyGeminiError(err: any): {
 export interface GeminiSingleAttemptResponse {
   text?: string;
   parsedJson: any | null;
+  finishReason?: string;
   error?: {
     statusCode?: number;
     category: GeminiFailureCategory;
@@ -1067,6 +1068,9 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
 
     const durationMs = Date.now() - startTime;
     const rawText = response?.text?.trim() || '';
+    const firstCandidate = (response as any)?.candidates?.[0];
+    const candidateFinishReason = firstCandidate?.finishReason ? String(firstCandidate.finishReason) : undefined;
+    const finishReason = candidateFinishReason || ((response as any)?.finishReason ? String((response as any).finishReason) : undefined);
 
     if (!rawText) {
       logGeminiAudited({
@@ -1075,15 +1079,18 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
         callerRole,
         durationMs,
         model: modelToUse,
-        detail: 'Model returned empty response text.',
+        detail: finishReason === 'MAX_TOKENS' ? 'Model response truncated (MAX_TOKENS).' : 'Model returned empty response text.',
       });
       return {
         parsedJson: null,
+        finishReason,
         error: {
           statusCode: 502,
           category: 'INVALID_RESPONSE',
-          safeReason: 'Model returned empty response text.',
-          rawMessage: 'EMPTY_RESPONSE',
+          safeReason: finishReason === 'MAX_TOKENS'
+            ? 'Model response was truncated (maxOutputTokens reached).'
+            : 'Model returned empty response text.',
+          rawMessage: finishReason === 'MAX_TOKENS' ? 'MAX_TOKENS_EMPTY_RESPONSE' : 'EMPTY_RESPONSE',
         },
       };
     }
@@ -1107,15 +1114,20 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
         callerRole,
         durationMs,
         model: modelToUse,
-        detail: 'Model response was not valid JSON.',
+        detail: finishReason === 'MAX_TOKENS'
+          ? 'Model response was truncated at token limit (MAX_TOKENS) and was not valid JSON.'
+          : 'Model response was not valid JSON.',
       });
       return {
         parsedJson: null,
+        finishReason,
         error: {
           statusCode: 502,
           category: 'INVALID_RESPONSE',
-          safeReason: 'Model response was not valid JSON.',
-          rawMessage: 'MALFORMED_JSON',
+          safeReason: finishReason === 'MAX_TOKENS'
+            ? 'Model response was truncated at token limit (MAX_TOKENS) and could not be parsed as valid JSON.'
+            : 'Model response was not valid JSON.',
+          rawMessage: finishReason === 'MAX_TOKENS' ? 'MALFORMED_JSON_MAX_TOKENS' : 'MALFORMED_JSON',
         },
       };
     }
@@ -1129,7 +1141,7 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
       tokensEstimated: Math.ceil(cleanJson.length / 4),
     });
 
-    return { text: rawText, parsedJson: parsed };
+    return { text: rawText, parsedJson: parsed, finishReason };
   } catch (err: any) {
     const durationMs = Date.now() - startTime;
     const classified = classifyGeminiError(err);
@@ -1335,6 +1347,10 @@ export interface GeminiAttemptDetail {
   statusCode?: number;
   safeReason?: string;
   durationMs?: number;
+  finishReason?: string;
+  isMaxTokens?: boolean;
+  isParseError?: boolean;
+  isValidationError?: boolean;
 }
 
 export type GeminiInterruptionReason =
@@ -1467,6 +1483,8 @@ export async function executeGeminiWithContingency(
       }
 
       if (isValid) {
+        const finishReason = attempt?.finishReason;
+        const isMaxTokens = finishReason === 'MAX_TOKENS';
         attemptsDetails.push({
           attemptNumber: i + 1,
           model: currentModel,
@@ -1474,6 +1492,10 @@ export async function executeGeminiWithContingency(
           statusCode: 200,
           safeReason: 'Valid structured response',
           durationMs: attemptDurationMs,
+          finishReason,
+          isMaxTokens,
+          isParseError: false,
+          isValidationError: false,
         });
 
         logGeminiAudited({
@@ -1512,6 +1534,21 @@ export async function executeGeminiWithContingency(
       safeReason: `Model ${currentModel} returned an empty or invalid response.`,
     };
 
+    const finishReason = attempt?.finishReason;
+    const isMaxTokens = finishReason === 'MAX_TOKENS' ||
+      Boolean(lastError?.rawMessage?.includes('MAX_TOKENS')) ||
+      Boolean(lastError?.safeReason?.includes('MAX_TOKENS') || lastError?.safeReason?.includes('token limit'));
+    const isParseError = Boolean(
+      lastError?.rawMessage?.includes('MALFORMED_JSON') ||
+      lastError?.safeReason?.toLowerCase().includes('not valid json') ||
+      lastError?.safeReason?.toLowerCase().includes('truncated at token limit')
+    );
+    const isValidationError = Boolean(
+      lastError?.rawMessage?.startsWith('VALIDATION_FAILED') ||
+      lastError?.safeReason?.includes('pedagogical schema contract') ||
+      lastError?.safeReason?.includes('schema')
+    );
+
     attemptsDetails.push({
       attemptNumber: i + 1,
       model: currentModel,
@@ -1520,6 +1557,10 @@ export async function executeGeminiWithContingency(
       statusCode: lastError.statusCode,
       safeReason: lastError.safeReason,
       durationMs: attemptDurationMs,
+      finishReason,
+      isMaxTokens,
+      isParseError,
+      isValidationError,
     });
 
     // Rule 3: Stop immediately on non-recoverable errors (auth, policy, shared quota)

@@ -9879,6 +9879,7 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
       success: true,
       cached: true,
       transformation: cached,
+      attemptsDetails: [],
     });
   }
 
@@ -9978,17 +9979,18 @@ CRITICAL INSTRUCTIONS ON TEACHER SHORTCUT MARKINGS & TAB ROUTING:
      * In "reviewSummary", ALWAYS generate a complete object:
        - "estimatedMinutes": "3–5 minutes"
        - "keyRules": []
-       - "mustKnowVocabulary": include all vocabulary items with their definitions in ${targetLang.nameEn}
+       - "mustKnowVocabulary": concise list of target terms/words from the session
        - "essentialCorrections": []
        - "rememberThis": an inspiring, memorable golden takeaway rule in ${targetLang.nameEn} (at least 15 characters), focusing on the vocabulary item or spelling distinction.
 4. CEFR LEVEL ADAPTATION:
    - There is NO separate CEFR tab. Instead, ALL tabs (Complete Report, 1. Analyze Mistakes, 2. Grammar Points, 3. Vocabulary & Expressions, and Quick Review) MUST be intelligently and deeply elaborated respecting and adapting to the student's current CEFR level (${cefr}).
-5. QUICK REVIEW MANDATE:
-   - ALL session notes, corrections, and processed terms MUST compose the Quick Review ("reviewSummary").
-   - "essentialCorrections": MUST contain ALL items from mistakesAnalysis.
-   - "mustKnowVocabulary": MUST contain ALL terms from vocabularyAndExpressions (both Alt+W and Alt+P).
-   - "keyRules": MUST contain ALL grammar rules from grammarPoints.
-   - "rememberThis": High-impact golden takeaway rule for the student (at least 15 characters).
+5. QUICK REVIEW (reviewSummary) MANDATE & TOKEN OPTIMIZATION:
+   - In "reviewSummary", provide a concise summary without duplicating full multi-sentence analyses or definitions already stated in "vocabularyAndExpressions" and "grammarPoints":
+     * "estimatedMinutes": e.g. "5–10 minutes" (or "3–5 minutes" for short sessions)
+     * "keyRules": concise bullet titles of grammar points covered in ${targetLang.nameEn} (empty array [] if no grammar errors)
+     * "mustKnowVocabulary": concise list of target terms from vocabularyAndExpressions (e.g. ["term 1", "term 2"]), avoiding redundant definition paragraphs
+     * "essentialCorrections": concise list of original and corrected pairs [{"original": "...", "corrected": "..."}] from mistakesAnalysis
+     * "rememberThis": High-impact golden takeaway rule for the student in ${targetLang.nameEn} (at least 15 characters).
 
 You MUST produce a JSON object strictly conforming to this schema:
 {
@@ -10034,8 +10036,8 @@ You MUST produce a JSON object strictly conforming to this schema:
   ],
   "reviewSummary": {
     "estimatedMinutes": "5–10 minutes",
-    "keyRules": ["Key grammar rules covered in ${targetLang.nameEn}"],
-    "mustKnowVocabulary": ["Vocabulary and pronunciation items with definitions in ${targetLang.nameEn}"],
+    "keyRules": ["Key grammar rule titles in ${targetLang.nameEn}"],
+    "mustKnowVocabulary": ["Target terms from vocabularyAndExpressions"],
     "essentialCorrections": [{"original": "...", "corrected": "..."}],
     "rememberThis": "Memorable takeaway focused on the session items in ${targetLang.nameEn}"
   }
@@ -10295,11 +10297,25 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
 
           await writeDbSync(db);
 
+          const sanitizedAttempts = (contingencyResult?.attemptsDetails || []).map((att: any) => ({
+            attemptNumber: att.attemptNumber,
+            model: att.model,
+            durationMs: typeof att.durationMs === 'number' ? att.durationMs : 0,
+            success: Boolean(att.success),
+            category: att.category || (att.success ? undefined : 'INVALID_RESPONSE'),
+            safeReason: att.safeReason || (att.success ? 'Success' : 'Execution failed'),
+            finishReason: att.finishReason || undefined,
+            isMaxTokens: Boolean(att.isMaxTokens || att.finishReason === 'MAX_TOKENS'),
+            isParseError: Boolean(att.isParseError),
+            isValidationError: Boolean(att.isValidationError),
+          }));
+
           return res.json({
             success: true,
             cached: false,
             transformation,
             journalEntry: recordedJournalEntry,
+            attemptsDetails: sanitizedAttempts,
           });
         }
       } else if (contingencyResult?.error) {
@@ -10311,6 +10327,19 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
     }
 
     // Fail transparently: zero invented/synthetic pedagogical feedback when contingency models fail!
+    const sanitizedAttempts = (contingencyResult?.attemptsDetails || []).map((att: any) => ({
+      attemptNumber: att.attemptNumber,
+      model: att.model,
+      durationMs: typeof att.durationMs === 'number' ? att.durationMs : 0,
+      success: Boolean(att.success),
+      category: att.category || (att.success ? undefined : 'INVALID_RESPONSE'),
+      safeReason: att.safeReason || (att.success ? 'Success' : 'Execution failed'),
+      finishReason: att.finishReason || undefined,
+      isMaxTokens: Boolean(att.isMaxTokens || att.finishReason === 'MAX_TOKENS'),
+      isParseError: Boolean(att.isParseError),
+      isValidationError: Boolean(att.isValidationError),
+    }));
+
     const statusCode = contingencyResult?.error?.statusCode === 429 ? 429 : 503;
     return res.status(statusCode).json({
       success: false,
@@ -10321,6 +10350,7 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
         : 'The pedagogical AI service is temporarily unavailable after trying contingency models. Original teacher notes have been preserved.',
       attemptsCount: contingencyResult?.attemptsCount || 1,
       modelsAttempted: contingencyResult?.modelsAttempted || resolveGeminiContingencyModels(),
+      attemptsDetails: sanitizedAttempts,
     });
   } finally {
     await flightLock.release();
