@@ -3933,18 +3933,21 @@ export async function fetchSessionNotesProgressServer(key: string): Promise<any>
  */
 export async function savePedagogicalTransformationToFirestoreServer(
   compositeCacheKey: string,
-  transformation: any
+  transformation: any,
+  options?: { rawNotes?: string }
 ): Promise<boolean> {
   if (isCloudWriteDisabled) return false;
   const db = getFirestoreDb();
   if (!db || !compositeCacheKey || !transformation) return false;
+
+  const rawNotesContext = options?.rawNotes || transformation?.rawNotesSnippet;
 
   // HOTFIX 2.1 — Persist ONLY valid pedagogical transformations (zero provisional, zero fallback, zero generic)
   if (
     !transformation.isAiGenerated ||
     transformation.isFallback ||
     transformation.isProvisional ||
-    isLegacyGenericTransformation(transformation)
+    isLegacyGenericTransformation(transformation, rawNotesContext)
   ) {
     console.info('[serverFirestore] Refusing to persist invalid or generic transformation to Firestore');
     return false;
@@ -3992,7 +3995,8 @@ export async function fetchPedagogicalTransformationFromFirestoreServer(
       const snap = await sessionRef.collection('pedagogical_cache').doc(rawKey).get();
       if (snap && snap.exists) {
         const data = snap.data();
-        if (data && data.isAiGenerated && !data.isProvisional && !isLegacyGenericTransformation(data, options?.rawNotes)) {
+        const noteCtx = options?.rawNotes || data?.rawNotesSnippet;
+        if (data && data.isAiGenerated && !data.isProvisional && !isLegacyGenericTransformation(data, noteCtx)) {
           return data;
         }
       }
@@ -4005,7 +4009,8 @@ export async function fetchPedagogicalTransformationFromFirestoreServer(
       let candidate: any = null;
       for (const d of colSnap.docs) {
         const data = d.data();
-        if (data && data.isAiGenerated && !data.isProvisional && !isLegacyGenericTransformation(data, options?.rawNotes)) {
+        const noteCtx = options?.rawNotes || data?.rawNotesSnippet;
+        if (data && data.isAiGenerated && !data.isProvisional && !isLegacyGenericTransformation(data, noteCtx)) {
           const matchLang = !options?.language || data.language === options.language;
           const matchHash = !options?.contentHash || data.contentHash === options.contentHash;
           if (matchLang && matchHash) {

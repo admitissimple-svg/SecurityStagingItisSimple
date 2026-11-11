@@ -179,8 +179,8 @@ export const GEMINI_POLICIES: Record<GeminiFeature, FeaturePolicy> = {
     rateLimitWindowSeconds: 60,
     rateLimitMaxRequests: 15,
     maxInputLengthChars: 500,
-    timeoutMs: 10000,
-    totalDeadlineMs: 25000,
+    timeoutMs: 16000,
+    totalDeadlineMs: 34000,
   },
   check_writing: {
     maxOutputTokens: 1200,
@@ -750,6 +750,7 @@ export function isModelConfigIncompatibleError(error?: {
     raw.includes('thinkingconfig') ||
     raw.includes('thinkingbudget') ||
     raw.includes('thinkinglevel') ||
+    raw.includes('temperature') ||
     raw.includes('not supported for this model') ||
     raw.includes('not supported on model') ||
     raw.includes('is not supported') ||
@@ -1032,8 +1033,18 @@ SECURITY & PRIVACY DIRECTIVE (CRITICAL):
       systemInstruction: hardenedSystemInstruction,
       responseMimeType: 'application/json',
       maxOutputTokens: policy.maxOutputTokens,
-      temperature,
     };
+
+    // SKILL.md: Do not pass deprecated sampling parameters (temperature, topP, topK) or candidateCount
+    // to gemini-3.8-flash, gemini-4-argon, or gemini-4-carbon.
+    const isSamplingDeprecatedForModel = (model: string): boolean => {
+      const clean = model.trim().replace(/^models\//, '').toLowerCase();
+      return clean.startsWith('gemini-3.8') || clean.startsWith('gemini-4');
+    };
+
+    if (!isSamplingDeprecatedForModel(modelToUse) && temperature !== undefined) {
+      config.temperature = temperature;
+    }
 
     const thinkingConfig = resolveThinkingConfig(modelToUse);
     if (thinkingConfig) {

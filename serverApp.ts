@@ -10265,7 +10265,7 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
           if (language === 'pt') {
             db.pedagogicalTransformationsMap[canonicalSessionKey] = transformation;
           }
-          await savePedagogicalTransformationToFirestoreServer(compositeCacheKey, transformation);
+          await savePedagogicalTransformationToFirestoreServer(compositeCacheKey, transformation, { rawNotes });
           await syncTransformationVocabToDictionary(transformation, cleanUid, effectiveEmail);
 
           // FASE 4B.9: Record single, validated pedagogical review in Student's My Journal via Firebase Admin SDK
@@ -10364,7 +10364,7 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
     for (const key of candidateKeys) {
       if (db.pedagogicalTransformationsMap?.[key]) {
         const candidate = db.pedagogicalTransformationsMap[key];
-        if (candidate && candidate.isAiGenerated && !candidate.isProvisional && !isLegacyGenericTransformation(candidate)) {
+        if (candidate && candidate.isAiGenerated && !candidate.isProvisional && !isLegacyGenericTransformation(candidate, candidate.rawNotesSnippet)) {
           if (!contentHash || candidate.contentHash === contentHash) {
             transformation = candidate;
             break;
@@ -10375,7 +10375,7 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
         const matchKey = k === key || k.startsWith(`${key}__`);
         const matchLang = !language || v?.language === language;
         const matchHash = !contentHash || v?.contentHash === contentHash;
-        return matchKey && matchLang && matchHash && v?.isAiGenerated && !v?.isProvisional && !isLegacyGenericTransformation(v);
+        return matchKey && matchLang && matchHash && v?.isAiGenerated && !v?.isProvisional && !isLegacyGenericTransformation(v, v?.rawNotesSnippet);
       });
       if (match) {
         transformation = match[1];
@@ -10388,7 +10388,7 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
       for (const key of candidateKeys) {
         try {
           const fsMatch = await fetchPedagogicalTransformationFromFirestoreServer(key, { language, contentHash });
-          if (fsMatch && fsMatch.isAiGenerated && !fsMatch.isProvisional && !isLegacyGenericTransformation(fsMatch)) {
+          if (fsMatch && fsMatch.isAiGenerated && !fsMatch.isProvisional && !isLegacyGenericTransformation(fsMatch, fsMatch.rawNotesSnippet)) {
             transformation = fsMatch;
             const storeKey = fsMatch.cacheKey || `${sessionKey || queryLessonId}__hash_${fsMatch.contentHash || 'any'}__lang_${fsMatch.language || language || 'pt'}`;
             if (!db.pedagogicalTransformationsMap) db.pedagogicalTransformationsMap = {};

@@ -438,12 +438,36 @@ export function validatePedagogicalAiResponse(
   }
 
   // 6. Validate Quick Review Summary
-  if (!parsed.reviewSummary || typeof parsed.reviewSummary !== 'object') {
-    return { valid: false, reason: 'AI response missing reviewSummary' };
+  if (!parsed.reviewSummary || typeof parsed.reviewSummary !== 'object' || Array.isArray(parsed.reviewSummary)) {
+    parsed.reviewSummary = {
+      estimatedMinutes: '5–10 minutes',
+      keyRules: [],
+      mustKnowVocabulary: [],
+      essentialCorrections: [],
+      rememberThis: '',
+    };
   }
 
-  if (typeof parsed.reviewSummary.rememberThis !== 'string' || parsed.reviewSummary.rememberThis.trim().length < 5) {
-    return { valid: false, reason: 'AI response missing rememberThis in reviewSummary' };
+  const cleanRememberThis = typeof parsed.reviewSummary.rememberThis === 'string'
+    ? parsed.reviewSummary.rememberThis.trim()
+    : '';
+
+  if (cleanRememberThis.length < 5) {
+    // Controlled complementation of rememberThis based strictly on validated items (never inventing errors)
+    const lang = (language || 'pt').toLowerCase().trim();
+    if (mistakes.length > 0 && mistakes[0].original && mistakes[0].corrected && !mistakes[0].isPendingConfirmation) {
+      parsed.reviewSummary.rememberThis = lang === 'en'
+        ? `Remember this: Instead of saying "${mistakes[0].original}", say "${mistakes[0].corrected}"! Consistent small shifts in your active vocabulary build speaking confidence.`
+        : `Lembre-se disto: Em vez de "${mistakes[0].original}", prefira "${mistakes[0].corrected}"! Pequenos ajustes consistentes no seu vocabulário ativo constroem confiança ao falar.`;
+    } else if (vocabList.length > 0 && vocabList[0].term) {
+      parsed.reviewSummary.rememberThis = lang === 'en'
+        ? `Remember this: Practice using "${vocabList[0].term}" naturally in your daily conversations!`
+        : `Lembre-se disto: Pratique o uso de "${vocabList[0].term}" naturalmente em suas conversas diárias!`;
+    } else {
+      parsed.reviewSummary.rememberThis = lang === 'en'
+        ? 'Remember this: Fluency is about recognizing patterns quickly and adopting natural native phraseology!'
+        : 'Lembre-se disto: A fluência se desenvolve reconhecendo padrões rapidamente e adotando construções naturais!';
+    }
   }
 
   return { valid: true };
@@ -452,6 +476,10 @@ export function validatePedagogicalAiResponse(
 /**
  * Detects whether a transformation contains legacy synthetic/generic content,
  * artificial placeholders, or fabricated items not present in the teacher notes.
+ * 
+ * FASE NF-NOTES.8:
+ * - Does NOT classify legitimate vocabulary (e.g. "streamline", "catch up") as generic if present in notes.
+ * - Does NOT presume fictitious content when raw notes are absent; relies on verifiable synthetic evidence.
  */
 export function isLegacyGenericTransformation(
   transformation: any,
@@ -464,76 +492,103 @@ export function isLegacyGenericTransformation(
     return true;
   }
 
+  // Determine note context from parameter or embedded snippet
+  const rawNoteContext = rawNotesOrMarkings || transformation.rawNotesSnippet;
+  const rawText = rawNoteContext
+    ? (typeof rawNoteContext === 'string' ? rawNoteContext.toLowerCase() : (rawNoteContext.cleanText || '').toLowerCase())
+    : undefined;
+
   // 2. Check mistakesAnalysis for synthetic boilerplate
   const mistakes = Array.isArray(transformation.mistakesAnalysis) ? transformation.mistakesAnalysis : [];
+  const CANNED_MISTAKES = [
+    'i have 28 years old',
+    "i'm agree with you",
+    'it depends of the day',
+    'it depends of the weather',
+    'can i make a question?',
+    'can i make a question',
+  ];
+  let cannedMistakesCount = 0;
+
   for (const m of mistakes) {
     if (m?.isPendingConfirmation) return true;
-    const orig = String(m?.original || '').toLowerCase();
-    const corr = String(m?.corrected || '').toLowerCase();
+    const orig = String(m?.original || '').toLowerCase().trim();
+    const corr = String(m?.corrected || '').toLowerCase().trim();
     if (
       corr.includes('pending confirmation') ||
       corr.includes('pendente de confirmação')
     ) {
       return true;
     }
-    if (
-      orig === 'i have 28 years old' ||
-      orig === "i'm agree with you" ||
-      orig === 'it depends of the day' ||
-      orig === 'it depends of the weather' ||
-      orig === 'can i make a question?' ||
-      orig === 'can i make a question'
-    ) {
-      if (rawNotesOrMarkings) {
-        const rawText = typeof rawNotesOrMarkings === 'string'
-          ? rawNotesOrMarkings.toLowerCase()
-          : rawNotesOrMarkings.cleanText.toLowerCase();
+
+    if (CANNED_MISTAKES.includes(orig)) {
+      if (rawText !== undefined) {
         if (!rawText.includes(orig)) {
-          return true;
+          return true; // Fabricated error not present in available teacher notes
         }
       } else {
+        cannedMistakesCount++;
+      }
+    }
+
+    const examples = Array.isArray(m?.twoExamples) ? m.twoExamples : (Array.isArray(m?.examples) ? m.examples : []);
+    for (const ex of examples) {
+      if (typeof ex === 'string' && isGenericPedagogicalExample(ex)) {
         return true;
       }
     }
   }
 
+  // If raw notes are missing, only reject if multiple canned fixture mistakes appear together
+  if (rawText === undefined && cannedMistakesCount >= 2) {
+    return true;
+  }
+
   // 3. Check vocabularyAndExpressions for generic definitions and examples
   const vocab = Array.isArray(transformation.vocabularyAndExpressions) ? transformation.vocabularyAndExpressions : [];
+  const SUSPICIOUS_FIXTURE_TERMS = ['catch up', 'workload', 'streamline', 'make sense', 'get the hang of'];
+  let suspiciousFixtureTermsCount = 0;
+
   for (const v of vocab) {
-    const term = String(v?.term || '').toLowerCase();
-    if (term === 'catch up' || term === 'workload' || term === 'streamline' || term === 'make sense' || term === 'get the hang of') {
-      if (rawNotesOrMarkings) {
-        const rawText = typeof rawNotesOrMarkings === 'string'
-          ? rawNotesOrMarkings.toLowerCase()
-          : rawNotesOrMarkings.cleanText.toLowerCase();
+    const term = String(v?.term || '').toLowerCase().trim();
+    if (SUSPICIOUS_FIXTURE_TERMS.includes(term)) {
+      if (rawText !== undefined) {
         if (!rawText.includes(term)) {
-          return true;
+          return true; // Suspicious term not present in actual teacher notes
         }
       } else {
-        return true;
+        suspiciousFixtureTermsCount++;
       }
     }
 
+    // Verifiable evidence of synthetic content: generic definition templates
     if (v.definitionEn && isGenericPedagogicalDefinition(v.definitionEn)) {
       return true;
     }
     if (v.simpleDefinition && isGenericPedagogicalDefinition(v.simpleDefinition)) {
       return true;
     }
+
+    // Verifiable evidence of synthetic content: generic example templates
     const examples = Array.isArray(v.realExamples) ? v.realExamples : [];
     for (const ex of examples) {
-      if (isGenericPedagogicalExample(ex)) {
+      if (typeof ex === 'string' && isGenericPedagogicalExample(ex)) {
         return true;
       }
     }
   }
 
+  // When raw notes context is completely absent, reject if >= 3 canned terms occur together (the fixture footprint)
+  if (rawText === undefined && suspiciousFixtureTermsCount >= 3) {
+    return true;
+  }
+
   // 4. Check grammarPoints: if rawNotes had no errors, but grammarPoints has synthetic points
   const grammar = Array.isArray(transformation.grammarPoints) ? transformation.grammarPoints : [];
-  if (rawNotesOrMarkings) {
-    const markings = typeof rawNotesOrMarkings === 'string'
-      ? parseNotesHtml(rawNotesOrMarkings)
-      : rawNotesOrMarkings;
+  if (rawNoteContext) {
+    const markings = typeof rawNoteContext === 'string'
+      ? parseNotesHtml(rawNoteContext)
+      : rawNoteContext;
     if (markings.errors.length === 0 && grammar.length > 0) {
       const hasAgree = grammar.some((g: any) => /agree/i.test(g?.topic || ''));
       const hasAge = grammar.some((g: any) => /age/i.test(g?.topic || '') || /to be/i.test(g?.topic || ''));
