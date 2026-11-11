@@ -35,6 +35,8 @@ import {
   resolveCefrLevel,
   extractNotesMarkings,
   computeNotesHash,
+  buildPedagogicalCacheKey,
+  getCanonicalSessionKey,
   PEDAGOGICAL_PROMPT_VERSION,
 } from '../utils/pedagogicalTransformer';
 import { syncSessionVocabularyToStudentDictionary } from '../utils/sessionVocabularySync';
@@ -73,6 +75,9 @@ interface SessionOption {
 
 // Module-level in-memory cache for open/close modal transitions (Zero localStorage)
 const sessionNotesModalMemoryCache = new Map<string, PedagogicalLessonTransformation>();
+
+// In-flight pedagogical transformation promises to guarantee at most one transformation in flight per canonical key across remounts and re-renders
+const inFlightTransformPromises = new Map<string, Promise<PedagogicalLessonTransformation>>();
 
 // In-flight synchronization promises to prevent duplicate simultaneous executions across remounts
 const inFlightVocabSyncPromises = new Map<string, Promise<StudentDictionaryEntry[]>>();
@@ -253,6 +258,10 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
   const [selectedSessionKey, setSelectedSessionKey] = useState<string>('');
   const [isLoadingSessions, setIsLoadingSessions] = useState<boolean>(true);
   const isFreshOpenRef = useRef<boolean>(true);
+  // Canonical key tracking to guarantee zero redundant calls on re-renders, StrictMode, or session list updates (AI-STD.1)
+  const lastRequestedTransformKeyRef = useRef<string | null>(null);
+  // Current active session key tracking to avoid stale async results overwriting new session (Requirement 7)
+  const currentActiveSessionKeyRef = useRef<string>('');
 
   const [isSyncingVocab, setIsSyncingVocab] = useState<boolean>(false);
   const [vocabSyncError, setVocabSyncError] = useState<string | null>(null);
@@ -305,6 +314,7 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
 
   const handleClose = useCallback(() => {
     isFreshOpenRef.current = true;
+    lastRequestedTransformKeyRef.current = null;
     onClose();
   }, [onClose]);
 
@@ -638,111 +648,186 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
     [hasValidAuth, resolvedUid, resolvedEmail, studentLevel, isEn, onVocabularySynced]
   );
 
+  // Active session ref and current active key ref to prevent stale response overwrites (Requirement 7)
+  const activeSessionRef = useRef<SessionOption | null>(activeSession);
+
+  useEffect(() => {
+    activeSessionRef.current = activeSession;
+    if (activeSession?.key) {
+      currentActiveSessionKeyRef.current = activeSession.key;
+    }
+  }, [activeSession]);
+
   // Load and transform pedagogical notes whenever active session changes
   const loadPedagogicalNotes = useCallback(
-    async (forceRegenerate: boolean = false) => {
-      if (!activeSession) {
+    async (forceRegenerate: boolean = false, targetSessionOverride?: SessionOption | null) => {
+      const session = targetSessionOverride !== undefined ? targetSessionOverride : activeSessionRef.current;
+      if (!session) {
         setTransformation(null);
+        setIsLoadingTransformation(false);
         return;
       }
 
-      const cacheKey = `${activeSession.key}__${currentLanguage}`;
+      const targetSessionKey = session.key;
+      const targetRawContent = session.rawContent || '';
+      const contentHash = computeNotesHash(targetRawContent);
+      const canonicalSessionKey = getCanonicalSessionKey({
+        lessonId: session.lessonId,
+        sessionKey: session.key,
+        studentUid: resolvedUid,
+        studentEmail: resolvedEmail,
+        sessionDate: session.dateStr,
+      });
+      const currentCefr = cefrMeta.cefr;
+      const transformCanonicalKey = buildPedagogicalCacheKey({
+        canonicalSessionKey,
+        contentHash,
+        language: currentLanguage,
+        cefrLevel: currentCefr,
+        promptVersion: PEDAGOGICAL_PROMPT_VERSION,
+      });
+
+      // Invalidate memory cache on explicit force regeneration (e.g. Retry or Refresh Analysis)
       if (forceRegenerate) {
-        sessionNotesModalMemoryCache.delete(cacheKey);
-        if (activeSession.lessonId) {
-          sessionNotesModalMemoryCache.delete(`${activeSession.lessonId}__${currentLanguage}`);
+        sessionNotesModalMemoryCache.delete(transformCanonicalKey);
+      } else {
+        // Fast path: Check module memory cache strictly matching canonical key (including contentHash, language, CEFR, promptVersion)
+        const cached = sessionNotesModalMemoryCache.get(transformCanonicalKey);
+
+        if (cached && !cached.isProvisional && cached.isAiGenerated && (!cached.contentHash || cached.contentHash === contentHash)) {
+          if (isMountedRef.current && currentActiveSessionKeyRef.current === targetSessionKey) {
+            setTransformation(cached);
+            setIsLoadingTransformation(false);
+          }
+          performVocabularySync(cached, session, false);
+          return;
         }
-      } else if (sessionNotesModalMemoryCache.has(cacheKey)) {
-        const cached = sessionNotesModalMemoryCache.get(cacheKey)!;
-        setTransformation(cached);
-        // Instant visual unlock: notes display immediately from cache
-        setIsLoadingTransformation(false);
-        // Trigger vocabulary sync asynchronously in background without delaying UI display
-        performVocabularySync(cached, activeSession, false);
-        return;
-      } else if (activeSession.lessonId && sessionNotesModalMemoryCache.has(`${activeSession.lessonId}__${currentLanguage}`)) {
-        const cached = sessionNotesModalMemoryCache.get(`${activeSession.lessonId}__${currentLanguage}`)!;
-        setTransformation(cached);
-        setIsLoadingTransformation(false);
-        performVocabularySync(cached, activeSession, false);
+      }
+
+      // Check if a transformation for this exact canonical key is ALREADY in flight (Requirement 1 & 5)
+      const existingInFlight = inFlightTransformPromises.get(transformCanonicalKey);
+      if (existingInFlight) {
+        setIsLoadingTransformation(true);
+        try {
+          const result = await existingInFlight;
+          if (isMountedRef.current && currentActiveSessionKeyRef.current === targetSessionKey) {
+            setTransformation(result);
+          }
+        } catch (err) {
+          console.warn('NativeFriendsNotes: in-flight attach notice:', err);
+        } finally {
+          if (isMountedRef.current && currentActiveSessionKeyRef.current === targetSessionKey) {
+            setIsLoadingTransformation(false);
+          }
+        }
         return;
       }
 
+      // Initiate single-flight transformation promise
       setIsLoadingTransformation(true);
-      let result: PedagogicalLessonTransformation | null = null;
-      try {
-        result = await fetchPedagogicalTransformation({
-          rawNotes: activeSession.rawContent,
-          topic: activeSession.topic,
-          sessionDate: activeSession.dateStr,
-          teacherName: activeSession.teacherName,
+
+      const targetLessonId = session.lessonId;
+      const targetTopic = session.topic;
+      const targetDateStr = session.dateStr;
+      const targetTeacherName = session.teacherName;
+
+      const transformPromise = (async (): Promise<PedagogicalLessonTransformation> => {
+        return await fetchPedagogicalTransformation({
+          rawNotes: targetRawContent,
+          topic: targetTopic,
+          sessionDate: targetDateStr,
+          teacherName: targetTeacherName,
           studentLevel,
           studentUid: resolvedUid,
           studentEmail: resolvedEmail,
-          lessonId: activeSession.lessonId,
-          sessionKey: activeSession.key,
+          lessonId: targetLessonId,
+          sessionKey: targetSessionKey,
           language: currentLanguage,
           forceRegenerate,
           triggerAiIfMissing: true,
         });
+      })();
 
-        // Step 1: Set pedagogical transformation report as soon as available
-        setTransformation(result);
+      inFlightTransformPromises.set(transformCanonicalKey, transformPromise);
+      lastRequestedTransformKeyRef.current = transformCanonicalKey;
+
+      let result: PedagogicalLessonTransformation | null = null;
+      try {
+        result = await transformPromise;
+
+        // Requirement 7: Do not overwrite state if user switched to another session while in-flight
+        if (isMountedRef.current && currentActiveSessionKeyRef.current === targetSessionKey) {
+          setTransformation(result);
+        }
+
+        // Cache definitive AI generation strictly under transformCanonicalKey
         if (result && result.isAiGenerated && !result.isProvisional) {
-          sessionNotesModalMemoryCache.set(cacheKey, result);
-          if (activeSession.lessonId) {
-            sessionNotesModalMemoryCache.set(`${activeSession.lessonId}__${currentLanguage}`, result);
-          }
-          if (result.sessionKey) {
-            sessionNotesModalMemoryCache.set(`${result.sessionKey}__${currentLanguage}`, result);
-          }
+          sessionNotesModalMemoryCache.set(transformCanonicalKey, result);
         }
       } catch (err) {
         console.warn('Failed to load pedagogical notes:', err);
       } finally {
-        // Step 2: Unblock visual presentation immediately so the user sees notes without delay
-        setIsLoadingTransformation(false);
+        inFlightTransformPromises.delete(transformCanonicalKey);
+        if (isMountedRef.current && currentActiveSessionKeyRef.current === targetSessionKey) {
+          setIsLoadingTransformation(false);
+        }
       }
 
-      // Step 3: Run automatic vocabulary synchronization asynchronously and independently from visual loading
+      // Trigger vocabulary sync asynchronously
       if (result) {
-        performVocabularySync(result, activeSession, forceRegenerate);
+        performVocabularySync(result, session, forceRegenerate);
       }
     },
-    [activeSession, studentLevel, resolvedUid, resolvedEmail, currentLanguage, performVocabularySync]
+    [studentLevel, resolvedUid, resolvedEmail, currentLanguage, cefrMeta.cefr, performVocabularySync]
   );
-
-  // FASE 4B.9: Active session & content hash tracking to guarantee zero repeated Gemini calls
-  const lastLoadedSessionRef = useRef<{ sessionKey: string; contentHash: string; lang: string } | null>(null);
 
   useEffect(() => {
     if (!isOpen || !activeSession) return;
+
     const currentHash = computeNotesHash(activeSession.rawContent || '');
-    if (
-      lastLoadedSessionRef.current &&
-      lastLoadedSessionRef.current.sessionKey === activeSession.key &&
-      lastLoadedSessionRef.current.contentHash === currentHash &&
-      lastLoadedSessionRef.current.lang === currentLanguage &&
-      transformation &&
-      !transformation.isFallback &&
-      !transformation.isProvisional &&
-      transformation.promptVersion === PEDAGOGICAL_PROMPT_VERSION
-    ) {
-      // Content has not changed and promptVersion matches; avoid redundant network requests
-      return;
-    }
-    // When active session changes, clear previous session's transformation immediately to avoid visual leakage
-    if (lastLoadedSessionRef.current && lastLoadedSessionRef.current.sessionKey !== activeSession.key) {
+    const canonicalSessionKey = getCanonicalSessionKey({
+      lessonId: activeSession.lessonId,
+      sessionKey: activeSession.key,
+      studentUid: resolvedUid,
+      studentEmail: resolvedEmail,
+      sessionDate: activeSession.dateStr,
+    });
+    const currentCefr = cefrMeta.cefr;
+    const targetKey = buildPedagogicalCacheKey({
+      canonicalSessionKey,
+      contentHash: currentHash,
+      language: currentLanguage,
+      cefrLevel: currentCefr,
+      promptVersion: PEDAGOGICAL_PROMPT_VERSION,
+    });
+
+    // When active session changes, clear previous session's transformation immediately to avoid visual leakage (Requirement 7)
+    if (currentActiveSessionKeyRef.current !== activeSession.key) {
+      currentActiveSessionKeyRef.current = activeSession.key;
       setTransformation(null);
     }
-    loadPedagogicalNotes(false).then(() => {
-      lastLoadedSessionRef.current = {
-        sessionKey: activeSession.key,
-        contentHash: currentHash,
-        lang: currentLanguage,
-      };
-    });
-  }, [isOpen, activeSession?.key, activeSession?.rawContent, loadPedagogicalNotes, currentLanguage]);
+
+    // If this exact canonical transformation key has already been requested or loaded by this modal instance, avoid redundant calls (Requirement 1, 2, 3)
+    if (lastRequestedTransformKeyRef.current === targetKey) {
+      return;
+    }
+
+    // Synchronously mark this key as requested to block concurrent re-renders or StrictMode remounts
+    lastRequestedTransformKeyRef.current = targetKey;
+
+    loadPedagogicalNotes(false, activeSession);
+  }, [
+    isOpen,
+    activeSession?.key,
+    activeSession?.rawContent,
+    activeSession?.lessonId,
+    activeSession?.dateStr,
+    currentLanguage,
+    cefrMeta.cefr,
+    resolvedUid,
+    resolvedEmail,
+    loadPedagogicalNotes,
+  ]);
 
   // Copy 5-10 minute review summary to clipboard
   const handleCopySummary = () => {
