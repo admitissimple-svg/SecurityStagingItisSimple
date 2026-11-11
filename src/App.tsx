@@ -7538,7 +7538,8 @@ export default function App() {
                         <div id="section-student-notes" className="scroll-mt-6 animate-in fade-in duration-200">
                           <TeacherLiveLessonNotesPanel
                             lessons={lessons || []}
-                            students={students || []}
+                            students={studentsList}
+                            studentUid={stUid}
                             currentAccount={currentAccount || null}
                             selectedStudentFilter={selectedStudentFilter}
                             onSaveLessonNotes={handleSaveLessonNotes}

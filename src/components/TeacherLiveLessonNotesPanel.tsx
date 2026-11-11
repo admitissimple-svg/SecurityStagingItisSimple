@@ -58,7 +58,8 @@ import {
 
 interface TeacherLiveLessonNotesPanelProps {
   lessons?: LiveLesson[];
-  students?: StudentProfile[];
+  students?: Array<StudentProfile | GoogleAccount>;
+  studentUid?: string;
   currentAccount?: GoogleAccount | null;
   selectedStudentFilter?: string;
   onSaveLessonNotes?: (
@@ -97,6 +98,7 @@ interface TeacherLiveLessonNotesPanelProps {
 const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanelProps> = ({
   lessons = [],
   students = [],
+  studentUid,
   currentAccount = null,
   selectedStudentFilter,
   onSaveLessonNotes,
@@ -152,7 +154,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
   // Safe helper to extract display name for student without crashing
   const resolveStudentName = useCallback(
-    (student?: StudentProfile | null, lesson?: LiveLesson | null, emailFallback?: string): string => {
+    (student?: StudentProfile | GoogleAccount | null, lesson?: LiveLesson | null, emailFallback?: string): string => {
       if (student?.name && student.name.trim()) return student.name.trim();
       if (lesson?.studentName && lesson.studentName.trim()) return lesson.studentName.trim();
       const rawEmail = (lesson?.studentEmail || emailFallback || '').trim();
@@ -192,6 +194,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   const [lastSavedTimestamp, setLastSavedTimestamp] = useState<string | null>(null);
   const [copiedSuccess, setCopiedSuccess] = useState<boolean>(false);
   const [savedSuccessBanner, setSavedSuccessBanner] = useState<boolean>(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   // Pre-styled Inline Coaching Tag Constants (mirrors exact design system references)
   // Correct tag: Rounded rectangle (6px radius), light green bg (#ecfdf5), dark green border (#15803d), green checkmark (✓)
@@ -396,13 +399,125 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     return safeStudents.find(
       (s) =>
         Boolean(s) &&
-        (s.email || '').toLowerCase().trim() === targetEmail
+        (((s.email || '').toLowerCase().trim() === targetEmail) ||
+          s.uid === selectedStudentEmail ||
+          s.id === selectedStudentEmail)
     );
   }, [safeStudents, selectedStudentEmail]);
 
   const activeLesson = useMemo(() => {
     return teacherLessons.find((l) => l && l.id === selectedLessonId);
   }, [teacherLessons, selectedLessonId]);
+
+  // Centralized Canonical Student Identity Resolution
+  const studentResolution = useMemo<{
+    uid: string;
+    error: string | null;
+    hasDivergence: boolean;
+    source: 'prop' | 'student_doc' | 'lesson' | 'none';
+  }>(() => {
+    const teacherUidVal = (currentAccount?.uid || (currentAccount as any)?.id || auth.currentUser?.uid || '').trim();
+    const cleanSelectedEmail = (selectedStudentEmail || '').toLowerCase().trim();
+    const cleanFilter = (selectedStudentFilter || '').toLowerCase().trim();
+
+    // Check if teacher UID was improperly provided as student UID
+    const rawPropUid = (studentUid || '').trim();
+    if (rawPropUid && teacherUidVal && rawPropUid === teacherUidVal) {
+      return {
+        uid: '',
+        error: 'Erro de identidade: O UID do professor não pode ser utilizado como UID do aluno.',
+        hasDivergence: true,
+        source: 'none',
+      };
+    }
+
+    // Determine if the prop studentUid is coherent with the selected student
+    let isPropCoherent = false;
+    if (rawPropUid && isValidCanonicalUid(rawPropUid)) {
+      if (!cleanFilter || cleanFilter === 'all') {
+        isPropCoherent = true;
+      } else {
+        const filterMatchesEmail = cleanFilter === cleanSelectedEmail;
+        const filterMatchesStudent = Boolean(
+          activeStudent &&
+          (((activeStudent.email || '').toLowerCase().trim() === cleanFilter) ||
+           activeStudent.uid === cleanFilter ||
+           activeStudent.id === cleanFilter)
+        );
+        const propMatchesActiveStudent = Boolean(
+          activeStudent && (activeStudent.uid === rawPropUid || (activeStudent as any)?.studentUid === rawPropUid)
+        );
+        isPropCoherent = filterMatchesEmail || filterMatchesStudent || propMatchesActiveStudent;
+      }
+    }
+
+    const validPropUid = isPropCoherent && isValidCanonicalUid(rawPropUid) ? rawPropUid : '';
+
+    // Candidate from active student profile doc in studentsList
+    const docUidRaw = (
+      activeStudent?.uid ||
+      (activeStudent as any)?.studentUid ||
+      (activeStudent?.id && isValidCanonicalUid(activeStudent.id) ? activeStudent.id : '') ||
+      ''
+    ).trim();
+    const validDocUid = (docUidRaw && isValidCanonicalUid(docUidRaw) && docUidRaw !== teacherUidVal) ? docUidRaw : '';
+
+    // Candidate from active lesson (if editing existing lesson for this student)
+    const isEditingExistingLesson = Boolean(selectedLessonId && activeLesson);
+    const lessonUidRaw = isEditingExistingLesson ? (activeLesson?.studentUid || '').trim() : '';
+    const validLessonUid = (lessonUidRaw && isValidCanonicalUid(lessonUidRaw) && lessonUidRaw !== teacherUidVal) ? lessonUidRaw : '';
+
+    // Verify divergence between available valid sources for the current selection
+    const uidsFound: { source: string; uid: string }[] = [];
+    if (validPropUid) uidsFound.push({ source: 'componente pai', uid: validPropUid });
+    if (validDocUid) uidsFound.push({ source: 'cadastro do aluno', uid: validDocUid });
+    if (validLessonUid) uidsFound.push({ source: 'aula existente', uid: validLessonUid });
+
+    const distinctUids = Array.from(new Set(uidsFound.map((u) => u.uid)));
+    if (distinctUids.length > 1) {
+      const details = uidsFound.map((u) => `${u.source}: ${u.uid}`).join(', ');
+      return {
+        uid: '',
+        error: `Erro de identidade: UIDs divergentes detectados para a mesma aluna (${details}). Operação bloqueada para segurança.`,
+        hasDivergence: true,
+        source: 'none',
+      };
+    }
+
+    // Priority 1: Canonical UID received from parent component (when validated & coherent)
+    if (validPropUid) {
+      return { uid: validPropUid, error: null, hasDivergence: false, source: 'prop' };
+    }
+
+    // Priority 2: Student document from safeStudents (studentsList)
+    if (validDocUid) {
+      return { uid: validDocUid, error: null, hasDivergence: false, source: 'student_doc' };
+    }
+
+    // Priority 3: Existing lesson's studentUid (when editing existing lesson)
+    if (validLessonUid) {
+      return { uid: validLessonUid, error: null, hasDivergence: false, source: 'lesson' };
+    }
+
+    // No valid canonical UID found
+    return {
+      uid: '',
+      error: cleanSelectedEmail
+        ? 'Erro de identidade: UID canônico da aluna ausente. O salvamento foi bloqueado para proteger a integridade dos dados.'
+        : null,
+      hasDivergence: false,
+      source: 'none',
+    };
+  }, [
+    studentUid,
+    selectedStudentFilter,
+    selectedStudentEmail,
+    activeStudent,
+    activeLesson,
+    selectedLessonId,
+    currentAccount?.uid,
+    (currentAccount as any)?.id,
+  ]);
 
   // Generate initial starter template: completely blank page with only Date, Student, and Topic annotations as shown in user screenshot
   const getStarterTemplate = useCallback(
@@ -594,7 +709,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         if (selectedLessonId) queryParams.set('lessonId', selectedLessonId);
         if (currentSessionKey) queryParams.set('id', currentSessionKey);
         if (selectedStudentEmail) queryParams.set('studentEmail', selectedStudentEmail);
-        const resolvedStudentUid = ((activeStudent as any)?.studentUid || activeStudent?.uid || activeStudent?.id || '').trim();
+        const resolvedStudentUid = studentResolution.uid;
         if (resolvedStudentUid) queryParams.set('studentUid', resolvedStudentUid);
         if (sessionDate) queryParams.set('sessionDate', sessionDate);
 
@@ -805,6 +920,11 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       targetFileId?: string
     ) => {
       if (isSavingRef.current || driveSyncStatus === 'syncing') return;
+      if (studentResolution.error || !studentResolution.uid) {
+        setDriveSyncStatus('error');
+        setDriveSyncError(studentResolution.error || 'Erro de identidade: UID canônico da aluna ausente. Sincronização com o Google Drive bloqueada.');
+        return;
+      }
       isSavingRef.current = true;
       try {
         setDriveSyncStatus('syncing');
@@ -907,7 +1027,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             const firestore = getDb();
             if (firestore) {
               setDoc(doc(firestore, 'session_notes', sessionKey), drivePayload, { merge: true }).catch(() => null);
-              const userDocId = activeStudent?.uid || activeStudent?.id || (cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : '');
+              const userDocId = studentResolution.uid;
               if (userDocId) {
                 setDoc(doc(firestore, 'users', userDocId, 'session_notes', sessionKey), drivePayload, { merge: true }).catch(() => null);
               }
@@ -922,12 +1042,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           // 2. Server API sync with Drive metadata (skipDriveSync prevents duplicate Google Drive operations)
           try {
             const idToken = await auth.currentUser?.getIdToken().catch(() => null);
-            const resolvedStudentUid = (
-              (activeStudent as any)?.studentUid ||
-              activeStudent?.uid ||
-              activeLesson?.studentUid ||
-              ((activeStudent?.id && isValidCanonicalUid(activeStudent.id)) ? activeStudent.id : '')
-            ).trim();
+            const resolvedStudentUid = studentResolution.uid;
             const resolvedTeacherUid = (currentAccount?.uid || auth.currentUser?.uid || '').trim();
 
             fetch('/api/session-notes', {
@@ -978,6 +1093,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       }
     },
     [
+      studentResolution,
       selectedLessonId,
       activeLesson,
       selectedStudentEmail,
@@ -1002,6 +1118,19 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         return;
       }
 
+      // Check canonical student identity resolution
+      if (studentResolution.error || !studentResolution.uid) {
+        const errMsg =
+          studentResolution.error ||
+          'Erro de identidade: UID canônico da aluna ausente. O salvamento foi bloqueado para proteger a integridade dos dados.';
+        setSaveError(errMsg);
+        if (explicitSave) {
+          setSavedSuccessBanner(false);
+        }
+        return;
+      }
+
+      const resolvedStudentUid = studentResolution.uid;
       const targetLessonId = selectedLessonId || (activeLesson ? activeLesson.id : '');
       const cleanEmail = (selectedStudentEmail || '').toLowerCase().trim();
       const effectiveDate = sessionDate || new Date().toISOString().split('T')[0];
@@ -1040,21 +1169,15 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         // 1. Client-Side Firestore Persistence
         try {
           const firestore = getDb();
-          const resolvedStudentUid = (
-            (activeStudent as any)?.studentUid ||
-            activeStudent?.uid ||
-            activeLesson?.studentUid ||
-            ((activeStudent?.id && isValidCanonicalUid(activeStudent.id)) ? activeStudent.id : '')
-          ).trim();
           const resolvedTeacherUid = (currentAccount?.uid || auth.currentUser?.uid || '').trim();
 
-          if (firestore) {
+          if (firestore && resolvedStudentUid) {
             const documentPayload: SessionNotesDocument = {
               id: sessionKey,
               sessionDate: effectiveDate,
               lessonId: targetLessonId || undefined,
               studentEmail: cleanEmail,
-              studentUid: resolvedStudentUid || undefined,
+              studentUid: resolvedStudentUid,
               teacherUid: resolvedTeacherUid || undefined,
               teacherEmail: currentAccount?.email || '',
               teacherName: currentAccount?.name || 'Native Friend',
@@ -1074,9 +1197,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               merge: true,
             }).catch((err) => console.warn('Firestore /session_notes notice:', err));
 
-            const userDocId = resolvedStudentUid && isValidCanonicalUid(resolvedStudentUid)
-              ? resolvedStudentUid
-              : ((activeStudent?.id && isValidCanonicalUid(activeStudent.id)) ? activeStudent.id : '');
+            const userDocId = resolvedStudentUid;
             if (userDocId) {
               assertSafeFirestoreWrite(`users/${userDocId}/session_notes/${sessionKey}`, stampedPayload, undefined, true);
               setDoc(
@@ -1097,7 +1218,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   sessionDate: effectiveDate,
                   notesLastSavedAt: nowIso,
                   updatedAt: nowIso,
-                  studentUid: resolvedStudentUid || undefined,
+                  studentUid: resolvedStudentUid,
                   teacherUid: resolvedTeacherUid || undefined,
                   ...(driveFileId ? { driveFileId } : {}),
                   ...(driveFileUrl ? { driveFileUrl } : {}),
@@ -1115,15 +1236,9 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         // 2. Server API Persistence (ensures clean database and Firestore sync without touching Google Drive)
         try {
           const idToken = await auth.currentUser?.getIdToken().catch(() => null);
-          const resolvedStudentUid = (
-            (activeStudent as any)?.studentUid ||
-            activeStudent?.uid ||
-            activeLesson?.studentUid ||
-            ((activeStudent?.id && isValidCanonicalUid(activeStudent.id)) ? activeStudent.id : '')
-          ).trim();
           const resolvedTeacherUid = (currentAccount?.uid || auth.currentUser?.uid || '').trim();
 
-          await fetch('/api/session-notes', {
+          const apiRes = await fetch('/api/session-notes', {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -1135,7 +1250,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               lessonId: targetLessonId || undefined,
               studentEmail: cleanEmail,
               studentName: sName,
-              studentUid: resolvedStudentUid || undefined,
+              studentUid: resolvedStudentUid,
               teacherUid: resolvedTeacherUid || undefined,
               teacherEmail: currentAccount?.email || '',
               teacherName: currentAccount?.name || 'Native Friend',
@@ -1149,6 +1264,12 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               skipDriveSync: true,
             }),
           });
+          if (!apiRes.ok) {
+            const errData = await apiRes.json().catch(() => ({}));
+            setSaveError(errData.error || errData.message || 'Erro ao salvar notas no servidor.');
+          } else {
+            setSaveError(null);
+          }
         } catch (err) {
           console.warn('Server /api/session-notes notice:', err);
         }
@@ -1183,6 +1304,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       }
     },
     [
+      studentResolution,
       selectedStudentEmail,
       selectedLessonId,
       sessionDate,
@@ -2022,6 +2144,17 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
       {activeTab === 'editor' ? (
         <div className="space-y-4">
+          {/* Identity Error Banner */}
+          {Boolean(studentResolution.error || saveError) && (
+            <div className="p-3.5 bg-rose-50 border border-rose-200 rounded-2xl flex items-center gap-3 text-rose-800 text-xs font-semibold shadow-xs animate-in fade-in duration-200">
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+              <div className="flex-1">
+                <span className="font-bold">Aviso de Identidade: </span>
+                <span>{studentResolution.error || saveError}</span>
+              </div>
+            </div>
+          )}
+
           {/* Session Metadata & Topic Control Bar */}
           <div className="p-3.5 bg-slate-50 rounded-2xl border border-[#607EC9]/30 flex flex-col md:flex-row md:items-center gap-3 shadow-2xs">
             {/* Session Selector */}
@@ -2634,6 +2767,12 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-emerald-100 text-emerald-800 text-xs font-bold animate-in fade-in duration-200 shadow-2xs">
                   <CheckCircle2 className="w-4 h-4 text-emerald-600" />
                   <span>Document saved successfully to Firestore!</span>
+                </div>
+              )}
+              {saveError && (
+                <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-rose-100 text-rose-800 text-xs font-bold animate-in fade-in duration-200 shadow-2xs">
+                  <AlertCircle className="w-4 h-4 text-rose-600" />
+                  <span>{saveError}</span>
                 </div>
               )}
             </div>
