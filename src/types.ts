@@ -29,7 +29,7 @@ export type Language =
   | 'ar'
   | 'tr';
 
-export type UserRole = 'student' | 'teacher' | 'admin';
+export type UserRole = 'student' | 'teacher' | 'admin' | 'pending_teacher' | 'conflict' | 'unregistered';
 
 export interface NativeFriendTutor {
   id: string;

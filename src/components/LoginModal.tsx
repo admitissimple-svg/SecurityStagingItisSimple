@@ -252,7 +252,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
       }
 
       const data = await res.json();
-      const verifiedRole: UserRole = data.account?.role || 'student';
+      const verifiedRole: UserRole = data.account?.role || 'unregistered';
 
       // Strict Defense-in-Depth: If Administrator was requested, user MUST be verified as admin
       if (selectedRole === 'admin' && verifiedRole !== 'admin') {
@@ -302,7 +302,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
             window.history.replaceState({ page: 'admin' }, '', '/admin');
           } catch {}
         }
-      } else {
+      } else if (verifiedRole === 'student') {
         if (typeof window !== 'undefined') {
           try {
             window.history.replaceState({ page: 'dashboard' }, '', '/dashboard');

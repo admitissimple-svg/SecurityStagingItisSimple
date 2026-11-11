@@ -334,7 +334,7 @@ async function runIdentityCriticalTestSuite() {
       // Route guard simulation:
       let accessGranted = false;
       let redirectPath = '';
-      if (resolved.role === 'teacher' || resolved.role === 'admin') {
+      if ((resolved.role as string) === 'teacher' || (resolved.role as string) === 'admin') {
         accessGranted = true;
       } else {
         accessGranted = false;
@@ -418,8 +418,8 @@ async function runIdentityCriticalTestSuite() {
     // TEST 9: Perfil com UID divergente, sem promoção ou rebaixamento automático
     // ------------------------------------------------------------------------
     await test('9. Perfil com UID divergente retorna estado explícito de conflito sem rebaixamento ou promoção automática', async () => {
-      const authUid = 'uid-auth-canonical-09';
-      const divergentDocUid = 'uid-divergent-db-99';
+      const authUid: string = 'uid-auth-canonical-09';
+      const divergentDocUid: string = 'uid-divergent-db-99';
       const email = 'user.divergent09@example.com';
 
       // Simulação da verificação de UID canônico
@@ -673,6 +673,7 @@ async function runIdentityCriticalTestSuite() {
   if (failed > 0) {
     process.exit(1);
   }
+  process.exit(0);
 }
 
 runIdentityCriticalTestSuite().catch((err) => {

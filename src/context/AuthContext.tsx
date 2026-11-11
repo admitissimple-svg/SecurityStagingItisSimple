@@ -168,8 +168,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
               });
               if (verifyRes.ok) {
                 const verifyData = await verifyRes.json();
-                if (verifyData.role === 'admin' || verifyData.role === 'teacher' || verifyData.role === 'student') {
+                if (verifyData.role === 'admin' || verifyData.role === 'teacher' || verifyData.role === 'student' || verifyData.role === 'pending_teacher' || verifyData.role === 'conflict') {
                   resolvedRole = verifyData.role;
+                }
+              } else if (verifyRes.status === 409) {
+                resolvedRole = 'conflict';
+              } else if (verifyRes.status === 403) {
+                const errData = await verifyRes.json().catch(() => ({}));
+                if (errData?.approvalStatus === 'pending' || errData?.role === 'pending_teacher') {
+                  resolvedRole = 'pending_teacher';
                 }
               }
             } catch {}
@@ -444,7 +451,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         picture: user.photoURL || '',
       };
 
-      const targetRole = (account.role || preferredRole || 'student') as UserRole;
+      const targetRole = (account.role || 'unregistered') as UserRole;
       setCurrentAccount(account);
       if (data.profile) {
         setUserProfile(data.profile);
@@ -505,7 +512,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         firebaseUser,
         currentAccount,
         userProfile,
-        userRole: currentAccount?.role || 'student',
+        userRole: currentAccount?.role || 'unregistered',
         isLoading,
         error,
         selectedRole,

@@ -643,7 +643,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
         if (res.ok) {
           const data = await res.json();
-          const verifiedRole: UserRole = data.account?.role || 'student';
+          const verifiedRole: UserRole = data.account?.role || 'unregistered';
           setRole(verifiedRole);
 
           const account: GoogleAccount = data.account || {
@@ -666,7 +666,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 window.history.replaceState({ page: 'admin' }, '', '/admin');
               } catch {}
             }
-          } else {
+          } else if (verifiedRole === 'student') {
             if (typeof window !== 'undefined') {
               try {
                 window.history.replaceState({ page: 'dashboard' }, '', '/dashboard');

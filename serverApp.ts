@@ -2587,8 +2587,18 @@ app.post('/api/auth/google', async (req, res) => {
       isRoleEnforced = true;
       console.warn(`[RBAC Google] Blocked teacher ${cleanEmail} from accessing admin panel.`);
     }
+  } else if (resolution.role === 'pending_teacher') {
+    role = 'pending_teacher';
+    displayName = resolution.name || displayName;
+  } else if (resolution.role === 'student') {
+    role = 'student';
+    displayName = resolution.name || displayName;
+    if (requestedRole && requestedRole !== 'student') {
+      isRoleEnforced = true;
+      console.warn(`[RBAC Google] Blocked student ${cleanEmail} from accessing ${requestedRole} panel. Locked to student space.`);
+    }
   } else {
-    // Student, unapproved candidate, or default safe role
+    // Student, unapproved candidate, or unverified teacher request -> Lock strictly to student space
     role = 'student';
     if (requestedRole && requestedRole !== 'student') {
       isRoleEnforced = true;
@@ -2607,21 +2617,14 @@ app.post('/api/auth/google', async (req, res) => {
       createdAt: new Date().toISOString(),
     };
   } else {
-    const existingAuthRole = db.authUsers[cleanEmail].role;
-    if (existingAuthRole === 'student') {
-      db.authUsers[cleanEmail].role = 'student';
-    } else if (existingAuthRole === 'teacher' && resolution.role === 'teacher') {
-      db.authUsers[cleanEmail].role = 'teacher';
-    } else {
-      db.authUsers[cleanEmail].role = role;
-    }
+    db.authUsers[cleanEmail].role = role;
     if (targetUid && !db.authUsers[cleanEmail].uid) {
       db.authUsers[cleanEmail].uid = targetUid;
     }
   }
 
-  // If new student, add to students list
-  if (role === 'student') {
+  // If new legitimate student, add to students list (NEVER for teachers or pending teachers)
+  if (role === 'student' && resolution.role !== 'teacher' && resolution.role !== 'pending_teacher') {
     const existing = db.students.find(
       (s) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail
     );

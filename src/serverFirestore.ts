@@ -610,7 +610,7 @@ export async function resolveCanonicalUserRoleAndIdentity(params: {
           const dData = docSnap.data();
           const docStoredUid = dData?.uid || dData?.id || docSnap.id;
           if (docStoredUid && isValidCanonicalUid(docStoredUid) && docStoredUid !== cleanUid) {
-            console.warn(`[resolveCanonicalUserRoleAndIdentity] Divergent UID detected: doc ${docSnap.id} has uid ${docStoredUid} vs authenticated ${cleanUid}`);
+            console.warn(`[resolveCanonicalUserRoleAndIdentity] Divergent UID detected in users: doc ${docSnap.id} has uid ${docStoredUid} vs authenticated ${cleanUid}`);
             return {
               role: 'conflict',
               identityStatus: 'divergent_uid',
@@ -621,8 +621,45 @@ export async function resolveCanonicalUserRoleAndIdentity(params: {
           }
         }
       }
+
+      const qTutorEmail = await db.collection('tutors').where('email', '==', cleanEmail).get().catch(() => null);
+      if (qTutorEmail && !qTutorEmail.empty) {
+        for (const docSnap of qTutorEmail.docs) {
+          const dData = docSnap.data();
+          const docStoredUid = dData?.uid || dData?.authUid;
+          if (docStoredUid && isValidCanonicalUid(docStoredUid) && docStoredUid !== cleanUid) {
+            console.warn(`[resolveCanonicalUserRoleAndIdentity] Divergent UID detected in tutors: doc ${docSnap.id} has uid ${docStoredUid} vs authenticated ${cleanUid}`);
+            return {
+              role: 'conflict',
+              identityStatus: 'divergent_uid',
+              uid: cleanUid,
+              email: cleanEmail,
+              message: 'Perfil de tutor com UID divergente detectado. Operação suspensa para reconciliação.',
+            };
+          }
+        }
+      }
     } catch (e) {
       console.warn('[resolveCanonicalUserRoleAndIdentity] Notice checking divergent UID:', e);
+    }
+  }
+
+  // Verificação de UID divergente em memória
+  if (cleanEmail && dbState) {
+    const divergentMemTutor = (dbState.teachers || dbState.tutorsList || []).find(
+      (t: any) =>
+        (t.email || '').toLowerCase() === cleanEmail &&
+        (t.uid || t.authUid) &&
+        (t.uid !== cleanUid && t.authUid !== cleanUid)
+    );
+    if (divergentMemTutor) {
+      return {
+        role: 'conflict',
+        identityStatus: 'divergent_uid',
+        uid: cleanUid,
+        email: cleanEmail,
+        message: 'Perfil com UID divergente detectado em memória. Operação suspensa para reconciliação.',
+      };
     }
   }
 
@@ -681,7 +718,9 @@ export async function resolveCanonicalUserRoleAndIdentity(params: {
 
   if (!linkedTutorData && dbState) {
     const memTutor = (dbState.teachers || dbState.tutorsList || []).find(
-      (t: any) => (t.uid === cleanUid || t.authUid === cleanUid || t.id === cleanUid || (t.email || '').toLowerCase() === cleanEmail) && t.role !== 'student'
+      (t: any) =>
+        (t.uid === cleanUid || t.authUid === cleanUid || (t.id === cleanUid && isValidCanonicalUid(t.id))) &&
+        t.role !== 'student'
     );
     if (memTutor) {
       linkedTutorData = memTutor;

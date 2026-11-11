@@ -174,7 +174,7 @@ import { ManageSubscriptionModal } from './components/ManageSubscriptionModal';
 import { RoutineRemindersManager } from './components/RoutineRemindersManager';
 import { OnboardingWizardModal, OnboardingResultData } from './components/OnboardingWizardModal';
 import { StartLivingEmailModal } from './components/StartLivingEmailModal';
-import { ShieldCheck, Edit3, Sparkles, Headphones, BookOpen, Video, X, User, CheckCircle2, ChevronRight, MessageSquareQuote, Layers } from 'lucide-react';
+import { ShieldCheck, Edit3, Sparkles, Headphones, BookOpen, Video, X, User, CheckCircle2, ChevronRight, MessageSquareQuote, Layers, AlertCircle, Clock } from 'lucide-react';
 
 const createDefaultStudentProfile = (account?: GoogleAccount | null): UserProfile => {
   const effectiveUid = account?.uid || auth?.currentUser?.uid || account?.id || '';
@@ -378,6 +378,8 @@ export default function App() {
 
         // Se backend não respondeu (ex: offline temporário), inspeciona estritamente Firestore em modo leitura
         // JAMAIS grava perfil de student durante F5 ou login
+        // Se backend não respondeu (ex: offline temporário), inspeciona estritamente Firestore em modo leitura
+        // JAMAIS grava perfil de student durante F5 ou login
         if (!resolvedRole && !isConflict && !isPending) {
           try {
             const db = getDb();
@@ -387,7 +389,20 @@ export default function App() {
                 getDoc(doc(db, 'tutors', fbUid)).catch(() => null),
               ]);
               const uData = uSnap && uSnap.exists() ? uSnap.data() : null;
-              const tData = tSnap && tSnap.exists() ? tSnap.data() : null;
+              let tData = tSnap && tSnap.exists() ? tSnap.data() : null;
+
+              if (!tData) {
+                const qUid = await getDocs(query(collection(db, 'tutors'), where('uid', '==', fbUid))).catch(() => null);
+                if (qUid && !qUid.empty) {
+                  tData = qUid.docs[0].data();
+                } else {
+                  const qAuthUid = await getDocs(query(collection(db, 'tutors'), where('authUid', '==', fbUid))).catch(() => null);
+                  if (qAuthUid && !qAuthUid.empty) {
+                    tData = qAuthUid.docs[0].data();
+                  }
+                }
+              }
+
               const uRole = (uData?.role || uData?.userRole || '').toLowerCase().trim();
               const isTutorApproved = Boolean(
                 tData && (tData.role === 'teacher' || tData.role === 'native_friend' || tData.isTeacher) &&
@@ -407,6 +422,8 @@ export default function App() {
                 resolvedRole = 'admin';
               } else if (uRole === 'student') {
                 resolvedRole = 'student';
+              } else if (tData && (tData.approvalStatus === 'pending' || tData.isApproved === false)) {
+                isPending = true;
               }
             }
           } catch {}
@@ -443,11 +460,17 @@ export default function App() {
           }
         }
 
+        const finalRole: UserRole = isConflict
+          ? 'conflict'
+          : isPending
+            ? 'pending_teacher'
+            : (resolvedRole || 'unregistered');
+
         const account: GoogleAccount = {
           uid: fbUid,
           email: cleanEmail,
           name: authoritativeName,
-          role: resolvedRole,
+          role: finalRole,
           picture: authoritativePicture,
         };
 
@@ -925,12 +948,15 @@ export default function App() {
                   const data = await res.json();
                   if (data.role !== 'teacher' && data.role !== 'admin') {
                     // Backend denied teacher authorization!
-                    setCurrentAccount((prev) => (prev ? { ...prev, role: 'student' } : null));
+                    const verifiedRole: UserRole = (data.role || 'unregistered') as UserRole;
+                    setCurrentAccount((prev) => (prev ? { ...prev, role: verifiedRole } : null));
                     setIsEditTutorProfileOpen(false);
-                    try {
-                      window.history.replaceState({ page: 'dashboard' }, '', '/dashboard');
-                    } catch {}
-                    setViewMode('dashboard');
+                    if (verifiedRole === 'student') {
+                      try {
+                        window.history.replaceState({ page: 'dashboard' }, '', '/dashboard');
+                      } catch {}
+                      setViewMode('dashboard');
+                    }
                     setNotifications((prev) => [
                       {
                         id: `rbac-teacher-backend-guard-${Date.now()}`,
@@ -948,22 +974,12 @@ export default function App() {
                     setViewMode('dashboard');
                   }
                 } else {
-                  // Verification endpoint failed -> block privilege elevation (Rule 6)
-                  setCurrentAccount((prev) => (prev ? { ...prev, role: 'student' } : null));
-                  setIsEditTutorProfileOpen(false);
-                  try {
-                    window.history.replaceState({ page: 'dashboard' }, '', '/dashboard');
-                  } catch {}
-                  setViewMode('dashboard');
+                  // Temporary verification endpoint error / timeout -> DO NOT downgrade teacher to student (FASE IDENTITY-CRITICAL.2)
+                  console.warn('[App Auth] Verify session notice on /teacher:', res.status);
                 }
-              } catch {
-                // Network or server error -> block privilege elevation (Rule 6)
-                setCurrentAccount((prev) => (prev ? { ...prev, role: 'student' } : null));
-                setIsEditTutorProfileOpen(false);
-                try {
-                  window.history.replaceState({ page: 'dashboard' }, '', '/dashboard');
-                } catch {}
-                setViewMode('dashboard');
+              } catch (netErr) {
+                // Network or server glitch -> DO NOT downgrade teacher to student (FASE IDENTITY-CRITICAL.2)
+                console.warn('[App Auth] Network error verifying /teacher session:', netErr);
               }
             }).catch(() => {});
           } else if (currentAccount.role === 'admin') {
@@ -7047,7 +7063,17 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[#FAFCFF] text-[#000035] flex flex-col font-sans selection:bg-[#9AB4FF]/40 selection:text-[#000035]">
       {/* 1. Conditional View Rendering: Landing Page vs Dashboard vs Find Tutors */}
-      {viewMode === 'landing' || (!currentAccount && viewMode !== 'find-tutors') ? (
+      {!isAuthReady && auth.currentUser ? (
+        <div className="flex-1 min-h-[60vh] flex flex-col items-center justify-center p-6 text-center space-y-4">
+          <div className="w-10 h-10 border-4 border-[#062863] border-t-transparent rounded-full animate-spin" />
+          <h2 className="text-base font-bold text-[#000035]">
+            {currentLanguage === 'en' ? 'Verifying authentication...' : 'Verificando autenticação...'}
+          </h2>
+          <p className="text-xs text-slate-500">
+            {currentLanguage === 'en' ? 'Confirming canonical user authorization with backend.' : 'Aguardando resolução autoritativa de identidade.'}
+          </p>
+        </div>
+      ) : viewMode === 'landing' || (!currentAccount && viewMode !== 'find-tutors') ? (
         <LandingPage
           tutors={tutors}
           currentLanguage={currentLanguage}
@@ -7592,7 +7618,53 @@ export default function App() {
                   );
                 })() : null}
               </div>
-            ) : (
+            ) : currentAccount?.role === 'conflict' ? (
+              <div className="bg-amber-50 border border-amber-300 rounded-3xl p-8 text-center space-y-4 shadow-sm my-6">
+                <div className="w-16 h-16 mx-auto rounded-2xl bg-amber-500 text-white flex items-center justify-center font-black shadow-md">
+                  <AlertCircle className="w-8 h-8" />
+                </div>
+                <h2 className="text-xl font-black text-[#000035]">
+                  {currentLanguage === 'en' ? 'Identity Conflict Detected' : 'Conflito de Identidade Detectado'}
+                </h2>
+                <p className="text-sm text-slate-700 max-w-xl mx-auto">
+                  {currentLanguage === 'en'
+                    ? 'A cadastral divergence was detected between authorized profiles. Workspace access is suspended to protect data integrity. No changes were written.'
+                    : 'A conta autenticada possui divergência cadastral entre perfis autorizados. O acesso ao painel foi suspenso para garantir a integridade dos seus dados. Nenhuma alteração foi gravada.'}
+                </p>
+                <div className="pt-2">
+                  <button
+                    type="button"
+                    onClick={handleLogout}
+                    className="px-5 py-2.5 rounded-xl bg-[#000035] hover:bg-[#062863] text-white font-bold text-xs transition cursor-pointer"
+                  >
+                    {currentLanguage === 'en' ? 'Sign Out' : 'Sair da Conta'}
+                  </button>
+                </div>
+              </div>
+            ) : currentAccount?.role === 'pending_teacher' ? (
+              <div className="bg-blue-50 border border-blue-200 rounded-3xl p-8 text-center space-y-4 shadow-sm my-6">
+                <div className="w-16 h-16 mx-auto rounded-2xl bg-blue-600 text-white flex items-center justify-center font-black shadow-md">
+                  <Clock className="w-8 h-8" />
+                </div>
+                <h2 className="text-xl font-black text-[#000035]">
+                  {currentLanguage === 'en' ? 'Native Friend Application Under Review' : 'Cadastro de Amigo Nativo em Análise'}
+                </h2>
+                <p className="text-sm text-slate-700 max-w-xl mx-auto">
+                  {currentLanguage === 'en'
+                    ? 'Your teacher application was received and is awaiting administrator approval. You will receive an email once your account is activated.'
+                    : 'Seu cadastro de professor foi recebido com sucesso e está aguardando aprovação da administração. Você será notificado assim que sua conta for ativada.'}
+                </p>
+                <div className="pt-2">
+                  <button
+                    type="button"
+                    onClick={handleLogout}
+                    className="px-5 py-2.5 rounded-xl bg-[#000035] hover:bg-[#062863] text-white font-bold text-xs transition cursor-pointer"
+                  >
+                    {currentLanguage === 'en' ? 'Sign Out' : 'Sair da Conta'}
+                  </button>
+                </div>
+              </div>
+            ) : currentAccount?.role === 'student' ? (
               /* STUDENT VIEW: Exactly Following the 3 User Model Sections */
               <div className="flex flex-col gap-5 sm:gap-6" id="student-model-dashboard">
                 {/* Section 1: Contracted Lessons & Balance + Fixed Teacher Card + Live 1-on-1 Sessions Panel (Image 1) */}
@@ -7739,7 +7811,7 @@ export default function App() {
                   }}
                 />
               </div>
-            )}
+            ) : null}
           </main>
 
           {/* Footer with Discreet Easter Egg on © */}

@@ -167,44 +167,11 @@ export const GoogleSignInModal: React.FC<GoogleSignInModalProps> = ({
       account.id = user.uid;
 
       // Authoritative role resolution strictly from backend verification
-      const authoritativeRole: UserRole = isVerifiedAdmin ? 'admin' : (data.account?.role || data.role || 'student');
+      const authoritativeRole: UserRole = isVerifiedAdmin
+        ? 'admin'
+        : (data.account?.role || data.role || 'unregistered');
       verifiedRole = authoritativeRole;
       account.role = authoritativeRole;
-
-      if (authoritativeRole === 'student') {
-        if (typeof window !== 'undefined') {
-          const p = window.location.pathname;
-          const h = window.location.hash;
-          if (p === '/admin' || p === '/teacher' || h === '#admin' || h === '#teacher') {
-            try {
-              window.history.replaceState({ page: 'dashboard' }, '', '/dashboard');
-            } catch {}
-          }
-        }
-      }
-
-      // Identity Hardening: Eliminate automatic client writes capable of promoting users to teachers.
-      // Backend /api/auth/google is the authoritative entity for persistence and role assignment.
-      if (authoritativeRole === 'student' && user.uid) {
-        const db = getDb();
-        if (db) {
-          const studentProfilePayload: Record<string, any> = {
-            id: user.uid,
-            uid: user.uid,
-            email: cleanEmail,
-            name: account.name || user.displayName || cleanEmail.split('@')[0],
-            picture: account.picture || user.photoURL || '',
-            avatar: account.picture || user.photoURL || '',
-            level: firestoreUserDoc?.level || data?.profile?.level || 'iniciante',
-            ...(firestoreUserDoc || {}),
-            ...(data?.profile || {}),
-            updatedAt: new Date().toISOString(),
-          };
-          delete studentProfilePayload.role;
-          delete studentProfilePayload.userRole;
-          setDoc(doc(db, 'users', user.uid), studentProfilePayload, { merge: true }).catch(() => null);
-        }
-      }
 
       // 3. Redirection based strictly on authoritative backend role
       if (authoritativeRole === 'student') {
