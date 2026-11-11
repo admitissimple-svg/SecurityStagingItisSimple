@@ -3683,51 +3683,100 @@ export async function fetchSessionNotesFromFirestoreServer(sessionKey: string): 
 
 /**
  * Canonical retrieval of session notes for a verified student directly from Firestore (default).
+ * FASE NF-NOTES.6: Queries root session_notes where studentUid == studentUid and
+ * users/{studentUid}/session_notes, merging and deduplicating by session key.
  * Guarantees that rawContent is preserved regardless of AI status.
  */
 export async function fetchSessionNotesForStudentServer(studentUid: string, sessionKey?: string): Promise<any[]> {
   const db = getFirestoreDb();
   if (!db || !studentUid || !isValidCanonicalUid(studentUid)) return [];
   try {
+    const resultsMap = new Map<string, any>();
+
     if (sessionKey) {
       const cleanKey = sessionKey.replace(/[^a-zA-Z0-9_-]/g, '_');
+      // 1. Check user subcollection
       const snap = await db.collection('users').doc(studentUid).collection('session_notes').doc(cleanKey).get();
       if (snap && snap.exists) {
         const d = snap.data();
-        if (d && d.studentUid === studentUid) {
-          return [{ ...d, rawContent: d.rawContent || d.content, content: d.content || d.rawContent }];
+        if (d && (d.studentUid === studentUid || !d.studentUid)) {
+          return [{
+            id: snap.id,
+            ...d,
+            rawContent: d.rawContent || d.content,
+            content: d.content || d.rawContent,
+          }];
         }
       }
-      // Also check global session_notes with studentUid check
+      // 2. Check root collection session_notes
       const globalSnap = await db.collection('session_notes').doc(cleanKey).get();
       if (globalSnap && globalSnap.exists) {
         const d = globalSnap.data();
         if (d && d.studentUid === studentUid) {
-          return [{ ...d, rawContent: d.rawContent || d.content, content: d.content || d.rawContent }];
+          return [{
+            id: globalSnap.id,
+            ...d,
+            rawContent: d.rawContent || d.content,
+            content: d.content || d.rawContent,
+          }];
         }
       }
       return [];
     }
 
-    // List all notes for student from subcollection
-    const colSnap = await db.collection('users').doc(studentUid).collection('session_notes').get();
-    const results: any[] = [];
-    if (colSnap && !colSnap.empty) {
-      colSnap.forEach((docSnap) => {
-        if (docSnap.id === 'review_cycle') return;
-        const d = docSnap.data();
-        if (d && (d.studentUid === studentUid || !d.studentUid)) {
-          results.push({
-            id: docSnap.id,
-            ...d,
-            rawContent: d.rawContent || d.content || '',
-            content: d.content || d.rawContent || '',
-          });
-        }
-      });
+    // 1. Query root session_notes collection by studentUid
+    try {
+      const rootSnap = await db.collection('session_notes').where('studentUid', '==', studentUid).get();
+      if (rootSnap && !rootSnap.empty) {
+        rootSnap.forEach((docSnap) => {
+          const d = docSnap.data();
+          if (d && d.studentUid === studentUid) {
+            const rawContent = d.rawContent || d.content || '';
+            const key = docSnap.id;
+            resultsMap.set(key, {
+              id: key,
+              ...d,
+              rawContent,
+              content: d.content || rawContent,
+            });
+          }
+        });
+      }
+    } catch (rootErr) {
+      if (!isPermissionError(rootErr)) {
+        console.warn('[serverFirestore] root session_notes query notice:', rootErr);
+      }
     }
 
-    return results;
+    // 2. Query subcollection users/{studentUid}/session_notes
+    try {
+      const colSnap = await db.collection('users').doc(studentUid).collection('session_notes').get();
+      if (colSnap && !colSnap.empty) {
+        colSnap.forEach((docSnap) => {
+          if (docSnap.id === 'review_cycle') return;
+          const d = docSnap.data();
+          // In user subcollection: accept matches or historical records with no conflicting studentUid
+          if (d && (d.studentUid === studentUid || !d.studentUid)) {
+            const key = docSnap.id;
+            if (!resultsMap.has(key)) {
+              const rawContent = d.rawContent || d.content || '';
+              resultsMap.set(key, {
+                id: key,
+                ...d,
+                rawContent,
+                content: d.content || rawContent,
+              });
+            }
+          }
+        });
+      }
+    } catch (colErr) {
+      if (!isPermissionError(colErr)) {
+        console.warn('[serverFirestore] users/{studentUid}/session_notes query notice:', colErr);
+      }
+    }
+
+    return Array.from(resultsMap.values());
   } catch (err: any) {
     if (!isPermissionError(err)) {
       console.warn('[serverFirestore] fetchSessionNotesForStudentServer notice:', err);
@@ -5582,6 +5631,136 @@ export async function verifyTeacherLessonAccessServer(
         }
       }
     } catch {}
+  }
+
+  return false;
+}
+
+/**
+ * FASE NF-NOTES.6: Canonical verification of the pedagogical link between Student and Native Friend.
+ * Reuses the existing Student <-> Teacher pedagogical relationship already in Firestore (default)
+ * without creating parallel collections or secondary links.
+ * Identifies the student EXCLUSIVELY by their canonical Firebase Auth UID.
+ * Never uses email, display name, or lessonId as authorization credentials.
+ */
+export async function verifyCanonicalPedagogicalLinkServer(
+  teacherUid: string,
+  studentUid: string
+): Promise<boolean> {
+  const cleanTeacherUid = (teacherUid || '').trim();
+  const cleanStudentUid = (studentUid || '').trim();
+
+  // 1. Strict validation of canonical UIDs
+  if (
+    !cleanTeacherUid ||
+    !cleanStudentUid ||
+    !isValidCanonicalUid(cleanTeacherUid) ||
+    !isValidCanonicalUid(cleanStudentUid) ||
+    cleanTeacherUid === cleanStudentUid
+  ) {
+    return false;
+  }
+
+  const db = getFirestoreDb();
+
+  // 2. Check canonical Firestore (default): users/{studentUid}
+  if (db) {
+    try {
+      const userSnap = await db.collection('users').doc(cleanStudentUid).get();
+      if (userSnap.exists) {
+        const uData = userSnap.data();
+        const assignedUid = (
+          uData?.assignedNativeFriendUID ||
+          uData?.teacherUid ||
+          uData?.assignedTeacherId ||
+          uData?.assignedTutorId ||
+          ''
+        ).trim();
+        if (
+          assignedUid &&
+          (assignedUid === cleanTeacherUid || assignedUid === `tutor-${cleanTeacherUid}`)
+        ) {
+          return true;
+        }
+      }
+    } catch (fsErr) {
+      if (!isPermissionError(fsErr)) {
+        console.warn('[serverFirestore] verifyCanonicalPedagogicalLinkServer user doc notice:', fsErr);
+      }
+    }
+
+    // 3. Check canonical Firestore (default): lessons collection
+    try {
+      const lessonSnap = await db
+        .collection('lessons')
+        .where('studentUid', '==', cleanStudentUid)
+        .where('teacherUid', '==', cleanTeacherUid)
+        .get();
+      if (!lessonSnap.empty) {
+        const hasValidLesson = lessonSnap.docs.some((d) => {
+          const lData = d.data();
+          return lData.status !== 'cancelled' && lData.status !== 'canceled';
+        });
+        if (hasValidLesson || lessonSnap.docs.length > 0) {
+          return true;
+        }
+      }
+    } catch (fsErr) {
+      if (!isPermissionError(fsErr)) {
+        console.warn('[serverFirestore] verifyCanonicalPedagogicalLinkServer lessons notice:', fsErr);
+      }
+    }
+  }
+
+  // 4. Check authoritative in-memory / local state (getAuthoritativeDb)
+  const dbLocal = getAuthoritativeDb();
+  if (dbLocal) {
+    // 4a. Check student profile in dbLocal.students or dbLocal.userProfiles
+    const student = (dbLocal.students || []).find(
+      (s: any) =>
+        (s.uid && s.uid === cleanStudentUid) ||
+        (s.id && s.id === cleanStudentUid) ||
+        (s.studentUid && s.studentUid === cleanStudentUid)
+    );
+    const profile = Object.values(dbLocal.userProfiles || {}).find(
+      (p: any) => p.uid && p.uid === cleanStudentUid
+    ) as any;
+
+    const assignedUid = (
+      student?.assignedNativeFriendUID ||
+      student?.teacherUid ||
+      student?.assignedTeacherId ||
+      student?.assignedTutorId ||
+      profile?.assignedNativeFriendUID ||
+      profile?.teacherUid ||
+      profile?.assignedTeacherId ||
+      ''
+    ).trim();
+
+    if (
+      assignedUid &&
+      (assignedUid === cleanTeacherUid || assignedUid === `tutor-${cleanTeacherUid}`)
+    ) {
+      return true;
+    }
+
+    // 4b. Check lessons in dbLocal.liveLessons
+    const hasLesson = (dbLocal.liveLessons || []).some((l: any) => {
+      if (!l) return false;
+      const lStudentUid = (l.studentUid || '').trim();
+      const lTeacherUid = (l.teacherUid || (l as any).tutorUid || '').trim();
+      const match =
+        lStudentUid === cleanStudentUid &&
+        (lTeacherUid === cleanTeacherUid || lTeacherUid === `tutor-${cleanTeacherUid}`);
+      if (match && l.status !== 'cancelled' && l.status !== 'canceled') {
+        return true;
+      }
+      return match;
+    });
+
+    if (hasLesson) {
+      return true;
+    }
   }
 
   return false;

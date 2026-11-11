@@ -603,6 +603,7 @@ export interface SessionNotesDocument {
   lessonId?: string;
   studentEmail: string;
   studentUid?: string;
+  teacherUid?: string;
   teacherEmail?: string;
   teacherName?: string;
   topic?: string;

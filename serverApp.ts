@@ -128,6 +128,7 @@ import {
   fetchLessonInsightsFromFirestoreServer,
   saveLessonInsightsToFirestoreServer,
   verifyTeacherLessonAccessServer,
+  verifyCanonicalPedagogicalLinkServer,
   getStudentActivitiesBetweenLessonsServer,
   registerDbReader,
   advanceWeeklyCycleTransactionServer,
@@ -867,7 +868,7 @@ function writeDb(db: AppDb) {
 }
 
 // Immediate synchronous memory update + background Cloud Firestore sync
-async function writeDbSync(db: AppDb): Promise<void> {
+export async function writeDbSync(db: AppDb): Promise<void> {
   if (isDiagnosticMode()) {
     return; // Strictly no disk writes or cloud syncing in diagnostic mode
   }
@@ -2765,6 +2766,9 @@ app.post('/api/auth/google', async (req, res) => {
     const existing = db.students.find(
       (s) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail
     );
+    const incomingAssignedTeacher = (req.body.assignedNativeFriendUID || req.body.teacherUid || '').trim();
+    const validAssignedTeacher = (incomingAssignedTeacher && isValidCanonicalUid(incomingAssignedTeacher) && incomingAssignedTeacher !== (uid || targetUid)) ? incomingAssignedTeacher : null;
+
     if (!existing) {
       const canonicalStudentId = uid || db.authUsers[cleanEmail]?.uid || `st-${Date.now()}`;
       db.students.push({
@@ -2784,6 +2788,8 @@ app.post('/api/auth/google', async (req, res) => {
         completedLessonsCount: 0,
         teacherEmail: null,
         teacherName: null,
+        teacherUid: validAssignedTeacher,
+        assignedNativeFriendUID: validAssignedTeacher,
         routineVideoTime: '09:00',
         routineAudioTime: '14:00',
         dailyPhraseTime: '20:00',
@@ -2807,6 +2813,8 @@ app.post('/api/auth/google', async (req, res) => {
           level: 'iniciante',
           teacherEmail: null,
           teacherName: null,
+          teacherUid: validAssignedTeacher,
+          assignedNativeFriendUID: validAssignedTeacher,
           routineVideoTime: '09:00',
           routineAudioTime: '14:00',
           dailyPhraseTime: '20:00',
@@ -2823,10 +2831,18 @@ app.post('/api/auth/google', async (req, res) => {
     } else if (uid) {
       existing.id = uid;
       existing.uid = uid;
+      if (validAssignedTeacher) {
+        existing.assignedNativeFriendUID = validAssignedTeacher;
+        existing.teacherUid = validAssignedTeacher;
+      }
       if (db.userProfiles?.[cleanEmail]) {
         db.userProfiles[cleanEmail].id = uid;
         db.userProfiles[cleanEmail].uid = uid;
         db.userProfiles[cleanEmail].role = 'student';
+        if (validAssignedTeacher) {
+          db.userProfiles[cleanEmail].assignedNativeFriendUID = validAssignedTeacher;
+          db.userProfiles[cleanEmail].teacherUid = validAssignedTeacher;
+        }
       }
       writeDb(db);
     }
@@ -8606,10 +8622,20 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
     }
   }
 
-  // 2. Derive teacherUid strictly from verified token
-  const teacherUid = callerUid;
+  // 2. Derive teacherUid strictly from verified token (admins can specify canonical teacherUid)
+  const teacherUid = (isCallerAdmin && req.body?.teacherUid && isValidCanonicalUid(req.body.teacherUid))
+    ? req.body.teacherUid.trim()
+    : callerUid;
 
-  // 3. Resolve and validate studentUid (reject empty or non-canonical)
+  if (!teacherUid || !isValidCanonicalUid(teacherUid)) {
+    return res.status(400).json({
+      error: 'CANONICAL_TEACHER_UID_REQUIRED',
+      code: 'CANONICAL_TEACHER_UID_REQUIRED',
+      message: 'UID canônico do professor é obrigatório para registrar anotações pedagógicas.',
+    });
+  }
+
+  // 3. Resolve and validate studentUid (reject empty, non-canonical, or self-teacher)
   const incomingStudentUid = (req.body?.studentUid || '').trim();
   if (!incomingStudentUid || !isValidCanonicalUid(incomingStudentUid)) {
     return res.status(400).json({
@@ -8619,6 +8645,14 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
     });
   }
   const studentUid = incomingStudentUid;
+
+  if (teacherUid === studentUid) {
+    return res.status(400).json({
+      error: 'INVALID_PEDAGOGICAL_IDENTITY',
+      code: 'INVALID_PEDAGOGICAL_IDENTITY',
+      message: 'O UID do professor não pode ser igual ao UID do aluno.',
+    });
+  }
 
   // 4. Verify student identity exists in canonical persistence (do NOT auto-create mock users)
   let studentDoc: any = null;
@@ -8633,8 +8667,9 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
   } catch {}
 
   if (!studentDoc) {
-    const localMatch = (db.students || []).find((s: any) => s.uid === studentUid || s.id === studentUid) ||
-      Object.values(db.authUsers || {}).find((u: any) => u.uid === studentUid);
+    const localMatch = (db.students || []).find((s: any) => s.uid === studentUid || s.id === studentUid || s.studentUid === studentUid) ||
+      Object.values(db.authUsers || {}).find((u: any) => u.uid === studentUid) ||
+      Object.values(db.userProfiles || {}).find((p: any) => p.uid === studentUid);
     if (localMatch) {
       studentDoc = localMatch;
     }
@@ -8648,8 +8683,20 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
     });
   }
 
-  // 5. Verify pedagogical link and lesson student match
-  const lessonId = explicitLessonId || req.body?.lessonId || (req.body?.id && !req.body.id.startsWith('session_') ? req.body.id : '');
+  // 5. Verify pedagogical link between teacher and student (Admins exempt)
+  if (!isCallerAdmin) {
+    const hasAuthorizedPedagogicalLink = await verifyCanonicalPedagogicalLinkServer(teacherUid, studentUid);
+    if (!hasAuthorizedPedagogicalLink) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'UNAUTHORIZED_PEDAGOGICAL_LINK',
+        message: 'Amigo Nativo não possui vínculo pedagógico autorizado com este aluno.',
+      });
+    }
+  }
+
+  // 6. Lesson check (optional)
+  const lessonId = (explicitLessonId || req.body?.lessonId || (req.body?.id && !req.body.id.startsWith('session_') ? req.body.id : '')).trim();
   let lesson: any = null;
   if (lessonId) {
     lesson = (db.liveLessons || []).find((l: any) => l.id === lessonId);
@@ -8664,33 +8711,45 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
         }
       } catch {}
     }
+    if (lesson) {
+      if (lesson.studentUid && lesson.studentUid !== studentUid) {
+        return res.status(403).json({
+          error: 'STUDENT_LESSON_MISMATCH',
+          code: 'STUDENT_LESSON_MISMATCH',
+          message: 'A aula especificada pertence a outro aluno. Gravação bloqueada.',
+        });
+      }
+      if (!isCallerAdmin && lesson.teacherUid && lesson.teacherUid !== teacherUid) {
+        return res.status(403).json({
+          error: 'TEACHER_LESSON_MISMATCH',
+          code: 'TEACHER_LESSON_MISMATCH',
+          message: 'Amigo Nativo não autorizado para lecionar ou registrar esta aula.',
+        });
+      }
+    }
   }
 
-  if (lesson) {
-    if (lesson.studentUid && lesson.studentUid !== studentUid) {
-      return res.status(403).json({
-        error: 'STUDENT_LESSON_MISMATCH',
-        code: 'STUDENT_LESSON_MISMATCH',
-        message: 'A aula especificada pertence a outro aluno. Gravação bloqueada.',
-      });
-    }
-    if (!isCallerAdmin && lesson.teacherUid && lesson.teacherUid !== teacherUid) {
-      return res.status(403).json({
-        error: 'TEACHER_LESSON_MISMATCH',
-        code: 'TEACHER_LESSON_MISMATCH',
-        message: 'Amigo Nativo não autorizado para lecionar ou registrar esta aula.',
-      });
-    }
-  }
-
-  // 6. Session date & stable canonical session key
+  // 7. Session date (mandatory YYYY-MM-DD)
   const rawDate = (
     req.body?.sessionDate ||
-    (lesson?.sessionDate || (lesson?.startDateTime ? lesson.startDateTime.split('T')[0] : '')) ||
-    new Date().toISOString().split('T')[0]
-  ).trim();
-  const dateMatch = rawDate.match(/^\d{4}-\d{2}-\d{2}$/);
-  const sessionDate = dateMatch ? rawDate : new Date().toISOString().split('T')[0];
+    (lesson?.sessionDate || (lesson?.startDateTime ? lesson.startDateTime.split('T')[0] : ''))
+  );
+  if (!rawDate || typeof rawDate !== 'string' || !rawDate.trim()) {
+    return res.status(400).json({
+      error: 'SESSION_DATE_REQUIRED',
+      code: 'SESSION_DATE_REQUIRED',
+      message: 'Data da sessão no formato YYYY-MM-DD é obrigatória para registrar anotações.',
+    });
+  }
+  const dateMatch = rawDate.trim().match(/^\d{4}-\d{2}-\d{2}$/);
+  if (!dateMatch) {
+    return res.status(400).json({
+      error: 'INVALID_SESSION_DATE',
+      code: 'INVALID_SESSION_DATE',
+      message: 'Data da sessão inválida. O formato exigido é YYYY-MM-DD.',
+    });
+  }
+  const sessionDate = dateMatch[0];
 
   const sessionKey = lessonId
     ? lessonId
@@ -8698,12 +8757,19 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
         ? req.body.id.trim()
         : `session_${sessionDate}_${studentUid}`);
 
-  // 7. Extract rawContent & content
+  // 8. Extract rawContent & content (mandatory)
   const rawContent = (
     req.body?.rawContent !== undefined
       ? req.body.rawContent
       : (req.body?.content || req.body?.sessionNotesDocument || req.body?.liveNotes || req.body?.recommendations || '')
   );
+  if (typeof rawContent !== 'string' || !rawContent.trim()) {
+    return res.status(400).json({
+      error: 'CONTENT_REQUIRED',
+      code: 'CONTENT_REQUIRED',
+      message: 'Conteúdo da anotação pedagógica é obrigatório.',
+    });
+  }
   const topic = req.body?.topic || lesson?.title || 'Live Coaching Session';
   const targetStudentEmail = (studentDoc?.email || req.body?.studentEmail || '').toLowerCase().trim();
 
@@ -9004,7 +9070,7 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
   const db = readDb();
 
   let isCallerTeacher = false;
-  if (!isCallerAdmin) {
+  if (!isCallerAdmin && req.user.role !== 'student') {
     try {
       const tRes = await resolveTeacherCanonicalIdentity({ teacherUid: callerUid, teacherEmail: req.user.email, dbState: db });
       if (tRes && tRes.isApproved) isCallerTeacher = true;
@@ -9027,6 +9093,18 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
   } else {
     // Admin or Teacher caller
     targetStudentUid = queryStudentUid;
+
+    // FASE NF-NOTES.6: If caller is a Teacher, verify authorized pedagogical link with target student
+    if (isCallerTeacher && !isCallerAdmin && targetStudentUid) {
+      const isAuthorized = await verifyCanonicalPedagogicalLinkServer(callerUid, targetStudentUid);
+      if (!isAuthorized) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          code: 'UNAUTHORIZED_PEDAGOGICAL_LINK',
+          message: 'Amigo Nativo não possui vínculo pedagógico autorizado com este aluno.',
+        });
+      }
+    }
   }
 
   // 2. Direct lookup by id or lessonId
@@ -9094,8 +9172,16 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
           return res.status(403).json({ error: 'Forbidden', message: 'Acesso negado a anotações de outro aluno.' });
         }
       } else if (isCallerTeacher && !isCallerAdmin) {
-        if (foundDoc.teacherUid && foundDoc.teacherUid !== callerUid) {
-          return res.status(403).json({ error: 'Forbidden', message: 'Acesso negado: professor não autorizado para esta anotação.' });
+        let isAuthorized = foundDoc.teacherUid === callerUid;
+        if (!isAuthorized && foundDoc.studentUid) {
+          isAuthorized = await verifyCanonicalPedagogicalLinkServer(callerUid, foundDoc.studentUid);
+        }
+        if (!isAuthorized) {
+          return res.status(403).json({
+            error: 'Forbidden',
+            code: 'UNAUTHORIZED_PEDAGOGICAL_LINK',
+            message: 'Acesso negado: professor não autorizado para esta anotação.',
+          });
         }
       }
       const rawContent = foundDoc.rawContent || foundDoc.content || '';
@@ -9196,7 +9282,12 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
     const results = Array.from(map.values()).sort((a: any, b: any) => {
       const timeA = getRealLessonTimestamp(a);
       const timeB = getRealLessonTimestamp(b);
-      return timeB - timeA;
+      if (timeB !== timeA) return timeB - timeA;
+      const dateCmp = (b.sessionDate || '').localeCompare(a.sessionDate || '');
+      if (dateCmp !== 0) return dateCmp;
+      const updateCmp = (b.updatedAt || b.createdAt || '').localeCompare(a.updatedAt || a.createdAt || '');
+      if (updateCmp !== 0) return updateCmp;
+      return (b.id || b.sessionKey || '').localeCompare(a.id || a.sessionKey || '');
     });
 
     if (sessionDate) {

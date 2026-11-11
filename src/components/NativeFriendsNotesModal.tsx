@@ -329,17 +329,16 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
     const sessionsMap = new Map<string, SessionOption>();
 
     try {
-      // 1. In-memory / passed lessons strictly matching authenticated student canonical UID or email
+      // 1. In-memory / passed lessons strictly matching authenticated student canonical UID exclusively
       if (Array.isArray(lessons)) {
         lessons.forEach((l) => {
           if (!l) return;
-          const lStudentUid = l.studentUid || (l as any)?.studentId || '';
-          const lStudentEmail = (l.studentEmail || (l as any)?.email || '').toLowerCase().trim();
+          const lStudentUid = (l.studentUid || (l as any)?.studentId || '').trim();
 
+          // Strictly canonical UID match only — never guess by email
           const matchesUid = resolvedUid && lStudentUid && lStudentUid === resolvedUid;
-          const matchesEmail = resolvedEmail && lStudentEmail && lStudentEmail === resolvedEmail;
 
-          if (matchesUid || matchesEmail) {
+          if (matchesUid) {
             const raw =
               l.sessionNotesDocument ||
               l.liveNotes ||
@@ -370,34 +369,67 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
         });
       }
 
-      // 2. Fetch Firestore /users/{studentUid}/session_notes and REST API /api/session-notes in parallel via Promise.allSettled
+      // 2. Fetch Firestore session_notes (root & user subcollection) and REST API /api/session-notes in parallel
       const firestoreTask = (async (): Promise<SessionOption[]> => {
         const firestore = getDb();
         if (!firestore || !resolvedUid) return [];
-        const userNotesCol = collection(firestore, 'users', resolvedUid, 'session_notes');
-        const snap = await getDocs(userNotesCol);
         const docs: SessionOption[] = [];
-        snap.forEach((docSnap) => {
-          if (docSnap.id === 'review_cycle') return;
-          const data = docSnap.data();
-          if (data && data.content && data.content.trim()) {
-            const { timestamp, dateStr } = extractRealLessonDateAndTimestamp({
-              sessionDate: data.sessionDate,
-              startDateTime: data.startDateTime,
-              id: docSnap.id,
-              key: docSnap.id,
-            });
-            docs.push({
-              key: docSnap.id,
-              lessonId: data.lessonId,
-              dateStr: dateStr || 'Session',
-              topic: data.topic || 'In-Session Coaching',
-              teacherName: data.teacherName || 'Native Friend',
-              rawContent: data.content,
-              timestamp,
-            });
-          }
-        });
+
+        // 2a. Query root session_notes where studentUid == resolvedUid
+        try {
+          const rootCol = collection(firestore, 'session_notes');
+          const rootQ = query(rootCol, where('studentUid', '==', resolvedUid));
+          const rootSnap = await getDocs(rootQ);
+          rootSnap.forEach((docSnap) => {
+            const data = docSnap.data();
+            if (data && data.content && data.content.trim() && data.studentUid === resolvedUid) {
+              const { timestamp, dateStr } = extractRealLessonDateAndTimestamp({
+                sessionDate: data.sessionDate,
+                startDateTime: data.startDateTime,
+                id: docSnap.id,
+                key: docSnap.id,
+              });
+              docs.push({
+                key: docSnap.id,
+                lessonId: data.lessonId,
+                dateStr: dateStr || 'Session',
+                topic: data.topic || 'In-Session Coaching',
+                teacherName: data.teacherName || 'Native Friend',
+                rawContent: data.content,
+                timestamp,
+              });
+            }
+          });
+        } catch {}
+
+        // 2b. Query subcollection users/{studentUid}/session_notes
+        try {
+          const userNotesCol = collection(firestore, 'users', resolvedUid, 'session_notes');
+          const snap = await getDocs(userNotesCol);
+          snap.forEach((docSnap) => {
+            if (docSnap.id === 'review_cycle') return;
+            const data = docSnap.data();
+            if (data && data.content && data.content.trim()) {
+              if (data.studentUid && data.studentUid !== resolvedUid) return;
+              const { timestamp, dateStr } = extractRealLessonDateAndTimestamp({
+                sessionDate: data.sessionDate,
+                startDateTime: data.startDateTime,
+                id: docSnap.id,
+                key: docSnap.id,
+              });
+              docs.push({
+                key: docSnap.id,
+                lessonId: data.lessonId,
+                dateStr: dateStr || 'Session',
+                topic: data.topic || 'In-Session Coaching',
+                teacherName: data.teacherName || 'Native Friend',
+                rawContent: data.content,
+                timestamp,
+              });
+            }
+          });
+        } catch {}
+
         return docs;
       })();
 
