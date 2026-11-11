@@ -434,16 +434,40 @@ export async function resolveTeacherCanonicalIdentity(
           return null;
         }
       } else {
-        // Rule 6: Absence of canonical profile blocks privilege elevation.
-        // If users/{resolvedUid} does not exist in Firestore, do not presume teacher.
-        // Exception: allow in isolated test mocks if explicit dbState contains an approved teacher record.
-        const dbState = (target && typeof target === 'object' && (target as any).dbState) || null;
-        const memoryTeacher = (dbState?.teachers || dbState?.tutorsList || []).find(
-          (t: any) => (t.uid === resolvedUid || t.id === resolvedUid || (t.email || '').toLowerCase() === email) && t.role !== 'student'
+        // Teacher without users/{resolvedUid} doc: verify canonical record in tutors/{resolvedUid}
+        const tutorSnap = await db.collection('tutors').doc(resolvedUid).get().catch(() => null);
+        let confirmedInTutors = Boolean(
+          tutorSnap && tutorSnap.exists && (tutorSnap.data()?.role !== 'student') &&
+          (tutorSnap.data()?.approvalStatus === 'approved') &&
+          (tutorSnap.data()?.isApproved === true)
         );
-        if (!memoryTeacher) {
-          console.warn(`[resolveTeacherCanonicalIdentity] Canonical profile users/${resolvedUid} does not exist. Blocking unverified teacher resolution.`);
-          return null;
+        if (!confirmedInTutors) {
+          const qTutorUid = await db.collection('tutors').where('uid', '==', resolvedUid).limit(1).get().catch(() => null);
+          if (qTutorUid && !qTutorUid.empty) {
+            const tDoc = qTutorUid.docs[0].data();
+            if (tDoc?.approvalStatus === 'approved' && tDoc?.isApproved === true && tDoc?.role !== 'student') {
+              confirmedInTutors = true;
+            }
+          }
+        }
+        if (!confirmedInTutors) {
+          const qTutorAuthUid = await db.collection('tutors').where('authUid', '==', resolvedUid).limit(1).get().catch(() => null);
+          if (qTutorAuthUid && !qTutorAuthUid.empty) {
+            const tDoc = qTutorAuthUid.docs[0].data();
+            if (tDoc?.approvalStatus === 'approved' && tDoc?.isApproved === true && tDoc?.role !== 'student') {
+              confirmedInTutors = true;
+            }
+          }
+        }
+        if (!confirmedInTutors) {
+          const dbState = (target && typeof target === 'object' && (target as any).dbState) || null;
+          const memoryTeacher = (dbState?.teachers || dbState?.tutorsList || []).find(
+            (t: any) => (t.uid === resolvedUid || t.id === resolvedUid || (t.email || '').toLowerCase() === email) && t.role !== 'student' && t.approvalStatus === 'approved'
+          );
+          if (!memoryTeacher) {
+            console.warn(`[resolveTeacherCanonicalIdentity] Canonical profile users/${resolvedUid} does not exist and no approved tutors record was found. Blocking unverified teacher resolution.`);
+            return null;
+          }
         }
       }
     } catch (fsErr) {
@@ -495,6 +519,298 @@ export async function resolveTeacherCanonicalIdentity(
     isApproved,
     role: 'teacher',
     rawDoc: consolidated,
+  };
+}
+
+export interface CanonicalIdentityResolutionResult {
+  role: 'student' | 'teacher' | 'admin' | 'pending_teacher' | 'conflict' | 'unregistered';
+  identityStatus: 'authorized' | 'pending_approval' | 'conflict' | 'unregistered' | 'divergent_uid';
+  uid: string;
+  email?: string;
+  name?: string;
+  approvalStatus?: 'approved' | 'pending' | 'rejected' | null;
+  publicTutorId?: string;
+  isApproved?: boolean;
+  message?: string;
+  rawDoc?: any;
+}
+
+/**
+ * FASE IDENTITY-CRITICAL.2: Resolução Canônica e Autoritativa de Identidade.
+ * UID verificado do Firebase Authentication é a chave canônica única.
+ * Inspeciona users/{auth.uid} e o registro tutors comprovadamente vinculado ao mesmo UID.
+ * Reconhece teacher somente se o vínculo for inequívoco, aprovado e ativo, sem conflitos.
+ * Na existência de conflito ou divergência de UID, retorna estado explícito pendente/conflito
+ * sem assumir automaticamente student e sem promover a teacher.
+ */
+export async function resolveCanonicalUserRoleAndIdentity(params: {
+  uid: string;
+  email?: string;
+  tokenRole?: string;
+  dbState?: any;
+}): Promise<CanonicalIdentityResolutionResult> {
+  const { uid, email, tokenRole, dbState } = params;
+  const cleanUid = (uid || '').trim();
+  const cleanEmail = (email || '').trim().toLowerCase();
+
+  // 1. Princípio de Identidade: UID canônico é a chave obrigatória
+  if (!cleanUid || !isValidCanonicalUid(cleanUid)) {
+    return {
+      role: 'unregistered',
+      identityStatus: 'unregistered',
+      uid: cleanUid,
+      email: cleanEmail,
+      message: 'UID canônico inválido ou ausente.',
+    };
+  }
+
+  const db = getFirestoreDb();
+
+  // 2. Resolução de Administrador
+  const isServerAdmin =
+    tokenRole === 'admin' ||
+    (dbState?.teachers || []).some(
+      (t: any) => t.role === 'admin' && (t.uid === cleanUid || t.id === cleanUid)
+    );
+
+  if (isServerAdmin) {
+    if (db) {
+      try {
+        const uSnap = await db.collection('users').doc(cleanUid).get().catch(() => null);
+        if (uSnap && uSnap.exists) {
+          const uRole = (uSnap.data()?.role || uSnap.data()?.userRole || '').toLowerCase().trim();
+          if (uRole === 'student') {
+            console.warn(`[resolveCanonicalUserRoleAndIdentity] Inconsistência: admin claim vs student em users/${cleanUid}.`);
+            return {
+              role: 'conflict',
+              identityStatus: 'conflict',
+              uid: cleanUid,
+              email: cleanEmail,
+              message: 'Inconsistência de identidade detectada: credencial administrativa em conta de aluno.',
+            };
+          }
+        }
+      } catch {}
+    }
+    return {
+      role: 'admin',
+      identityStatus: 'authorized',
+      uid: cleanUid,
+      email: cleanEmail,
+      name: 'Admin',
+    };
+  }
+
+  // 3. Verificação de UID Divergente: Documento com mesmo e-mail mas UID divergente
+  if (cleanEmail && db) {
+    try {
+      const qEmail = await db.collection('users').where('email', '==', cleanEmail).get().catch(() => null);
+      if (qEmail && !qEmail.empty) {
+        for (const docSnap of qEmail.docs) {
+          const dData = docSnap.data();
+          const docStoredUid = dData?.uid || dData?.id || docSnap.id;
+          if (docStoredUid && isValidCanonicalUid(docStoredUid) && docStoredUid !== cleanUid) {
+            console.warn(`[resolveCanonicalUserRoleAndIdentity] Divergent UID detected: doc ${docSnap.id} has uid ${docStoredUid} vs authenticated ${cleanUid}`);
+            return {
+              role: 'conflict',
+              identityStatus: 'divergent_uid',
+              uid: cleanUid,
+              email: cleanEmail,
+              message: 'Perfil com UID divergente detectado. Operação suspensa para reconciliação.',
+            };
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[resolveCanonicalUserRoleAndIdentity] Notice checking divergent UID:', e);
+    }
+  }
+
+  // 4. Inspeção autoritativa pontual em users/{cleanUid} e registro tutors vinculado ao mesmo UID
+  let userData: any = null;
+  let linkedTutorData: any = null;
+
+  if (db) {
+    try {
+      // 4.1 Inspecionar users/{cleanUid}
+      const userSnap = await db.collection('users').doc(cleanUid).get().catch(() => null);
+      if (userSnap && userSnap.exists) {
+        userData = userSnap.data();
+      }
+
+      // 4.2 Inspecionar tutors/{cleanUid}
+      const tutorSnap = await db.collection('tutors').doc(cleanUid).get().catch(() => null);
+      if (tutorSnap && tutorSnap.exists) {
+        linkedTutorData = { id: tutorSnap.id, ...tutorSnap.data() };
+      }
+
+      // 4.3 Inspecionar tutors where uid == cleanUid
+      if (!linkedTutorData) {
+        const qUid = await db.collection('tutors').where('uid', '==', cleanUid).limit(1).get().catch(() => null);
+        if (qUid && !qUid.empty) {
+          linkedTutorData = { id: qUid.docs[0].id, ...qUid.docs[0].data() };
+        }
+      }
+
+      // 4.4 Inspecionar tutors where authUid == cleanUid
+      if (!linkedTutorData) {
+        const qAuthUid = await db.collection('tutors').where('authUid', '==', cleanUid).limit(1).get().catch(() => null);
+        if (qAuthUid && !qAuthUid.empty) {
+          linkedTutorData = { id: qAuthUid.docs[0].id, ...qAuthUid.docs[0].data() };
+        }
+      }
+    } catch (fsErr) {
+      console.warn('[resolveCanonicalUserRoleAndIdentity] Notice querying Firestore identity:', fsErr);
+    }
+  }
+
+  // Fallback para memória em dbState se Firestore não estiver instanciado ou em ambiente de teste isolado
+  if (!userData && dbState) {
+    const memStudent = (dbState.students || []).find(
+      (s: any) => (s.uid === cleanUid || s.id === cleanUid || (s.email || s.studentEmail || '').toLowerCase() === cleanEmail)
+    );
+    if (memStudent) {
+      userData = { ...memStudent, role: 'student' };
+    } else {
+      const memProfile = dbState.userProfiles?.[cleanEmail] || (cleanUid && Object.values(dbState.userProfiles || {}).find((p: any) => p?.uid === cleanUid));
+      if (memProfile && (memProfile.role === 'student' || !memProfile.role)) {
+        userData = { ...memProfile, role: 'student' };
+      }
+    }
+  }
+
+  if (!linkedTutorData && dbState) {
+    const memTutor = (dbState.teachers || dbState.tutorsList || []).find(
+      (t: any) => (t.uid === cleanUid || t.authUid === cleanUid || t.id === cleanUid || (t.email || '').toLowerCase() === cleanEmail) && t.role !== 'student'
+    );
+    if (memTutor) {
+      linkedTutorData = memTutor;
+    }
+  }
+
+  const userRole = (userData?.role || userData?.userRole || '').toLowerCase().trim();
+  const tutorRole = (linkedTutorData?.role || (linkedTutorData?.isTeacher ? 'teacher' : '')).toLowerCase().trim();
+
+  const isTokenTeacher = tokenRole === 'teacher';
+
+  const isUserApprovedTeacher = Boolean(
+    userData &&
+    (userRole === 'teacher' || userRole === 'native_friend') &&
+    userData.approvalStatus === 'approved' &&
+    userData.isApproved === true
+  );
+
+  const isTutorApproved = Boolean(
+    (linkedTutorData &&
+      (tutorRole === 'teacher' || tutorRole === 'native_friend' || tutorRole === 'tutor' || linkedTutorData.isTeacher === true) &&
+      linkedTutorData.approvalStatus === 'approved' &&
+      linkedTutorData.isApproved === true) ||
+    (isTokenTeacher && (!linkedTutorData || linkedTutorData.approvalStatus !== 'pending'))
+  );
+
+  const isTutorPending = Boolean(
+    linkedTutorData &&
+    !isTutorApproved &&
+    (linkedTutorData.approvalStatus === 'pending' || linkedTutorData.isApproved === false || linkedTutorData.status === 'pending')
+  );
+
+  // 5. Conflito de Identidade: Registro em users/{uid} como student mas aprovado em tutors
+  if (userData && userRole === 'student') {
+    if (isTutorApproved || isTokenTeacher) {
+      console.warn(`[resolveCanonicalUserRoleAndIdentity] Conflito de identidade detectado para ${cleanUid}: aluno em users vs professor aprovado em tutors.`);
+      return {
+        role: 'conflict',
+        identityStatus: 'conflict',
+        uid: cleanUid,
+        email: cleanEmail,
+        message: 'Conflito de identidade não resolvido entre perfil de aluno e tutor aprovado.',
+        rawDoc: { user: userData, tutor: linkedTutorData },
+      };
+    }
+    // Aluno legítimo com documento residual ou não-aprovado em tutors -> Permanece student sem promoção
+    return {
+      role: 'student',
+      identityStatus: 'authorized',
+      uid: cleanUid,
+      email: userData.email || cleanEmail,
+      name: userData.name || cleanEmail.split('@')[0],
+      rawDoc: userData,
+    };
+  }
+
+  // 6. Professor Aprovado com vínculo inequívoco ao UID autenticado
+  if (isUserApprovedTeacher || isTutorApproved || isTokenTeacher) {
+    const effectiveTutorDoc = linkedTutorData || userData;
+    const name = effectiveTutorDoc?.name || userData?.name || 'Native Friend';
+    const publicTutorId =
+      effectiveTutorDoc?.publicTutorId ||
+      effectiveTutorDoc?.id ||
+      cleanUid;
+
+    return {
+      role: 'teacher',
+      identityStatus: 'authorized',
+      uid: cleanUid,
+      email: effectiveTutorDoc?.email || userData?.email || cleanEmail,
+      name,
+      publicTutorId,
+      approvalStatus: 'approved',
+      isApproved: true,
+      rawDoc: effectiveTutorDoc,
+    };
+  }
+
+  // 7. Conta de tutor ainda não aprovada (sem privilégios de professor)
+  if (isTutorPending) {
+    return {
+      role: 'pending_teacher',
+      identityStatus: 'pending_approval',
+      uid: cleanUid,
+      email: linkedTutorData?.email || cleanEmail,
+      name: linkedTutorData?.name,
+      approvalStatus: 'pending',
+      isApproved: false,
+      message: 'Seu cadastro de Amigo Nativo está em análise e aguarda aprovação da administração.',
+      rawDoc: linkedTutorData,
+    };
+  }
+
+  // 7.1 Aluno autenticado com custom claim ou papel verificado de student no token Firebase
+  if (tokenRole === 'student' && !isTutorApproved && !isUserApprovedTeacher) {
+    return {
+      role: 'student',
+      identityStatus: 'authorized',
+      uid: cleanUid,
+      email: cleanEmail,
+      name: userData?.name || cleanEmail.split('@')[0],
+      rawDoc: userData || { uid: cleanUid, email: cleanEmail, role: 'student' },
+    };
+  }
+
+  // 8. Aluno registrado em dbState em memória
+  if (dbState) {
+    const memoryStudent = (dbState.students || []).find(
+      (s: any) => s.uid === cleanUid || (s.email || s.studentEmail || '').toLowerCase() === cleanEmail
+    );
+    if (memoryStudent) {
+      return {
+        role: 'student',
+        identityStatus: 'authorized',
+        uid: cleanUid,
+        email: memoryStudent.email || cleanEmail,
+        name: memoryStudent.name || cleanEmail.split('@')[0],
+        rawDoc: memoryStudent,
+      };
+    }
+  }
+
+  // 9. Perfil ausente na base canônica (NUNCA assume student como fallback silencioso)
+  return {
+    role: 'unregistered',
+    identityStatus: 'unregistered',
+    uid: cleanUid,
+    email: cleanEmail,
+    message: 'Perfil não encontrado na base canônica.',
   };
 }
 
@@ -1435,9 +1751,9 @@ export async function fetchUserFromFirestore(email: string, uid?: string): Promi
         const snapEmail = await db.collection('users').doc(cleanDocId).get().catch(() => null);
         if (snapEmail && snapEmail.exists) {
           const data = snapEmail.data();
-          // Rule D & 6: Legacy email-keyed doc cannot confer teacher privileges
-          if (data && (data.role === 'teacher' || data.role === 'native_friend') && uid) {
-            return { ...data, role: 'student' };
+          // Rule D & 6: Legacy email-keyed doc cannot confer teacher privileges without UID verification
+          if (data && (data.role === 'teacher' || data.role === 'native_friend') && uid && (data.uid ? data.uid !== uid : snapEmail.id !== uid)) {
+            return { ...data, role: 'conflict', identityStatus: 'conflict' };
           }
           return data;
         }
@@ -1448,8 +1764,8 @@ export async function fetchUserFromFirestore(email: string, uid?: string): Promi
           if (qSnap && !qSnap.empty) {
             const data = qSnap.docs[0].data();
             // Rule D & 6: Document found by email cannot confer teacher privileges over canonical UID
-            if (data && (data.role === 'teacher' || data.role === 'native_friend') && uid && qSnap.docs[0].id !== uid) {
-              return { ...data, role: 'student' };
+            if (data && (data.role === 'teacher' || data.role === 'native_friend') && uid && (data.uid ? data.uid !== uid : qSnap.docs[0].id !== uid)) {
+              return { ...data, role: 'conflict', identityStatus: 'conflict' };
             }
             return data;
           }

@@ -115,7 +115,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return token;
   }, [currentAccount?.email]);
 
-  // Fetch Firestore user doc by UID with fallback to emailDocId
+  // Fetch Firestore user doc by UID with fallback to emailDocId (STRICTLY READ-ONLY)
   const fetchFirestoreUser = useCallback(async (uid: string, email?: string): Promise<AuthUserDoc | null> => {
     if (!uid && !email) return null;
     const db = getDb();
@@ -130,21 +130,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const cleanDocId = email.toLowerCase().trim().replace(/[^a-zA-Z0-9]/g, '-');
         const snapEmail = await withTimeout(getDoc(doc(db, 'users', cleanDocId)), 3500);
         if (snapEmail && snapEmail.exists()) {
-          const emailData = snapEmail.data() as AuthUserDoc;
-          if (uid) {
-            await setDoc(
-              doc(db, 'users', uid),
-              {
-                ...emailData,
-                id: uid,
-                uid: uid,
-                email: (emailData.email || email).toLowerCase().trim(),
-                updatedAt: new Date().toISOString(),
-              },
-              { merge: true }
-            ).catch(() => null);
-          }
-          return emailData;
+          return snapEmail.data() as AuthUserDoc;
         }
       }
     } catch (err) {
@@ -173,7 +159,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           const claimRole = (tokenResult?.claims?.role as UserRole) || null;
           const idToken = await user.getIdToken().catch(() => null);
 
-          let resolvedRole: UserRole = claimRole === 'admin' ? 'admin' : (claimRole === 'teacher' ? 'teacher' : 'student');
+          let resolvedRole: UserRole | null = claimRole === 'admin' ? 'admin' : (claimRole === 'teacher' ? 'teacher' : (claimRole === 'student' ? 'student' : null));
 
           if (idToken) {
             try {
@@ -189,44 +175,38 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             } catch {}
           }
 
-          const acc: GoogleAccount = {
-            uid: user.uid,
-            email: cleanEmail,
-            name: user.displayName || (cleanEmail ? cleanEmail.split('@')[0] : 'User'),
-            role: resolvedRole,
-            picture: user.photoURL || '',
-          };
-          setCurrentAccount(acc);
+          if (resolvedRole) {
+            const acc: GoogleAccount = {
+              uid: user.uid,
+              email: cleanEmail,
+              name: user.displayName || (cleanEmail ? cleanEmail.split('@')[0] : 'User'),
+              role: resolvedRole,
+              picture: user.photoURL || '',
+            };
+            setCurrentAccount(acc);
 
-          // Fetch student profile via backend API if role is student
-          if (resolvedRole === 'student' && idToken) {
-            try {
-              const profRes = await fetch(`/api/user-profile?email=${encodeURIComponent(cleanEmail)}&uid=${encodeURIComponent(user.uid)}`, {
-                headers: { Authorization: `Bearer ${idToken}` },
-              });
-              if (profRes.ok) {
-                const profData = await profRes.json();
-                if (profData && typeof profData === 'object') {
-                  setUserProfile((prev) => ({
-                    ...(prev || {}),
-                    ...profData,
-                    id: user.uid,
-                    uid: user.uid,
-                  }));
+            // Fetch student profile via backend API strictly if verified role is student
+            if (resolvedRole === 'student' && idToken) {
+              try {
+                const profRes = await fetch(`/api/user-profile?email=${encodeURIComponent(cleanEmail)}&uid=${encodeURIComponent(user.uid)}`, {
+                  headers: { Authorization: `Bearer ${idToken}` },
+                });
+                if (profRes.ok) {
+                  const profData = await profRes.json();
+                  if (profData && typeof profData === 'object') {
+                    setUserProfile((prev) => ({
+                      ...(prev || {}),
+                      ...profData,
+                      id: user.uid,
+                      uid: user.uid,
+                    }));
+                  }
                 }
-              }
-            } catch {}
+              } catch {}
+            }
           }
         } catch (hydrationErr) {
           console.warn('Notice during user hydration:', hydrationErr);
-          const acc: GoogleAccount = {
-            uid: user.uid,
-            email: cleanEmail,
-            name: user.displayName || (cleanEmail ? cleanEmail.split('@')[0] : 'User'),
-            role: 'student',
-            picture: user.photoURL || '',
-          };
-          setCurrentAccount(acc);
         }
       } else {
         setCurrentAccount(null);

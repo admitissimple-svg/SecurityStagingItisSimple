@@ -319,255 +319,219 @@ export default function App() {
     }
   }, [currentAccount?.uid, currentAccount?.email]);
 
-  // Synchronize Firebase Auth state with React app state for multi-account isolation & published profile detection
+  // FASE IDENTITY-CRITICAL.2: Resolução Canônica e Autoritativa de Identidade
+  // Elimina concorrência de listeners, escritas indevidas no login/F5 e fallbacks silenciosos para student.
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (fbUser) => {
-      if (fbUser && fbUser.email) {
-        const cleanEmail = fbUser.email.toLowerCase().trim();
-        const tokenResult = await fbUser.getIdTokenResult().catch(() => null);
-        const isVerifiedAdmin = tokenResult?.claims?.role === 'admin';
+    let isCancelled = false;
 
-        // Check if currentAccount matches the active Firebase Auth user and has the verified UID
-        if (!currentAccount || currentAccount.email.toLowerCase() !== cleanEmail || currentAccount.uid !== fbUser.uid) {
-          let resolvedRole: UserRole = isVerifiedAdmin ? 'admin' : 'student';
-          let firestoreDoc: any = null;
+    const unsubscribe = onAuthStateChanged(auth, async (fbUser) => {
+      if (isCancelled) return;
+
+      if (!fbUser || !fbUser.email) {
+        setCurrentAccount(null);
+        setIsAuthReady(true);
+        return;
+      }
+
+      const cleanEmail = fbUser.email.toLowerCase().trim();
+      const fbUid = fbUser.uid;
+
+      try {
+        const idToken = await fbUser.getIdToken().catch(() => null);
+        let resolvedRole: UserRole | null = null;
+        let authoritativeName: string = fbUser.displayName || cleanEmail.split('@')[0];
+        let authoritativePicture: string = fbUser.photoURL || '';
+        let isConflict = false;
+        let isPending = false;
+
+        if (idToken) {
           try {
-            const db = getDb();
-            const snap = await Promise.race([
-              getDoc(doc(db, 'users', fbUser.uid)),
-              new Promise<null>((r) => setTimeout(() => r(null), 3000)),
+            const verifyRes = await Promise.race([
+              fetch('/api/auth/verify-session', {
+                headers: { Authorization: `Bearer ${idToken}` },
+              }),
+              new Promise<null>((r) => setTimeout(() => r(null), 4500)),
             ]);
-            if (snap && snap.exists()) {
-              firestoreDoc = snap.data();
-              const r = (firestoreDoc.role || firestoreDoc.userRole || '').toLowerCase();
-              if (r === 'admin' || isVerifiedAdmin) {
-                resolvedRole = isVerifiedAdmin ? 'admin' : 'student';
-              } else if (r === 'student') {
-                resolvedRole = 'student';
-              } else if (r === 'teacher' || r === 'native_friend' || r === 'tutor') {
-                const isApproved = Boolean(
-                  (r === 'teacher' || r === 'native_friend') &&
-                  firestoreDoc.approvalStatus === 'approved' &&
-                  firestoreDoc.isApproved === true
-                );
-                resolvedRole = isApproved ? 'teacher' : 'student';
+
+            if (verifyRes && verifyRes.ok) {
+              const verifyData = await verifyRes.json().catch(() => null);
+              if (verifyData?.role === 'teacher' || verifyData?.role === 'admin' || verifyData?.role === 'student') {
+                resolvedRole = verifyData.role;
+                if (verifyData.name) authoritativeName = verifyData.name;
+              } else if (verifyData?.role === 'conflict' || verifyData?.identityStatus === 'conflict' || verifyData?.identityStatus === 'divergent_uid') {
+                isConflict = true;
+              } else if (verifyData?.role === 'pending_teacher' || verifyData?.approvalStatus === 'pending') {
+                isPending = true;
               }
-            } else {
-              // Rule 6: Absence, error or unavailability of canonical profile blocks privilege elevation
-              resolvedRole = isVerifiedAdmin ? 'admin' : 'student';
+            } else if (verifyRes && verifyRes.status === 409) {
+              isConflict = true;
+            } else if (verifyRes && verifyRes.status === 403) {
+              const errBody = await verifyRes.json().catch(() => ({}));
+              if (errBody?.approvalStatus === 'pending' || errBody?.role === 'pending_teacher') {
+                isPending = true;
+              }
             }
           } catch (e) {
-            console.warn('Notice hydrating Firebase Auth user in App:', e);
-            resolvedRole = isVerifiedAdmin ? 'admin' : 'student';
+            console.warn('[App Auth] Notice verifying session with backend:', e);
           }
+        }
 
-          if (resolvedRole === 'teacher') {
-            setViewMode('dashboard');
-            if (typeof window !== 'undefined') {
+        // Se backend não respondeu (ex: offline temporário), inspeciona estritamente Firestore em modo leitura
+        // JAMAIS grava perfil de student durante F5 ou login
+        if (!resolvedRole && !isConflict && !isPending) {
+          try {
+            const db = getDb();
+            if (db) {
+              const [uSnap, tSnap] = await Promise.all([
+                getDoc(doc(db, 'users', fbUid)).catch(() => null),
+                getDoc(doc(db, 'tutors', fbUid)).catch(() => null),
+              ]);
+              const uData = uSnap && uSnap.exists() ? uSnap.data() : null;
+              const tData = tSnap && tSnap.exists() ? tSnap.data() : null;
+              const uRole = (uData?.role || uData?.userRole || '').toLowerCase().trim();
+              const isTutorApproved = Boolean(
+                tData && (tData.role === 'teacher' || tData.role === 'native_friend' || tData.isTeacher) &&
+                tData.approvalStatus === 'approved' && tData.isApproved === true
+              );
+              const isUserApproved = Boolean(
+                uData && (uRole === 'teacher' || uRole === 'native_friend') &&
+                uData.approvalStatus === 'approved' && uData.isApproved === true
+              );
+
+              if (uRole === 'student' && isTutorApproved) {
+                isConflict = true;
+              } else if (isUserApproved || isTutorApproved) {
+                resolvedRole = 'teacher';
+                if (tData?.name || uData?.name) authoritativeName = tData?.name || uData?.name;
+              } else if (uRole === 'admin') {
+                resolvedRole = 'admin';
+              } else if (uRole === 'student') {
+                resolvedRole = 'student';
+              }
+            }
+          } catch {}
+        }
+
+        if (isCancelled) return;
+
+        // Alinhamento de rota estritamente pelo papel autoritativo
+        if (resolvedRole === 'teacher') {
+          setViewMode('dashboard');
+          if (typeof window !== 'undefined') {
+            const p = window.location.pathname;
+            if (p === '/admin' || p === '/dashboard' || p === '/') {
               try {
                 window.history.replaceState({ page: 'teacher' }, '', '/teacher');
               } catch {}
             }
-          } else if (resolvedRole === 'admin') {
-            setViewMode('dashboard');
-            setIsAdminApprovalsOpen(true);
-            if (typeof window !== 'undefined') {
-              try {
-                window.history.replaceState({ page: 'admin' }, '', '/admin');
-              } catch {}
-            }
-          } else if (resolvedRole === 'student') {
-            const p = typeof window !== 'undefined' ? window.location.pathname : '';
-            const h = typeof window !== 'undefined' ? window.location.hash : '';
-            if (p === '/admin' || p === '/teacher' || h === '#admin' || h === '#teacher') {
-              try {
-                window.history.replaceState({ page: 'dashboard' }, '', '/dashboard');
-              } catch {}
-            }
           }
+        } else if (resolvedRole === 'admin') {
+          setViewMode('dashboard');
+          setIsAdminApprovalsOpen(true);
+          if (typeof window !== 'undefined') {
+            try {
+              window.history.replaceState({ page: 'admin' }, '', '/admin');
+            } catch {}
+          }
+        } else if (resolvedRole === 'student') {
+          const p = typeof window !== 'undefined' ? window.location.pathname : '';
+          const h = typeof window !== 'undefined' ? window.location.hash : '';
+          if (p === '/admin' || p === '/teacher' || h === '#admin' || h === '#teacher') {
+            try {
+              window.history.replaceState({ page: 'dashboard' }, '', '/dashboard');
+            } catch {}
+          }
+        }
 
-          const account: GoogleAccount = {
-            uid: fbUser.uid,
-            email: cleanEmail,
-            name: firestoreDoc?.name || fbUser.displayName || cleanEmail.split('@')[0],
-            role: resolvedRole,
-            picture: firestoreDoc?.picture || firestoreDoc?.avatar || fbUser.photoURL || '',
-          };
+        const account: GoogleAccount = {
+          uid: fbUid,
+          email: cleanEmail,
+          name: authoritativeName,
+          role: resolvedRole,
+          picture: authoritativePicture,
+        };
 
-          // Guarantee that student profile in Firestore is created/saved using doc(db, 'users', fbUser.uid)
-          // Guarantee that student profile in Firestore is created/saved using doc(db, 'users', fbUser.uid)
-          // Do NOT overwrite if user has a teacher/tutor role
-          if (resolvedRole === 'student' && firestoreDoc?.role !== 'teacher' && firestoreDoc?.role !== 'native_friend') {
+        setCurrentAccount(account);
+        setAvailableAccounts((prev) => {
+          if (!prev.some((a) => a.email.toLowerCase() === cleanEmail)) {
+            return [...prev, account];
+          }
+          return prev.map((a) => (a.email.toLowerCase() === cleanEmail ? account : a));
+        });
+
+        // Hidrata perfil de aluno apenas em leitura se o papel for student (SEM NENHUMA ESCRITA)
+        if (resolvedRole === 'student' && !isConflict && !isPending) {
+          try {
             const db = getDb();
-            if (db && fbUser.uid) {
-              // HOTFIX 3D.2: Reutilizar resolveCanonicalStudentLevel priorizando englishLevel e userLevel sobre level legado
-              const canonicalLevelType =
+            const snap = await Promise.race([
+              getDoc(doc(db, 'users', fbUid)),
+              new Promise<null>((r) => setTimeout(() => r(null), 3000)),
+            ]);
+            if (snap && snap.exists()) {
+              const firestoreDoc = snap.data();
+              const teacherUid = (firestoreDoc?.teacherUid && isValidCanonicalUid(firestoreDoc.teacherUid))
+                ? firestoreDoc.teacherUid
+                : (firestoreDoc?.assignedNativeFriendUID && isValidCanonicalUid(firestoreDoc.assignedNativeFriendUID))
+                  ? firestoreDoc.assignedNativeFriendUID
+                  : (firestoreDoc?.nativeFriendUID && isValidCanonicalUid(firestoreDoc.nativeFriendUID))
+                    ? firestoreDoc.nativeFriendUID
+                    : undefined;
+
+              const authCanonicalLevelType =
                 resolveCanonicalStudentLevel(firestoreDoc?.englishLevel, firestoreDoc?.userLevel) ||
                 resolveCanonicalStudentLevel((firestoreDoc as any)?.studentLevel, (firestoreDoc as any)?.cefrLevel) ||
-                resolveCanonicalStudentLevel(firestoreDoc?.level);
+                resolveCanonicalStudentLevel(firestoreDoc?.level) ||
+                EnglishLevel.BEGINNER;
 
-              const rawStoredLevelCandidate = [
-                firestoreDoc?.englishLevel,
-                firestoreDoc?.userLevel,
-                firestoreDoc?.level,
-              ].find((val) => {
-                if (typeof val !== 'string') return false;
-                if (canonicalLevelType === 'intermediate') return val.toLowerCase().includes('inter');
-                if (canonicalLevelType === 'advanced') return val.toLowerCase().includes('avan') || val.toLowerCase().includes('adv');
-                if (canonicalLevelType === 'beginner') return val.toLowerCase().includes('inici') || val.toLowerCase().includes('beg');
-                return false;
-              });
-
-              const studentPayload: Record<string, any> = {
-                id: fbUser.uid,
-                uid: fbUser.uid,
+              const restoredProfile: UserProfile = {
+                ...createDefaultStudentProfile(account),
+                id: fbUid,
+                uid: fbUid,
                 email: cleanEmail,
                 name: account.name,
                 picture: account.picture,
                 avatar: account.picture,
+                level: (authCanonicalLevelType || EnglishLevel.BEGINNER) as EnglishLevel,
+                weeklyCycle: typeof firestoreDoc?.weeklyCycle === 'number' ? firestoreDoc.weeklyCycle : 1,
                 learningGoal: firestoreDoc?.learningGoal || '',
+                weeklyStudyDaysTarget: typeof firestoreDoc?.weeklyStudyDaysTarget === 'number' ? firestoreDoc.weeklyStudyDaysTarget : 4,
+                weeklyStudyDays: firestoreDoc?.weeklyStudyDays || ['monday', 'tuesday', 'wednesday', 'thursday'],
                 routineVideoTime: firestoreDoc?.routineVideoTime || '09:00',
                 routineAudioTime: firestoreDoc?.routineAudioTime || '14:00',
                 dailyPhraseTime: firestoreDoc?.dailyPhraseTime || '20:00',
-                ...(firestoreDoc || {}),
-                updatedAt: new Date().toISOString(),
+                teacherEmail: firestoreDoc?.teacherEmail || '',
+                teacherName: firestoreDoc?.teacherName || '',
+                teacherMeetUrl: firestoreDoc?.teacherMeetUrl || '',
+                teacherUid: teacherUid,
+                assignedNativeFriendUID: teacherUid,
+                contractedLessons: typeof firestoreDoc?.contractedLessons === 'number' ? firestoreDoc.contractedLessons : (firestoreDoc?.hasCompletedTrialLesson ? 1 : 0),
+                availableLessons: typeof firestoreDoc?.availableLessons === 'number' ? firestoreDoc.availableLessons : undefined,
+                completedLessonsCount: typeof firestoreDoc?.completedLessonsCount === 'number' ? firestoreDoc.completedLessonsCount : 0,
+                hasCompletedTrialLesson: Boolean(firestoreDoc?.hasCompletedTrialLesson),
+                onboardingCompleted: typeof firestoreDoc?.onboardingCompleted === "boolean"
+                  ? firestoreDoc.onboardingCompleted
+                  : Boolean(firestoreDoc?.hasCompletedTrialLesson),
+                subscriptionType: firestoreDoc?.subscriptionType || 'trial',
+                enrollmentStatus: firestoreDoc?.enrollmentStatus || (teacherUid ? 'active' : 'not_enrolled'),
               };
-              // Identity Hardening: Client must never set or mutate role in Firestore
-              delete studentPayload.role;
-              delete studentPayload.userRole;
-
-              // Strictly preserve existing canonical level in Firestore. Never overwrite with BEGINNER on login.
-              if (rawStoredLevelCandidate || canonicalLevelType) {
-                const preservedLevel = rawStoredLevelCandidate || canonicalLevelType;
-                studentPayload.level = preservedLevel;
-                studentPayload.englishLevel = preservedLevel;
-                studentPayload.userLevel = preservedLevel;
-              } else {
-                delete studentPayload.level;
-                delete studentPayload.englishLevel;
-                delete studentPayload.userLevel;
-              }
-
-              setDoc(doc(db, 'users', fbUser.uid), studentPayload, { merge: true }).catch(() => null);
+              setUserProfile(restoredProfile);
             }
-
-            const teacherUid = (firestoreDoc?.teacherUid && isValidCanonicalUid(firestoreDoc.teacherUid))
-              ? firestoreDoc.teacherUid
-              : (firestoreDoc?.assignedNativeFriendUID && isValidCanonicalUid(firestoreDoc.assignedNativeFriendUID))
-                ? firestoreDoc.assignedNativeFriendUID
-                : (firestoreDoc?.nativeFriendUID && isValidCanonicalUid(firestoreDoc.nativeFriendUID))
-                  ? firestoreDoc.nativeFriendUID
-                  : undefined;
-
-            // HOTFIX 3D.2: Reutilizar resolveCanonicalStudentLevel no perfil restaurado pós-login/F5
-            const authCanonicalLevelType =
-              resolveCanonicalStudentLevel(firestoreDoc?.englishLevel, firestoreDoc?.userLevel) ||
-              resolveCanonicalStudentLevel((firestoreDoc as any)?.studentLevel, (firestoreDoc as any)?.cefrLevel) ||
-              resolveCanonicalStudentLevel(firestoreDoc?.level) ||
-              resolveCanonicalStudentLevel(userProfile?.englishLevel, userProfile?.userLevel) ||
-              resolveCanonicalStudentLevel(userProfile?.level);
-
-            const rawAuthCandidate = [
-              firestoreDoc?.englishLevel,
-              firestoreDoc?.userLevel,
-              firestoreDoc?.level,
-              userProfile?.englishLevel,
-              userProfile?.userLevel,
-            ].find((val) => {
-              if (typeof val !== 'string') return false;
-              if (authCanonicalLevelType === 'intermediate') return val.toLowerCase().includes('inter');
-              if (authCanonicalLevelType === 'advanced') return val.toLowerCase().includes('avan') || val.toLowerCase().includes('adv');
-              if (authCanonicalLevelType === 'beginner') return val.toLowerCase().includes('inici') || val.toLowerCase().includes('beg');
-              return false;
-            });
-
-            const resolvedAuthEnglishLevel = rawAuthCandidate || (
-              authCanonicalLevelType === 'intermediate' ? 'intermediate' :
-              authCanonicalLevelType === 'advanced' ? 'advanced' :
-              authCanonicalLevelType === 'beginner' ? EnglishLevel.BEGINNER :
-              undefined
-            );
-
-            const resolvedAuthLevel = (resolvedAuthEnglishLevel || EnglishLevel.BEGINNER) as EnglishLevel;
-
-            const restoredProfile: UserProfile = {
-              ...createDefaultStudentProfile(account),
-              id: fbUser.uid,
-              uid: fbUser.uid,
-              email: cleanEmail,
-              name: account.name,
-              picture: account.picture,
-              avatar: account.picture,
-              level: resolvedAuthLevel,
-              ...(resolvedAuthEnglishLevel ? {
-                englishLevel: resolvedAuthEnglishLevel,
-                userLevel: resolvedAuthEnglishLevel,
-              } : {}),
-              weeklyCycle: typeof firestoreDoc?.weeklyCycle === 'number' ? firestoreDoc.weeklyCycle : (userProfile?.weeklyCycle || 1),
-              learningGoal: firestoreDoc?.learningGoal || '',
-              weeklyStudyDaysTarget: typeof firestoreDoc?.weeklyStudyDaysTarget === 'number' ? firestoreDoc.weeklyStudyDaysTarget : 4,
-              weeklyStudyDays: firestoreDoc?.weeklyStudyDays || ['monday', 'tuesday', 'wednesday', 'thursday'],
-              routineVideoTime: firestoreDoc?.routineVideoTime || '09:00',
-              routineAudioTime: firestoreDoc?.routineAudioTime || '14:00',
-              dailyPhraseTime: firestoreDoc?.dailyPhraseTime || '20:00',
-              teacherEmail: firestoreDoc?.teacherEmail || '',
-              teacherName: firestoreDoc?.teacherName || '',
-              teacherMeetUrl: firestoreDoc?.teacherMeetUrl || '',
-              teacherUid: teacherUid,
-              assignedNativeFriendUID: teacherUid,
-              contractedLessons: typeof firestoreDoc?.contractedLessons === 'number' ? firestoreDoc.contractedLessons : (firestoreDoc?.hasCompletedTrialLesson ? 1 : 0),
-              availableLessons: typeof firestoreDoc?.availableLessons === 'number' ? firestoreDoc.availableLessons : undefined,
-              completedLessonsCount: typeof firestoreDoc?.completedLessonsCount === 'number' ? firestoreDoc.completedLessonsCount : 0,
-              hasCompletedTrialLesson: Boolean(firestoreDoc?.hasCompletedTrialLesson),
-              onboardingCompleted: typeof firestoreDoc?.onboardingCompleted === "boolean"
-                ? firestoreDoc.onboardingCompleted
-                : Boolean(firestoreDoc?.hasCompletedTrialLesson),
-              subscriptionType: firestoreDoc?.subscriptionType || 'trial',
-              enrollmentStatus: firestoreDoc?.enrollmentStatus || (teacherUid ? 'active' : 'not_enrolled'),
-            };
-            setUserProfile(restoredProfile);
-          }
-
-          setCurrentAccount(account);
-          setAvailableAccounts((prev) => {
-            if (!prev.some((a) => a.email.toLowerCase() === cleanEmail)) {
-              return [...prev, account];
-            }
-            return prev.map((a) => (a.email.toLowerCase() === cleanEmail ? account : a));
-          });
-
-          // Sync with backend API to obtain authoritative account role
-          fetch('/api/auth/google', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              uid: fbUser.uid,
-              email: cleanEmail,
-              name: account.name,
-              role: resolvedRole,
-              picture: account.picture,
-            }),
-          })
-            .then(async (res) => {
-              if (res.ok) {
-                const data = await res.json().catch(() => null);
-                if (data?.account?.role && data.account.role !== account.role) {
-                  const authoritativeRole: UserRole = data.account.role;
-                  setCurrentAccount((prev) => (prev ? { ...prev, role: authoritativeRole } : prev));
-                }
-              }
-            })
-            .catch(() => {});
+          } catch {}
         }
-        setIsAuthReady(true);
-      } else {
-        setCurrentAccount(null);
-        setIsAuthReady(true);
+      } catch (err) {
+        console.warn('[App Auth] Notice hydrating Firebase Auth user in App:', err);
+      } finally {
+        if (!isCancelled) {
+          setIsAuthReady(true);
+        }
       }
     });
 
-    return () => unsubscribe();
-  }, [currentAccount, tutors]);
+    return () => {
+      isCancelled = true;
+      unsubscribe();
+    };
+  }, []);
 
   const isTeacher = currentAccount ? (currentAccount.role === 'teacher' || currentAccount.role === 'admin') : false;
 
