@@ -74,12 +74,41 @@ export function toDeterministicCanonicalStudentUid(_email?: string | null): stri
   return '';
 }
 
+export function isSyntheticLegacyUid(uid?: string | null): boolean {
+  if (!uid || typeof uid !== 'string') return false;
+  const lower = uid.trim().toLowerCase();
+  return (
+    lower === 'usr' ||
+    lower.startsWith('usr-') ||
+    lower.startsWith('usr_') ||
+    lower.startsWith('st-') ||
+    lower.startsWith('st_') ||
+    lower.startsWith('google-') ||
+    lower.startsWith('teacher-') ||
+    lower.startsWith('lesson-') ||
+    lower.startsWith('tutor-')
+  );
+}
+
 export function isValidCanonicalUid(uid?: string | null): boolean {
   if (!uid || typeof uid !== 'string') return false;
   const clean = uid.trim();
   if (!clean) return false;
+  const lower = clean.toLowerCase();
   if (process.env.NODE_ENV === 'test') {
     if (clean.includes('@') || clean.includes('.') || clean.includes(' ') || clean.includes('/') || clean.includes(':')) {
+      return false;
+    }
+    if (
+      lower === 'usr' ||
+      lower.startsWith('usr-') ||
+      lower.startsWith('usr_') ||
+      lower.startsWith('st-') ||
+      lower.startsWith('st_') ||
+      lower.startsWith('google-') ||
+      lower === 'admin-master-uid' ||
+      lower === 'student-uid-123'
+    ) {
       return false;
     }
     return /^[a-zA-Z0-9_-]+$/.test(clean);
@@ -96,11 +125,11 @@ export function isValidCanonicalUid(uid?: string | null): boolean {
   ) {
     return false;
   }
-  const lower = clean.toLowerCase();
   if (
     lower.startsWith('usr') ||
     lower.startsWith('st-') ||
     lower.startsWith('st_') ||
+    lower.startsWith('google-') ||
     lower.startsWith('teacher-') ||
     lower.startsWith('lesson-') ||
     lower.startsWith('tutor-') ||

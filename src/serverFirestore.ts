@@ -1186,6 +1186,15 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
       }
     };
 
+    const fetchTutorsStatus = async (): Promise<{ ok: boolean; tutors: any[] }> => {
+      try {
+        const tutors = await fetchTutorsFromFirestore();
+        return { ok: true, tutors: Array.isArray(tutors) ? tutors : [] };
+      } catch {
+        return { ok: false, tutors: [] };
+      }
+    };
+
     const fetchAllPromise = Promise.all([
       fetchDoc('main_data'),
       fetchDoc('routines'),
@@ -1193,100 +1202,149 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
       fetchDoc('assignments'),
       fetchDoc('lessons'),
       fetchDoc('youtube_playlists'),
-      fetchTutorsFromFirestore().catch(() => []),
-      fetchUsersFromFirestore().catch(() => []),
-    ]).then(([mainData, routines, tutors, assignments, lessons, ytPlaylists, directTutors, directUsers]) => {
-      if (!mainData && !routines && !tutors && !assignments && !lessons && !ytPlaylists && (!directTutors || directTutors.length === 0) && (!directUsers || directUsers.length === 0)) {
+      fetchTutorsStatus(),
+      fetchUsersFromFirestoreCanonical(),
+    ]).then(([mainData, routines, tutors, assignments, lessons, ytPlaylists, directTutorsResult, directUsersResult]) => {
+      const directTutors = directTutorsResult.tutors;
+      const directUsers = directUsersResult.users;
+
+      if (
+        !mainData &&
+        !routines &&
+        !tutors &&
+        !assignments &&
+        !lessons &&
+        !ytPlaylists &&
+        directTutors.length === 0 &&
+        directUsers.length === 0
+      ) {
         return null;
       }
 
-      // Merge direct users from /users collection into userProfiles, authUsers, and students
-      const mergedUserProfiles = { ...(mainData?.userProfiles || {}) };
-      const mergedAuthUsers = { ...(mainData?.authUsers || {}) };
+      // ARCH.2A: Canonical persistence strictly in (default) /users and /tutors.
+      // Never reconstruct userProfiles, authUsers, or students from unconfirmed app_state/main_data caches
+      // or isolated activity maps (studentRoutinesMap, studentVideoAssignments, studentSpotifyAssignments, studentWeeklyChecks).
+      const mergedUserProfiles: Record<string, any> = {};
+      const mergedAuthUsers: Record<string, any> = {};
       const studentMap = new Map<string, any>();
-      (mainData?.students || []).forEach((s: any) => {
-        const key = (s.studentEmail || s.email || '').toLowerCase().trim();
-        if (key) studentMap.set(key, s);
-      });
 
-      (directUsers || []).forEach((u: any) => {
-        const key = (u.email || '').toLowerCase().trim();
-        if (key) {
-          const canonicalUid = (u.uid && isValidCanonicalUid(u.uid)) ? u.uid : (u.id && isValidCanonicalUid(u.id) ? u.id : null);
-          if (!mergedUserProfiles[key]) {
+      const legacyProfilesMap = (mainData?.userProfiles && typeof mainData.userProfiles === 'object') ? mainData.userProfiles : {};
+      const legacyStudentsByEmail = new Map<string, any>();
+      if (Array.isArray(mainData?.students)) {
+        mainData.students.forEach((s: any) => {
+          const sKey = (s?.studentEmail || s?.email || '').toLowerCase().trim();
+          if (sKey) legacyStudentsByEmail.set(sKey, s);
+        });
+      }
+
+      if (directUsersResult.ok) {
+        directUsers.forEach((u: any) => {
+          const key = (u.email || '').toLowerCase().trim();
+          if (!key) return;
+
+          const canonicalUid =
+            (u.uid && isValidCanonicalUid(u.uid))
+              ? u.uid
+              : (u.id && isValidCanonicalUid(u.id) ? u.id : null);
+          if (!canonicalUid) return;
+
+          const uRole = (u.role || u.userRole || '').toLowerCase().trim();
+
+          // Optional enrichment from main_data ONLY when canonical /users doc exists and UID is compatible
+          const rawLegacyProfile = legacyProfilesMap[key];
+          const legacyProfUid = rawLegacyProfile?.uid || rawLegacyProfile?.id;
+          const isLegacyProfCompatible =
+            rawLegacyProfile &&
+            typeof rawLegacyProfile === 'object' &&
+            (!legacyProfUid || !isValidCanonicalUid(legacyProfUid) || legacyProfUid === canonicalUid);
+
+          if (uRole !== 'teacher' && uRole !== 'tutor' && uRole !== 'native_friend') {
             mergedUserProfiles[key] = {
-              id: canonicalUid || u.uid || u.id,
-              uid: canonicalUid || u.uid || u.id,
-              name: u.name || key.split('@')[0],
-              email: key,
-              level: u.level || u.englishLevel || 'iniciante',
-              enrollmentStatus: u.enrollmentStatus || 'active',
-              learningGoal: u.learningGoal || u.goal || 'English for everyday life & work',
-              weeklyStudyDaysTarget: u.weeklyStudyDaysTarget ?? 7,
-              weeklyStudyDays: u.weeklyStudyDays || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'],
-              createdAt: u.createdAt || new Date().toISOString(),
-            };
-          } else if (canonicalUid) {
-            mergedUserProfiles[key] = {
-              ...mergedUserProfiles[key],
+              ...(isLegacyProfCompatible ? rawLegacyProfile : {}),
               ...u,
               id: canonicalUid,
               uid: canonicalUid,
+              name: u.name || (isLegacyProfCompatible ? rawLegacyProfile?.name : undefined) || key.split('@')[0],
+              email: key,
+              level: u.level || u.englishLevel || (isLegacyProfCompatible ? rawLegacyProfile?.level : undefined) || 'iniciante',
+              enrollmentStatus: u.enrollmentStatus || (isLegacyProfCompatible ? rawLegacyProfile?.enrollmentStatus : undefined) || 'active',
+              learningGoal: u.learningGoal || u.goal || (isLegacyProfCompatible ? rawLegacyProfile?.learningGoal : undefined) || 'English for everyday life & work',
+              weeklyStudyDaysTarget: u.weeklyStudyDaysTarget ?? (isLegacyProfCompatible ? rawLegacyProfile?.weeklyStudyDaysTarget : undefined) ?? 7,
+              weeklyStudyDays: u.weeklyStudyDays || (isLegacyProfCompatible ? rawLegacyProfile?.weeklyStudyDays : undefined) || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'],
+              createdAt: u.createdAt || (isLegacyProfCompatible ? rawLegacyProfile?.createdAt : undefined) || new Date().toISOString(),
             };
-          }
-
-          if (!mergedAuthUsers[key]) {
-            if (canonicalUid) {
-              mergedAuthUsers[key] = {
-                uid: canonicalUid,
-                id: canonicalUid,
-                email: key,
-                name: u.name || key.split('@')[0],
-                role: u.role || 'student',
-                createdAt: u.createdAt || new Date().toISOString(),
-              };
-            }
-          } else if (canonicalUid) {
-            mergedAuthUsers[key] = {
-              ...mergedAuthUsers[key],
-              uid: canonicalUid,
+          } else {
+            mergedUserProfiles[key] = {
+              ...u,
               id: canonicalUid,
+              uid: canonicalUid,
+              email: key,
+              role: uRole || 'teacher',
             };
           }
 
-          if (u.role === 'student' || !u.role) {
-            const existingStudent = studentMap.get(key);
-            if (!existingStudent) {
-              if (canonicalUid) {
-                studentMap.set(key, {
-                  id: canonicalUid,
-                  studentUid: canonicalUid,
-                  uid: canonicalUid,
-                  name: u.name || key.split('@')[0],
-                  studentName: u.name || key.split('@')[0],
-                  email: key,
-                  studentEmail: key,
-                  level: u.level || u.englishLevel || 'iniciante',
-                  studentLevel: u.level || u.englishLevel || 'iniciante',
-                  goal: u.learningGoal || u.goal || 'English for everyday life & work',
-                  learningGoal: u.learningGoal || u.goal || 'English for everyday life & work',
-                  contractedLessons: u.contractedLessons || 5,
-                  completedLessonsCount: u.completedLessonsCount || 0,
-                  status: 'active',
-                  activeSince: (u.createdAt || new Date().toISOString()).split('T')[0],
-                  createdAt: u.createdAt || new Date().toISOString(),
-                });
-              }
-            } else if (canonicalUid) {
-              studentMap.set(key, {
-                ...existingStudent,
-                ...u,
-                id: canonicalUid,
-                studentUid: canonicalUid,
-                uid: canonicalUid,
-              });
-            }
+          mergedAuthUsers[key] = {
+            uid: canonicalUid,
+            id: canonicalUid,
+            email: key,
+            name: u.name || key.split('@')[0],
+            role: uRole || 'student',
+            createdAt: u.createdAt || new Date().toISOString(),
+          };
+
+          if (uRole === 'student' || !uRole) {
+            const rawLegacyStudent = legacyStudentsByEmail.get(key);
+            const legacyStudentUid = rawLegacyStudent?.uid || rawLegacyStudent?.studentUid || rawLegacyStudent?.id;
+            const isLegacyStudentCompatible =
+              rawLegacyStudent &&
+              typeof rawLegacyStudent === 'object' &&
+              (!legacyStudentUid || !isValidCanonicalUid(legacyStudentUid) || legacyStudentUid === canonicalUid);
+
+            studentMap.set(key, {
+              ...(isLegacyStudentCompatible ? rawLegacyStudent : {}),
+              ...u,
+              id: canonicalUid,
+              studentUid: canonicalUid,
+              uid: canonicalUid,
+              name: u.name || (isLegacyStudentCompatible ? (rawLegacyStudent?.name || rawLegacyStudent?.studentName) : undefined) || key.split('@')[0],
+              studentName: u.name || (isLegacyStudentCompatible ? (rawLegacyStudent?.studentName || rawLegacyStudent?.name) : undefined) || key.split('@')[0],
+              email: key,
+              studentEmail: key,
+              level: u.level || u.englishLevel || (isLegacyStudentCompatible ? (rawLegacyStudent?.level || rawLegacyStudent?.studentLevel) : undefined) || 'iniciante',
+              studentLevel: u.level || u.englishLevel || (isLegacyStudentCompatible ? (rawLegacyStudent?.studentLevel || rawLegacyStudent?.level) : undefined) || 'iniciante',
+              goal: u.learningGoal || u.goal || (isLegacyStudentCompatible ? (rawLegacyStudent?.goal || rawLegacyStudent?.learningGoal) : undefined) || 'English for everyday life & work',
+              learningGoal: u.learningGoal || u.goal || (isLegacyStudentCompatible ? (rawLegacyStudent?.learningGoal || rawLegacyStudent?.goal) : undefined) || 'English for everyday life & work',
+              contractedLessons: u.contractedLessons ?? (isLegacyStudentCompatible ? rawLegacyStudent?.contractedLessons : undefined) ?? 5,
+              completedLessonsCount: u.completedLessonsCount ?? (isLegacyStudentCompatible ? rawLegacyStudent?.completedLessonsCount : undefined) ?? 0,
+              status: u.status || 'active',
+              activeSince: (u.createdAt || new Date().toISOString()).split('T')[0],
+              createdAt: u.createdAt || new Date().toISOString(),
+            });
           }
+        });
+      }
+
+      // Preserve legitimate administrators configured in teachers (with valid canonical UID)
+      const confirmedAdminTeachers = Array.isArray(tutors?.teachers)
+        ? tutors.teachers.filter((t: any) => {
+            if (!t || t.role !== 'admin') return false;
+            const adminUid = t.uid || t.id;
+            return Boolean(adminUid && isValidCanonicalUid(adminUid));
+          })
+        : [];
+
+      confirmedAdminTeachers.forEach((adminTeacher: any) => {
+        const key = (adminTeacher.email || '').toLowerCase().trim();
+        const adminUid = (adminTeacher.uid || adminTeacher.id).trim();
+        if (key && !mergedAuthUsers[key]) {
+          mergedAuthUsers[key] = {
+            uid: adminUid,
+            id: adminUid,
+            email: key,
+            name: adminTeacher.name || 'Admin',
+            role: 'admin',
+            createdAt: adminTeacher.createdAt || new Date().toISOString(),
+          };
         }
       });
 
@@ -1297,12 +1355,45 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
         students: Array.from(studentMap.values()),
       };
 
-      // Canonical consolidation of tutors from /tutors collection with app_state/tutors
+      // Canonical consolidation of tutors strictly anchored in /tutors and /users (role=='teacher').
+      // app_state/tutors entries without canonical confirmation in directTutors are never resurrected.
       const stateTutors = Array.isArray(tutors?.tutorsList) ? tutors.tutorsList : [];
-      const consolidatedTutorsList = consolidateTutorsList([...stateTutors, ...(directTutors || [])]);
+      const confirmedStateTutors = directTutorsResult.ok
+        ? stateTutors.filter((st: any) => {
+            const stEmail = (st?.email || '').toLowerCase().trim();
+            const stUid = (st?.authUid || st?.uid || st?.id || '').trim();
+            return directTutors.some((dt: any) => {
+              const dtEmail = (dt?.email || '').toLowerCase().trim();
+              const dtUid = (dt?.authUid || dt?.uid || dt?.id || '').trim();
+              return (stUid && dtUid && stUid === dtUid) || (stEmail && dtEmail && stEmail === dtEmail);
+            });
+          })
+        : [];
+      const consolidatedTutorsList = directTutorsResult.ok
+        ? consolidateTutorsList([...confirmedStateTutors, ...directTutors])
+        : [];
+
+      const existingStateTeachers = Array.isArray(tutors?.teachers) ? tutors.teachers : [];
+      const confirmedStateTeachers = existingStateTeachers.filter((tc: any) => {
+        if (!tc) return false;
+        if (tc.role === 'admin') {
+          const adminUid = tc.uid || tc.id;
+          return Boolean(adminUid && isValidCanonicalUid(adminUid));
+        }
+        if (!directTutorsResult.ok) return false;
+        const tcEmail = (tc.email || '').toLowerCase().trim();
+        const tcUid = (tc.authUid || tc.uid || tc.id || '').trim();
+        return consolidatedTutorsList.some((dt: any) => {
+          const dtEmail = (dt?.email || '').toLowerCase().trim();
+          const dtUid = (dt?.authUid || dt?.uid || dt?.id || '').trim();
+          return (tcUid && dtUid && tcUid === dtUid) || (tcEmail && dtEmail && tcEmail === dtEmail);
+        });
+      });
+
       const mergedTutorsDoc = {
         ...(tutors || {}),
         tutorsList: consolidatedTutorsList,
+        teachers: confirmedStateTeachers,
       };
 
       return {
@@ -1764,25 +1855,27 @@ export async function saveUserToFirestore(user: any): Promise<boolean> {
   }
 }
 
-export async function fetchUsersFromFirestore(): Promise<any[]> {
+export async function fetchUsersFromFirestoreCanonical(): Promise<{ ok: boolean; users: any[] }> {
   const db = getFirestoreDb();
-  if (!db) return [];
+  if (!db) return { ok: false, users: [] };
   try {
     const fetchPromise = async () => {
+      let queryError: any = null;
       const snap = await db.collection('users').get().catch((queryErr: any) => {
+        queryError = queryErr;
         const isPerm =
           queryErr?.code === 7 ||
           queryErr?.code === 'permission-denied' ||
           String(queryErr?.message || '').includes('PERMISSION_DENIED') ||
           String(queryErr?.message || '').includes('Missing or insufficient permissions');
         if (isPerm) {
-          console.info('[serverFirestore] Users collection read restricted by cloud IAM credentials, continuing with local state.');
+          console.info('[serverFirestore] Users collection read restricted by cloud IAM credentials.');
         } else {
           console.info('[serverFirestore] Users collection query notice:', queryErr?.message || String(queryErr));
         }
         return null;
       });
-      if (!snap) return [];
+      if (!snap || queryError) return { ok: false, users: [] };
       const list: any[] = [];
       snap.forEach((d: any) => {
         const data = d.data();
@@ -1793,10 +1886,10 @@ export async function fetchUsersFromFirestore(): Promise<any[]> {
           });
         }
       });
-      return list;
+      return { ok: true, users: list };
     };
     const result = await withTimeout(fetchPromise(), 10000);
-    return result || [];
+    return result || { ok: false, users: [] };
   } catch (err: any) {
     const isPerm =
       err?.code === 7 ||
@@ -1804,12 +1897,17 @@ export async function fetchUsersFromFirestore(): Promise<any[]> {
       String(err?.message || '').includes('PERMISSION_DENIED') ||
       String(err?.message || '').includes('Missing or insufficient permissions');
     if (isPerm) {
-      console.info('[serverFirestore] Users collection read restricted by cloud IAM credentials, continuing with local state.');
+      console.info('[serverFirestore] Users collection read restricted by cloud IAM credentials.');
     } else {
       console.info('[serverFirestore] Users collection query notice:', err?.message || String(err));
     }
-    return [];
+    return { ok: false, users: [] };
   }
+}
+
+export async function fetchUsersFromFirestore(): Promise<any[]> {
+  const res = await fetchUsersFromFirestoreCanonical();
+  return res.users;
 }
 
 export async function fetchUserFromFirestore(email: string, uid?: string): Promise<any | null> {
@@ -1935,18 +2033,6 @@ export async function fetchTutorDocumentFromFirestore(docId: string, timeoutMs: 
           const matchedDoc = qSnap.docs[0];
           return { id: matchedDoc.id, ...matchedDoc.data() };
         }
-      }
-    }
-
-    // 5. Check app_state/tutors
-    const appStateSnap = await withTimeout(db.collection('app_state').doc('tutors').get(), timeoutMs);
-    if (appStateSnap && appStateSnap.exists) {
-      const stateData = appStateSnap.data();
-      if (stateData && Array.isArray(stateData.tutorsList)) {
-        const found = stateData.tutorsList.find(
-          (t: any) => t.id === docId || (t.email && t.email.toLowerCase() === docId.toLowerCase())
-        );
-        if (found) return found;
       }
     }
 
