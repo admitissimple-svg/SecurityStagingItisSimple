@@ -143,9 +143,12 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
     );
   };
 
-  // 1. Pre-process wrapped spans that directly wrap target words (e.g. <span class="new-word">streamline</span>
-  // or nested <span class="new-word"><span class="pronounce">breakthrough</span></span>)
-  let preprocessed = rawContent.replace(
+  // Normalize &nbsp; and non-breaking spaces upfront
+  const normalizedRaw = rawContent.replace(/&nbsp;/gi, ' ').replace(/\u00A0/g, ' ');
+
+  // 1. Pre-process wrapped spans that directly wrap target words (e.g. <span class="new-word">streamline</span>,
+  // <span class="incorrect">we can't to have</span>, or nested tags)
+  let preprocessed = normalizedRaw.replace(
     /<span\b([^>]*?(?:data-tag-type=["'](new-word|pronounce|correct|incorrect)["']|class=["'][^"']*\b(new-word|pronounce|correct|incorrect)\b)[^>]*)>([\s\S]*?)<\/span>/gi,
     (fullMatch, attrs, tagType, className, inner) => {
       const strippedInner = stripHtmlTags(inner).trim();
@@ -165,6 +168,18 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
         /pronounce/i.test(attrs) ||
         /pronounce/i.test(inner);
 
+      const hasInc =
+        tagType === 'incorrect' ||
+        className === 'incorrect' ||
+        /incorrect/i.test(attrs) ||
+        /incorrect/i.test(inner);
+
+      const hasCor =
+        tagType === 'correct' ||
+        className === 'correct' ||
+        /correct/i.test(attrs) ||
+        /correct/i.test(inner);
+
       const cleanWord = cleanExpressionTerm(strippedInner);
       if (cleanWord) {
         const normKey = cleanWord.toLowerCase();
@@ -178,6 +193,19 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
         }
       }
 
+      if (hasInc) {
+        return ` [[TAG:INCORRECT]] ${cleanWord} `;
+      }
+      if (hasCor) {
+        return ` [[TAG:CORRECT]] ${cleanWord} `;
+      }
+      if (hasNw) {
+        return ` [[TAG:NEW_WORD]] ${cleanWord} `;
+      }
+      if (hasPr) {
+        return ` [[TAG:PRONOUNCE]] ${cleanWord} `;
+      }
+
       return ` ${cleanWord} `;
     }
   );
@@ -189,22 +217,23 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
   const tagNewWord = countMatches(/<span\b[^>]*(?:data-tag-type=["']new-word["']|class=["'][^"']*\bnew-word(?:-tag)?\b)[^>]*>|\[New Word\]|\(Alt\+W\)/gi);
   const tagPronounce = countMatches(/<span\b[^>]*(?:data-tag-type=["']pronounce["']|class=["'][^"']*\bpronounce(?:-tag)?\b)[^>]*>|\[Pronounce\]|\(Alt\+P\)/gi);
 
-  const plainWithoutSpans = rawContent.replace(/<span[^>]*>[\s\S]*?<\/span>/gi, '');
-  const plainCorrect = (plainWithoutSpans.match(/✓|✔/g) || []).length;
-  const plainIncorrect = (plainWithoutSpans.match(/✗|✖/g) || []).length;
-
-
   // 3. Tokenize remaining badge tags and symbols
   let tokenized = preprocessed
-    .replace(/<span[^>]*?(?:data-tag-type=["']correct["']|class=["'][^"']*\bcorrect\b)[^>]*>[\s\S]*?<\/span>/gi, ' [[TAG:CORRECT]] ')
-    .replace(/<span[^>]*?(?:data-tag-type=["']incorrect["']|class=["'][^"']*\bincorrect\b)[^>]*>[\s\S]*?<\/span>/gi, ' [[TAG:INCORRECT]] ')
-    .replace(/<span[^>]*?(?:data-tag-type=["']new-word["']|class=["'][^"']*\bnew-word\b)[^>]*>[\s\S]*?<\/span>/gi, ' [[TAG:NEW_WORD]] ')
-    .replace(/<span[^>]*?(?:data-tag-type=["']pronounce["']|class=["'][^"']*\bpronounce\b)[^>]*>[\s\S]*?<\/span>/gi, ' [[TAG:PRONOUNCE]] ');
+    .replace(/<span[^>]*?(?:data-tag-type=["']correct["']|class=["'][^"']*\bcorrect(?:-tag)?\b)[^>]*>[\s\S]*?<\/span>/gi, ' [[TAG:CORRECT]] ')
+    .replace(/<span[^>]*?(?:data-tag-type=["']incorrect["']|class=["'][^"']*\bincorrect(?:-tag)?\b)[^>]*>[\s\S]*?<\/span>/gi, ' [[TAG:INCORRECT]] ')
+    .replace(/<span[^>]*?(?:data-tag-type=["']new-word["']|class=["'][^"']*\bnew-word(?:-tag)?\b)[^>]*>[\s\S]*?<\/span>/gi, ' [[TAG:NEW_WORD]] ')
+    .replace(/<span[^>]*?(?:data-tag-type=["']pronounce["']|class=["'][^"']*\bpronounce(?:-tag)?\b)[^>]*>[\s\S]*?<\/span>/gi, ' [[TAG:PRONOUNCE]] ');
 
   // Tokenize plain text stamps if present
   tokenized = tokenized
     .replace(/\[New Word\]/gi, ' [[TAG:NEW_WORD]] ')
     .replace(/\[Pronounce\]/gi, ' [[TAG:PRONOUNCE]] ')
+    .replace(/\[Correct\]/gi, ' [[TAG:CORRECT]] ')
+    .replace(/\[Incorrect\]/gi, ' [[TAG:INCORRECT]] ')
+    .replace(/\(Alt\+W\)/gi, ' [[TAG:NEW_WORD]] ')
+    .replace(/\(Alt\+P\)/gi, ' [[TAG:PRONOUNCE]] ')
+    .replace(/\(Alt\+Y\)/gi, ' [[TAG:CORRECT]] ')
+    .replace(/\(Alt\+N\)/gi, ' [[TAG:INCORRECT]] ')
     .replace(/(^|[^a-zA-Z0-9_])(✓|✔)([^a-zA-Z0-9_]|$)/g, '$1 [[TAG:CORRECT]] $3')
     .replace(/(^|[^a-zA-Z0-9_])(✗|✖)([^a-zA-Z0-9_]|$)/g, '$1 [[TAG:INCORRECT]] $3');
 
@@ -241,74 +270,96 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
     const hasIncorrect = line.includes('[[TAG:INCORRECT]]');
     const hasCorrect = line.includes('[[TAG:CORRECT]]');
 
-    // Case 1: Alt+W (New Word badge on line)
-    if (hasNewWord) {
+    // Case 1: Alt+W (New Word) / Alt+P (Pronounce) on line without error tags
+    if ((hasNewWord || hasPronounce) && !hasIncorrect && !hasCorrect) {
       const cleanTerm = cleanExpressionTerm(
         line.replace(/\[\[TAG:[A-Z_]+\]\]/g, '')
       );
       if (
         cleanTerm &&
         cleanTerm.length > 0 &&
-        cleanTerm.length <= 60 &&
-        !cleanTerm.includes('.') &&
-        !seenNewWords.has(cleanTerm.toLowerCase())
+        cleanTerm.length <= 80 &&
+        !isBadgeLabel(cleanTerm)
       ) {
-        seenNewWords.add(cleanTerm.toLowerCase());
-        newWords.push(cleanTerm);
-      }
-      if (
-        hasPronounce &&
-        cleanTerm &&
-        cleanTerm.length > 0 &&
-        cleanTerm.length <= 60 &&
-        !cleanTerm.includes('.') &&
-        !seenPronounce.has(cleanTerm.toLowerCase())
-      ) {
-        seenPronounce.add(cleanTerm.toLowerCase());
-        pronounceItems.push(cleanTerm);
+        if (hasNewWord && !seenNewWords.has(cleanTerm.toLowerCase())) {
+          seenNewWords.add(cleanTerm.toLowerCase());
+          newWords.push(cleanTerm);
+        }
+        if (hasPronounce && !seenPronounce.has(cleanTerm.toLowerCase())) {
+          seenPronounce.add(cleanTerm.toLowerCase());
+          pronounceItems.push(cleanTerm);
+        }
       }
       continue;
     }
 
-    // Case 2: Alt+P (Pronounce badge on line)
-    if (hasPronounce) {
-      const cleanTerm = cleanExpressionTerm(
-        line.replace(/\[\[TAG:[A-Z_]+\]\]/g, '')
-      );
-      if (
-        cleanTerm &&
-        cleanTerm.length > 0 &&
-        cleanTerm.length <= 60 &&
-        !cleanTerm.includes('.') &&
-        !seenPronounce.has(cleanTerm.toLowerCase())
-      ) {
-        seenPronounce.add(cleanTerm.toLowerCase());
-        pronounceItems.push(cleanTerm);
-      }
-      continue;
-    }
-
-    // Case 3: Both Incorrect and Correct in the SAME line
-    // e.g., "[[TAG:INCORRECT]] Blate [[TAG:CORRECT]] Blast"
+    // Case 2: Both Incorrect and Correct in the SAME line
+    // Supports:
+    // "we can't to have ✗ we can't have ✓ [optional explanation]"
+    // "✗ we can't to have ✓ we can't have"
+    // "we can't to have ✗ ✓ we can't have"
+    // "we can't have ✓ we can't to have ✗"
+    // "✓ we can't have ✗ we can't to have"
     if (hasIncorrect && hasCorrect) {
       const incIdx = line.indexOf('[[TAG:INCORRECT]]');
       const corIdx = line.indexOf('[[TAG:CORRECT]]');
 
-      let originalPart = '';
-      let correctedPart = '';
+      let cleanOrig = '';
+      let cleanCorr = '';
+      let noteContext = '';
 
       if (incIdx < corIdx) {
-        // Incorrect comes first
-        originalPart = line.substring(incIdx + '[[TAG:INCORRECT]]'.length, corIdx);
-        correctedPart = line.substring(corIdx + '[[TAG:CORRECT]]'.length);
+        const partBeforeInc = line.substring(0, incIdx);
+        const partBetween = line.substring(incIdx + '[[TAG:INCORRECT]]'.length, corIdx);
+        const partAfterCor = line.substring(corIdx + '[[TAG:CORRECT]]'.length);
+
+        const cBefore = cleanExpressionTerm(partBeforeInc);
+        const cBetween = cleanExpressionTerm(partBetween);
+        const cAfter = cleanExpressionTerm(partAfterCor);
+
+        if (cBefore && cBetween) {
+          cleanOrig = cBefore;
+          cleanCorr = cBetween;
+          noteContext = cAfter;
+        } else if (!cBefore && cBetween && cAfter) {
+          cleanOrig = cBetween;
+          cleanCorr = cAfter;
+        } else if (cBefore && !cBetween && cAfter) {
+          cleanOrig = cBefore;
+          cleanCorr = cAfter;
+        } else if (cBetween) {
+          cleanOrig = cBetween;
+        } else if (cBefore) {
+          cleanOrig = cBefore;
+        }
       } else {
-        // Correct comes first
-        correctedPart = line.substring(corIdx + '[[TAG:CORRECT]]'.length, incIdx);
-        originalPart = line.substring(incIdx + '[[TAG:INCORRECT]]'.length);
+        const partBeforeCor = line.substring(0, corIdx);
+        const partBetween = line.substring(corIdx + '[[TAG:CORRECT]]'.length, incIdx);
+        const partAfterInc = line.substring(incIdx + '[[TAG:INCORRECT]]'.length);
+
+        const cBefore = cleanExpressionTerm(partBeforeCor);
+        const cBetween = cleanExpressionTerm(partBetween);
+        const cAfter = cleanExpressionTerm(partAfterInc);
+
+        if (cBefore && cBetween) {
+          cleanCorr = cBefore;
+          cleanOrig = cBetween;
+          noteContext = cAfter;
+        } else if (!cBefore && cBetween && cAfter) {
+          cleanCorr = cBetween;
+          cleanOrig = cAfter;
+        } else if (cBefore && !cBetween && cAfter) {
+          cleanCorr = cBefore;
+          cleanOrig = cAfter;
+        } else if (cBetween) {
+          cleanOrig = cBetween;
+        } else if (cAfter) {
+          cleanOrig = cAfter;
+        }
       }
 
-      const cleanOrig = cleanExpressionTerm(originalPart.replace(/^(instead of|original|error):\s*/i, ''));
-      const cleanCorr = cleanExpressionTerm(correctedPart.replace(/^(say|better|correction):\s*/i, ''));
+      cleanOrig = cleanOrig.replace(/^(instead of|original|error):\s*/i, '').trim();
+      cleanCorr = cleanCorr.replace(/^(say|better|correction|correct):\s*/i, '').trim();
 
       if (cleanOrig && !seenErrors.has(cleanOrig.toLowerCase())) {
         seenErrors.add(cleanOrig.toLowerCase());
@@ -316,13 +367,13 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
           original: cleanOrig,
           corrected: cleanCorr || undefined,
           isPendingConfirmation: !cleanCorr,
-          context: line.replace(/\[\[TAG:[^\]]+\]\]/g, '').trim(),
+          context: noteContext || line.replace(/\[\[TAG:[^\]]+\]\]/g, '').trim(),
         });
       }
       continue;
     }
 
-    // Case 4: Explicit text pair "Instead of: ... Say: ..." or "A -> B"
+    // Case 3: Explicit text pair "Instead of: ... Say: ..." or "A -> B"
     if (/instead of/i.test(line) && /say/i.test(line)) {
       const m = line.match(/instead of:?\s*(.*?)(?:say:?\s*(.*)|$)/i);
       if (m) {
@@ -359,17 +410,65 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
       }
     }
 
-    // Case 5: Single Incorrect Tag on line
+    // Case 4: Single Incorrect Tag on line (with lookahead for consecutive correction and explanation)
     if (hasIncorrect) {
-      const cleanOrig = cleanExpressionTerm(line.replace(/\[\[TAG:INCORRECT\]\]/g, ''));
+      const cleanOrig = cleanExpressionTerm(
+        line.replace(/\[\[TAG:INCORRECT\]\]/g, '').replace(/^(instead of|original|error):\s*/i, '')
+      );
 
-      // Check if next line is explicitly a "Say: ..." or "Better: ..." correction
       let lookaheadCorrection = '';
+      let errorContext = line.replace(/\[\[TAG:[^\]]+\]\]/g, '').trim();
+
       if (i + 1 < rawLines.length) {
         const nextLine = rawLines[i + 1];
-        if (/^(say|better|correction):\s*/i.test(nextLine)) {
-          lookaheadCorrection = cleanExpressionTerm(nextLine.replace(/^(say|better|correction):\s*/i, ''));
-          i++; // Consume lookahead
+        const nextHasIncorrect = nextLine.includes('[[TAG:INCORRECT]]');
+        const nextHasCorrect = nextLine.includes('[[TAG:CORRECT]]');
+        const nextIsExplicitCorrection = /^(say|better|correction|correct):\s*/i.test(nextLine);
+
+        // Ambiguity check: if nextLine is another error, there is NO consecutive correction for this error
+        if (!nextHasIncorrect && (nextHasCorrect || nextIsExplicitCorrection)) {
+          const candidateCorr = cleanExpressionTerm(
+            nextLine
+              .replace(/\[\[TAG:CORRECT\]\]/g, '')
+              .replace(/^(say|better|correction|correct):\s*/i, '')
+          );
+
+          if (candidateCorr) {
+            const hasPrecedingUncorrectedError =
+              errors.length > 0 && errors[errors.length - 1].isPendingConfirmation;
+            const isDirectMatch = isPedagogicalTermMatch(candidateCorr, cleanOrig);
+
+            if (hasPrecedingUncorrectedError && !isDirectMatch) {
+              // Ambiguous association: multiple errors with detached correction.
+              // Preserve original texts and keep as pending confirmation without inventing an uncertain link.
+              lookaheadCorrection = '';
+            } else {
+              lookaheadCorrection = candidateCorr;
+              i++; // Consume lookahead correction line
+
+              // Check if subsequent line is a teacher explanation / rule note
+              // (e.g. "we do not use 'to' after verbs suchs as can and help ,motly model verbs")
+              if (i + 1 < rawLines.length) {
+                const explanationLine = rawLines[i + 1];
+                const expHasTags =
+                  explanationLine.includes('[[TAG:') ||
+                  explanationLine.includes('✗') ||
+                  explanationLine.includes('✓');
+                const expIsBullet =
+                  explanationLine.startsWith('•') ||
+                  explanationLine.startsWith('-') ||
+                  explanationLine.startsWith('*');
+
+                if (!expHasTags && !expIsBullet && !isTemplateHeaderLine(explanationLine)) {
+                  const expClean = cleanExpressionTerm(explanationLine);
+                  if (expClean.length > 5) {
+                    errorContext = expClean;
+                    i++; // Consume explanation line so it attaches to error context rather than becoming an orphaned vocab item
+                  }
+                }
+              }
+            }
+          }
         }
       }
 
@@ -379,15 +478,18 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
           original: cleanOrig,
           corrected: lookaheadCorrection || undefined,
           isPendingConfirmation: !lookaheadCorrection,
-          context: line,
+          context: errorContext,
         });
       }
       continue;
     }
 
-    // Case 6: Single Correct Tag on line (Positive / Mastered Expression)
+    // Case 5: Single Correct Tag on line (Positive / Mastered Expression)
+    // Only reached if NOT consumed as a consecutive correction to an error
     if (hasCorrect) {
-      const cleanTerm = cleanExpressionTerm(line.replace(/\[\[TAG:CORRECT\]\]/g, ''));
+      const cleanTerm = cleanExpressionTerm(
+        line.replace(/\[\[TAG:CORRECT\]\]/g, '').replace(/^(say|better|correction|correct):\s*/i, '')
+      );
       if (cleanTerm && cleanTerm.length > 0 && !seenPositives.has(cleanTerm.toLowerCase())) {
         seenPositives.add(cleanTerm.toLowerCase());
         positives.push(cleanTerm);
@@ -395,7 +497,7 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
       continue;
     }
 
-    // Case 7: Bulleted notes or standalone untagged expressions without explicit coaching tag
+    // Case 6: Bulleted notes or standalone untagged expressions
     if (line.startsWith('•') || line.startsWith('-') || line.startsWith('*')) {
       const item = cleanExpressionTerm(line);
       if (item && item.length >= 1 && !item.toLowerCase().includes('in-session notes')) {
@@ -403,7 +505,6 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
       }
     } else {
       const item = cleanExpressionTerm(line);
-      // Only treat as standalone untagged vocab if it is an isolated term/expression (not a full narrative sentence)
       const wordCount = item.split(/\s+/).filter(Boolean).length;
       const isSentence = item.includes('.') || item.includes('?') || item.includes('!') || wordCount > 4;
       if (
@@ -429,15 +530,11 @@ export function parseNotesHtml(rawContent: string): ParsedNotesResult {
     .replace(/\s+/g, ' ')
     .trim();
 
-  // Final tag count evaluation
-  const correctCount = Math.max(tagCorrect + plainCorrect, positives.length);
-  const incorrectCount = Math.max(tagIncorrect + plainIncorrect, errors.length);
-  const newWordCount = Math.max(
-    tagNewWord,
-    newWords.length,
-    errors.length === 0 && pronounceItems.length === 0 ? vocabItems.length : 0
-  );
-  const pronounceCount = Math.max(tagPronounce, pronounceItems.length);
+  // Final tag counts: only count valid items, zero phantom counts
+  const correctCount = positives.length + errors.filter((e) => Boolean(e.corrected)).length;
+  const incorrectCount = errors.length;
+  const newWordCount = newWords.length;
+  const pronounceCount = pronounceItems.length;
 
   return {
     errors,

@@ -9826,24 +9826,30 @@ CRITICAL INSTRUCTIONS ON TEACHER SHORTCUT MARKINGS & TAB ROUTING:
 1. Alt + N (Error / Incorrect Markings):
    - Items stamped with 'data-tag-type="incorrect"', '✗', 'Instead of:', or error lines MUST be directed and processed appropriately into:
      a) "mistakesAnalysis" (Tab 1: Analyze Mistakes): student's original faulty utterance, natural native correction (resolving spelling, phrasing, or grammatical slips into polished English), category, grammatical explanation (addressing L1 interference), two natural examples, and common pitfalls. Even if the teacher wrote an isolated mistake without explicit correction (e.g. spelling slips or words marked with ✗), deduce and provide the accurate, natural native correction.
-     b) "grammarPoints" (Tab 2: Grammar Points): whenever an error involves a systemic grammatical rule/structure (e.g. verb tenses, stative verbs, auxiliary verbs, dependent prepositions, conditionals, modals, word order), elaborate the corresponding rule with syntax (FORM), usage, examples, and comparisons. Ensure at least 2 relevant, high-impact grammar points are provided, connecting to the session errors or CEFR ${cefr} speaking goals.
+     b) "grammarPoints" (Tab 2: Grammar Points): whenever an error involves a systemic grammatical rule/structure (e.g. modal verbs without "to", stative verbs, auxiliary verbs, verb tenses, dependent prepositions, conditionals, word order), elaborate the corresponding rule with syntax (FORM), usage, examples, and comparisons.
+        CRITICAL FIDELITY RULES FOR GRAMMAR POINTS:
+        * ONLY generate grammar points that are directly substantiated by the student's actual session errors or notes.
+        * If there is only ONE systemic grammar error in the notes (for example, using "to" after the modal "can"), provide EXACTLY ONE corresponding grammar point. DO NOT fabricate or invent a second grammar point!
+        * If there are no systemic grammar errors in the notes, "grammarPoints" MUST be an empty array [].
+        * NEVER fabricate non-existent or ungrounded grammar points.
 2. Alt + W (New Word) & Alt + P (Pronunciation Markings):
    - Items stamped with 'data-tag-type="new-word"', '[New Word]', 'data-tag-type="pronounce"', '[Pronounce]' or standalone vocabulary words MUST be directed and processed into:
      "vocabularyAndExpressions" (Tab 3: Vocabulary & Expressions).
    - For Alt+W / vocabulary: provide part of speech, register, simple definition adapted to CEFR ${cefr}, collocations, real examples, and synonyms.
    - For Alt+P: mark partOfSpeech as "Pronunciation Focus", provide clear syllable stress breakdown, phonetic guide with IPA, common pronunciation slips to avoid, and conversational examples.
-3. CRITICAL RULES FOR VOCABULARY-ONLY OR SHORT NOTES:
-   - If the notes contain ONLY vocabulary or pronunciation items (and NO student sentence errors):
-     * "mistakesAnalysis" MUST be an empty array []. NEVER fabricate non-existent student errors, sentences, or phrases!
-     * "grammarPoints" MUST be an empty array []. NEVER fabricate synthetic grammar rules when there are no systemic grammar errors!
-     * In "vocabularyAndExpressions", provide rich, authentic pedagogical analysis calibrated to CEFR ${cefr}.
-     * If a term contains a spelling slip (e.g. the teacher recorded "blury", which is standardly spelled "blurry"), evaluate and identify the correct spelling "blurry", explain the spelling rule/distinction, provide accurate CEFR ${cefr} definitions in English and ${targetLang.nameEn}, natural real-world examples, collocations, and register.
-     * In "reviewSummary", ALWAYS generate a complete object:
-       - "estimatedMinutes": "3–5 minutes"
-       - "keyRules": []
-       - "mustKnowVocabulary": concise list of target terms/words from the session
-       - "essentialCorrections": []
-       - "rememberThis": an inspiring, memorable golden takeaway rule in ${targetLang.nameEn} (at least 15 characters), focusing on the vocabulary item or spelling distinction.
+3. CRITICAL RULES FOR CONTENT FIDELITY & EMPTY SECTIONS:
+   - Exclusively generate content grounded in and substantiated by the teacher's actual notes.
+   - If a section legitimately has no corresponding content in the notes, it MUST be returned as an empty array []:
+     * If the notes contain NO student errors: "mistakesAnalysis" MUST be []. NEVER fabricate non-existent student errors, sentences, or phrases!
+     * If the notes contain NO systemic grammar errors: "grammarPoints" MUST be []. NEVER fabricate synthetic grammar points!
+     * If the notes contain NO vocabulary or pronunciation items (e.g. session only had grammar corrections): "vocabularyAndExpressions" MUST be []. NEVER fabricate synthetic vocabulary items (such as "catch up", "workload", "streamline")!
+   - If a term contains a spelling slip (e.g. the teacher recorded "blury", which is standardly spelled "blurry"), evaluate and identify the correct spelling "blurry", explain the spelling rule/distinction, provide accurate CEFR ${cefr} definitions in English and ${targetLang.nameEn}, natural real-world examples, collocations, and register.
+   - In "reviewSummary", ALWAYS generate a complete object:
+     * "estimatedMinutes": "3–5 minutes" for short notes, "5–10 minutes" for standard notes
+     * "keyRules": concise bullet titles of grammar points covered in ${targetLang.nameEn} (empty array [] if no grammar points)
+     * "mustKnowVocabulary": concise list of target terms from vocabularyAndExpressions (empty array [] if no vocabulary items)
+     * "essentialCorrections": concise list of original and corrected pairs [{"original": "...", "corrected": "..."}] from mistakesAnalysis (empty array [] if no errors)
+     * "rememberThis": an inspiring, memorable golden takeaway rule in ${targetLang.nameEn} (at least 15 characters), strictly focused on the items recorded in the session.
 4. CEFR LEVEL ADAPTATION:
    - There is NO separate CEFR tab. Instead, ALL tabs (Complete Report, 1. Analyze Mistakes, 2. Grammar Points, 3. Vocabulary & Expressions, and Quick Review) MUST be intelligently and deeply elaborated respecting and adapting to the student's current CEFR level (${cefr}).
 5. QUICK REVIEW (reviewSummary) MANDATE & TOKEN OPTIMIZATION:
@@ -9921,7 +9927,12 @@ Raw In-Session Notes to transform:
 ${rawNotes}
 """
 
-Please synthesize and transform these notes according to the Alt+N, Alt+W, and Alt+P routing rules, adapting deeply to CEFR ${cefr}. If the notes contain only vocabulary (such as a single word like "blury"), evaluate the term (including spelling accuracy like "blurry"), leave mistakesAnalysis and grammarPoints empty without fabricating errors, and ensure reviewSummary and rememberThis are fully provided in ${targetLang.nameEn} (${targetLang.nameNative}). Provide all explanations and pedagogical rules in ${targetLang.nameEn} (${targetLang.nameNative}).`;
+Please synthesize and transform these notes according to the Alt+N, Alt+W, and Alt+P routing rules, adapting deeply to CEFR ${cefr}.
+- If notes contain only errors/grammar, provide only the grounded mistakes and grammar points, and leave vocabularyAndExpressions empty [].
+- If notes contain only vocabulary (such as a single word like "blury"), evaluate the term (including spelling accuracy like "blurry"), leave mistakesAnalysis and grammarPoints empty without fabricating errors.
+- If only one grammar error exists, provide only that one grammar point without inventing a second rule.
+- Preserve all teacher markings and required expressions.
+Ensure reviewSummary and rememberThis are fully provided in ${targetLang.nameEn} (${targetLang.nameNative}). Provide all explanations and pedagogical rules in ${targetLang.nameEn} (${targetLang.nameNative}).`;
 
       // HOTFIX 3-MODEL CONTINGENCY: Sequential failover across up to 3 verified models on recoverable errors
       contingencyResult = await executeGeminiWithContingency({

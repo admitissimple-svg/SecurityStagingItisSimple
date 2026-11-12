@@ -212,20 +212,20 @@ export function getPendingPitfallsText(lang: string = 'pt'): string {
 
 export function getAiUnavailableNoticeText(lang: string = 'pt'): string {
   switch (lang.toLowerCase()) {
-    case 'en': return 'AI pedagogical enrichment is temporarily unavailable. Displaying verified teacher notes and standard markings.';
-    case 'es': return 'El enriquecimiento pedagógico por IA no está disponible temporalmente. Mostrando notas verificadas del profesor y marcas estándar.';
-    case 'fr': return 'L\'enrichissement pédagogique par IA est temporairement indisponible. Affichage des notes vérifiées de l\'enseignant et des annotations standard.';
-    case 'de': return 'Die pädagogische KI-Anreicherung ist vorübergehend nicht verfügbar. Zeigt verifizierte Lehrernotizen und Standardmarkierungen an.';
-    case 'it': return 'L\'arricchimento pedagogico con IA è temporaneamente non disponibile. Vengono mostrate le note verificate dell\'insegnante e le annotazioni standard.';
-    case 'ja': return 'AIによる教育的拡張は現在一時的に利用できません。確認済みの講師メモと標準マーキングを表示しています。';
-    case 'ko': return 'AI 교육적 심화 분석을 일시적으로 사용할 수 없습니다. 확인된 교사 메모와 표준 마킹을 표시합니다.';
-    case 'zh': return 'AI教学丰富功能暂时不可用。正在显示已验证的教师笔记和标准标记。';
-    case 'ru': return 'Педагогическое обогащение с помощью ИИ временно недоступно. Отображаются проверенные заметки преподавателя и стандартная разметка.';
-    case 'ar': return 'التحسين التربوي بالذكاء الاصطناعي غير متاح مؤقتًا. يتم عرض ملاحظات المعلم المعتمدة والعلامات القياسية.';
-    case 'tr': return 'Yapay zeka pedagojik zenginleştirmesi geçici olarak kullanılamıyor. Doğrulanmış öğretmen notları ve standart işaretlemeler gösteriliyor.';
+    case 'en': return 'AI pedagogical enrichment is temporarily unavailable. Displaying verified teacher notes and original markings.';
+    case 'es': return 'El enriquecimiento pedagógico por IA no está disponible temporalmente. Mostrando notas verificadas del profesor y marcas originales.';
+    case 'fr': return 'L\'enrichissement pédagogique par IA est temporairement indisponible. Affichage des notes vérifiées de l\'enseignant et des annotations originales.';
+    case 'de': return 'Die pädagogische KI-Anreicherung ist vorübergehend nicht verfügbar. Zeigt verifizierte Lehrernotizen und Originalmarkierungen an.';
+    case 'it': return 'L\'arricchimento pedagogico con IA è temporaneamente non disponibile. Vengono mostrate le note verificate dell\'insegnante e le annotazioni originali.';
+    case 'ja': return 'AIによる教育的拡張は現在一時的に利用できません。確認済みの講師メモと原典マーキングを表示しています。';
+    case 'ko': return 'AI 교육적 심화 분석을 일시적으로 사용할 수 없습니다. 확인된 교사 메모와 원본 마킹을 표시합니다.';
+    case 'zh': return 'AI教学丰富功能暂时不可用。正在显示已验证的教师笔记和原始标记。';
+    case 'ru': return 'Педагогическое обогащение с помощью ИИ временно недоступно. Отображаются проверенные заметки преподавателя и оригинальная разметка.';
+    case 'ar': return 'التحسين التربوي بالذكاء الاصطناعي غير متاح مؤقتًا. يتم عرض ملاحظات المعلم المعتمدة والعلامات الأصلية.';
+    case 'tr': return 'Yapay zeka pedagojik zenginleştirmesi geçici olarak kullanılamıyor. Doğrulanmış öğretmen notları ve orijinal işaretlemeler gösteriliyor.';
     case 'pt':
     default:
-      return 'O enriquecimento pedagógico por IA está temporariamente indisponível. Exibindo as anotações verificadas do professor e marcações padrão.';
+      return 'O enriquecimento pedagógico por IA está temporariamente indisponível. Exibindo as anotações verificadas do professor e marcações originais.';
   }
 }
 
@@ -710,76 +710,8 @@ export function generateLocalPedagogicalTransformation(params: {
     sessionDate,
   });
 
-  // Common L1 (Portuguese) error patterns & grammar rules
-  const L1_PATTERNS = [
-    {
-      regex: /\b(have|has)\s+(\d{1,2})\s*(years|years old)?\b/i,
-      category: 'grammar' as const,
-      topic: 'Age expression (Be vs Have)',
-      rule: 'In English, we express age using the verb "to be" (am / is / are), NEVER "have". In Portuguese, "ter anos" is used, which creates a classic false friend interference.',
-      form: 'Subject + be (am/is/are) + [number] (years old)',
-      usage: 'Used to state age, duration of life, or anniversary of things.',
-      correctedFallback: 'I am 28 years old',
-      explanation: 'Age is an ongoing physical and temporal state of being in English, not a tangible possession.',
-      twoExamples: ['She is 34 years old.', 'When I was 20, I lived in London.'],
-      commonPitfalls: 'Saying "I have 25 years" or translating Portuguese "Eu tenho ... anos" literally.',
-      comparisons: 'English: "I AM 25" (State) vs Portuguese: "Eu TENHO 25" (Possession)',
-    },
-    {
-      regex: /\b(i('m| am)\s+agree)\b/i,
-      category: 'grammar' as const,
-      topic: 'Verb "Agree" (Active Verb vs Adjective)',
-      rule: '"Agree" is an active verb in English, NOT an adjective. Do not put the auxiliary verb "am" before it in the present simple.',
-      form: 'Subject + agree / agrees (with + person / on + topic)',
-      usage: 'Used to express shared opinion, consensus, or harmony in thoughts.',
-      correctedFallback: 'I agree with you',
-      explanation: 'In Portuguese, we say "Estou de acordo", which misleads learners into saying "I am agree".',
-      twoExamples: ['I completely agree with your proposal.', 'Do you agree with the manager?'],
-      commonPitfalls: 'Adding "am" ("I am agree") or making it negative with "am not agree" instead of "I don\'t agree".',
-      comparisons: 'I agree (Verb) vs I am in agreement (Formal idiom)',
-    },
-    {
-      regex: /\b(depend\s+of)\b/i,
-      category: 'preposition' as const,
-      topic: 'Preposition collocation with "Depend"',
-      rule: 'The verb "depend" strictly collocates with the preposition "ON" (or occasionally "upon"), NEVER "of".',
-      form: 'Subject + depend(s) + ON + object / noun phrase',
-      usage: 'Expresses reliance, contingency, or conditional outcome.',
-      correctedFallback: 'It depends on the weather',
-      explanation: 'Portuguese speakers say "depende DE", causing automatic substitution of "de" with "of".',
-      twoExamples: ['Our travel plans depend on the budget.', 'Success depends on daily consistency.'],
-      commonPitfalls: 'Using "depend of" or "it depends from".',
-      comparisons: 'Depend ON (English) vs Depender DE (Portuguese)',
-    },
-    {
-      regex: /\b(make\s+a\s+question)\b/i,
-      category: 'collocation' as const,
-      topic: 'Collocation "Ask a question" (Make vs Ask)',
-      rule: 'In English, you "ASK a question", you never "make a question" or "do a question".',
-      form: 'Subject + ask + [someone] + a question',
-      usage: 'Used when inquiring or seeking clarification from a colleague or speaker.',
-      correctedFallback: 'Can I ask a question?',
-      explanation: 'Portuguese "fazer uma pergunta" leads to translating "fazer" as "make".',
-      twoExamples: ['Feel free to ask questions at any point.', 'He asked me a tricky question about finance.'],
-      commonPitfalls: 'Saying "make a question" or "do a question".',
-      comparisons: 'Ask a question (Inquire) vs Make a statement (Declare)',
-    },
-    {
-      regex: /\b(for\s+to\s+\w+|for\s+\w+ing\s+to)\b/i,
-      category: 'grammar' as const,
-      topic: 'Infinitive of Purpose (To + Verb vs For)',
-      rule: 'To express the purpose of an action ("para fazer algo"), use "TO + base verb", NOT "for + verb" or "for to".',
-      form: 'Main clause + TO + base verb (Infinitive of purpose)',
-      usage: 'Answers "why" an action was performed.',
-      correctedFallback: 'I went to the store to buy coffee',
-      explanation: 'In Portuguese "para comprar" is translated with "para" -> "for". But in English, purpose of an action is expressed by the bare infinitive with "to".',
-      twoExamples: ['I called him to confirm our meeting time.', 'She exercises daily to stay energized.'],
-      commonPitfalls: 'Saying "for to buy" or "for buying" when indicating your personal goal or immediate reason.',
-      comparisons: 'To buy (purpose of action) vs For buying (purpose of an object or tool)',
-    },
-  ];
-
-  // 1. Build Section 1: Mistakes Analysis (Strictly from real markings)
+  // 1. Build Section 1: Mistakes Analysis (Strictly from real teacher markings)
+  // Zero canned fallback corrections, zero pre-fabricated AI explanations, zero invented examples.
   const mistakesAnalysis: PedagogicalMistakeAnalysis[] = [];
   const processedSignatures = new Set<string>();
 
@@ -789,144 +721,44 @@ export function generateLocalPedagogicalTransformation(params: {
     processedSignatures.add(rawOrig.toLowerCase());
 
     const cleanCorr = (err.corrected || (rawOrig.includes('->') ? rawOrig.split('->')[1].trim() : '')).trim();
-    const matchedPattern = L1_PATTERNS.find(
-      (p) => p.regex.test(rawOrig) || (cleanCorr && p.regex.test(cleanCorr))
-    );
+    const isUnconfirmed = err.isPendingConfirmation || !cleanCorr;
 
-    if (matchedPattern) {
-      mistakesAnalysis.push({
-        id: `mistake-${mistakesAnalysis.length + 1}`,
-        original: rawOrig,
-        corrected: cleanCorr || matchedPattern.correctedFallback,
-        category: matchedPattern.category,
-        explanation: matchedPattern.explanation,
-        twoExamples: matchedPattern.twoExamples,
-        commonPitfalls: matchedPattern.commonPitfalls,
-        isPendingConfirmation: false,
-      });
-    } else if (err.isPendingConfirmation || !cleanCorr) {
-      const isPt = cleanLang === 'pt';
+    if (isUnconfirmed) {
       const pendingText = getPendingConfirmationText(cleanLang);
-      const hypothetical = includeHypotheticalExamples
-        ? [
-            `Didactic Example (Hypothetical): "Verify the intended phrasing for '${rawOrig}'."`,
-            `Didactic Example (Hypothetical): "Discuss with your Native Friend how native speakers phrase this."`,
-          ]
-        : [];
       mistakesAnalysis.push({
         id: `mistake-${mistakesAnalysis.length + 1}`,
         original: rawOrig,
         corrected: pendingText,
-        category: 'vocabulary',
+        category: 'phrasing',
         explanation: getUnconfirmedExplanationText(rawOrig, cleanLang),
-        twoExamples: hypothetical,
+        twoExamples: [],
         commonPitfalls: getPendingPitfallsText(cleanLang),
         isPendingConfirmation: true,
       });
     } else {
-      const correctedText = cleanCorr;
       mistakesAnalysis.push({
         id: `mistake-${mistakesAnalysis.length + 1}`,
         original: rawOrig,
-        corrected: correctedText,
-        category: 'grammar',
-        explanation: `In native spoken English, phrasing this structure as "${correctedText}" aligns naturally with conversational rhythm and grammatical precision.`,
-        twoExamples: [
-          `In everyday conversation: "${correctedText}".`,
-          `Alternative formulation: "I prefer saying ${correctedText} to sound natural and clear."`,
-        ],
-        commonPitfalls: `Reverting to literal native language syntax instead of adopting natural English phraseology.`,
+        corrected: cleanCorr,
+        category: 'phrasing',
+        explanation: err.context && err.context !== rawOrig ? err.context : '',
+        twoExamples: [],
+        commonPitfalls: '',
         isPendingConfirmation: false,
       });
     }
   }
 
-  // 2. Build Section 2: Teach Grammar Points (Strictly when systemic evidence exists)
+  // 2. Build Section 2: Teach Grammar Points
+  // In local fallback mode without a validated Gemini response:
+  // Zero pre-fabricated grammar points, zero canned rules, zero synthetic examples!
   const grammarPoints: PedagogicalGrammarPoint[] = [];
 
-  const hasAgreeMistake = mistakesAnalysis.some(
-    (m) => (/agree/i.test(m.original) || /agree/i.test(m.corrected)) && !m.isPendingConfirmation
-  );
-  const hasAgeMistake = mistakesAnalysis.some(
-    (m) => (/year/i.test(m.original) || /have.*old/i.test(m.original)) && !m.isPendingConfirmation
-  );
-  const hasPrepositionMistake = mistakesAnalysis.some(
-    (m) => m.category === 'preposition' && !m.isPendingConfirmation
-  );
-
-  if (hasAgreeMistake) {
-    grammarPoints.push({
-      id: 'grammar-1',
-      topic: 'Stative & Opinion Verbs: Agree, Believe, Need',
-      rule: 'Verbs expressing mental state or opinion (agree, think, understand) function as main lexical verbs. They do not take the auxiliary "be" in simple affirmative statements.',
-      form: 'Affirmative: Subject + Verb (e.g., I agree) | Negative: Subject + do/does not + Verb (e.g., I don\'t agree) | Question: Do/Does + Subject + Verb? (e.g., Do you agree?)',
-      usage: 'Used in discussions, meetings, and casual chats to indicate agreement, consensus, or shared perspectives.',
-      examples: [
-        'I agree with your perspective on work-life balance.',
-        'We don\'t agree on every detail, but we respect each other\'s view.',
-        'Do you agree with the revised deadline?',
-      ],
-      commonMistakes: 'Saying "I am agree", "I am not agree", or "Are you agree?".',
-      comparisons: 'I agree (Active state verb) vs I am happy (Subject + be + adjective).',
-    });
-  }
-
-  if (hasPrepositionMistake) {
-    grammarPoints.push({
-      id: 'grammar-2',
-      topic: 'Dependent Prepositions with Common Verbs (Depend on, Wait for, Listen to)',
-      rule: 'In English, certain verbs demand specific fixed prepositions before their noun objects. These pairings must be learned as single semantic blocks.',
-      form: 'Verb + Fixed Preposition + Object Noun/Pronoun/Gerund (-ing)',
-      usage: 'Essential for discussing dependencies, time, and interpersonal focus accurately.',
-      examples: [
-        'My weekend plans depend on my energy levels after Friday.',
-        'I am waiting for the confirmation email.',
-        'She always listens to the daily podcast during her commute.',
-      ],
-      commonMistakes: 'Saying "depend of" (from Portuguese "depender de") or "listen music" without "to".',
-      comparisons: 'Depend ON vs Wait FOR vs Listen TO vs Look AT.',
-    });
-  }
-
-  if (hasAgeMistake) {
-    grammarPoints.push({
-      id: 'grammar-3',
-      topic: 'Expressing Age and Enduring Physical States with "To Be"',
-      rule: 'Age, temperature, hunger, and physical conditions in English are expressed with the verb "to be", reflecting states of existence.',
-      form: 'Subject + be (am/is/are) + age number [years old] / adjective',
-      usage: 'Introducing oneself, introducing relatives, discussing milestones and life phases.',
-      examples: [
-        'I am 32 years old, and my brother is 29.',
-        'When my daughter is five, she will start school.',
-      ],
-      commonMistakes: 'Using "have" instead of "be" (e.g., "I have 25 years").',
-      comparisons: 'I am 25 (English state) vs Eu tenho 25 anos (Portuguese possession).',
-    });
-  }
-
-  // 3. Build Section 3: Teach Vocabulary and Expressions (Mapped from Alt+W and Alt+P + bullets)
+  // 3. Build Section 3: Teach Vocabulary and Expressions
+  // Strictly mapped from Alt+W and Alt+P markings recorded by the teacher.
+  // Zero canned database lookups or artificial definitions/examples pretending to be AI!
   const vocabularyAndExpressions: PedagogicalVocabularyItem[] = [];
-
-  // Combine Alt+W (New Word), Alt+P (Pronounce), and general vocab markings
   const candidateVocab = [...markings.newWords, ...markings.pronounceItems, ...markings.vocabItems];
-
-  const VOCAB_DATABASE: Record<string, Omit<PedagogicalVocabularyItem, 'id' | 'term'>> = {
-    ...Object.fromEntries(
-      Object.entries(NATIVE_FRIENDS_DICTIONARY_DATABASE).map(([key, item]) => [
-        key,
-        {
-          partOfSpeech: item.partOfSpeech,
-          simpleDefinition: item.definitionEn,
-          collocations: item.collocations || [`use "${item.word}" naturally`],
-          realExamples: item.realExamples || [item.exampleSentenceEn],
-          synonyms: item.synonyms || ['target phrase'],
-          register: item.register || ('neutral' as const),
-          category: item.category || 'Core Session Vocabulary',
-        },
-      ])
-    ),
-  };
-
   const seenVocabTerms = new Set<string>();
 
   candidateVocab.forEach((item) => {
@@ -943,75 +775,73 @@ export function generateLocalPedagogicalTransformation(params: {
       (w) => w.toLowerCase().trim() === cleanWord || cleanWord.includes(w.toLowerCase().trim())
     );
 
-    const normalizedKey = cleanWord.replace(/[_\-]+/g, ' ');
-    const dbMatch = NATIVE_FRIENDS_DICTIONARY_DATABASE[cleanWord] || NATIVE_FRIENDS_DICTIONARY_DATABASE[normalizedKey];
-
-    const entry = VOCAB_DATABASE[cleanWord] || (dbMatch ? {
-      partOfSpeech: dbMatch.partOfSpeech,
-      simpleDefinition: dbMatch.definitionEn,
-      collocations: dbMatch.collocations || [`use "${rawTrimmed}" naturally`],
-      realExamples: dbMatch.realExamples || [dbMatch.exampleSentenceEn],
-      synonyms: dbMatch.synonyms || ['target phrase'],
-      register: dbMatch.register || ('neutral' as const),
-      category: isPronounce ? 'Pronunciation & Phonetics (Alt+P)' : isNewWord ? 'New Words & Expressions (Alt+W)' : 'Core Session Vocabulary',
-    } : {
+    vocabularyAndExpressions.push({
+      id: `vocab-${vocabularyAndExpressions.length + 1}`,
+      term: rawTrimmed,
+      cefrLevel: cefrMeta.cefr,
       partOfSpeech: isPronounce
         ? 'Pronunciation Focus'
         : cleanWord.includes(' ')
-        ? 'Idiomatic Expression'
+        ? 'Expression'
         : 'Vocabulary Item',
       simpleDefinition: isPronounce
-        ? (cleanLang === 'pt' ? `Foco em pronúncia da aula para "${rawTrimmed}".` : `Session pronunciation note for "${rawTrimmed}".`)
+        ? (cleanLang === 'pt' ? `Foco em pronúncia anotado pelo professor na sessão: "${rawTrimmed}".` : `Teacher session pronunciation focus: "${rawTrimmed}".`)
         : (cleanLang === 'pt' ? `Vocabulário anotado pelo professor na sessão: "${rawTrimmed}".` : `Teacher session vocabulary: "${rawTrimmed}".`),
       collocations: [],
       realExamples: [],
       synonyms: [],
       register: 'neutral' as const,
-      category: isPronounce ? 'Pronunciation & Phonetics (Alt+P)' : isNewWord ? 'New Words & Expressions (Alt+W)' : 'Core Session Vocabulary',
-    });
-
-    vocabularyAndExpressions.push({
-      id: `vocab-${vocabularyAndExpressions.length + 1}`,
-      term: rawTrimmed,
-      cefrLevel: dbMatch?.cefrLevel || cefrMeta.cefr,
-      ...entry,
+      category: isPronounce
+        ? 'Pronunciation & Phonetics (Alt+P)'
+        : isNewWord
+        ? 'New Words & Expressions (Alt+W)'
+        : 'Core Session Vocabulary',
       phoneticGuide: isPronounce
-        ? `🎯 Pronunciation focus: practice clean syllable stress on "${rawTrimmed}" without adding Portuguese final vowels.`
-        : (dbMatch?.phonetic || undefined),
+        ? `🎯 Pronunciation focus: practice clean syllable stress on "${rawTrimmed}".`
+        : undefined,
       isPronunciationFocus: isPronounce,
       isNewWord: isNewWord,
+      isProvisional: true,
+      isFallback: true,
     });
   });
 
-  // CEFR Level Adaptation metadata
+  // CEFR Level Adaptation metadata (Faithful review notice)
   const levelAdaptation: PedagogicalLevelAdaptation = {
     cefrLevel: cefrMeta.cefr,
     levelLabel: cefrMeta.labelEn,
     nativeInterferenceNotes:
-      cefrMeta.cefr === 'A1' || cefrMeta.cefr === 'A2'
-        ? 'At the A1-A2 level, Brazilian Portuguese speakers frequently transfer basic word order and verb structures directly into English. Focus on short, declarative subject-verb-object building blocks and anchor common prepositions (in/on/at).'
-        : cefrMeta.cefr === 'B1' || cefrMeta.cefr === 'B2'
-        ? 'At the B1-B2 level, learners speak comfortably but often encounter subtle preposition collocations, false friends, and over-reliance on simple verb forms. Prioritize conversational collocations and connecting phrases.'
-        : 'At the C1-C2 level, focus shifts to pragmatic nuance, sophisticated idiomatic expressions, tone calibration, and eliminating residual syntactic Portuguese calques to achieve effortless executive fluency.',
+      cleanLang === 'pt'
+        ? `Revisão direta baseada nas anotações da aula para o nível CEFR ${cefrMeta.cefr}.`
+        : `Direct review based on session teacher notes for CEFR level ${cefrMeta.cefr}.`,
     complexityAdjustmentAdvice:
-      cefrMeta.cefr === 'A1' || cefrMeta.cefr === 'A2'
-        ? 'Keep sentences short, clear, and grounded in daily concrete actions. Repeat the expressions out loud 3 times.'
-        : 'Integrate the new vocabulary into spontaneous 2-minute speaking monologues before your next live session.',
-    targetedPracticePrompt: `Describe your typical routine or recent experiences regarding "${topic}", making sure to incorporate at least two of the session items.`,
+      cleanLang === 'pt'
+        ? 'Revise os itens marcados pelo professor antes da sua próxima aula.'
+        : 'Review teacher-marked items before your next live session.',
+    targetedPracticePrompt: `Practice using the expressions from "${topic}".`,
   };
 
   // 4. Build Section 4: 5-10 Minute Quick Review Summary
+  // Strictly reflects teacher markings without invented key rules or fake rules
   const rememberThis =
-    mistakesAnalysis.length > 0
-      ? `Remember this: Instead of saying "${mistakesAnalysis[0].original}", always say "${mistakesAnalysis[0].corrected}"! Consistent small shifts in your active vocabulary build unstoppable speaking confidence.`
-      : `Remember this: Fluency is not about never making mistakes; it is about recognizing patterns quickly and adopting natural native phraseology!`;
+    mistakesAnalysis.length > 0 && !mistakesAnalysis[0].isPendingConfirmation && mistakesAnalysis[0].corrected
+      ? (cleanLang === 'pt'
+          ? `Lembre-se disto: Em vez de "${mistakesAnalysis[0].original}", prefira "${mistakesAnalysis[0].corrected}".`
+          : `Remember this: Instead of saying "${mistakesAnalysis[0].original}", say "${mistakesAnalysis[0].corrected}".`)
+      : vocabularyAndExpressions.length > 0
+      ? (cleanLang === 'pt'
+          ? `Lembre-se disto: Revise as anotações do professor para fixar o vocabulário da sessão.`
+          : `Remember this: Review your teacher notes to reinforce the vocabulary from this session.`)
+      : (cleanLang === 'pt'
+          ? `Lembre-se disto: A prática consistente desenvolve naturalidade e confiança na fala!`
+          : `Remember this: Consistent speaking practice builds natural conversational confidence!`);
 
   const reviewSummary: PedagogicalReviewSummary = {
-    estimatedMinutes: '5–10 minutes',
+    estimatedMinutes: '3–5 minutes',
     keyRules: grammarPoints.map((gp) => `${gp.topic}: ${gp.rule}`),
     mustKnowVocabulary: vocabularyAndExpressions.map((v) => {
       const tag = v.isPronunciationFocus ? '🎯 [Pronounce]' : '✨';
-      return `${tag} ${v.term} (${v.partOfSpeech}) — ${v.simpleDefinition}`;
+      return `${tag} ${v.term}`;
     }),
     essentialCorrections: mistakesAnalysis.map((m) => ({
       original: m.original,

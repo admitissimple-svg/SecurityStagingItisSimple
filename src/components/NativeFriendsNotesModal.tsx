@@ -893,7 +893,7 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                 ) : transformation?.isFallback ? (
                   <span className="px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 text-[11px] font-semibold border border-amber-400/40 flex items-center gap-1">
                     <AlertTriangle className="w-3 h-3 text-amber-300" />
-                    {isEn ? 'Direct Notes (AI Offline)' : 'Notas Diretas (IA Offline)'}
+                    {isEn ? 'AI Enrichment Unavailable' : 'Enriquecimento de IA Indisponível'}
                   </span>
                 ) : null}
               </div>
@@ -1516,12 +1516,18 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                       <div className="p-8 rounded-2xl bg-white border border-slate-200 text-center space-y-2">
                         <GraduationCap className="w-8 h-8 text-blue-500 mx-auto" />
                         <h4 className="font-bold text-sm text-[#000035]">
-                          {isEn ? 'No Formal Grammar Points Recorded' : 'Nenhum Ponto Gramatical Formal'}
+                          {transformation.isFallback
+                            ? (isEn ? 'AI Grammar Enrichment Unavailable' : 'Enriquecimento Gramatical de IA Indisponível')
+                            : (isEn ? 'No Formal Grammar Points Recorded' : 'Nenhum Ponto Gramatical Formal')}
                         </h4>
                         <p className="text-xs text-slate-500">
-                          {isEn
-                            ? 'This session focused primarily on vocabulary and natural fluency.'
-                            : 'Esta sessão teve foco em vocabulário e conversação fluida.'}
+                          {transformation.isFallback
+                            ? (isEn
+                                ? 'Grammar rules and syntax breakdowns require AI enrichment. Original teacher notes and error corrections are preserved in Tab 1.'
+                                : 'Regras gramaticais e estruturas exigem enriquecimento por IA. As correções originais do professor estão preservadas na Aba 1.')
+                            : (isEn
+                                ? 'This session focused primarily on vocabulary and natural fluency.'
+                                : 'Esta sessão teve foco em vocabulário e conversação fluida.')}
                         </p>
                       </div>
                     )}
