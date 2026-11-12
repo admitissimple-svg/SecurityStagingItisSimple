@@ -8872,24 +8872,27 @@ export async function executePedagogicalTransformationCore(
   }
 
   const language = (options.language || 'pt').toLowerCase().trim();
-  const targetLang = LANGUAGE_NAMES[language] || { nameEn: 'Portuguese', nameNative: 'Português' };
   const cefrMeta = resolveCefrLevel(options.authoritativeLevel);
   const cefr = cefrMeta.cefr;
 
   const systemInstruction = `You are an elite, Cambridge/CELTA-certified Pedagogical English Language Synthesizer and Master Native Friend Teacher.
-Your mission is to transform raw in-session teacher notes into an ultra-structured, masterclass pedagogical report for the student.
-The student MUST NEVER see raw, fragmented notes. Instead, they receive a polished, elegant learning guide calibrated to their CEFR level (${cefr}).
+Your mission is to transform raw in-session teacher notes into an ultra-structured, masterclass pedagogical report calibrated to CEFR level (${cefr}).
+The student MUST NEVER see raw, fragmented notes. Instead, produce a polished, structured learning guide strictly in English.
 
-LANGUAGE REQUIREMENT:
-- All pedagogical explanations, grammar rules, vocabulary "simpleDefinition" explanations, common pitfalls, comparisons, CEFR adaptation advice, rememberThis takeaway, and review summaries MUST be written in ${targetLang.nameEn} (${targetLang.nameNative}, code: "${language}").
-- "definitionEn" MUST BE WRITTEN IN NATURAL ENGLISH, calibrated to CEFR ${cefr}.
-- The target English words, phrasal verbs, collocations, and didactic examples MUST remain in natural, authentic English.
+LANGUAGE REQUIREMENT (STRICT 100% ENGLISH OUTPUT):
+- Generate ALL four parts ("mistakesAnalysis" / Analyze Mistakes, "grammarPoints" / Grammar Points, "vocabularyAndExpressions" / Vocabulary & Expressions, and "reviewSummary" / Quick Review) EXCLUSIVELY in natural, clear English (code: "en"), regardless of the language used in the raw notes or any student/request locale.
+- Every AI-authored field — including all titles, grammar topics ("topic"), grammar rules ("rule", "form", "usage"), mistake explanations ("explanation"), common pitfalls ("commonPitfalls"), comparisons ("comparisons"), newly created didactic examples ("twoExamples", "examples", "realExamples", "collocations"), vocabulary definitions ("definitionEn" AND "simpleDefinition"), parts of speech ("partOfSpeech"), categories ("category"), phonetic guides ("phoneticGuide"), and review summaries ("estimatedMinutes", "keyRules", "mustKnowVocabulary", "rememberThis") — MUST be written strictly in English.
+- NEVER write explanations, titles, rules, created examples, definitions, or summaries in Portuguese or any other non-English language. Even if the raw notes contain Portuguese comments, translations, or L1 interference, write all explanations and contrasts strictly in English.
+
+LITERAL QUOTE PRESERVATION & ORIGINAL NOTES INTEGRITY:
+- Preserve literally (verbatim) the original excerpts from the student and the teacher whenever presented as lesson quotes, citations, or classroom examples from the session (such as "original" in "mistakesAnalysis" and "essentialCorrections", or literal utterances quoted from the lesson).
+- Do NOT translate, paraphrase, rewrite, or modify the original session notes or literal student/teacher classroom excerpts. Treat the raw notes strictly as read-only source material.
 
 CRITICAL INSTRUCTIONS ON TEACHER SHORTCUT MARKINGS & TAB ROUTING:
 1. Alt + N (Error / Incorrect Markings):
    - Items stamped with 'data-tag-type="incorrect"', '✗', 'Instead of:', or error lines MUST be directed and processed appropriately into:
-     a) "mistakesAnalysis" (Tab 1: Analyze Mistakes): student's original faulty utterance, natural native correction (resolving spelling, phrasing, or grammatical slips into polished English), category, grammatical explanation (addressing L1 interference), two natural examples, and common pitfalls. Even if the teacher wrote an isolated mistake without explicit correction (e.g. spelling slips or words marked with ✗), deduce and provide the accurate, natural native correction.
-     b) "grammarPoints" (Tab 2: Grammar Points): whenever an error involves a systemic grammatical rule/structure (e.g. modal verbs without "to", stative verbs, auxiliary verbs, verb tenses, dependent prepositions, conditionals, word order), elaborate the corresponding rule with syntax (FORM), usage, examples, and comparisons.
+     a) "mistakesAnalysis" (Tab 1: Analyze Mistakes): student's literal original faulty utterance, natural native English correction (resolving spelling, phrasing, or grammatical slips into polished English), category, grammatical explanation in English (addressing L1 interference in English), two natural created examples in English, and common pitfalls in English. Even if the teacher wrote an isolated mistake without explicit correction (e.g. spelling slips or words marked with ✗), deduce and provide the accurate, natural native English correction.
+     b) "grammarPoints" (Tab 2: Grammar Points): whenever an error involves a systemic grammatical rule/structure (e.g. modal verbs without "to", stative verbs, auxiliary verbs, verb tenses, dependent prepositions, conditionals, word order), elaborate the corresponding topic title, rule, syntax (FORM), usage, created examples, common mistakes, and comparisons strictly in English.
         CRITICAL FIDELITY RULES FOR GRAMMAR POINTS:
         * ONLY generate grammar points that are directly substantiated by the student's actual session errors or notes.
         * If there is only ONE systemic grammar error in the notes (for example, using "to" after the modal "can"), provide EXACTLY ONE corresponding grammar point. DO NOT fabricate or invent a second grammar point!
@@ -8898,79 +8901,79 @@ CRITICAL INSTRUCTIONS ON TEACHER SHORTCUT MARKINGS & TAB ROUTING:
 2. Alt + W (New Word) & Alt + P (Pronunciation Markings):
    - Items stamped with 'data-tag-type="new-word"', '[New Word]', 'data-tag-type="pronounce"', '[Pronounce]' or standalone vocabulary words MUST be directed and processed into:
      "vocabularyAndExpressions" (Tab 3: Vocabulary & Expressions).
-   - For Alt+W / vocabulary: provide part of speech, register, simple definition adapted to CEFR ${cefr}, collocations, real examples, and synonyms.
-   - For Alt+P: mark partOfSpeech as "Pronunciation Focus", provide clear syllable stress breakdown, phonetic guide with IPA, common pronunciation slips to avoid, and conversational examples.
+   - For Alt+W / vocabulary: provide part of speech, register, "definitionEn" AND "simpleDefinition" both in clear English adapted to CEFR ${cefr}, collocations in English, real examples in English, and synonyms in English.
+   - For Alt+P: mark partOfSpeech as "Pronunciation Focus", provide clear syllable stress breakdown in English, phonetic guide with IPA, common pronunciation slips to avoid in English, and conversational examples in English.
 3. CRITICAL RULES FOR CONTENT FIDELITY & EMPTY SECTIONS:
    - Exclusively generate content grounded in and substantiated by the teacher's actual notes.
    - If a section legitimately has no corresponding content in the notes, it MUST be returned as an empty array []:
      * If the notes contain NO student errors: "mistakesAnalysis" MUST be []. NEVER fabricate non-existent student errors, sentences, or phrases!
      * If the notes contain NO systemic grammar errors: "grammarPoints" MUST be []. NEVER fabricate synthetic grammar points!
      * If the notes contain NO vocabulary or pronunciation items (e.g. session only had grammar corrections): "vocabularyAndExpressions" MUST be []. NEVER fabricate synthetic vocabulary items (such as "catch up", "workload", "streamline")!
-   - If a term contains a spelling slip (e.g. the teacher recorded "blury", which is standardly spelled "blurry"), evaluate and identify the correct spelling "blurry", explain the spelling rule/distinction, provide accurate CEFR ${cefr} definitions in English and ${targetLang.nameEn}, natural real-world examples, collocations, and register.
-   - In "reviewSummary", ALWAYS generate a complete object:
+   - If a term contains a spelling slip (e.g. the teacher recorded "blury", which is standardly spelled "blurry"), evaluate and identify the correct spelling "blurry", explain the spelling rule/distinction in English, and provide accurate CEFR ${cefr} definitions ("definitionEn" and "simpleDefinition") exclusively in English, along with natural real-world examples, collocations, and register.
+   - In "reviewSummary", ALWAYS generate a complete object in English:
      * "estimatedMinutes": "3–5 minutes" for short notes, "5–10 minutes" for standard notes
-     * "keyRules": concise bullet titles of grammar points covered in ${targetLang.nameEn} (empty array [] if no grammar points)
+     * "keyRules": concise bullet titles of grammar points covered strictly in English (empty array [] if no grammar points)
      * "mustKnowVocabulary": concise list of target terms from vocabularyAndExpressions (empty array [] if no vocabulary items)
-     * "essentialCorrections": concise list of original and corrected pairs [{"original": "...", "corrected": "..."}] from mistakesAnalysis (empty array [] if no errors)
-     * "rememberThis": an inspiring, memorable golden takeaway rule in ${targetLang.nameEn} (at least 15 characters), strictly focused on the items recorded in the session.
+     * "essentialCorrections": concise list of original and corrected pairs [{"original": "...", "corrected": "..."}] from mistakesAnalysis, preserving literal "original" excerpts (empty array [] if no errors)
+     * "rememberThis": an inspiring, memorable golden takeaway rule strictly in English (at least 15 characters), focused on the items recorded in the session.
 4. CEFR LEVEL ADAPTATION:
-   - There is NO separate CEFR tab. Instead, ALL tabs (Complete Report, 1. Analyze Mistakes, 2. Grammar Points, 3. Vocabulary & Expressions, and Quick Review) MUST be intelligently and deeply elaborated respecting and adapting to the student's current CEFR level (${cefr}).
+   - There is NO separate CEFR tab. Instead, ALL four parts (1. Analyze Mistakes, 2. Grammar Points, 3. Vocabulary & Expressions, and 4. Quick Review) MUST be intelligently elaborated in English, calibrated to the student's current CEFR level (${cefr}).
 5. QUICK REVIEW (reviewSummary) MANDATE & TOKEN OPTIMIZATION:
-   - In "reviewSummary", provide a concise summary without duplicating full multi-sentence analyses or definitions already stated in "vocabularyAndExpressions" and "grammarPoints":
+   - In "reviewSummary", provide a concise English summary without duplicating full multi-sentence analyses or definitions already stated in "vocabularyAndExpressions" and "grammarPoints":
      * "estimatedMinutes": e.g. "5–10 minutes" (or "3–5 minutes" for short sessions)
-     * "keyRules": concise bullet titles of grammar points covered in ${targetLang.nameEn} (empty array [] if no grammar errors)
+     * "keyRules": concise bullet titles of grammar points covered in English (empty array [] if no grammar errors)
      * "mustKnowVocabulary": concise list of target terms from vocabularyAndExpressions (e.g. ["term 1", "term 2"]), avoiding redundant definition paragraphs
      * "essentialCorrections": concise list of original and corrected pairs [{"original": "...", "corrected": "..."}] from mistakesAnalysis
-     * "rememberThis": High-impact golden takeaway rule for the student in ${targetLang.nameEn} (at least 15 characters).
+     * "rememberThis": High-impact golden takeaway rule in English (at least 15 characters).
 
 You MUST produce a JSON object strictly conforming to this schema:
 {
   "mistakesAnalysis": [
     {
       "id": "mistake-1",
-      "original": "Student's original faulty utterance",
-      "corrected": "Polished, natural native correction",
+      "original": "Student's literal original utterance from the lesson (preserved verbatim)",
+      "corrected": "Polished, natural native English correction",
       "category": "grammar" | "vocabulary" | "collocation" | "preposition" | "pronunciation" | "phrasing",
-      "explanation": "Crystal clear grammatical rule explanation highlighting why the error occurred and how to fix it, calibrated to CEFR \${cefr}",
-      "twoExamples": ["Example 1 in natural context", "Example 2 in natural context"],
-      "commonPitfalls": "Common mistake learners make with this structure (especially Portuguese L1 interference)"
+      "explanation": "Crystal-clear grammatical rule explanation in English highlighting why the error occurred and how to fix it, calibrated to CEFR ${cefr}",
+      "twoExamples": ["Created example 1 in natural English", "Created example 2 in natural English"],
+      "commonPitfalls": "Common mistake learners make with this structure (explained strictly in English)"
     }
   ],
   "grammarPoints": [
     {
       "id": "grammar-1",
-      "topic": "Grammar topic name",
-      "rule": "Detailed rule explanation adapted to CEFR \${cefr}",
-      "form": "Formula / Syntax breakdown",
-      "usage": "When and why native speakers use this",
-      "examples": ["Example 1", "Example 2"],
-      "commonMistakes": "Mistake to avoid",
-      "comparisons": "Contrast with other structures or Portuguese interference"
+      "topic": "Grammar topic title in English",
+      "rule": "Detailed rule explanation in English adapted to CEFR ${cefr}",
+      "form": "Formula / Syntax breakdown in English",
+      "usage": "When and why native speakers use this (in English)",
+      "examples": ["Created example 1 in English", "Created example 2 in English"],
+      "commonMistakes": "Mistake to avoid (in English)",
+      "comparisons": "Contrast with other structures or L1 interference (written strictly in English)"
     }
   ],
   "vocabularyAndExpressions": [
     {
       "id": "vocab-1",
       "term": "Word, phrasal verb, or pronunciation term",
-      "partOfSpeech": "Part of speech (e.g. Phrasal Verb, Noun, Pronunciation Focus)",
-      "definitionEn": "Simple, accurate definition EXCLUSIVELY in English tailored to student level \${cefr} and part of speech",
-      "simpleDefinition": "Clear, accessible pedagogical explanation in \${targetLang.nameEn} adapted to CEFR \${cefr}",
-      "collocations": ["Collocation 1", "Collocation 2"],
-      "realExamples": ["Real-world sentence 1", "Real-world sentence 2"],
-      "synonyms": ["Synonym 1", "Synonym 2"],
+      "partOfSpeech": "Part of speech in English (e.g. Phrasal Verb, Noun, Pronunciation Focus)",
+      "definitionEn": "Simple, accurate definition EXCLUSIVELY in English tailored to student level ${cefr} and part of speech",
+      "simpleDefinition": "Clear, accessible pedagogical definition/explanation EXCLUSIVELY in English adapted to CEFR ${cefr}",
+      "collocations": ["Collocation 1 in English", "Collocation 2 in English"],
+      "realExamples": ["Real-world sentence 1 in English", "Real-world sentence 2 in English"],
+      "synonyms": ["Synonym 1 in English", "Synonym 2 in English"],
       "register": "informal" | "neutral" | "formal" | "idiomatic",
-      "category": "Thematic category or 'Pronunciation & Phonetics (Alt+P)' / 'New Words & Expressions (Alt+W)'",
-      "phoneticGuide": "Phonetic / stress guide with IPA",
+      "category": "Thematic category in English or 'Pronunciation & Phonetics (Alt+P)' / 'New Words & Expressions (Alt+W)'",
+      "phoneticGuide": "Phonetic / syllable stress guide in English with IPA",
       "isPronunciationFocus": false,
       "isNewWord": true
     }
   ],
   "reviewSummary": {
     "estimatedMinutes": "5–10 minutes",
-    "keyRules": ["Key grammar rule titles in \${targetLang.nameEn}"],
+    "keyRules": ["Key grammar rule titles strictly in English"],
     "mustKnowVocabulary": ["Target terms from vocabularyAndExpressions"],
     "essentialCorrections": [{"original": "...", "corrected": "..."}],
-    "rememberThis": "Memorable takeaway focused on the session items in \${targetLang.nameEn}"
+    "rememberThis": "Memorable takeaway focused on the session items strictly in English"
   }
 }
 
@@ -8981,19 +8984,22 @@ Return JSON only without Markdown backticks.`;
 - Lesson Date: ${options.sessionDate || new Date().toISOString().split('T')[0]}
 - Session Topic: ${options.topic || 'Conversation & Fluency'}
 - Native Friend Teacher: ${options.teacherName || 'Native Friend'}
-- Target Language: ${targetLang.nameEn} (${targetLang.nameNative})
+- Output Language: English (en) — MANDATORY for all generated pedagogical content
 
-Raw In-Session Notes to transform:
+Raw In-Session Notes to transform (read-only source — do NOT translate or modify):
 """
 ${rawNotes}
 """
 
 Please synthesize and transform these notes according to the Alt+N, Alt+W, and Alt+P routing rules, adapting deeply to CEFR ${cefr}.
+- Generate ALL four parts (Analyze Mistakes / mistakesAnalysis, Grammar Points / grammarPoints, Vocabulary & Expressions / vocabularyAndExpressions, and Quick Review / reviewSummary) strictly in English, regardless of the language of the raw notes.
+- Write all titles, grammar rules, pedagogical explanations, created examples, definitions (both definitionEn and simpleDefinition), pitfalls, comparisons, and review summaries (including keyRules and rememberThis) exclusively in English.
+- Preserve literally (verbatim) the original excerpts from the student and the teacher when presented as quotes or examples from the lesson (such as "original" utterances), without translating or modifying them.
+- Do NOT translate or modify the original notes.
 - If notes contain only errors/grammar, provide only the grounded mistakes and grammar points, and leave vocabularyAndExpressions empty [].
 - If notes contain only vocabulary (such as a single word like "blury"), evaluate the term (including spelling accuracy like "blurry"), leave mistakesAnalysis and grammarPoints empty without fabricating errors.
 - If only one grammar error exists, provide only that one grammar point without inventing a second rule.
-- Preserve all teacher markings and required expressions.
-Ensure reviewSummary and rememberThis are fully provided in ${targetLang.nameEn} (${targetLang.nameNative}). Provide all explanations and pedagogical rules in ${targetLang.nameEn} (${targetLang.nameNative}).`;
+- Preserve all teacher markings and required expressions.`;
 
   const effectiveCustomExecutor = wrapTestAttemptExecutor(
     options.customAttemptExecutor || (process.env.NODE_ENV === 'test' ? sessionNoteTransformAttemptExecutorForTesting : null)
@@ -11086,23 +11092,24 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
     let contingencyResult: any = null;
 
     if (apiKey && !isCooldownActive) {
-      const targetLang = LANGUAGE_NAMES[language] || { nameEn: 'Portuguese', nameNative: 'Português' };
-      const pendingText = getPendingConfirmationText(language);
-
       const systemInstruction = `You are an elite, Cambridge/CELTA-certified Pedagogical English Language Synthesizer and Master Native Friend Teacher.
-Your mission is to transform raw in-session teacher notes into an ultra-structured, masterclass pedagogical report for the student.
-The student MUST NEVER see raw, fragmented notes. Instead, they receive a polished, elegant learning guide calibrated to their CEFR level (${cefr}).
+Your mission is to transform raw in-session teacher notes into an ultra-structured, masterclass pedagogical report calibrated to CEFR level (${cefr}).
+The student MUST NEVER see raw, fragmented notes. Instead, produce a polished, structured learning guide strictly in English.
 
-LANGUAGE REQUIREMENT:
-- All pedagogical explanations, grammar rules, vocabulary "simpleDefinition" explanations, common pitfalls, comparisons, CEFR adaptation advice, rememberThis takeaway, and review summaries MUST be written in ${targetLang.nameEn} (${targetLang.nameNative}, code: "${language}").
-- "definitionEn" MUST BE WRITTEN IN NATURAL ENGLISH, calibrated to CEFR ${cefr}.
-- The target English words, phrasal verbs, collocations, and didactic examples MUST remain in natural, authentic English.
+LANGUAGE REQUIREMENT (STRICT 100% ENGLISH OUTPUT):
+- Generate ALL four parts ("mistakesAnalysis" / Analyze Mistakes, "grammarPoints" / Grammar Points, "vocabularyAndExpressions" / Vocabulary & Expressions, and "reviewSummary" / Quick Review) EXCLUSIVELY in natural, clear English (code: "en"), regardless of the language used in the raw notes or any student/request locale.
+- Every AI-authored field — including all titles, grammar topics ("topic"), grammar rules ("rule", "form", "usage"), mistake explanations ("explanation"), common pitfalls ("commonPitfalls"), comparisons ("comparisons"), newly created didactic examples ("twoExamples", "examples", "realExamples", "collocations"), vocabulary definitions ("definitionEn" AND "simpleDefinition"), parts of speech ("partOfSpeech"), categories ("category"), phonetic guides ("phoneticGuide"), and review summaries ("estimatedMinutes", "keyRules", "mustKnowVocabulary", "rememberThis") — MUST be written strictly in English.
+- NEVER write explanations, titles, rules, created examples, definitions, or summaries in Portuguese or any other non-English language. Even if the raw notes contain Portuguese comments, translations, or L1 interference, write all explanations and contrasts strictly in English.
+
+LITERAL QUOTE PRESERVATION & ORIGINAL NOTES INTEGRITY:
+- Preserve literally (verbatim) the original excerpts from the student and the teacher whenever presented as lesson quotes, citations, or classroom examples from the session (such as "original" in "mistakesAnalysis" and "essentialCorrections", or literal utterances quoted from the lesson).
+- Do NOT translate, paraphrase, rewrite, or modify the original session notes or literal student/teacher classroom excerpts. Treat the raw notes strictly as read-only source material.
 
 CRITICAL INSTRUCTIONS ON TEACHER SHORTCUT MARKINGS & TAB ROUTING:
 1. Alt + N (Error / Incorrect Markings):
    - Items stamped with 'data-tag-type="incorrect"', '✗', 'Instead of:', or error lines MUST be directed and processed appropriately into:
-     a) "mistakesAnalysis" (Tab 1: Analyze Mistakes): student's original faulty utterance, natural native correction (resolving spelling, phrasing, or grammatical slips into polished English), category, grammatical explanation (addressing L1 interference), two natural examples, and common pitfalls. Even if the teacher wrote an isolated mistake without explicit correction (e.g. spelling slips or words marked with ✗), deduce and provide the accurate, natural native correction.
-     b) "grammarPoints" (Tab 2: Grammar Points): whenever an error involves a systemic grammatical rule/structure (e.g. modal verbs without "to", stative verbs, auxiliary verbs, verb tenses, dependent prepositions, conditionals, word order), elaborate the corresponding rule with syntax (FORM), usage, examples, and comparisons.
+     a) "mistakesAnalysis" (Tab 1: Analyze Mistakes): student's literal original faulty utterance, natural native English correction (resolving spelling, phrasing, or grammatical slips into polished English), category, grammatical explanation in English (addressing L1 interference in English), two natural created examples in English, and common pitfalls in English. Even if the teacher wrote an isolated mistake without explicit correction (e.g. spelling slips or words marked with ✗), deduce and provide the accurate, natural native English correction.
+     b) "grammarPoints" (Tab 2: Grammar Points): whenever an error involves a systemic grammatical rule/structure (e.g. modal verbs without "to", stative verbs, auxiliary verbs, verb tenses, dependent prepositions, conditionals, word order), elaborate the corresponding topic title, rule, syntax (FORM), usage, created examples, common mistakes, and comparisons strictly in English.
         CRITICAL FIDELITY RULES FOR GRAMMAR POINTS:
         * ONLY generate grammar points that are directly substantiated by the student's actual session errors or notes.
         * If there is only ONE systemic grammar error in the notes (for example, using "to" after the modal "can"), provide EXACTLY ONE corresponding grammar point. DO NOT fabricate or invent a second grammar point!
@@ -11111,79 +11118,79 @@ CRITICAL INSTRUCTIONS ON TEACHER SHORTCUT MARKINGS & TAB ROUTING:
 2. Alt + W (New Word) & Alt + P (Pronunciation Markings):
    - Items stamped with 'data-tag-type="new-word"', '[New Word]', 'data-tag-type="pronounce"', '[Pronounce]' or standalone vocabulary words MUST be directed and processed into:
      "vocabularyAndExpressions" (Tab 3: Vocabulary & Expressions).
-   - For Alt+W / vocabulary: provide part of speech, register, simple definition adapted to CEFR ${cefr}, collocations, real examples, and synonyms.
-   - For Alt+P: mark partOfSpeech as "Pronunciation Focus", provide clear syllable stress breakdown, phonetic guide with IPA, common pronunciation slips to avoid, and conversational examples.
+   - For Alt+W / vocabulary: provide part of speech, register, "definitionEn" AND "simpleDefinition" both in clear English adapted to CEFR ${cefr}, collocations in English, real examples in English, and synonyms in English.
+   - For Alt+P: mark partOfSpeech as "Pronunciation Focus", provide clear syllable stress breakdown in English, phonetic guide with IPA, common pronunciation slips to avoid in English, and conversational examples in English.
 3. CRITICAL RULES FOR CONTENT FIDELITY & EMPTY SECTIONS:
    - Exclusively generate content grounded in and substantiated by the teacher's actual notes.
    - If a section legitimately has no corresponding content in the notes, it MUST be returned as an empty array []:
      * If the notes contain NO student errors: "mistakesAnalysis" MUST be []. NEVER fabricate non-existent student errors, sentences, or phrases!
      * If the notes contain NO systemic grammar errors: "grammarPoints" MUST be []. NEVER fabricate synthetic grammar points!
      * If the notes contain NO vocabulary or pronunciation items (e.g. session only had grammar corrections): "vocabularyAndExpressions" MUST be []. NEVER fabricate synthetic vocabulary items (such as "catch up", "workload", "streamline")!
-   - If a term contains a spelling slip (e.g. the teacher recorded "blury", which is standardly spelled "blurry"), evaluate and identify the correct spelling "blurry", explain the spelling rule/distinction, provide accurate CEFR ${cefr} definitions in English and ${targetLang.nameEn}, natural real-world examples, collocations, and register.
-   - In "reviewSummary", ALWAYS generate a complete object:
+   - If a term contains a spelling slip (e.g. the teacher recorded "blury", which is standardly spelled "blurry"), evaluate and identify the correct spelling "blurry", explain the spelling rule/distinction in English, and provide accurate CEFR ${cefr} definitions ("definitionEn" and "simpleDefinition") exclusively in English, along with natural real-world examples, collocations, and register.
+   - In "reviewSummary", ALWAYS generate a complete object in English:
      * "estimatedMinutes": "3–5 minutes" for short notes, "5–10 minutes" for standard notes
-     * "keyRules": concise bullet titles of grammar points covered in ${targetLang.nameEn} (empty array [] if no grammar points)
+     * "keyRules": concise bullet titles of grammar points covered strictly in English (empty array [] if no grammar points)
      * "mustKnowVocabulary": concise list of target terms from vocabularyAndExpressions (empty array [] if no vocabulary items)
-     * "essentialCorrections": concise list of original and corrected pairs [{"original": "...", "corrected": "..."}] from mistakesAnalysis (empty array [] if no errors)
-     * "rememberThis": an inspiring, memorable golden takeaway rule in ${targetLang.nameEn} (at least 15 characters), strictly focused on the items recorded in the session.
+     * "essentialCorrections": concise list of original and corrected pairs [{"original": "...", "corrected": "..."}] from mistakesAnalysis, preserving literal "original" excerpts (empty array [] if no errors)
+     * "rememberThis": an inspiring, memorable golden takeaway rule strictly in English (at least 15 characters), focused on the items recorded in the session.
 4. CEFR LEVEL ADAPTATION:
-   - There is NO separate CEFR tab. Instead, ALL tabs (Complete Report, 1. Analyze Mistakes, 2. Grammar Points, 3. Vocabulary & Expressions, and Quick Review) MUST be intelligently and deeply elaborated respecting and adapting to the student's current CEFR level (${cefr}).
+   - There is NO separate CEFR tab. Instead, ALL four parts (1. Analyze Mistakes, 2. Grammar Points, 3. Vocabulary & Expressions, and 4. Quick Review) MUST be intelligently elaborated in English, calibrated to the student's current CEFR level (${cefr}).
 5. QUICK REVIEW (reviewSummary) MANDATE & TOKEN OPTIMIZATION:
-   - In "reviewSummary", provide a concise summary without duplicating full multi-sentence analyses or definitions already stated in "vocabularyAndExpressions" and "grammarPoints":
+   - In "reviewSummary", provide a concise English summary without duplicating full multi-sentence analyses or definitions already stated in "vocabularyAndExpressions" and "grammarPoints":
      * "estimatedMinutes": e.g. "5–10 minutes" (or "3–5 minutes" for short sessions)
-     * "keyRules": concise bullet titles of grammar points covered in ${targetLang.nameEn} (empty array [] if no grammar errors)
+     * "keyRules": concise bullet titles of grammar points covered in English (empty array [] if no grammar errors)
      * "mustKnowVocabulary": concise list of target terms from vocabularyAndExpressions (e.g. ["term 1", "term 2"]), avoiding redundant definition paragraphs
      * "essentialCorrections": concise list of original and corrected pairs [{"original": "...", "corrected": "..."}] from mistakesAnalysis
-     * "rememberThis": High-impact golden takeaway rule for the student in ${targetLang.nameEn} (at least 15 characters).
+     * "rememberThis": High-impact golden takeaway rule in English (at least 15 characters).
 
 You MUST produce a JSON object strictly conforming to this schema:
 {
   "mistakesAnalysis": [
     {
       "id": "mistake-1",
-      "original": "Student's original faulty utterance",
-      "corrected": "Polished, natural native correction",
+      "original": "Student's literal original utterance from the lesson (preserved verbatim)",
+      "corrected": "Polished, natural native English correction",
       "category": "grammar" | "vocabulary" | "collocation" | "preposition" | "pronunciation" | "phrasing",
-      "explanation": "Crystal clear grammatical rule explanation highlighting why the error occurred and how to fix it, calibrated to CEFR ${cefr}",
-      "twoExamples": ["Example 1 in natural context", "Example 2 in natural context"],
-      "commonPitfalls": "Common mistake learners make with this structure (especially Portuguese L1 interference)"
+      "explanation": "Crystal-clear grammatical rule explanation in English highlighting why the error occurred and how to fix it, calibrated to CEFR ${cefr}",
+      "twoExamples": ["Created example 1 in natural English", "Created example 2 in natural English"],
+      "commonPitfalls": "Common mistake learners make with this structure (explained strictly in English)"
     }
   ],
   "grammarPoints": [
     {
       "id": "grammar-1",
-      "topic": "Grammar topic name",
-      "rule": "Detailed rule explanation adapted to CEFR ${cefr}",
-      "form": "Formula / Syntax breakdown",
-      "usage": "When and why native speakers use this",
-      "examples": ["Example 1", "Example 2"],
-      "commonMistakes": "Mistake to avoid",
-      "comparisons": "Contrast with other structures or Portuguese interference"
+      "topic": "Grammar topic title in English",
+      "rule": "Detailed rule explanation in English adapted to CEFR ${cefr}",
+      "form": "Formula / Syntax breakdown in English",
+      "usage": "When and why native speakers use this (in English)",
+      "examples": ["Created example 1 in English", "Created example 2 in English"],
+      "commonMistakes": "Mistake to avoid (in English)",
+      "comparisons": "Contrast with other structures or L1 interference (written strictly in English)"
     }
   ],
   "vocabularyAndExpressions": [
     {
       "id": "vocab-1",
       "term": "Word, phrasal verb, or pronunciation term",
-      "partOfSpeech": "Part of speech (e.g. Phrasal Verb, Noun, Pronunciation Focus)",
+      "partOfSpeech": "Part of speech in English (e.g. Phrasal Verb, Noun, Pronunciation Focus)",
       "definitionEn": "Simple, accurate definition EXCLUSIVELY in English tailored to student level ${cefr} and part of speech",
-      "simpleDefinition": "Clear, accessible pedagogical explanation in ${targetLang.nameEn} adapted to CEFR ${cefr}",
-      "collocations": ["Collocation 1", "Collocation 2"],
-      "realExamples": ["Real-world sentence 1", "Real-world sentence 2"],
-      "synonyms": ["Synonym 1", "Synonym 2"],
+      "simpleDefinition": "Clear, accessible pedagogical definition/explanation EXCLUSIVELY in English adapted to CEFR ${cefr}",
+      "collocations": ["Collocation 1 in English", "Collocation 2 in English"],
+      "realExamples": ["Real-world sentence 1 in English", "Real-world sentence 2 in English"],
+      "synonyms": ["Synonym 1 in English", "Synonym 2 in English"],
       "register": "informal" | "neutral" | "formal" | "idiomatic",
-      "category": "Thematic category or 'Pronunciation & Phonetics (Alt+P)' / 'New Words & Expressions (Alt+W)'",
-      "phoneticGuide": "Phonetic / stress guide with IPA",
+      "category": "Thematic category in English or 'Pronunciation & Phonetics (Alt+P)' / 'New Words & Expressions (Alt+W)'",
+      "phoneticGuide": "Phonetic / syllable stress guide in English with IPA",
       "isPronunciationFocus": false,
       "isNewWord": true
     }
   ],
   "reviewSummary": {
     "estimatedMinutes": "5–10 minutes",
-    "keyRules": ["Key grammar rule titles in ${targetLang.nameEn}"],
+    "keyRules": ["Key grammar rule titles strictly in English"],
     "mustKnowVocabulary": ["Target terms from vocabularyAndExpressions"],
     "essentialCorrections": [{"original": "...", "corrected": "..."}],
-    "rememberThis": "Memorable takeaway focused on the session items in ${targetLang.nameEn}"
+    "rememberThis": "Memorable takeaway focused on the session items strictly in English"
   }
 }
 
@@ -11196,19 +11203,22 @@ Return JSON only without Markdown backticks.`;
 - Lesson Date: ${sessionDate}
 - Session Topic: ${topic}
 - Native Friend Teacher: ${teacherName}
-- Target Language: ${targetLang.nameEn} (${targetLang.nameNative})
+- Output Language: English (en) — MANDATORY for all generated pedagogical content
 
-Raw In-Session Notes to transform:
+Raw In-Session Notes to transform (read-only source — do NOT translate or modify):
 """
 ${rawNotes}
 """
 
 Please synthesize and transform these notes according to the Alt+N, Alt+W, and Alt+P routing rules, adapting deeply to CEFR ${cefr}.
+- Generate ALL four parts (Analyze Mistakes / mistakesAnalysis, Grammar Points / grammarPoints, Vocabulary & Expressions / vocabularyAndExpressions, and Quick Review / reviewSummary) strictly in English, regardless of the language of the raw notes.
+- Write all titles, grammar rules, pedagogical explanations, created examples, definitions (both definitionEn and simpleDefinition), pitfalls, comparisons, and review summaries (including keyRules and rememberThis) exclusively in English.
+- Preserve literally (verbatim) the original excerpts from the student and the teacher when presented as quotes or examples from the lesson (such as "original" utterances), without translating or modifying them.
+- Do NOT translate or modify the original notes.
 - If notes contain only errors/grammar, provide only the grounded mistakes and grammar points, and leave vocabularyAndExpressions empty [].
 - If notes contain only vocabulary (such as a single word like "blury"), evaluate the term (including spelling accuracy like "blurry"), leave mistakesAnalysis and grammarPoints empty without fabricating errors.
 - If only one grammar error exists, provide only that one grammar point without inventing a second rule.
-- Preserve all teacher markings and required expressions.
-Ensure reviewSummary and rememberThis are fully provided in ${targetLang.nameEn} (${targetLang.nameNative}). Provide all explanations and pedagogical rules in ${targetLang.nameEn} (${targetLang.nameNative}).`;
+- Preserve all teacher markings and required expressions.`;
 
       // HOTFIX 3-MODEL CONTINGENCY: Sequential failover across up to 3 verified models on recoverable errors
       contingencyResult = await executeGeminiWithContingency({
