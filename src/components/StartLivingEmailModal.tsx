@@ -82,6 +82,14 @@ export const StartLivingEmailModal: React.FC<StartLivingEmailModalProps> = ({
           }
           return;
         }
+      } else if (res && (res.status === 503 || res.status >= 500)) {
+        setIsChecking(false);
+        setErrorMsg(
+          isEn
+            ? 'Account verification service is temporarily unavailable. Please try again in a moment.'
+            : 'O serviço de verificação de cadastro está temporariamente indisponível. Tente novamente em instantes.'
+        );
+        return;
       }
 
       // Email is unique or verification reached fallback: proceed to onboarding wizard

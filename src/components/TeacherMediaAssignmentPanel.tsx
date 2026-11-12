@@ -282,11 +282,12 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
         if (activeStudentEmail) profileParams.append('email', activeStudentEmail);
         if (activeStudentUid) profileParams.append('uid', activeStudentUid);
 
+        const authHeaders = token ? { Authorization: `Bearer ${token}` } : undefined;
         const [routinesRes, assignmentsRes, spotAssignRes, profileRes] = await Promise.all([
-          fetch(`/api/student-routines?${params.toString()}`).catch(() => null),
-          fetch(`/api/student-video-assignments?${params.toString()}`).catch(() => null),
-          fetch(`/api/student-spotify-assignments?${params.toString()}`).catch(() => null),
-          fetch(`/api/user-profile?${profileParams.toString()}`).catch(() => null),
+          fetch(`/api/student-routines?${params.toString()}`, authHeaders ? { headers: authHeaders } : undefined).catch(() => null),
+          fetch(`/api/student-video-assignments?${params.toString()}`, authHeaders ? { headers: authHeaders } : undefined).catch(() => null),
+          fetch(`/api/student-spotify-assignments?${params.toString()}`, authHeaders ? { headers: authHeaders } : undefined).catch(() => null),
+          fetch(`/api/user-profile?${profileParams.toString()}`, authHeaders ? { headers: authHeaders } : undefined).catch(() => null),
         ]);
 
         if (routinesRes && routinesRes.ok) {

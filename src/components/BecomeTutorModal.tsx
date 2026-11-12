@@ -107,6 +107,8 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
         } else {
           setEmailWarning(null);
         }
+      } else if (res.status === 503) {
+        setEmailWarning('Serviço de verificação de e-mail temporariamente indisponível. Tente novamente em instantes.');
       }
     } catch {
       // ignore
@@ -128,6 +130,8 @@ export const BecomeTutorModal: React.FC<BecomeTutorModalProps> = ({
         } else {
           setNameWarning(null);
         }
+      } else if (res.status === 503) {
+        setNameWarning('Serviço de verificação de nome temporariamente indisponível. Tente novamente em instantes.');
       }
     } catch {
       // ignore

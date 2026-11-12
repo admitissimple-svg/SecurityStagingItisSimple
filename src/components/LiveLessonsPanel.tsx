@@ -239,47 +239,49 @@ export const LiveLessonsPanel: React.FC<LiveLessonsPanelProps> = ({
             </span>
           </div>
 
-          <div className="flex items-center gap-2">
-            {!isEditingContract ? (
-              <button
-                type="button"
-                onClick={() => handleStartEditContract(primaryStudentEmail, studentContractedTotal)}
-                className="px-2.5 py-1 bg-white hover:bg-[#9AB4FF]/15 border border-[#607EC9]/40 rounded-xl text-[11px] font-bold text-[#062863] flex items-center gap-1 transition cursor-pointer shadow-2xs"
-                title={isEn ? 'Edit contracted lessons total' : 'Informar ou alterar total de aulas contratadas'}
-              >
-                <Edit3 className="w-3 h-3 text-[#1C4C96]" />
-                <span>{isEn ? 'Edit Contracted Total' : 'Informar/Alterar Contrato'}</span>
-              </button>
-            ) : (
-              <form onSubmit={handleSaveContract} className="flex items-center gap-1.5">
-                <label className="text-[11px] font-bold text-[#000035]">
-                  {isEn ? 'Total:' : 'Total:'}
-                </label>
-                <input
-                  type="number"
-                  min="0"
-                  max="500"
-                  value={contractInputVal}
-                  onChange={(e) => setContractInputVal(parseInt(e.target.value, 10) || 0)}
-                  className="w-16 px-2 py-0.5 bg-white border border-[#1C4C96] rounded-lg text-xs font-black text-center text-[#000035] focus:outline-none focus:ring-1 focus:ring-[#1C4C96]"
-                  autoFocus
-                />
-                <button
-                  type="submit"
-                  className="px-2.5 py-0.5 bg-[#1C4C96] hover:bg-[#062863] text-white rounded-lg text-[11px] font-extrabold cursor-pointer"
-                >
-                  {isEn ? 'Save' : 'Salvar'}
-                </button>
+          {currentAccount?.role === 'admin' && onUpdateContractedLessons && (
+            <div className="flex items-center gap-2">
+              {!isEditingContract ? (
                 <button
                   type="button"
-                  onClick={() => setIsEditingContract(false)}
-                  className="px-2.5 py-0.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg text-[11px] font-bold cursor-pointer"
+                  onClick={() => handleStartEditContract(primaryStudentEmail, studentContractedTotal)}
+                  className="px-2.5 py-1 bg-white hover:bg-[#9AB4FF]/15 border border-[#607EC9]/40 rounded-xl text-[11px] font-bold text-[#062863] flex items-center gap-1 transition cursor-pointer shadow-2xs"
+                  title={isEn ? 'Edit contracted lessons total' : 'Informar ou alterar total de aulas contratadas'}
                 >
-                  {isEn ? 'Cancel' : 'Cancelar'}
+                  <Edit3 className="w-3 h-3 text-[#1C4C96]" />
+                  <span>{isEn ? 'Edit Contracted Total' : 'Informar/Alterar Contrato'}</span>
                 </button>
-              </form>
-            )}
-          </div>
+              ) : (
+                <form onSubmit={handleSaveContract} className="flex items-center gap-1.5">
+                  <label className="text-[11px] font-bold text-[#000035]">
+                    {isEn ? 'Total:' : 'Total:'}
+                  </label>
+                  <input
+                    type="number"
+                    min="0"
+                    max="500"
+                    value={contractInputVal}
+                    onChange={(e) => setContractInputVal(parseInt(e.target.value, 10) || 0)}
+                    className="w-16 px-2 py-0.5 bg-white border border-[#1C4C96] rounded-lg text-xs font-black text-center text-[#000035] focus:outline-none focus:ring-1 focus:ring-[#1C4C96]"
+                    autoFocus
+                  />
+                  <button
+                    type="submit"
+                    className="px-2.5 py-0.5 bg-[#1C4C96] hover:bg-[#062863] text-white rounded-lg text-[11px] font-extrabold cursor-pointer"
+                  >
+                    {isEn ? 'Save' : 'Salvar'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsEditingContract(false)}
+                    className="px-2.5 py-0.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg text-[11px] font-bold cursor-pointer"
+                  >
+                    {isEn ? 'Cancel' : 'Cancelar'}
+                  </button>
+                </form>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Metric Cards Grid */}

@@ -257,47 +257,49 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
               </span>
             </div>
 
-            <div className="shrink-0">
-              {!isEditingContract ? (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setContractInputVal(totalContractedCount);
-                    setIsEditingContract(true);
-                  }}
-                  className="px-2 py-0.5 bg-[#9AB4FF]/10 hover:bg-[#9AB4FF]/25 border border-[#607EC9]/30 rounded-lg text-[10px] font-bold text-[#062863] flex items-center gap-1 transition cursor-pointer"
-                  title={isEn ? 'Edit contracted lessons total' : 'Alterar total de aulas contratadas'}
-                >
-                  <Edit3 className="w-2.5 h-2.5 text-[#1C4C96]" />
-                  <span>{isEn ? 'Edit Total' : 'Editar Total'}</span>
-                </button>
-              ) : (
-                <form onSubmit={handleSaveContract} className="flex items-center gap-1">
-                  <input
-                    type="number"
-                    min="0"
-                    max="500"
-                    value={contractInputVal}
-                    onChange={(e) => setContractInputVal(parseInt(e.target.value, 10) || 0)}
-                    className="w-12 px-1 py-0.2 bg-white border border-[#1C4C96] rounded text-[10px] font-black text-center text-[#000035] focus:outline-none"
-                    autoFocus
-                  />
-                  <button
-                    type="submit"
-                    className="px-2 py-0.2 bg-[#1C4C96] hover:bg-[#062863] text-white rounded text-[10px] font-bold cursor-pointer"
-                  >
-                    {isEn ? 'Save' : 'Salvar'}
-                  </button>
+            {currentAccount?.role === 'admin' && onUpdateContractedLessons && (
+              <div className="shrink-0">
+                {!isEditingContract ? (
                   <button
                     type="button"
-                    onClick={() => setIsEditingContract(false)}
-                    className="px-1.5 py-0.2 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded text-[10px] cursor-pointer"
+                    onClick={() => {
+                      setContractInputVal(totalContractedCount);
+                      setIsEditingContract(true);
+                    }}
+                    className="px-2 py-0.5 bg-[#9AB4FF]/10 hover:bg-[#9AB4FF]/25 border border-[#607EC9]/30 rounded-lg text-[10px] font-bold text-[#062863] flex items-center gap-1 transition cursor-pointer"
+                    title={isEn ? 'Edit contracted lessons total' : 'Alterar total de aulas contratadas'}
                   >
-                    ✕
+                    <Edit3 className="w-2.5 h-2.5 text-[#1C4C96]" />
+                    <span>{isEn ? 'Edit Total' : 'Editar Total'}</span>
                   </button>
-                </form>
-              )}
-            </div>
+                ) : (
+                  <form onSubmit={handleSaveContract} className="flex items-center gap-1">
+                    <input
+                      type="number"
+                      min="0"
+                      max="500"
+                      value={contractInputVal}
+                      onChange={(e) => setContractInputVal(parseInt(e.target.value, 10) || 0)}
+                      className="w-12 px-1 py-0.2 bg-white border border-[#1C4C96] rounded text-[10px] font-black text-center text-[#000035] focus:outline-none"
+                      autoFocus
+                    />
+                    <button
+                      type="submit"
+                      className="px-2 py-0.2 bg-[#1C4C96] hover:bg-[#062863] text-white rounded text-[10px] font-bold cursor-pointer"
+                    >
+                      {isEn ? 'Save' : 'Salvar'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setIsEditingContract(false)}
+                      className="px-1.5 py-0.2 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded text-[10px] cursor-pointer"
+                    >
+                      ✕
+                    </button>
+                  </form>
+                )}
+              </div>
+            )}
           </div>
 
           {/* 4 Metrics Grid */}

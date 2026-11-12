@@ -1522,8 +1522,17 @@ export async function purchasePackageWithTransaction(params: PurchasePackageTran
         null;
     } catch {}
 
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (idToken) headers['Authorization'] = `Bearer ${idToken}`;
+    if (!idToken || typeof idToken !== 'string' || !idToken.trim()) {
+      return {
+        success: false,
+        error: 'Sessão não autenticada. Faça login para contratar um pacote.',
+      };
+    }
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${idToken.trim()}`,
+    };
 
     const idempotencyKey =
       params.idempotencyKey ||
@@ -1554,7 +1563,7 @@ export async function purchasePackageWithTransaction(params: PurchasePackageTran
         };
       }
 
-      const contracted = Number(resData.contractedLessons || params.packageLessons);
+      const contracted = Number(resData.contractedLessons ?? params.packageLessons);
       const available = Number(resData.availableLessons ?? resData.profile?.availableLessons ?? contracted);
 
       return {
@@ -1581,6 +1590,13 @@ export async function purchasePackageWithTransaction(params: PurchasePackageTran
       };
     }
 
+    if (![1, 4, 8, 12].includes(Number(params.packageLessons))) {
+      return {
+        success: false,
+        error: 'Pacote inválido. Os pacotes comerciais aprovados são de 1, 4, 8 ou 12 aulas.',
+      };
+    }
+
     try {
       const serverModule = '../' + 'serverFirestore';
       const { getFirestoreDb, resolveTeacherCanonicalIdentity } = await import(/* @vite-ignore */ serverModule);
@@ -1603,18 +1619,50 @@ export async function purchasePackageWithTransaction(params: PurchasePackageTran
         const canonicalTeacherUid = teacherRes.canonicalUid;
         const studentDocRef = adminDb.collection('users').doc(studentUid);
         const teacherDocRef = adminDb.collection('users').doc(canonicalTeacherUid);
+        const idempKey = params.idempotencyKey ? String(params.idempotencyKey).trim() : '';
+        const txDocId = idempKey ? `pkg_${studentUid}_${idempKey.replace(/[^a-zA-Z0-9_-]/g, '_')}` : `pkg_${studentUid}_${Date.now()}`;
+        const txDocRef = adminDb.collection('financial_transactions').doc(txDocId);
+
         let finalContracted = params.packageLessons;
         let finalAvailable = params.packageLessons;
 
         await adminDb.runTransaction(async (transaction: any) => {
-          const studentSnap = await transaction.get(studentDocRef);
+          const [studentSnap, txSnap] = await Promise.all([
+            transaction.get(studentDocRef),
+            idempKey ? transaction.get(txDocRef) : Promise.resolve(null),
+          ]);
           const studentData = studentSnap.exists ? (studentSnap.data() || {}) : {};
+          const processedPurchases = studentData.processedPurchases || {};
+
+          if (idempKey && ((txSnap && txSnap.exists) || processedPurchases[idempKey])) {
+            finalContracted = typeof studentData.contractedLessons === 'number'
+              ? studentData.contractedLessons
+              : Number(processedPurchases[idempKey]?.contractedLessons ?? 0);
+            finalAvailable = typeof studentData.availableLessons === 'number'
+              ? studentData.availableLessons
+              : Number(processedPurchases[idempKey]?.availableLessons ?? 0);
+            return;
+          }
+
           const currentContracted = Number(studentData.contractedLessons || 0);
           const currentAvailable = typeof studentData.availableLessons === 'number'
             ? studentData.availableLessons
             : 0;
           finalContracted = currentContracted + params.packageLessons;
           finalAvailable = currentAvailable + params.packageLessons;
+
+          const nowIso = new Date().toISOString();
+          const updatedProcessed = { ...processedPurchases };
+          if (idempKey) {
+            updatedProcessed[idempKey] = {
+              transactionId: txDocId,
+              lessonsAdded: params.packageLessons,
+              contractedLessons: finalContracted,
+              availableLessons: finalAvailable,
+              teacherUid: canonicalTeacherUid,
+              timestamp: nowIso,
+            };
+          }
 
           transaction.set(studentDocRef, {
             contractedLessons: finalContracted,
@@ -1626,10 +1674,22 @@ export async function purchasePackageWithTransaction(params: PurchasePackageTran
             teacherName: teacherRes.name || params.teacherName || '',
             enrollmentStatus: 'active',
             subscriptionType: 'package',
-            updatedAt: new Date().toISOString(),
+            processedPurchases: updatedProcessed,
+            updatedAt: nowIso,
           }, { merge: true });
 
-          transaction.set(teacherDocRef, { updatedAt: new Date().toISOString() }, { merge: true });
+          transaction.set(teacherDocRef, { updatedAt: nowIso }, { merge: true });
+          transaction.set(txDocRef, {
+            id: txDocId,
+            type: 'package_purchase',
+            idempotencyKey: idempKey || null,
+            studentUid,
+            studentEmail: cleanStudentEmail,
+            teacherUid: canonicalTeacherUid,
+            packageLessons: params.packageLessons,
+            status: 'completed',
+            createdAt: nowIso,
+          });
         });
 
         return {

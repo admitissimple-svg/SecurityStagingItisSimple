@@ -789,7 +789,7 @@ export default function App() {
 
         const [routinesRes, studentsRes, settingsRes, landingRes, tutorsRes] = await Promise.all([
           fetch('/api/routines').catch(() => null),
-          fetch('/api/students').catch(() => null),
+          fetch('/api/students', { headers: tutorHeaders }).catch(() => null),
           fetch('/api/teacher-settings').catch(() => null),
           fetch('/api/landing-content').catch(() => null),
           fetch('/api/tutors', { headers: tutorHeaders }).catch(() => null),
@@ -1648,12 +1648,22 @@ export default function App() {
 
     // 2. Fetch user-isolated students list (for teachers and admin)
     if (role === 'teacher' || role === 'admin') {
-      fetch(`/api/students?${queryParams}`)
-        .then((r) => (r.ok ? r.json() : []))
-        .then((data) => {
-          if (Array.isArray(data)) setStudents(data);
-        })
-        .catch((err) => console.warn('Could not fetch isolated students:', err));
+      (async () => {
+        try {
+          const token = role === 'admin'
+            ? ((await getAdminAccessToken().catch(() => null)) || (await getAccessToken().catch(() => null)))
+            : (await getAccessToken().catch(() => null));
+          const headers: Record<string, string> = {};
+          if (token) headers['Authorization'] = `Bearer ${token}`;
+          const r = await fetch(`/api/students?${queryParams}`, { headers });
+          if (r.ok && !isCancelled) {
+            const data = await r.json();
+            if (Array.isArray(data) && !isCancelled) setStudents(data);
+          }
+        } catch (err) {
+          console.warn('Could not fetch isolated students:', err);
+        }
+      })();
     } else {
       setStudents([]);
     }
@@ -1676,10 +1686,15 @@ export default function App() {
 
       async function loadStudentData() {
         try {
+          const studentToken = await getAccessToken().catch(() => null);
+          const profileHeaders: Record<string, string> = {};
+          if (studentToken) profileHeaders['Authorization'] = `Bearer ${studentToken}`;
           // A. Fetch directly from Firestore first (master source of truth for assigned Native Friend & profile)
           const [fsProfile, profileRes] = await Promise.all([
             fetchStudentProfileFromFirestore(uid, email).catch(() => null),
-            fetch(`/api/user-profile?email=${encodeURIComponent(email)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`).catch(() => null),
+            fetch(`/api/user-profile?email=${encodeURIComponent(email)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`, {
+              headers: profileHeaders,
+            }).catch(() => null),
           ]);
 
           let loadedProfile: UserProfile | null = null;
@@ -2147,7 +2162,11 @@ export default function App() {
             console.warn('Direct Firestore tutor check notice:', fsErr);
           }
 
-          const res = await fetch(`/api/user-profile?email=${encodeURIComponent(email)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`);
+          const teacherToken = await getAccessToken().catch(() => null);
+          const res = await fetch(
+            `/api/user-profile?email=${encodeURIComponent(email)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`,
+            teacherToken ? { headers: { Authorization: `Bearer ${teacherToken}` } } : undefined
+          );
           if (res.ok) {
             const data = await res.json();
             if (data.tutor) {
@@ -2785,11 +2804,78 @@ export default function App() {
   const handleUpdateSubscription = async (teacherEmail: string | null, teacherName: string | null) => {
     const cleanTeacherEmail = teacherEmail ? teacherEmail.trim().toLowerCase() : null;
     const cleanTeacherName = teacherName ? teacherName.trim() : null;
+
+    // Cancellation path: strictly execute authenticated backend cancellation on Firestore (default)
+    if (!cleanTeacherEmail) {
+      if (!currentAccount?.email) {
+        throw new Error('Autenticação obrigatória para cancelar inscrição.');
+      }
+      const cleanStEmail = currentAccount.email.toLowerCase().trim();
+      const stUid = currentAccount.uid || userProfile?.id || '';
+      const idToken =
+        (await auth.currentUser?.getIdToken().catch(() => null)) ||
+        (await getAccessToken().catch(() => null));
+
+      if (!idToken) {
+        throw new Error('Sessão não autenticada. Faça login novamente para cancelar.');
+      }
+
+      const cancelRes = await fetch('/api/students/cancel', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({
+          studentUid: stUid || undefined,
+          studentEmail: cleanStEmail,
+        }),
+      });
+      const cancelData = await cancelRes.json().catch(() => ({}));
+      if (!cancelRes.ok || !cancelData.success) {
+        throw new Error(cancelData.message || cancelData.error || 'Falha ao cancelar inscrição no servidor.');
+      }
+
+      const preservedContracted = typeof cancelData.contractedLessons === 'number'
+        ? cancelData.contractedLessons
+        : userProfile?.contractedLessons;
+      const preservedAvailable = typeof cancelData.availableLessons === 'number'
+        ? cancelData.availableLessons
+        : userProfile?.availableLessons;
+
+      setUserProfile((prev) => ({
+        ...prev,
+        teacherEmail: undefined,
+        teacherName: undefined,
+        teacherUid: undefined,
+        assignedNativeFriendUID: undefined,
+        nativeFriendUID: undefined,
+        enrollmentStatus: 'cancelled',
+        ...(preservedContracted !== undefined ? { contractedLessons: preservedContracted } : {}),
+        ...(preservedAvailable !== undefined ? { availableLessons: preservedAvailable } : {}),
+      }));
+
+      setStudents((prev) =>
+        prev.map((s) =>
+          (s.email || s.studentEmail || '').toLowerCase().trim() === cleanStEmail
+            ? {
+                ...s,
+                teacherEmail: '',
+                teacherName: '',
+                teacherUid: '',
+                status: 'cancelled',
+              }
+            : s
+        )
+      );
+      return;
+    }
+
     const matchedTutor = tutors.find((t) => (t.email || '').toLowerCase().trim() === cleanTeacherEmail);
     const resolvedTeacherUid =
       (matchedTutor?.uid && isValidCanonicalUid(matchedTutor.uid) ? matchedTutor.uid : null) ||
       (matchedTutor?.id && isValidCanonicalUid(matchedTutor.id) ? matchedTutor.id : null);
-    const newEnrollmentStatus: 'active' | 'not_enrolled' | 'cancelled' = cleanTeacherEmail && resolvedTeacherUid ? 'active' : (cleanTeacherEmail ? 'not_enrolled' : 'cancelled');
+    const newEnrollmentStatus: 'active' | 'not_enrolled' | 'cancelled' = cleanTeacherEmail && resolvedTeacherUid ? 'active' : 'not_enrolled';
 
     setUserProfile((prev) => ({
       ...prev,
@@ -3638,8 +3724,15 @@ export default function App() {
           return [...next, tutorData];
         });
       }
-      fetch(`/api/user-profile?email=${encodeURIComponent(account.email)}`)
-        .then((res) => (res.ok ? res.json() : null))
+      getAccessToken()
+        .catch(() => null)
+        .then((teacherToken) =>
+          fetch(
+            `/api/user-profile?email=${encodeURIComponent(account.email)}${account.uid ? `&uid=${encodeURIComponent(account.uid)}` : ''}`,
+            teacherToken ? { headers: { Authorization: `Bearer ${teacherToken}` } } : undefined
+          )
+        )
+        .then((res) => (res && res.ok ? res.json() : null))
         .then((data) => {
           if (data?.tutor) {
             const dataTutorEmail = (data.tutor.email || '').toLowerCase().trim();
@@ -3718,17 +3811,70 @@ export default function App() {
     }));
   };
 
-  // Handler: Update contracted lessons
+  // Handler: Update contracted lessons (Admin-only authoritative Firestore mutation)
   const handleUpdateContractedLessons = async (studentEmail: string, count: number) => {
-    setContractedLessons((prev) => ({ ...prev, [studentEmail.toLowerCase()]: count }));
+    if (!currentAccount || currentAccount.role !== 'admin') {
+      console.warn('[RBAC] Somente administradores podem alterar saldos contratuais.');
+      return;
+    }
+
+    const cleanEmail = (studentEmail || '').toLowerCase().trim();
+    const matchedStudent = students.find(
+      (s) => (s.email || s.studentEmail || '').toLowerCase().trim() === cleanEmail
+    );
+    const targetStudentUid =
+      (matchedStudent?.uid && isValidCanonicalUid(matchedStudent.uid) ? matchedStudent.uid : undefined) ||
+      (matchedStudent?.id && isValidCanonicalUid(matchedStudent.id) ? matchedStudent.id : undefined);
+
     try {
-      await fetch('/api/students/contract', {
+      const idToken =
+        (await auth.currentUser?.getIdToken().catch(() => null)) ||
+        (await getAccessToken().catch(() => null));
+      if (!idToken) return;
+
+      const res = await fetch('/api/students/contract', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: studentEmail, count }),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({
+          studentUid: targetStudentUid,
+          email: cleanEmail,
+          count,
+        }),
       });
-    } catch {
-      // local fallback
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        console.error('[handleUpdateContractedLessons] Rejected by server:', data);
+        return;
+      }
+
+      const authContracted = Number(data.contractedLessons ?? count);
+      const authAvailable = typeof data.availableLessons === 'number' ? data.availableLessons : undefined;
+      const resolvedEmail = (data.studentEmail || cleanEmail).toLowerCase().trim();
+
+      setContractedLessons((prev) => ({ ...prev, [resolvedEmail]: authContracted }));
+      setStudents((prev) =>
+        prev.map((s) =>
+          (s.email || s.studentEmail || '').toLowerCase().trim() === resolvedEmail
+            ? {
+                ...s,
+                contractedLessons: authContracted,
+                ...(authAvailable !== undefined ? { availableLessons: authAvailable } : {}),
+              }
+            : s
+        )
+      );
+      if (userProfile?.email?.toLowerCase().trim() === resolvedEmail) {
+        setUserProfile((prev) => ({
+          ...prev,
+          contractedLessons: authContracted,
+          ...(authAvailable !== undefined ? { availableLessons: authAvailable } : {}),
+        }));
+      }
+    } catch (err) {
+      console.error('[handleUpdateContractedLessons] Network error:', err);
     }
   };
 

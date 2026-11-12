@@ -303,6 +303,12 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         } else {
           setEmailWarning('');
         }
+      } else if (res.status === 503) {
+        setEmailWarning(
+          isEn
+            ? 'Unable to verify email availability right now (service temporarily unavailable).'
+            : 'Não foi possível verificar o e-mail no momento (serviço temporariamente indisponível).'
+        );
       }
     } catch {
       // ignore
@@ -331,6 +337,12 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         } else {
           setNameWarning('');
         }
+      } else if (res.status === 503) {
+        setNameWarning(
+          isEn
+            ? 'Unable to verify name availability right now (service temporarily unavailable).'
+            : 'Não foi possível verificar o nome no momento (serviço temporariamente indisponível).'
+        );
       }
     } catch {
       // ignore
