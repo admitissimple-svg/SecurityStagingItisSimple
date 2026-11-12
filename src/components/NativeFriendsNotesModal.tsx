@@ -26,12 +26,11 @@ import {
   FileText,
   Info,
 } from 'lucide-react';
-import { GoogleAccount, LiveLesson, StudentProfile, UserProfile, EnglishLevel, StudentDictionaryEntry } from '../types';
+import { GoogleAccount, LiveLesson, StudentProfile, UserProfile, EnglishLevel, StudentDictionaryEntry, NoteApprovedVersion } from '../types';
 import { formatDateInTimeZone } from '../utils/timezone';
 import { speakEnglish } from '../utils/audio';
 import {
   PedagogicalLessonTransformation,
-  fetchPedagogicalTransformation,
   resolveCefrLevel,
   extractNotesMarkings,
   computeNotesHash,
@@ -71,13 +70,12 @@ interface SessionOption {
   teacherName: string;
   rawContent: string;
   timestamp: number;
+  lastApprovedVersion?: NoteApprovedVersion | null;
+  approvalStatus?: 'unapproved' | 'draft_in_progress' | 'approved';
 }
 
 // Module-level in-memory cache for open/close modal transitions (Zero localStorage)
 const sessionNotesModalMemoryCache = new Map<string, PedagogicalLessonTransformation>();
-
-// In-flight pedagogical transformation promises to guarantee at most one transformation in flight per canonical key across remounts and re-renders
-const inFlightTransformPromises = new Map<string, Promise<PedagogicalLessonTransformation>>();
 
 // In-flight synchronization promises to prevent duplicate simultaneous executions across remounts
 const inFlightVocabSyncPromises = new Map<string, Promise<StudentDictionaryEntry[]>>();
@@ -160,6 +158,8 @@ function mergeSessionOption(
     const bestDateStr = (newItem.dateStr && /\d{4}-\d{2}-\d{2}/.test(newItem.dateStr))
       ? newItem.dateStr
       : existing.dateStr;
+    const bestApprovedVersion = newItem.lastApprovedVersion || existing.lastApprovedVersion || null;
+    const bestApprovalStatus = newItem.approvalStatus || (bestApprovedVersion ? 'approved' : existing.approvalStatus || 'unapproved');
 
     map.set(existingKey, {
       ...existing,
@@ -167,9 +167,15 @@ function mergeSessionOption(
       dateStr: bestDateStr,
       rawContent: bestContent,
       timestamp: bestTimestamp,
+      lastApprovedVersion: bestApprovedVersion,
+      approvalStatus: bestApprovalStatus,
     });
   } else {
-    map.set(newItem.key, newItem);
+    map.set(newItem.key, {
+      ...newItem,
+      lastApprovedVersion: newItem.lastApprovedVersion || null,
+      approvalStatus: newItem.approvalStatus || (newItem.lastApprovedVersion ? 'approved' : 'unapproved'),
+    });
   }
 }
 
@@ -267,6 +273,7 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
   const [vocabSyncError, setVocabSyncError] = useState<string | null>(null);
 
   // Transformation data state
+  const [approvedVersionMeta, setApprovedVersionMeta] = useState<NoteApprovedVersion | null>(null);
   const [transformation, setTransformation] = useState<PedagogicalLessonTransformation | null>(null);
   const [isLoadingTransformation, setIsLoadingTransformation] = useState<boolean>(false);
   const [activeTab, setActiveTab] = useState<'all' | 'mistakes' | 'grammar' | 'vocab' | 'summary'>(
@@ -373,6 +380,8 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                 teacherName: l.teacherName || (l as any)?.tutorName || 'Native Friend',
                 rawContent: raw,
                 timestamp,
+                lastApprovedVersion: (l as any)?.lastApprovedVersion || null,
+                approvalStatus: (l as any)?.approvalStatus || ((l as any)?.lastApprovedVersion ? 'approved' : 'unapproved'),
               });
             }
           }
@@ -407,6 +416,8 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                 teacherName: data.teacherName || 'Native Friend',
                 rawContent: data.content,
                 timestamp,
+                lastApprovedVersion: data.lastApprovedVersion || null,
+                approvalStatus: data.approvalStatus || (data.lastApprovedVersion ? 'approved' : 'unapproved'),
               });
             }
           });
@@ -435,6 +446,8 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                 teacherName: data.teacherName || 'Native Friend',
                 rawContent: data.content,
                 timestamp,
+                lastApprovedVersion: data.lastApprovedVersion || null,
+                approvalStatus: data.approvalStatus || (data.lastApprovedVersion ? 'approved' : 'unapproved'),
               });
             }
           });
@@ -476,6 +489,8 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                 teacherName: n.teacherName || 'Native Friend',
                 rawContent: n.content,
                 timestamp,
+                lastApprovedVersion: n.lastApprovedVersion || null,
+                approvalStatus: n.approvalStatus || (n.lastApprovedVersion ? 'approved' : 'unapproved'),
               });
             }
           });
@@ -598,7 +613,10 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
       setIsSyncingVocab(true);
       setVocabSyncError(null);
 
-      const isDefinitive = Boolean(currentResult.isAiGenerated && !currentResult.isProvisional && !currentResult.isFallback);
+      const isDefinitive = Boolean(
+        (approvedVersionMeta && approvedVersionMeta.status === 'approved') ||
+        (currentResult.isAiGenerated && !currentResult.isProvisional && !currentResult.isFallback)
+      );
 
       const syncPromise = syncSessionVocabularyToStudentDictionary({
         studentUid: resolvedUid, // Strictly canonical UID from authenticated Firebase Auth
@@ -658,175 +676,111 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
     }
   }, [activeSession]);
 
-  // Load and transform pedagogical notes whenever active session changes
-  const loadPedagogicalNotes = useCallback(
-    async (forceRegenerate: boolean = false, targetSessionOverride?: SessionOption | null) => {
+  // Load and validate approved pedagogical notes for active session (FASE NF-DOC.2D: Read-Only Approved Version)
+  const loadApprovedNotes = useCallback(
+    async (targetSessionOverride?: SessionOption | null) => {
       const session = targetSessionOverride !== undefined ? targetSessionOverride : activeSessionRef.current;
       if (!session) {
         setTransformation(null);
+        setApprovedVersionMeta(null);
         setIsLoadingTransformation(false);
         return;
       }
 
       const targetSessionKey = session.key;
-      const targetRawContent = session.rawContent || '';
-      const contentHash = computeNotesHash(targetRawContent);
-      const canonicalSessionKey = getCanonicalSessionKey({
-        lessonId: session.lessonId,
-        sessionKey: session.key,
-        studentUid: resolvedUid,
-        studentEmail: resolvedEmail,
-        sessionDate: session.dateStr,
-      });
-      const currentCefr = cefrMeta.cefr;
-      const transformCanonicalKey = buildPedagogicalCacheKey({
-        canonicalSessionKey,
-        contentHash,
-        language: currentLanguage,
-        cefrLevel: currentCefr,
-        promptVersion: PEDAGOGICAL_PROMPT_VERSION,
-      });
+      let approved: NoteApprovedVersion | null = session.lastApprovedVersion || null;
 
-      // Invalidate memory cache on explicit force regeneration (e.g. Retry or Refresh Analysis)
-      if (forceRegenerate) {
-        sessionNotesModalMemoryCache.delete(transformCanonicalKey);
-      } else {
-        // Fast path: Check module memory cache strictly matching canonical key (including contentHash, language, CEFR, promptVersion)
-        const cached = sessionNotesModalMemoryCache.get(transformCanonicalKey);
+      // Fast-path: Check memory cache first
+      const cached = sessionNotesModalMemoryCache.get(targetSessionKey);
+      if (cached && approved && approved.transformation) {
+        if (isMountedRef.current && currentActiveSessionKeyRef.current === targetSessionKey) {
+          setApprovedVersionMeta(approved);
+          setTransformation(cached);
+          setIsLoadingTransformation(false);
+        }
+        performVocabularySync(cached, session, false);
+        return;
+      }
 
-        if (cached && !cached.isProvisional && cached.isAiGenerated && (!cached.contentHash || cached.contentHash === contentHash)) {
+      // If approved version is not yet attached in session object, query server details strictly for student
+      if (!approved) {
+        setIsLoadingTransformation(true);
+        try {
+          const idToken = await auth?.currentUser?.getIdToken().catch(() => null);
+          const targetKey = session.lessonId || session.key;
+          const res = await fetch(`/api/session-notes?id=${encodeURIComponent(targetKey)}`, {
+            headers: {
+              ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+            },
+          });
+          if (res.ok) {
+            const serverDoc = await res.json();
+            if (serverDoc?.lastApprovedVersion?.status === 'approved' && serverDoc.lastApprovedVersion.transformation) {
+              approved = serverDoc.lastApprovedVersion;
+              if (isMountedRef.current) {
+                setSessionOptions((prev) =>
+                  prev.map((s) =>
+                    s.key === targetSessionKey
+                      ? { ...s, lastApprovedVersion: approved, approvalStatus: 'approved' }
+                      : s
+                  )
+                );
+              }
+            }
+          }
+        } catch (fetchErr) {
+          console.warn('NativeFriendsNotes: session notes detail fetch notice:', fetchErr);
+        }
+      }
+
+      // Validate that approved version is genuine with all 4 canonical parts
+      if (approved && approved.status === 'approved' && approved.transformation) {
+        const t = approved.transformation;
+        if (
+          Array.isArray(t.mistakesAnalysis) &&
+          Array.isArray(t.grammarPoints) &&
+          Array.isArray(t.vocabularyAndExpressions) &&
+          t.reviewSummary &&
+          typeof t.reviewSummary === 'object' &&
+          !Array.isArray(t.reviewSummary)
+        ) {
           if (isMountedRef.current && currentActiveSessionKeyRef.current === targetSessionKey) {
-            setTransformation(cached);
+            setApprovedVersionMeta(approved);
+            setTransformation(t);
             setIsLoadingTransformation(false);
           }
-          performVocabularySync(cached, session, false);
+          sessionNotesModalMemoryCache.set(targetSessionKey, t);
+          performVocabularySync(t, session, false);
           return;
         }
       }
 
-      // Check if a transformation for this exact canonical key is ALREADY in flight (Requirement 1 & 5)
-      const existingInFlight = inFlightTransformPromises.get(transformCanonicalKey);
-      if (existingInFlight) {
-        setIsLoadingTransformation(true);
-        try {
-          const result = await existingInFlight;
-          if (isMountedRef.current && currentActiveSessionKeyRef.current === targetSessionKey) {
-            setTransformation(result);
-          }
-        } catch (err) {
-          console.warn('NativeFriendsNotes: in-flight attach notice:', err);
-        } finally {
-          if (isMountedRef.current && currentActiveSessionKeyRef.current === targetSessionKey) {
-            setIsLoadingTransformation(false);
-          }
-        }
-        return;
-      }
-
-      // Initiate single-flight transformation promise
-      setIsLoadingTransformation(true);
-
-      const targetLessonId = session.lessonId;
-      const targetTopic = session.topic;
-      const targetDateStr = session.dateStr;
-      const targetTeacherName = session.teacherName;
-
-      const transformPromise = (async (): Promise<PedagogicalLessonTransformation> => {
-        return await fetchPedagogicalTransformation({
-          rawNotes: targetRawContent,
-          topic: targetTopic,
-          sessionDate: targetDateStr,
-          teacherName: targetTeacherName,
-          studentLevel,
-          studentUid: resolvedUid,
-          studentEmail: resolvedEmail,
-          lessonId: targetLessonId,
-          sessionKey: targetSessionKey,
-          language: currentLanguage,
-          forceRegenerate,
-          triggerAiIfMissing: true,
-        });
-      })();
-
-      inFlightTransformPromises.set(transformCanonicalKey, transformPromise);
-      lastRequestedTransformKeyRef.current = transformCanonicalKey;
-
-      let result: PedagogicalLessonTransformation | null = null;
-      try {
-        result = await transformPromise;
-
-        // Requirement 7: Do not overwrite state if user switched to another session while in-flight
-        if (isMountedRef.current && currentActiveSessionKeyRef.current === targetSessionKey) {
-          setTransformation(result);
-        }
-
-        // Cache definitive AI generation strictly under transformCanonicalKey
-        if (result && result.isAiGenerated && !result.isProvisional) {
-          sessionNotesModalMemoryCache.set(transformCanonicalKey, result);
-        }
-      } catch (err) {
-        console.warn('Failed to load pedagogical notes:', err);
-      } finally {
-        inFlightTransformPromises.delete(transformCanonicalKey);
-        if (isMountedRef.current && currentActiveSessionKeyRef.current === targetSessionKey) {
-          setIsLoadingTransformation(false);
-        }
-      }
-
-      // Trigger vocabulary sync asynchronously
-      if (result) {
-        performVocabularySync(result, session, forceRegenerate);
+      // No approved version: student does NOT generate or use legacy unapproved transformations
+      if (isMountedRef.current && currentActiveSessionKeyRef.current === targetSessionKey) {
+        setApprovedVersionMeta(null);
+        setTransformation(null);
+        setIsLoadingTransformation(false);
       }
     },
-    [studentLevel, resolvedUid, resolvedEmail, currentLanguage, cefrMeta.cefr, performVocabularySync]
+    [performVocabularySync]
   );
 
   useEffect(() => {
     if (!isOpen || !activeSession) return;
 
-    const currentHash = computeNotesHash(activeSession.rawContent || '');
-    const canonicalSessionKey = getCanonicalSessionKey({
-      lessonId: activeSession.lessonId,
-      sessionKey: activeSession.key,
-      studentUid: resolvedUid,
-      studentEmail: resolvedEmail,
-      sessionDate: activeSession.dateStr,
-    });
-    const currentCefr = cefrMeta.cefr;
-    const targetKey = buildPedagogicalCacheKey({
-      canonicalSessionKey,
-      contentHash: currentHash,
-      language: currentLanguage,
-      cefrLevel: currentCefr,
-      promptVersion: PEDAGOGICAL_PROMPT_VERSION,
-    });
-
-    // When active session changes, clear previous session's transformation immediately to avoid visual leakage (Requirement 7)
+    // When active session changes, clear previous session's transformation immediately to avoid visual leakage
     if (currentActiveSessionKeyRef.current !== activeSession.key) {
       currentActiveSessionKeyRef.current = activeSession.key;
       setTransformation(null);
+      setApprovedVersionMeta(null);
     }
 
-    // If this exact canonical transformation key has already been requested or loaded by this modal instance, avoid redundant calls (Requirement 1, 2, 3)
-    if (lastRequestedTransformKeyRef.current === targetKey) {
-      return;
-    }
-
-    // Synchronously mark this key as requested to block concurrent re-renders or StrictMode remounts
-    lastRequestedTransformKeyRef.current = targetKey;
-
-    loadPedagogicalNotes(false, activeSession);
+    loadApprovedNotes(activeSession);
   }, [
     isOpen,
     activeSession?.key,
-    activeSession?.rawContent,
-    activeSession?.lessonId,
-    activeSession?.dateStr,
-    currentLanguage,
-    cefrMeta.cefr,
-    resolvedUid,
-    resolvedEmail,
-    loadPedagogicalNotes,
+    activeSession?.lastApprovedVersion,
+    loadApprovedNotes,
   ]);
 
   // Copy 5-10 minute review summary to clipboard
@@ -885,15 +839,15 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                 <span className="px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[11px] font-black border border-emerald-400/40">
                   {cefrMeta.cefr} • {cefrMeta.labelEn}
                 </span>
-                {transformation?.isAiGenerated ? (
-                  <span className="px-2 py-0.5 rounded-full bg-blue-500/20 text-[#9AB4FF] text-[11px] font-black border border-blue-400/40 flex items-center gap-1">
-                    <Sparkles className="w-3 h-3 text-[#9AB4FF]" />
-                    {transformation.modelUsed || 'Gemini'}
+                {approvedVersionMeta ? (
+                  <span id="student-approved-version-badge" className="px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[11px] font-black border border-emerald-400/40 flex items-center gap-1">
+                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-300" />
+                    <span>{isEn ? `Approved (v${approvedVersionMeta.versionNumber})` : `Aprovado (v${approvedVersionMeta.versionNumber})`}</span>
                   </span>
-                ) : transformation?.isFallback ? (
-                  <span className="px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 text-[11px] font-semibold border border-amber-400/40 flex items-center gap-1">
-                    <AlertTriangle className="w-3 h-3 text-amber-300" />
-                    {isEn ? 'AI Enrichment Unavailable' : 'Enriquecimento de IA Indisponível'}
+                ) : activeSession ? (
+                  <span id="student-in-prep-badge" className="px-2.5 py-0.5 rounded-full bg-amber-500/20 text-amber-200 text-[11px] font-semibold border border-amber-400/40 flex items-center gap-1">
+                    <Clock className="w-3 h-3 text-amber-200" />
+                    <span>{isEn ? 'In Preparation' : 'Em Preparação'}</span>
                   </span>
                 ) : null}
               </div>
@@ -952,6 +906,7 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                       {opt.dateStr ? formatDateInTimeZone(opt.dateStr, timeZone, isEn ? 'en' : 'pt') : 'Session'}
                       {' — '}
                       {opt.topic} ({opt.teacherName})
+                      {opt.lastApprovedVersion ? (isEn ? ' [Approved]' : ' [Aprovado]') : ''}
                     </option>
                   ))}
                 </select>
@@ -966,18 +921,18 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
             )}
           </div>
 
-          {/* Refresh analysis */}
+          {/* Refresh notes list */}
           {activeSession && (
             <div className="flex items-center gap-2 shrink-0">
               <button
                 type="button"
-                onClick={() => loadPedagogicalNotes(true)}
-                disabled={isLoadingTransformation}
+                onClick={() => fetchStudentSessions()}
+                disabled={isLoadingSessions || isLoadingTransformation}
                 className="px-3 py-1.5 rounded-xl bg-white hover:bg-slate-100 border border-[#607EC9]/40 text-[#1C4C96] font-bold text-xs flex items-center gap-1.5 transition cursor-pointer shadow-2xs disabled:opacity-50"
-                title={isEn ? 'Regenerate pedagogical report' : 'Regerar transformação pedagógica'}
+                title={isEn ? 'Check for updates from teacher' : 'Verificar atualizações do professor'}
               >
-                <RefreshCw className={`w-3.5 h-3.5 ${isLoadingTransformation ? 'animate-spin' : ''}`} />
-                <span>{isEn ? 'Refresh Analysis' : 'Atualizar Análise'}</span>
+                <RefreshCw className={`w-3.5 h-3.5 ${(isLoadingSessions || isLoadingTransformation) ? 'animate-spin' : ''}`} />
+                <span>{isEn ? 'Check Updates' : 'Atualizar'}</span>
               </button>
             </div>
           )}
@@ -1118,23 +1073,23 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
             </div>
           ) : isLoadingSessions || isLoadingTransformation ? (
             <div className="py-20 flex flex-col items-center justify-center text-center space-y-4">
-              <div className="w-14 h-14 rounded-3xl bg-[#000035] text-[#9AB4FF] flex items-center justify-center animate-bounce shadow-lg">
-                <Sparkles className="w-7 h-7" />
+              <div className="w-14 h-14 rounded-3xl bg-[#000035] text-[#9AB4FF] flex items-center justify-center animate-pulse shadow-lg">
+                <BookOpen className="w-7 h-7" />
               </div>
               <div>
                 <h3 className="text-base font-black text-[#000035]">
                   {isEn
-                    ? 'Transforming Raw Teacher Notes into Masterclass Pedagogical Report...'
-                    : 'Transformando Anotações Brutas em Guia Pedagógico Masterclass...'}
+                    ? 'Loading Pedagogical Notes...'
+                    : 'Carregando Anotações Pedagógicas...'}
                 </h3>
                 <p className="text-xs text-[#607EC9] mt-1 max-w-md">
                   {isEn
-                    ? `Parsing corrections and calibrating rules to CEFR ${cefrMeta.cefr}.`
-                    : `Processando correções calibradas para CEFR ${cefrMeta.cefr}.`}
+                    ? `Calibrated to your CEFR level (${cefrMeta.cefr}).`
+                    : `Calibrado para o seu nível CEFR (${cefrMeta.cefr}).`}
                 </p>
               </div>
             </div>
-          ) : !activeSession || !transformation ? (
+          ) : !activeSession ? (
             <div className="py-16 px-6 rounded-3xl border-2 border-dashed border-[#9AB4FF]/50 bg-white flex flex-col items-center justify-center text-center space-y-3">
               <div className="w-12 h-12 rounded-2xl bg-[#9AB4FF]/20 text-[#1C4C96] flex items-center justify-center">
                 <BookOpen className="w-6 h-6" />
@@ -1144,91 +1099,31 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
               </h3>
               <p className="text-xs text-[#607EC9] max-w-md">
                 {isEn
-                  ? 'Your Native Friend will record notes and stamp corrections during your 1-on-1 sessions. They will be transformed into this pedagogical report automatically!'
-                  : 'Seu Amigo Nativo gravará anotações e marcará correções durante suas sessões 1-a-1. Elas serão transformadas neste guia pedagógico automaticamente!'}
+                  ? 'Your Native Friend will record notes and stamp corrections during your 1-on-1 sessions.'
+                  : 'Seu Amigo Nativo gravará anotações e marcará correções durante suas sessões 1-a-1.'}
               </p>
             </div>
-          ) : transformation.authError ? (
-            <div className="py-14 px-6 rounded-3xl bg-rose-50/80 border border-rose-200/90 shadow-sm flex flex-col items-center justify-center text-center space-y-3">
-              <div className="w-12 h-12 rounded-2xl bg-rose-100 text-rose-700 flex items-center justify-center font-bold text-xl">
-                🔒
+          ) : !transformation ? (
+            <div className="py-16 px-6 rounded-3xl border border-slate-200/80 bg-white flex flex-col items-center justify-center text-center space-y-3 shadow-2xs" id="notes-in-preparation-message">
+              <div className="w-12 h-12 rounded-2xl bg-blue-50 text-[#1C4C96] flex items-center justify-center">
+                <Clock className="w-6 h-6 text-[#1C4C96]" />
               </div>
-              <h3 className="font-black text-base text-rose-950">
-                {transformation.authError.status === 401
-                  ? (isEn ? 'Authentication Required' : 'Autenticação Necessária')
-                  : (isEn ? 'Access Restricted' : 'Acesso Não Autorizado')}
+              <h3 className="font-bold text-base text-[#000035]">
+                {isEn ? 'Pedagogical Notes in Preparation' : 'Anotações Pedagógicas em Preparação'}
               </h3>
-              <p className="text-xs text-rose-800 max-w-md">
-                {transformation.authError.message}
+              <p className="text-xs text-slate-500 max-w-md">
+                {isEn
+                  ? 'Your Native Friend is preparing and reviewing the pedagogical notes for this session. They will be published here once approved.'
+                  : 'O professor está preparando e revisando as anotações pedagógicas desta sessão. Elas serão publicadas aqui assim que aprovadas.'}
               </p>
+              {activeSession.teacherName && (
+                <div className="text-[11px] font-semibold text-slate-400">
+                  {isEn ? `Teacher: ${activeSession.teacherName}` : `Professor: ${activeSession.teacherName}`}
+                </div>
+              )}
             </div>
           ) : (
             <>
-              {/* Optional Prompt to Generate with AI (Zero automatic billing on open/language change) */}
-              {transformation.needsAiGeneration && (
-                <div className="p-3.5 rounded-2xl bg-indigo-50/90 border border-indigo-200/90 shadow-2xs flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-indigo-950">
-                  <div className="flex items-start gap-2.5">
-                    <Sparkles className="w-4 h-4 text-indigo-600 mt-0.5 shrink-0" />
-                    <div>
-                      <div className="font-bold flex items-center gap-2">
-                        <span>{isEn ? 'Masterclass AI Analysis Ready' : 'Análise Pedagógica Masterclass Disponível'}</span>
-                      </div>
-                      <p className="text-indigo-800 text-[11px] mt-0.5">
-                        {isEn
-                          ? 'Viewing preliminary teacher notes. Generate full masterclass report calibrated to your CEFR level.'
-                          : 'Exibindo notas preliminares do professor. Gere o guia pedagógico inteligente com o Gemini.'}
-                      </p>
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => loadPedagogicalNotes(true)}
-                    disabled={isLoadingTransformation}
-                    className="px-3.5 py-1.5 rounded-xl bg-[#1C4C96] hover:bg-[#000035] text-white font-bold text-xs shrink-0 transition cursor-pointer shadow-sm disabled:opacity-50 flex items-center gap-1.5"
-                  >
-                    <Sparkles className="w-3.5 h-3.5" />
-                    {isEn ? 'Generate with Gemini' : 'Gerar com Gemini'}
-                  </button>
-                </div>
-              )}
-
-              {/* AI Fallback Notice Banner (when Gemini was offline or quota reached during explicit request) */}
-              {transformation.isFallback && !transformation.needsAiGeneration && (
-                <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200/90 shadow-2xs flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-amber-900">
-                  <div className="flex items-start gap-2.5">
-                    <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
-                    <div>
-                      <div className="font-bold text-amber-950 flex items-center gap-2 flex-wrap">
-                        <span>
-                          {transformation.fallbackReason === 'SERVICE_UNAVAILABLE'
-                            ? (isEn ? 'Gemini Experiencing High Demand (HTTP 503)' : 'Gemini com Alta Demanda Temporária (HTTP 503)')
-                            : (isEn ? 'AI Pedagogical Enrichment Temporarily Unavailable' : 'Enriquecimento por IA Temporariamente Indisponível')}
-                        </span>
-                        {transformation.cooldownSecondsRemaining ? (
-                          <span className="text-[10px] px-2 py-0.5 rounded-md bg-amber-200/70 text-amber-900 font-bold">
-                            {isEn ? `Cooldown: ${transformation.cooldownSecondsRemaining}s` : `Aguarde: ${transformation.cooldownSecondsRemaining}s`}
-                          </span>
-                        ) : null}
-                      </div>
-                      <p className="text-amber-800 text-[11px] mt-0.5">
-                        {transformation.aiNotice ||
-                          (isEn
-                            ? 'Displaying direct notes faithful to teacher markings. Detailed explanations and exercises are paused.'
-                            : 'Exibindo notas diretas fiéis às marcações do professor. Explicações detalhadas e exercícios pausados.')}
-                      </p>
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => loadPedagogicalNotes(true)}
-                    disabled={isLoadingTransformation}
-                    className="px-3 py-1.5 rounded-xl bg-white border border-amber-300 hover:bg-amber-100/60 text-amber-950 font-bold text-xs shrink-0 transition cursor-pointer shadow-2xs disabled:opacity-50"
-                  >
-                    {isEn ? 'Retry with Gemini' : 'Tentar com Gemini'}
-                  </button>
-                </div>
-              )}
-
               {/* Minimalist Top Context Strip */}
               {activeTab !== 'all' ? (
                 <div className="px-4 py-2 rounded-xl bg-white border border-slate-200/80 shadow-2xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs text-slate-600">
@@ -1249,6 +1144,11 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                     <span className="px-2 py-0.5 rounded-md bg-slate-100 text-slate-700 text-[10px] font-bold">
                       CEFR {cefrMeta.cefr}
                     </span>
+                    {approvedVersionMeta && (
+                      <span className="px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-800 text-[10px] font-bold border border-emerald-200">
+                        v{approvedVersionMeta.versionNumber}
+                      </span>
+                    )}
                   </div>
                 </div>
               ) : (
@@ -1263,6 +1163,11 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                       <span className="px-2 py-0.5 rounded-md bg-slate-100 text-[11px] font-semibold text-slate-700">
                         📅 {formatDateInTimeZone(transformation.sessionDate, timeZone, isEn ? 'en' : 'pt')}
                       </span>
+                      {approvedVersionMeta && (
+                        <span className="px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-800 text-[11px] font-bold border border-emerald-200">
+                          v{approvedVersionMeta.versionNumber}
+                        </span>
+                      )}
                     </div>
                     <p className="text-xs text-slate-500">
                       {isEn ? 'Guided with Native Friend' : 'Conduzida com o Amigo Nativo'}:{' '}
@@ -1516,18 +1421,12 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                       <div className="p-8 rounded-2xl bg-white border border-slate-200 text-center space-y-2">
                         <GraduationCap className="w-8 h-8 text-blue-500 mx-auto" />
                         <h4 className="font-bold text-sm text-[#000035]">
-                          {transformation.isFallback
-                            ? (isEn ? 'AI Grammar Enrichment Unavailable' : 'Enriquecimento Gramatical de IA Indisponível')
-                            : (isEn ? 'No Formal Grammar Points Recorded' : 'Nenhum Ponto Gramatical Formal')}
+                          {isEn ? 'No Formal Grammar Points Recorded' : 'Nenhum Ponto Gramatical Formal'}
                         </h4>
                         <p className="text-xs text-slate-500">
-                          {transformation.isFallback
-                            ? (isEn
-                                ? 'Grammar rules and syntax breakdowns require AI enrichment. Original teacher notes and error corrections are preserved in Tab 1.'
-                                : 'Regras gramaticais e estruturas exigem enriquecimento por IA. As correções originais do professor estão preservadas na Aba 1.')
-                            : (isEn
-                                ? 'This session focused primarily on vocabulary and natural fluency.'
-                                : 'Esta sessão teve foco em vocabulário e conversação fluida.')}
+                          {isEn
+                            ? 'This session focused primarily on vocabulary and natural fluency.'
+                            : 'Esta sessão teve foco em vocabulário e conversação fluida.'}
                         </p>
                       </div>
                     )}
@@ -1618,7 +1517,7 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                           if (transformation && activeSession) {
                             performVocabularySync(transformation, activeSession, true);
                           } else {
-                            loadPedagogicalNotes(false);
+                            loadApprovedNotes(activeSession);
                           }
                         }}
                         className="px-3 py-1.5 rounded-xl bg-amber-200/80 hover:bg-amber-300 text-amber-950 font-bold text-xs transition cursor-pointer shrink-0"
