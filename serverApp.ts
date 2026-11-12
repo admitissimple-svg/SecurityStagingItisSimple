@@ -8492,7 +8492,7 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
       return res.status(403).json({
         error: 'Forbidden',
         code: 'FORBIDDEN',
-        message: 'Apenas Amigos Nativos aprovados ou administradores possuem autorização para registrar anotações pedagógicas.',
+        message: 'Only approved Native Friends or administrators are authorized to save pedagogical session notes.',
       });
     }
   }
@@ -8506,7 +8506,7 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
     return res.status(400).json({
       error: 'CANONICAL_TEACHER_UID_REQUIRED',
       code: 'CANONICAL_TEACHER_UID_REQUIRED',
-      message: 'UID canônico do professor é obrigatório para registrar anotações pedagógicas.',
+      message: 'Canonical teacher UID is required to save pedagogical session notes.',
     });
   }
 
@@ -8516,7 +8516,7 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
     return res.status(400).json({
       error: 'CANONICAL_STUDENT_UID_REQUIRED',
       code: 'CANONICAL_STUDENT_UID_REQUIRED',
-      message: 'UID canônico do aluno é obrigatório para registrar anotações pedagógicas.',
+      message: 'Canonical student UID is required to save pedagogical session notes.',
     });
   }
   const studentUid = incomingStudentUid;
@@ -8525,7 +8525,7 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
     return res.status(400).json({
       error: 'INVALID_PEDAGOGICAL_IDENTITY',
       code: 'INVALID_PEDAGOGICAL_IDENTITY',
-      message: 'O UID do professor não pode ser igual ao UID do aluno.',
+      message: 'Teacher UID cannot be identical to student UID.',
     });
   }
 
@@ -8554,7 +8554,7 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
     return res.status(400).json({
       error: 'STUDENT_NOT_FOUND',
       code: 'STUDENT_NOT_FOUND',
-      message: 'Identidade canônica do aluno não foi encontrada no Firestore.',
+      message: 'Canonical student identity was not found in Firestore.',
     });
   }
 
@@ -8565,7 +8565,7 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
       return res.status(403).json({
         error: 'Forbidden',
         code: 'UNAUTHORIZED_PEDAGOGICAL_LINK',
-        message: 'Amigo Nativo não possui vínculo pedagógico autorizado com este aluno.',
+        message: 'Native Friend does not have an authorized pedagogical link with this student.',
       });
     }
   }
@@ -8591,14 +8591,14 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
         return res.status(403).json({
           error: 'STUDENT_LESSON_MISMATCH',
           code: 'STUDENT_LESSON_MISMATCH',
-          message: 'A aula especificada pertence a outro aluno. Gravação bloqueada.',
+          message: 'The specified lesson belongs to a different student. Save blocked.',
         });
       }
       if (!isCallerAdmin && lesson.teacherUid && lesson.teacherUid !== teacherUid) {
         return res.status(403).json({
           error: 'TEACHER_LESSON_MISMATCH',
           code: 'TEACHER_LESSON_MISMATCH',
-          message: 'Amigo Nativo não autorizado para lecionar ou registrar esta aula.',
+          message: 'Native Friend is not authorized to teach or save notes for this lesson.',
         });
       }
     }
@@ -8613,7 +8613,7 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
     return res.status(400).json({
       error: 'SESSION_DATE_REQUIRED',
       code: 'SESSION_DATE_REQUIRED',
-      message: 'Data da sessão no formato YYYY-MM-DD é obrigatória para registrar anotações.',
+      message: 'Session date in YYYY-MM-DD format is required to save pedagogical notes.',
     });
   }
   const dateMatch = rawDate.trim().match(/^\d{4}-\d{2}-\d{2}$/);
@@ -8621,7 +8621,7 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
     return res.status(400).json({
       error: 'INVALID_SESSION_DATE',
       code: 'INVALID_SESSION_DATE',
-      message: 'Data da sessão inválida. O formato exigido é YYYY-MM-DD.',
+      message: 'Invalid session date. Expected format is YYYY-MM-DD.',
     });
   }
   const sessionDate = dateMatch[0];
@@ -8642,7 +8642,7 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
     return res.status(400).json({
       error: 'CONTENT_REQUIRED',
       code: 'CONTENT_REQUIRED',
-      message: 'Conteúdo da anotação pedagógica é obrigatório.',
+      message: 'Pedagogical note content is required.',
     });
   }
   const topic = req.body?.topic || lesson?.title || 'Live Coaching Session';
@@ -8844,13 +8844,14 @@ export async function executePedagogicalTransformationCore(
   const newWordCount = markings.newWordCount;
   const pronounceCount = markings.pronounceCount;
 
+  const isTeacherCaller = options.callerRole === 'teacher' || options.callerRole === 'admin';
   if (!hasValidPedagogicalContent(rawNotes, markings)) {
     return {
       success: false,
       statusCode: 400,
       category: 'INVALID_INPUT',
       error: 'InvalidNotesContent',
-      message: (options.language || 'pt') === 'pt'
+      message: (!isTeacherCaller && (options.language || 'pt') === 'pt')
         ? 'As anotações enviadas estão vazias ou não contêm termos pedagógicos válidos para análise.'
         : 'The submitted notes are empty or contain no valid pedagogical content for analysis.',
     };
@@ -8864,7 +8865,7 @@ export async function executePedagogicalTransformationCore(
       statusCode: 503,
       category: isCooldownActive ? 'QUOTA_EXCEEDED' : 'NO_API_KEY',
       error: 'AiUnavailable',
-      message: (options.language || 'pt') === 'pt'
+      message: (!isTeacherCaller && (options.language || 'pt') === 'pt')
         ? 'O serviço pedagógico de IA está temporariamente indisponível. As anotações originais foram preservadas intactas.'
         : 'The pedagogical AI service is temporarily unavailable. Original teacher notes have been preserved.',
     };
@@ -9035,7 +9036,7 @@ Ensure reviewSummary and rememberThis are fully provided in ${targetLang.nameEn}
       statusCode,
       category: lastFailureCategory,
       error: contingencyResult?.error || 'AiUnavailable',
-      message: language === 'pt'
+      message: (!isTeacherCaller && language === 'pt')
         ? 'O serviço pedagógico de IA está temporariamente indisponível após tentativa com os modelos de contingência. As anotações originais do professor foram preservadas intactas.'
         : 'The pedagogical AI service is temporarily unavailable after trying contingency models. Original teacher notes have been preserved.',
       attemptsCount: contingencyResult?.attemptsCount || 1,
@@ -9237,13 +9238,17 @@ Ensure reviewSummary and rememberThis are fully provided in ${targetLang.nameEn}
   };
 }
 
-// Helper to autoritatively resolve approved teacher for pedagogical note actions (transform, draft, approve)
+// Helper to authoritatively resolve approved teacher for pedagogical note actions (transform, draft, approve)
 async function resolveApprovedTeacherForSessionNotes(
   callerUid: string,
   callerEmail?: string,
   tokenRole?: string,
   dbState?: any
-): Promise<{ isApproved: boolean; resolution: any }> {
+): Promise<{
+  isApproved: boolean;
+  callerKind: 'teacher' | 'pending_teacher' | 'conflict' | 'student' | 'unregistered';
+  resolution: any;
+}> {
   const canonicalRes = await resolveCanonicalUserRoleAndIdentity({
     uid: callerUid,
     email: callerEmail,
@@ -9254,6 +9259,7 @@ async function resolveApprovedTeacherForSessionNotes(
   if (canonicalRes && canonicalRes.role === 'teacher' && canonicalRes.identityStatus === 'authorized') {
     return {
       isApproved: true,
+      callerKind: 'teacher',
       resolution: {
         canonicalUid: canonicalRes.uid || callerUid,
         email: canonicalRes.email || callerEmail,
@@ -9266,23 +9272,71 @@ async function resolveApprovedTeacherForSessionNotes(
     };
   }
 
+  // Respect explicit canonical conflict or pending tutor status without auto-promotion or student misclassification
+  if (
+    canonicalRes &&
+    (canonicalRes.role === 'conflict' ||
+      canonicalRes.identityStatus === 'conflict' ||
+      canonicalRes.identityStatus === 'divergent_uid')
+  ) {
+    return { isApproved: false, callerKind: 'conflict', resolution: null };
+  }
+
+  if (canonicalRes && canonicalRes.role === 'pending_teacher') {
+    return { isApproved: false, callerKind: 'pending_teacher', resolution: null };
+  }
+
   const teacherResolution = await resolveTeacherCanonicalIdentity({
     teacherUid: callerUid,
     teacherEmail: callerEmail,
     dbState,
   }).catch(() => null);
 
-  if (teacherResolution && teacherResolution.isApproved) {
-    return { isApproved: true, resolution: teacherResolution };
+  if (teacherResolution && teacherResolution.isApproved && teacherResolution.canonicalUid === callerUid) {
+    return { isApproved: true, callerKind: 'teacher', resolution: teacherResolution };
   }
 
-  return { isApproved: false, resolution: null };
+  return {
+    isApproved: false,
+    callerKind: canonicalRes?.role === 'student' ? 'student' : 'unregistered',
+    resolution: null,
+  };
+}
+
+async function resolveExistingSessionNoteWithKeyFallback(
+  db: any,
+  rawSessionKey: string
+): Promise<{ effectiveKey: string; existingDoc: any | null }> {
+  const candidateKeys = [rawSessionKey];
+  if (rawSessionKey.startsWith('lesson_')) {
+    const stripped = rawSessionKey.replace(/^lesson_/, '').trim();
+    if (stripped && !candidateKeys.includes(stripped)) {
+      candidateKeys.push(stripped);
+    }
+  }
+
+  for (const key of candidateKeys) {
+    if (db.sessionNotesMap?.[key]) {
+      return { effectiveKey: key, existingDoc: db.sessionNotesMap[key] };
+    }
+  }
+
+  for (const key of candidateKeys) {
+    try {
+      const fsDoc = await fetchSessionNotesFromFirestoreServer(key);
+      if (fsDoc) {
+        return { effectiveKey: key, existingDoc: fsDoc };
+      }
+    } catch {}
+  }
+
+  return { effectiveKey: rawSessionKey, existingDoc: null };
 }
 
 // FASE NF-DOC.2A & 2B: Save in-progress draft AI transformation being edited/reviewed by teacher
 async function handleSessionNoteDraftInternal(req: any, res: any) {
   if (!req.user || !req.user.uid) {
-    return res.status(401).json({ error: 'Unauthorized', message: 'Autenticação mandatória.' });
+    return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required.' });
   }
 
   const callerUid = req.user.uid;
@@ -9296,6 +9350,18 @@ async function handleSessionNoteDraftInternal(req: any, res: any) {
     if (authCheck.isApproved) {
       isCallerTeacher = true;
       teacherResolution = authCheck.resolution;
+    } else if (authCheck.callerKind === 'conflict') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'IDENTITY_CONFLICT',
+        message: 'Identity conflict detected on this account. Operation blocked to preserve canonical integrity.',
+      });
+    } else if (authCheck.callerKind === 'pending_teacher') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHER_NOT_APPROVED',
+        message: 'Your Native Friend profile is pending administrator approval and cannot edit pedagogical drafts yet.',
+      });
     } else {
       return res.status(403).json({
         error: 'Forbidden',
@@ -9305,44 +9371,39 @@ async function handleSessionNoteDraftInternal(req: any, res: any) {
     }
   }
 
-  const targetSessionKey = decodeURIComponent(req.params.id || req.body?.id || req.body?.sessionId || req.body?.sessionKey || '').trim();
-  if (!targetSessionKey) {
-    return res.status(400).json({ error: 'SESSION_ID_REQUIRED', code: 'SESSION_ID_REQUIRED', message: 'Identificador da sessão é obrigatório.' });
+  const rawSessionKey = decodeURIComponent(req.params.id || req.body?.id || req.body?.sessionId || req.body?.sessionKey || '').trim();
+  if (!rawSessionKey) {
+    return res.status(400).json({ error: 'SESSION_ID_REQUIRED', code: 'SESSION_ID_REQUIRED', message: 'Session identifier is required.' });
   }
 
-  let existingDoc = db.sessionNotesMap?.[targetSessionKey];
-  if (!existingDoc) {
-    try {
-      existingDoc = await fetchSessionNotesFromFirestoreServer(targetSessionKey);
-    } catch {}
-  }
+  const { effectiveKey: targetSessionKey, existingDoc } = await resolveExistingSessionNoteWithKeyFallback(db, rawSessionKey);
 
   if (!existingDoc) {
-    return res.status(404).json({ error: 'NOT_FOUND', code: 'SESSION_NOTE_NOT_FOUND', message: 'Documento da anotação não encontrado.' });
+    return res.status(404).json({ error: 'NOT_FOUND', code: 'SESSION_NOTE_NOT_FOUND', message: 'Session note document not found.' });
   }
 
   const studentUid = existingDoc.studentUid;
   if (!studentUid || !isValidCanonicalUid(studentUid)) {
-    return res.status(400).json({ error: 'INVALID_STUDENT_IDENTITY', code: 'CANONICAL_STUDENT_UID_REQUIRED', message: 'Identidade canônica do aluno ausente no documento.' });
+    return res.status(400).json({ error: 'INVALID_STUDENT_IDENTITY', code: 'CANONICAL_STUDENT_UID_REQUIRED', message: 'Canonical student identity is missing or invalid in this document.' });
   }
   const docTeacherUid = existingDoc.teacherUid;
   if (!docTeacherUid || !isValidCanonicalUid(docTeacherUid)) {
-    return res.status(400).json({ error: 'INVALID_TEACHER_IDENTITY', code: 'CANONICAL_TEACHER_UID_REQUIRED', message: 'Identidade canônica do professor ausente ou inválida no documento.' });
+    return res.status(400).json({ error: 'INVALID_TEACHER_IDENTITY', code: 'CANONICAL_TEACHER_UID_REQUIRED', message: 'Canonical teacher identity is missing or invalid in this document.' });
   }
   if (req.body?.studentUid && String(req.body.studentUid).trim() !== studentUid) {
-    return res.status(403).json({ error: 'Forbidden', code: 'STUDENT_UID_MISMATCH', message: 'O studentUid informado diverge do proprietário canônico do documento.' });
+    return res.status(403).json({ error: 'Forbidden', code: 'STUDENT_UID_MISMATCH', message: 'Provided studentUid does not match the canonical owner of this document.' });
   }
 
   if (isCallerTeacher && !isCallerAdmin) {
     if (req.body?.teacherUid && String(req.body.teacherUid).trim() !== callerUid) {
-      return res.status(403).json({ error: 'Forbidden', code: 'TEACHER_MISMATCH', message: 'Parâmetro teacherUid inválido para o professor autenticado.' });
+      return res.status(403).json({ error: 'Forbidden', code: 'TEACHER_MISMATCH', message: 'Invalid teacherUid parameter for the authenticated teacher.' });
     }
     const isAuthorized = await verifyCanonicalPedagogicalLinkServer(callerUid, studentUid);
     if (!isAuthorized) {
-      return res.status(403).json({ error: 'Forbidden', code: 'UNAUTHORIZED_PEDAGOGICAL_LINK', message: 'Amigo Nativo não possui vínculo autorizado com este aluno.' });
+      return res.status(403).json({ error: 'Forbidden', code: 'UNAUTHORIZED_PEDAGOGICAL_LINK', message: 'Native Friend does not have an authorized pedagogical link with this student.' });
     }
     if (docTeacherUid !== callerUid) {
-      return res.status(403).json({ error: 'Forbidden', code: 'TEACHER_MISMATCH', message: 'Professor não autorizado para editar rascunhos de outro professor.' });
+      return res.status(403).json({ error: 'Forbidden', code: 'TEACHER_MISMATCH', message: 'Teacher is not authorized to edit drafts belonging to another teacher.' });
     }
   }
 
@@ -9401,7 +9462,7 @@ async function handleSessionNoteDraftInternal(req: any, res: any) {
 // FASE NF-DOC.2B: Generate AI draft transformation using Gemini and persist exclusively as draftTransformation
 async function handleSessionNoteTransformInternal(req: any, res: any) {
   if (!req.user || !req.user.uid) {
-    return res.status(401).json({ error: 'Unauthorized', message: 'Autenticação mandatória.' });
+    return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required.' });
   }
 
   const callerUid = req.user.uid;
@@ -9415,6 +9476,18 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
     if (authCheck.isApproved) {
       isCallerTeacher = true;
       teacherResolution = authCheck.resolution;
+    } else if (authCheck.callerKind === 'conflict') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'IDENTITY_CONFLICT',
+        message: 'Identity conflict detected on this account. Operation blocked to preserve canonical integrity.',
+      });
+    } else if (authCheck.callerKind === 'pending_teacher') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHER_NOT_APPROVED',
+        message: 'Your Native Friend profile is pending administrator approval and cannot transform pedagogical notes yet.',
+      });
     } else {
       // Non-admin caller is not an approved teacher -> reject as student/unauthorized
       return res.status(403).json({
@@ -9425,27 +9498,22 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
     }
   }
 
-  const targetSessionKey = decodeURIComponent(req.params.id || req.body?.id || req.body?.sessionId || req.body?.sessionKey || '').trim();
-  if (!targetSessionKey) {
+  const rawSessionKey = decodeURIComponent(req.params.id || req.body?.id || req.body?.sessionId || req.body?.sessionKey || '').trim();
+  if (!rawSessionKey) {
     return res.status(400).json({
       error: 'SESSION_ID_REQUIRED',
       code: 'SESSION_ID_REQUIRED',
-      message: 'Identificador da sessão é obrigatório.',
+      message: 'Session identifier is required.',
     });
   }
 
-  let existingDoc = db.sessionNotesMap?.[targetSessionKey];
-  if (!existingDoc) {
-    try {
-      existingDoc = await fetchSessionNotesFromFirestoreServer(targetSessionKey);
-    } catch {}
-  }
+  const { effectiveKey: targetSessionKey, existingDoc } = await resolveExistingSessionNoteWithKeyFallback(db, rawSessionKey);
 
   if (!existingDoc) {
     return res.status(404).json({
       error: 'NOT_FOUND',
       code: 'SESSION_NOTE_NOT_FOUND',
-      message: 'Documento da anotação não encontrado.',
+      message: 'Session note document not found.',
     });
   }
 
@@ -9454,7 +9522,7 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
     return res.status(400).json({
       error: 'INVALID_STUDENT_IDENTITY',
       code: 'CANONICAL_STUDENT_UID_REQUIRED',
-      message: 'Identidade canônica do aluno ausente ou inválida no documento.',
+      message: 'Canonical student identity is missing or invalid in this document.',
     });
   }
   const docTeacherUid = existingDoc.teacherUid;
@@ -9462,14 +9530,14 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
     return res.status(400).json({
       error: 'INVALID_TEACHER_IDENTITY',
       code: 'CANONICAL_TEACHER_UID_REQUIRED',
-      message: 'Identidade canônica do professor ausente ou inválida no documento.',
+      message: 'Canonical teacher identity is missing or invalid in this document.',
     });
   }
   if (req.body?.studentUid && String(req.body.studentUid).trim() !== studentUid) {
     return res.status(403).json({
       error: 'Forbidden',
       code: 'STUDENT_UID_MISMATCH',
-      message: 'O studentUid informado diverge do proprietário canônico do documento.',
+      message: 'Provided studentUid does not match the canonical owner of this document.',
     });
   }
 
@@ -9478,7 +9546,7 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
       return res.status(403).json({
         error: 'Forbidden',
         code: 'TEACHER_MISMATCH',
-        message: 'Parâmetro teacherUid inválido para o professor autenticado.',
+        message: 'Invalid teacherUid parameter for the authenticated teacher.',
       });
     }
     const isAuthorized = await verifyCanonicalPedagogicalLinkServer(callerUid, studentUid);
@@ -9486,14 +9554,14 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
       return res.status(403).json({
         error: 'Forbidden',
         code: 'UNAUTHORIZED_PEDAGOGICAL_LINK',
-        message: 'Amigo Nativo não possui vínculo autorizado com este aluno.',
+        message: 'Native Friend does not have an authorized pedagogical link with this student.',
       });
     }
     if (docTeacherUid !== callerUid) {
       return res.status(403).json({
         error: 'Forbidden',
         code: 'TEACHER_MISMATCH',
-        message: 'Professor não autorizado para transformar notas de outro professor.',
+        message: 'Teacher is not authorized to transform notes belonging to another teacher.',
       });
     }
   }
@@ -9505,7 +9573,7 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
       success: false,
       error: 'InvalidNotesContent',
       code: 'NO_PEDAGOGICAL_CONTENT',
-      message: 'As anotações enviadas estão vazias ou não contêm termos pedagógicos válidos para análise.',
+      message: 'The submitted notes are empty or contain no valid pedagogical content for analysis.',
     });
   }
 
@@ -9517,7 +9585,7 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
       success: false,
       error: 'Concurrent generation in progress',
       code: 'CONCURRENT_TRANSFORMATION',
-      message: 'Uma transformação pedagógica para esta sessão já está em andamento. Aguarde alguns instantes.',
+      message: 'A pedagogical transformation for this session is already in progress. Please wait a moment.',
     });
   }
 
@@ -9528,7 +9596,7 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
       success: false,
       error: 'Rate limit exceeded',
       code: 'RATE_LIMIT_EXCEEDED',
-      message: 'Limite de requisições de transformação atingido para este usuário. Aguarde alguns instantes.',
+      message: 'Transformation request rate limit reached for this account. Please wait a moment.',
       retryAfterSeconds: rateLimitCheck.retryAfterSeconds,
     });
   }
@@ -9564,7 +9632,7 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
         error: 'AI_TRANSFORMATION_FAILED',
         code: 'AI_TRANSFORMATION_FAILED',
         category: coreResult.category || 'SERVICE_UNAVAILABLE',
-        message: coreResult.message || 'Falha na transformação pedagógica via IA. O documento original foi preservado intacto sem publicação.',
+        message: coreResult.message || 'Pedagogical AI transformation failed. Original notes were preserved intact without publishing.',
         attemptsCount: coreResult.attemptsCount || 1,
         modelsAttempted: coreResult.modelsAttempted || resolveGeminiContingencyModels(),
         attemptsDetails: coreResult.attemptsDetails,
@@ -9625,7 +9693,7 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
 // FASE NF-DOC.2A & 2B: Teacher reviews and approves transformation version for student (publishing to lastApprovedVersion)
 async function handleSessionNoteApproveInternal(req: any, res: any) {
   if (!req.user || !req.user.uid) {
-    return res.status(401).json({ error: 'Unauthorized', message: 'Autenticação mandatória.' });
+    return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required.' });
   }
 
   const callerUid = req.user.uid;
@@ -9639,6 +9707,18 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
     if (authCheck.isApproved) {
       isCallerTeacher = true;
       teacherResolution = authCheck.resolution;
+    } else if (authCheck.callerKind === 'conflict') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'IDENTITY_CONFLICT',
+        message: 'Identity conflict detected on this account. Operation blocked to preserve canonical integrity.',
+      });
+    } else if (authCheck.callerKind === 'pending_teacher') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHER_NOT_APPROVED',
+        message: 'Your Native Friend profile is pending administrator approval and cannot approve pedagogical notes yet.',
+      });
     } else {
       return res.status(403).json({
         error: 'Forbidden',
@@ -9648,27 +9728,22 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
     }
   }
 
-  const targetSessionKey = decodeURIComponent(req.params.id || req.body?.id || req.body?.sessionId || req.body?.sessionKey || '').trim();
-  if (!targetSessionKey) {
+  const rawSessionKey = decodeURIComponent(req.params.id || req.body?.id || req.body?.sessionId || req.body?.sessionKey || '').trim();
+  if (!rawSessionKey) {
     return res.status(400).json({
       error: 'SESSION_ID_REQUIRED',
       code: 'SESSION_ID_REQUIRED',
-      message: 'Identificador da sessão é obrigatório.',
+      message: 'Session identifier is required.',
     });
   }
 
-  let existingDoc = db.sessionNotesMap?.[targetSessionKey];
-  if (!existingDoc) {
-    try {
-      existingDoc = await fetchSessionNotesFromFirestoreServer(targetSessionKey);
-    } catch {}
-  }
+  const { effectiveKey: targetSessionKey, existingDoc } = await resolveExistingSessionNoteWithKeyFallback(db, rawSessionKey);
 
   if (!existingDoc) {
     return res.status(404).json({
       error: 'NOT_FOUND',
       code: 'SESSION_NOTE_NOT_FOUND',
-      message: 'Documento da anotação não encontrado.',
+      message: 'Session note document not found.',
     });
   }
 
@@ -9677,7 +9752,7 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
     return res.status(400).json({
       error: 'INVALID_STUDENT_IDENTITY',
       code: 'CANONICAL_STUDENT_UID_REQUIRED',
-      message: 'Identidade canônica do aluno ausente ou inválida no documento.',
+      message: 'Canonical student identity is missing or invalid in this document.',
     });
   }
   const docTeacherUid = existingDoc.teacherUid;
@@ -9685,14 +9760,14 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
     return res.status(400).json({
       error: 'INVALID_TEACHER_IDENTITY',
       code: 'CANONICAL_TEACHER_UID_REQUIRED',
-      message: 'Identidade canônica do professor ausente ou inválida no documento.',
+      message: 'Canonical teacher identity is missing or invalid in this document.',
     });
   }
   if (req.body?.studentUid && String(req.body.studentUid).trim() !== studentUid) {
     return res.status(403).json({
       error: 'Forbidden',
       code: 'STUDENT_UID_MISMATCH',
-      message: 'O studentUid informado diverge do proprietário canônico do documento.',
+      message: 'Provided studentUid does not match the canonical owner of this document.',
     });
   }
 
@@ -9701,7 +9776,7 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
       return res.status(403).json({
         error: 'Forbidden',
         code: 'TEACHER_MISMATCH',
-        message: 'Parâmetro teacherUid inválido para o professor autenticado.',
+        message: 'Invalid teacherUid parameter for the authenticated teacher.',
       });
     }
     const isAuthorized = await verifyCanonicalPedagogicalLinkServer(callerUid, studentUid);
@@ -9709,14 +9784,14 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
       return res.status(403).json({
         error: 'Forbidden',
         code: 'UNAUTHORIZED_PEDAGOGICAL_LINK',
-        message: 'Amigo Nativo não possui vínculo autorizado com este aluno.',
+        message: 'Native Friend does not have an authorized pedagogical link with this student.',
       });
     }
     if (docTeacherUid !== callerUid) {
       return res.status(403).json({
         error: 'Forbidden',
         code: 'TEACHER_MISMATCH',
-        message: 'Professor não autorizado para aprovar notas de outro professor.',
+        message: 'Teacher is not authorized to approve notes belonging to another teacher.',
       });
     }
   }
@@ -9730,14 +9805,14 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
       return res.status(409).json({
         error: 'Conflict',
         code: 'DRAFT_ID_MISMATCH',
-        message: 'O ID do rascunho enviado não corresponde ao rascunho atual.',
+        message: 'The submitted draft ID does not match the current active draft.',
       });
     }
     if (existingDoc.draftTransformation.contentHash && existingDoc.draftTransformation.contentHash !== currentContentHash) {
       return res.status(409).json({
         error: 'Conflict',
         code: 'STALE_DRAFT',
-        message: 'O rascunho pedagógico está desatualizado em relação às anotações atuais da sessão. Modificações foram feitas nas anotações após o rascunho. Gere ou edite um novo rascunho antes de aprovar.',
+        message: 'The pedagogical draft is outdated compared to the current session notes. Notes were modified after this draft was generated. Generate or edit a new draft before approving.',
       });
     }
   }
@@ -9746,7 +9821,7 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
     return res.status(409).json({
       error: 'Conflict',
       code: 'STALE_DRAFT',
-      message: 'A transformação enviada está desatualizada em relação às anotações atuais da sessão.',
+      message: 'The submitted transformation is outdated compared to the current session notes.',
     });
   }
 
@@ -9775,7 +9850,7 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
     return res.status(400).json({
       error: 'TRANSFORMATION_REQUIRED',
       code: 'TRANSFORMATION_REQUIRED',
-      message: 'Transformação pedagógica válida é mandatória para aprovação.',
+      message: 'A valid pedagogical transformation is required for approval.',
     });
   }
 
@@ -9790,7 +9865,7 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
     return res.status(400).json({
       error: 'INVALID_TRANSFORMATION',
       code: 'INVALID_TRANSFORMATION_STRUCTURE',
-      message: 'Estrutura da transformação pedagógica inválida: as 4 partes canônicas são obrigatórias.',
+      message: 'Invalid pedagogical transformation structure: all 4 canonical parts are required.',
     });
   }
 
@@ -9802,7 +9877,7 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
     return res.status(400).json({
       error: 'SYNTHETIC_TRANSFORMATION_REJECTED',
       code: 'SYNTHETIC_TRANSFORMATION_REJECTED',
-      message: 'Transformações locais pré-fabricadas ou sintéticas não podem ser aprovadas.',
+      message: 'Synthetic or pre-fabricated fallback transformations cannot be approved.',
     });
   }
 

@@ -249,7 +249,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                 tutors={tutors}
                 lessons={lessons}
                 students={students}
-                currentLanguage={currentLanguage}
+                currentLanguage={navLanguage}
                 onUnreadChange={setUnreadMessagesCount}
               />
             </div>

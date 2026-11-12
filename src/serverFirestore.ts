@@ -281,15 +281,14 @@ export async function resolveTeacherCanonicalIdentity(
           }
         }
 
-        // Only inspect tutors/{candidateUid} if users/{candidateUid} is NOT a student
+        // Only inspect tutors/{candidateUid} and linked tutors records if users/{candidateUid} is NOT a student
         const tSnap = await db.collection('tutors').doc(candidateUid).get().catch(() => null);
         if (tSnap && tSnap.exists) {
           const tData = tSnap.data();
           if (tData && tData.role !== 'student') {
             candidateDocs.push({ id: tSnap.id, ...tData });
           }
-        }
-        if (candidateDocs.length === 0) {
+        } else {
           const [qUid, qAuthUid] = await Promise.all([
             db.collection('tutors').where('uid', '==', candidateUid).limit(1).get().catch(() => null),
             db.collection('tutors').where('authUid', '==', candidateUid).limit(1).get().catch(() => null),
@@ -477,8 +476,14 @@ export async function resolveTeacherCanonicalIdentity(
         }
         if (!confirmedInTutors) {
           const dbState = (target && typeof target === 'object' && (target as any).dbState) || null;
-          const memoryTeacher = (dbState?.teachers || dbState?.tutorsList || []).find(
-            (t: any) => (t.uid === resolvedUid || t.id === resolvedUid || (t.email || '').toLowerCase() === email) && t.role !== 'student' && (t.approvalStatus === 'approved' || t.status === 'approved' || t.isApproved === true || t.approved === true)
+          const allMemoryTutors = [...(dbState?.tutorsList || []), ...(dbState?.teachers || [])];
+          const memoryTeacher = allMemoryTutors.find(
+            (t: any) =>
+              t &&
+              (t.uid === resolvedUid || t.authUid === resolvedUid || t.id === resolvedUid || (t.email || '').toLowerCase() === email) &&
+              t.role !== 'student' &&
+              (t.approvalStatus === 'approved' || t.status === 'approved') &&
+              (t.isApproved === true || t.approved === true)
           );
           if (!memoryTeacher) {
             console.warn(`[resolveTeacherCanonicalIdentity] Canonical profile users/${resolvedUid} does not exist and no approved tutors record was found. Blocking unverified teacher resolution.`);
@@ -495,10 +500,15 @@ export async function resolveTeacherCanonicalIdentity(
   // Check in-memory dbState if provided to guarantee no student is promoted
   const dbState = (target && typeof target === 'object' && (target as any).dbState) || null;
   if (dbState) {
-    const isMemoryApprovedTeacher = (dbState.teachers || dbState.tutorsList || []).some(
-      (t: any) => (t.uid === resolvedUid || t.id === resolvedUid || (t.email || '').toLowerCase() === email) &&
-        (t.role === 'teacher' || t.role === 'native_friend' || t.role === 'tutor' || t.isTeacher === true) &&
-        (t.approvalStatus === 'approved' || t.isApproved === true || t.status === 'approved' || t.approved === true)
+    const allMemoryTutors = [...(dbState.tutorsList || []), ...(dbState.teachers || [])];
+    const isMemoryApprovedTeacher = allMemoryTutors.some(
+      (t: any) =>
+        t &&
+        (t.uid === resolvedUid || t.authUid === resolvedUid || t.id === resolvedUid || (t.email || '').toLowerCase() === email) &&
+        t.role !== 'student' &&
+        (t.role === 'teacher' || t.role === 'native_friend' || t.role === 'tutor' || !t.role || t.isTeacher === true) &&
+        (t.approvalStatus === 'approved' || t.status === 'approved') &&
+        (t.isApproved === true || t.approved === true)
     );
     const isLocalStudent = !isMemoryApprovedTeacher && (
       (dbState.students || []).some((s: any) => (s.uid === resolvedUid || (s.email || '').toLowerCase() === email)) ||
@@ -660,8 +670,10 @@ export async function resolveCanonicalUserRoleAndIdentity(params: {
 
   // Verificação de UID divergente em memória
   if (cleanEmail && dbState) {
-    const divergentMemTutor = (dbState.teachers || dbState.tutorsList || []).find(
+    const allMemoryTutors = [...(dbState.tutorsList || []), ...(dbState.teachers || [])];
+    const divergentMemTutor = allMemoryTutors.find(
       (t: any) =>
+        t &&
         (t.email || '').toLowerCase() === cleanEmail &&
         (t.uid || t.authUid) &&
         (t.uid !== cleanUid && t.authUid !== cleanUid)
@@ -731,8 +743,10 @@ export async function resolveCanonicalUserRoleAndIdentity(params: {
   }
 
   if (!linkedTutorData && dbState) {
-    const memTutor = (dbState.teachers || dbState.tutorsList || []).find(
+    const allMemoryTutors = [...(dbState.tutorsList || []), ...(dbState.teachers || [])];
+    const memTutor = allMemoryTutors.find(
       (t: any) =>
+        t &&
         (t.uid === cleanUid || t.authUid === cleanUid || (t.id === cleanUid && isValidCanonicalUid(t.id))) &&
         t.role !== 'student'
     );
@@ -748,23 +762,33 @@ export async function resolveCanonicalUserRoleAndIdentity(params: {
 
   const isUserApprovedTeacher = Boolean(
     userData &&
-    (userRole === 'teacher' || userRole === 'native_friend') &&
-    userData.approvalStatus === 'approved' &&
-    userData.isApproved === true
+    (userRole === 'teacher' || userRole === 'native_friend' || userRole === 'tutor') &&
+    (userData.approvalStatus === 'approved' || userData.status === 'approved') &&
+    (userData.isApproved === true || userData.approved === true)
+  );
+
+  const hasValidTutorProfileRole = Boolean(
+    linkedTutorData &&
+    tutorRole !== 'student' &&
+    (tutorRole === 'teacher' || tutorRole === 'native_friend' || tutorRole === 'tutor' || !tutorRole || linkedTutorData.isTeacher === true)
   );
 
   const isTutorApproved = Boolean(
-    (linkedTutorData &&
-      (tutorRole === 'teacher' || tutorRole === 'native_friend' || tutorRole === 'tutor' || linkedTutorData.isTeacher === true) &&
-      linkedTutorData.approvalStatus === 'approved' &&
-      linkedTutorData.isApproved === true) ||
+    (hasValidTutorProfileRole &&
+      (linkedTutorData.approvalStatus === 'approved' || linkedTutorData.status === 'approved') &&
+      (linkedTutorData.isApproved === true || linkedTutorData.approved === true)) ||
     (isTokenTeacher && (!linkedTutorData || linkedTutorData.approvalStatus !== 'pending'))
   );
 
   const isTutorPending = Boolean(
-    linkedTutorData &&
-    !isTutorApproved &&
-    (linkedTutorData.approvalStatus === 'pending' || linkedTutorData.isApproved === false || linkedTutorData.status === 'pending')
+    (linkedTutorData &&
+      !isTutorApproved &&
+      (linkedTutorData.approvalStatus === 'pending' || linkedTutorData.isApproved === false || linkedTutorData.status === 'pending')) ||
+    (userData &&
+      !isUserApprovedTeacher &&
+      !isTutorApproved &&
+      (userRole === 'teacher' || userRole === 'native_friend' || userRole === 'tutor') &&
+      (userData.approvalStatus === 'pending' || userData.isApproved === false || userData.status === 'pending'))
   );
 
   // 5. Conflito de Identidade: Registro em users/{uid} como student mas aprovado em tutors
@@ -6076,9 +6100,10 @@ export async function verifyCanonicalPedagogicalLinkServer(
   }
 
   const db = getFirestoreDb();
+  const dbLocal = getAuthoritativeDb();
   const allowedTeacherIds = new Set<string>([cleanTeacherUid, `tutor-${cleanTeacherUid}`]);
   try {
-    const teacherIdent = await resolveTeacherCanonicalIdentity({ teacherUid: cleanTeacherUid }).catch(() => null);
+    const teacherIdent = await resolveTeacherCanonicalIdentity({ teacherUid: cleanTeacherUid, dbState: dbLocal }).catch(() => null);
     if (teacherIdent?.publicTutorId) {
       allowedTeacherIds.add(teacherIdent.publicTutorId);
       allowedTeacherIds.add(`tutor-${teacherIdent.publicTutorId}`);
@@ -6100,6 +6125,7 @@ export async function verifyCanonicalPedagogicalLinkServer(
           uData?.teacherUid ||
           uData?.assignedTeacherId ||
           uData?.assignedTutorId ||
+          uData?.teacherId ||
           ''
         ).trim();
         if (assignedUid && allowedTeacherIds.has(assignedUid)) {
@@ -6138,7 +6164,6 @@ export async function verifyCanonicalPedagogicalLinkServer(
   }
 
   // 4. Check authoritative in-memory / local state (getAuthoritativeDb)
-  const dbLocal = getAuthoritativeDb();
   if (dbLocal) {
     // 4a. Check student profile in dbLocal.students or dbLocal.userProfiles
     const student = (dbLocal.students || []).find(
@@ -6156,9 +6181,11 @@ export async function verifyCanonicalPedagogicalLinkServer(
       student?.teacherUid ||
       student?.assignedTeacherId ||
       student?.assignedTutorId ||
+      student?.teacherId ||
       profile?.assignedNativeFriendUID ||
       profile?.teacherUid ||
       profile?.assignedTeacherId ||
+      profile?.teacherId ||
       ''
     ).trim();
 
@@ -6170,7 +6197,7 @@ export async function verifyCanonicalPedagogicalLinkServer(
     const hasLesson = (dbLocal.liveLessons || []).some((l: any) => {
       if (!l) return false;
       const lStudentUid = (l.studentUid || '').trim();
-      const lTeacherUid = (l.teacherUid || (l as any).tutorUid || '').trim();
+      const lTeacherUid = (l.teacherUid || (l as any).tutorUid || (l as any).teacherId || '').trim();
       const match =
         lStudentUid === cleanStudentUid &&
         allowedTeacherIds.has(lTeacherUid);

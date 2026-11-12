@@ -415,7 +415,7 @@ export const TeacherMeetConfigModal: React.FC<TeacherMeetConfigModalProps> = ({
             <div id="timezone-field-group">
               <label className="block text-xs font-bold text-[#000035] mb-1 flex items-center gap-1.5">
                 <Globe className="w-3.5 h-3.5 text-[#1C4C96]" />
-                <span>Timezone (Fuso Horário) *</span>
+                <span>Timezone *</span>
               </label>
               <div className="relative">
                 <select

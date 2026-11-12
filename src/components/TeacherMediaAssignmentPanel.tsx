@@ -1561,7 +1561,7 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
                   type="button"
                   onClick={() => loadPlaylists(true)}
                   disabled={isSyncingPlaylists}
-                  title="Sincronizar playlists do YouTube (adm.itissimple@gmail.com)"
+                  title="Sync YouTube playlists (adm.itissimple@gmail.com)"
                   className="p-1 rounded-lg text-slate-500 hover:text-[#1C4C96] hover:bg-slate-100 transition shrink-0"
                 >
                   <RefreshCw className={`w-3.5 h-3.5 ${isSyncingPlaylists ? 'animate-spin text-amber-500' : ''}`} />

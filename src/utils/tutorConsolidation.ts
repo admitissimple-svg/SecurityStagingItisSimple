@@ -291,13 +291,22 @@ export function areSameTutor(a: any, b: any): boolean {
  * biography, images, availability, pricing, and canonical IDs.
  */
 export function mergeTutors(existing: any, incoming: any): any {
+  const existingRole = typeof existing.role === 'string' ? existing.role.toLowerCase().trim() : '';
+  const incomingRole = typeof incoming.role === 'string' ? incoming.role.toLowerCase().trim() : '';
+  const isExistingValidTutorRole =
+    existingRole !== 'student' &&
+    (existingRole === 'teacher' || existingRole === 'native_friend' || existingRole === 'tutor' || !existingRole || existing.isTeacher === true);
+  const isIncomingValidTutorRole =
+    incomingRole !== 'student' &&
+    (incomingRole === 'teacher' || incomingRole === 'native_friend' || incomingRole === 'tutor' || !incomingRole || incoming.isTeacher === true);
+
   const isApproved = Boolean(
-    ((existing.role === 'teacher' || existing.role === 'native_friend') &&
-      existing.approvalStatus === 'approved' &&
-      existing.isApproved === true) ||
-    ((incoming.role === 'teacher' || incoming.role === 'native_friend') &&
-      incoming.approvalStatus === 'approved' &&
-      incoming.isApproved === true)
+    (isExistingValidTutorRole &&
+      (existing.approvalStatus === 'approved' || existing.status === 'approved') &&
+      (existing.isApproved === true || existing.approved === true)) ||
+    (isIncomingValidTutorRole &&
+      (incoming.approvalStatus === 'approved' || incoming.status === 'approved') &&
+      (incoming.isApproved === true || incoming.approved === true))
   );
 
   const approvalStatus = isApproved ? 'approved' : (existing.approvalStatus === 'rejected' || incoming.approvalStatus === 'rejected' ? 'rejected' : 'pending');

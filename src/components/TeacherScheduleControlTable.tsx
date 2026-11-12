@@ -690,10 +690,10 @@ export const TeacherScheduleControlTable: React.FC<TeacherScheduleControlTablePr
                         ) : (
                           <span
                             className="px-2.5 py-1.5 bg-slate-100 text-slate-400 font-semibold rounded-lg text-[11px] flex items-center gap-1 border border-slate-200 cursor-not-allowed"
-                            title="Link da reunião ainda não configurado"
+                            title="Meeting link not configured yet"
                           >
                             <Video className="w-3.5 h-3.5 text-slate-300" />
-                            <span>Pendente</span>
+                            <span>Pending</span>
                           </span>
                         )}
 

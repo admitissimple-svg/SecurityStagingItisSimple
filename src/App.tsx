@@ -404,13 +404,19 @@ export default function App() {
               }
 
               const uRole = (uData?.role || uData?.userRole || '').toLowerCase().trim();
+              const tRole = (tData?.role || (tData?.isTeacher ? 'teacher' : '')).toLowerCase().trim();
               const isTutorApproved = Boolean(
-                tData && (tData.role === 'teacher' || tData.role === 'native_friend' || tData.isTeacher) &&
-                tData.approvalStatus === 'approved' && tData.isApproved === true
+                tData &&
+                tRole !== 'student' &&
+                (tRole === 'teacher' || tRole === 'native_friend' || tRole === 'tutor' || !tRole || tData.isTeacher) &&
+                (tData.approvalStatus === 'approved' || tData.status === 'approved') &&
+                (tData.isApproved === true || tData.approved === true)
               );
               const isUserApproved = Boolean(
-                uData && (uRole === 'teacher' || uRole === 'native_friend') &&
-                uData.approvalStatus === 'approved' && uData.isApproved === true
+                uData &&
+                (uRole === 'teacher' || uRole === 'native_friend' || uRole === 'tutor') &&
+                (uData.approvalStatus === 'approved' || uData.status === 'approved') &&
+                (uData.isApproved === true || uData.approved === true)
               );
 
               if (uRole === 'student' && isTutorApproved) {
@@ -433,6 +439,7 @@ export default function App() {
 
         // Alinhamento de rota estritamente pelo papel autoritativo
         if (resolvedRole === 'teacher') {
+          setCurrentLanguage('en');
           setViewMode('dashboard');
           if (typeof window !== 'undefined') {
             const p = window.location.pathname;
@@ -7625,10 +7632,12 @@ export default function App() {
                   <AlertCircle className="w-8 h-8" />
                 </div>
                 <h2 className="text-xl font-black text-[#000035]">
-                  {currentLanguage === 'en' ? 'Identity Conflict Detected' : 'Conflito de Identidade Detectado'}
+                  {currentLanguage === 'en' || (typeof window !== 'undefined' && window.location.pathname.startsWith('/teacher'))
+                    ? 'Identity Conflict Detected'
+                    : 'Conflito de Identidade Detectado'}
                 </h2>
                 <p className="text-sm text-slate-700 max-w-xl mx-auto">
-                  {currentLanguage === 'en'
+                  {currentLanguage === 'en' || (typeof window !== 'undefined' && window.location.pathname.startsWith('/teacher'))
                     ? 'A cadastral divergence was detected between authorized profiles. Workspace access is suspended to protect data integrity. No changes were written.'
                     : 'A conta autenticada possui divergência cadastral entre perfis autorizados. O acesso ao painel foi suspenso para garantir a integridade dos seus dados. Nenhuma alteração foi gravada.'}
                 </p>
@@ -7638,7 +7647,9 @@ export default function App() {
                     onClick={handleLogout}
                     className="px-5 py-2.5 rounded-xl bg-[#000035] hover:bg-[#062863] text-white font-bold text-xs transition cursor-pointer"
                   >
-                    {currentLanguage === 'en' ? 'Sign Out' : 'Sair da Conta'}
+                    {currentLanguage === 'en' || (typeof window !== 'undefined' && window.location.pathname.startsWith('/teacher'))
+                      ? 'Sign Out'
+                      : 'Sair da Conta'}
                   </button>
                 </div>
               </div>
@@ -7648,10 +7659,12 @@ export default function App() {
                   <Clock className="w-8 h-8" />
                 </div>
                 <h2 className="text-xl font-black text-[#000035]">
-                  {currentLanguage === 'en' ? 'Native Friend Application Under Review' : 'Cadastro de Amigo Nativo em Análise'}
+                  {currentLanguage === 'en' || (typeof window !== 'undefined' && window.location.pathname.startsWith('/teacher'))
+                    ? 'Native Friend Application Under Review'
+                    : 'Cadastro de Amigo Nativo em Análise'}
                 </h2>
                 <p className="text-sm text-slate-700 max-w-xl mx-auto">
-                  {currentLanguage === 'en'
+                  {currentLanguage === 'en' || (typeof window !== 'undefined' && window.location.pathname.startsWith('/teacher'))
                     ? 'Your teacher application was received and is awaiting administrator approval. You will receive an email once your account is activated.'
                     : 'Seu cadastro de professor foi recebido com sucesso e está aguardando aprovação da administração. Você será notificado assim que sua conta for ativada.'}
                 </p>
@@ -7661,7 +7674,9 @@ export default function App() {
                     onClick={handleLogout}
                     className="px-5 py-2.5 rounded-xl bg-[#000035] hover:bg-[#062863] text-white font-bold text-xs transition cursor-pointer"
                   >
-                    {currentLanguage === 'en' ? 'Sign Out' : 'Sair da Conta'}
+                    {currentLanguage === 'en' || (typeof window !== 'undefined' && window.location.pathname.startsWith('/teacher'))
+                      ? 'Sign Out'
+                      : 'Sair da Conta'}
                   </button>
                 </div>
               </div>

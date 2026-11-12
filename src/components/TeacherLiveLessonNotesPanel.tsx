@@ -1069,8 +1069,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           setDriveSyncStatus('synced');
 
           const toastMsg = res.isUpdated
-            ? `Arquivo atualizado no seu Google Drive ("It's Simple - Session Notes")`
-            : `Arquivo criado no seu Google Drive ("It's Simple - Session Notes")`;
+            ? `File updated in your Google Drive ("It's Simple - Session Notes")`
+            : `File created in your Google Drive ("It's Simple - Session Notes")`;
           setDriveSuccessToast(toastMsg);
           setTimeout(() => setDriveSuccessToast(null), 5000);
 
@@ -1171,7 +1171,12 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
    * Controlled persistence: guarded by isSavingRef and isDirtyRef to completely eliminate save loops
    */
   const persistSessionDocument = useCallback(
-    async (contentToSave: string, topicToSave: string, explicitSave: boolean = false): Promise<boolean> => {
+    async (
+      contentToSave: string,
+      topicToSave: string,
+      explicitSave: boolean = false,
+      forceServerSync: boolean = false
+    ): Promise<boolean> => {
       // 1. Concurrency and dirty guard
       if (isSavingRef.current) {
         return false;
@@ -1199,8 +1204,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
       if (!cleanEmail && !targetLessonId) return false;
 
-      // If not an explicit manual save, require the dirty flag and ensure content actually changed
-      if (!explicitSave) {
+      // If not an explicit manual save or forced pre-AI sync, require the dirty flag and ensure content actually changed
+      if (!explicitSave && !forceServerSync) {
         if (!isDirtyRef.current) return true;
         if (
           lastSavedContentRef.current.sessionKey === sessionKey &&
@@ -1384,8 +1389,18 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     ]
   );
 
+  const resolveCanonicalServerSessionKey = useCallback(() => {
+    const targetLessonId = selectedLessonId || (activeLesson ? activeLesson.id : '');
+    const cleanEmail = (selectedStudentEmail || '').toLowerCase().trim();
+    const effectiveDate = sessionDate || new Date().toISOString().split('T')[0];
+    return (
+      targetLessonId ||
+      `session_${effectiveDate}_${cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : 'notes'}`
+    );
+  }, [selectedLessonId, activeLesson, selectedStudentEmail, sessionDate]);
+
   /**
-   * FASE NF-DOC.2C: Aplicar IA
+   * FASE NF-DOC.2C: Apply AI
    * 1. Preserves editor, formatting, history, and shortcuts Alt+Y/N/W/P
    * 2. Persists original notes first before running transformation
    * 3. Triggers Gemini strictly via user click
@@ -1406,7 +1421,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
     try {
       // 1. Mandatory: Save original notes first to ensure server is in sync
-      const savedOk = await persistSessionDocument(notesContent, topic, false);
+      const savedOk = await persistSessionDocument(notesContent, topic, false, true);
       if (!savedOk) {
         setAiError('Failed to save original notes before executing transformation.');
         setIsApplyingAi(false);
@@ -1416,7 +1431,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       const idToken = await auth.currentUser?.getIdToken().catch(() => null);
       const resolvedTeacherUid = (currentAccount?.uid || (currentAccount as any)?.id || auth.currentUser?.uid || '').trim();
       const resolvedStudentUid = studentResolution.uid;
-      const targetKey = selectedLessonId ? `lesson_${selectedLessonId}` : currentSessionKey;
+      const targetKey = resolveCanonicalServerSessionKey();
 
       const res = await fetch(`/api/session-notes/${encodeURIComponent(targetKey)}/transform`, {
         method: 'POST',
@@ -1464,12 +1479,11 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     persistSessionDocument,
     currentAccount,
     studentResolution,
-    selectedLessonId,
-    currentSessionKey,
+    resolveCanonicalServerSessionKey,
   ]);
 
   /**
-   * FASE NF-DOC.2C: Aprovar e Publicar
+   * FASE NF-DOC.2C: Approve & Publish
    * 1. Publishes only when teacher clicks button
    * 2. Blocks stale drafts (when rawContent changed after draft)
    * 3. Publishes edited transformation directly to lastApprovedVersion
@@ -1491,7 +1505,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       const idToken = await auth.currentUser?.getIdToken().catch(() => null);
       const resolvedTeacherUid = (currentAccount?.uid || (currentAccount as any)?.id || auth.currentUser?.uid || '').trim();
       const resolvedStudentUid = studentResolution.uid;
-      const targetKey = selectedLessonId ? `lesson_${selectedLessonId}` : currentSessionKey;
+      const targetKey = resolveCanonicalServerSessionKey();
 
       const res = await fetch(`/api/session-notes/${encodeURIComponent(targetKey)}/approve`, {
         method: 'POST',
@@ -1533,8 +1547,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     isApproving,
     editableTransformation,
     isDraftStale,
-    selectedLessonId,
-    currentSessionKey,
+    resolveCanonicalServerSessionKey,
     draftTransformation,
     studentResolution,
     currentAccount,
@@ -2920,7 +2933,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                             type="text"
                             value={v.simpleDefinition || v.definitionEn || ''}
                             onChange={(e) => handleUpdateVocab(idx, 'simpleDefinition', e.target.value)}
-                            placeholder="Clear definition in English or Portuguese..."
+                            placeholder="Clear, simple definition..."
                             className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
                           />
                         </div>
@@ -3496,7 +3509,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   )}
                 </button>
 
-                {/* FASE NF-DOC.2C: Aplicar IA top button */}
+                {/* FASE NF-DOC.2C: Apply AI top button */}
                 <button
                   type="button"
                   id="btn-apply-ai-top"
@@ -3514,7 +3527,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   <span>{isApplyingAi ? 'Applying AI...' : 'Apply AI'}</span>
                 </button>
 
-                {/* FASE NF-DOC.2C: Aprovar e Publicar top button */}
+                {/* FASE NF-DOC.2C: Approve & Publish top button */}
                 {editableTransformation && (
                   <button
                     type="button"
