@@ -208,6 +208,7 @@ import {
   resolveCefrLevel,
   validatePedagogicalAiResponse,
   isLegacyGenericTransformation,
+  PedagogicalLessonTransformation,
 } from './src/utils/pedagogicalTransformer';
 import {
   mergeSessionNoteWithVersioning,
@@ -271,6 +272,10 @@ export const LANGUAGE_NAMES: Record<string, { nameEn: string; nameNative: string
 const GEMINI_TEXT_MODEL = GEMINI_FIXED_MODEL;
 const ACTIVE_FIREBASE_PROJECT_ID = 'itissimple-security-staging';
 const GEMINI_PROJECT_ID = ACTIVE_FIREBASE_PROJECT_ID;
+
+// Controlled cooldown tracker for Gemini quota exhaustion to prevent repeated 429 floods
+let geminiQuotaCooldownUntil = 0;
+const GEMINI_QUOTA_COOLDOWN_MS = 60_000;
 
 const app = express();
 /**
@@ -8745,15 +8750,515 @@ app.post('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
   return handleSaveSessionNotesInternal(req, res);
 });
 
-// FASE NF-DOC.2A: Save in-progress draft AI transformation being edited/reviewed by teacher
-app.post('/api/session-notes/:id/draft', firebaseAuthMiddleware, async (req, res) => {
+export interface PedagogicalTransformationCoreOptions {
+  rawNotes: string;
+  topic?: string;
+  sessionDate?: string;
+  teacherName?: string;
+  authoritativeLevel?: string;
+  language?: string;
+  callerRole?: string;
+  canonicalSessionKey: string;
+  lessonId?: string;
+  studentUid?: string;
+  studentEmail?: string;
+  effectiveTeacherUid?: string;
+  effectiveTeacherEmail?: string;
+  customAttemptExecutor?: (model: string, params: any) => Promise<any>;
+}
+
+export interface PedagogicalTransformationCoreResult {
+  success: boolean;
+  transformation?: PedagogicalLessonTransformation;
+  attemptsDetails?: any[];
+  attemptsCount?: number;
+  modelsAttempted?: string[];
+  error?: any;
+  category?: string;
+  statusCode?: number;
+  message?: string;
+}
+
+let sessionNoteTransformAttemptExecutorForTesting: ((model: string, params: any) => Promise<any>) | null = null;
+
+export function setSessionNoteTransformAttemptExecutorForTesting(
+  executor: ((model: string, params: any) => Promise<any>) | null
+): void {
+  if (process.env.NODE_ENV === 'test') {
+    sessionNoteTransformAttemptExecutorForTesting = executor;
+  }
+}
+
+function wrapTestAttemptExecutor(
+  rawExecutor?: ((model: string, params: any) => Promise<any>) | null
+): ((model: string, params: any) => Promise<any>) | undefined {
+  if (!rawExecutor) return undefined;
+  return async (model: string, params: any) => {
+    const customRes = await rawExecutor(model, params);
+    if (typeof customRes === 'string') {
+      let cleanJson = customRes.trim();
+      if (cleanJson.startsWith('```')) {
+        cleanJson = cleanJson.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+      }
+      const firstBrace = cleanJson.indexOf('{');
+      const lastBrace = cleanJson.lastIndexOf('}');
+      if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+        cleanJson = cleanJson.substring(firstBrace, lastBrace + 1);
+      }
+      return {
+        text: customRes,
+        parsedJson: JSON.parse(cleanJson),
+      };
+    }
+    if (customRes && (customRes.parsedJson !== undefined || customRes.error !== undefined)) {
+      return customRes;
+    }
+    if (customRes && typeof customRes === 'object') {
+      return {
+        text: JSON.stringify(customRes),
+        parsedJson: customRes,
+      };
+    }
+    return customRes;
+  };
+}
+
+export async function executePedagogicalTransformationCore(
+  options: PedagogicalTransformationCoreOptions
+): Promise<PedagogicalTransformationCoreResult> {
+  const rawNotes = (options.rawNotes || '').trim();
+  const bounds = validatePayloadBounds('pedagogical_transform', { text: rawNotes });
+  if (!bounds.valid) {
+    return {
+      success: false,
+      statusCode: 400,
+      category: 'INVALID_INPUT',
+      error: 'PayloadBoundsExceeded',
+      message: bounds.error,
+    };
+  }
+
+  const markings = parseNotesHtml(rawNotes);
+  const correctCount = markings.correctCount;
+  const incorrectCount = markings.incorrectCount;
+  const newWordCount = markings.newWordCount;
+  const pronounceCount = markings.pronounceCount;
+
+  if (!hasValidPedagogicalContent(rawNotes, markings)) {
+    return {
+      success: false,
+      statusCode: 400,
+      category: 'INVALID_INPUT',
+      error: 'InvalidNotesContent',
+      message: (options.language || 'pt') === 'pt'
+        ? 'As anotações enviadas estão vazias ou não contêm termos pedagógicos válidos para análise.'
+        : 'The submitted notes are empty or contain no valid pedagogical content for analysis.',
+    };
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || (process.env.NODE_ENV === 'test' ? 'test-dummy-key' : '');
+  const isCooldownActive = Date.now() < geminiQuotaCooldownUntil;
+  if (!apiKey || isCooldownActive) {
+    return {
+      success: false,
+      statusCode: 503,
+      category: isCooldownActive ? 'QUOTA_EXCEEDED' : 'NO_API_KEY',
+      error: 'AiUnavailable',
+      message: (options.language || 'pt') === 'pt'
+        ? 'O serviço pedagógico de IA está temporariamente indisponível. As anotações originais foram preservadas intactas.'
+        : 'The pedagogical AI service is temporarily unavailable. Original teacher notes have been preserved.',
+    };
+  }
+
+  const language = (options.language || 'pt').toLowerCase().trim();
+  const targetLang = LANGUAGE_NAMES[language] || { nameEn: 'Portuguese', nameNative: 'Português' };
+  const cefrMeta = resolveCefrLevel(options.authoritativeLevel);
+  const cefr = cefrMeta.cefr;
+
+  const systemInstruction = `You are an elite, Cambridge/CELTA-certified Pedagogical English Language Synthesizer and Master Native Friend Teacher.
+Your mission is to transform raw in-session teacher notes into an ultra-structured, masterclass pedagogical report for the student.
+The student MUST NEVER see raw, fragmented notes. Instead, they receive a polished, elegant learning guide calibrated to their CEFR level (${cefr}).
+
+LANGUAGE REQUIREMENT:
+- All pedagogical explanations, grammar rules, vocabulary "simpleDefinition" explanations, common pitfalls, comparisons, CEFR adaptation advice, rememberThis takeaway, and review summaries MUST be written in ${targetLang.nameEn} (${targetLang.nameNative}, code: "${language}").
+- "definitionEn" MUST BE WRITTEN IN NATURAL ENGLISH, calibrated to CEFR ${cefr}.
+- The target English words, phrasal verbs, collocations, and didactic examples MUST remain in natural, authentic English.
+
+CRITICAL INSTRUCTIONS ON TEACHER SHORTCUT MARKINGS & TAB ROUTING:
+1. Alt + N (Error / Incorrect Markings):
+   - Items stamped with 'data-tag-type="incorrect"', '✗', 'Instead of:', or error lines MUST be directed and processed appropriately into:
+     a) "mistakesAnalysis" (Tab 1: Analyze Mistakes): student's original faulty utterance, natural native correction (resolving spelling, phrasing, or grammatical slips into polished English), category, grammatical explanation (addressing L1 interference), two natural examples, and common pitfalls. Even if the teacher wrote an isolated mistake without explicit correction (e.g. spelling slips or words marked with ✗), deduce and provide the accurate, natural native correction.
+     b) "grammarPoints" (Tab 2: Grammar Points): whenever an error involves a systemic grammatical rule/structure (e.g. modal verbs without "to", stative verbs, auxiliary verbs, verb tenses, dependent prepositions, conditionals, word order), elaborate the corresponding rule with syntax (FORM), usage, examples, and comparisons.
+        CRITICAL FIDELITY RULES FOR GRAMMAR POINTS:
+        * ONLY generate grammar points that are directly substantiated by the student's actual session errors or notes.
+        * If there is only ONE systemic grammar error in the notes (for example, using "to" after the modal "can"), provide EXACTLY ONE corresponding grammar point. DO NOT fabricate or invent a second grammar point!
+        * If there are no systemic grammar errors in the notes, "grammarPoints" MUST be an empty array [].
+        * NEVER fabricate non-existent or ungrounded grammar points.
+2. Alt + W (New Word) & Alt + P (Pronunciation Markings):
+   - Items stamped with 'data-tag-type="new-word"', '[New Word]', 'data-tag-type="pronounce"', '[Pronounce]' or standalone vocabulary words MUST be directed and processed into:
+     "vocabularyAndExpressions" (Tab 3: Vocabulary & Expressions).
+   - For Alt+W / vocabulary: provide part of speech, register, simple definition adapted to CEFR ${cefr}, collocations, real examples, and synonyms.
+   - For Alt+P: mark partOfSpeech as "Pronunciation Focus", provide clear syllable stress breakdown, phonetic guide with IPA, common pronunciation slips to avoid, and conversational examples.
+3. CRITICAL RULES FOR CONTENT FIDELITY & EMPTY SECTIONS:
+   - Exclusively generate content grounded in and substantiated by the teacher's actual notes.
+   - If a section legitimately has no corresponding content in the notes, it MUST be returned as an empty array []:
+     * If the notes contain NO student errors: "mistakesAnalysis" MUST be []. NEVER fabricate non-existent student errors, sentences, or phrases!
+     * If the notes contain NO systemic grammar errors: "grammarPoints" MUST be []. NEVER fabricate synthetic grammar points!
+     * If the notes contain NO vocabulary or pronunciation items (e.g. session only had grammar corrections): "vocabularyAndExpressions" MUST be []. NEVER fabricate synthetic vocabulary items (such as "catch up", "workload", "streamline")!
+   - If a term contains a spelling slip (e.g. the teacher recorded "blury", which is standardly spelled "blurry"), evaluate and identify the correct spelling "blurry", explain the spelling rule/distinction, provide accurate CEFR ${cefr} definitions in English and ${targetLang.nameEn}, natural real-world examples, collocations, and register.
+   - In "reviewSummary", ALWAYS generate a complete object:
+     * "estimatedMinutes": "3–5 minutes" for short notes, "5–10 minutes" for standard notes
+     * "keyRules": concise bullet titles of grammar points covered in ${targetLang.nameEn} (empty array [] if no grammar points)
+     * "mustKnowVocabulary": concise list of target terms from vocabularyAndExpressions (empty array [] if no vocabulary items)
+     * "essentialCorrections": concise list of original and corrected pairs [{"original": "...", "corrected": "..."}] from mistakesAnalysis (empty array [] if no errors)
+     * "rememberThis": an inspiring, memorable golden takeaway rule in ${targetLang.nameEn} (at least 15 characters), strictly focused on the items recorded in the session.
+4. CEFR LEVEL ADAPTATION:
+   - There is NO separate CEFR tab. Instead, ALL tabs (Complete Report, 1. Analyze Mistakes, 2. Grammar Points, 3. Vocabulary & Expressions, and Quick Review) MUST be intelligently and deeply elaborated respecting and adapting to the student's current CEFR level (${cefr}).
+5. QUICK REVIEW (reviewSummary) MANDATE & TOKEN OPTIMIZATION:
+   - In "reviewSummary", provide a concise summary without duplicating full multi-sentence analyses or definitions already stated in "vocabularyAndExpressions" and "grammarPoints":
+     * "estimatedMinutes": e.g. "5–10 minutes" (or "3–5 minutes" for short sessions)
+     * "keyRules": concise bullet titles of grammar points covered in ${targetLang.nameEn} (empty array [] if no grammar errors)
+     * "mustKnowVocabulary": concise list of target terms from vocabularyAndExpressions (e.g. ["term 1", "term 2"]), avoiding redundant definition paragraphs
+     * "essentialCorrections": concise list of original and corrected pairs [{"original": "...", "corrected": "..."}] from mistakesAnalysis
+     * "rememberThis": High-impact golden takeaway rule for the student in ${targetLang.nameEn} (at least 15 characters).
+
+You MUST produce a JSON object strictly conforming to this schema:
+{
+  "mistakesAnalysis": [
+    {
+      "id": "mistake-1",
+      "original": "Student's original faulty utterance",
+      "corrected": "Polished, natural native correction",
+      "category": "grammar" | "vocabulary" | "collocation" | "preposition" | "pronunciation" | "phrasing",
+      "explanation": "Crystal clear grammatical rule explanation highlighting why the error occurred and how to fix it, calibrated to CEFR \${cefr}",
+      "twoExamples": ["Example 1 in natural context", "Example 2 in natural context"],
+      "commonPitfalls": "Common mistake learners make with this structure (especially Portuguese L1 interference)"
+    }
+  ],
+  "grammarPoints": [
+    {
+      "id": "grammar-1",
+      "topic": "Grammar topic name",
+      "rule": "Detailed rule explanation adapted to CEFR \${cefr}",
+      "form": "Formula / Syntax breakdown",
+      "usage": "When and why native speakers use this",
+      "examples": ["Example 1", "Example 2"],
+      "commonMistakes": "Mistake to avoid",
+      "comparisons": "Contrast with other structures or Portuguese interference"
+    }
+  ],
+  "vocabularyAndExpressions": [
+    {
+      "id": "vocab-1",
+      "term": "Word, phrasal verb, or pronunciation term",
+      "partOfSpeech": "Part of speech (e.g. Phrasal Verb, Noun, Pronunciation Focus)",
+      "definitionEn": "Simple, accurate definition EXCLUSIVELY in English tailored to student level \${cefr} and part of speech",
+      "simpleDefinition": "Clear, accessible pedagogical explanation in \${targetLang.nameEn} adapted to CEFR \${cefr}",
+      "collocations": ["Collocation 1", "Collocation 2"],
+      "realExamples": ["Real-world sentence 1", "Real-world sentence 2"],
+      "synonyms": ["Synonym 1", "Synonym 2"],
+      "register": "informal" | "neutral" | "formal" | "idiomatic",
+      "category": "Thematic category or 'Pronunciation & Phonetics (Alt+P)' / 'New Words & Expressions (Alt+W)'",
+      "phoneticGuide": "Phonetic / stress guide with IPA",
+      "isPronunciationFocus": false,
+      "isNewWord": true
+    }
+  ],
+  "reviewSummary": {
+    "estimatedMinutes": "5–10 minutes",
+    "keyRules": ["Key grammar rule titles in \${targetLang.nameEn}"],
+    "mustKnowVocabulary": ["Target terms from vocabularyAndExpressions"],
+    "essentialCorrections": [{"original": "...", "corrected": "..."}],
+    "rememberThis": "Memorable takeaway focused on the session items in \${targetLang.nameEn}"
+  }
+}
+
+Return JSON only without Markdown backticks.`;
+
+  const prompt = `Pedagogical Parameters:
+- CEFR Level: ${cefr}
+- Lesson Date: ${options.sessionDate || new Date().toISOString().split('T')[0]}
+- Session Topic: ${options.topic || 'Conversation & Fluency'}
+- Native Friend Teacher: ${options.teacherName || 'Native Friend'}
+- Target Language: ${targetLang.nameEn} (${targetLang.nameNative})
+
+Raw In-Session Notes to transform:
+"""
+${rawNotes}
+"""
+
+Please synthesize and transform these notes according to the Alt+N, Alt+W, and Alt+P routing rules, adapting deeply to CEFR ${cefr}.
+- If notes contain only errors/grammar, provide only the grounded mistakes and grammar points, and leave vocabularyAndExpressions empty [].
+- If notes contain only vocabulary (such as a single word like "blury"), evaluate the term (including spelling accuracy like "blurry"), leave mistakesAnalysis and grammarPoints empty without fabricating errors.
+- If only one grammar error exists, provide only that one grammar point without inventing a second rule.
+- Preserve all teacher markings and required expressions.
+Ensure reviewSummary and rememberThis are fully provided in ${targetLang.nameEn} (${targetLang.nameNative}). Provide all explanations and pedagogical rules in ${targetLang.nameEn} (${targetLang.nameNative}).`;
+
+  const effectiveCustomExecutor = wrapTestAttemptExecutor(
+    options.customAttemptExecutor || (process.env.NODE_ENV === 'test' ? sessionNoteTransformAttemptExecutorForTesting : null)
+  );
+
+  const contingencyResult = await executeGeminiWithContingency(
+    {
+      feature: 'pedagogical_transform',
+      systemInstruction,
+      untrustedUserDataPrompt: prompt,
+      callerRole: options.callerRole || 'teacher',
+      apiKey,
+      temperature: 0.35,
+      validator: (json) => validatePedagogicalAiResponse(json, markings, cefr, language),
+    },
+    effectiveCustomExecutor
+  );
+
+  const sanitizedAttempts = (contingencyResult?.attemptsDetails || []).map((att: any) => ({
+    attemptNumber: att.attemptNumber,
+    model: att.model,
+    durationMs: typeof att.durationMs === 'number' ? att.durationMs : 0,
+    success: Boolean(att.success),
+    category: att.category || (att.success ? undefined : 'INVALID_RESPONSE'),
+    safeReason: att.safeReason || (att.success ? 'Success' : 'Execution failed'),
+    finishReason: att.finishReason || undefined,
+    isMaxTokens: Boolean(att.isMaxTokens || att.finishReason === 'MAX_TOKENS'),
+    isParseError: Boolean(att.isParseError),
+    isValidationError: Boolean(att.isValidationError),
+  }));
+
+  if (!contingencyResult.success || !contingencyResult.parsedJson) {
+    const lastFailureCategory = (contingencyResult?.error?.category as GeminiFailureCategory) || 'SERVICE_UNAVAILABLE';
+    if (contingencyResult?.error?.statusCode === 429 || lastFailureCategory === 'QUOTA_EXCEEDED') {
+      geminiQuotaCooldownUntil = Date.now() + GEMINI_QUOTA_COOLDOWN_MS;
+    }
+    const statusCode = contingencyResult?.error?.statusCode === 429 ? 429 : 503;
+    return {
+      success: false,
+      statusCode,
+      category: lastFailureCategory,
+      error: contingencyResult?.error || 'AiUnavailable',
+      message: language === 'pt'
+        ? 'O serviço pedagógico de IA está temporariamente indisponível após tentativa com os modelos de contingência. As anotações originais do professor foram preservadas intactas.'
+        : 'The pedagogical AI service is temporarily unavailable after trying contingency models. Original teacher notes have been preserved.',
+      attemptsCount: contingencyResult?.attemptsCount || 1,
+      modelsAttempted: contingencyResult?.modelsAttempted || resolveGeminiContingencyModels(),
+      attemptsDetails: sanitizedAttempts,
+    };
+  }
+
+  const parsed = contingencyResult.parsedJson;
+  const rawErrMap = new Map<string, typeof markings.errors[0]>();
+  markings.errors.forEach((e) => rawErrMap.set(e.original.toLowerCase().trim(), e));
+
+  const validatedMistakes: any[] = [];
+  if (markings.errors.length > 0) {
+    (parsed.mistakesAnalysis || []).forEach((m: any) => {
+      const origKey = String(m?.original || '').toLowerCase().trim();
+      const rawErr = Array.from(rawErrMap.values()).find(
+        (e) => origKey.includes(e.original.toLowerCase().trim()) || e.original.toLowerCase().trim().includes(origKey)
+      );
+      const originalText = rawErr ? rawErr.original : (m.original || 'Mistake');
+      const correctedText = (rawErr && rawErr.corrected) ? rawErr.corrected : (m.corrected || originalText);
+
+      validatedMistakes.push({
+        id: `mistake-${validatedMistakes.length + 1}`,
+        original: originalText,
+        corrected: correctedText,
+        category: m.category || 'grammar',
+        explanation: m.explanation || `In natural spoken English, phrasing this structure as "${correctedText}" is the native formulation.`,
+        twoExamples: Array.isArray(m.twoExamples) && m.twoExamples.length > 0
+          ? m.twoExamples
+          : (Array.isArray(m.examples) ? m.examples : []),
+        commonPitfalls: m.commonPitfalls || '',
+        isPendingConfirmation: false,
+      });
+      if (rawErr) {
+        rawErrMap.delete(rawErr.original.toLowerCase().trim());
+      }
+    });
+  }
+
+  const validTermsSet = new Set<string>([
+    ...markings.newWords.map((w) => w.toLowerCase().trim()),
+    ...markings.pronounceItems.map((p) => p.toLowerCase().trim()),
+    ...markings.vocabItems.map((v) => v.toLowerCase().trim()),
+  ]);
+
+  const validatedVocab: any[] = [];
+  if (validTermsSet.size > 0) {
+    (parsed.vocabularyAndExpressions || []).forEach((v: any) => {
+      const termKey = String(v?.term || '').toLowerCase().trim();
+      const matchedTarget = Array.from(validTermsSet).find(
+        (target) => isPedagogicalTermMatch(termKey, target)
+      );
+      if (matchedTarget) {
+        const isPronounce = markings.pronounceItems.some(
+          (p) => isPedagogicalTermMatch(p, matchedTarget)
+        );
+        const isNewWord = markings.newWords.some(
+          (w) => isPedagogicalTermMatch(w, matchedTarget)
+        ) || markings.vocabItems.some(
+          (w) => isPedagogicalTermMatch(w, matchedTarget)
+        );
+
+        const rawExamples = Array.isArray(v.realExamples) ? v.realExamples : [];
+        const formattedExamples = rawExamples
+          .map((ex: any) => String(ex || '').trim().replace(/^["']|["']$/g, ''))
+          .filter(Boolean);
+
+        validatedVocab.push({
+          ...v,
+          id: `vocab-${validatedVocab.length + 1}`,
+          partOfSpeech: v.partOfSpeech || (isPronounce ? 'Pronunciation Focus' : 'Vocabulary Item'),
+          realExamples: formattedExamples,
+          category: isNewWord && isPronounce
+            ? 'New Word & Pronunciation (Alt+W + Alt+P)'
+            : isPronounce
+            ? 'Pronunciation & Phonetics (Alt+P)'
+            : 'New Words & Expressions (Alt+W)',
+          isPronunciationFocus: isPronounce,
+          isNewWord: isNewWord,
+        });
+        validTermsSet.delete(matchedTarget);
+      }
+    });
+  }
+
+  let validatedGrammar: any[] = [];
+  if (markings.errors.length > 0) {
+    const rawGrammarList = Array.isArray(parsed.grammarPoints) ? parsed.grammarPoints : [];
+    validatedGrammar = rawGrammarList
+      .filter((g: any) => g && g.topic && g.rule)
+      .map((g: any, idx: number) => ({
+        id: g.id || `grammar-${idx + 1}`,
+        topic: String(g.topic).trim(),
+        rule: String(g.rule).trim(),
+        form: String(g.form || '').trim(),
+        usage: String(g.usage || '').trim(),
+        examples: Array.isArray(g.examples)
+          ? g.examples.map((ex: any) => String(ex || '').trim().replace(/^["']|["']$/g, '')).filter(Boolean)
+          : [],
+        commonMistakes: String(g.commonMistakes || '').trim(),
+        comparisons: String(g.comparisons || '').trim(),
+      }));
+  }
+
+  const allCorrections = validatedMistakes.map((m: any) => ({
+    original: m.original,
+    corrected: m.corrected,
+    explanation: m.explanation,
+  }));
+
+  const allVocab = validatedVocab.map((v: any) => {
+    const tag = v.isNewWord && v.isPronunciationFocus
+      ? '🎯✨ [Word & Pronounce]'
+      : v.isPronunciationFocus
+      ? '🎯 [Pronounce]'
+      : '✨';
+    return `${tag} ${v.term} (${v.partOfSpeech || 'Vocab'}) — ${v.simpleDefinition || ''}`;
+  });
+
+  const allRules = validatedGrammar.map((g: any) => `${g.topic}: ${g.rule}`);
+
+  let rememberThis =
+    typeof parsed?.reviewSummary?.rememberThis === 'string' && parsed.reviewSummary.rememberThis.trim().length > 10
+      ? parsed.reviewSummary.rememberThis.trim()
+      : '';
+
+  if (!rememberThis) {
+    if (validatedMistakes.length > 0) {
+      rememberThis =
+        language === 'pt'
+          ? `Lembre-se disto: Em vez de dizer "${validatedMistakes[0].original}", use "${validatedMistakes[0].corrected}"!`
+          : `Remember this: Instead of saying "${validatedMistakes[0].original}", say "${validatedMistakes[0].corrected}"!`;
+    } else if (validatedVocab.length > 0) {
+      const termNames = validatedVocab.map((v: any) => v.term).slice(0, 3).join(', ');
+      rememberThis =
+        language === 'pt'
+          ? `Lembre-se disto: A prática ativa das novas expressões (${termNames}) transforma o reconhecimento passivo em confiança espontânea!`
+          : `Remember this: Active practice with your new expressions (${termNames}) turns passive recognition into spontaneous conversational confidence!`;
+    } else {
+      rememberThis =
+        language === 'pt'
+          ? 'Lembre-se: Fluência não significa nunca errar, mas reconhecer padrões rapidamente e adotar a fraseologia nativa!'
+          : 'Remember: Fluency is not about never making mistakes; it is about recognizing patterns quickly and adopting natural native phraseology!';
+    }
+  }
+
+  const contentHash = computeNotesContentHash(rawNotes);
+  const transformation: PedagogicalLessonTransformation = {
+    lessonId: options.lessonId || undefined,
+    sessionKey: options.canonicalSessionKey,
+    sessionDate: options.sessionDate || new Date().toISOString().split('T')[0],
+    topic: options.topic || 'Live Coaching Session',
+    teacherName: options.teacherName || 'Native Friend',
+    teacherEmail: options.effectiveTeacherEmail || undefined,
+    studentUid: options.studentUid || undefined,
+    studentEmail: options.studentEmail || undefined,
+    studentLevel: String(options.authoritativeLevel || 'intermediario'),
+    cefrLevel: cefr,
+    contentHash,
+    language,
+    promptVersion: PEDAGOGICAL_PROMPT_VERSION,
+    isAiGenerated: true,
+    isFallback: false,
+    isProvisional: false,
+    source: 'gemini' as const,
+    modelUsed: contingencyResult.modelUsed || GEMINI_FIXED_MODEL,
+    mistakesAnalysis: validatedMistakes,
+    grammarPoints: validatedGrammar,
+    vocabularyAndExpressions: validatedVocab,
+    levelAdaptation: parsed.levelAdaptation || {
+      cefrLevel: cefr,
+      levelLabel: cefrMeta.labelEn,
+      nativeInterferenceNotes: 'Focus on native collocations and avoiding literal calques.',
+      complexityAdjustmentAdvice: 'Review key corrections out loud before each session.',
+      targetedPracticePrompt: `Practice summarizing your views on "${options.topic || 'the topic'}".`,
+    },
+    reviewSummary: {
+      estimatedMinutes: '5–10 minutes',
+      keyRules: allRules,
+      mustKnowVocabulary: allVocab,
+      essentialCorrections: allCorrections,
+      rememberThis,
+    },
+    rawNotesSnippet: markings.cleanText.slice(0, 300),
+    correctStampsCount: correctCount,
+    incorrectStampsCount: incorrectCount,
+    newWordStampsCount: newWordCount,
+    pronounceStampsCount: pronounceCount,
+    generatedAt: new Date().toISOString(),
+  };
+
+  return {
+    success: true,
+    transformation,
+    attemptsDetails: sanitizedAttempts,
+    modelsAttempted: contingencyResult.modelsAttempted,
+    attemptsCount: contingencyResult.attemptsCount,
+  };
+}
+
+// FASE NF-DOC.2A & 2B: Save in-progress draft AI transformation being edited/reviewed by teacher
+async function handleSessionNoteDraftInternal(req: any, res: any) {
   if (!req.user || !req.user.uid) {
     return res.status(401).json({ error: 'Unauthorized', message: 'Autenticação mandatória.' });
   }
 
   const callerUid = req.user.uid;
   const isCallerAdmin = req.user.role === 'admin';
-  const targetSessionKey = decodeURIComponent(req.params.id).trim();
+
+  // Security Gate: Students are strictly forbidden from drafting transformations
+  if (req.user.role === 'student') {
+    return res.status(403).json({
+      error: 'Forbidden',
+      code: 'STUDENTS_CANNOT_DRAFT',
+      message: 'Alunos não têm permissão para criar ou editar rascunhos pedagógicos.',
+    });
+  }
+
+  const targetSessionKey = decodeURIComponent(req.params.id || req.body?.id || req.body?.sessionId || req.body?.sessionKey || '').trim();
+  if (!targetSessionKey) {
+    return res.status(400).json({ error: 'SESSION_ID_REQUIRED', code: 'SESSION_ID_REQUIRED', message: 'Identificador da sessão é obrigatório.' });
+  }
 
   const db = readDb();
   let teacherResolution: any = null;
@@ -8761,7 +9266,7 @@ app.post('/api/session-notes/:id/draft', firebaseAuthMiddleware, async (req, res
   if (!isCallerAdmin) {
     teacherResolution = await resolveTeacherCanonicalIdentity({ teacherUid: callerUid, teacherEmail: req.user.email, dbState: db }).catch(() => null);
     if (!teacherResolution || !teacherResolution.isApproved) {
-      return res.status(403).json({ error: 'Forbidden', message: 'Apenas professores aprovados ou administradores podem elaborar rascunhos pedagógicos.' });
+      return res.status(403).json({ error: 'Forbidden', code: 'UNAUTHORIZED_TEACHER', message: 'Apenas professores aprovados ou administradores podem elaborar rascunhos pedagógicos.' });
     }
     isCallerTeacher = true;
   }
@@ -8774,18 +9279,31 @@ app.post('/api/session-notes/:id/draft', firebaseAuthMiddleware, async (req, res
   }
 
   if (!existingDoc) {
-    return res.status(404).json({ error: 'NOT_FOUND', message: 'Documento da anotação não encontrado.' });
+    return res.status(404).json({ error: 'NOT_FOUND', code: 'SESSION_NOTE_NOT_FOUND', message: 'Documento da anotação não encontrado.' });
   }
 
   const studentUid = existingDoc.studentUid;
   if (!studentUid || !isValidCanonicalUid(studentUid)) {
-    return res.status(400).json({ error: 'INVALID_STUDENT_IDENTITY', message: 'Identidade canônica do aluno ausente no documento.' });
+    return res.status(400).json({ error: 'INVALID_STUDENT_IDENTITY', code: 'CANONICAL_STUDENT_UID_REQUIRED', message: 'Identidade canônica do aluno ausente no documento.' });
+  }
+  const docTeacherUid = existingDoc.teacherUid;
+  if (!docTeacherUid || !isValidCanonicalUid(docTeacherUid)) {
+    return res.status(400).json({ error: 'INVALID_TEACHER_IDENTITY', code: 'CANONICAL_TEACHER_UID_REQUIRED', message: 'Identidade canônica do professor ausente ou inválida no documento.' });
+  }
+  if (req.body?.studentUid && String(req.body.studentUid).trim() !== studentUid) {
+    return res.status(403).json({ error: 'Forbidden', code: 'STUDENT_UID_MISMATCH', message: 'O studentUid informado diverge do proprietário canônico do documento.' });
   }
 
   if (isCallerTeacher && !isCallerAdmin) {
+    if (req.body?.teacherUid && String(req.body.teacherUid).trim() !== callerUid) {
+      return res.status(403).json({ error: 'Forbidden', code: 'TEACHER_MISMATCH', message: 'Parâmetro teacherUid inválido para o professor autenticado.' });
+    }
     const isAuthorized = await verifyCanonicalPedagogicalLinkServer(callerUid, studentUid);
     if (!isAuthorized) {
       return res.status(403).json({ error: 'Forbidden', code: 'UNAUTHORIZED_PEDAGOGICAL_LINK', message: 'Amigo Nativo não possui vínculo autorizado com este aluno.' });
+    }
+    if (docTeacherUid !== callerUid) {
+      return res.status(403).json({ error: 'Forbidden', code: 'TEACHER_MISMATCH', message: 'Professor não autorizado para editar rascunhos de outro professor.' });
     }
   }
 
@@ -8839,27 +9357,52 @@ app.post('/api/session-notes/:id/draft', firebaseAuthMiddleware, async (req, res
   await saveSessionNotesToFirestoreServer(targetSessionKey, updatedDoc).catch(() => null);
 
   return res.json({ success: true, sessionNote: updatedDoc });
-});
+}
 
-// FASE NF-DOC.2A: Teacher reviews and approves transformation version for student
-app.post('/api/session-notes/:id/approve', firebaseAuthMiddleware, async (req, res) => {
+// FASE NF-DOC.2B: Generate AI draft transformation using Gemini and persist exclusively as draftTransformation
+async function handleSessionNoteTransformInternal(req: any, res: any) {
   if (!req.user || !req.user.uid) {
     return res.status(401).json({ error: 'Unauthorized', message: 'Autenticação mandatória.' });
   }
 
   const callerUid = req.user.uid;
   const isCallerAdmin = req.user.role === 'admin';
-  const targetSessionKey = decodeURIComponent(req.params.id).trim();
+
+  // Rule: Students can NEVER trigger transformation
+  if (req.user.role === 'student') {
+    return res.status(403).json({
+      error: 'Forbidden',
+      code: 'STUDENTS_CANNOT_TRANSFORM',
+      message: 'Alunos não têm permissão para transformar anotações pedagógicas.',
+    });
+  }
 
   const db = readDb();
   let teacherResolution: any = null;
   let isCallerTeacher = false;
   if (!isCallerAdmin) {
-    teacherResolution = await resolveTeacherCanonicalIdentity({ teacherUid: callerUid, teacherEmail: req.user.email, dbState: db }).catch(() => null);
+    teacherResolution = await resolveTeacherCanonicalIdentity({
+      teacherUid: callerUid,
+      teacherEmail: req.user.email,
+      dbState: db,
+    }).catch(() => null);
     if (!teacherResolution || !teacherResolution.isApproved) {
-      return res.status(403).json({ error: 'Forbidden', message: 'Apenas professores aprovados ou administradores podem aprovar anotações.' });
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'UNAUTHORIZED_TEACHER',
+        message: 'Apenas professores aprovados ou administradores podem transformar anotações.',
+      });
     }
     isCallerTeacher = true;
+  }
+
+  const targetSessionKey = decodeURIComponent(req.params.id || req.body?.id || req.body?.sessionId || req.body?.sessionKey || '').trim();
+  if (!targetSessionKey) {
+    return res.status(400).json({
+      error: 'SESSION_ID_REQUIRED',
+      code: 'SESSION_ID_REQUIRED',
+      message: 'Identificador da sessão é obrigatório.',
+    });
   }
 
   let existingDoc = db.sessionNotesMap?.[targetSessionKey];
@@ -8870,37 +9413,390 @@ app.post('/api/session-notes/:id/approve', firebaseAuthMiddleware, async (req, r
   }
 
   if (!existingDoc) {
-    return res.status(404).json({ error: 'NOT_FOUND', message: 'Documento da anotação não encontrado.' });
+    return res.status(404).json({
+      error: 'NOT_FOUND',
+      code: 'SESSION_NOTE_NOT_FOUND',
+      message: 'Documento da anotação não encontrado.',
+    });
   }
 
   const studentUid = existingDoc.studentUid;
   if (!studentUid || !isValidCanonicalUid(studentUid)) {
-    return res.status(400).json({ error: 'INVALID_STUDENT_IDENTITY', message: 'Identidade canônica do aluno ausente no documento.' });
+    return res.status(400).json({
+      error: 'INVALID_STUDENT_IDENTITY',
+      code: 'CANONICAL_STUDENT_UID_REQUIRED',
+      message: 'Identidade canônica do aluno ausente ou inválida no documento.',
+    });
+  }
+  const docTeacherUid = existingDoc.teacherUid;
+  if (!docTeacherUid || !isValidCanonicalUid(docTeacherUid)) {
+    return res.status(400).json({
+      error: 'INVALID_TEACHER_IDENTITY',
+      code: 'CANONICAL_TEACHER_UID_REQUIRED',
+      message: 'Identidade canônica do professor ausente ou inválida no documento.',
+    });
+  }
+  if (req.body?.studentUid && String(req.body.studentUid).trim() !== studentUid) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      code: 'STUDENT_UID_MISMATCH',
+      message: 'O studentUid informado diverge do proprietário canônico do documento.',
+    });
   }
 
   if (isCallerTeacher && !isCallerAdmin) {
+    if (req.body?.teacherUid && String(req.body.teacherUid).trim() !== callerUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHER_MISMATCH',
+        message: 'Parâmetro teacherUid inválido para o professor autenticado.',
+      });
+    }
     const isAuthorized = await verifyCanonicalPedagogicalLinkServer(callerUid, studentUid);
     if (!isAuthorized) {
-      return res.status(403).json({ error: 'Forbidden', code: 'UNAUTHORIZED_PEDAGOGICAL_LINK', message: 'Amigo Nativo não possui vínculo autorizado com este aluno.' });
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'UNAUTHORIZED_PEDAGOGICAL_LINK',
+        message: 'Amigo Nativo não possui vínculo autorizado com este aluno.',
+      });
+    }
+    if (docTeacherUid !== callerUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHER_MISMATCH',
+        message: 'Professor não autorizado para transformar notas de outro professor.',
+      });
     }
   }
 
-  const transformation = req.body?.transformation || existingDoc.draftTransformation?.transformation;
+  const rawNotes = (existingDoc.rawContent || existingDoc.content || '').trim();
+  const markings = parseNotesHtml(rawNotes);
+  if (!rawNotes || !hasValidPedagogicalContent(rawNotes, markings)) {
+    return res.status(400).json({
+      success: false,
+      error: 'InvalidNotesContent',
+      code: 'NO_PEDAGOGICAL_CONTENT',
+      message: 'As anotações enviadas estão vazias ou não contêm termos pedagógicos válidos para análise.',
+    });
+  }
+
+  const contentHash = computeNotesContentHash(rawNotes);
+  const lockKey = `session_notes_transform:${targetSessionKey}:${contentHash}`;
+  const flightLock = await acquireSingleFlightLock(lockKey);
+  if (!flightLock.acquired) {
+    return res.status(429).json({
+      success: false,
+      error: 'Concurrent generation in progress',
+      code: 'CONCURRENT_TRANSFORMATION',
+      message: 'Uma transformação pedagógica para esta sessão já está em andamento. Aguarde alguns instantes.',
+    });
+  }
+
+  const rateLimitCheck = await checkAndConsumeRateLimit(callerUid, 'pedagogical_transform');
+  if (!rateLimitCheck.allowed) {
+    await flightLock.release();
+    return res.status(429).json({
+      success: false,
+      error: 'Rate limit exceeded',
+      code: 'RATE_LIMIT_EXCEEDED',
+      message: 'Limite de requisições de transformação atingido para este usuário. Aguarde alguns instantes.',
+      retryAfterSeconds: rateLimitCheck.retryAfterSeconds,
+    });
+  }
+
+  try {
+    const language = (req.body?.language || req.body?.lang || 'pt').toLowerCase().trim();
+    const registeredStudent = (db.students || []).find((s: any) =>
+      (studentUid && (s.uid === studentUid || s.id === studentUid)) ||
+      (existingDoc.studentEmail && (s.email || '').toLowerCase().trim() === existingDoc.studentEmail.toLowerCase().trim())
+    );
+    const profile = (studentUid && db.userProfiles?.[studentUid]) || (existingDoc.studentEmail && db.userProfiles?.[existingDoc.studentEmail]);
+    const authoritativeLevel = profile?.level || profile?.englishLevel || registeredStudent?.level || registeredStudent?.englishLevel || 'intermediario';
+
+    const coreResult = await executePedagogicalTransformationCore({
+      rawNotes,
+      topic: existingDoc.topic || 'Live Coaching Session',
+      sessionDate: existingDoc.sessionDate,
+      teacherName: teacherResolution?.name || (req.user as any)?.name || existingDoc.teacherName || 'Native Friend',
+      authoritativeLevel,
+      language,
+      callerRole: isCallerAdmin ? 'admin' : 'teacher',
+      canonicalSessionKey: targetSessionKey,
+      lessonId: existingDoc.lessonId,
+      studentUid,
+      studentEmail: existingDoc.studentEmail,
+      effectiveTeacherUid: existingDoc.teacherUid || callerUid,
+      effectiveTeacherEmail: existingDoc.teacherEmail || req.user.email,
+    });
+
+    if (!coreResult.success || !coreResult.transformation) {
+      return res.status(coreResult.statusCode || 503).json({
+        success: false,
+        error: 'AI_TRANSFORMATION_FAILED',
+        code: 'AI_TRANSFORMATION_FAILED',
+        category: coreResult.category || 'SERVICE_UNAVAILABLE',
+        message: coreResult.message || 'Falha na transformação pedagógica via IA. O documento original foi preservado intacto sem publicação.',
+        attemptsCount: coreResult.attemptsCount || 1,
+        modelsAttempted: coreResult.modelsAttempted || resolveGeminiContingencyModels(),
+        attemptsDetails: coreResult.attemptsDetails,
+      });
+    }
+
+    const currentVersion = existingDoc.currentVersionNumber || 1;
+    const nextDraftVersion = currentVersion + 1;
+
+    const draftTransformation: NoteDraftTransformation = {
+      draftId: `draft_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+      versionNumber: nextDraftVersion,
+      status: 'draft',
+      contentHash,
+      rawNotesSnippet: rawNotes.slice(0, 300),
+      transformation: coreResult.transformation,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      editorUid: callerUid,
+      editorEmail: req.user.email,
+    };
+
+    const authorContext = {
+      authorUid: callerUid,
+      authorEmail: req.user.email,
+      authorRole: (isCallerAdmin ? 'admin' : 'teacher') as 'teacher' | 'admin',
+      teacherName: teacherResolution?.name || (req.user as any)?.name || 'Native Friend',
+    };
+
+    const updatedDoc = mergeSessionNoteWithVersioning({
+      existingNote: existingDoc,
+      incomingNote: {
+        ...existingDoc,
+        draftTransformation,
+        studentUid,
+        teacherUid: existingDoc.teacherUid || callerUid,
+        sessionDate: existingDoc.sessionDate,
+      },
+      author: authorContext,
+      changeSummary: req.body?.changeSummary || 'Gemini generated pedagogical draft transformation',
+    });
+
+    if (!db.sessionNotesMap) db.sessionNotesMap = {};
+    db.sessionNotesMap[targetSessionKey] = updatedDoc;
+    await writeDbSync(db);
+    await saveSessionNotesToFirestoreServer(targetSessionKey, updatedDoc).catch(() => null);
+
+    return res.json({
+      success: true,
+      draftTransformation,
+      sessionNote: updatedDoc,
+    });
+  } finally {
+    await flightLock.release();
+  }
+}
+
+// FASE NF-DOC.2A & 2B: Teacher reviews and approves transformation version for student (publishing to lastApprovedVersion)
+async function handleSessionNoteApproveInternal(req: any, res: any) {
+  if (!req.user || !req.user.uid) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Autenticação mandatória.' });
+  }
+
+  const callerUid = req.user.uid;
+  const isCallerAdmin = req.user.role === 'admin';
+
+  // Security Gate: Students are strictly forbidden from approving notes
+  if (req.user.role === 'student') {
+    return res.status(403).json({
+      error: 'Forbidden',
+      code: 'STUDENTS_CANNOT_APPROVE',
+      message: 'Alunos não têm permissão para aprovar anotações.',
+    });
+  }
+
+  const db = readDb();
+  let teacherResolution: any = null;
+  let isCallerTeacher = false;
+  if (!isCallerAdmin) {
+    teacherResolution = await resolveTeacherCanonicalIdentity({
+      teacherUid: callerUid,
+      teacherEmail: req.user.email,
+      dbState: db,
+    }).catch(() => null);
+    if (!teacherResolution || !teacherResolution.isApproved) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'UNAUTHORIZED_TEACHER',
+        message: 'Apenas professores aprovados ou administradores podem aprovar anotações.',
+      });
+    }
+    isCallerTeacher = true;
+  }
+
+  const targetSessionKey = decodeURIComponent(req.params.id || req.body?.id || req.body?.sessionId || req.body?.sessionKey || '').trim();
+  if (!targetSessionKey) {
+    return res.status(400).json({
+      error: 'SESSION_ID_REQUIRED',
+      code: 'SESSION_ID_REQUIRED',
+      message: 'Identificador da sessão é obrigatório.',
+    });
+  }
+
+  let existingDoc = db.sessionNotesMap?.[targetSessionKey];
+  if (!existingDoc) {
+    try {
+      existingDoc = await fetchSessionNotesFromFirestoreServer(targetSessionKey);
+    } catch {}
+  }
+
+  if (!existingDoc) {
+    return res.status(404).json({
+      error: 'NOT_FOUND',
+      code: 'SESSION_NOTE_NOT_FOUND',
+      message: 'Documento da anotação não encontrado.',
+    });
+  }
+
+  const studentUid = existingDoc.studentUid;
+  if (!studentUid || !isValidCanonicalUid(studentUid)) {
+    return res.status(400).json({
+      error: 'INVALID_STUDENT_IDENTITY',
+      code: 'CANONICAL_STUDENT_UID_REQUIRED',
+      message: 'Identidade canônica do aluno ausente ou inválida no documento.',
+    });
+  }
+  const docTeacherUid = existingDoc.teacherUid;
+  if (!docTeacherUid || !isValidCanonicalUid(docTeacherUid)) {
+    return res.status(400).json({
+      error: 'INVALID_TEACHER_IDENTITY',
+      code: 'CANONICAL_TEACHER_UID_REQUIRED',
+      message: 'Identidade canônica do professor ausente ou inválida no documento.',
+    });
+  }
+  if (req.body?.studentUid && String(req.body.studentUid).trim() !== studentUid) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      code: 'STUDENT_UID_MISMATCH',
+      message: 'O studentUid informado diverge do proprietário canônico do documento.',
+    });
+  }
+
+  if (isCallerTeacher && !isCallerAdmin) {
+    if (req.body?.teacherUid && String(req.body.teacherUid).trim() !== callerUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHER_MISMATCH',
+        message: 'Parâmetro teacherUid inválido para o professor autenticado.',
+      });
+    }
+    const isAuthorized = await verifyCanonicalPedagogicalLinkServer(callerUid, studentUid);
+    if (!isAuthorized) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'UNAUTHORIZED_PEDAGOGICAL_LINK',
+        message: 'Amigo Nativo não possui vínculo autorizado com este aluno.',
+      });
+    }
+    if (docTeacherUid !== callerUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHER_MISMATCH',
+        message: 'Professor não autorizado para aprovar notas de outro professor.',
+      });
+    }
+  }
+
+  const currentRawContent = existingDoc.rawContent || existingDoc.content || '';
+  const currentContentHash = computeNotesContentHash(currentRawContent);
+
+  // Stale draft & version protection
+  if (existingDoc.draftTransformation) {
+    if (req.body?.draftId && existingDoc.draftTransformation.draftId !== req.body.draftId) {
+      return res.status(409).json({
+        error: 'Conflict',
+        code: 'DRAFT_ID_MISMATCH',
+        message: 'O ID do rascunho enviado não corresponde ao rascunho atual.',
+      });
+    }
+    if (existingDoc.draftTransformation.contentHash && existingDoc.draftTransformation.contentHash !== currentContentHash) {
+      return res.status(409).json({
+        error: 'Conflict',
+        code: 'STALE_DRAFT',
+        message: 'O rascunho pedagógico está desatualizado em relação às anotações atuais da sessão. Modificações foram feitas nas anotações após o rascunho. Gere ou edite um novo rascunho antes de aprovar.',
+      });
+    }
+  }
+
+  if (req.body?.transformation?.contentHash && req.body.transformation.contentHash !== currentContentHash) {
+    return res.status(409).json({
+      error: 'Conflict',
+      code: 'STALE_DRAFT',
+      message: 'A transformação enviada está desatualizada em relação às anotações atuais da sessão.',
+    });
+  }
+
+  // Idempotency check: already approved with identical content
+  if (
+    existingDoc.approvalStatus === 'approved' &&
+    existingDoc.lastApprovedVersion &&
+    existingDoc.lastApprovedVersion.contentHash === currentContentHash &&
+    !existingDoc.draftTransformation
+  ) {
+    return res.json({
+      success: true,
+      approvalStatus: existingDoc.approvalStatus,
+      approvedVersion: existingDoc.lastApprovedVersion,
+      sessionNote: existingDoc,
+      alreadyApproved: true,
+    });
+  }
+
+  const rawIncomingTransformation = req.body?.transformation;
+  const transformation =
+    rawIncomingTransformation?.transformation ||
+    (rawIncomingTransformation?.mistakesAnalysis ? rawIncomingTransformation : null) ||
+    existingDoc.draftTransformation?.transformation;
   if (!transformation) {
-    return res.status(400).json({ error: 'TRANSFORMATION_REQUIRED', message: 'Transformação pedagógica válida é mandatória para aprovação.' });
+    return res.status(400).json({
+      error: 'TRANSFORMATION_REQUIRED',
+      code: 'TRANSFORMATION_REQUIRED',
+      message: 'Transformação pedagógica válida é mandatória para aprovação.',
+    });
+  }
+
+  if (
+    !Array.isArray(transformation.mistakesAnalysis) ||
+    !Array.isArray(transformation.grammarPoints) ||
+    !Array.isArray(transformation.vocabularyAndExpressions) ||
+    !transformation.reviewSummary ||
+    typeof transformation.reviewSummary !== 'object' ||
+    Array.isArray(transformation.reviewSummary)
+  ) {
+    return res.status(400).json({
+      error: 'INVALID_TRANSFORMATION',
+      code: 'INVALID_TRANSFORMATION_STRUCTURE',
+      message: 'Estrutura da transformação pedagógica inválida: as 4 partes canônicas são obrigatórias.',
+    });
+  }
+
+  if (
+    transformation.isFallback === true ||
+    transformation.isProvisional === true ||
+    (transformation.isAiGenerated && isLegacyGenericTransformation(transformation, currentRawContent))
+  ) {
+    return res.status(400).json({
+      error: 'SYNTHETIC_TRANSFORMATION_REJECTED',
+      code: 'SYNTHETIC_TRANSFORMATION_REJECTED',
+      message: 'Transformações locais pré-fabricadas ou sintéticas não podem ser aprovadas.',
+    });
   }
 
   const currentVersion = existingDoc.currentVersionNumber || 1;
   const nextApprovedVersion = currentVersion + 1;
-  const rawNoteText = existingDoc.rawContent || existingDoc.content || '';
-  const contentHash = computeNotesContentHash(rawNoteText);
 
   const approvedVersion: NoteApprovedVersion = {
     approvedVersionId: `appr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     versionNumber: nextApprovedVersion,
     status: 'approved',
-    contentHash,
-    rawNotesSnippet: rawNoteText.slice(0, 300),
+    contentHash: currentContentHash,
+    rawNotesSnippet: currentRawContent.slice(0, 300),
     transformation,
     approvedAt: new Date().toISOString(),
     approvedByUid: callerUid,
@@ -8921,9 +9817,9 @@ app.post('/api/session-notes/:id/approve', firebaseAuthMiddleware, async (req, r
     incomingNote: {
       ...existingDoc,
       lastApprovedVersion: approvedVersion,
-      draftTransformation: null,
+      draftTransformation: null, // Draft is cleared upon approval and publication!
       studentUid,
-      teacherUid: existingDoc.teacherUid || callerUid,
+      teacherUid: docTeacherUid,
       sessionDate: existingDoc.sessionDate,
     },
     author: authorContext,
@@ -8935,8 +9831,22 @@ app.post('/api/session-notes/:id/approve', firebaseAuthMiddleware, async (req, r
   await writeDbSync(db);
   await saveSessionNotesToFirestoreServer(targetSessionKey, updatedDoc).catch(() => null);
 
-  return res.json({ success: true, sessionNote: updatedDoc });
-});
+  return res.json({
+    success: true,
+    approvalStatus: updatedDoc.approvalStatus,
+    approvedVersion,
+    sessionNote: updatedDoc,
+  });
+}
+
+app.post('/api/session-notes/:id/draft', firebaseAuthMiddleware, handleSessionNoteDraftInternal);
+app.post('/api/session-notes/draft', firebaseAuthMiddleware, handleSessionNoteDraftInternal);
+
+app.post('/api/session-notes/:id/transform', firebaseAuthMiddleware, handleSessionNoteTransformInternal);
+app.post('/api/session-notes/transform', firebaseAuthMiddleware, handleSessionNoteTransformInternal);
+
+app.post('/api/session-notes/:id/approve', firebaseAuthMiddleware, handleSessionNoteApproveInternal);
+app.post('/api/session-notes/approve', firebaseAuthMiddleware, handleSessionNoteApproveInternal);
 
 // FASE NF-DOC.2A: Inspect complete version history of session notes document
 app.get('/api/session-notes/:id/versions', firebaseAuthMiddleware, async (req, res) => {
@@ -9565,10 +10475,6 @@ app.post('/api/session-notes/reminder/claim', async (req, res) => {
     lastReminderShownDate: result.lastReminderShownDate,
   });
 });
-
-// Controlled cooldown tracker for Gemini quota exhaustion to prevent repeated 429 floods
-let geminiQuotaCooldownUntil = 0;
-const GEMINI_QUOTA_COOLDOWN_MS = 60_000;
 
 export type GeminiFailureCategory =
   | 'AUTH_ERROR'
