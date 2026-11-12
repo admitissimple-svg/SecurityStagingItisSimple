@@ -8764,6 +8764,7 @@ export interface PedagogicalTransformationCoreOptions {
   studentEmail?: string;
   effectiveTeacherUid?: string;
   effectiveTeacherEmail?: string;
+  contentHashOverride?: string;
   customAttemptExecutor?: (model: string, params: any) => Promise<any>;
 }
 
@@ -8876,108 +8877,119 @@ export async function executePedagogicalTransformationCore(
   const cefr = cefrMeta.cefr;
 
   const systemInstruction = `You are an elite, Cambridge/CELTA-certified Pedagogical English Language Synthesizer and Master Native Friend Teacher.
-Your mission is to transform raw in-session teacher notes into an ultra-structured, masterclass pedagogical report calibrated to CEFR level (${cefr}).
-The student MUST NEVER see raw, fragmented notes. Instead, produce a polished, structured learning guide strictly in English.
+Your mission is to transform raw in-session teacher notes into a structured, high-clarity 4-part pedagogical lesson guide calibrated to the student's CEFR level (${cefr}).
+The student MUST NEVER see raw, fragmented notes. Produce a polished, cohesive learning guide strictly in English.
 
 LANGUAGE REQUIREMENT (STRICT 100% ENGLISH OUTPUT):
 - Generate ALL four parts ("mistakesAnalysis" / Analyze Mistakes, "grammarPoints" / Grammar Points, "vocabularyAndExpressions" / Vocabulary & Expressions, and "reviewSummary" / Quick Review) EXCLUSIVELY in natural, clear English (code: "en"), regardless of the language used in the raw notes or any student/request locale.
-- Every AI-authored field — including all titles, grammar topics ("topic"), grammar rules ("rule", "form", "usage"), mistake explanations ("explanation"), common pitfalls ("commonPitfalls"), comparisons ("comparisons"), newly created didactic examples ("twoExamples", "examples", "realExamples", "collocations"), vocabulary definitions ("definitionEn" AND "simpleDefinition"), parts of speech ("partOfSpeech"), categories ("category"), phonetic guides ("phoneticGuide"), and review summaries ("estimatedMinutes", "keyRules", "mustKnowVocabulary", "rememberThis") — MUST be written strictly in English.
-- NEVER write explanations, titles, rules, created examples, definitions, or summaries in Portuguese or any other non-English language. Even if the raw notes contain Portuguese comments, translations, or L1 interference, write all explanations and contrasts strictly in English.
+- Every AI-authored field — including all titles, grammar topics ("topic"), grammar rules ("rule", "form", "usage"), mistake explanations ("explanation", "grammarRule", "similarFormsComparison"), common pitfalls ("commonPitfalls"), comparisons ("comparisons"), created examples ("twoExamples", "examples", "realExamples", "collocations"), vocabulary definitions ("definitionEn" AND "simpleDefinition"), parts of speech ("partOfSpeech"), register notes ("registerNote"), categories ("category"), phonetic guides ("phoneticGuide"), and review summaries ("estimatedMinutes", "keyRules", "mustKnowVocabulary", "usefulPatterns", "rememberThis") — MUST be written strictly in English.
+- NEVER write explanations, titles, rules, created examples, definitions, or summaries in Portuguese or any other non-English language.
 
 LITERAL QUOTE PRESERVATION & ORIGINAL NOTES INTEGRITY:
 - Preserve literally (verbatim) the original excerpts from the student and the teacher whenever presented as lesson quotes, citations, or classroom examples from the session (such as "original" in "mistakesAnalysis" and "essentialCorrections", or literal utterances quoted from the lesson).
 - Do NOT translate, paraphrase, rewrite, or modify the original session notes or literal student/teacher classroom excerpts. Treat the raw notes strictly as read-only source material.
 
-CRITICAL INSTRUCTIONS ON TEACHER SHORTCUT MARKINGS & TAB ROUTING:
-1. Alt + N (Error / Incorrect Markings):
-   - Items stamped with 'data-tag-type="incorrect"', '✗', 'Instead of:', or error lines MUST be directed and processed appropriately into:
-     a) "mistakesAnalysis" (Tab 1: Analyze Mistakes): student's literal original faulty utterance, natural native English correction (resolving spelling, phrasing, or grammatical slips into polished English), category, grammatical explanation in English (addressing L1 interference in English), two natural created examples in English, and common pitfalls in English. Even if the teacher wrote an isolated mistake without explicit correction (e.g. spelling slips or words marked with ✗), deduce and provide the accurate, natural native English correction.
-     b) "grammarPoints" (Tab 2: Grammar Points): whenever an error involves a systemic grammatical rule/structure (e.g. modal verbs without "to", stative verbs, auxiliary verbs, verb tenses, dependent prepositions, conditionals, word order), elaborate the corresponding topic title, rule, syntax (FORM), usage, created examples, common mistakes, and comparisons strictly in English.
-        CRITICAL FIDELITY RULES FOR GRAMMAR POINTS:
-        * ONLY generate grammar points that are directly substantiated by the student's actual session errors or notes.
-        * If there is only ONE systemic grammar error in the notes (for example, using "to" after the modal "can"), provide EXACTLY ONE corresponding grammar point. DO NOT fabricate or invent a second grammar point!
-        * If there are no systemic grammar errors in the notes, "grammarPoints" MUST be an empty array [].
-        * NEVER fabricate non-existent or ungrounded grammar points.
-2. Alt + W (New Word) & Alt + P (Pronunciation Markings):
-   - Items stamped with 'data-tag-type="new-word"', '[New Word]', 'data-tag-type="pronounce"', '[Pronounce]' or standalone vocabulary words MUST be directed and processed into:
-     "vocabularyAndExpressions" (Tab 3: Vocabulary & Expressions).
-   - For Alt+W / vocabulary: provide part of speech, register, "definitionEn" AND "simpleDefinition" both in clear English adapted to CEFR ${cefr}, collocations in English, real examples in English, and synonyms in English.
-   - For Alt+P: mark partOfSpeech as "Pronunciation Focus", provide clear syllable stress breakdown in English, phonetic guide with IPA, common pronunciation slips to avoid in English, and conversational examples in English.
-3. CRITICAL RULES FOR CONTENT FIDELITY & EMPTY SECTIONS:
-   - Exclusively generate content grounded in and substantiated by the teacher's actual notes.
-   - If a section legitimately has no corresponding content in the notes, it MUST be returned as an empty array []:
-     * If the notes contain NO student errors: "mistakesAnalysis" MUST be []. NEVER fabricate non-existent student errors, sentences, or phrases!
-     * If the notes contain NO systemic grammar errors: "grammarPoints" MUST be []. NEVER fabricate synthetic grammar points!
-     * If the notes contain NO vocabulary or pronunciation items (e.g. session only had grammar corrections): "vocabularyAndExpressions" MUST be []. NEVER fabricate synthetic vocabulary items (such as "catch up", "workload", "streamline")!
-   - If a term contains a spelling slip (e.g. the teacher recorded "blury", which is standardly spelled "blurry"), evaluate and identify the correct spelling "blurry", explain the spelling rule/distinction in English, and provide accurate CEFR ${cefr} definitions ("definitionEn" and "simpleDefinition") exclusively in English, along with natural real-world examples, collocations, and register.
-   - In "reviewSummary", ALWAYS generate a complete object in English:
-     * "estimatedMinutes": "3–5 minutes" for short notes, "5–10 minutes" for standard notes
-     * "keyRules": concise bullet titles of grammar points covered strictly in English (empty array [] if no grammar points)
-     * "mustKnowVocabulary": concise list of target terms from vocabularyAndExpressions (empty array [] if no vocabulary items)
-     * "essentialCorrections": concise list of original and corrected pairs [{"original": "...", "corrected": "..."}] from mistakesAnalysis, preserving literal "original" excerpts (empty array [] if no errors)
-     * "rememberThis": an inspiring, memorable golden takeaway rule strictly in English (at least 15 characters), focused on the items recorded in the session.
-4. CEFR LEVEL ADAPTATION:
-   - There is NO separate CEFR tab. Instead, ALL four parts (1. Analyze Mistakes, 2. Grammar Points, 3. Vocabulary & Expressions, and 4. Quick Review) MUST be intelligently elaborated in English, calibrated to the student's current CEFR level (${cefr}).
-5. QUICK REVIEW (reviewSummary) MANDATE & TOKEN OPTIMIZATION:
-   - In "reviewSummary", provide a concise English summary without duplicating full multi-sentence analyses or definitions already stated in "vocabularyAndExpressions" and "grammarPoints":
-     * "estimatedMinutes": e.g. "5–10 minutes" (or "3–5 minutes" for short sessions)
-     * "keyRules": concise bullet titles of grammar points covered in English (empty array [] if no grammar errors)
-     * "mustKnowVocabulary": concise list of target terms from vocabularyAndExpressions (e.g. ["term 1", "term 2"]), avoiding redundant definition paragraphs
-     * "essentialCorrections": concise list of original and corrected pairs [{"original": "...", "corrected": "..."}] from mistakesAnalysis
-     * "rememberThis": High-impact golden takeaway rule in English (at least 15 characters).
+PEDAGOGICAL INSTRUCTIONS FOR THE 4 PARTS:
 
-You MUST produce a JSON object strictly conforming to this schema:
+Alt+N = Part 1. Analyze the student's mistakes ("mistakesAnalysis")
+Go through every grammar, vocabulary, word-choice, collocation, preposition, sentence-structure, and naturalness issue in the note (including items marked with Alt+N, 'data-tag-type="incorrect"', '✗', 'Instead of:', or clear errors in the note).
+For each mistake:
+- Show the student's original form ("original", preserved verbatim).
+- Show the corrected/natural version ("corrected").
+- Explain why the original is incorrect or unnatural AND explain the underlying grammar rule or language pattern ("explanation" and "grammarRule").
+- Give 2–4 natural examples ("twoExamples").
+- Highlight common mistakes the student is likely to make with the same structure ("commonPitfalls").
+- Where useful, explain the difference between similar forms or expressions ("similarFormsComparison").
+Do not simply correct the sentence. Teach the grammar behind the correction.
+(If the note contains NO student mistakes, return "mistakesAnalysis": [] — never invent synthetic mistakes.)
+
+Alt+N = Part 2. Teach the grammar points ("grammarPoints")
+Identify the main grammar points that appear in the note and explain them at the student's level (CEFR ${cefr}).
+For each grammar point, include:
+- Rule ("rule")
+- Form/structure ("form")
+- Meaning/use ("usage")
+- Examples from real-life situations ("examples")
+- Common mistakes ("commonMistakes")
+- A short comparison with similar structures, when relevant ("comparisons")
+Prioritize the grammar that is actually connected to the student's mistakes rather than adding unrelated grammar. If there are no grammar issues in the note, return "grammarPoints": [].
+
+Alt + W or Alt + P = Part 3. Teach the vocabulary and expressions ("vocabularyAndExpressions")
+Include every important word, phrase, expression, collocation, or phrasal verb from the note (items marked with Alt+W / 'new-word', Alt+P / 'pronounce', or vocabulary recorded in the note; if a term has a spelling slip like "blury", identify and teach the correct spelling "blurry").
+For each one, provide:
+- Part of speech ("partOfSpeech")
+- Simple definition appropriate for the student's level ("simpleDefinition" AND "definitionEn" in clear English calibrated to CEFR ${cefr})
+- Natural collocations or sentence patterns ("collocations")
+- At least one realistic real-life example ("realExamples")
+- Synonyms or related words when useful ("synonyms")
+- A brief note about register or nuance when relevant — formal, informal, conversational, etc. ("register" and "registerNote")
+- For Alt+P pronunciation items, also include IPA/syllable stress in "phoneticGuide" and set "isPronunciationFocus": true.
+Organize the vocabulary into useful categories rather than giving one long alphabetical list. Assign each item's "category" to a clear thematic/functional group.
+(If the note contains NO vocabulary or pronunciation items, return "vocabularyAndExpressions": [] — never invent synthetic vocabulary.)
+
+4. Create a 5–10 minute review summary ("reviewSummary")
+At the end, create a concise 5–10 minute revision section covering the entire lesson.
+Include:
+- The most important grammar rules ("keyRules")
+- The most important vocabulary ("mustKnowVocabulary")
+- Key corrections ("essentialCorrections": [{"original": "...", "corrected": "..."}])
+- Useful sentence patterns ("usefulPatterns")
+- A short "Remember this" section ("rememberThis")
+
+Return a single JSON object strictly conforming to this schema (JSON only, no Markdown backticks):
 {
   "mistakesAnalysis": [
     {
       "id": "mistake-1",
-      "original": "Student's literal original utterance from the lesson (preserved verbatim)",
-      "corrected": "Polished, natural native English correction",
-      "category": "grammar" | "vocabulary" | "collocation" | "preposition" | "pronunciation" | "phrasing",
-      "explanation": "Crystal-clear grammatical rule explanation in English highlighting why the error occurred and how to fix it, calibrated to CEFR ${cefr}",
-      "twoExamples": ["Created example 1 in natural English", "Created example 2 in natural English"],
-      "commonPitfalls": "Common mistake learners make with this structure (explained strictly in English)"
+      "original": "Student's original form (verbatim)",
+      "corrected": "Corrected/natural version",
+      "category": "grammar" | "vocabulary" | "word-choice" | "collocation" | "preposition" | "sentence-structure" | "naturalness",
+      "explanation": "Why the original is incorrect/unnatural and the underlying grammar rule or language pattern",
+      "grammarRule": "Concise underlying grammar rule or pattern",
+      "twoExamples": ["Natural example 1", "Natural example 2", "Natural example 3 (2 to 4 examples)"],
+      "commonPitfalls": "Common mistakes the student is likely to make with the same structure",
+      "similarFormsComparison": "Difference between similar forms or expressions (when useful, else empty string)"
     }
   ],
   "grammarPoints": [
     {
       "id": "grammar-1",
-      "topic": "Grammar topic title in English",
-      "rule": "Detailed rule explanation in English adapted to CEFR ${cefr}",
-      "form": "Formula / Syntax breakdown in English",
-      "usage": "When and why native speakers use this (in English)",
-      "examples": ["Created example 1 in English", "Created example 2 in English"],
-      "commonMistakes": "Mistake to avoid (in English)",
-      "comparisons": "Contrast with other structures or L1 interference (written strictly in English)"
+      "topic": "Main grammar point title",
+      "rule": "Clear rule at CEFR ${cefr}",
+      "form": "Form / structure formula",
+      "usage": "Meaning / use in real communication",
+      "examples": ["Real-life example 1", "Real-life example 2"],
+      "commonMistakes": "Common mistakes to avoid",
+      "comparisons": "Short comparison with similar structures, when relevant"
     }
   ],
   "vocabularyAndExpressions": [
     {
       "id": "vocab-1",
-      "term": "Word, phrasal verb, or pronunciation term",
-      "partOfSpeech": "Part of speech in English (e.g. Phrasal Verb, Noun, Pronunciation Focus)",
-      "definitionEn": "Simple, accurate definition EXCLUSIVELY in English tailored to student level ${cefr} and part of speech",
-      "simpleDefinition": "Clear, accessible pedagogical definition/explanation EXCLUSIVELY in English adapted to CEFR ${cefr}",
-      "collocations": ["Collocation 1 in English", "Collocation 2 in English"],
-      "realExamples": ["Real-world sentence 1 in English", "Real-world sentence 2 in English"],
-      "synonyms": ["Synonym 1 in English", "Synonym 2 in English"],
-      "register": "informal" | "neutral" | "formal" | "idiomatic",
-      "category": "Thematic category in English or 'Pronunciation & Phonetics (Alt+P)' / 'New Words & Expressions (Alt+W)'",
-      "phoneticGuide": "Phonetic / syllable stress guide in English with IPA",
+      "term": "Word, phrase, expression, collocation, or phrasal verb",
+      "partOfSpeech": "Part of speech (e.g., Phrasal Verb, Noun, Adjective, Expression)",
+      "definitionEn": "Simple, accurate English definition appropriate for CEFR ${cefr}",
+      "simpleDefinition": "Simple definition appropriate for the student's level (CEFR ${cefr})",
+      "collocations": ["Natural collocation or sentence pattern 1", "Natural collocation or sentence pattern 2"],
+      "realExamples": ["Realistic real-life example sentence"],
+      "synonyms": ["Synonym or related word 1"],
+      "register": "conversational" | "informal" | "neutral" | "formal" | "idiomatic",
+      "registerNote": "Brief note about register or nuance when relevant",
+      "category": "Useful thematic or functional category (e.g., Work & Meetings, Everyday Expressions, Pronunciation Focus)",
+      "phoneticGuide": "IPA / syllable stress guide (especially for Alt+P items)",
       "isPronunciationFocus": false,
       "isNewWord": true
     }
   ],
   "reviewSummary": {
     "estimatedMinutes": "5–10 minutes",
-    "keyRules": ["Key grammar rule titles strictly in English"],
-    "mustKnowVocabulary": ["Target terms from vocabularyAndExpressions"],
+    "keyRules": ["Most important grammar rules"],
+    "mustKnowVocabulary": ["Most important vocabulary"],
     "essentialCorrections": [{"original": "...", "corrected": "..."}],
-    "rememberThis": "Memorable takeaway focused on the session items strictly in English"
+    "usefulPatterns": ["Useful sentence pattern 1", "Useful sentence pattern 2"],
+    "rememberThis": "Short, high-retention 'Remember this' takeaway"
   }
-}
-
-Return JSON only without Markdown backticks.`;
+}`;
 
   const prompt = `Pedagogical Parameters:
 - CEFR Level: ${cefr}
@@ -8991,15 +9003,12 @@ Raw In-Session Notes to transform (read-only source — do NOT translate or modi
 ${rawNotes}
 """
 
-Please synthesize and transform these notes according to the Alt+N, Alt+W, and Alt+P routing rules, adapting deeply to CEFR ${cefr}.
-- Generate ALL four parts (Analyze Mistakes / mistakesAnalysis, Grammar Points / grammarPoints, Vocabulary & Expressions / vocabularyAndExpressions, and Quick Review / reviewSummary) strictly in English, regardless of the language of the raw notes.
-- Write all titles, grammar rules, pedagogical explanations, created examples, definitions (both definitionEn and simpleDefinition), pitfalls, comparisons, and review summaries (including keyRules and rememberThis) exclusively in English.
-- Preserve literally (verbatim) the original excerpts from the student and the teacher when presented as quotes or examples from the lesson (such as "original" utterances), without translating or modifying them.
-- Do NOT translate or modify the original notes.
-- If notes contain only errors/grammar, provide only the grounded mistakes and grammar points, and leave vocabularyAndExpressions empty [].
-- If notes contain only vocabulary (such as a single word like "blury"), evaluate the term (including spelling accuracy like "blurry"), leave mistakesAnalysis and grammarPoints empty without fabricating errors.
-- If only one grammar error exists, provide only that one grammar point without inventing a second rule.
-- Preserve all teacher markings and required expressions.`;
+Apply the 4-part pedagogical instructions in a single pass calibrated to CEFR ${cefr}:
+- Alt+N -> Part 1 (Analyze Mistakes: original, corrected/natural, why + underlying grammar rule/pattern, 2–4 natural examples, common mistakes, and comparison of similar forms where useful) AND Part 2 (Grammar Points prioritized strictly to the student's mistakes: rule, form/structure, meaning/use, real-life examples, common mistakes, short comparison when relevant).
+- Alt+W or Alt+P -> Part 3 (Vocabulary & Expressions: part of speech, simple level-appropriate definition in both simpleDefinition and definitionEn, natural collocations/sentence patterns, realistic real-life example(s), useful synonyms/related words, register/nuance note, organized into useful categories).
+- Part 4 -> Concise 5–10 minute review summary (most important grammar rules, most important vocabulary, key corrections, useful sentence patterns, and a short "Remember this" section).
+- Preserve literally (verbatim) the original excerpts from the student and the teacher when presented as quotes or examples from the lesson.
+- Do NOT translate or modify the original notes. Never invent ungrounded mistakes, grammar points, or vocabulary when absent from the notes.`;
 
   const effectiveCustomExecutor = wrapTestAttemptExecutor(
     options.customAttemptExecutor || (process.env.NODE_ENV === 'test' ? sessionNoteTransformAttemptExecutorForTesting : null)
@@ -9052,85 +9061,61 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
   }
 
   const parsed = contingencyResult.parsedJson;
+  const cleanRawLower = (markings.cleanText || rawNotes).toLowerCase();
+
+  // Part 1: Mistakes Analysis — preserve AI pedagogical fields directly without redundant rework
   const rawErrMap = new Map<string, typeof markings.errors[0]>();
   markings.errors.forEach((e) => rawErrMap.set(e.original.toLowerCase().trim(), e));
 
   const validatedMistakes: any[] = [];
-  if (markings.errors.length > 0) {
-    (parsed.mistakesAnalysis || []).forEach((m: any) => {
-      const origKey = String(m?.original || '').toLowerCase().trim();
-      const rawErr = Array.from(rawErrMap.values()).find(
-        (e) => origKey.includes(e.original.toLowerCase().trim()) || e.original.toLowerCase().trim().includes(origKey)
-      );
-      const originalText = rawErr ? rawErr.original : (m.original || 'Mistake');
-      const correctedText = (rawErr && rawErr.corrected) ? rawErr.corrected : (m.corrected || originalText);
+  (parsed.mistakesAnalysis || []).forEach((m: any) => {
+    if (!m || typeof m !== 'object') return;
+    const aiOrig = String(m.original || '').trim();
+    const origKey = aiOrig.toLowerCase();
+    if (!origKey) return;
 
-      validatedMistakes.push({
-        id: `mistake-${validatedMistakes.length + 1}`,
-        original: originalText,
-        corrected: correctedText,
-        category: m.category || 'grammar',
-        explanation: m.explanation || `In natural spoken English, phrasing this structure as "${correctedText}" is the native formulation.`,
-        twoExamples: Array.isArray(m.twoExamples) && m.twoExamples.length > 0
-          ? m.twoExamples
-          : (Array.isArray(m.examples) ? m.examples : []),
-        commonPitfalls: m.commonPitfalls || '',
-        isPendingConfirmation: false,
-      });
-      if (rawErr) {
-        rawErrMap.delete(rawErr.original.toLowerCase().trim());
-      }
+    const rawErr = Array.from(rawErrMap.values()).find(
+      (e) => isPedagogicalTermMatch(origKey, e.original.toLowerCase().trim()) ||
+             origKey.includes(e.original.toLowerCase().trim()) ||
+             e.original.toLowerCase().trim().includes(origKey)
+    );
+
+    // Accept if matched to teacher Alt+N error OR grounded verbatim in untagged notes
+    const isGroundedInNotes = Boolean(rawErr) || (markings.errors.length === 0 && cleanRawLower.includes(origKey));
+    if (!isGroundedInNotes) return;
+
+    const originalText = rawErr ? rawErr.original : aiOrig;
+    const correctedText = (rawErr && rawErr.corrected) ? rawErr.corrected : String(m.corrected || originalText).trim();
+    const examplesList = Array.isArray(m.twoExamples) && m.twoExamples.length > 0
+      ? m.twoExamples
+      : (Array.isArray(m.examples) ? m.examples : []);
+
+    validatedMistakes.push({
+      id: m.id || `mistake-${validatedMistakes.length + 1}`,
+      original: originalText,
+      corrected: correctedText,
+      category: m.category || 'grammar',
+      explanation: String(m.explanation || m.grammarRule || `In natural English, "${correctedText}" is the idiomatic structure.`).trim(),
+      grammarRule: typeof m.grammarRule === 'string' && m.grammarRule.trim() ? m.grammarRule.trim() : undefined,
+      twoExamples: examplesList
+        .map((ex: any) => String(ex || '').trim().replace(/^["']|["']$/g, ''))
+        .filter(Boolean)
+        .slice(0, 4),
+      commonPitfalls: String(m.commonPitfalls || '').trim(),
+      similarFormsComparison: typeof m.similarFormsComparison === 'string' && m.similarFormsComparison.trim()
+        ? m.similarFormsComparison.trim()
+        : undefined,
+      isPendingConfirmation: false,
     });
-  }
 
-  const validTermsSet = new Set<string>([
-    ...markings.newWords.map((w) => w.toLowerCase().trim()),
-    ...markings.pronounceItems.map((p) => p.toLowerCase().trim()),
-    ...markings.vocabItems.map((v) => v.toLowerCase().trim()),
-  ]);
+    if (rawErr) {
+      rawErrMap.delete(rawErr.original.toLowerCase().trim());
+    }
+  });
 
-  const validatedVocab: any[] = [];
-  if (validTermsSet.size > 0) {
-    (parsed.vocabularyAndExpressions || []).forEach((v: any) => {
-      const termKey = String(v?.term || '').toLowerCase().trim();
-      const matchedTarget = Array.from(validTermsSet).find(
-        (target) => isPedagogicalTermMatch(termKey, target)
-      );
-      if (matchedTarget) {
-        const isPronounce = markings.pronounceItems.some(
-          (p) => isPedagogicalTermMatch(p, matchedTarget)
-        );
-        const isNewWord = markings.newWords.some(
-          (w) => isPedagogicalTermMatch(w, matchedTarget)
-        ) || markings.vocabItems.some(
-          (w) => isPedagogicalTermMatch(w, matchedTarget)
-        );
-
-        const rawExamples = Array.isArray(v.realExamples) ? v.realExamples : [];
-        const formattedExamples = rawExamples
-          .map((ex: any) => String(ex || '').trim().replace(/^["']|["']$/g, ''))
-          .filter(Boolean);
-
-        validatedVocab.push({
-          ...v,
-          id: `vocab-${validatedVocab.length + 1}`,
-          partOfSpeech: v.partOfSpeech || (isPronounce ? 'Pronunciation Focus' : 'Vocabulary Item'),
-          realExamples: formattedExamples,
-          category: isNewWord && isPronounce
-            ? 'New Word & Pronunciation (Alt+W + Alt+P)'
-            : isPronounce
-            ? 'Pronunciation & Phonetics (Alt+P)'
-            : 'New Words & Expressions (Alt+W)',
-          isPronunciationFocus: isPronounce,
-          isNewWord: isNewWord,
-        });
-        validTermsSet.delete(matchedTarget);
-      }
-    });
-  }
-
+  // Part 2: Grammar Points — connected to the student's mistakes or notes
   let validatedGrammar: any[] = [];
-  if (markings.errors.length > 0) {
+  if (validatedMistakes.length > 0 || markings.errors.length > 0) {
     const rawGrammarList = Array.isArray(parsed.grammarPoints) ? parsed.grammarPoints : [];
     validatedGrammar = rawGrammarList
       .filter((g: any) => g && g.topic && g.rule)
@@ -9148,55 +9133,139 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
       }));
   }
 
-  const allCorrections = validatedMistakes.map((m: any) => ({
+  // Part 3: Vocabulary & Expressions — preserve useful AI categories, register nuance, and mirror definitions
+  const validTermsPool = [
+    ...markings.newWords.map((w) => w.toLowerCase().trim()),
+    ...markings.pronounceItems.map((p) => p.toLowerCase().trim()),
+    ...markings.vocabItems.map((v) => v.toLowerCase().trim()),
+  ];
+  const consumedTargets = new Set<string>();
+  const seenVocabKeys = new Set<string>();
+  const validatedVocab: any[] = [];
+
+  (parsed.vocabularyAndExpressions || []).forEach((v: any) => {
+    if (!v || typeof v !== 'object') return;
+    const rawTerm = String(v.term || '').trim();
+    const termKey = rawTerm.toLowerCase();
+    if (!termKey || seenVocabKeys.has(termKey)) return;
+
+    const matchedTarget = validTermsPool.find(
+      (target) => !consumedTargets.has(target) && isPedagogicalTermMatch(termKey, target)
+    );
+    const appearsInRawNotes = validTermsPool.length > 0 && cleanRawLower.includes(termKey);
+
+    if (!matchedTarget && !appearsInRawNotes) return;
+    if (matchedTarget) consumedTargets.add(matchedTarget);
+    seenVocabKeys.add(termKey);
+
+    const lookupTarget = matchedTarget || termKey;
+    const isPronounce =
+      markings.pronounceItems.some((p) => isPedagogicalTermMatch(p, lookupTarget)) ||
+      (markings.pronounceItems.length === 0 && Boolean(v.isPronunciationFocus));
+    const isNewWord =
+      markings.newWords.some((w) => isPedagogicalTermMatch(w, lookupTarget)) ||
+      markings.vocabItems.some((w) => isPedagogicalTermMatch(w, lookupTarget)) ||
+      (!isPronounce && Boolean(v.isNewWord ?? true));
+
+    const simpleDef = String(v.simpleDefinition || v.definitionEn || '').trim();
+    const defEn = String(v.definitionEn || simpleDef).trim();
+    const rawExamples = Array.isArray(v.realExamples) ? v.realExamples : [];
+    const formattedExamples = rawExamples
+      .map((ex: any) => String(ex || '').trim().replace(/^["']|["']$/g, ''))
+      .filter(Boolean);
+
+    const aiCategory = String(v.category || '').trim();
+    const isGenericCat = !aiCategory || /^(core|vocabulary|general|words?)$/i.test(aiCategory);
+    const resolvedCategory = !isGenericCat
+      ? aiCategory
+      : isNewWord && isPronounce
+      ? 'New Word & Pronunciation (Alt+W + Alt+P)'
+      : isPronounce
+      ? 'Pronunciation & Phonetics (Alt+P)'
+      : 'New Words & Expressions (Alt+W)';
+
+    validatedVocab.push({
+      ...v,
+      id: v.id || `vocab-${validatedVocab.length + 1}`,
+      term: rawTerm,
+      partOfSpeech: String(v.partOfSpeech || (isPronounce ? 'Pronunciation Focus' : 'Expression')).trim(),
+      definitionEn: defEn,
+      simpleDefinition: simpleDef,
+      collocations: Array.isArray(v.collocations)
+        ? v.collocations.map((c: any) => String(c || '').trim()).filter(Boolean)
+        : [],
+      realExamples: formattedExamples,
+      synonyms: Array.isArray(v.synonyms)
+        ? v.synonyms.map((s: any) => String(s || '').trim()).filter(Boolean)
+        : [],
+      register: v.register || 'conversational',
+      registerNote: typeof v.registerNote === 'string' && v.registerNote.trim() ? v.registerNote.trim() : undefined,
+      category: resolvedCategory,
+      isPronunciationFocus: isPronounce,
+      isNewWord: isNewWord,
+    });
+  });
+
+  // Part 4: 5–10 Minute Review Summary — reuse AI summary fields directly when present, fallback deterministically only if empty
+  const rawSummary = parsed.reviewSummary && typeof parsed.reviewSummary === 'object' ? parsed.reviewSummary : {};
+
+  const aiKeyRules = Array.isArray(rawSummary.keyRules)
+    ? rawSummary.keyRules.map((r: any) => String(r || '').trim()).filter(Boolean)
+    : [];
+  const finalKeyRules = validatedGrammar.length === 0
+    ? []
+    : (aiKeyRules.length > 0 ? aiKeyRules : validatedGrammar.map((g: any) => `${g.topic}: ${g.rule}`));
+
+  const aiMustKnowVocab = Array.isArray(rawSummary.mustKnowVocabulary)
+    ? rawSummary.mustKnowVocabulary.map((w: any) => String(w || '').trim()).filter(Boolean)
+    : [];
+  const finalMustKnowVocab = validatedVocab.length === 0
+    ? []
+    : (aiMustKnowVocab.length > 0
+        ? aiMustKnowVocab
+        : validatedVocab.map((v: any) => {
+            const tag = v.isNewWord && v.isPronunciationFocus
+              ? '🎯✨'
+              : v.isPronunciationFocus
+              ? '🎯'
+              : '✨';
+            return `${tag} ${v.term} (${v.partOfSpeech || 'Vocab'}) — ${v.simpleDefinition || ''}`;
+          }));
+
+  const finalCorrections = validatedMistakes.map((m: any) => ({
     original: m.original,
     corrected: m.corrected,
     explanation: m.explanation,
   }));
 
-  const allVocab = validatedVocab.map((v: any) => {
-    const tag = v.isNewWord && v.isPronunciationFocus
-      ? '🎯✨ [Word & Pronounce]'
-      : v.isPronunciationFocus
-      ? '🎯 [Pronounce]'
-      : '✨';
-    return `${tag} ${v.term} (${v.partOfSpeech || 'Vocab'}) — ${v.simpleDefinition || ''}`;
-  });
-
-  const allRules = validatedGrammar.map((g: any) => `${g.topic}: ${g.rule}`);
+  const finalUsefulPatterns = Array.isArray(rawSummary.usefulPatterns)
+    ? rawSummary.usefulPatterns.map((p: any) => String(p || '').trim()).filter(Boolean)
+    : [];
 
   let rememberThis =
-    typeof parsed?.reviewSummary?.rememberThis === 'string' && parsed.reviewSummary.rememberThis.trim().length > 10
-      ? parsed.reviewSummary.rememberThis.trim()
+    typeof rawSummary.rememberThis === 'string' && rawSummary.rememberThis.trim().length >= 5
+      ? rawSummary.rememberThis.trim()
       : '';
 
   if (!rememberThis) {
     if (validatedMistakes.length > 0) {
-      rememberThis =
-        language === 'pt'
-          ? `Lembre-se disto: Em vez de dizer "${validatedMistakes[0].original}", use "${validatedMistakes[0].corrected}"!`
-          : `Remember this: Instead of saying "${validatedMistakes[0].original}", say "${validatedMistakes[0].corrected}"!`;
+      rememberThis = `Remember this: Instead of saying "${validatedMistakes[0].original}", say "${validatedMistakes[0].corrected}"!`;
     } else if (validatedVocab.length > 0) {
       const termNames = validatedVocab.map((v: any) => v.term).slice(0, 3).join(', ');
-      rememberThis =
-        language === 'pt'
-          ? `Lembre-se disto: A prática ativa das novas expressões (${termNames}) transforma o reconhecimento passivo em confiança espontânea!`
-          : `Remember this: Active practice with your new expressions (${termNames}) turns passive recognition into spontaneous conversational confidence!`;
+      rememberThis = `Remember this: Active practice with your new expressions (${termNames}) turns passive recognition into spontaneous conversational confidence!`;
     } else {
-      rememberThis =
-        language === 'pt'
-          ? 'Lembre-se: Fluência não significa nunca errar, mas reconhecer padrões rapidamente e adotar a fraseologia nativa!'
-          : 'Remember: Fluency is not about never making mistakes; it is about recognizing patterns quickly and adopting natural native phraseology!';
+      rememberThis = 'Remember this: Fluency is not about never making mistakes; it is about recognizing patterns quickly and adopting natural native phraseology!';
     }
   }
 
-  const contentHash = computeNotesContentHash(rawNotes);
+  const contentHash = options.contentHashOverride || computeNotesContentHash(rawNotes);
   const transformation: PedagogicalLessonTransformation = {
     lessonId: options.lessonId || undefined,
     sessionKey: options.canonicalSessionKey,
     sessionDate: options.sessionDate || new Date().toISOString().split('T')[0],
     topic: options.topic || 'Live Coaching Session',
     teacherName: options.teacherName || 'Native Friend',
+    ...(options.effectiveTeacherUid ? { teacherUid: options.effectiveTeacherUid } : {}),
     teacherEmail: options.effectiveTeacherEmail || undefined,
     studentUid: options.studentUid || undefined,
     studentEmail: options.studentEmail || undefined,
@@ -9221,10 +9290,11 @@ Please synthesize and transform these notes according to the Alt+N, Alt+W, and A
       targetedPracticePrompt: `Practice summarizing your views on "${options.topic || 'the topic'}".`,
     },
     reviewSummary: {
-      estimatedMinutes: '5–10 minutes',
-      keyRules: allRules,
-      mustKnowVocabulary: allVocab,
-      essentialCorrections: allCorrections,
+      estimatedMinutes: String(rawSummary.estimatedMinutes || '5–10 minutes').trim(),
+      keyRules: finalKeyRules,
+      mustKnowVocabulary: finalMustKnowVocab,
+      essentialCorrections: finalCorrections,
+      usefulPatterns: finalUsefulPatterns,
       rememberThis,
     },
     rawNotesSnippet: markings.cleanText.slice(0, 300),
@@ -9584,6 +9654,101 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
   }
 
   const contentHash = computeNotesContentHash(rawNotes);
+  const forceRegenerate = Boolean(req.body?.forceRegenerate);
+  const language = (req.body?.language || req.body?.lang || 'pt').toLowerCase().trim();
+  const registeredStudent = (db.students || []).find((s: any) =>
+    (studentUid && (s.uid === studentUid || s.id === studentUid)) ||
+    (existingDoc.studentEmail && (s.email || '').toLowerCase().trim() === existingDoc.studentEmail.toLowerCase().trim())
+  );
+  const profile = (studentUid && db.userProfiles?.[studentUid]) || (existingDoc.studentEmail && db.userProfiles?.[existingDoc.studentEmail]);
+  const authoritativeLevel = profile?.level || profile?.englishLevel || registeredStudent?.level || registeredStudent?.englishLevel || 'intermediario';
+  const cefr = resolveCefrLevel(authoritativeLevel).cefr;
+  const compositeCacheKey = buildPedagogicalCacheKey({
+    canonicalSessionKey: targetSessionKey,
+    contentHash,
+    language: 'en',
+    cefrLevel: cefr,
+  });
+
+  // Avoid duplicate AI calls in production when an identical, verified transformation already exists for this exact contentHash
+  const isTestMockActive = Boolean(process.env.NODE_ENV === 'test' && sessionNoteTransformAttemptExecutorForTesting);
+  if (!forceRegenerate && !isTestMockActive) {
+    const existingDraftTrans =
+      existingDoc.draftTransformation?.contentHash === contentHash
+        ? existingDoc.draftTransformation.transformation
+        : null;
+    const existingApprovedTrans =
+      existingDoc.lastApprovedVersion?.contentHash === contentHash
+        ? existingDoc.lastApprovedVersion.transformation
+        : null;
+    const memoryCachedTrans = db.pedagogicalTransformationsMap?.[compositeCacheKey] || null;
+
+    const reusableTransformation = [existingDraftTrans, existingApprovedTrans, memoryCachedTrans].find(
+      (cand: any) =>
+        cand &&
+        cand.isAiGenerated &&
+        !cand.isFallback &&
+        !cand.isProvisional &&
+        cand.promptVersion === PEDAGOGICAL_PROMPT_VERSION &&
+        !isLegacyGenericTransformation(cand, rawNotes)
+    );
+
+    if (reusableTransformation) {
+      if (existingDoc.draftTransformation?.contentHash === contentHash && existingDoc.draftTransformation?.transformation === reusableTransformation) {
+        return res.json({
+          success: true,
+          cached: true,
+          draftTransformation: existingDoc.draftTransformation,
+          sessionNote: existingDoc,
+        });
+      }
+
+      const currentVersion = existingDoc.currentVersionNumber || 1;
+      const reusedDraft: NoteDraftTransformation = {
+        draftId: `draft_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        versionNumber: currentVersion + 1,
+        status: 'draft',
+        contentHash,
+        rawNotesSnippet: rawNotes.slice(0, 300),
+        transformation: reusableTransformation,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        editorUid: callerUid,
+        editorEmail: req.user.email,
+      };
+
+      const updatedDoc = mergeSessionNoteWithVersioning({
+        existingNote: existingDoc,
+        incomingNote: {
+          ...existingDoc,
+          draftTransformation: reusedDraft,
+          studentUid,
+          teacherUid: existingDoc.teacherUid || callerUid,
+          sessionDate: existingDoc.sessionDate,
+        },
+        author: {
+          authorUid: callerUid,
+          authorEmail: req.user.email,
+          authorRole: (isCallerAdmin ? 'admin' : 'teacher') as 'teacher' | 'admin',
+          teacherName: teacherResolution?.name || (req.user as any)?.name || 'Native Friend',
+        },
+        changeSummary: req.body?.changeSummary || 'Reused validated pedagogical transformation for unchanged notes',
+      });
+
+      if (!db.sessionNotesMap) db.sessionNotesMap = {};
+      db.sessionNotesMap[targetSessionKey] = updatedDoc;
+      await writeDbSync(db);
+      await saveSessionNotesToFirestoreServer(targetSessionKey, updatedDoc).catch(() => null);
+
+      return res.json({
+        success: true,
+        cached: true,
+        draftTransformation: reusedDraft,
+        sessionNote: updatedDoc,
+      });
+    }
+  }
+
   const lockKey = `session_notes_transform:${targetSessionKey}:${contentHash}`;
   const flightLock = await acquireSingleFlightLock(lockKey);
   if (!flightLock.acquired) {
@@ -9608,14 +9773,6 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
   }
 
   try {
-    const language = (req.body?.language || req.body?.lang || 'pt').toLowerCase().trim();
-    const registeredStudent = (db.students || []).find((s: any) =>
-      (studentUid && (s.uid === studentUid || s.id === studentUid)) ||
-      (existingDoc.studentEmail && (s.email || '').toLowerCase().trim() === existingDoc.studentEmail.toLowerCase().trim())
-    );
-    const profile = (studentUid && db.userProfiles?.[studentUid]) || (existingDoc.studentEmail && db.userProfiles?.[existingDoc.studentEmail]);
-    const authoritativeLevel = profile?.level || profile?.englishLevel || registeredStudent?.level || registeredStudent?.englishLevel || 'intermediario';
-
     const coreResult = await executePedagogicalTransformationCore({
       rawNotes,
       topic: existingDoc.topic || 'Live Coaching Session',
@@ -9630,6 +9787,7 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
       studentEmail: existingDoc.studentEmail,
       effectiveTeacherUid: existingDoc.teacherUid || callerUid,
       effectiveTeacherEmail: existingDoc.teacherEmail || req.user.email,
+      contentHashOverride: contentHash,
     });
 
     if (!coreResult.success || !coreResult.transformation) {
@@ -9644,6 +9802,9 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
         attemptsDetails: coreResult.attemptsDetails,
       });
     }
+
+    if (!db.pedagogicalTransformationsMap) db.pedagogicalTransformationsMap = {};
+    db.pedagogicalTransformationsMap[compositeCacheKey] = coreResult.transformation;
 
     const currentVersion = existingDoc.currentVersionNumber || 1;
     const nextDraftVersion = currentVersion + 1;
@@ -11068,14 +11229,8 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
   }
 
   try {
-    // Parse notes using robust notesHtmlParser
+    // Delegate to the single unified executePedagogicalTransformationCore (zero duplicated prompt/AI logic)
     const markings = parseNotesHtml(rawNotes);
-    const correctCount = markings.correctCount;
-    const incorrectCount = markings.incorrectCount;
-    const newWordCount = markings.newWordCount;
-    const pronounceCount = markings.pronounceCount;
-
-    // FASE NF-NOTES.2: Semantic validation — reject empty notes or markup without pedagogical content
     if (!hasValidPedagogicalContent(rawNotes, markings)) {
       return res.status(400).json({
         success: false,
@@ -11086,430 +11241,79 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
       });
     }
 
-    const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || '';
-    const isCooldownActive = Date.now() < geminiQuotaCooldownUntil;
-    let lastFailureCategory: GeminiFailureCategory | null = isCooldownActive ? 'QUOTA_EXCEEDED' : null;
-    let contingencyResult: any = null;
+    const coreResult = await executePedagogicalTransformationCore({
+      rawNotes,
+      topic,
+      sessionDate,
+      teacherName,
+      authoritativeLevel: String(authoritativeLevel),
+      language,
+      callerRole: caller.role,
+      canonicalSessionKey,
+      lessonId: lessonId || undefined,
+      studentUid: cleanUid || studentUid,
+      studentEmail: cleanEmail,
+      effectiveTeacherUid: effectiveTeacherUid || undefined,
+      effectiveTeacherEmail: effectiveTeacherEmail || undefined,
+      contentHashOverride: contentHash,
+    });
 
-    if (apiKey && !isCooldownActive) {
-      const systemInstruction = `You are an elite, Cambridge/CELTA-certified Pedagogical English Language Synthesizer and Master Native Friend Teacher.
-Your mission is to transform raw in-session teacher notes into an ultra-structured, masterclass pedagogical report calibrated to CEFR level (${cefr}).
-The student MUST NEVER see raw, fragmented notes. Instead, produce a polished, structured learning guide strictly in English.
-
-LANGUAGE REQUIREMENT (STRICT 100% ENGLISH OUTPUT):
-- Generate ALL four parts ("mistakesAnalysis" / Analyze Mistakes, "grammarPoints" / Grammar Points, "vocabularyAndExpressions" / Vocabulary & Expressions, and "reviewSummary" / Quick Review) EXCLUSIVELY in natural, clear English (code: "en"), regardless of the language used in the raw notes or any student/request locale.
-- Every AI-authored field — including all titles, grammar topics ("topic"), grammar rules ("rule", "form", "usage"), mistake explanations ("explanation"), common pitfalls ("commonPitfalls"), comparisons ("comparisons"), newly created didactic examples ("twoExamples", "examples", "realExamples", "collocations"), vocabulary definitions ("definitionEn" AND "simpleDefinition"), parts of speech ("partOfSpeech"), categories ("category"), phonetic guides ("phoneticGuide"), and review summaries ("estimatedMinutes", "keyRules", "mustKnowVocabulary", "rememberThis") — MUST be written strictly in English.
-- NEVER write explanations, titles, rules, created examples, definitions, or summaries in Portuguese or any other non-English language. Even if the raw notes contain Portuguese comments, translations, or L1 interference, write all explanations and contrasts strictly in English.
-
-LITERAL QUOTE PRESERVATION & ORIGINAL NOTES INTEGRITY:
-- Preserve literally (verbatim) the original excerpts from the student and the teacher whenever presented as lesson quotes, citations, or classroom examples from the session (such as "original" in "mistakesAnalysis" and "essentialCorrections", or literal utterances quoted from the lesson).
-- Do NOT translate, paraphrase, rewrite, or modify the original session notes or literal student/teacher classroom excerpts. Treat the raw notes strictly as read-only source material.
-
-CRITICAL INSTRUCTIONS ON TEACHER SHORTCUT MARKINGS & TAB ROUTING:
-1. Alt + N (Error / Incorrect Markings):
-   - Items stamped with 'data-tag-type="incorrect"', '✗', 'Instead of:', or error lines MUST be directed and processed appropriately into:
-     a) "mistakesAnalysis" (Tab 1: Analyze Mistakes): student's literal original faulty utterance, natural native English correction (resolving spelling, phrasing, or grammatical slips into polished English), category, grammatical explanation in English (addressing L1 interference in English), two natural created examples in English, and common pitfalls in English. Even if the teacher wrote an isolated mistake without explicit correction (e.g. spelling slips or words marked with ✗), deduce and provide the accurate, natural native English correction.
-     b) "grammarPoints" (Tab 2: Grammar Points): whenever an error involves a systemic grammatical rule/structure (e.g. modal verbs without "to", stative verbs, auxiliary verbs, verb tenses, dependent prepositions, conditionals, word order), elaborate the corresponding topic title, rule, syntax (FORM), usage, created examples, common mistakes, and comparisons strictly in English.
-        CRITICAL FIDELITY RULES FOR GRAMMAR POINTS:
-        * ONLY generate grammar points that are directly substantiated by the student's actual session errors or notes.
-        * If there is only ONE systemic grammar error in the notes (for example, using "to" after the modal "can"), provide EXACTLY ONE corresponding grammar point. DO NOT fabricate or invent a second grammar point!
-        * If there are no systemic grammar errors in the notes, "grammarPoints" MUST be an empty array [].
-        * NEVER fabricate non-existent or ungrounded grammar points.
-2. Alt + W (New Word) & Alt + P (Pronunciation Markings):
-   - Items stamped with 'data-tag-type="new-word"', '[New Word]', 'data-tag-type="pronounce"', '[Pronounce]' or standalone vocabulary words MUST be directed and processed into:
-     "vocabularyAndExpressions" (Tab 3: Vocabulary & Expressions).
-   - For Alt+W / vocabulary: provide part of speech, register, "definitionEn" AND "simpleDefinition" both in clear English adapted to CEFR ${cefr}, collocations in English, real examples in English, and synonyms in English.
-   - For Alt+P: mark partOfSpeech as "Pronunciation Focus", provide clear syllable stress breakdown in English, phonetic guide with IPA, common pronunciation slips to avoid in English, and conversational examples in English.
-3. CRITICAL RULES FOR CONTENT FIDELITY & EMPTY SECTIONS:
-   - Exclusively generate content grounded in and substantiated by the teacher's actual notes.
-   - If a section legitimately has no corresponding content in the notes, it MUST be returned as an empty array []:
-     * If the notes contain NO student errors: "mistakesAnalysis" MUST be []. NEVER fabricate non-existent student errors, sentences, or phrases!
-     * If the notes contain NO systemic grammar errors: "grammarPoints" MUST be []. NEVER fabricate synthetic grammar points!
-     * If the notes contain NO vocabulary or pronunciation items (e.g. session only had grammar corrections): "vocabularyAndExpressions" MUST be []. NEVER fabricate synthetic vocabulary items (such as "catch up", "workload", "streamline")!
-   - If a term contains a spelling slip (e.g. the teacher recorded "blury", which is standardly spelled "blurry"), evaluate and identify the correct spelling "blurry", explain the spelling rule/distinction in English, and provide accurate CEFR ${cefr} definitions ("definitionEn" and "simpleDefinition") exclusively in English, along with natural real-world examples, collocations, and register.
-   - In "reviewSummary", ALWAYS generate a complete object in English:
-     * "estimatedMinutes": "3–5 minutes" for short notes, "5–10 minutes" for standard notes
-     * "keyRules": concise bullet titles of grammar points covered strictly in English (empty array [] if no grammar points)
-     * "mustKnowVocabulary": concise list of target terms from vocabularyAndExpressions (empty array [] if no vocabulary items)
-     * "essentialCorrections": concise list of original and corrected pairs [{"original": "...", "corrected": "..."}] from mistakesAnalysis, preserving literal "original" excerpts (empty array [] if no errors)
-     * "rememberThis": an inspiring, memorable golden takeaway rule strictly in English (at least 15 characters), focused on the items recorded in the session.
-4. CEFR LEVEL ADAPTATION:
-   - There is NO separate CEFR tab. Instead, ALL four parts (1. Analyze Mistakes, 2. Grammar Points, 3. Vocabulary & Expressions, and 4. Quick Review) MUST be intelligently elaborated in English, calibrated to the student's current CEFR level (${cefr}).
-5. QUICK REVIEW (reviewSummary) MANDATE & TOKEN OPTIMIZATION:
-   - In "reviewSummary", provide a concise English summary without duplicating full multi-sentence analyses or definitions already stated in "vocabularyAndExpressions" and "grammarPoints":
-     * "estimatedMinutes": e.g. "5–10 minutes" (or "3–5 minutes" for short sessions)
-     * "keyRules": concise bullet titles of grammar points covered in English (empty array [] if no grammar errors)
-     * "mustKnowVocabulary": concise list of target terms from vocabularyAndExpressions (e.g. ["term 1", "term 2"]), avoiding redundant definition paragraphs
-     * "essentialCorrections": concise list of original and corrected pairs [{"original": "...", "corrected": "..."}] from mistakesAnalysis
-     * "rememberThis": High-impact golden takeaway rule in English (at least 15 characters).
-
-You MUST produce a JSON object strictly conforming to this schema:
-{
-  "mistakesAnalysis": [
-    {
-      "id": "mistake-1",
-      "original": "Student's literal original utterance from the lesson (preserved verbatim)",
-      "corrected": "Polished, natural native English correction",
-      "category": "grammar" | "vocabulary" | "collocation" | "preposition" | "pronunciation" | "phrasing",
-      "explanation": "Crystal-clear grammatical rule explanation in English highlighting why the error occurred and how to fix it, calibrated to CEFR ${cefr}",
-      "twoExamples": ["Created example 1 in natural English", "Created example 2 in natural English"],
-      "commonPitfalls": "Common mistake learners make with this structure (explained strictly in English)"
-    }
-  ],
-  "grammarPoints": [
-    {
-      "id": "grammar-1",
-      "topic": "Grammar topic title in English",
-      "rule": "Detailed rule explanation in English adapted to CEFR ${cefr}",
-      "form": "Formula / Syntax breakdown in English",
-      "usage": "When and why native speakers use this (in English)",
-      "examples": ["Created example 1 in English", "Created example 2 in English"],
-      "commonMistakes": "Mistake to avoid (in English)",
-      "comparisons": "Contrast with other structures or L1 interference (written strictly in English)"
-    }
-  ],
-  "vocabularyAndExpressions": [
-    {
-      "id": "vocab-1",
-      "term": "Word, phrasal verb, or pronunciation term",
-      "partOfSpeech": "Part of speech in English (e.g. Phrasal Verb, Noun, Pronunciation Focus)",
-      "definitionEn": "Simple, accurate definition EXCLUSIVELY in English tailored to student level ${cefr} and part of speech",
-      "simpleDefinition": "Clear, accessible pedagogical definition/explanation EXCLUSIVELY in English adapted to CEFR ${cefr}",
-      "collocations": ["Collocation 1 in English", "Collocation 2 in English"],
-      "realExamples": ["Real-world sentence 1 in English", "Real-world sentence 2 in English"],
-      "synonyms": ["Synonym 1 in English", "Synonym 2 in English"],
-      "register": "informal" | "neutral" | "formal" | "idiomatic",
-      "category": "Thematic category in English or 'Pronunciation & Phonetics (Alt+P)' / 'New Words & Expressions (Alt+W)'",
-      "phoneticGuide": "Phonetic / syllable stress guide in English with IPA",
-      "isPronunciationFocus": false,
-      "isNewWord": true
-    }
-  ],
-  "reviewSummary": {
-    "estimatedMinutes": "5–10 minutes",
-    "keyRules": ["Key grammar rule titles strictly in English"],
-    "mustKnowVocabulary": ["Target terms from vocabularyAndExpressions"],
-    "essentialCorrections": [{"original": "...", "corrected": "..."}],
-    "rememberThis": "Memorable takeaway focused on the session items strictly in English"
-  }
-}
-
-Return JSON only without Markdown backticks.`;
-
-      // Security Hotfix (Etapa 2): Privacy enforcement — studentUid and email REMOVED from prompt.
-      // Untrusted raw notes are cleanly delimited and passed.
-      const prompt = `Pedagogical Parameters:
-- CEFR Level: ${cefr}
-- Lesson Date: ${sessionDate}
-- Session Topic: ${topic}
-- Native Friend Teacher: ${teacherName}
-- Output Language: English (en) — MANDATORY for all generated pedagogical content
-
-Raw In-Session Notes to transform (read-only source — do NOT translate or modify):
-"""
-${rawNotes}
-"""
-
-Please synthesize and transform these notes according to the Alt+N, Alt+W, and Alt+P routing rules, adapting deeply to CEFR ${cefr}.
-- Generate ALL four parts (Analyze Mistakes / mistakesAnalysis, Grammar Points / grammarPoints, Vocabulary & Expressions / vocabularyAndExpressions, and Quick Review / reviewSummary) strictly in English, regardless of the language of the raw notes.
-- Write all titles, grammar rules, pedagogical explanations, created examples, definitions (both definitionEn and simpleDefinition), pitfalls, comparisons, and review summaries (including keyRules and rememberThis) exclusively in English.
-- Preserve literally (verbatim) the original excerpts from the student and the teacher when presented as quotes or examples from the lesson (such as "original" utterances), without translating or modifying them.
-- Do NOT translate or modify the original notes.
-- If notes contain only errors/grammar, provide only the grounded mistakes and grammar points, and leave vocabularyAndExpressions empty [].
-- If notes contain only vocabulary (such as a single word like "blury"), evaluate the term (including spelling accuracy like "blurry"), leave mistakesAnalysis and grammarPoints empty without fabricating errors.
-- If only one grammar error exists, provide only that one grammar point without inventing a second rule.
-- Preserve all teacher markings and required expressions.`;
-
-      // HOTFIX 3-MODEL CONTINGENCY: Sequential failover across up to 3 verified models on recoverable errors
-      contingencyResult = await executeGeminiWithContingency({
-        feature: 'pedagogical_transform',
-        systemInstruction,
-        untrustedUserDataPrompt: prompt,
-        callerRole: caller.role,
-        apiKey,
-        temperature: 0.35,
-        validator: (json) => validatePedagogicalAiResponse(json, markings, cefr, language),
-      });
-
-      if (contingencyResult.success && contingencyResult.parsedJson) {
-        const parsed = contingencyResult.parsedJson;
-
-        if (parsed && (Array.isArray(parsed.mistakesAnalysis) || Array.isArray(parsed.vocabularyAndExpressions))) {
-          // Process mistakes directly preserving AI native corrections
-          const rawErrMap = new Map<string, typeof markings.errors[0]>();
-          markings.errors.forEach((e) => rawErrMap.set(e.original.toLowerCase().trim(), e));
-
-          const validatedMistakes: any[] = [];
-          if (markings.errors.length > 0) {
-            (parsed.mistakesAnalysis || []).forEach((m: any) => {
-              const origKey = String(m?.original || '').toLowerCase().trim();
-              const rawErr = Array.from(rawErrMap.values()).find(
-                (e) => origKey.includes(e.original.toLowerCase().trim()) || e.original.toLowerCase().trim().includes(origKey)
-              );
-              const originalText = rawErr ? rawErr.original : (m.original || 'Mistake');
-              // Prioritize teacher explicit correction if provided, otherwise model native correction
-              const correctedText = (rawErr && rawErr.corrected) ? rawErr.corrected : (m.corrected || originalText);
-
-              validatedMistakes.push({
-                id: `mistake-${validatedMistakes.length + 1}`,
-                original: originalText,
-                corrected: correctedText,
-                category: m.category || 'grammar',
-                explanation: m.explanation || `In natural spoken English, phrasing this structure as "${correctedText}" is the native formulation.`,
-                twoExamples: Array.isArray(m.twoExamples) && m.twoExamples.length > 0
-                  ? m.twoExamples
-                  : (Array.isArray(m.examples) ? m.examples : []),
-                commonPitfalls: m.commonPitfalls || '',
-                isPendingConfirmation: false,
-              });
-              if (rawErr) {
-                rawErrMap.delete(rawErr.original.toLowerCase().trim());
-              }
-            });
-          }
-
-          // Strict validation of vocabulary: terms MUST be in markings.newWords, markings.pronounceItems, or markings.vocabItems
-          const validTermsSet = new Set<string>([
-            ...markings.newWords.map((w) => w.toLowerCase().trim()),
-            ...markings.pronounceItems.map((p) => p.toLowerCase().trim()),
-            ...markings.vocabItems.map((v) => v.toLowerCase().trim()),
-          ]);
-
-          const validatedVocab: any[] = [];
-          if (validTermsSet.size > 0) {
-            (parsed.vocabularyAndExpressions || []).forEach((v: any) => {
-              const termKey = String(v?.term || '').toLowerCase().trim();
-              const matchedTarget = Array.from(validTermsSet).find(
-                (target) => isPedagogicalTermMatch(termKey, target)
-              );
-              if (matchedTarget) {
-                const isPronounce = markings.pronounceItems.some(
-                  (p) => isPedagogicalTermMatch(p, matchedTarget)
-                );
-                const isNewWord = markings.newWords.some(
-                  (w) => isPedagogicalTermMatch(w, matchedTarget)
-                ) || markings.vocabItems.some(
-                  (w) => isPedagogicalTermMatch(w, matchedTarget)
-                );
-
-                const rawExamples = Array.isArray(v.realExamples) ? v.realExamples : [];
-                const formattedExamples = rawExamples
-                  .map((ex: any) => String(ex || '').trim().replace(/^["']|["']$/g, ''))
-                  .filter(Boolean);
-
-                validatedVocab.push({
-                  ...v,
-                  id: `vocab-${validatedVocab.length + 1}`,
-                  partOfSpeech: v.partOfSpeech || (isPronounce ? 'Pronunciation Focus' : 'Vocabulary Item'),
-                  realExamples: formattedExamples,
-                  category: isNewWord && isPronounce
-                    ? 'New Word & Pronunciation (Alt+W + Alt+P)'
-                    : isPronounce
-                    ? 'Pronunciation & Phonetics (Alt+P)'
-                    : 'New Words & Expressions (Alt+W)',
-                  isPronunciationFocus: isPronounce,
-                  isNewWord: isNewWord,
-                });
-                validTermsSet.delete(matchedTarget);
-              }
-            });
-          }
-
-          // Authentic grammar points generated by the model (strictly when present, zero forced padding)
-          let validatedGrammar: any[] = [];
-          if (markings.errors.length > 0) {
-            const rawGrammarList = Array.isArray(parsed.grammarPoints) ? parsed.grammarPoints : [];
-            validatedGrammar = rawGrammarList
-              .filter((g: any) => g && g.topic && g.rule)
-              .map((g: any, idx: number) => ({
-                id: g.id || `grammar-${idx + 1}`,
-                topic: String(g.topic).trim(),
-                rule: String(g.rule).trim(),
-                form: String(g.form || '').trim(),
-                usage: String(g.usage || '').trim(),
-                examples: Array.isArray(g.examples)
-                  ? g.examples.map((ex: any) => String(ex || '').trim().replace(/^["']|["']$/g, '')).filter(Boolean)
-                  : [],
-                commonMistakes: String(g.commonMistakes || '').trim(),
-                comparisons: String(g.comparisons || '').trim(),
-              }));
-          }
-
-          const allCorrections = validatedMistakes.map((m: any) => ({
-            original: m.original,
-            corrected: m.corrected,
-            explanation: m.explanation,
-          }));
-
-          const allVocab = validatedVocab.map((v: any) => {
-            const tag = v.isNewWord && v.isPronunciationFocus
-              ? '🎯✨ [Word & Pronounce]'
-              : v.isPronunciationFocus
-              ? '🎯 [Pronounce]'
-              : '✨';
-            return `${tag} ${v.term} (${v.partOfSpeech || 'Vocab'}) — ${v.simpleDefinition || ''}`;
-          });
-
-          const allRules = validatedGrammar.map((g: any) => `${g.topic}: ${g.rule}`);
-
-          let rememberThis =
-            typeof parsed?.reviewSummary?.rememberThis === 'string' && parsed.reviewSummary.rememberThis.trim().length > 10
-              ? parsed.reviewSummary.rememberThis.trim()
-              : '';
-
-          if (!rememberThis) {
-            if (validatedMistakes.length > 0) {
-              rememberThis =
-                language === 'pt'
-                  ? `Lembre-se disto: Em vez de dizer "${validatedMistakes[0].original}", use "${validatedMistakes[0].corrected}"!`
-                  : `Remember this: Instead of saying "${validatedMistakes[0].original}", say "${validatedMistakes[0].corrected}"!`;
-            } else if (validatedVocab.length > 0) {
-              const termNames = validatedVocab.map((v: any) => v.term).slice(0, 3).join(', ');
-              rememberThis =
-                language === 'pt'
-                  ? `Lembre-se disto: A prática ativa das novas expressões (${termNames}) transforma o reconhecimento passivo em confiança espontânea!`
-                  : `Remember this: Active practice with your new expressions (${termNames}) turns passive recognition into spontaneous conversational confidence!`;
-            } else {
-              rememberThis =
-                language === 'pt'
-                  ? 'Lembre-se: Fluência não significa nunca errar, mas reconhecer padrões rapidamente e adotar a fraseologia nativa!'
-                  : 'Remember: Fluency is not about never making mistakes; it is about recognizing patterns quickly and adopting natural native phraseology!';
-            }
-          }
-
-          const transformation = {
-            lessonId: lessonId || undefined,
-            sessionKey: canonicalSessionKey,
-            sessionDate,
-            topic,
-            teacherName,
-            teacherUid: effectiveTeacherUid || undefined,
-            teacherEmail: effectiveTeacherEmail || undefined,
-            studentUid: cleanUid || studentUid,
-            studentEmail: cleanEmail,
-            studentLevel: String(authoritativeLevel),
-            cefrLevel: cefr,
-            contentHash,
-            language,
-            promptVersion: PEDAGOGICAL_PROMPT_VERSION,
-            isAiGenerated: true,
-            isFallback: false,
-            isProvisional: false,
-            source: 'gemini' as const,
-            modelUsed: contingencyResult.modelUsed || GEMINI_FIXED_MODEL,
-            mistakesAnalysis: validatedMistakes,
-            grammarPoints: validatedGrammar,
-            vocabularyAndExpressions: validatedVocab,
-            levelAdaptation: parsed.levelAdaptation || {
-              cefrLevel: cefr,
-              levelLabel: cefrMeta.labelEn,
-              nativeInterferenceNotes: 'Focus on native collocations and avoiding literal calques.',
-              complexityAdjustmentAdvice: 'Review key corrections out loud before each session.',
-              targetedPracticePrompt: `Practice summarizing your views on "${topic}".`,
-            },
-            reviewSummary: {
-              estimatedMinutes: '5–10 minutes',
-              keyRules: allRules,
-              mustKnowVocabulary: allVocab,
-              essentialCorrections: allCorrections,
-              rememberThis,
-            },
-            rawNotesSnippet: markings.cleanText.slice(0, 300),
-            correctStampsCount: correctCount,
-            incorrectStampsCount: incorrectCount,
-            newWordStampsCount: newWordCount,
-            pronounceStampsCount: pronounceCount,
-            generatedAt: new Date().toISOString(),
-          };
-
-          db.pedagogicalTransformationsMap[compositeCacheKey] = transformation;
-          if (language === 'pt') {
-            db.pedagogicalTransformationsMap[canonicalSessionKey] = transformation;
-          }
-          await savePedagogicalTransformationToFirestoreServer(compositeCacheKey, transformation, { rawNotes });
-          await syncTransformationVocabToDictionary(transformation, cleanUid, effectiveEmail);
-
-          // FASE 4B.9: Record single, validated pedagogical review in Student's My Journal via Firebase Admin SDK
-          let recordedJournalEntry: any = null;
-          try {
-            const journalRes = await recordLessonReviewInStudentJournalServer({
-              studentUid: cleanUid,
-              studentEmail: effectiveEmail,
-              transformation,
-              compositeCacheKey,
-            });
-            if (journalRes.success && journalRes.entry) {
-              recordedJournalEntry = journalRes.entry;
-              if (!db.studentJournalMap) db.studentJournalMap = {};
-              const currentJournal =
-                (cleanUid && db.studentJournalMap[cleanUid]) ||
-                (effectiveEmail && db.studentJournalMap[effectiveEmail]) ||
-                [];
-              const filteredJournal = currentJournal.filter((e: any) => e.id !== journalRes.entry.id);
-              const updatedJournal = [journalRes.entry, ...filteredJournal];
-              if (cleanUid) db.studentJournalMap[cleanUid] = updatedJournal;
-              if (effectiveEmail) db.studentJournalMap[effectiveEmail] = updatedJournal;
-            }
-          } catch (journalErr) {
-            console.warn('Backend My Journal lesson review save notice:', journalErr);
-          }
-
-          await writeDbSync(db);
-
-          const sanitizedAttempts = (contingencyResult?.attemptsDetails || []).map((att: any) => ({
-            attemptNumber: att.attemptNumber,
-            model: att.model,
-            durationMs: typeof att.durationMs === 'number' ? att.durationMs : 0,
-            success: Boolean(att.success),
-            category: att.category || (att.success ? undefined : 'INVALID_RESPONSE'),
-            safeReason: att.safeReason || (att.success ? 'Success' : 'Execution failed'),
-            finishReason: att.finishReason || undefined,
-            isMaxTokens: Boolean(att.isMaxTokens || att.finishReason === 'MAX_TOKENS'),
-            isParseError: Boolean(att.isParseError),
-            isValidationError: Boolean(att.isValidationError),
-          }));
-
-          return res.json({
-            success: true,
-            cached: false,
-            transformation,
-            journalEntry: recordedJournalEntry,
-            attemptsDetails: sanitizedAttempts,
-          });
-        }
-      } else if (contingencyResult?.error) {
-        lastFailureCategory = contingencyResult.error.category as GeminiFailureCategory;
-        if (contingencyResult.error.statusCode === 429 || lastFailureCategory === 'QUOTA_EXCEEDED') {
-          geminiQuotaCooldownUntil = Date.now() + GEMINI_QUOTA_COOLDOWN_MS;
-        }
+    if (coreResult.success && coreResult.transformation) {
+      const transformation = coreResult.transformation;
+      db.pedagogicalTransformationsMap[compositeCacheKey] = transformation;
+      if (language === 'pt') {
+        db.pedagogicalTransformationsMap[canonicalSessionKey] = transformation;
       }
+      await savePedagogicalTransformationToFirestoreServer(compositeCacheKey, transformation, { rawNotes });
+      await syncTransformationVocabToDictionary(transformation, cleanUid, effectiveEmail);
+
+      // FASE 4B.9: Record single, validated pedagogical review in Student's My Journal via Firebase Admin SDK
+      let recordedJournalEntry: any = null;
+      try {
+        const journalRes = await recordLessonReviewInStudentJournalServer({
+          studentUid: cleanUid,
+          studentEmail: effectiveEmail,
+          transformation,
+          compositeCacheKey,
+        });
+        if (journalRes.success && journalRes.entry) {
+          recordedJournalEntry = journalRes.entry;
+          if (!db.studentJournalMap) db.studentJournalMap = {};
+          const currentJournal =
+            (cleanUid && db.studentJournalMap[cleanUid]) ||
+            (effectiveEmail && db.studentJournalMap[effectiveEmail]) ||
+            [];
+          const filteredJournal = currentJournal.filter((e: any) => e.id !== journalRes.entry.id);
+          const updatedJournal = [journalRes.entry, ...filteredJournal];
+          if (cleanUid) db.studentJournalMap[cleanUid] = updatedJournal;
+          if (effectiveEmail) db.studentJournalMap[effectiveEmail] = updatedJournal;
+        }
+      } catch (journalErr) {
+        console.warn('Backend My Journal lesson review save notice:', journalErr);
+      }
+
+      await writeDbSync(db);
+
+      return res.json({
+        success: true,
+        cached: false,
+        transformation,
+        journalEntry: recordedJournalEntry,
+        attemptsDetails: coreResult.attemptsDetails || [],
+      });
     }
 
-    // Fail transparently: zero invented/synthetic pedagogical feedback when contingency models fail!
-    const sanitizedAttempts = (contingencyResult?.attemptsDetails || []).map((att: any) => ({
-      attemptNumber: att.attemptNumber,
-      model: att.model,
-      durationMs: typeof att.durationMs === 'number' ? att.durationMs : 0,
-      success: Boolean(att.success),
-      category: att.category || (att.success ? undefined : 'INVALID_RESPONSE'),
-      safeReason: att.safeReason || (att.success ? 'Success' : 'Execution failed'),
-      finishReason: att.finishReason || undefined,
-      isMaxTokens: Boolean(att.isMaxTokens || att.finishReason === 'MAX_TOKENS'),
-      isParseError: Boolean(att.isParseError),
-      isValidationError: Boolean(att.isValidationError),
-    }));
-
-    const statusCode = contingencyResult?.error?.statusCode === 429 ? 429 : 503;
+    const statusCode = coreResult.statusCode || 503;
     return res.status(statusCode).json({
       success: false,
       error: 'AiUnavailable',
-      category: lastFailureCategory || 'SERVICE_UNAVAILABLE',
+      category: coreResult.category || 'SERVICE_UNAVAILABLE',
       message: language === 'pt'
         ? 'O serviço pedagógico de IA está temporariamente indisponível após tentativa com os modelos de contingência. As anotações originais do professor foram preservadas intactas.'
         : 'The pedagogical AI service is temporarily unavailable after trying contingency models. Original teacher notes have been preserved.',
-      attemptsCount: contingencyResult?.attemptsCount || 1,
-      modelsAttempted: contingencyResult?.modelsAttempted || resolveGeminiContingencyModels(),
-      attemptsDetails: sanitizedAttempts,
+      attemptsCount: coreResult.attemptsCount || 1,
+      modelsAttempted: coreResult.modelsAttempted || resolveGeminiContingencyModels(),
+      attemptsDetails: coreResult.attemptsDetails || [],
     });
   } finally {
     await flightLock.release();

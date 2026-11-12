@@ -31,6 +31,7 @@ import { formatDateInTimeZone } from '../utils/timezone';
 import { speakEnglish } from '../utils/audio';
 import {
   PedagogicalLessonTransformation,
+  fetchPedagogicalTransformation,
   resolveCefrLevel,
   extractNotesMarkings,
   computeNotesHash,
@@ -794,11 +795,14 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
       `🎓 Level: ${transformation.cefrLevel} (${levelLabel})`,
       `\n🎯 REMEMBER THIS:`,
       summary.rememberThis,
-      `\n💬 ALL ESSENTIAL CORRECTIONS (Alt + N):`,
+      `\n💬 KEY CORRECTIONS (Alt + N):`,
       ...summary.essentialCorrections.map((c) => `✗ ${c.original}  ➜  ✓ ${c.corrected}`),
-      `\n⚡ KEY GRAMMAR RULES (Alt + N):`,
+      `\n⚡ MOST IMPORTANT GRAMMAR RULES (Alt + N):`,
       ...summary.keyRules.map((r, i) => `${i + 1}. ${r}`),
-      `\n✨ MUST-KNOW VOCABULARY & PRONUNCIATION (Alt + W / Alt + P):`,
+      ...(Array.isArray(summary.usefulPatterns) && summary.usefulPatterns.length > 0
+        ? [`\n🗣️ USEFUL SENTENCE PATTERNS:`, ...summary.usefulPatterns.map((p) => `• ${p}`)]
+        : []),
+      `\n✨ MOST IMPORTANT VOCABULARY & PRONUNCIATION (Alt + W / Alt + P):`,
       ...summary.mustKnowVocabulary.map((v) => `• ${v}`),
     ].join('\n');
 
@@ -1269,7 +1273,18 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                           </div>
                         )}
 
-                        {/* Natural Examples (if any) */}
+                        {/* Underlying Grammar Rule / Pattern */}
+                        {item.grammarRule &&
+                          item.grammarRule.trim() !== (item.explanation || '').trim() && (
+                            <div className="text-xs text-slate-700 bg-blue-50/50 border border-blue-100 rounded-lg px-2.5 py-1.5 ml-1">
+                              <span className="font-bold text-[#1C4C96]">
+                                {isEn ? 'Grammar Rule / Pattern:' : 'Regra / Padrão Gramatical:'}
+                              </span>{' '}
+                              <span>{item.grammarRule}</span>
+                            </div>
+                          )}
+
+                        {/* Natural Examples (2–4 examples) */}
                         {Array.isArray(item.twoExamples) && item.twoExamples.length > 0 && (
                           <div className="pt-2 border-t border-slate-100 pl-1 text-xs space-y-1">
                             <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
@@ -1291,6 +1306,17 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                           <div className="text-[11px] text-amber-900 bg-amber-50/70 px-2.5 py-1.5 rounded-lg border border-amber-200/60 flex items-center gap-1.5">
                             <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
                             <span><strong>{isEn ? 'Watch out:' : 'Atenção:'}</strong> {item.commonPitfalls}</span>
+                          </div>
+                        )}
+
+                        {/* Similar Forms Comparison (when useful) */}
+                        {item.similarFormsComparison && (
+                          <div className="text-[11px] text-slate-700 bg-slate-50 px-2.5 py-1.5 rounded-lg border border-slate-200/80 flex items-start gap-1.5">
+                            <Compass className="w-3.5 h-3.5 text-[#1C4C96] shrink-0 mt-0.5" />
+                            <span>
+                              <strong>{isEn ? 'Similar forms:' : 'Formas semelhantes:'}</strong>{' '}
+                              {item.similarFormsComparison}
+                            </span>
                           </div>
                         )}
                       </div>
@@ -1414,6 +1440,13 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                             <strong>{isEn ? 'Watch out:' : 'Atenção:'}</strong> {gp.commonMistakes}
                           </div>
                         )}
+
+                        {/* Short Comparison with Similar Structures */}
+                        {gp.comparisons && (
+                          <div className="ml-7 text-[11px] p-2 rounded-lg bg-blue-50/60 text-[#062863] border border-blue-200/60">
+                            <strong>{isEn ? 'Similar structures:' : 'Estruturas semelhantes:'}</strong> {gp.comparisons}
+                          </div>
+                        )}
                       </div>
                     ))}
 
@@ -1527,110 +1560,177 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                     </div>
                   )}
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
-                    {transformation.vocabularyAndExpressions.map((v, idx) => {
-                      const isPronounce = v.isPronunciationFocus || v.partOfSpeech === 'Pronunciation Focus' || v.category?.toLowerCase().includes('pronounc');
-                      const isNewWord = v.category?.toLowerCase().includes('new word') || v.partOfSpeech?.toLowerCase().includes('new');
+                  {transformation.vocabularyAndExpressions.length > 0 ? (
+                    <div className="space-y-4">
+                      {Array.from(
+                        transformation.vocabularyAndExpressions.reduce((acc, item) => {
+                          const cat =
+                            (item.category || '').trim() ||
+                            (isEn ? 'Session Vocabulary & Expressions' : 'Vocabulário & Expressões da Aula');
+                          if (!acc.has(cat)) acc.set(cat, []);
+                          acc.get(cat)!.push(item);
+                          return acc;
+                        }, new Map<string, typeof transformation.vocabularyAndExpressions>())
+                      ).map(([categoryTitle, items]) => (
+                        <div key={categoryTitle} className="space-y-2.5">
+                          <div className="flex items-center gap-2 px-1">
+                            <Layers className="w-3.5 h-3.5 text-purple-600 shrink-0" />
+                            <h4 className="text-xs font-bold uppercase tracking-wider text-purple-900">
+                              {categoryTitle}
+                            </h4>
+                            <span className="text-[10px] font-semibold text-purple-600 bg-purple-50 border border-purple-200/70 px-1.5 py-0.5 rounded-full">
+                              {items.length}
+                            </span>
+                          </div>
 
-                      return (
-                        <div
-                          key={v.id || idx}
-                          className="p-4.5 rounded-2xl bg-white border border-slate-200/90 shadow-2xs hover:border-slate-300 transition-all space-y-2.5 flex flex-col justify-between"
-                        >
-                          <div className="space-y-2">
-                            <div className="flex items-center justify-between gap-2">
-                              <span
-                                className={`px-2 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wider ${
-                                  isPronounce
-                                    ? 'bg-purple-50 text-purple-800 border border-purple-200/60'
-                                    : isNewWord
-                                    ? 'bg-blue-50 text-blue-800 border border-blue-200/60'
-                                    : 'bg-slate-100 text-slate-700'
-                                }`}
-                              >
-                                {isPronounce
-                                  ? (isEn ? 'Pronunciation' : 'Pronúncia')
-                                  : isNewWord
-                                  ? (isEn ? 'New Term' : 'Novo Termo')
-                                  : v.category || (isEn ? 'Vocabulary' : 'Vocabulário')}
-                              </span>
-                              <div className="flex items-center gap-1.5 flex-wrap justify-end">
-                                {(v.cefrLevel || transformation.cefrLevel) && (
-                                  <span className="text-[10px] font-black text-white bg-[#000035] px-1.5 py-0.5 rounded uppercase tracking-wider shrink-0 select-none shadow-2xs">
-                                    {v.cefrLevel || transformation.cefrLevel}
-                                  </span>
-                                )}
-                                <span className="inline-flex items-center gap-1 text-[10px] text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200/80 font-semibold shadow-2xs">
-                                  <Check className="w-3 h-3 text-emerald-600" />
-                                  <span>{isEn ? 'In My Dictionary' : 'No Meu Dicionário'}</span>
-                                </span>
-                                <span className="text-[10px] font-bold text-[#1C4C96] bg-[#9AB4FF]/20 border border-[#9AB4FF]/40 px-1.5 py-0.5 rounded uppercase tracking-wider shrink-0 select-none">
-                                  {v.partOfSpeech}
-                                </span>
-                              </div>
-                            </div>
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+                            {items.map((v, idx) => {
+                              const isPronounce =
+                                v.isPronunciationFocus ||
+                                v.partOfSpeech === 'Pronunciation Focus' ||
+                                v.category?.toLowerCase().includes('pronounc');
+                              const isNewWord =
+                                v.isNewWord ||
+                                v.category?.toLowerCase().includes('new word') ||
+                                v.partOfSpeech?.toLowerCase().includes('new');
+                              const registerDetail =
+                                v.registerNote ||
+                                (v.register && v.register !== 'neutral' ? v.register : '');
 
-                            <div className="flex items-center justify-between">
-                              <h4 className="font-bold text-base text-[#000035] tracking-tight">{v.term}</h4>
-                              <button
-                                type="button"
-                                onClick={() => speakEnglish(v.term)}
-                                className="w-7 h-7 rounded-lg bg-slate-50 hover:bg-slate-100 text-purple-700 flex items-center justify-center cursor-pointer transition border border-slate-200 shadow-2xs"
-                                title={isEn ? 'Listen to pronunciation' : 'Ouvir pronúncia'}
-                              >
-                                <Volume2 className="w-3.5 h-3.5" />
-                              </button>
-                            </div>
+                              return (
+                                <div
+                                  key={v.id || idx}
+                                  className="p-4.5 rounded-2xl bg-white border border-slate-200/90 shadow-2xs hover:border-slate-300 transition-all space-y-2.5 flex flex-col justify-between"
+                                >
+                                  <div className="space-y-2">
+                                    <div className="flex items-center justify-between gap-2">
+                                      <span
+                                        className={`px-2 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wider ${
+                                          isPronounce
+                                            ? 'bg-purple-50 text-purple-800 border border-purple-200/60'
+                                            : isNewWord
+                                            ? 'bg-blue-50 text-blue-800 border border-blue-200/60'
+                                            : 'bg-slate-100 text-slate-700'
+                                        }`}
+                                      >
+                                        {isPronounce
+                                          ? isEn
+                                            ? 'Pronunciation'
+                                            : 'Pronúncia'
+                                          : isNewWord
+                                          ? isEn
+                                            ? 'New Term'
+                                            : 'Novo Termo'
+                                          : v.category || (isEn ? 'Vocabulary' : 'Vocabulário')}
+                                      </span>
+                                      <div className="flex items-center gap-1.5 flex-wrap justify-end">
+                                        {(v.cefrLevel || transformation.cefrLevel) && (
+                                          <span className="text-[10px] font-black text-white bg-[#000035] px-1.5 py-0.5 rounded uppercase tracking-wider shrink-0 select-none shadow-2xs">
+                                            {v.cefrLevel || transformation.cefrLevel}
+                                          </span>
+                                        )}
+                                        <span className="inline-flex items-center gap-1 text-[10px] text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200/80 font-semibold shadow-2xs">
+                                          <Check className="w-3 h-3 text-emerald-600" />
+                                          <span>{isEn ? 'In My Dictionary' : 'No Meu Dicionário'}</span>
+                                        </span>
+                                        <span className="text-[10px] font-bold text-[#1C4C96] bg-[#9AB4FF]/20 border border-[#9AB4FF]/40 px-1.5 py-0.5 rounded uppercase tracking-wider shrink-0 select-none">
+                                          {v.partOfSpeech}
+                                        </span>
+                                      </div>
+                                    </div>
 
-                            {v.phoneticGuide && (
-                              <div className="text-xs text-purple-900 font-mono bg-purple-50/50 px-2 py-0.5 rounded border border-purple-100 inline-block">
-                                {v.phoneticGuide}
-                              </div>
-                            )}
+                                    <div className="flex items-center justify-between">
+                                      <h4 className="font-bold text-base text-[#000035] tracking-tight">
+                                        {v.term}
+                                      </h4>
+                                      <button
+                                        type="button"
+                                        onClick={() => speakEnglish(v.term)}
+                                        className="w-7 h-7 rounded-lg bg-slate-50 hover:bg-slate-100 text-purple-700 flex items-center justify-center cursor-pointer transition border border-slate-200 shadow-2xs"
+                                        title={isEn ? 'Listen to pronunciation' : 'Ouvir pronúncia'}
+                                      >
+                                        <Volume2 className="w-3.5 h-3.5" />
+                                      </button>
+                                    </div>
 
-                            <p className="text-xs text-slate-700 leading-relaxed">
-                              {v.simpleDefinition}
-                            </p>
+                                    {v.phoneticGuide && (
+                                      <div className="text-xs text-purple-900 font-mono bg-purple-50/50 px-2 py-0.5 rounded border border-purple-100 inline-block">
+                                        {v.phoneticGuide}
+                                      </div>
+                                    )}
 
-                            {/* Real Example */}
-                            {Array.isArray(v.realExamples) && v.realExamples.length > 0 && (
-                              <p className="text-xs text-slate-500 italic pl-2 border-l-2 border-slate-200">
-                                "{v.realExamples[0]}"
-                              </p>
-                            )}
+                                    <p className="text-xs text-slate-700 leading-relaxed">
+                                      {v.simpleDefinition}
+                                    </p>
 
-                            {/* Collocations */}
-                            {Array.isArray(v.collocations) && v.collocations.length > 0 && (
-                              <div className="flex flex-wrap gap-1 pt-1">
-                                {v.collocations.map((col, cI) => (
-                                  <span
-                                    key={cI}
-                                    className="px-2 py-0.5 rounded bg-slate-100 text-slate-600 text-[10px] font-medium"
-                                  >
-                                    {col}
-                                  </span>
-                                ))}
-                              </div>
-                            )}
+                                    {/* Real Examples */}
+                                    {Array.isArray(v.realExamples) && v.realExamples.length > 0 && (
+                                      <div className="space-y-1 pl-2 border-l-2 border-slate-200">
+                                        {v.realExamples.map((ex, exI) => (
+                                          <p key={exI} className="text-xs text-slate-500 italic">
+                                            "{ex}"
+                                          </p>
+                                        ))}
+                                      </div>
+                                    )}
+
+                                    {/* Collocations */}
+                                    {Array.isArray(v.collocations) && v.collocations.length > 0 && (
+                                      <div className="flex flex-wrap gap-1 pt-1">
+                                        {v.collocations.map((col, cI) => (
+                                          <span
+                                            key={cI}
+                                            className="px-2 py-0.5 rounded bg-slate-100 text-slate-600 text-[10px] font-medium"
+                                          >
+                                            {col}
+                                          </span>
+                                        ))}
+                                      </div>
+                                    )}
+
+                                    {/* Synonyms & Register/Nuance Note */}
+                                    {((Array.isArray(v.synonyms) && v.synonyms.length > 0) ||
+                                      registerDetail) && (
+                                      <div className="pt-1.5 border-t border-slate-100 space-y-1 text-[11px] text-slate-600">
+                                        {Array.isArray(v.synonyms) && v.synonyms.length > 0 && (
+                                          <div>
+                                            <strong className="text-slate-700">
+                                              {isEn ? 'Synonyms / Related:' : 'Sinônimos / Relacionados:'}
+                                            </strong>{' '}
+                                            {v.synonyms.join(', ')}
+                                          </div>
+                                        )}
+                                        {registerDetail && (
+                                          <div className="text-slate-500">
+                                            <strong className="text-slate-700">
+                                              {isEn ? 'Register / Nuance:' : 'Registro / Nuance:'}
+                                            </strong>{' '}
+                                            {registerDetail}
+                                          </div>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              );
+                            })}
                           </div>
                         </div>
-                      );
-                    })}
-
-                    {transformation.vocabularyAndExpressions.length === 0 && (
-                      <div className="p-8 rounded-2xl bg-white border border-slate-200 text-center space-y-2 col-span-full">
-                        <Sparkles className="w-8 h-8 text-purple-500 mx-auto" />
-                        <h4 className="font-bold text-sm text-[#000035]">
-                          {isEn ? 'No Vocabulary Recorded' : 'Nenhum Novo Termo Marcado'}
-                        </h4>
-                        <p className="text-xs text-slate-500">
-                          {isEn
-                            ? 'No new terms or pronunciation marks were recorded in this session.'
-                            : 'Nenhum novo termo ou marcação de pronúncia foi registrada nesta sessão.'}
-                        </p>
-                      </div>
-                    )}
-                  </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="p-8 rounded-2xl bg-white border border-slate-200 text-center space-y-2">
+                      <Sparkles className="w-8 h-8 text-purple-500 mx-auto" />
+                      <h4 className="font-bold text-sm text-[#000035]">
+                        {isEn ? 'No Vocabulary Recorded' : 'Nenhum Novo Termo Marcado'}
+                      </h4>
+                      <p className="text-xs text-slate-500">
+                        {isEn
+                          ? 'No new terms or pronunciation marks were recorded in this session.'
+                          : 'Nenhum novo termo ou marcação de pronúncia foi registrada nesta sessão.'}
+                      </p>
+                    </div>
+                  )}
 
                   {/* Minimalist Bottom Tab Navigation */}
                   {activeTab === 'vocab' && (
@@ -1764,6 +1864,23 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                         </ul>
                       </div>
                     </div>
+
+                    {/* Useful Sentence Patterns */}
+                    {Array.isArray(transformation.reviewSummary.usefulPatterns) &&
+                      transformation.reviewSummary.usefulPatterns.length > 0 && (
+                        <div className="space-y-1.5 pt-2 border-t border-slate-100">
+                          <h4 className="font-bold text-xs text-slate-700 uppercase tracking-wide">
+                            {isEn ? 'Useful Sentence Patterns:' : 'Padrões Úteis de Frase:'}
+                          </h4>
+                          <ul className="space-y-1 text-xs text-slate-700 pl-4 list-disc">
+                            {transformation.reviewSummary.usefulPatterns.map((pattern, pI) => (
+                              <li key={pI} className="font-medium leading-snug">
+                                {pattern}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
 
                     {/* Must-Know Vocabulary Checklist */}
                     {Array.isArray(transformation.reviewSummary.mustKnowVocabulary) &&

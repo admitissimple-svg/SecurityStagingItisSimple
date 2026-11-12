@@ -1554,7 +1554,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   ]);
 
   // Inline editing handlers for Pedagogical Report
-  const handleUpdateMistake = useCallback((index: number, field: string, value: string) => {
+  const handleUpdateMistake = useCallback((index: number, field: string, value: any) => {
     setEditableTransformation((prev: any) => {
       if (!prev) return prev;
       const list = Array.isArray(prev.mistakesAnalysis) ? [...prev.mistakesAnalysis] : [];
@@ -1572,7 +1572,11 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         original: '',
         corrected: '',
         explanation: '',
-        category: 'Grammar',
+        grammarRule: '',
+        twoExamples: [''],
+        commonPitfalls: '',
+        similarFormsComparison: '',
+        category: 'grammar',
       });
       return { ...(prev || {}), mistakesAnalysis: list };
     });
@@ -1604,8 +1608,11 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         id: `grammar-${Date.now()}`,
         topic: 'New Grammar Point',
         rule: '',
-        explanation: '',
+        form: '',
+        usage: '',
         examples: [''],
+        commonMistakes: '',
+        comparisons: '',
       });
       return { ...(prev || {}), grammarPoints: list };
     });
@@ -1646,8 +1653,14 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       list.push({
         id: `vocab-${Date.now()}`,
         term: '',
+        partOfSpeech: 'Expression',
+        category: 'Conversational Expressions',
         simpleDefinition: '',
+        collocations: [],
         realExamples: [''],
+        synonyms: [],
+        register: 'conversational',
+        registerNote: '',
         isNewWord: true,
         isPronunciationFocus: false,
       });
@@ -2710,18 +2723,82 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                         </button>
                       </div>
 
-                      {/* Explanation */}
+                      {/* Explanation & Underlying Grammar Rule */}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <div className="space-y-1">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                            Why Incorrect / Unnatural:
+                          </span>
+                          <textarea
+                            rows={2}
+                            value={item.explanation || ''}
+                            onChange={(e) => handleUpdateMistake(idx, 'explanation', e.target.value)}
+                            placeholder="Why the original is incorrect or unnatural..."
+                            className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96] resize-y leading-relaxed"
+                          />
+                        </div>
+
+                        <div className="space-y-1">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                            Underlying Grammar Rule / Pattern:
+                          </span>
+                          <textarea
+                            rows={2}
+                            value={item.grammarRule || ''}
+                            onChange={(e) => handleUpdateMistake(idx, 'grammarRule', e.target.value)}
+                            placeholder="Grammar rule or language pattern behind the correction..."
+                            className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96] resize-y leading-relaxed"
+                          />
+                        </div>
+                      </div>
+
+                      {/* 2-4 Natural Examples */}
                       <div className="space-y-1">
                         <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
-                          Pedagogical Explanation:
+                          Natural Examples (2–4, separated by •):
                         </span>
-                        <textarea
-                          rows={2}
-                          value={item.explanation || ''}
-                          onChange={(e) => handleUpdateMistake(idx, 'explanation', e.target.value)}
-                          placeholder="Why correct it this way? Learning tip for the student..."
-                          className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96] resize-y leading-relaxed"
+                        <input
+                          type="text"
+                          value={Array.isArray(item.twoExamples) ? item.twoExamples.join(' • ') : (item.twoExamples || '')}
+                          onChange={(e) =>
+                            handleUpdateMistake(
+                              idx,
+                              'twoExamples',
+                              e.target.value.split('•').map((s) => s.trim()).filter(Boolean)
+                            )
+                          }
+                          placeholder="Example 1 • Example 2 • Example 3"
+                          className="w-full text-xs text-slate-600 italic bg-white border border-slate-200 rounded-lg px-2.5 py-1 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
                         />
+                      </div>
+
+                      {/* Common Pitfalls & Similar Forms Comparison */}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <div className="space-y-1">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                            Common Mistakes with This Structure:
+                          </span>
+                          <input
+                            type="text"
+                            value={item.commonPitfalls || ''}
+                            onChange={(e) => handleUpdateMistake(idx, 'commonPitfalls', e.target.value)}
+                            placeholder="Likely student pitfalls..."
+                            className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
+                          />
+                        </div>
+
+                        <div className="space-y-1">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                            Difference Between Similar Forms (Optional):
+                          </span>
+                          <input
+                            type="text"
+                            value={item.similarFormsComparison || ''}
+                            onChange={(e) => handleUpdateMistake(idx, 'similarFormsComparison', e.target.value)}
+                            placeholder="Comparison with similar expressions when useful..."
+                            className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
+                          />
+                        </div>
                       </div>
                     </div>
                   ))}
@@ -2752,7 +2829,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                     </span>
                   </div>
                   <p className="text-[11px] text-slate-500 mt-0.5">
-                    Structural patterns, rules, and contextualized examples.
+                    Structural patterns, rules, meaning/use, examples, common mistakes, and comparisons connected to the student's mistakes.
                   </p>
                 </div>
                 <button
@@ -2774,17 +2851,32 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                       className="p-3.5 bg-slate-50/60 rounded-xl border border-slate-200/80 space-y-2.5 hover:border-slate-300 transition border-l-2 border-l-[#1C4C96]"
                     >
                       <div className="flex items-start justify-between gap-2">
-                        <div className="space-y-1 flex-1">
-                          <span className="text-[10px] font-bold uppercase tracking-wider text-[#1C4C96]">
-                            Topic / Grammar Rule:
-                          </span>
-                          <input
-                            type="text"
-                            value={gp.topic || gp.rule || ''}
-                            onChange={(e) => handleUpdateGrammar(idx, 'topic', e.target.value)}
-                            placeholder="e.g. Present Perfect vs Simple Past..."
-                            className="w-full text-xs font-bold text-[#000035] bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
-                          />
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 flex-1">
+                          <div className="space-y-1">
+                            <span className="text-[10px] font-bold uppercase tracking-wider text-[#1C4C96]">
+                              Grammar Topic:
+                            </span>
+                            <input
+                              type="text"
+                              value={gp.topic || ''}
+                              onChange={(e) => handleUpdateGrammar(idx, 'topic', e.target.value)}
+                              placeholder="e.g. Present Perfect vs Simple Past..."
+                              className="w-full text-xs font-bold text-[#000035] bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
+                            />
+                          </div>
+
+                          <div className="space-y-1">
+                            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                              Form / Structure:
+                            </span>
+                            <input
+                              type="text"
+                              value={gp.form || ''}
+                              onChange={(e) => handleUpdateGrammar(idx, 'form', e.target.value)}
+                              placeholder="e.g. Subject + modal + base verb..."
+                              className="w-full text-xs font-mono text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
+                            />
+                          </div>
                         </div>
 
                         <button
@@ -2797,23 +2889,38 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                         </button>
                       </div>
 
-                      <div className="space-y-1">
-                        <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
-                          Explanation:
-                        </span>
-                        <textarea
-                          rows={2}
-                          value={gp.explanation || ''}
-                          onChange={(e) => handleUpdateGrammar(idx, 'explanation', e.target.value)}
-                          placeholder="Clear and simple rule explanation..."
-                          className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96] resize-y leading-relaxed"
-                        />
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <div className="space-y-1">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                            Rule:
+                          </span>
+                          <textarea
+                            rows={2}
+                            value={gp.rule || gp.explanation || ''}
+                            onChange={(e) => handleUpdateGrammar(idx, 'rule', e.target.value)}
+                            placeholder="Clear rule calibrated to the student's level..."
+                            className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96] resize-y leading-relaxed"
+                          />
+                        </div>
+
+                        <div className="space-y-1">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                            Meaning / Use:
+                          </span>
+                          <textarea
+                            rows={2}
+                            value={gp.usage || ''}
+                            onChange={(e) => handleUpdateGrammar(idx, 'usage', e.target.value)}
+                            placeholder="When and why native speakers use this structure..."
+                            className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96] resize-y leading-relaxed"
+                          />
+                        </div>
                       </div>
 
                       {/* Examples */}
                       <div className="space-y-1">
                         <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
-                          Usage Examples:
+                          Real-Life Examples (separated by •):
                         </span>
                         <input
                           type="text"
@@ -2828,6 +2935,34 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                           placeholder="Separate multiple examples with • (bullet)"
                           className="w-full text-xs text-slate-600 italic bg-white border border-slate-200 rounded-lg px-2.5 py-1 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
                         />
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <div className="space-y-1">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                            Common Mistakes:
+                          </span>
+                          <input
+                            type="text"
+                            value={gp.commonMistakes || ''}
+                            onChange={(e) => handleUpdateGrammar(idx, 'commonMistakes', e.target.value)}
+                            placeholder="Typical learner errors..."
+                            className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
+                          />
+                        </div>
+
+                        <div className="space-y-1">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                            Comparison with Similar Structures:
+                          </span>
+                          <input
+                            type="text"
+                            value={gp.comparisons || ''}
+                            onChange={(e) => handleUpdateGrammar(idx, 'comparisons', e.target.value)}
+                            placeholder="Short comparison when relevant..."
+                            className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
+                          />
+                        </div>
                       </div>
                     </div>
                   ))}
@@ -2858,7 +2993,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                     </span>
                   </div>
                   <p className="text-[11px] text-slate-500 mt-0.5">
-                    New vocabulary, idiomatic expressions, and pronunciation focus.
+                    Organized by useful thematic categories with part of speech, simple definition, collocations, examples, synonyms, and register.
                   </p>
                 </div>
                 <button
@@ -2880,13 +3015,27 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                       className="p-3.5 bg-slate-50/60 rounded-xl border border-slate-200/80 space-y-2 hover:border-slate-300 transition"
                     >
                       <div className="flex items-start justify-between gap-2 flex-wrap">
-                        <div className="flex items-center gap-2 flex-1 min-w-[200px]">
+                        <div className="flex items-center gap-2 flex-1 min-w-[200px] flex-wrap">
                           <input
                             type="text"
                             value={v.term || ''}
                             onChange={(e) => handleUpdateVocab(idx, 'term', e.target.value)}
                             placeholder="Word or Expression..."
-                            className="text-xs font-bold text-[#000035] bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96] flex-1 max-w-xs"
+                            className="text-xs font-bold text-[#000035] bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96] flex-1 min-w-[160px] max-w-xs"
+                          />
+                          <input
+                            type="text"
+                            value={v.partOfSpeech || ''}
+                            onChange={(e) => handleUpdateVocab(idx, 'partOfSpeech', e.target.value)}
+                            placeholder="Part of speech..."
+                            className="text-[11px] font-semibold text-[#1C4C96] bg-white border border-slate-200 rounded-lg px-2 py-1 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96] w-32"
+                          />
+                          <input
+                            type="text"
+                            value={v.category || ''}
+                            onChange={(e) => handleUpdateVocab(idx, 'category', e.target.value)}
+                            placeholder="Category (e.g. Work & Meetings)..."
+                            className="text-[11px] font-medium text-slate-700 bg-white border border-slate-200 rounded-lg px-2 py-1 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96] w-44"
                           />
                           <button
                             type="button"
@@ -2927,12 +3076,15 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                         <div className="space-y-0.5">
                           <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
-                            Meaning / Definition:
+                            Simple Definition:
                           </span>
                           <input
                             type="text"
                             value={v.simpleDefinition || v.definitionEn || ''}
-                            onChange={(e) => handleUpdateVocab(idx, 'simpleDefinition', e.target.value)}
+                            onChange={(e) => {
+                              handleUpdateVocab(idx, 'simpleDefinition', e.target.value);
+                              handleUpdateVocab(idx, 'definitionEn', e.target.value);
+                            }}
                             placeholder="Clear, simple definition..."
                             className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
                           />
@@ -2940,14 +3092,73 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
                         <div className="space-y-0.5">
                           <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
-                            Example of Use:
+                            Real-Life Examples (separated by •):
                           </span>
                           <input
                             type="text"
-                            value={Array.isArray(v.realExamples) ? v.realExamples[0] || '' : (v.realExamples || '')}
-                            onChange={(e) => handleUpdateVocab(idx, 'realExamples', [e.target.value])}
-                            placeholder="Example sentence from the session..."
+                            value={Array.isArray(v.realExamples) ? v.realExamples.join(' • ') : (v.realExamples || '')}
+                            onChange={(e) =>
+                              handleUpdateVocab(
+                                idx,
+                                'realExamples',
+                                e.target.value.split('•').map((s) => s.trim()).filter(Boolean)
+                              )
+                            }
+                            placeholder="Realistic example sentence..."
                             className="w-full text-xs text-slate-600 italic bg-white border border-slate-200 rounded-lg px-2.5 py-1 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                        <div className="space-y-0.5">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                            Collocations / Patterns:
+                          </span>
+                          <input
+                            type="text"
+                            value={Array.isArray(v.collocations) ? v.collocations.join(', ') : (v.collocations || '')}
+                            onChange={(e) =>
+                              handleUpdateVocab(
+                                idx,
+                                'collocations',
+                                e.target.value.split(',').map((s) => s.trim()).filter(Boolean)
+                              )
+                            }
+                            placeholder="e.g. follow up on, follow up with"
+                            className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
+                          />
+                        </div>
+
+                        <div className="space-y-0.5">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                            Synonyms / Related:
+                          </span>
+                          <input
+                            type="text"
+                            value={Array.isArray(v.synonyms) ? v.synonyms.join(', ') : (v.synonyms || '')}
+                            onChange={(e) =>
+                              handleUpdateVocab(
+                                idx,
+                                'synonyms',
+                                e.target.value.split(',').map((s) => s.trim()).filter(Boolean)
+                              )
+                            }
+                            placeholder="Synonyms when useful..."
+                            className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
+                          />
+                        </div>
+
+                        <div className="space-y-0.5">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                            Register / Nuance Note:
+                          </span>
+                          <input
+                            type="text"
+                            value={v.registerNote || v.register || ''}
+                            onChange={(e) => handleUpdateVocab(idx, 'registerNote', e.target.value)}
+                            placeholder="Formal, informal, conversational..."
+                            className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
                           />
                         </div>
                       </div>
@@ -2977,7 +3188,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                     </span>
                   </div>
                   <p className="text-[11px] text-slate-500 mt-0.5">
-                    Concise, high-retention summary for immediate student review.
+                    Concise 5–10 minute revision section covering key grammar rules, vocabulary, corrections, sentence patterns, and "Remember this".
                   </p>
                 </div>
                 <div className="flex items-center gap-1.5">
@@ -2996,7 +3207,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 <div className="space-y-1">
                   <span className="text-[10px] font-black uppercase tracking-wider text-[#1C4C96] flex items-center gap-1">
                     <Lightbulb className="w-3.5 h-3.5 text-[#F4CA54]" />
-                    <span>Main Takeaway (Remember This):</span>
+                    <span>Remember This:</span>
                   </span>
                   <textarea
                     rows={2}
@@ -3010,7 +3221,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 {/* Key Rules list */}
                 <div className="space-y-1">
                   <span className="text-[10px] font-bold uppercase tracking-wider text-slate-600">
-                    Key Rules:
+                    Most Important Grammar Rules:
                   </span>
                   <input
                     type="text"
@@ -3030,10 +3241,33 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   />
                 </div>
 
+                {/* Useful Sentence Patterns */}
+                <div className="space-y-1">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-600">
+                    Useful Sentence Patterns:
+                  </span>
+                  <input
+                    type="text"
+                    value={
+                      Array.isArray(editableTransformation.reviewSummary?.usefulPatterns)
+                        ? editableTransformation.reviewSummary.usefulPatterns.join(' • ')
+                        : ''
+                    }
+                    onChange={(e) =>
+                      handleUpdateQuickReview(
+                        'usefulPatterns',
+                        e.target.value.split('•').map((s) => s.trim()).filter(Boolean)
+                      )
+                    }
+                    placeholder="Useful sentence frames separated by • (bullet)"
+                    className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
+                  />
+                </div>
+
                 {/* Must Know Vocabulary */}
                 <div className="space-y-1">
                   <span className="text-[10px] font-bold uppercase tracking-wider text-slate-600">
-                    Mandatory Vocabulary:
+                    Most Important Vocabulary:
                   </span>
                   <input
                     type="text"

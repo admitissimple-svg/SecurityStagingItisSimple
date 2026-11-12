@@ -417,13 +417,18 @@ async function runSuite() {
       );
     });
 
-    await test('1.3: Both Native Friends Notes Gemini prompt blocks in serverApp.ts are aligned and contain zero targetLang Portuguese interpolations', () => {
+    await test('1.3: Unified Native Friends Notes Gemini prompt in serverApp.ts enforces 100% English output with zero duplicated blocks or targetLang Portuguese interpolations', () => {
       const serverAppContent = fs.readFileSync(path.resolve(process.cwd(), 'serverApp.ts'), 'utf8');
       const matches = serverAppContent.match(/LANGUAGE REQUIREMENT \(STRICT 100% ENGLISH OUTPUT\):/g) || [];
       assert.strictEqual(
         matches.length,
-        2,
-        `Expected both Native Friends Notes Gemini blocks in serverApp.ts to have STRICT 100% ENGLISH OUTPUT, found ${matches.length}`
+        1,
+        `Expected unified Native Friends Notes Gemini prompt in serverApp.ts to have STRICT 100% ENGLISH OUTPUT once (no duplicated prompt blocks), found ${matches.length}`
+      );
+      const coreCallMatches = serverAppContent.match(/executePedagogicalTransformationCore\(/g) || [];
+      assert(
+        coreCallMatches.length >= 3,
+        'Both /api/session-notes/:id/transform and /api/pedagogical-notes/transform must delegate to executePedagogicalTransformationCore'
       );
       assert(
         !serverAppContent.includes('Ensure reviewSummary and rememberThis are fully provided in ${targetLang.nameEn}'),

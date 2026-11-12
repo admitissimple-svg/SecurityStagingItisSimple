@@ -11,10 +11,22 @@ export interface PedagogicalMistakeAnalysis {
   id: string;
   original: string;
   corrected: string;
-  category: 'grammar' | 'vocabulary' | 'collocation' | 'preposition' | 'pronunciation' | 'phrasing';
+  category:
+    | 'grammar'
+    | 'vocabulary'
+    | 'word-choice'
+    | 'collocation'
+    | 'preposition'
+    | 'sentence-structure'
+    | 'naturalness'
+    | 'pronunciation'
+    | 'phrasing'
+    | string;
   explanation: string;
+  grammarRule?: string;
   twoExamples: string[];
   commonPitfalls: string;
+  similarFormsComparison?: string;
   isPendingConfirmation?: boolean;
 }
 
@@ -38,7 +50,8 @@ export interface PedagogicalVocabularyItem {
   collocations: string[];
   realExamples: string[];
   synonyms: string[];
-  register: 'informal' | 'neutral' | 'formal' | 'idiomatic';
+  register: 'informal' | 'neutral' | 'formal' | 'conversational' | 'idiomatic' | string;
+  registerNote?: string;
   category: string;
   phoneticGuide?: string;
   isPronunciationFocus?: boolean;
@@ -61,10 +74,11 @@ export interface PedagogicalReviewSummary {
   keyRules: string[];
   mustKnowVocabulary: string[];
   essentialCorrections: { original: string; corrected: string; explanation?: string }[];
+  usefulPatterns?: string[];
   rememberThis: string;
 }
 
-export const PEDAGOGICAL_PROMPT_VERSION = 'v2.4-original-pedagogical-rules';
+export const PEDAGOGICAL_PROMPT_VERSION = 'v2.5-pedagogical-rules-simplified';
 
 export interface PedagogicalLessonTransformation {
   lessonId?: string;
@@ -230,11 +244,31 @@ export function getAiUnavailableNoticeText(lang: string = 'pt'): string {
 }
 
 /**
- * Strict pedagogical validation function following 5 Words functional quality standards:
- * - Checks items in Alt+N, Alt+W, and Alt+P.
- * - Does NOT require categories that were not in the teacher's notes.
- * - Rejects responses omitting requested items or containing generic definitions/examples.
- * - Rejects responses injecting synthetic mistakes or vocabulary when none was in the notes.
+ * Helper to match a student's mistake between raw parsed markings and AI output,
+ * tolerating punctuation, casing, quotes, or compound sentence splitting without triggering false retries.
+ */
+function isPedagogicalMistakeMatch(aiOriginal: string, targetOriginal: string): boolean {
+  if (!aiOriginal || !targetOriginal) return false;
+  const a = aiOriginal.toLowerCase().trim();
+  const b = targetOriginal.toLowerCase().trim();
+  if (isPedagogicalTermMatch(a, b)) return true;
+
+  const tokensB = b
+    .replace(/[^a-z0-9\s']/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 3);
+  if (tokensB.length >= 2) {
+    const matchedCount = tokensB.filter((t) => a.includes(t)).length;
+    if (matchedCount / tokensB.length >= 0.6) return true;
+  }
+  return false;
+}
+
+/**
+ * Streamlined pedagogical validation function:
+ * - Normalizes synonymous/mirrored fields in-place (e.g. definitionEn <-> simpleDefinition, examples -> twoExamples, Alt+P focus)
+ *   so valid AI outputs never fail validation over minor structural omissions or trigger duplicate contingency retries.
+ * - Rejects responses omitting explicitly stamped Alt+N / Alt+W / Alt+P items or injecting synthetic/generic boilerplate.
  */
 export function validatePedagogicalAiResponse(
   parsed: any,
@@ -246,22 +280,31 @@ export function validatePedagogicalAiResponse(
     return { valid: false, reason: 'Response is not a valid JSON object' };
   }
 
-  // 1. Validate Alt+N (Errors / Mistakes)
+  // 1. Validate Alt+N (Part 1: Analyze the student's mistakes)
   const hasErrors = Array.isArray(markings.errors) && markings.errors.length > 0;
   const mistakes = Array.isArray(parsed.mistakesAnalysis) ? parsed.mistakesAnalysis : [];
+
+  // Normalize mistake fields in-place to avoid unnecessary validation rework
+  for (const m of mistakes) {
+    if (!m || typeof m !== 'object') continue;
+    if ((!Array.isArray(m.twoExamples) || m.twoExamples.length === 0) && Array.isArray(m.examples)) {
+      m.twoExamples = m.examples;
+    }
+    if (!m.explanation && typeof m.grammarRule === 'string' && m.grammarRule.trim()) {
+      m.explanation = m.grammarRule.trim();
+    }
+  }
 
   if (hasErrors) {
     if (mistakes.length === 0) {
       return { valid: false, reason: 'AI omitted mistakesAnalysis although teacher marked Alt+N errors' };
     }
 
-    // Check that every error marked by the teacher is accounted for
     for (const rawErr of markings.errors) {
       const origTarget = rawErr.original.toLowerCase().trim();
-      const found = mistakes.find((m: any) => {
-        const mOrig = String(m?.original || '').toLowerCase().trim();
-        return mOrig.includes(origTarget) || origTarget.includes(mOrig);
-      });
+      const found = mistakes.find((m: any) =>
+        isPedagogicalMistakeMatch(String(m?.original || ''), origTarget)
+      );
 
       if (!found) {
         return { valid: false, reason: `AI response missed teacher Alt+N error: "${rawErr.original}"` };
@@ -271,20 +314,16 @@ export function validatePedagogicalAiResponse(
         return { valid: false, reason: `AI response omitted correction for: "${rawErr.original}"` };
       }
 
-      // Must not be a placeholder like "Pending confirmation" or "Pendente de confirmação"
       const corrLower = found.corrected.toLowerCase();
       if (corrLower.includes('pending confirmation') || corrLower.includes('pendente de confirmação')) {
         return { valid: false, reason: `AI returned pending placeholder for: "${rawErr.original}"` };
       }
 
-      if (!found.explanation || typeof found.explanation !== 'string' || found.explanation.trim().length < 8) {
+      if (!found.explanation || typeof found.explanation !== 'string' || found.explanation.trim().length < 5) {
         return { valid: false, reason: `AI explanation too short or missing for: "${rawErr.original}"` };
       }
 
-      // Check examples (supports 2-4 natural examples)
-      const rawExamples = Array.isArray(found.twoExamples) && found.twoExamples.length > 0
-        ? found.twoExamples
-        : (Array.isArray(found.examples) ? found.examples : []);
+      const rawExamples = Array.isArray(found.twoExamples) ? found.twoExamples : [];
       if (rawExamples.length === 0) {
         return { valid: false, reason: `AI omitted examples for mistake: "${rawErr.original}"` };
       }
@@ -295,7 +334,7 @@ export function validatePedagogicalAiResponse(
       }
     }
   } else {
-    // If teacher did NOT mark any errors, mistakesAnalysis must be empty or contain NO synthetic errors
+    // Reject canned fixture mistakes when notes had no errors
     for (const m of mistakes) {
       const origLower = String(m?.original || '').toLowerCase();
       if (
@@ -309,9 +348,25 @@ export function validatePedagogicalAiResponse(
     }
   }
 
-  // 2. Validate Alt+W (New Words & Expressions)
+  // 2. Normalize & Validate Alt+W and Alt+P (Part 3: Teach the vocabulary and expressions)
   const hasNewWords = Array.isArray(markings.newWords) && markings.newWords.length > 0;
+  const hasPronounce = Array.isArray(markings.pronounceItems) && markings.pronounceItems.length > 0;
   const vocabList = Array.isArray(parsed.vocabularyAndExpressions) ? parsed.vocabularyAndExpressions : [];
+
+  // Mirror simpleDefinition <-> definitionEn in-place so single definition avoids duplicate fields & extra dictionary AI calls
+  for (const v of vocabList) {
+    if (!v || typeof v !== 'object') continue;
+    const defEn = typeof v.definitionEn === 'string' ? v.definitionEn.trim() : '';
+    const simpleDef = typeof v.simpleDefinition === 'string' ? v.simpleDefinition.trim() : '';
+    if (!simpleDef && defEn) {
+      v.simpleDefinition = defEn;
+    } else if (!defEn && simpleDef) {
+      v.definitionEn = simpleDef;
+    }
+    if ((!Array.isArray(v.realExamples) || v.realExamples.length === 0) && Array.isArray(v.examples)) {
+      v.realExamples = v.examples;
+    }
+  }
 
   if (hasNewWords) {
     if (vocabList.length === 0) {
@@ -320,26 +375,23 @@ export function validatePedagogicalAiResponse(
 
     for (const newWord of markings.newWords) {
       const cleanTarget = newWord.toLowerCase().trim();
-      const found = vocabList.find((v: any) => {
-        const vTerm = String(v?.term || '').toLowerCase().trim();
-        return isPedagogicalTermMatch(vTerm, cleanTarget);
-      });
+      const found = vocabList.find((v: any) =>
+        isPedagogicalTermMatch(String(v?.term || '').toLowerCase().trim(), cleanTarget)
+      );
 
       if (!found) {
         return { valid: false, reason: `AI response missed teacher Alt+W word: "${newWord}"` };
       }
 
-      // Validate definitionEn
-      if (!found.definitionEn || typeof found.definitionEn !== 'string' || isGenericPedagogicalDefinition(found.definitionEn)) {
-        return { valid: false, reason: `AI provided generic or missing definitionEn for: "${newWord}"` };
-      }
+      found.isNewWord = true;
 
-      // Validate simpleDefinition
       if (!found.simpleDefinition || typeof found.simpleDefinition !== 'string' || isGenericPedagogicalDefinition(found.simpleDefinition)) {
         return { valid: false, reason: `AI provided generic or missing simpleDefinition for: "${newWord}"` };
       }
+      if (found.definitionEn && isGenericPedagogicalDefinition(found.definitionEn)) {
+        return { valid: false, reason: `AI provided generic definitionEn for: "${newWord}"` };
+      }
 
-      // Validate realExamples
       if (!Array.isArray(found.realExamples) || found.realExamples.length === 0) {
         return { valid: false, reason: `AI omitted realExamples for: "${newWord}"` };
       }
@@ -352,8 +404,6 @@ export function validatePedagogicalAiResponse(
     }
   }
 
-  // 3. Validate Alt+P (Pronunciation)
-  const hasPronounce = Array.isArray(markings.pronounceItems) && markings.pronounceItems.length > 0;
   if (hasPronounce) {
     if (vocabList.length === 0) {
       return { valid: false, reason: 'AI omitted vocabularyAndExpressions although teacher marked Alt+P pronunciation items' };
@@ -361,61 +411,42 @@ export function validatePedagogicalAiResponse(
 
     for (const pItem of markings.pronounceItems) {
       const cleanTarget = pItem.toLowerCase().trim();
-      const found = vocabList.find((v: any) => {
-        const vTerm = String(v?.term || '').toLowerCase().trim();
-        return isPedagogicalTermMatch(vTerm, cleanTarget);
-      });
+      const found = vocabList.find((v: any) =>
+        isPedagogicalTermMatch(String(v?.term || '').toLowerCase().trim(), cleanTarget)
+      );
 
       if (!found) {
         return { valid: false, reason: `AI response missed teacher Alt+P item: "${pItem}"` };
       }
 
-      const isPronounceCategory = Boolean(
-        found.isPronunciationFocus ||
-        (found.partOfSpeech && found.partOfSpeech.toLowerCase().includes('pronunciation')) ||
-        (found.category && found.category.toLowerCase().includes('pronunciation'))
+      // Automatically tag pronunciation focus from verified teacher Alt+P stamp while preserving thematic category
+      found.isPronunciationFocus = true;
+
+      const hasDefinitionOrPhonetic = Boolean(
+        (found.phoneticGuide && String(found.phoneticGuide).trim().length > 2) ||
+        (found.simpleDefinition && String(found.simpleDefinition).trim().length > 3 && !isGenericPedagogicalDefinition(found.simpleDefinition))
       );
 
-      if (!isPronounceCategory) {
-        return { valid: false, reason: `AI failed to set pronunciation focus on Alt+P item: "${pItem}"` };
-      }
-
-      const hasPhoneticOrStress = Boolean(
-        (found.phoneticGuide && String(found.phoneticGuide).trim().length > 3) ||
-        (found.simpleDefinition && String(found.simpleDefinition).trim().length > 3)
-      );
-
-      if (!hasPhoneticOrStress) {
-        return { valid: false, reason: `AI omitted phonetic or syllable guide for Alt+P item: "${pItem}"` };
+      if (!hasDefinitionOrPhonetic) {
+        return { valid: false, reason: `AI omitted definition or phonetic guide for Alt+P item: "${pItem}"` };
       }
     }
   }
 
-  // 4. Validate Untagged Vocab Items (when teacher provided notes without explicit Alt+W/P stamps)
+  // 3. Untagged notes items (e.g. standalone vocabulary notes without explicit Alt+W / Alt+P stamps)
   const hasUntaggedVocab = Array.isArray(markings.vocabItems) && markings.vocabItems.length > 0;
-  if (!hasNewWords && !hasPronounce && hasUntaggedVocab) {
-    if (vocabList.length === 0) {
-      return { valid: false, reason: 'AI omitted vocabularyAndExpressions although teacher provided vocabulary notes' };
+  if (!hasNewWords && !hasPronounce && !hasErrors && hasUntaggedVocab) {
+    if (vocabList.length === 0 && mistakes.length === 0) {
+      return { valid: false, reason: 'AI omitted pedagogical analysis although teacher provided notes' };
     }
-
-    for (const vItem of markings.vocabItems) {
-      const cleanTarget = vItem.toLowerCase().trim();
-      const found = vocabList.find((v: any) => {
-        const vTerm = String(v?.term || '').toLowerCase().trim();
-        return isPedagogicalTermMatch(vTerm, cleanTarget);
-      });
-
-      if (!found) {
-        return { valid: false, reason: `AI response missed teacher note item: "${vItem}"` };
-      }
-
-      if (!found.simpleDefinition || typeof found.simpleDefinition !== 'string' || isGenericPedagogicalDefinition(found.simpleDefinition)) {
-        return { valid: false, reason: `AI provided generic or missing simpleDefinition for: "${vItem}"` };
+    for (const v of vocabList) {
+      if (!v?.simpleDefinition || typeof v.simpleDefinition !== 'string' || isGenericPedagogicalDefinition(v.simpleDefinition)) {
+        return { valid: false, reason: `AI provided generic or missing simpleDefinition for: "${v?.term || 'item'}"` };
       }
     }
   }
 
-  // If teacher had NEITHER Alt+W, Alt+P, NOR untagged vocab items, check that vocabList does not contain synthetic words
+  // Reject synthetic fixture vocabulary when notes had zero vocabulary items
   if (!hasNewWords && !hasPronounce && !hasUntaggedVocab) {
     for (const v of vocabList) {
       const termLower = String(v?.term || '').toLowerCase().trim();
@@ -425,10 +456,9 @@ export function validatePedagogicalAiResponse(
     }
   }
 
-  // 5. Validate Grammar Points: if notes had no errors, grammarPoints must be empty (no invented grammar rules)
+  // 4. Validate Part 2 (Grammar Points): reject canned synthetic rules when notes had no errors
   const grammar = Array.isArray(parsed.grammarPoints) ? parsed.grammarPoints : [];
-  if (!hasErrors && grammar.length > 0) {
-    // Check if synthetic rules were fabricated
+  if (!hasErrors && mistakes.length === 0 && grammar.length > 0) {
     for (const g of grammar) {
       const topicLower = String(g?.topic || '').toLowerCase();
       if (topicLower.includes('agree') || topicLower.includes('age') || topicLower.includes('to be')) {
@@ -437,15 +467,19 @@ export function validatePedagogicalAiResponse(
     }
   }
 
-  // 6. Validate Quick Review Summary
+  // 5. Validate Part 4 (5–10 Minute Review Summary)
   if (!parsed.reviewSummary || typeof parsed.reviewSummary !== 'object' || Array.isArray(parsed.reviewSummary)) {
     parsed.reviewSummary = {
       estimatedMinutes: '5–10 minutes',
       keyRules: [],
       mustKnowVocabulary: [],
       essentialCorrections: [],
+      usefulPatterns: [],
       rememberThis: '',
     };
+  }
+  if (!Array.isArray(parsed.reviewSummary.usefulPatterns)) {
+    parsed.reviewSummary.usefulPatterns = [];
   }
 
   const cleanRememberThis = typeof parsed.reviewSummary.rememberThis === 'string'
@@ -453,20 +487,12 @@ export function validatePedagogicalAiResponse(
     : '';
 
   if (cleanRememberThis.length < 5) {
-    // Controlled complementation of rememberThis based strictly on validated items (never inventing errors)
-    const lang = (language || 'pt').toLowerCase().trim();
     if (mistakes.length > 0 && mistakes[0].original && mistakes[0].corrected && !mistakes[0].isPendingConfirmation) {
-      parsed.reviewSummary.rememberThis = lang === 'en'
-        ? `Remember this: Instead of saying "${mistakes[0].original}", say "${mistakes[0].corrected}"! Consistent small shifts in your active vocabulary build speaking confidence.`
-        : `Lembre-se disto: Em vez de "${mistakes[0].original}", prefira "${mistakes[0].corrected}"! Pequenos ajustes consistentes no seu vocabulário ativo constroem confiança ao falar.`;
+      parsed.reviewSummary.rememberThis = `Remember this: Instead of saying "${mistakes[0].original}", say "${mistakes[0].corrected}"! Consistent small shifts in your active speaking build lasting fluency.`;
     } else if (vocabList.length > 0 && vocabList[0].term) {
-      parsed.reviewSummary.rememberThis = lang === 'en'
-        ? `Remember this: Practice using "${vocabList[0].term}" naturally in your daily conversations!`
-        : `Lembre-se disto: Pratique o uso de "${vocabList[0].term}" naturalmente em suas conversas diárias!`;
+      parsed.reviewSummary.rememberThis = `Remember this: Practice using "${vocabList[0].term}" naturally in your everyday conversations!`;
     } else {
-      parsed.reviewSummary.rememberThis = lang === 'en'
-        ? 'Remember this: Fluency is about recognizing patterns quickly and adopting natural native phraseology!'
-        : 'Lembre-se disto: A fluência se desenvolve reconhecendo padrões rapidamente e adotando construções naturais!';
+      parsed.reviewSummary.rememberThis = 'Remember this: Fluency grows by recognizing natural patterns and practicing them out loud!';
     }
   }
 
