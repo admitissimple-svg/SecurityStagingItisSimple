@@ -31,6 +31,11 @@ import {
   Eye,
   Columns,
   Edit3,
+  Trash2,
+  Plus,
+  RefreshCw,
+  Undo2,
+  Send,
 } from 'lucide-react';
 import {
   LiveLesson,
@@ -40,8 +45,11 @@ import {
   StudentDictionaryEntry,
   SessionNotesDocument,
   EnglishLevel,
+  NoteDraftTransformation,
+  NoteApprovedVersion,
 } from '../types';
 import { isValidCanonicalUid } from '../utils/studentPersistence';
+import { computeNotesContentHash } from '../utils/notesVersioning';
 import { formatDateInTimeZone, formatTimeInTimeZone } from '../utils/timezone';
 import { doc, setDoc } from 'firebase/firestore';
 import { getDb, auth } from '../firebase';
@@ -193,8 +201,25 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [lastSavedTimestamp, setLastSavedTimestamp] = useState<string | null>(null);
   const [copiedSuccess, setCopiedSuccess] = useState<boolean>(false);
-  const [savedSuccessBanner, setSavedSuccessBanner] = useState<boolean>(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [savedSuccessBanner, setSavedSuccessBanner] = useState<boolean>(false);
+
+  // FASE NF-DOC.2C: AI Transformation & Teacher Approval States
+  const [draftTransformation, setDraftTransformation] = useState<NoteDraftTransformation | null>(null);
+  const [lastApprovedVersion, setLastApprovedVersion] = useState<NoteApprovedVersion | null>(null);
+  const [approvalStatus, setApprovalStatus] = useState<'unapproved' | 'draft_in_progress' | 'approved'>('unapproved');
+  const [editableTransformation, setEditableTransformation] = useState<any | null>(null);
+  const [isApplyingAi, setIsApplyingAi] = useState<boolean>(false);
+  const [isApproving, setIsApproving] = useState<boolean>(false);
+  const [aiError, setAiError] = useState<string | null>(null);
+  const [aiSuccessMessage, setAiSuccessMessage] = useState<string | null>(null);
+
+  // Stale draft check: compares draft contentHash with current notes content hash
+  const isDraftStale = useMemo(() => {
+    if (!draftTransformation) return false;
+    const currentHash = computeNotesContentHash(notesContent);
+    return Boolean(draftTransformation.contentHash && draftTransformation.contentHash !== currentHash);
+  }, [draftTransformation, notesContent]);
 
   // Pre-styled Inline Coaching Tag Constants (mirrors exact design system references)
   // Correct tag: Rounded rectangle (6px radius), light green bg (#ecfdf5), dark green border (#15803d), green checkmark (✓)
@@ -577,6 +602,14 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       autoSaveTimeoutRef.current = null;
     }
 
+    // Reset AI pedagogical draft and approval states for fresh session
+    setDraftTransformation(null);
+    setLastApprovedVersion(null);
+    setApprovalStatus('unapproved');
+    setEditableTransformation(null);
+    setAiError(null);
+    setAiSuccessMessage(null);
+
     let initialContent = '';
     let initialTopic = '';
     let initialDriveId: string | null = null;
@@ -722,28 +755,54 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         if (res.ok && !cancelled) {
           const data = await res.json();
           const savedNote = Array.isArray(data) ? data[0] : data;
-          if (savedNote && savedNote.content && savedNote.content.trim() && !isOnlyOldTemplate(savedNote.content)) {
-            const serverContent = savedNote.content;
-            setNotesContent(serverContent);
-            if (savedNote.topic) setTopic(savedNote.topic);
-            if (savedNote.updatedAt) setLastSavedTimestamp(savedNote.updatedAt);
-            if (savedNote.driveFileId) {
-              setDriveFileId(savedNote.driveFileId);
-              setDriveFileUrl(savedNote.driveFileUrl || null);
-              setDriveLastSyncedAt(savedNote.driveLastSyncedAt || null);
-              setDriveSyncStatus('synced');
+          if (savedNote) {
+            if (savedNote.content && savedNote.content.trim() && !isOnlyOldTemplate(savedNote.content)) {
+              const serverContent = savedNote.content;
+              setNotesContent(serverContent);
+              if (savedNote.topic) setTopic(savedNote.topic);
+              if (savedNote.updatedAt) setLastSavedTimestamp(savedNote.updatedAt);
+              if (savedNote.driveFileId) {
+                setDriveFileId(savedNote.driveFileId);
+                setDriveFileUrl(savedNote.driveFileUrl || null);
+                setDriveLastSyncedAt(savedNote.driveLastSyncedAt || null);
+                setDriveSyncStatus('synced');
+              }
+              lastSavedContentRef.current = {
+                content: serverContent,
+                topic: savedNote.topic || initialTopic,
+                sessionKey: currentSessionKey,
+              };
+              const f = formatContentForEditor(serverContent);
+              const ed = getActiveEditor();
+              if (ed && ed.innerHTML !== f) {
+                ed.innerHTML = f;
+                lastInternalHtmlRef.current = f;
+              }
             }
-            lastSavedContentRef.current = {
-              content: serverContent,
-              topic: savedNote.topic || initialTopic,
-              sessionKey: currentSessionKey,
-            };
-            const f = formatContentForEditor(serverContent);
-            const ed = getActiveEditor();
-            if (ed && ed.innerHTML !== f) {
-              ed.innerHTML = f;
-              lastInternalHtmlRef.current = f;
+
+            // FASE NF-DOC.2C: Restore draft, approved versions and editable transformation
+            if (savedNote.draftTransformation) {
+              setDraftTransformation(savedNote.draftTransformation);
+              if (savedNote.draftTransformation.transformation) {
+                setEditableTransformation(JSON.parse(JSON.stringify(savedNote.draftTransformation.transformation)));
+              }
+            } else {
+              setDraftTransformation(null);
             }
+
+            if (savedNote.lastApprovedVersion) {
+              setLastApprovedVersion(savedNote.lastApprovedVersion);
+              if (!savedNote.draftTransformation && savedNote.lastApprovedVersion.transformation) {
+                setEditableTransformation(JSON.parse(JSON.stringify(savedNote.lastApprovedVersion.transformation)));
+              }
+            } else {
+              setLastApprovedVersion(null);
+            }
+
+            setApprovalStatus(
+              savedNote.approvalStatus ||
+              (savedNote.lastApprovedVersion ? 'approved' : savedNote.draftTransformation ? 'draft_in_progress' : 'unapproved')
+            );
           }
         }
       } catch {
@@ -1112,10 +1171,10 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
    * Controlled persistence: guarded by isSavingRef and isDirtyRef to completely eliminate save loops
    */
   const persistSessionDocument = useCallback(
-    async (contentToSave: string, topicToSave: string, explicitSave: boolean = false) => {
+    async (contentToSave: string, topicToSave: string, explicitSave: boolean = false): Promise<boolean> => {
       // 1. Concurrency and dirty guard
       if (isSavingRef.current) {
-        return;
+        return false;
       }
 
       // Check canonical student identity resolution
@@ -1127,7 +1186,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         if (explicitSave) {
           setSavedSuccessBanner(false);
         }
-        return;
+        return false;
       }
 
       const resolvedStudentUid = studentResolution.uid;
@@ -1138,18 +1197,18 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         targetLessonId ||
         `session_${effectiveDate}_${cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : 'notes'}`;
 
-      if (!cleanEmail && !targetLessonId) return;
+      if (!cleanEmail && !targetLessonId) return false;
 
       // If not an explicit manual save, require the dirty flag and ensure content actually changed
       if (!explicitSave) {
-        if (!isDirtyRef.current) return;
+        if (!isDirtyRef.current) return true;
         if (
           lastSavedContentRef.current.sessionKey === sessionKey &&
           lastSavedContentRef.current.content === contentToSave &&
           lastSavedContentRef.current.topic === topicToSave
         ) {
           isDirtyRef.current = false;
-          return;
+          return true;
         }
       }
 
@@ -1234,6 +1293,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         }
 
         // 2. Server API Persistence (ensures clean database and Firestore sync without touching Google Drive)
+        let serverSaveOk = true;
         try {
           const idToken = await auth.currentUser?.getIdToken().catch(() => null);
           const resolvedTeacherUid = (currentAccount?.uid || auth.currentUser?.uid || '').trim();
@@ -1265,12 +1325,14 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             }),
           });
           if (!apiRes.ok) {
+            serverSaveOk = false;
             const errData = await apiRes.json().catch(() => ({}));
             setSaveError(errData.error || errData.message || 'Erro ao salvar notas no servidor.');
           } else {
             setSaveError(null);
           }
         } catch (err) {
+          serverSaveOk = false;
           console.warn('Server /api/session-notes notice:', err);
         }
 
@@ -1295,9 +1357,12 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           setSavedSuccessBanner(true);
           setTimeout(() => setSavedSuccessBanner(false), 3000);
         }
+
+        return serverSaveOk;
       } catch (err: any) {
         console.error('persistSessionDocument error:', err);
         setSavedSuccessBanner(false);
+        return false;
       } finally {
         isSavingRef.current = false;
         setIsSaving(false);
@@ -1318,6 +1383,289 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       resolveStudentName,
     ]
   );
+
+  /**
+   * FASE NF-DOC.2C: Aplicar IA
+   * 1. Preserves editor, formatting, history, and shortcuts Alt+Y/N/W/P
+   * 2. Persists original notes first before running transformation
+   * 3. Triggers Gemini strictly via user click
+   * 4. Displays real progress, error, and success banners without mock data
+   * 5. Preserves original content and last approved version upon failure
+   */
+  const handleApplyAi = useCallback(async () => {
+    if (isApplyingAi || isSaving) return;
+
+    if (!notesContent || !notesContent.trim()) {
+      setAiError('As anotações estão vazias. Escreva notas de sessão com termos pedagógicos antes de aplicar IA.');
+      return;
+    }
+
+    setAiError(null);
+    setAiSuccessMessage(null);
+    setIsApplyingAi(true);
+
+    try {
+      // 1. Mandatory: Save original notes first to ensure server is in sync
+      const savedOk = await persistSessionDocument(notesContent, topic, false);
+      if (!savedOk) {
+        setAiError('Não foi possível salvar as anotações originais antes de executar a transformação.');
+        setIsApplyingAi(false);
+        return;
+      }
+
+      const idToken = await auth.currentUser?.getIdToken().catch(() => null);
+      const resolvedTeacherUid = (currentAccount?.uid || (currentAccount as any)?.id || auth.currentUser?.uid || '').trim();
+      const resolvedStudentUid = studentResolution.uid;
+      const targetKey = selectedLessonId ? `lesson_${selectedLessonId}` : currentSessionKey;
+
+      const res = await fetch(`/api/session-notes/${encodeURIComponent(targetKey)}/transform`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+        },
+        body: JSON.stringify({
+          id: targetKey,
+          sessionId: targetKey,
+          sessionKey: targetKey,
+          rawNotes: notesContent,
+          topic,
+          language: 'pt',
+          studentUid: resolvedStudentUid,
+          teacherUid: resolvedTeacherUid,
+        }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        const errMsg = data.message || data.error || 'Falha na transformação pedagógica via IA. O documento original foi preservado intacto sem publicação.';
+        setAiError(errMsg);
+      } else if (data.draftTransformation) {
+        setDraftTransformation(data.draftTransformation);
+        if (data.draftTransformation.transformation) {
+          setEditableTransformation(JSON.parse(JSON.stringify(data.draftTransformation.transformation)));
+        }
+        setApprovalStatus('draft_in_progress');
+        setAiSuccessMessage('Transformação pedagógica gerada pela IA com sucesso! Revise o conteúdo antes de aprovar.');
+      } else {
+        setAiError('Resposta inesperada da IA. O documento original foi mantido intacto.');
+      }
+    } catch (err: any) {
+      setAiError(err.message || 'Erro de conexão ao acionar o serviço de IA.');
+    } finally {
+      setIsApplyingAi(false);
+    }
+  }, [
+    isApplyingAi,
+    isSaving,
+    notesContent,
+    topic,
+    persistSessionDocument,
+    currentAccount,
+    studentResolution,
+    selectedLessonId,
+    currentSessionKey,
+  ]);
+
+  /**
+   * FASE NF-DOC.2C: Aprovar e Publicar
+   * 1. Publishes only when teacher clicks button
+   * 2. Blocks stale drafts (when rawContent changed after draft)
+   * 3. Publishes edited transformation directly to lastApprovedVersion
+   * 4. Clears active draft and updates approval status
+   */
+  const handleApproveAndPublish = useCallback(async () => {
+    if (isApproving || !editableTransformation) return;
+
+    if (isDraftStale) {
+      setAiError('O rascunho pedagógico está desatualizado em relação às anotações atuais da sessão. Modificações foram feitas nas anotações após o rascunho. Gere ou edite um novo rascunho antes de aprovar.');
+      return;
+    }
+
+    setAiError(null);
+    setAiSuccessMessage(null);
+    setIsApproving(true);
+
+    try {
+      const idToken = await auth.currentUser?.getIdToken().catch(() => null);
+      const resolvedTeacherUid = (currentAccount?.uid || (currentAccount as any)?.id || auth.currentUser?.uid || '').trim();
+      const resolvedStudentUid = studentResolution.uid;
+      const targetKey = selectedLessonId ? `lesson_${selectedLessonId}` : currentSessionKey;
+
+      const res = await fetch(`/api/session-notes/${encodeURIComponent(targetKey)}/approve`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+        },
+        body: JSON.stringify({
+          id: targetKey,
+          sessionId: targetKey,
+          draftId: draftTransformation?.draftId,
+          transformation: editableTransformation,
+          studentUid: resolvedStudentUid,
+          teacherUid: resolvedTeacherUid,
+          changeSummary: 'Teacher reviewed and approved pedagogical notes for student',
+        }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        const errMsg = data.message || data.error || 'Falha ao aprovar o relatório pedagógico.';
+        setAiError(errMsg);
+      } else {
+        setApprovalStatus('approved');
+        if (data.approvedVersion) {
+          setLastApprovedVersion(data.approvedVersion);
+          setEditableTransformation(JSON.parse(JSON.stringify(data.approvedVersion.transformation)));
+        }
+        setDraftTransformation(null);
+        setAiSuccessMessage('Relatório pedagógico aprovado e publicado com sucesso para o aluno!');
+      }
+    } catch (err: any) {
+      setAiError(err.message || 'Erro de conexão ao aprovar relatório.');
+    } finally {
+      setIsApproving(false);
+    }
+  }, [
+    isApproving,
+    editableTransformation,
+    isDraftStale,
+    selectedLessonId,
+    currentSessionKey,
+    draftTransformation,
+    studentResolution,
+    currentAccount,
+  ]);
+
+  // Inline editing handlers for Pedagogical Report
+  const handleUpdateMistake = useCallback((index: number, field: string, value: string) => {
+    setEditableTransformation((prev: any) => {
+      if (!prev) return prev;
+      const list = Array.isArray(prev.mistakesAnalysis) ? [...prev.mistakesAnalysis] : [];
+      if (!list[index]) return prev;
+      list[index] = { ...list[index], [field]: value };
+      return { ...prev, mistakesAnalysis: list };
+    });
+  }, []);
+
+  const handleAddMistake = useCallback(() => {
+    setEditableTransformation((prev: any) => {
+      const list = Array.isArray(prev?.mistakesAnalysis) ? [...prev.mistakesAnalysis] : [];
+      list.push({
+        id: `mistake-${Date.now()}`,
+        original: '',
+        corrected: '',
+        explanation: '',
+        category: 'Grammar',
+      });
+      return { ...(prev || {}), mistakesAnalysis: list };
+    });
+  }, []);
+
+  const handleRemoveMistake = useCallback((index: number) => {
+    setEditableTransformation((prev: any) => {
+      if (!prev) return prev;
+      const list = Array.isArray(prev.mistakesAnalysis) ? [...prev.mistakesAnalysis] : [];
+      list.splice(index, 1);
+      return { ...prev, mistakesAnalysis: list };
+    });
+  }, []);
+
+  const handleUpdateGrammar = useCallback((index: number, field: string, value: any) => {
+    setEditableTransformation((prev: any) => {
+      if (!prev) return prev;
+      const list = Array.isArray(prev.grammarPoints) ? [...prev.grammarPoints] : [];
+      if (!list[index]) return prev;
+      list[index] = { ...list[index], [field]: value };
+      return { ...prev, grammarPoints: list };
+    });
+  }, []);
+
+  const handleAddGrammar = useCallback(() => {
+    setEditableTransformation((prev: any) => {
+      const list = Array.isArray(prev?.grammarPoints) ? [...prev.grammarPoints] : [];
+      list.push({
+        id: `grammar-${Date.now()}`,
+        topic: 'Novo Ponto Gramatical',
+        rule: '',
+        explanation: '',
+        examples: [''],
+      });
+      return { ...(prev || {}), grammarPoints: list };
+    });
+  }, []);
+
+  const handleRemoveGrammar = useCallback((index: number) => {
+    setEditableTransformation((prev: any) => {
+      if (!prev) return prev;
+      const list = Array.isArray(prev.grammarPoints) ? [...prev.grammarPoints] : [];
+      list.splice(index, 1);
+      return { ...prev, grammarPoints: list };
+    });
+  }, []);
+
+  const handleUpdateVocab = useCallback((index: number, field: string, value: any) => {
+    setEditableTransformation((prev: any) => {
+      if (!prev) return prev;
+      const list = Array.isArray(prev.vocabularyAndExpressions) ? [...prev.vocabularyAndExpressions] : [];
+      if (!list[index]) return prev;
+      list[index] = { ...list[index], [field]: value };
+      return { ...prev, vocabularyAndExpressions: list };
+    });
+  }, []);
+
+  const handleToggleVocabTag = useCallback((index: number, tag: 'isNewWord' | 'isPronunciationFocus') => {
+    setEditableTransformation((prev: any) => {
+      if (!prev) return prev;
+      const list = Array.isArray(prev.vocabularyAndExpressions) ? [...prev.vocabularyAndExpressions] : [];
+      if (!list[index]) return prev;
+      list[index] = { ...list[index], [tag]: !list[index][tag] };
+      return { ...prev, vocabularyAndExpressions: list };
+    });
+  }, []);
+
+  const handleAddVocab = useCallback(() => {
+    setEditableTransformation((prev: any) => {
+      const list = Array.isArray(prev?.vocabularyAndExpressions) ? [...prev.vocabularyAndExpressions] : [];
+      list.push({
+        id: `vocab-${Date.now()}`,
+        term: '',
+        simpleDefinition: '',
+        realExamples: [''],
+        isNewWord: true,
+        isPronunciationFocus: false,
+      });
+      return { ...(prev || {}), vocabularyAndExpressions: list };
+    });
+  }, []);
+
+  const handleRemoveVocab = useCallback((index: number) => {
+    setEditableTransformation((prev: any) => {
+      if (!prev) return prev;
+      const list = Array.isArray(prev.vocabularyAndExpressions) ? [...prev.vocabularyAndExpressions] : [];
+      list.splice(index, 1);
+      return { ...prev, vocabularyAndExpressions: list };
+    });
+  }, []);
+
+  const handleUpdateQuickReview = useCallback((field: string, value: any) => {
+    setEditableTransformation((prev: any) => {
+      const summary = prev?.reviewSummary ? { ...prev.reviewSummary } : {};
+      summary[field] = value;
+      return { ...(prev || {}), reviewSummary: summary };
+    });
+  }, []);
+
+  const handleResetToAiSuggestion = useCallback(() => {
+    if (draftTransformation?.transformation) {
+      setEditableTransformation(JSON.parse(JSON.stringify(draftTransformation.transformation)));
+    } else if (lastApprovedVersion?.transformation) {
+      setEditableTransformation(JSON.parse(JSON.stringify(lastApprovedVersion.transformation)));
+    }
+  }, [draftTransformation, lastApprovedVersion]);
 
   // Keep a stable ref to persistSessionDocument so autosave never re-triggers when persistSessionDocument is recreated
   const persistSessionDocumentRef = useRef(persistSessionDocument);
@@ -2082,6 +2430,672 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     });
   };
 
+  /**
+   * FASE NF-DOC.2C: Resultado da IA — Visual Minimalista e Revisão Editorial
+   * Renders the 4 canonical pedagogical parts:
+   * 1. Analyze Mistakes
+   * 2. Grammar Points
+   * 3. Vocabulary & Expressions
+   * 4. Quick Review (5–10 min)
+   *
+   * Design:
+   * - Minimalist editorial style, like a well-typeset document.
+   * - White background, readable typography, generous spacing, discrete hierarchy.
+   * - Subtle borders and dividers, point-highlights for errors (subtle rose) and corrections (subtle emerald).
+   * - Discreet "Sugestão IA" badges, editable inline fields for teacher review.
+   * - Stale draft warning when rawContent changed after draft.
+   */
+  const renderPedagogicalSection = () => {
+    return (
+      <div
+        id="pedagogical-enrichment-environment"
+        data-testid="pedagogical-enrichment-environment"
+        className="pt-8 mt-8 border-t border-slate-200 space-y-6 text-left"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Editorial Section Header */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-100">
+          <div className="space-y-0.5">
+            <div className="flex items-center gap-2 flex-wrap">
+              <h4 className="text-xs font-black uppercase tracking-wider text-[#000035]">
+                Síntese Pedagógica Estruturada
+              </h4>
+              <span className="text-[10px] uppercase font-mono font-bold text-slate-500 bg-slate-100 px-2 py-0.5 rounded">
+                CELTA • 4 Partes
+              </span>
+            </div>
+            <p className="text-xs text-slate-500">
+              Transformação pedagógica gerada exclusivamente via Gemini, revisada e aprovada pelo professor.
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2 flex-wrap">
+            {approvalStatus === 'approved' && (
+              <span
+                id="pedagogical-approved-badge"
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200 text-xs font-bold"
+              >
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                <span>Aprovado & Publicado {lastApprovedVersion?.versionNumber ? `(v${lastApprovedVersion.versionNumber})` : ''}</span>
+              </span>
+            )}
+            {approvalStatus !== 'approved' && draftTransformation && !isDraftStale && (
+              <span
+                id="pedagogical-draft-badge"
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-50 text-amber-800 border border-amber-200 text-xs font-bold"
+              >
+                <Sparkles className="w-3.5 h-3.5 text-amber-600" />
+                <span>Rascunho IA (Em Revisão)</span>
+              </span>
+            )}
+            {isDraftStale && (
+              <span
+                id="pedagogical-stale-badge"
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-rose-50 text-rose-800 border border-rose-200 text-xs font-bold"
+                title="Anotações originais alteradas após a criação deste rascunho"
+              >
+                <AlertCircle className="w-3.5 h-3.5 text-rose-600" />
+                <span>Rascunho Obsoleto</span>
+              </span>
+            )}
+            {editableTransformation && (draftTransformation || lastApprovedVersion) && (
+              <button
+                type="button"
+                onClick={handleResetToAiSuggestion}
+                className="text-[11px] text-slate-500 hover:text-[#1C4C96] transition flex items-center gap-1 cursor-pointer underline underline-offset-2 ml-1"
+                title="Restaurar valores sugeridos originalmente pela IA"
+              >
+                <Undo2 className="w-3 h-3" />
+                <span>Restaurar sugestão da IA</span>
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Real Status and Error Banners */}
+        {aiError && (
+          <div
+            id="pedagogical-error-banner"
+            className="p-3.5 bg-rose-50 border border-rose-200 rounded-2xl flex items-center gap-3 text-rose-800 text-xs font-semibold shadow-2xs animate-in fade-in duration-200"
+          >
+            <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+            <div className="flex-1">
+              <span>{aiError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setAiError(null)}
+              className="text-rose-600 hover:text-rose-900 text-xs font-bold px-1"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
+        {aiSuccessMessage && (
+          <div
+            id="pedagogical-success-banner"
+            className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-2xl flex items-center gap-3 text-emerald-800 text-xs font-semibold shadow-2xs animate-in fade-in duration-200"
+          >
+            <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+            <div className="flex-1">
+              <span>{aiSuccessMessage}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setAiSuccessMessage(null)}
+              className="text-emerald-600 hover:text-emerald-900 text-xs font-bold px-1"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
+        {isDraftStale && (
+          <div
+            id="pedagogical-stale-alert"
+            className="p-3.5 bg-amber-50 border border-amber-200 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-amber-900 text-xs font-medium shadow-2xs"
+          >
+            <div className="flex items-center gap-2.5">
+              <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+              <span>
+                As anotações brutas do documento foram alteradas após a geração do rascunho. Clique em <strong>Aplicar IA</strong> para atualizar o rascunho antes de aprovar.
+              </span>
+            </div>
+            <button
+              type="button"
+              disabled={isApplyingAi}
+              onClick={handleApplyAi}
+              className="px-3 py-1.5 bg-amber-700 hover:bg-amber-800 text-white rounded-xl text-xs font-bold shrink-0 transition flex items-center gap-1.5 cursor-pointer shadow-2xs disabled:opacity-50"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>Atualizar com IA</span>
+            </button>
+          </div>
+        )}
+
+        {/* Loading State */}
+        {isApplyingAi && (
+          <div className="py-12 px-6 rounded-2xl border border-slate-200 bg-slate-50/50 text-center space-y-3 animate-in fade-in duration-200">
+            <Loader2 className="w-6 h-6 text-[#1C4C96] mx-auto animate-spin" />
+            <h5 className="text-sm font-bold text-[#000035]">
+              Sintetizando anotações pedagógicas via Gemini...
+            </h5>
+            <p className="text-xs text-slate-500 max-w-md mx-auto">
+              Preservando todas as correções (Alt+N), termos novos (Alt+W) e pronúncia (Alt+P) em 4 partes estruturadas.
+            </p>
+          </div>
+        )}
+
+        {/* Empty state when no transformation has been generated yet */}
+        {!isApplyingAi && !editableTransformation && (
+          <div className="py-10 px-6 rounded-2xl border border-dashed border-slate-200 bg-slate-50/40 text-center space-y-3">
+            <Sparkles className="w-6 h-6 text-slate-400 mx-auto" />
+            <div className="space-y-1">
+              <h5 className="text-sm font-bold text-slate-700">
+                Relatório Pedagógico não gerado para esta sessão
+              </h5>
+              <p className="text-xs text-slate-500 max-w-lg mx-auto leading-relaxed">
+                Escreva ou revise suas anotações acima usando os atalhos de marcação (<kbd className="font-mono bg-white px-1 py-0.5 rounded border border-slate-200 text-[10px]">Alt+Y</kbd>, <kbd className="font-mono bg-white px-1 py-0.5 rounded border border-slate-200 text-[10px]">Alt+N</kbd>, <kbd className="font-mono bg-white px-1 py-0.5 rounded border border-slate-200 text-[10px]">Alt+W</kbd>, <kbd className="font-mono bg-white px-1 py-0.5 rounded border border-slate-200 text-[10px]">Alt+P</kbd>) e clique no botão <strong>Aplicar IA</strong> para sintetizar o relatório pedagógico em 4 seções.
+              </p>
+            </div>
+            <div className="pt-2">
+              <button
+                type="button"
+                disabled={isApplyingAi || !notesContent.trim()}
+                onClick={handleApplyAi}
+                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-xs font-bold bg-[#1C4C96] hover:bg-[#062863] text-white shadow-xs transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Sparkles className="w-4 h-4 text-[#F4CA54]" />
+                <span>Aplicar IA nas Anotações</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* 4 Canonical Parts Rendered when editableTransformation exists */}
+        {!isApplyingAi && editableTransformation && (
+          <div className="space-y-8 animate-in fade-in duration-200">
+            {/* PART 1: Analyze Mistakes */}
+            <section
+              id="pedagogical-part-1-mistakes"
+              className="space-y-3 pb-6 border-b border-slate-100"
+            >
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-black text-xs text-[#000035] uppercase tracking-wider">
+                      1. Analyze Mistakes
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded">
+                      {editableTransformation.mistakesAnalysis?.length || 0}
+                    </span>
+                    <span className="text-[10px] uppercase font-mono tracking-wider text-slate-400 bg-slate-50 border border-slate-200 px-1.5 py-0.2 rounded">
+                      Sugestão IA
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Correções pontuais com foco em precisão, contexto e uso natural.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleAddMistake}
+                  className="px-2.5 py-1 text-xs font-semibold text-[#1C4C96] hover:bg-slate-100 rounded-lg transition flex items-center gap-1 cursor-pointer border border-transparent hover:border-slate-200"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>Adicionar Correção</span>
+                </button>
+              </div>
+
+              {Array.isArray(editableTransformation.mistakesAnalysis) &&
+              editableTransformation.mistakesAnalysis.length > 0 ? (
+                <div className="space-y-3">
+                  {editableTransformation.mistakesAnalysis.map((item: any, idx: number) => (
+                    <div
+                      key={item.id || idx}
+                      className="p-3.5 bg-slate-50/60 rounded-xl border border-slate-200/80 space-y-2.5 hover:border-slate-300 transition"
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 flex-1">
+                          {/* Original Expression */}
+                          <div className="space-y-1">
+                            <span className="text-[10px] font-bold uppercase tracking-wider text-rose-700 flex items-center gap-1">
+                              <span>✗ Como o aluno falou</span>
+                            </span>
+                            <input
+                              type="text"
+                              value={item.original || ''}
+                              onChange={(e) => handleUpdateMistake(idx, 'original', e.target.value)}
+                              placeholder="Frase original com erro..."
+                              className="w-full text-xs font-mono text-rose-950 bg-rose-50/70 border border-rose-200/70 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-rose-400 focus:bg-white transition"
+                            />
+                          </div>
+
+                          {/* Corrected Expression */}
+                          <div className="space-y-1">
+                            <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-700 flex items-center gap-1">
+                              <span>✓ Como falar naturalmente</span>
+                            </span>
+                            <input
+                              type="text"
+                              value={item.corrected || ''}
+                              onChange={(e) => handleUpdateMistake(idx, 'corrected', e.target.value)}
+                              placeholder="Forma correta sugerida..."
+                              className="w-full text-xs font-semibold text-emerald-950 bg-emerald-50/70 border border-emerald-200/70 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-emerald-400 focus:bg-white transition"
+                            />
+                          </div>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveMistake(idx)}
+                          className="text-slate-400 hover:text-rose-600 transition p-1.5 rounded-lg hover:bg-rose-50 cursor-pointer"
+                          title="Remover esta correção"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+
+                      {/* Explanation */}
+                      <div className="space-y-1">
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                          Explicação Pedagógica:
+                        </span>
+                        <textarea
+                          rows={2}
+                          value={item.explanation || ''}
+                          onChange={(e) => handleUpdateMistake(idx, 'explanation', e.target.value)}
+                          placeholder="Por que corrigir dessa forma? Dica de fixação para o aluno..."
+                          className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96] resize-y leading-relaxed"
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-xs text-slate-400 italic py-2">
+                  Nenhum erro registrado nesta sessão.
+                </p>
+              )}
+            </section>
+
+            {/* PART 2: Grammar Points */}
+            <section
+              id="pedagogical-part-2-grammar"
+              className="space-y-3 pb-6 border-b border-slate-100"
+            >
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-black text-xs text-[#000035] uppercase tracking-wider">
+                      2. Grammar Points
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded">
+                      {editableTransformation.grammarPoints?.length || 0}
+                    </span>
+                    <span className="text-[10px] uppercase font-mono tracking-wider text-slate-400 bg-slate-50 border border-slate-200 px-1.5 py-0.2 rounded">
+                      Sugestão IA
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Padrões estruturais, regras e exemplos contextualizados.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleAddGrammar}
+                  className="px-2.5 py-1 text-xs font-semibold text-[#1C4C96] hover:bg-slate-100 rounded-lg transition flex items-center gap-1 cursor-pointer border border-transparent hover:border-slate-200"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>Adicionar Ponto Gramatical</span>
+                </button>
+              </div>
+
+              {Array.isArray(editableTransformation.grammarPoints) &&
+              editableTransformation.grammarPoints.length > 0 ? (
+                <div className="space-y-3">
+                  {editableTransformation.grammarPoints.map((gp: any, idx: number) => (
+                    <div
+                      key={gp.id || idx}
+                      className="p-3.5 bg-slate-50/60 rounded-xl border border-slate-200/80 space-y-2.5 hover:border-slate-300 transition border-l-2 border-l-[#1C4C96]"
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="space-y-1 flex-1">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-[#1C4C96]">
+                            Tópico / Regra Gramatical:
+                          </span>
+                          <input
+                            type="text"
+                            value={gp.topic || gp.rule || ''}
+                            onChange={(e) => handleUpdateGrammar(idx, 'topic', e.target.value)}
+                            placeholder="ex: Present Perfect vs Simple Past..."
+                            className="w-full text-xs font-bold text-[#000035] bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
+                          />
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveGrammar(idx)}
+                          className="text-slate-400 hover:text-rose-600 transition p-1.5 rounded-lg hover:bg-rose-50 cursor-pointer"
+                          title="Remover ponto gramatical"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+
+                      <div className="space-y-1">
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                          Explicação:
+                        </span>
+                        <textarea
+                          rows={2}
+                          value={gp.explanation || ''}
+                          onChange={(e) => handleUpdateGrammar(idx, 'explanation', e.target.value)}
+                          placeholder="Explicação da regra de forma clara e simples..."
+                          className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96] resize-y leading-relaxed"
+                        />
+                      </div>
+
+                      {/* Examples */}
+                      <div className="space-y-1">
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                          Exemplos de Uso:
+                        </span>
+                        <input
+                          type="text"
+                          value={Array.isArray(gp.examples) ? gp.examples.join(' • ') : (gp.examples || '')}
+                          onChange={(e) =>
+                            handleUpdateGrammar(
+                              idx,
+                              'examples',
+                              e.target.value.split('•').map((s) => s.trim()).filter(Boolean)
+                            )
+                          }
+                          placeholder="Separe múltiplos exemplos com • (bullet)"
+                          className="w-full text-xs text-slate-600 italic bg-white border border-slate-200 rounded-lg px-2.5 py-1 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-xs text-slate-400 italic py-2">
+                  Nenhum ponto gramatical registrado nesta sessão.
+                </p>
+              )}
+            </section>
+
+            {/* PART 3: Vocabulary & Expressions */}
+            <section
+              id="pedagogical-part-3-vocab"
+              className="space-y-3 pb-6 border-b border-slate-100"
+            >
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-black text-xs text-[#000035] uppercase tracking-wider">
+                      3. Vocabulary & Expressions
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded">
+                      {editableTransformation.vocabularyAndExpressions?.length || 0}
+                    </span>
+                    <span className="text-[10px] uppercase font-mono tracking-wider text-slate-400 bg-slate-50 border border-slate-200 px-1.5 py-0.2 rounded">
+                      Sugestão IA
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Vocabulário novo, expressões idiomáticas e foco em pronúncia.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleAddVocab}
+                  className="px-2.5 py-1 text-xs font-semibold text-[#1C4C96] hover:bg-slate-100 rounded-lg transition flex items-center gap-1 cursor-pointer border border-transparent hover:border-slate-200"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>Adicionar Termo</span>
+                </button>
+              </div>
+
+              {Array.isArray(editableTransformation.vocabularyAndExpressions) &&
+              editableTransformation.vocabularyAndExpressions.length > 0 ? (
+                <div className="space-y-3">
+                  {editableTransformation.vocabularyAndExpressions.map((v: any, idx: number) => (
+                    <div
+                      key={v.id || idx}
+                      className="p-3.5 bg-slate-50/60 rounded-xl border border-slate-200/80 space-y-2 hover:border-slate-300 transition"
+                    >
+                      <div className="flex items-start justify-between gap-2 flex-wrap">
+                        <div className="flex items-center gap-2 flex-1 min-w-[200px]">
+                          <input
+                            type="text"
+                            value={v.term || ''}
+                            onChange={(e) => handleUpdateVocab(idx, 'term', e.target.value)}
+                            placeholder="Palavra ou Expressão..."
+                            className="text-xs font-bold text-[#000035] bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96] flex-1 max-w-xs"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handleToggleVocabTag(idx, 'isNewWord')}
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold border transition cursor-pointer ${
+                              v.isNewWord
+                                ? 'bg-[#eff6ff] text-[#1d4ed8] border-[#1d4ed8]'
+                                : 'bg-slate-100 text-slate-400 border-slate-200'
+                            }`}
+                            title="Alternar marcação New Word"
+                          >
+                            ✦ New Word
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleToggleVocabTag(idx, 'isPronunciationFocus')}
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold border transition cursor-pointer ${
+                              v.isPronunciationFocus
+                                ? 'bg-[#faf5ff] text-[#7e22ce] border-[#7e22ce]'
+                                : 'bg-slate-100 text-slate-400 border-slate-200'
+                            }`}
+                            title="Alternar marcação Pronounce"
+                          >
+                            🎯 Pronounce
+                          </button>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveVocab(idx)}
+                          className="text-slate-400 hover:text-rose-600 transition p-1.5 rounded-lg hover:bg-rose-50 cursor-pointer"
+                          title="Remover este termo"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <div className="space-y-0.5">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                            Significado / Definição:
+                          </span>
+                          <input
+                            type="text"
+                            value={v.simpleDefinition || v.definitionEn || ''}
+                            onChange={(e) => handleUpdateVocab(idx, 'simpleDefinition', e.target.value)}
+                            placeholder="Significado claro em português ou inglês..."
+                            className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
+                          />
+                        </div>
+
+                        <div className="space-y-0.5">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                            Exemplo de Aplicação:
+                          </span>
+                          <input
+                            type="text"
+                            value={Array.isArray(v.realExamples) ? v.realExamples[0] || '' : (v.realExamples || '')}
+                            onChange={(e) => handleUpdateVocab(idx, 'realExamples', [e.target.value])}
+                            placeholder="Frase de exemplo da sessão..."
+                            className="w-full text-xs text-slate-600 italic bg-white border border-slate-200 rounded-lg px-2.5 py-1 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-xs text-slate-400 italic py-2">
+                  Nenhum termo de vocabulário registrado nesta sessão.
+                </p>
+              )}
+            </section>
+
+            {/* PART 4: Quick Review (5–10 min) */}
+            <section
+              id="pedagogical-part-4-review"
+              className="space-y-4"
+            >
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-black text-xs text-[#000035] uppercase tracking-wider">
+                      4. Quick Review (5–10 min)
+                    </span>
+                    <span className="text-[10px] uppercase font-mono tracking-wider text-slate-400 bg-slate-50 border border-slate-200 px-1.5 py-0.2 rounded">
+                      Sugestão IA
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Resumo conciso de alta retenção para revisão imediata do aluno.
+                  </p>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Tempo estimado:</span>
+                  <input
+                    type="text"
+                    value={editableTransformation.reviewSummary?.estimatedMinutes || '5–10 min'}
+                    onChange={(e) => handleUpdateQuickReview('estimatedMinutes', e.target.value)}
+                    className="w-24 text-xs font-semibold text-[#000035] bg-white border border-slate-200 rounded-lg px-2 py-0.5 text-center"
+                  />
+                </div>
+              </div>
+
+              <div className="p-4 bg-slate-50/70 rounded-xl border border-slate-200 space-y-4">
+                {/* Remember This */}
+                <div className="space-y-1">
+                  <span className="text-[10px] font-black uppercase tracking-wider text-[#1C4C96] flex items-center gap-1">
+                    <Lightbulb className="w-3.5 h-3.5 text-[#F4CA54]" />
+                    <span>Takeaway Central (Remember This):</span>
+                  </span>
+                  <textarea
+                    rows={2}
+                    value={editableTransformation.reviewSummary?.rememberThis || ''}
+                    onChange={(e) => handleUpdateQuickReview('rememberThis', e.target.value)}
+                    placeholder="A mensagem principal que o aluno deve levar desta aula..."
+                    className="w-full text-xs text-slate-800 bg-white border border-blue-200/80 rounded-lg px-3 py-2 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96] leading-relaxed"
+                  />
+                </div>
+
+                {/* Key Rules list */}
+                <div className="space-y-1">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-600">
+                    Regras Principais:
+                  </span>
+                  <input
+                    type="text"
+                    value={
+                      Array.isArray(editableTransformation.reviewSummary?.keyRules)
+                        ? editableTransformation.reviewSummary.keyRules.join(' • ')
+                        : ''
+                    }
+                    onChange={(e) =>
+                      handleUpdateQuickReview(
+                        'keyRules',
+                        e.target.value.split('•').map((s) => s.trim()).filter(Boolean)
+                      )
+                    }
+                    placeholder="Regras essenciais separadas por • (bullet)"
+                    className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
+                  />
+                </div>
+
+                {/* Must Know Vocabulary */}
+                <div className="space-y-1">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-600">
+                    Vocabulário Mandatório:
+                  </span>
+                  <input
+                    type="text"
+                    value={
+                      Array.isArray(editableTransformation.reviewSummary?.mustKnowVocabulary)
+                        ? editableTransformation.reviewSummary.mustKnowVocabulary.join(', ')
+                        : ''
+                    }
+                    onChange={(e) =>
+                      handleUpdateQuickReview(
+                        'mustKnowVocabulary',
+                        e.target.value.split(',').map((s) => s.trim()).filter(Boolean)
+                      )
+                    }
+                    placeholder="Palavras e expressões essenciais separadas por vírgula"
+                    className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
+                  />
+                </div>
+              </div>
+            </section>
+
+            {/* Editorial Approval Footer */}
+            <div className="pt-4 border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between gap-3">
+              <div className="text-xs text-slate-500">
+                {isDraftStale ? (
+                  <span className="text-rose-600 font-semibold flex items-center gap-1">
+                    <AlertCircle className="w-3.5 h-3.5" />
+                    <span>Anotações modificadas após a geração. Atualize via Aplicar IA para habilitar aprovação.</span>
+                  </span>
+                ) : approvalStatus === 'approved' ? (
+                  <span className="text-emerald-700 font-semibold flex items-center gap-1">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    <span>Versão atual publicada para o aluno.</span>
+                  </span>
+                ) : (
+                  <span>Revisão concluída? Clique em Aprovar e Publicar para disponibilizar ao aluno.</span>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={isApproving || isDraftStale}
+                  onClick={handleApproveAndPublish}
+                  id="btn-pedagogical-approve-publish-editorial"
+                  className={`px-5 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 shadow-xs border ${
+                    isDraftStale
+                      ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
+                      : approvalStatus === 'approved'
+                      ? 'bg-emerald-600 hover:bg-emerald-700 text-white border-emerald-700 cursor-pointer'
+                      : 'bg-[#15803d] hover:bg-[#166534] text-white border-[#15803d] cursor-pointer active:scale-98'
+                  }`}
+                  title={isDraftStale ? 'Anotações alteradas. Re-aplique IA antes de aprovar.' : 'Aprovar e Publicar para o Aluno'}
+                >
+                  {isApproving ? (
+                    <Loader2 className="w-4 h-4 animate-spin text-white" />
+                  ) : (
+                    <CheckCircle2 className="w-4 h-4 text-white" />
+                  )}
+                  <span>
+                    {isApproving
+                      ? 'Publicando...'
+                      : approvalStatus === 'approved'
+                      ? 'Aprovado & Publicado ✓'
+                      : 'Aprovar e Publicar'}
+                  </span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div
       className="bg-white rounded-3xl p-5 sm:p-7 border border-[#607EC9]/30 shadow-xs space-y-5"
@@ -2482,6 +3496,60 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   )}
                 </button>
 
+                {/* FASE NF-DOC.2C: Aplicar IA top button */}
+                <button
+                  type="button"
+                  id="btn-apply-ai-top"
+                  disabled={isApplyingAi || isSaving}
+                  onClick={handleApplyAi}
+                  className="px-3 py-1.5 bg-white hover:bg-slate-50 text-[#1C4C96] border border-[#1C4C96]/40 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer shadow-2xs disabled:opacity-50 disabled:cursor-not-allowed"
+                  title="Salva as anotações e aciona o Gemini para sintetizar o relatório pedagógico"
+                  aria-label="Aplicar IA"
+                >
+                  {isApplyingAi ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-[#1C4C96]" />
+                  ) : (
+                    <Sparkles className="w-3.5 h-3.5 text-[#1C4C96]" />
+                  )}
+                  <span>{isApplyingAi ? 'Aplicando IA...' : 'Aplicar IA'}</span>
+                </button>
+
+                {/* FASE NF-DOC.2C: Aprovar e Publicar top button */}
+                {editableTransformation && (
+                  <button
+                    type="button"
+                    id="btn-approve-publish-top"
+                    disabled={isApproving || isDraftStale}
+                    onClick={handleApproveAndPublish}
+                    className={`px-3 py-1.5 rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-2xs border ${
+                      isDraftStale
+                        ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
+                        : approvalStatus === 'approved'
+                        ? 'bg-emerald-50 text-emerald-700 border-emerald-300 cursor-pointer'
+                        : 'bg-[#15803d] text-white hover:bg-[#166534] border-[#15803d] cursor-pointer'
+                    }`}
+                    title={
+                      isDraftStale
+                        ? 'Anotações alteradas. Re-aplique a IA antes de aprovar.'
+                        : 'Aprovar e publicar relatório pedagógico para o aluno'
+                    }
+                    aria-label="Aprovar e Publicar"
+                  >
+                    {isApproving ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-current" />
+                    ) : (
+                      <CheckCircle2 className="w-3.5 h-3.5 text-current" />
+                    )}
+                    <span>
+                      {isApproving
+                        ? 'Publicando...'
+                        : approvalStatus === 'approved'
+                        ? 'Publicado ✓'
+                        : 'Aprovar e Publicar'}
+                    </span>
+                  </button>
+                )}
+
                 <button
                   type="button"
                   onClick={handleResetDocument}
@@ -2564,66 +3632,78 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                       spellCheck={false}
                     />
                   </div>
+
+                  {/* FASE NF-DOC.2C: Editorial Pedagogical Synthesis Section */}
+                  {renderPedagogicalSection()}
                 </div>
               </div>
             )}
 
             {editorViewMode === 'split' && (
               /* Side-by-Side Split View Mode */
-              <div className="p-4 sm:p-6 bg-slate-100/50 grid grid-cols-1 lg:grid-cols-2 gap-4">
-                {/* Left Column: Direct Editor */}
-                <div
-                  id="session-notes-split-sheet"
-                  className="bg-white rounded-2xl border border-slate-300 shadow-sm p-5 sm:p-6 space-y-3 cursor-text focus-within:border-[#1C4C96] focus-within:ring-2 focus-within:ring-[#1C4C96]/20 transition"
-                  onClick={(e) => {
-                    if (e.target === e.currentTarget) {
-                      focusEditorAtEnd(splitEditorRef.current);
-                    }
-                  }}
-                >
-                  <div className="flex items-center justify-between border-b border-slate-100 pb-2 text-[11px] text-slate-400 font-mono uppercase tracking-wider">
-                    <span>EDITING CANVAS</span>
-                    <span>Session: {sessionDate}</span>
-                  </div>
+              <div className="space-y-4">
+                <div className="p-4 sm:p-6 bg-slate-100/50 grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  {/* Left Column: Direct Editor */}
                   <div
-                    ref={splitEditorRef}
-                    id="session-notes-split-editor"
-                    data-testid="session-notes-split-editor"
-                    contentEditable={true}
-                    suppressContentEditableWarning={true}
-                    role="textbox"
-                    aria-multiline={true}
-                    tabIndex={0}
-                    onInput={handleEditorInput}
-                    onKeyDown={handleEditorKeyDown}
-                    onBlur={handleEditorBlur}
-                    onClick={(e) => e.stopPropagation()}
-                    className="w-full bg-transparent border-0 text-[#000035] text-sm leading-relaxed placeholder:text-slate-400 focus:outline-hidden min-h-[420px] font-sans selection:bg-[#9AB4FF]/40 p-0 m-0 block outline-none cursor-text whitespace-pre-wrap break-words"
-                    spellCheck={false}
-                  />
-                </div>
+                    id="session-notes-split-sheet"
+                    className="bg-white rounded-2xl border border-slate-300 shadow-sm p-5 sm:p-6 space-y-3 cursor-text focus-within:border-[#1C4C96] focus-within:ring-2 focus-within:ring-[#1C4C96]/20 transition"
+                    onClick={(e) => {
+                      if (e.target === e.currentTarget) {
+                        focusEditorAtEnd(splitEditorRef.current);
+                      }
+                    }}
+                  >
+                    <div className="flex items-center justify-between border-b border-slate-100 pb-2 text-[11px] text-slate-400 font-mono uppercase tracking-wider">
+                      <span>EDITING CANVAS</span>
+                      <span>Session: {sessionDate}</span>
+                    </div>
+                    <div
+                      ref={splitEditorRef}
+                      id="session-notes-split-editor"
+                      data-testid="session-notes-split-editor"
+                      contentEditable={true}
+                      suppressContentEditableWarning={true}
+                      role="textbox"
+                      aria-multiline={true}
+                      tabIndex={0}
+                      onInput={handleEditorInput}
+                      onKeyDown={handleEditorKeyDown}
+                      onBlur={handleEditorBlur}
+                      onClick={(e) => e.stopPropagation()}
+                      className="w-full bg-transparent border-0 text-[#000035] text-sm leading-relaxed placeholder:text-slate-400 focus:outline-hidden min-h-[420px] font-sans selection:bg-[#9AB4FF]/40 p-0 m-0 block outline-none cursor-text whitespace-pre-wrap break-words"
+                      spellCheck={false}
+                    />
+                  </div>
 
-                {/* Right Column: Live Rich-Text Rendered Document */}
-                <div className="bg-white rounded-2xl border border-slate-300 shadow-sm p-5 sm:p-6 space-y-3 overflow-y-auto max-h-[580px]">
-                  <div className="flex items-center justify-between border-b border-slate-100 pb-2 text-[11px] text-slate-400 font-mono uppercase tracking-wider flex-wrap gap-2">
-                    <span>FORMATTED DOCUMENT PREVIEW</span>
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#ecfdf5] text-[#15803d] text-[10px] font-bold border border-[#15803d]">
-                        ✓ {correctCount}
-                      </span>
-                      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#fff1f2] text-[#b91c1c] text-[10px] font-bold border border-[#b91c1c]">
-                        ✗ {incorrectCount}
-                      </span>
-                      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#eff6ff] text-[#1d4ed8] text-[10px] font-bold border border-[#1d4ed8]">
-                        ✦ {newWordCount}
-                      </span>
-                      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#faf5ff] text-[#7e22ce] text-[10px] font-bold border border-[#7e22ce]">
-                        🎯 {pronounceCount}
-                      </span>
+                  {/* Right Column: Live Rich-Text Rendered Document */}
+                  <div className="bg-white rounded-2xl border border-slate-300 shadow-sm p-5 sm:p-6 space-y-3 overflow-y-auto max-h-[580px]">
+                    <div className="flex items-center justify-between border-b border-slate-100 pb-2 text-[11px] text-slate-400 font-mono uppercase tracking-wider flex-wrap gap-2">
+                      <span>FORMATTED DOCUMENT PREVIEW</span>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#ecfdf5] text-[#15803d] text-[10px] font-bold border border-[#15803d]">
+                          ✓ {correctCount}
+                        </span>
+                        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#fff1f2] text-[#b91c1c] text-[10px] font-bold border border-[#b91c1c]">
+                          ✗ {incorrectCount}
+                        </span>
+                        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#eff6ff] text-[#1d4ed8] text-[10px] font-bold border border-[#1d4ed8]">
+                          ✦ {newWordCount}
+                        </span>
+                        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#faf5ff] text-[#7e22ce] text-[10px] font-bold border border-[#7e22ce]">
+                          🎯 {pronounceCount}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="space-y-1 text-sm font-sans leading-relaxed">
+                      {renderRichSessionNotes(notesContent)}
                     </div>
                   </div>
-                  <div className="space-y-1 text-sm font-sans leading-relaxed">
-                    {renderRichSessionNotes(notesContent)}
+                </div>
+
+                {/* FASE NF-DOC.2C: Pedagogical Synthesis in Split Mode */}
+                <div className="p-4 sm:p-6 pt-0 bg-slate-100/50 flex justify-center">
+                  <div className="w-full max-w-4xl bg-white rounded-2xl border border-slate-300 shadow-sm p-6 sm:p-8">
+                    {renderPedagogicalSection()}
                   </div>
                 </div>
               </div>
@@ -2673,6 +3753,9 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   <div className="space-y-1 font-sans min-h-[380px]">
                     {renderRichSessionNotes(notesContent)}
                   </div>
+
+                  {/* FASE NF-DOC.2C: Pedagogical Synthesis in Preview Mode */}
+                  {renderPedagogicalSection()}
                 </div>
               </div>
             )}
@@ -2760,7 +3843,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             </div>
           </div>
 
-          {/* Action Bar (Save Document to Firestore) */}
+          {/* Action Bar (Save Document to Firestore & FASE NF-DOC.2C AI Actions) */}
           <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-1">
             <div className="flex items-center gap-2 flex-wrap">
               {savedSuccessBanner && (
@@ -2775,26 +3858,97 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   <span>{saveError}</span>
                 </div>
               )}
+              {aiSuccessMessage && !savedSuccessBanner && (
+                <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-emerald-50 text-emerald-800 text-xs font-bold animate-in fade-in duration-200 shadow-2xs border border-emerald-200">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                  <span>{aiSuccessMessage}</span>
+                </div>
+              )}
+              {aiError && !saveError && (
+                <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-rose-50 text-rose-800 text-xs font-bold animate-in fade-in duration-200 shadow-2xs border border-rose-200">
+                  <AlertCircle className="w-4 h-4 text-rose-600" />
+                  <span>{aiError}</span>
+                </div>
+              )}
+              {isDraftStale && (
+                <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-amber-50 text-amber-800 text-xs font-semibold border border-amber-200">
+                  <span>⚠️ Rascunho desatualizado com o texto original</span>
+                </div>
+              )}
             </div>
 
             <div className="flex items-center gap-2.5 flex-wrap justify-end">
               <button
                 type="button"
+                id="btn-save-notes"
                 disabled={isSaving}
                 onClick={() => persistSessionDocument(notesContent, topic, true)}
-                className={`px-6 py-2.5 rounded-xl text-xs font-bold transition flex items-center gap-2 shadow-md border border-[#9AB4FF]/40 active:scale-98 ${
+                className={`px-5 py-2.5 rounded-xl text-xs font-bold transition flex items-center gap-2 shadow-xs border border-[#9AB4FF]/40 active:scale-98 ${
                   isSaving
                     ? 'bg-[#1C4C96]/70 text-white cursor-not-allowed'
                     : 'bg-[#1C4C96] hover:bg-[#062863] text-white cursor-pointer'
                 }`}
+                title="Salvar alterações manuais das anotações no Firestore"
               >
                 {isSaving ? (
                   <Loader2 className="w-4 h-4 animate-spin text-[#9AB4FF]" />
                 ) : (
                   <Save className="w-4 h-4 text-[#9AB4FF]" />
                 )}
-                <span>{isSaving ? 'Saving...' : 'Save to Firestore'}</span>
+                <span>{isSaving ? 'Saving...' : 'Save Notes'}</span>
               </button>
+
+              <button
+                type="button"
+                id="btn-apply-ai-bottom"
+                disabled={isApplyingAi || isSaving}
+                onClick={handleApplyAi}
+                className="px-5 py-2.5 bg-white hover:bg-slate-50 text-[#1C4C96] border border-[#1C4C96]/40 rounded-xl text-xs font-bold transition flex items-center gap-2 cursor-pointer shadow-xs disabled:opacity-50 disabled:cursor-not-allowed active:scale-98"
+                title="Salva as anotações e aciona o Gemini para estruturar o relatório pedagógico"
+                aria-label="Aplicar IA"
+              >
+                {isApplyingAi ? (
+                  <Loader2 className="w-4 h-4 animate-spin text-[#1C4C96]" />
+                ) : (
+                  <Sparkles className="w-4 h-4 text-[#1C4C96]" />
+                )}
+                <span>{isApplyingAi ? 'Aplicando IA...' : 'Aplicar IA'}</span>
+              </button>
+
+              {editableTransformation && (
+                <button
+                  type="button"
+                  id="btn-approve-publish-bottom"
+                  disabled={isApproving || isDraftStale}
+                  onClick={handleApproveAndPublish}
+                  className={`px-6 py-2.5 rounded-xl text-xs font-bold transition flex items-center gap-2 shadow-xs border active:scale-98 ${
+                    isDraftStale
+                      ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
+                      : approvalStatus === 'approved'
+                      ? 'bg-emerald-50 text-emerald-700 border-emerald-300 cursor-pointer'
+                      : 'bg-[#15803d] text-white hover:bg-[#166534] border-[#15803d] cursor-pointer'
+                  }`}
+                  title={
+                    isDraftStale
+                      ? 'Anotações alteradas. Re-aplique a IA antes de aprovar.'
+                      : 'Aprovar e publicar relatório pedagógico'
+                  }
+                  aria-label="Aprovar e Publicar"
+                >
+                  {isApproving ? (
+                    <Loader2 className="w-4 h-4 animate-spin text-current" />
+                  ) : (
+                    <CheckCircle2 className="w-4 h-4 text-current" />
+                  )}
+                  <span>
+                    {isApproving
+                      ? 'Publicando...'
+                      : approvalStatus === 'approved'
+                      ? 'Publicado ✓'
+                      : 'Aprovar e Publicar'}
+                  </span>
+                </button>
+              )}
             </div>
           </div>
         </div>
