@@ -210,6 +210,14 @@ import {
   isLegacyGenericTransformation,
 } from './src/utils/pedagogicalTransformer';
 import {
+  mergeSessionNoteWithVersioning,
+  computeNotesContentHash,
+} from './src/utils/notesVersioning';
+import {
+  NoteDraftTransformation,
+  NoteApprovedVersion,
+} from './src/types';
+import {
   firebaseAuthMiddleware,
   requireAdmin,
   requireTeacher,
@@ -8635,30 +8643,49 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
   const topic = req.body?.topic || lesson?.title || 'Live Coaching Session';
   const targetStudentEmail = (studentDoc?.email || req.body?.studentEmail || '').toLowerCase().trim();
 
-  // 8. Construct canonical note document
-  const noteDoc = {
-    id: sessionKey,
-    sessionKey,
-    sessionDate,
-    lessonId: lessonId || '',
-    studentUid,
-    studentEmail: targetStudentEmail,
-    teacherUid,
-    teacherEmail: (req.user.email || '').toLowerCase().trim(),
+  // 8. Fetch existing document to preserve approved version, original notes, and version history (FASE NF-DOC.2A)
+  let existingDoc = db.sessionNotesMap?.[sessionKey];
+  if (!existingDoc) {
+    try {
+      existingDoc = await fetchSessionNotesFromFirestoreServer(sessionKey);
+    } catch {}
+  }
+
+  const authorContext = {
+    authorUid: teacherUid,
+    authorEmail: (req.user.email || '').toLowerCase().trim(),
+    authorRole: (isCallerAdmin ? 'admin' : 'teacher') as 'teacher' | 'admin',
     teacherName: teacherResolution?.name || req.body?.teacherName || req.user.name || 'Native Friend',
-    topic,
-    content: rawContent,
-    rawContent,
-    pronunciationNotes: req.body?.pronunciationNotes,
-    grammarAndPhrasing: req.body?.grammarAndPhrasing,
-    vocabularyNotes: req.body?.vocabularyNotes,
-    driveFileId: req.body?.driveFileId || '',
-    driveFileUrl: req.body?.driveFileUrl || '',
-    driveFolderName: req.body?.driveFolderName || GOOGLE_DRIVE_SESSION_FOLDER,
-    driveLastSyncedAt: req.body?.driveLastSyncedAt || '',
-    updatedAt: new Date().toISOString(),
-    lastSavedByUid: teacherUid,
   };
+
+  const noteDoc = mergeSessionNoteWithVersioning({
+    existingNote: existingDoc,
+    incomingNote: {
+      ...req.body,
+      id: sessionKey,
+      sessionId: sessionKey,
+      sessionKey,
+      sessionDate,
+      lessonId: lessonId || '',
+      studentUid,
+      studentEmail: targetStudentEmail,
+      teacherUid,
+      teacherEmail: authorContext.authorEmail,
+      teacherName: authorContext.teacherName,
+      topic,
+      content: rawContent,
+      rawContent,
+      pronunciationNotes: req.body?.pronunciationNotes,
+      grammarAndPhrasing: req.body?.grammarAndPhrasing,
+      vocabularyNotes: req.body?.vocabularyNotes,
+      driveFileId: req.body?.driveFileId || '',
+      driveFileUrl: req.body?.driveFileUrl || '',
+      driveFolderName: req.body?.driveFolderName || GOOGLE_DRIVE_SESSION_FOLDER,
+      driveLastSyncedAt: req.body?.driveLastSyncedAt || '',
+    },
+    author: authorContext,
+    changeSummary: req.body?.changeSummary,
+  });
 
   // 9. Synchronize liveLessons in memory if lesson exists
   if (lessonId && Array.isArray(db.liveLessons)) {
@@ -8716,6 +8743,250 @@ app.post('/api/lessons/:id/notes', firebaseAuthMiddleware, async (req, res) => {
 // Save Native Friend In-Session Notes & Recommendations document keyed by session date/ID
 app.post('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
   return handleSaveSessionNotesInternal(req, res);
+});
+
+// FASE NF-DOC.2A: Save in-progress draft AI transformation being edited/reviewed by teacher
+app.post('/api/session-notes/:id/draft', firebaseAuthMiddleware, async (req, res) => {
+  if (!req.user || !req.user.uid) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Autenticação mandatória.' });
+  }
+
+  const callerUid = req.user.uid;
+  const isCallerAdmin = req.user.role === 'admin';
+  const targetSessionKey = decodeURIComponent(req.params.id).trim();
+
+  const db = readDb();
+  let teacherResolution: any = null;
+  let isCallerTeacher = false;
+  if (!isCallerAdmin) {
+    teacherResolution = await resolveTeacherCanonicalIdentity({ teacherUid: callerUid, teacherEmail: req.user.email, dbState: db }).catch(() => null);
+    if (!teacherResolution || !teacherResolution.isApproved) {
+      return res.status(403).json({ error: 'Forbidden', message: 'Apenas professores aprovados ou administradores podem elaborar rascunhos pedagógicos.' });
+    }
+    isCallerTeacher = true;
+  }
+
+  let existingDoc = db.sessionNotesMap?.[targetSessionKey];
+  if (!existingDoc) {
+    try {
+      existingDoc = await fetchSessionNotesFromFirestoreServer(targetSessionKey);
+    } catch {}
+  }
+
+  if (!existingDoc) {
+    return res.status(404).json({ error: 'NOT_FOUND', message: 'Documento da anotação não encontrado.' });
+  }
+
+  const studentUid = existingDoc.studentUid;
+  if (!studentUid || !isValidCanonicalUid(studentUid)) {
+    return res.status(400).json({ error: 'INVALID_STUDENT_IDENTITY', message: 'Identidade canônica do aluno ausente no documento.' });
+  }
+
+  if (isCallerTeacher && !isCallerAdmin) {
+    const isAuthorized = await verifyCanonicalPedagogicalLinkServer(callerUid, studentUid);
+    if (!isAuthorized) {
+      return res.status(403).json({ error: 'Forbidden', code: 'UNAUTHORIZED_PEDAGOGICAL_LINK', message: 'Amigo Nativo não possui vínculo autorizado com este aluno.' });
+    }
+  }
+
+  const transformation = req.body?.transformation;
+  const customTeacherNotes = typeof req.body?.customTeacherNotes === 'string' ? req.body.customTeacherNotes : undefined;
+  const reviewNotes = typeof req.body?.reviewNotes === 'string' ? req.body.reviewNotes : undefined;
+
+  const currentVersion = existingDoc.currentVersionNumber || 1;
+  const nextDraftVersion = currentVersion + 1;
+  const rawNoteText = existingDoc.rawContent || existingDoc.content || '';
+  const contentHash = computeNotesContentHash(rawNoteText);
+
+  const draftTransformation: NoteDraftTransformation = {
+    draftId: `draft_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+    versionNumber: nextDraftVersion,
+    status: 'draft',
+    contentHash,
+    rawNotesSnippet: rawNoteText.slice(0, 300),
+    transformation: transformation || undefined,
+    customTeacherNotes,
+    reviewNotes,
+    createdAt: existingDoc.draftTransformation?.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    editorUid: callerUid,
+    editorEmail: req.user.email,
+  };
+
+  const authorContext = {
+    authorUid: callerUid,
+    authorEmail: req.user.email,
+    authorRole: (isCallerAdmin ? 'admin' : 'teacher') as 'teacher' | 'admin',
+    teacherName: teacherResolution?.name || (req.user as any)?.name || 'Native Friend',
+  };
+
+  const updatedDoc = mergeSessionNoteWithVersioning({
+    existingNote: existingDoc,
+    incomingNote: {
+      ...existingDoc,
+      draftTransformation,
+      studentUid,
+      teacherUid: existingDoc.teacherUid || callerUid,
+      sessionDate: existingDoc.sessionDate,
+    },
+    author: authorContext,
+    changeSummary: req.body?.changeSummary || 'Teacher updated draft AI transformation in progress',
+  });
+
+  if (!db.sessionNotesMap) db.sessionNotesMap = {};
+  db.sessionNotesMap[targetSessionKey] = updatedDoc;
+  await writeDbSync(db);
+  await saveSessionNotesToFirestoreServer(targetSessionKey, updatedDoc).catch(() => null);
+
+  return res.json({ success: true, sessionNote: updatedDoc });
+});
+
+// FASE NF-DOC.2A: Teacher reviews and approves transformation version for student
+app.post('/api/session-notes/:id/approve', firebaseAuthMiddleware, async (req, res) => {
+  if (!req.user || !req.user.uid) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Autenticação mandatória.' });
+  }
+
+  const callerUid = req.user.uid;
+  const isCallerAdmin = req.user.role === 'admin';
+  const targetSessionKey = decodeURIComponent(req.params.id).trim();
+
+  const db = readDb();
+  let teacherResolution: any = null;
+  let isCallerTeacher = false;
+  if (!isCallerAdmin) {
+    teacherResolution = await resolveTeacherCanonicalIdentity({ teacherUid: callerUid, teacherEmail: req.user.email, dbState: db }).catch(() => null);
+    if (!teacherResolution || !teacherResolution.isApproved) {
+      return res.status(403).json({ error: 'Forbidden', message: 'Apenas professores aprovados ou administradores podem aprovar anotações.' });
+    }
+    isCallerTeacher = true;
+  }
+
+  let existingDoc = db.sessionNotesMap?.[targetSessionKey];
+  if (!existingDoc) {
+    try {
+      existingDoc = await fetchSessionNotesFromFirestoreServer(targetSessionKey);
+    } catch {}
+  }
+
+  if (!existingDoc) {
+    return res.status(404).json({ error: 'NOT_FOUND', message: 'Documento da anotação não encontrado.' });
+  }
+
+  const studentUid = existingDoc.studentUid;
+  if (!studentUid || !isValidCanonicalUid(studentUid)) {
+    return res.status(400).json({ error: 'INVALID_STUDENT_IDENTITY', message: 'Identidade canônica do aluno ausente no documento.' });
+  }
+
+  if (isCallerTeacher && !isCallerAdmin) {
+    const isAuthorized = await verifyCanonicalPedagogicalLinkServer(callerUid, studentUid);
+    if (!isAuthorized) {
+      return res.status(403).json({ error: 'Forbidden', code: 'UNAUTHORIZED_PEDAGOGICAL_LINK', message: 'Amigo Nativo não possui vínculo autorizado com este aluno.' });
+    }
+  }
+
+  const transformation = req.body?.transformation || existingDoc.draftTransformation?.transformation;
+  if (!transformation) {
+    return res.status(400).json({ error: 'TRANSFORMATION_REQUIRED', message: 'Transformação pedagógica válida é mandatória para aprovação.' });
+  }
+
+  const currentVersion = existingDoc.currentVersionNumber || 1;
+  const nextApprovedVersion = currentVersion + 1;
+  const rawNoteText = existingDoc.rawContent || existingDoc.content || '';
+  const contentHash = computeNotesContentHash(rawNoteText);
+
+  const approvedVersion: NoteApprovedVersion = {
+    approvedVersionId: `appr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+    versionNumber: nextApprovedVersion,
+    status: 'approved',
+    contentHash,
+    rawNotesSnippet: rawNoteText.slice(0, 300),
+    transformation,
+    approvedAt: new Date().toISOString(),
+    approvedByUid: callerUid,
+    approvedByEmail: req.user.email,
+    approvedByName: teacherResolution?.name || (req.user as any)?.name || 'Native Friend',
+    notesSummary: req.body?.notesSummary || 'Teacher reviewed and approved pedagogical notes for student',
+  };
+
+  const authorContext = {
+    authorUid: callerUid,
+    authorEmail: req.user.email,
+    authorRole: (isCallerAdmin ? 'admin' : 'teacher') as 'teacher' | 'admin',
+    teacherName: teacherResolution?.name || (req.user as any)?.name || 'Native Friend',
+  };
+
+  const updatedDoc = mergeSessionNoteWithVersioning({
+    existingNote: existingDoc,
+    incomingNote: {
+      ...existingDoc,
+      lastApprovedVersion: approvedVersion,
+      draftTransformation: null,
+      studentUid,
+      teacherUid: existingDoc.teacherUid || callerUid,
+      sessionDate: existingDoc.sessionDate,
+    },
+    author: authorContext,
+    changeSummary: req.body?.changeSummary || `Version ${nextApprovedVersion} approved and published for student`,
+  });
+
+  if (!db.sessionNotesMap) db.sessionNotesMap = {};
+  db.sessionNotesMap[targetSessionKey] = updatedDoc;
+  await writeDbSync(db);
+  await saveSessionNotesToFirestoreServer(targetSessionKey, updatedDoc).catch(() => null);
+
+  return res.json({ success: true, sessionNote: updatedDoc });
+});
+
+// FASE NF-DOC.2A: Inspect complete version history of session notes document
+app.get('/api/session-notes/:id/versions', firebaseAuthMiddleware, async (req, res) => {
+  if (!req.user || !req.user.uid) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Autenticação mandatória.' });
+  }
+
+  const callerUid = req.user.uid;
+  const isCallerAdmin = req.user.role === 'admin';
+  const targetSessionKey = decodeURIComponent(req.params.id).trim();
+
+  const db = readDb();
+  let existingDoc = db.sessionNotesMap?.[targetSessionKey];
+  if (!existingDoc) {
+    try {
+      existingDoc = await fetchSessionNotesFromFirestoreServer(targetSessionKey);
+    } catch {}
+  }
+
+  if (!existingDoc) {
+    return res.status(404).json({ error: 'NOT_FOUND', message: 'Documento da anotação não encontrado.' });
+  }
+
+  const studentUid = existingDoc.studentUid;
+  if (!isCallerAdmin) {
+    if (req.user.role === 'student' || (!req.user.role && callerUid === studentUid)) {
+      if (callerUid !== studentUid) {
+        return res.status(403).json({ error: 'Forbidden', message: 'Acesso negado a histórico de anotações de outro aluno.' });
+      }
+    } else {
+      const isAuthorized = await verifyCanonicalPedagogicalLinkServer(callerUid, studentUid);
+      if (!isAuthorized && existingDoc.teacherUid !== callerUid) {
+        return res.status(403).json({ error: 'Forbidden', message: 'Professor não autorizado para consultar histórico deste documento.' });
+      }
+    }
+  }
+
+  return res.json({
+    success: true,
+    sessionId: existingDoc.id,
+    sessionDate: existingDoc.sessionDate,
+    studentUid: existingDoc.studentUid,
+    teacherUid: existingDoc.teacherUid,
+    approvalStatus: existingDoc.approvalStatus || (existingDoc.lastApprovedVersion ? 'approved' : 'unapproved'),
+    currentVersionNumber: existingDoc.currentVersionNumber || 1,
+    originalTeacherNotes: existingDoc.originalTeacherNotes || null,
+    draftTransformation: existingDoc.draftTransformation || null,
+    lastApprovedVersion: existingDoc.lastApprovedVersion || null,
+    versionHistory: existingDoc.versionHistory || [],
+  });
 });
 
 // Dedicated Google Drive Session Notes Sync Endpoint (uses platform credentials mapped to teacher's email)

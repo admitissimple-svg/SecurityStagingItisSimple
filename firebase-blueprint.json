@@ -312,6 +312,12 @@
         "teacherName": { "type": "string", "description": "Teacher name" },
         "topic": { "type": "string", "description": "Session topic" },
         "content": { "type": "string", "description": "Free-form notes, vocabulary, pronunciation, and recommendations" },
+        "originalTeacherNotes": { "type": "object", "description": "Original raw notes from teacher with immutable baseline timestamp" },
+        "draftTransformation": { "type": "object", "description": "In-progress draft AI transformation being edited/reviewed by teacher" },
+        "lastApprovedVersion": { "type": "object", "description": "Last teacher-approved transformation version published for student" },
+        "approvalStatus": { "type": "string", "enum": ["unapproved", "draft_in_progress", "approved"], "description": "Status of document approval" },
+        "versionHistory": { "type": "array", "description": "Complete chronological version history entries" },
+        "currentVersionNumber": { "type": "number", "description": "Latest monotonic version number" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["sessionDate", "studentEmail", "content"]

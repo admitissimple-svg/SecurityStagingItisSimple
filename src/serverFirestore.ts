@@ -3920,6 +3920,12 @@ export async function saveSessionNotesToFirestoreServer(
     topic?: string;
     content: string;
     rawContent?: string;
+    originalTeacherNotes?: any;
+    draftTransformation?: any;
+    lastApprovedVersion?: any;
+    approvalStatus?: 'unapproved' | 'draft_in_progress' | 'approved';
+    versionHistory?: any[];
+    currentVersionNumber?: number;
     createdAt?: string;
     updatedAt?: string;
     lastSavedByUid?: string;
@@ -3949,12 +3955,35 @@ export async function saveSessionNotesToFirestoreServer(
   try {
     const cleanKey = sessionKey.replace(/[^a-zA-Z0-9_-]/g, '_');
 
-    // Idempotency check: preserve original createdAt if doc exists
+    // Idempotency check: preserve original createdAt and lastApprovedVersion if doc exists
     let existingCreatedAt = data.createdAt;
+    let existingApprovedVersion = data.lastApprovedVersion;
+    let existingOriginalNotes = data.originalTeacherNotes;
+    let existingDraft = data.draftTransformation;
+    let existingHistory = data.versionHistory;
+    let existingApprovalStatus = data.approvalStatus;
+
     try {
       const existingDoc = await db.collection('session_notes').doc(cleanKey).get();
       if (existingDoc && existingDoc.exists) {
-        existingCreatedAt = existingDoc.data()?.createdAt || existingCreatedAt;
+        const exData = existingDoc.data() || {};
+        existingCreatedAt = exData.createdAt || existingCreatedAt;
+        // FASE NF-DOC.2A: A new edit MUST NOT erase or unpublish the previously approved version
+        if (existingApprovedVersion === undefined && exData.lastApprovedVersion) {
+          existingApprovedVersion = exData.lastApprovedVersion;
+        }
+        if (!existingOriginalNotes && exData.originalTeacherNotes) {
+          existingOriginalNotes = exData.originalTeacherNotes;
+        }
+        if (existingDraft === undefined && exData.draftTransformation) {
+          existingDraft = exData.draftTransformation;
+        }
+        if ((!existingHistory || existingHistory.length === 0) && Array.isArray(exData.versionHistory)) {
+          existingHistory = exData.versionHistory;
+        }
+        if (!existingApprovalStatus && exData.approvalStatus) {
+          existingApprovalStatus = exData.approvalStatus;
+        }
       }
     } catch {}
 
@@ -3962,17 +3991,28 @@ export async function saveSessionNotesToFirestoreServer(
     const effectiveCreatedAt = existingCreatedAt || nowIso;
     const rawContent = data.rawContent || data.content || '';
 
+    const effectiveApprovedVersion = data.lastApprovedVersion !== undefined ? data.lastApprovedVersion : (existingApprovedVersion || null);
+    const effectiveDraft = data.draftTransformation !== undefined ? data.draftTransformation : (existingDraft || null);
+    const effectiveApprovalStatus = effectiveApprovedVersion ? 'approved' : effectiveDraft ? 'draft_in_progress' : (data.approvalStatus || existingApprovalStatus || 'unapproved');
+
     const sanitized = JSON.parse(JSON.stringify({
       ...data,
       id: cleanKey,
+      sessionId: cleanKey,
       sessionKey: cleanKey,
       lessonId: data.lessonId || '',
       studentUid,
       teacherUid,
       sessionDate: data.sessionDate,
       rawContent,
-      content: data.content,
+      content: data.content || rawContent,
       topic: data.topic || '',
+      originalTeacherNotes: data.originalTeacherNotes || existingOriginalNotes || null,
+      draftTransformation: effectiveDraft,
+      lastApprovedVersion: effectiveApprovedVersion,
+      approvalStatus: effectiveApprovalStatus,
+      versionHistory: data.versionHistory || existingHistory || [],
+      currentVersionNumber: data.currentVersionNumber || (Array.isArray(existingHistory) && existingHistory.length > 0 ? Math.max(...existingHistory.map((v: any) => v.versionNumber || 0)) : 1),
       createdAt: effectiveCreatedAt,
       updatedAt: data.updatedAt || nowIso,
       lastSavedByUid: teacherUid,

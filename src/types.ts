@@ -597,8 +597,63 @@ export interface LiveLesson {
   driveLastSyncedAt?: string;
 }
 
+export interface TeacherOriginalNotes {
+  rawContent: string;
+  topic?: string;
+  updatedAt: string;
+  savedByUid: string;
+  teacherEmail?: string;
+  teacherName?: string;
+  contentHash: string;
+}
+
+export interface NoteDraftTransformation {
+  draftId: string;
+  versionNumber: number;
+  status: 'draft' | 'in_review';
+  contentHash: string;
+  rawNotesSnippet?: string;
+  transformation?: any;
+  customTeacherNotes?: string;
+  reviewNotes?: string;
+  createdAt: string;
+  updatedAt: string;
+  editorUid: string;
+  editorEmail?: string;
+}
+
+export interface NoteApprovedVersion {
+  approvedVersionId: string;
+  versionNumber: number;
+  status: 'approved';
+  contentHash: string;
+  rawNotesSnippet?: string;
+  transformation: any;
+  approvedAt: string;
+  approvedByUid: string;
+  approvedByEmail?: string;
+  approvedByName?: string;
+  notesSummary?: string;
+}
+
+export interface SessionNoteVersionEntry {
+  versionId: string;
+  versionNumber: number;
+  type: 'teacher_raw' | 'ai_draft' | 'approved_published';
+  createdAt: string;
+  authorUid: string;
+  authorEmail?: string;
+  authorRole: 'teacher' | 'admin';
+  contentHash: string;
+  rawContent?: string;
+  transformation?: any;
+  changeSummary?: string;
+}
+
 export interface SessionNotesDocument {
   id: string;
+  sessionId?: string;
+  sessionKey?: string;
   sessionDate: string;
   lessonId?: string;
   studentEmail: string;
@@ -608,12 +663,26 @@ export interface SessionNotesDocument {
   teacherName?: string;
   topic?: string;
   content: string;
+  rawContent?: string;
+
+  // FASE NF-DOC.2A Canonical Contract & Versioning
+  originalTeacherNotes?: TeacherOriginalNotes;
+  draftTransformation?: NoteDraftTransformation | null;
+  lastApprovedVersion?: NoteApprovedVersion | null;
+  approvalStatus?: 'unapproved' | 'draft_in_progress' | 'approved';
+  versionHistory?: SessionNoteVersionEntry[];
+  currentVersionNumber?: number;
+
   driveFileId?: string;
   driveFileUrl?: string;
   driveFolderName?: string;
   driveLastSyncedAt?: string;
   createdAt?: string;
   updatedAt?: string;
+  lastSavedByUid?: string;
+  pronunciationNotes?: any;
+  grammarAndPhrasing?: any;
+  vocabularyNotes?: any[];
 }
 
 export interface ChatMessage {
