@@ -1717,7 +1717,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     } catch (err: any) {
       console.warn('handleSyncToGoogleDriveClick error:', err);
       setDriveSyncStatus('error');
-      setDriveSyncError(err?.message || 'Erro ao sincronizar com o Google Drive.');
+      setDriveSyncError(err?.message || 'Error syncing with Google Drive.');
     }
   };
 

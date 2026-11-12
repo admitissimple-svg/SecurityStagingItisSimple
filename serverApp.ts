@@ -9237,6 +9237,48 @@ Ensure reviewSummary and rememberThis are fully provided in ${targetLang.nameEn}
   };
 }
 
+// Helper to autoritatively resolve approved teacher for pedagogical note actions (transform, draft, approve)
+async function resolveApprovedTeacherForSessionNotes(
+  callerUid: string,
+  callerEmail?: string,
+  tokenRole?: string,
+  dbState?: any
+): Promise<{ isApproved: boolean; resolution: any }> {
+  const canonicalRes = await resolveCanonicalUserRoleAndIdentity({
+    uid: callerUid,
+    email: callerEmail,
+    tokenRole,
+    dbState,
+  }).catch(() => null);
+
+  if (canonicalRes && canonicalRes.role === 'teacher' && canonicalRes.identityStatus === 'authorized') {
+    return {
+      isApproved: true,
+      resolution: {
+        canonicalUid: canonicalRes.uid || callerUid,
+        email: canonicalRes.email || callerEmail,
+        name: canonicalRes.name || 'Native Friend',
+        publicTutorId: canonicalRes.publicTutorId || callerUid,
+        isApproved: true,
+        role: 'teacher',
+        rawDoc: canonicalRes.rawDoc,
+      },
+    };
+  }
+
+  const teacherResolution = await resolveTeacherCanonicalIdentity({
+    teacherUid: callerUid,
+    teacherEmail: callerEmail,
+    dbState,
+  }).catch(() => null);
+
+  if (teacherResolution && teacherResolution.isApproved) {
+    return { isApproved: true, resolution: teacherResolution };
+  }
+
+  return { isApproved: false, resolution: null };
+}
+
 // FASE NF-DOC.2A & 2B: Save in-progress draft AI transformation being edited/reviewed by teacher
 async function handleSessionNoteDraftInternal(req: any, res: any) {
   if (!req.user || !req.user.uid) {
@@ -9250,9 +9292,10 @@ async function handleSessionNoteDraftInternal(req: any, res: any) {
   let teacherResolution: any = null;
   let isCallerTeacher = false;
   if (!isCallerAdmin) {
-    teacherResolution = await resolveTeacherCanonicalIdentity({ teacherUid: callerUid, teacherEmail: req.user.email, dbState: db }).catch(() => null);
-    if (teacherResolution && teacherResolution.isApproved) {
+    const authCheck = await resolveApprovedTeacherForSessionNotes(callerUid, req.user.email, req.user.role, db);
+    if (authCheck.isApproved) {
       isCallerTeacher = true;
+      teacherResolution = authCheck.resolution;
     } else {
       return res.status(403).json({
         error: 'Forbidden',
@@ -9368,14 +9411,10 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
   let teacherResolution: any = null;
   let isCallerTeacher = false;
   if (!isCallerAdmin) {
-    teacherResolution = await resolveTeacherCanonicalIdentity({
-      teacherUid: callerUid,
-      teacherEmail: req.user.email,
-      dbState: db,
-    }).catch(() => null);
-
-    if (teacherResolution && teacherResolution.isApproved) {
+    const authCheck = await resolveApprovedTeacherForSessionNotes(callerUid, req.user.email, req.user.role, db);
+    if (authCheck.isApproved) {
       isCallerTeacher = true;
+      teacherResolution = authCheck.resolution;
     } else {
       // Non-admin caller is not an approved teacher -> reject as student/unauthorized
       return res.status(403).json({
@@ -9596,14 +9635,10 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
   let teacherResolution: any = null;
   let isCallerTeacher = false;
   if (!isCallerAdmin) {
-    teacherResolution = await resolveTeacherCanonicalIdentity({
-      teacherUid: callerUid,
-      teacherEmail: req.user.email,
-      dbState: db,
-    }).catch(() => null);
-
-    if (teacherResolution && teacherResolution.isApproved) {
+    const authCheck = await resolveApprovedTeacherForSessionNotes(callerUid, req.user.email, req.user.role, db);
+    if (authCheck.isApproved) {
       isCallerTeacher = true;
+      teacherResolution = authCheck.resolution;
     } else {
       return res.status(403).json({
         error: 'Forbidden',

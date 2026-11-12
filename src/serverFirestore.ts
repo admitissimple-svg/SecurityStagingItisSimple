@@ -289,6 +289,22 @@ export async function resolveTeacherCanonicalIdentity(
             candidateDocs.push({ id: tSnap.id, ...tData });
           }
         }
+        if (candidateDocs.length === 0) {
+          const [qUid, qAuthUid] = await Promise.all([
+            db.collection('tutors').where('uid', '==', candidateUid).limit(1).get().catch(() => null),
+            db.collection('tutors').where('authUid', '==', candidateUid).limit(1).get().catch(() => null),
+          ]);
+          if (qUid && !qUid.empty) {
+            const d = qUid.docs[0];
+            const data = d.data();
+            if (data?.role !== 'student') candidateDocs.push({ id: d.id, ...data });
+          }
+          if (qAuthUid && !qAuthUid.empty) {
+            const d = qAuthUid.docs[0];
+            const data = d.data();
+            if (data?.role !== 'student') candidateDocs.push({ id: d.id, ...data });
+          }
+        }
       }
 
       if (candidatePublicId) {
@@ -429,7 +445,7 @@ export async function resolveTeacherCanonicalIdentity(
           console.warn(`[resolveTeacherCanonicalIdentity] Account ${resolvedUid} is canonically a student in users/{uid}. Refusing teacher resolution.`);
           return null;
         }
-        if (canonicalRole !== 'teacher' && canonicalRole !== 'native_friend') {
+        if (canonicalRole !== 'teacher' && canonicalRole !== 'native_friend' && canonicalRole !== 'tutor') {
           console.warn(`[resolveTeacherCanonicalIdentity] Account ${resolvedUid} has non-teacher canonical role '${canonicalRole}'.`);
           return null;
         }
@@ -438,14 +454,14 @@ export async function resolveTeacherCanonicalIdentity(
         const tutorSnap = await db.collection('tutors').doc(resolvedUid).get().catch(() => null);
         let confirmedInTutors = Boolean(
           tutorSnap && tutorSnap.exists && (tutorSnap.data()?.role !== 'student') &&
-          (tutorSnap.data()?.approvalStatus === 'approved') &&
-          (tutorSnap.data()?.isApproved === true)
+          (tutorSnap.data()?.approvalStatus === 'approved' || tutorSnap.data()?.status === 'approved') &&
+          (tutorSnap.data()?.isApproved === true || tutorSnap.data()?.approved === true)
         );
         if (!confirmedInTutors) {
           const qTutorUid = await db.collection('tutors').where('uid', '==', resolvedUid).limit(1).get().catch(() => null);
           if (qTutorUid && !qTutorUid.empty) {
             const tDoc = qTutorUid.docs[0].data();
-            if (tDoc?.approvalStatus === 'approved' && tDoc?.isApproved === true && tDoc?.role !== 'student') {
+            if ((tDoc?.approvalStatus === 'approved' || tDoc?.status === 'approved') && (tDoc?.isApproved === true || tDoc?.approved === true) && tDoc?.role !== 'student') {
               confirmedInTutors = true;
             }
           }
@@ -454,7 +470,7 @@ export async function resolveTeacherCanonicalIdentity(
           const qTutorAuthUid = await db.collection('tutors').where('authUid', '==', resolvedUid).limit(1).get().catch(() => null);
           if (qTutorAuthUid && !qTutorAuthUid.empty) {
             const tDoc = qTutorAuthUid.docs[0].data();
-            if (tDoc?.approvalStatus === 'approved' && tDoc?.isApproved === true && tDoc?.role !== 'student') {
+            if ((tDoc?.approvalStatus === 'approved' || tDoc?.status === 'approved') && (tDoc?.isApproved === true || tDoc?.approved === true) && tDoc?.role !== 'student') {
               confirmedInTutors = true;
             }
           }
@@ -462,7 +478,7 @@ export async function resolveTeacherCanonicalIdentity(
         if (!confirmedInTutors) {
           const dbState = (target && typeof target === 'object' && (target as any).dbState) || null;
           const memoryTeacher = (dbState?.teachers || dbState?.tutorsList || []).find(
-            (t: any) => (t.uid === resolvedUid || t.id === resolvedUid || (t.email || '').toLowerCase() === email) && t.role !== 'student' && t.approvalStatus === 'approved'
+            (t: any) => (t.uid === resolvedUid || t.id === resolvedUid || (t.email || '').toLowerCase() === email) && t.role !== 'student' && (t.approvalStatus === 'approved' || t.status === 'approved' || t.isApproved === true || t.approved === true)
           );
           if (!memoryTeacher) {
             console.warn(`[resolveTeacherCanonicalIdentity] Canonical profile users/${resolvedUid} does not exist and no approved tutors record was found. Blocking unverified teacher resolution.`);
@@ -479,11 +495,10 @@ export async function resolveTeacherCanonicalIdentity(
   // Check in-memory dbState if provided to guarantee no student is promoted
   const dbState = (target && typeof target === 'object' && (target as any).dbState) || null;
   if (dbState) {
-    const isMemoryApprovedTeacher = (dbState.teachers || []).some(
+    const isMemoryApprovedTeacher = (dbState.teachers || dbState.tutorsList || []).some(
       (t: any) => (t.uid === resolvedUid || t.id === resolvedUid || (t.email || '').toLowerCase() === email) &&
-        t.role === 'teacher' &&
-        t.approvalStatus === 'approved' &&
-        t.isApproved === true
+        (t.role === 'teacher' || t.role === 'native_friend' || t.role === 'tutor' || t.isTeacher === true) &&
+        (t.approvalStatus === 'approved' || t.isApproved === true || t.status === 'approved' || t.approved === true)
     );
     const isLocalStudent = !isMemoryApprovedTeacher && (
       (dbState.students || []).some((s: any) => (s.uid === resolvedUid || (s.email || '').toLowerCase() === email)) ||
@@ -497,9 +512,8 @@ export async function resolveTeacherCanonicalIdentity(
   }
 
   const isApproved = Boolean(
-    (consolidated?.role === 'teacher' || consolidated?.role === 'native_friend') &&
-    consolidated?.approvalStatus === 'approved' &&
-    consolidated?.isApproved === true
+    (consolidated?.role === 'teacher' || consolidated?.role === 'native_friend' || consolidated?.role === 'tutor' || consolidated?.isTeacher === true) &&
+    (consolidated?.approvalStatus === 'approved' || consolidated?.isApproved === true || consolidated?.status === 'approved' || consolidated?.approved === true)
   );
 
   const name = consolidated?.name || 'Native Friend';
@@ -6062,6 +6076,18 @@ export async function verifyCanonicalPedagogicalLinkServer(
   }
 
   const db = getFirestoreDb();
+  const allowedTeacherIds = new Set<string>([cleanTeacherUid, `tutor-${cleanTeacherUid}`]);
+  try {
+    const teacherIdent = await resolveTeacherCanonicalIdentity({ teacherUid: cleanTeacherUid }).catch(() => null);
+    if (teacherIdent?.publicTutorId) {
+      allowedTeacherIds.add(teacherIdent.publicTutorId);
+      allowedTeacherIds.add(`tutor-${teacherIdent.publicTutorId}`);
+    }
+    if (teacherIdent?.canonicalUid) {
+      allowedTeacherIds.add(teacherIdent.canonicalUid);
+      allowedTeacherIds.add(`tutor-${teacherIdent.canonicalUid}`);
+    }
+  } catch {}
 
   // 2. Check canonical Firestore (default): users/{studentUid}
   if (db) {
@@ -6076,10 +6102,7 @@ export async function verifyCanonicalPedagogicalLinkServer(
           uData?.assignedTutorId ||
           ''
         ).trim();
-        if (
-          assignedUid &&
-          (assignedUid === cleanTeacherUid || assignedUid === `tutor-${cleanTeacherUid}`)
-        ) {
+        if (assignedUid && allowedTeacherIds.has(assignedUid)) {
           return true;
         }
       }
@@ -6091,18 +6114,20 @@ export async function verifyCanonicalPedagogicalLinkServer(
 
     // 3. Check canonical Firestore (default): lessons collection
     try {
-      const lessonSnap = await db
-        .collection('lessons')
-        .where('studentUid', '==', cleanStudentUid)
-        .where('teacherUid', '==', cleanTeacherUid)
-        .get();
-      if (!lessonSnap.empty) {
-        const hasValidLesson = lessonSnap.docs.some((d) => {
-          const lData = d.data();
-          return lData.status !== 'cancelled' && lData.status !== 'canceled';
-        });
-        if (hasValidLesson || lessonSnap.docs.length > 0) {
-          return true;
+      for (const tId of allowedTeacherIds) {
+        const lessonSnap = await db
+          .collection('lessons')
+          .where('studentUid', '==', cleanStudentUid)
+          .where('teacherUid', '==', tId)
+          .get();
+        if (!lessonSnap.empty) {
+          const hasValidLesson = lessonSnap.docs.some((d) => {
+            const lData = d.data();
+            return lData.status !== 'cancelled' && lData.status !== 'canceled';
+          });
+          if (hasValidLesson || lessonSnap.docs.length > 0) {
+            return true;
+          }
         }
       }
     } catch (fsErr) {
@@ -6137,10 +6162,7 @@ export async function verifyCanonicalPedagogicalLinkServer(
       ''
     ).trim();
 
-    if (
-      assignedUid &&
-      (assignedUid === cleanTeacherUid || assignedUid === `tutor-${cleanTeacherUid}`)
-    ) {
+    if (assignedUid && allowedTeacherIds.has(assignedUid)) {
       return true;
     }
 
@@ -6151,7 +6173,7 @@ export async function verifyCanonicalPedagogicalLinkServer(
       const lTeacherUid = (l.teacherUid || (l as any).tutorUid || '').trim();
       const match =
         lStudentUid === cleanStudentUid &&
-        (lTeacherUid === cleanTeacherUid || lTeacherUid === `tutor-${cleanTeacherUid}`);
+        allowedTeacherIds.has(lTeacherUid);
       if (match && l.status !== 'cancelled' && l.status !== 'canceled') {
         return true;
       }
