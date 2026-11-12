@@ -450,7 +450,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     if (rawPropUid && teacherUidVal && rawPropUid === teacherUidVal) {
       return {
         uid: '',
-        error: 'Erro de identidade: O UID do professor não pode ser utilizado como UID do aluno.',
+        error: 'Identity Error: Teacher UID cannot be used as student UID.',
         hasDivergence: true,
         source: 'none',
       };
@@ -494,16 +494,16 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
     // Verify divergence between available valid sources for the current selection
     const uidsFound: { source: string; uid: string }[] = [];
-    if (validPropUid) uidsFound.push({ source: 'componente pai', uid: validPropUid });
-    if (validDocUid) uidsFound.push({ source: 'cadastro do aluno', uid: validDocUid });
-    if (validLessonUid) uidsFound.push({ source: 'aula existente', uid: validLessonUid });
+    if (validPropUid) uidsFound.push({ source: 'parent component', uid: validPropUid });
+    if (validDocUid) uidsFound.push({ source: 'student profile', uid: validDocUid });
+    if (validLessonUid) uidsFound.push({ source: 'existing lesson', uid: validLessonUid });
 
     const distinctUids = Array.from(new Set(uidsFound.map((u) => u.uid)));
     if (distinctUids.length > 1) {
       const details = uidsFound.map((u) => `${u.source}: ${u.uid}`).join(', ');
       return {
         uid: '',
-        error: `Erro de identidade: UIDs divergentes detectados para a mesma aluna (${details}). Operação bloqueada para segurança.`,
+        error: `Identity Error: Divergent UIDs detected for the same student (${details}). Operation blocked for security.`,
         hasDivergence: true,
         source: 'none',
       };
@@ -528,7 +528,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     return {
       uid: '',
       error: cleanSelectedEmail
-        ? 'Erro de identidade: UID canônico da aluna ausente. O salvamento foi bloqueado para proteger a integridade dos dados.'
+        ? 'Identity Error: Canonical student UID missing. Saving blocked to protect data integrity.'
         : null,
       hasDivergence: false,
       source: 'none',
@@ -981,7 +981,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       if (isSavingRef.current || driveSyncStatus === 'syncing') return;
       if (studentResolution.error || !studentResolution.uid) {
         setDriveSyncStatus('error');
-        setDriveSyncError(studentResolution.error || 'Erro de identidade: UID canônico da aluna ausente. Sincronização com o Google Drive bloqueada.');
+        setDriveSyncError(studentResolution.error || 'Identity Error: Canonical student UID missing. Google Drive sync blocked.');
         return;
       }
       isSavingRef.current = true;
@@ -997,7 +997,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           } catch (authErr: any) {
             console.warn('Google Drive auth error:', authErr);
             setDriveSyncStatus('error');
-            setDriveSyncError('Autenticação com o Google Drive necessária. Por favor, autorize sua conta.');
+            setDriveSyncError('Google Drive authentication required. Please authorize your account.');
             isSavingRef.current = false;
             return;
           }
@@ -1005,7 +1005,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
         if (!activeToken) {
           setDriveSyncStatus('error');
-          setDriveSyncError('Autenticação com o Google Drive necessária. Clique no botão para autorizar.');
+          setDriveSyncError('Google Drive authentication required. Click the button to authorize.');
           isSavingRef.current = false;
           return;
         }
@@ -1054,7 +1054,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             }
           } catch (reAuthErr) {
             setDriveSyncStatus('error');
-            setDriveSyncError('Sessão expirada. Por favor, autorize novamente o Google Drive.');
+            setDriveSyncError('Session expired. Please authorize Google Drive again.');
             isSavingRef.current = false;
             return;
           }
@@ -1141,12 +1141,12 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           }
         } else {
           setDriveSyncStatus('error');
-          setDriveSyncError(res.error || 'Falha ao sincronizar com o Google Drive.');
+          setDriveSyncError(res.error || 'Failed to sync with Google Drive.');
         }
       } catch (err: any) {
         console.warn('executeDriveSync error:', err);
         setDriveSyncStatus('error');
-        setDriveSyncError(err?.message || 'Erro ao comunicar com o Google Drive.');
+        setDriveSyncError(err?.message || 'Error communicating with Google Drive.');
       } finally {
         isSavingRef.current = false;
       }
@@ -1181,7 +1181,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       if (studentResolution.error || !studentResolution.uid) {
         const errMsg =
           studentResolution.error ||
-          'Erro de identidade: UID canônico da aluna ausente. O salvamento foi bloqueado para proteger a integridade dos dados.';
+          'Identity Error: Canonical student UID missing. Saving was blocked to protect data integrity.';
         setSaveError(errMsg);
         if (explicitSave) {
           setSavedSuccessBanner(false);
@@ -1327,7 +1327,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           if (!apiRes.ok) {
             serverSaveOk = false;
             const errData = await apiRes.json().catch(() => ({}));
-            setSaveError(errData.error || errData.message || 'Erro ao salvar notas no servidor.');
+            setSaveError(errData.error || errData.message || 'Error saving notes to server.');
           } else {
             setSaveError(null);
           }
@@ -1396,7 +1396,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     if (isApplyingAi || isSaving) return;
 
     if (!notesContent || !notesContent.trim()) {
-      setAiError('As anotações estão vazias. Escreva notas de sessão com termos pedagógicos antes de aplicar IA.');
+      setAiError('Notes are empty. Write session notes with pedagogical terms before applying AI.');
       return;
     }
 
@@ -1408,7 +1408,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       // 1. Mandatory: Save original notes first to ensure server is in sync
       const savedOk = await persistSessionDocument(notesContent, topic, false);
       if (!savedOk) {
-        setAiError('Não foi possível salvar as anotações originais antes de executar a transformação.');
+        setAiError('Failed to save original notes before executing transformation.');
         setIsApplyingAi(false);
         return;
       }
@@ -1439,7 +1439,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       const data = await res.json().catch(() => ({}));
 
       if (!res.ok) {
-        const errMsg = data.message || data.error || 'Falha na transformação pedagógica via IA. O documento original foi preservado intacto sem publicação.';
+        const errMsg = data.message || data.error || 'Pedagogical transformation via AI failed. Original document was preserved intact without publishing.';
         setAiError(errMsg);
       } else if (data.draftTransformation) {
         setDraftTransformation(data.draftTransformation);
@@ -1447,12 +1447,12 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           setEditableTransformation(JSON.parse(JSON.stringify(data.draftTransformation.transformation)));
         }
         setApprovalStatus('draft_in_progress');
-        setAiSuccessMessage('Transformação pedagógica gerada pela IA com sucesso! Revise o conteúdo antes de aprovar.');
+        setAiSuccessMessage('Pedagogical transformation successfully generated by AI! Please review the content before approving.');
       } else {
-        setAiError('Resposta inesperada da IA. O documento original foi mantido intacto.');
+        setAiError('Unexpected AI response. The original document was kept intact.');
       }
     } catch (err: any) {
-      setAiError(err.message || 'Erro de conexão ao acionar o serviço de IA.');
+      setAiError(err.message || 'Connection error when calling the AI service.');
     } finally {
       setIsApplyingAi(false);
     }
@@ -1479,7 +1479,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     if (isApproving || !editableTransformation) return;
 
     if (isDraftStale) {
-      setAiError('O rascunho pedagógico está desatualizado em relação às anotações atuais da sessão. Modificações foram feitas nas anotações após o rascunho. Gere ou edite um novo rascunho antes de aprovar.');
+      setAiError('The pedagogical draft is outdated compared to the current session notes. Modifications were made to notes after the draft. Generate or edit a new draft before approving.');
       return;
     }
 
@@ -1513,7 +1513,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       const data = await res.json().catch(() => ({}));
 
       if (!res.ok) {
-        const errMsg = data.message || data.error || 'Falha ao aprovar o relatório pedagógico.';
+        const errMsg = data.message || data.error || 'Failed to approve pedagogical report.';
         setAiError(errMsg);
       } else {
         setApprovalStatus('approved');
@@ -1522,10 +1522,10 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           setEditableTransformation(JSON.parse(JSON.stringify(data.approvedVersion.transformation)));
         }
         setDraftTransformation(null);
-        setAiSuccessMessage('Relatório pedagógico aprovado e publicado com sucesso para o aluno!');
+        setAiSuccessMessage('Pedagogical report successfully approved and published for the student!');
       }
     } catch (err: any) {
-      setAiError(err.message || 'Erro de conexão ao aprovar relatório.');
+      setAiError(err.message || 'Connection error while approving report.');
     } finally {
       setIsApproving(false);
     }
@@ -1589,7 +1589,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       const list = Array.isArray(prev?.grammarPoints) ? [...prev.grammarPoints] : [];
       list.push({
         id: `grammar-${Date.now()}`,
-        topic: 'Novo Ponto Gramatical',
+        topic: 'New Grammar Point',
         rule: '',
         explanation: '',
         examples: [''],
@@ -2458,14 +2458,14 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           <div className="space-y-0.5">
             <div className="flex items-center gap-2 flex-wrap">
               <h4 className="text-xs font-black uppercase tracking-wider text-[#000035]">
-                Síntese Pedagógica Estruturada
+                Structured Pedagogical Synthesis
               </h4>
               <span className="text-[10px] uppercase font-mono font-bold text-slate-500 bg-slate-100 px-2 py-0.5 rounded">
-                CELTA • 4 Partes
+                CELTA • 4 Parts
               </span>
             </div>
             <p className="text-xs text-slate-500">
-              Transformação pedagógica gerada exclusivamente via Gemini, revisada e aprovada pelo professor.
+              Pedagogical transformation generated exclusively via Gemini, reviewed and approved by the teacher.
             </p>
           </div>
 
@@ -2476,7 +2476,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200 text-xs font-bold"
               >
                 <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                <span>Aprovado & Publicado {lastApprovedVersion?.versionNumber ? `(v${lastApprovedVersion.versionNumber})` : ''}</span>
+                <span>Approved & Published {lastApprovedVersion?.versionNumber ? `(v${lastApprovedVersion.versionNumber})` : ''}</span>
               </span>
             )}
             {approvalStatus !== 'approved' && draftTransformation && !isDraftStale && (
@@ -2485,17 +2485,17 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-50 text-amber-800 border border-amber-200 text-xs font-bold"
               >
                 <Sparkles className="w-3.5 h-3.5 text-amber-600" />
-                <span>Rascunho IA (Em Revisão)</span>
+                <span>AI Draft (In Review)</span>
               </span>
             )}
             {isDraftStale && (
               <span
                 id="pedagogical-stale-badge"
                 className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-rose-50 text-rose-800 border border-rose-200 text-xs font-bold"
-                title="Anotações originais alteradas após a criação deste rascunho"
+                title="Original notes were modified after this draft was created"
               >
                 <AlertCircle className="w-3.5 h-3.5 text-rose-600" />
-                <span>Rascunho Obsoleto</span>
+                <span>Outdated Draft</span>
               </span>
             )}
             {editableTransformation && (draftTransformation || lastApprovedVersion) && (
@@ -2503,10 +2503,10 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 type="button"
                 onClick={handleResetToAiSuggestion}
                 className="text-[11px] text-slate-500 hover:text-[#1C4C96] transition flex items-center gap-1 cursor-pointer underline underline-offset-2 ml-1"
-                title="Restaurar valores sugeridos originalmente pela IA"
+                title="Restore values originally suggested by AI"
               >
                 <Undo2 className="w-3 h-3" />
-                <span>Restaurar sugestão da IA</span>
+                <span>Restore AI suggestion</span>
               </button>
             )}
           </div>
@@ -2559,7 +2559,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             <div className="flex items-center gap-2.5">
               <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
               <span>
-                As anotações brutas do documento foram alteradas após a geração do rascunho. Clique em <strong>Aplicar IA</strong> para atualizar o rascunho antes de aprovar.
+                Raw session notes were modified after this draft was generated. Click <strong>Apply AI</strong> to update the draft before approving.
               </span>
             </div>
             <button
@@ -2569,7 +2569,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               className="px-3 py-1.5 bg-amber-700 hover:bg-amber-800 text-white rounded-xl text-xs font-bold shrink-0 transition flex items-center gap-1.5 cursor-pointer shadow-2xs disabled:opacity-50"
             >
               <Sparkles className="w-3.5 h-3.5" />
-              <span>Atualizar com IA</span>
+              <span>Update with AI</span>
             </button>
           </div>
         )}
@@ -2579,10 +2579,10 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           <div className="py-12 px-6 rounded-2xl border border-slate-200 bg-slate-50/50 text-center space-y-3 animate-in fade-in duration-200">
             <Loader2 className="w-6 h-6 text-[#1C4C96] mx-auto animate-spin" />
             <h5 className="text-sm font-bold text-[#000035]">
-              Sintetizando anotações pedagógicas via Gemini...
+              Synthesizing pedagogical notes via Gemini...
             </h5>
             <p className="text-xs text-slate-500 max-w-md mx-auto">
-              Preservando todas as correções (Alt+N), termos novos (Alt+W) e pronúncia (Alt+P) em 4 partes estruturadas.
+              Preserving all corrections (Alt+N), new terms (Alt+W), and pronunciation (Alt+P) across 4 structured parts.
             </p>
           </div>
         )}
@@ -2593,10 +2593,10 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             <Sparkles className="w-6 h-6 text-slate-400 mx-auto" />
             <div className="space-y-1">
               <h5 className="text-sm font-bold text-slate-700">
-                Relatório Pedagógico não gerado para esta sessão
+                Pedagogical report not generated for this session yet
               </h5>
               <p className="text-xs text-slate-500 max-w-lg mx-auto leading-relaxed">
-                Escreva ou revise suas anotações acima usando os atalhos de marcação (<kbd className="font-mono bg-white px-1 py-0.5 rounded border border-slate-200 text-[10px]">Alt+Y</kbd>, <kbd className="font-mono bg-white px-1 py-0.5 rounded border border-slate-200 text-[10px]">Alt+N</kbd>, <kbd className="font-mono bg-white px-1 py-0.5 rounded border border-slate-200 text-[10px]">Alt+W</kbd>, <kbd className="font-mono bg-white px-1 py-0.5 rounded border border-slate-200 text-[10px]">Alt+P</kbd>) e clique no botão <strong>Aplicar IA</strong> para sintetizar o relatório pedagógico em 4 seções.
+                Write or review your notes above using the quick stamp shortcuts (<kbd className="font-mono bg-white px-1 py-0.5 rounded border border-slate-200 text-[10px]">Alt+Y</kbd>, <kbd className="font-mono bg-white px-1 py-0.5 rounded border border-slate-200 text-[10px]">Alt+N</kbd>, <kbd className="font-mono bg-white px-1 py-0.5 rounded border border-slate-200 text-[10px]">Alt+W</kbd>, <kbd className="font-mono bg-white px-1 py-0.5 rounded border border-slate-200 text-[10px]">Alt+P</kbd>) and click <strong>Apply AI</strong> to synthesize the 4-part pedagogical report.
               </p>
             </div>
             <div className="pt-2">
@@ -2607,7 +2607,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-xs font-bold bg-[#1C4C96] hover:bg-[#062863] text-white shadow-xs transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <Sparkles className="w-4 h-4 text-[#F4CA54]" />
-                <span>Aplicar IA nas Anotações</span>
+                <span>Apply AI to Notes</span>
               </button>
             </div>
           </div>
@@ -2631,11 +2631,11 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                       {editableTransformation.mistakesAnalysis?.length || 0}
                     </span>
                     <span className="text-[10px] uppercase font-mono tracking-wider text-slate-400 bg-slate-50 border border-slate-200 px-1.5 py-0.2 rounded">
-                      Sugestão IA
+                      AI Suggestion
                     </span>
                   </div>
                   <p className="text-[11px] text-slate-500 mt-0.5">
-                    Correções pontuais com foco em precisão, contexto e uso natural.
+                    Targeted corrections focusing on precision, context, and natural usage.
                   </p>
                 </div>
                 <button
@@ -2644,7 +2644,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   className="px-2.5 py-1 text-xs font-semibold text-[#1C4C96] hover:bg-slate-100 rounded-lg transition flex items-center gap-1 cursor-pointer border border-transparent hover:border-slate-200"
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  <span>Adicionar Correção</span>
+                  <span>Add Correction</span>
                 </button>
               </div>
 
@@ -2661,13 +2661,13 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                           {/* Original Expression */}
                           <div className="space-y-1">
                             <span className="text-[10px] font-bold uppercase tracking-wider text-rose-700 flex items-center gap-1">
-                              <span>✗ Como o aluno falou</span>
+                              <span>✗ Student Said</span>
                             </span>
                             <input
                               type="text"
                               value={item.original || ''}
                               onChange={(e) => handleUpdateMistake(idx, 'original', e.target.value)}
-                              placeholder="Frase original com erro..."
+                              placeholder="Original phrase with mistake..."
                               className="w-full text-xs font-mono text-rose-950 bg-rose-50/70 border border-rose-200/70 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-rose-400 focus:bg-white transition"
                             />
                           </div>
@@ -2675,13 +2675,13 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                           {/* Corrected Expression */}
                           <div className="space-y-1">
                             <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-700 flex items-center gap-1">
-                              <span>✓ Como falar naturalmente</span>
+                              <span>✓ Natural Way to Say It</span>
                             </span>
                             <input
                               type="text"
                               value={item.corrected || ''}
                               onChange={(e) => handleUpdateMistake(idx, 'corrected', e.target.value)}
-                              placeholder="Forma correta sugerida..."
+                              placeholder="Suggested correct form..."
                               className="w-full text-xs font-semibold text-emerald-950 bg-emerald-50/70 border border-emerald-200/70 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-emerald-400 focus:bg-white transition"
                             />
                           </div>
@@ -2691,7 +2691,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                           type="button"
                           onClick={() => handleRemoveMistake(idx)}
                           className="text-slate-400 hover:text-rose-600 transition p-1.5 rounded-lg hover:bg-rose-50 cursor-pointer"
-                          title="Remover esta correção"
+                          title="Remove this correction"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
@@ -2700,13 +2700,13 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                       {/* Explanation */}
                       <div className="space-y-1">
                         <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
-                          Explicação Pedagógica:
+                          Pedagogical Explanation:
                         </span>
                         <textarea
                           rows={2}
                           value={item.explanation || ''}
                           onChange={(e) => handleUpdateMistake(idx, 'explanation', e.target.value)}
-                          placeholder="Por que corrigir dessa forma? Dica de fixação para o aluno..."
+                          placeholder="Why correct it this way? Learning tip for the student..."
                           className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96] resize-y leading-relaxed"
                         />
                       </div>
@@ -2715,7 +2715,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 </div>
               ) : (
                 <p className="text-xs text-slate-400 italic py-2">
-                  Nenhum erro registrado nesta sessão.
+                  No mistakes recorded in this session.
                 </p>
               )}
             </section>
@@ -2735,11 +2735,11 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                       {editableTransformation.grammarPoints?.length || 0}
                     </span>
                     <span className="text-[10px] uppercase font-mono tracking-wider text-slate-400 bg-slate-50 border border-slate-200 px-1.5 py-0.2 rounded">
-                      Sugestão IA
+                      AI Suggestion
                     </span>
                   </div>
                   <p className="text-[11px] text-slate-500 mt-0.5">
-                    Padrões estruturais, regras e exemplos contextualizados.
+                    Structural patterns, rules, and contextualized examples.
                   </p>
                 </div>
                 <button
@@ -2748,7 +2748,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   className="px-2.5 py-1 text-xs font-semibold text-[#1C4C96] hover:bg-slate-100 rounded-lg transition flex items-center gap-1 cursor-pointer border border-transparent hover:border-slate-200"
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  <span>Adicionar Ponto Gramatical</span>
+                  <span>Add Grammar Point</span>
                 </button>
               </div>
 
@@ -2763,13 +2763,13 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                       <div className="flex items-start justify-between gap-2">
                         <div className="space-y-1 flex-1">
                           <span className="text-[10px] font-bold uppercase tracking-wider text-[#1C4C96]">
-                            Tópico / Regra Gramatical:
+                            Topic / Grammar Rule:
                           </span>
                           <input
                             type="text"
                             value={gp.topic || gp.rule || ''}
                             onChange={(e) => handleUpdateGrammar(idx, 'topic', e.target.value)}
-                            placeholder="ex: Present Perfect vs Simple Past..."
+                            placeholder="e.g. Present Perfect vs Simple Past..."
                             className="w-full text-xs font-bold text-[#000035] bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
                           />
                         </div>
@@ -2778,7 +2778,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                           type="button"
                           onClick={() => handleRemoveGrammar(idx)}
                           className="text-slate-400 hover:text-rose-600 transition p-1.5 rounded-lg hover:bg-rose-50 cursor-pointer"
-                          title="Remover ponto gramatical"
+                          title="Remove grammar point"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
@@ -2786,13 +2786,13 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
                       <div className="space-y-1">
                         <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
-                          Explicação:
+                          Explanation:
                         </span>
                         <textarea
                           rows={2}
                           value={gp.explanation || ''}
                           onChange={(e) => handleUpdateGrammar(idx, 'explanation', e.target.value)}
-                          placeholder="Explicação da regra de forma clara e simples..."
+                          placeholder="Clear and simple rule explanation..."
                           className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96] resize-y leading-relaxed"
                         />
                       </div>
@@ -2800,7 +2800,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                       {/* Examples */}
                       <div className="space-y-1">
                         <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
-                          Exemplos de Uso:
+                          Usage Examples:
                         </span>
                         <input
                           type="text"
@@ -2812,7 +2812,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                               e.target.value.split('•').map((s) => s.trim()).filter(Boolean)
                             )
                           }
-                          placeholder="Separe múltiplos exemplos com • (bullet)"
+                          placeholder="Separate multiple examples with • (bullet)"
                           className="w-full text-xs text-slate-600 italic bg-white border border-slate-200 rounded-lg px-2.5 py-1 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
                         />
                       </div>
@@ -2821,7 +2821,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 </div>
               ) : (
                 <p className="text-xs text-slate-400 italic py-2">
-                  Nenhum ponto gramatical registrado nesta sessão.
+                  No grammar points recorded in this session.
                 </p>
               )}
             </section>
@@ -2841,11 +2841,11 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                       {editableTransformation.vocabularyAndExpressions?.length || 0}
                     </span>
                     <span className="text-[10px] uppercase font-mono tracking-wider text-slate-400 bg-slate-50 border border-slate-200 px-1.5 py-0.2 rounded">
-                      Sugestão IA
+                      AI Suggestion
                     </span>
                   </div>
                   <p className="text-[11px] text-slate-500 mt-0.5">
-                    Vocabulário novo, expressões idiomáticas e foco em pronúncia.
+                    New vocabulary, idiomatic expressions, and pronunciation focus.
                   </p>
                 </div>
                 <button
@@ -2854,7 +2854,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   className="px-2.5 py-1 text-xs font-semibold text-[#1C4C96] hover:bg-slate-100 rounded-lg transition flex items-center gap-1 cursor-pointer border border-transparent hover:border-slate-200"
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  <span>Adicionar Termo</span>
+                  <span>Add Term</span>
                 </button>
               </div>
 
@@ -2872,7 +2872,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                             type="text"
                             value={v.term || ''}
                             onChange={(e) => handleUpdateVocab(idx, 'term', e.target.value)}
-                            placeholder="Palavra ou Expressão..."
+                            placeholder="Word or Expression..."
                             className="text-xs font-bold text-[#000035] bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96] flex-1 max-w-xs"
                           />
                           <button
@@ -2883,7 +2883,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                                 ? 'bg-[#eff6ff] text-[#1d4ed8] border-[#1d4ed8]'
                                 : 'bg-slate-100 text-slate-400 border-slate-200'
                             }`}
-                            title="Alternar marcação New Word"
+                            title="Toggle New Word tag"
                           >
                             ✦ New Word
                           </button>
@@ -2895,7 +2895,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                                 ? 'bg-[#faf5ff] text-[#7e22ce] border-[#7e22ce]'
                                 : 'bg-slate-100 text-slate-400 border-slate-200'
                             }`}
-                            title="Alternar marcação Pronounce"
+                            title="Toggle Pronounce tag"
                           >
                             🎯 Pronounce
                           </button>
@@ -2905,7 +2905,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                           type="button"
                           onClick={() => handleRemoveVocab(idx)}
                           className="text-slate-400 hover:text-rose-600 transition p-1.5 rounded-lg hover:bg-rose-50 cursor-pointer"
-                          title="Remover este termo"
+                          title="Remove this term"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
@@ -2914,26 +2914,26 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                         <div className="space-y-0.5">
                           <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
-                            Significado / Definição:
+                            Meaning / Definition:
                           </span>
                           <input
                             type="text"
                             value={v.simpleDefinition || v.definitionEn || ''}
                             onChange={(e) => handleUpdateVocab(idx, 'simpleDefinition', e.target.value)}
-                            placeholder="Significado claro em português ou inglês..."
+                            placeholder="Clear definition in English or Portuguese..."
                             className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
                           />
                         </div>
 
                         <div className="space-y-0.5">
                           <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
-                            Exemplo de Aplicação:
+                            Example of Use:
                           </span>
                           <input
                             type="text"
                             value={Array.isArray(v.realExamples) ? v.realExamples[0] || '' : (v.realExamples || '')}
                             onChange={(e) => handleUpdateVocab(idx, 'realExamples', [e.target.value])}
-                            placeholder="Frase de exemplo da sessão..."
+                            placeholder="Example sentence from the session..."
                             className="w-full text-xs text-slate-600 italic bg-white border border-slate-200 rounded-lg px-2.5 py-1 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
                           />
                         </div>
@@ -2943,7 +2943,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 </div>
               ) : (
                 <p className="text-xs text-slate-400 italic py-2">
-                  Nenhum termo de vocabulário registrado nesta sessão.
+                  No vocabulary terms recorded in this session.
                 </p>
               )}
             </section>
@@ -2960,15 +2960,15 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                       4. Quick Review (5–10 min)
                     </span>
                     <span className="text-[10px] uppercase font-mono tracking-wider text-slate-400 bg-slate-50 border border-slate-200 px-1.5 py-0.2 rounded">
-                      Sugestão IA
+                      AI Suggestion
                     </span>
                   </div>
                   <p className="text-[11px] text-slate-500 mt-0.5">
-                    Resumo conciso de alta retenção para revisão imediata do aluno.
+                    Concise, high-retention summary for immediate student review.
                   </p>
                 </div>
                 <div className="flex items-center gap-1.5">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Tempo estimado:</span>
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Estimated time:</span>
                   <input
                     type="text"
                     value={editableTransformation.reviewSummary?.estimatedMinutes || '5–10 min'}
@@ -2983,13 +2983,13 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 <div className="space-y-1">
                   <span className="text-[10px] font-black uppercase tracking-wider text-[#1C4C96] flex items-center gap-1">
                     <Lightbulb className="w-3.5 h-3.5 text-[#F4CA54]" />
-                    <span>Takeaway Central (Remember This):</span>
+                    <span>Main Takeaway (Remember This):</span>
                   </span>
                   <textarea
                     rows={2}
                     value={editableTransformation.reviewSummary?.rememberThis || ''}
                     onChange={(e) => handleUpdateQuickReview('rememberThis', e.target.value)}
-                    placeholder="A mensagem principal que o aluno deve levar desta aula..."
+                    placeholder="The main takeaway message the student should retain from this lesson..."
                     className="w-full text-xs text-slate-800 bg-white border border-blue-200/80 rounded-lg px-3 py-2 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96] leading-relaxed"
                   />
                 </div>
@@ -2997,7 +2997,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 {/* Key Rules list */}
                 <div className="space-y-1">
                   <span className="text-[10px] font-bold uppercase tracking-wider text-slate-600">
-                    Regras Principais:
+                    Key Rules:
                   </span>
                   <input
                     type="text"
@@ -3012,7 +3012,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                         e.target.value.split('•').map((s) => s.trim()).filter(Boolean)
                       )
                     }
-                    placeholder="Regras essenciais separadas por • (bullet)"
+                    placeholder="Essential rules separated by • (bullet)"
                     className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
                   />
                 </div>
@@ -3020,7 +3020,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 {/* Must Know Vocabulary */}
                 <div className="space-y-1">
                   <span className="text-[10px] font-bold uppercase tracking-wider text-slate-600">
-                    Vocabulário Mandatório:
+                    Mandatory Vocabulary:
                   </span>
                   <input
                     type="text"
@@ -3035,7 +3035,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                         e.target.value.split(',').map((s) => s.trim()).filter(Boolean)
                       )
                     }
-                    placeholder="Palavras e expressões essenciais separadas por vírgula"
+                    placeholder="Essential words and expressions separated by commas"
                     className="w-full text-xs text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-[#1C4C96]"
                   />
                 </div>
@@ -3048,15 +3048,15 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 {isDraftStale ? (
                   <span className="text-rose-600 font-semibold flex items-center gap-1">
                     <AlertCircle className="w-3.5 h-3.5" />
-                    <span>Anotações modificadas após a geração. Atualize via Aplicar IA para habilitar aprovação.</span>
+                    <span>Notes modified after generation. Update via Apply AI to enable approval.</span>
                   </span>
                 ) : approvalStatus === 'approved' ? (
                   <span className="text-emerald-700 font-semibold flex items-center gap-1">
                     <CheckCircle2 className="w-3.5 h-3.5" />
-                    <span>Versão atual publicada para o aluno.</span>
+                    <span>Current version published to student.</span>
                   </span>
                 ) : (
-                  <span>Revisão concluída? Clique em Aprovar e Publicar para disponibilizar ao aluno.</span>
+                  <span>Review complete? Click Approve & Publish to make available to the student.</span>
                 )}
               </div>
 
@@ -3073,7 +3073,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                       ? 'bg-emerald-600 hover:bg-emerald-700 text-white border-emerald-700 cursor-pointer'
                       : 'bg-[#15803d] hover:bg-[#166534] text-white border-[#15803d] cursor-pointer active:scale-98'
                   }`}
-                  title={isDraftStale ? 'Anotações alteradas. Re-aplique IA antes de aprovar.' : 'Aprovar e Publicar para o Aluno'}
+                  title={isDraftStale ? 'Notes modified. Re-apply AI before approving.' : 'Approve and Publish for Student'}
                 >
                   {isApproving ? (
                     <Loader2 className="w-4 h-4 animate-spin text-white" />
@@ -3082,10 +3082,10 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   )}
                   <span>
                     {isApproving
-                      ? 'Publicando...'
+                      ? 'Publishing...'
                       : approvalStatus === 'approved'
-                      ? 'Aprovado & Publicado ✓'
-                      : 'Aprovar e Publicar'}
+                      ? 'Approved & Published ✓'
+                      : 'Approve & Publish'}
                   </span>
                 </button>
               </div>
@@ -3163,7 +3163,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             <div className="p-3.5 bg-rose-50 border border-rose-200 rounded-2xl flex items-center gap-3 text-rose-800 text-xs font-semibold shadow-xs animate-in fade-in duration-200">
               <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
               <div className="flex-1">
-                <span className="font-bold">Aviso de Identidade: </span>
+                <span className="font-bold">Identity Warning: </span>
                 <span>{studentResolution.error || saveError}</span>
               </div>
             </div>
@@ -3503,15 +3503,15 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   disabled={isApplyingAi || isSaving}
                   onClick={handleApplyAi}
                   className="px-3 py-1.5 bg-white hover:bg-slate-50 text-[#1C4C96] border border-[#1C4C96]/40 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer shadow-2xs disabled:opacity-50 disabled:cursor-not-allowed"
-                  title="Salva as anotações e aciona o Gemini para sintetizar o relatório pedagógico"
-                  aria-label="Aplicar IA"
+                  title="Saves notes and triggers Gemini to synthesize the pedagogical report"
+                  aria-label="Apply AI"
                 >
                   {isApplyingAi ? (
                     <Loader2 className="w-3.5 h-3.5 animate-spin text-[#1C4C96]" />
                   ) : (
                     <Sparkles className="w-3.5 h-3.5 text-[#1C4C96]" />
                   )}
-                  <span>{isApplyingAi ? 'Aplicando IA...' : 'Aplicar IA'}</span>
+                  <span>{isApplyingAi ? 'Applying AI...' : 'Apply AI'}</span>
                 </button>
 
                 {/* FASE NF-DOC.2C: Aprovar e Publicar top button */}
@@ -3530,10 +3530,10 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                     }`}
                     title={
                       isDraftStale
-                        ? 'Anotações alteradas. Re-aplique a IA antes de aprovar.'
-                        : 'Aprovar e publicar relatório pedagógico para o aluno'
+                        ? 'Notes modified. Re-apply AI before approving.'
+                        : 'Approve and publish pedagogical report for the student'
                     }
-                    aria-label="Aprovar e Publicar"
+                    aria-label="Approve & Publish"
                   >
                     {isApproving ? (
                       <Loader2 className="w-3.5 h-3.5 animate-spin text-current" />
@@ -3542,10 +3542,10 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                     )}
                     <span>
                       {isApproving
-                        ? 'Publicando...'
+                        ? 'Publishing...'
                         : approvalStatus === 'approved'
-                        ? 'Publicado ✓'
-                        : 'Aprovar e Publicar'}
+                        ? 'Published ✓'
+                        : 'Approve & Publish'}
                     </span>
                   </button>
                 )}
@@ -3872,7 +3872,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               )}
               {isDraftStale && (
                 <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-amber-50 text-amber-800 text-xs font-semibold border border-amber-200">
-                  <span>⚠️ Rascunho desatualizado com o texto original</span>
+                  <span>⚠️ Draft outdated with original notes</span>
                 </div>
               )}
             </div>
@@ -3888,7 +3888,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                     ? 'bg-[#1C4C96]/70 text-white cursor-not-allowed'
                     : 'bg-[#1C4C96] hover:bg-[#062863] text-white cursor-pointer'
                 }`}
-                title="Salvar alterações manuais das anotações no Firestore"
+                title="Save manual notes changes to Firestore"
               >
                 {isSaving ? (
                   <Loader2 className="w-4 h-4 animate-spin text-[#9AB4FF]" />
@@ -3904,15 +3904,15 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 disabled={isApplyingAi || isSaving}
                 onClick={handleApplyAi}
                 className="px-5 py-2.5 bg-white hover:bg-slate-50 text-[#1C4C96] border border-[#1C4C96]/40 rounded-xl text-xs font-bold transition flex items-center gap-2 cursor-pointer shadow-xs disabled:opacity-50 disabled:cursor-not-allowed active:scale-98"
-                title="Salva as anotações e aciona o Gemini para estruturar o relatório pedagógico"
-                aria-label="Aplicar IA"
+                title="Saves notes and triggers Gemini to structure the pedagogical report"
+                aria-label="Apply AI"
               >
                 {isApplyingAi ? (
                   <Loader2 className="w-4 h-4 animate-spin text-[#1C4C96]" />
                 ) : (
                   <Sparkles className="w-4 h-4 text-[#1C4C96]" />
                 )}
-                <span>{isApplyingAi ? 'Aplicando IA...' : 'Aplicar IA'}</span>
+                <span>{isApplyingAi ? 'Applying AI...' : 'Apply AI'}</span>
               </button>
 
               {editableTransformation && (
@@ -3930,10 +3930,10 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   }`}
                   title={
                     isDraftStale
-                      ? 'Anotações alteradas. Re-aplique a IA antes de aprovar.'
-                      : 'Aprovar e publicar relatório pedagógico'
+                      ? 'Notes modified. Re-apply AI before approving.'
+                      : 'Approve and publish pedagogical report'
                   }
-                  aria-label="Aprovar e Publicar"
+                  aria-label="Approve & Publish"
                 >
                   {isApproving ? (
                     <Loader2 className="w-4 h-4 animate-spin text-current" />
@@ -3942,10 +3942,10 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   )}
                   <span>
                     {isApproving
-                      ? 'Publicando...'
+                      ? 'Publishing...'
                       : approvalStatus === 'approved'
-                      ? 'Publicado ✓'
-                      : 'Aprovar e Publicar'}
+                      ? 'Published ✓'
+                      : 'Approve & Publish'}
                   </span>
                 </button>
               )}

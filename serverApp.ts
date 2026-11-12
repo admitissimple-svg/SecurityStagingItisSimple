@@ -9245,30 +9245,26 @@ async function handleSessionNoteDraftInternal(req: any, res: any) {
 
   const callerUid = req.user.uid;
   const isCallerAdmin = req.user.role === 'admin';
+  const db = readDb();
 
-  // Security Gate: Students are strictly forbidden from drafting transformations
-  if (req.user.role === 'student') {
-    return res.status(403).json({
-      error: 'Forbidden',
-      code: 'STUDENTS_CANNOT_DRAFT',
-      message: 'Alunos não têm permissão para criar ou editar rascunhos pedagógicos.',
-    });
+  let teacherResolution: any = null;
+  let isCallerTeacher = false;
+  if (!isCallerAdmin) {
+    teacherResolution = await resolveTeacherCanonicalIdentity({ teacherUid: callerUid, teacherEmail: req.user.email, dbState: db }).catch(() => null);
+    if (teacherResolution && teacherResolution.isApproved) {
+      isCallerTeacher = true;
+    } else {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'STUDENTS_CANNOT_DRAFT',
+        message: 'Students cannot create or edit pedagogical drafts.',
+      });
+    }
   }
 
   const targetSessionKey = decodeURIComponent(req.params.id || req.body?.id || req.body?.sessionId || req.body?.sessionKey || '').trim();
   if (!targetSessionKey) {
     return res.status(400).json({ error: 'SESSION_ID_REQUIRED', code: 'SESSION_ID_REQUIRED', message: 'Identificador da sessão é obrigatório.' });
-  }
-
-  const db = readDb();
-  let teacherResolution: any = null;
-  let isCallerTeacher = false;
-  if (!isCallerAdmin) {
-    teacherResolution = await resolveTeacherCanonicalIdentity({ teacherUid: callerUid, teacherEmail: req.user.email, dbState: db }).catch(() => null);
-    if (!teacherResolution || !teacherResolution.isApproved) {
-      return res.status(403).json({ error: 'Forbidden', code: 'UNAUTHORIZED_TEACHER', message: 'Apenas professores aprovados ou administradores podem elaborar rascunhos pedagógicos.' });
-    }
-    isCallerTeacher = true;
   }
 
   let existingDoc = db.sessionNotesMap?.[targetSessionKey];
@@ -9367,17 +9363,8 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
 
   const callerUid = req.user.uid;
   const isCallerAdmin = req.user.role === 'admin';
-
-  // Rule: Students can NEVER trigger transformation
-  if (req.user.role === 'student') {
-    return res.status(403).json({
-      error: 'Forbidden',
-      code: 'STUDENTS_CANNOT_TRANSFORM',
-      message: 'Alunos não têm permissão para transformar anotações pedagógicas.',
-    });
-  }
-
   const db = readDb();
+
   let teacherResolution: any = null;
   let isCallerTeacher = false;
   if (!isCallerAdmin) {
@@ -9386,14 +9373,17 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
       teacherEmail: req.user.email,
       dbState: db,
     }).catch(() => null);
-    if (!teacherResolution || !teacherResolution.isApproved) {
+
+    if (teacherResolution && teacherResolution.isApproved) {
+      isCallerTeacher = true;
+    } else {
+      // Non-admin caller is not an approved teacher -> reject as student/unauthorized
       return res.status(403).json({
         error: 'Forbidden',
-        code: 'UNAUTHORIZED_TEACHER',
-        message: 'Apenas professores aprovados ou administradores podem transformar anotações.',
+        code: 'STUDENTS_CANNOT_TRANSFORM',
+        message: 'Students cannot transform pedagogical notes.',
       });
     }
-    isCallerTeacher = true;
   }
 
   const targetSessionKey = decodeURIComponent(req.params.id || req.body?.id || req.body?.sessionId || req.body?.sessionKey || '').trim();
@@ -9601,17 +9591,8 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
 
   const callerUid = req.user.uid;
   const isCallerAdmin = req.user.role === 'admin';
-
-  // Security Gate: Students are strictly forbidden from approving notes
-  if (req.user.role === 'student') {
-    return res.status(403).json({
-      error: 'Forbidden',
-      code: 'STUDENTS_CANNOT_APPROVE',
-      message: 'Alunos não têm permissão para aprovar anotações.',
-    });
-  }
-
   const db = readDb();
+
   let teacherResolution: any = null;
   let isCallerTeacher = false;
   if (!isCallerAdmin) {
@@ -9620,14 +9601,16 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
       teacherEmail: req.user.email,
       dbState: db,
     }).catch(() => null);
-    if (!teacherResolution || !teacherResolution.isApproved) {
+
+    if (teacherResolution && teacherResolution.isApproved) {
+      isCallerTeacher = true;
+    } else {
       return res.status(403).json({
         error: 'Forbidden',
-        code: 'UNAUTHORIZED_TEACHER',
-        message: 'Apenas professores aprovados ou administradores podem aprovar anotações.',
+        code: 'STUDENTS_CANNOT_APPROVE',
+        message: 'Students cannot approve pedagogical notes.',
       });
     }
-    isCallerTeacher = true;
   }
 
   const targetSessionKey = decodeURIComponent(req.params.id || req.body?.id || req.body?.sessionId || req.body?.sessionKey || '').trim();
@@ -9872,7 +9855,13 @@ app.get('/api/session-notes/:id/versions', firebaseAuthMiddleware, async (req, r
 
   const studentUid = existingDoc.studentUid;
   if (!isCallerAdmin) {
-    if (req.user.role === 'student' || (!req.user.role && callerUid === studentUid)) {
+    let isCallerTeacher = false;
+    try {
+      const tRes = await resolveTeacherCanonicalIdentity({ teacherUid: callerUid, teacherEmail: req.user.email, dbState: db });
+      if (tRes && tRes.isApproved) isCallerTeacher = true;
+    } catch {}
+
+    if (!isCallerTeacher) {
       if (callerUid !== studentUid) {
         return res.status(403).json({ error: 'Forbidden', message: 'Acesso negado a histórico de anotações de outro aluno.' });
       }
@@ -10113,7 +10102,7 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
   const db = readDb();
 
   let isCallerTeacher = false;
-  if (!isCallerAdmin && req.user.role !== 'student') {
+  if (!isCallerAdmin) {
     try {
       const tRes = await resolveTeacherCanonicalIdentity({ teacherUid: callerUid, teacherEmail: req.user.email, dbState: db });
       if (tRes && tRes.isApproved) isCallerTeacher = true;
