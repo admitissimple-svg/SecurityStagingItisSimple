@@ -500,24 +500,28 @@ export async function resolveTeacherCanonicalIdentity(
   // Check in-memory dbState if provided to guarantee no student is promoted
   const dbState = (target && typeof target === 'object' && (target as any).dbState) || null;
   if (dbState) {
-    const allMemoryTutors = [...(dbState.tutorsList || []), ...(dbState.teachers || [])];
-    const isMemoryApprovedTeacher = allMemoryTutors.some(
-      (t: any) =>
-        t &&
-        (t.uid === resolvedUid || t.authUid === resolvedUid || t.id === resolvedUid || (t.email || '').toLowerCase() === email) &&
-        t.role !== 'student' &&
-        (t.role === 'teacher' || t.role === 'native_friend' || t.role === 'tutor' || !t.role || t.isTeacher === true) &&
-        (t.approvalStatus === 'approved' || t.status === 'approved') &&
-        (t.isApproved === true || t.approved === true)
-    );
-    const isLocalStudent = !isMemoryApprovedTeacher && (
-      (dbState.students || []).some((s: any) => (s.uid === resolvedUid || (s.email || '').toLowerCase() === email)) ||
-      (dbState.userProfiles && Object.entries(dbState.userProfiles).some(([k, p]: any) => (p?.uid === resolvedUid || k.toLowerCase() === email) && p?.role === 'student')) ||
-      (dbState.authUsers && Object.entries(dbState.authUsers).some(([k, u]: any) => (u?.uid === resolvedUid || k.toLowerCase() === email) && u?.role === 'student'))
-    );
-    if (isLocalStudent) {
-      console.warn(`[resolveTeacherCanonicalIdentity] Account ${resolvedUid} is registered as student in memory dbState. Blocking teacher resolution.`);
-      return null;
+    try {
+      const allMemoryTutors = [...(dbState.tutorsList || []), ...(dbState.teachers || [])];
+      const isMemoryApprovedTeacher = allMemoryTutors.some(
+        (t: any) =>
+          t &&
+          (t.uid === resolvedUid || t.authUid === resolvedUid || t.id === resolvedUid || (t.email || '').toLowerCase() === email) &&
+          t.role !== 'student' &&
+          (t.role === 'teacher' || t.role === 'native_friend' || t.role === 'tutor' || !t.role || t.isTeacher === true) &&
+          (t.approvalStatus === 'approved' || t.status === 'approved') &&
+          (t.isApproved === true || t.approved === true)
+      );
+      const isLocalStudent = !isMemoryApprovedTeacher && (
+        (dbState.students || []).some((s: any) => (s.uid === resolvedUid || (s.email || '').toLowerCase() === email)) ||
+        (dbState.userProfiles && Object.entries(dbState.userProfiles).some(([k, p]: any) => (p?.uid === resolvedUid || k.toLowerCase() === email) && p?.role === 'student')) ||
+        (dbState.authUsers && Object.entries(dbState.authUsers).some(([k, u]: any) => (u?.uid === resolvedUid || k.toLowerCase() === email) && u?.role === 'student'))
+      );
+      if (isLocalStudent) {
+        console.warn(`[resolveTeacherCanonicalIdentity] Account ${resolvedUid} is registered as student in memory dbState. Blocking teacher resolution.`);
+        return null;
+      }
+    } catch (memErr) {
+      console.warn(`[resolveTeacherCanonicalIdentity] Skipping memory dbState inspection due to read error:`, memErr);
     }
   }
 
@@ -1396,12 +1400,15 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
         teachers: confirmedStateTeachers,
       };
 
+      const sanitizedLessonsDoc = lessons ? { ...lessons } : {};
+      delete sanitizedLessonsDoc.liveLessons;
+
       return {
         ...hydratedMainData,
         ...(routines || {}),
         ...mergedTutorsDoc,
         ...(assignments || {}),
-        ...(lessons || {}),
+        ...sanitizedLessonsDoc,
         ...(ytPlaylists && ytPlaylists.playlists ? { youtubePlaylists: ytPlaylists.playlists } : {}),
       };
     });
@@ -1596,7 +1603,6 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
     };
 
     const lessonsData = {
-      liveLessons: (sanitized.liveLessons || []).filter((l: any) => !isLocalJsonOrTestRecord(l)),
       contractedLessons: sanitized.contractedLessons || {},
       weeklyHomework: sanitized.weeklyHomework || {},
       studentHomeworkMap: sanitized.studentHomeworkMap || {},
@@ -2893,27 +2899,9 @@ export async function resolveCanonicalStudentIdentity(
       }
     }
 
-    // B2. Check server authoritative store (getAuthoritativeDb) for authorized link
-    if (!hasAuthorizedLink && dbLocal && (authorizedEmail || candidateUid)) {
+    // B2. Check server authoritative store (getAuthoritativeDb) for assigned student profile link
+    if (!hasAuthorizedLink && dbLocal && authorizedEmail) {
       try {
-        const matchingLesson = (dbLocal.liveLessons || []).find((l: any) => {
-          if (!l || l.status === 'cancelled') return false;
-          const lStudentEmail = (l.studentEmail || '').toLowerCase().trim();
-          const lStudentUid = (l.studentUid || '').trim();
-          const lTeacherUid = (l.teacherUid || (l as any).tutorUid || '').trim();
-          const lTeacherEmail = (l.teacherEmail || (l as any).tutorEmail || '').toLowerCase().trim();
-          const teacherMatches = (lTeacherUid && (lTeacherUid === caller.uid || lTeacherUid === `tutor-${caller.uid}`)) || (lTeacherEmail && lTeacherEmail === callerEmail);
-          const studentMatches = (authorizedEmail && lStudentEmail === authorizedEmail) || (candidateUid && lStudentUid === candidateUid);
-          return teacherMatches && studentMatches;
-        });
-        if (matchingLesson) {
-          hasAuthorizedLink = true;
-          if (!authorizedEmail && matchingLesson.studentEmail) authorizedEmail = matchingLesson.studentEmail.toLowerCase().trim();
-          if ((!candidateUid || candidateUid.includes('@') || !isValidCanonicalUid(candidateUid)) && matchingLesson.studentUid && isValidCanonicalUid(matchingLesson.studentUid) && matchingLesson.studentUid !== caller.uid) {
-            candidateUid = matchingLesson.studentUid;
-          }
-        }
-
         if (!hasAuthorizedLink && authorizedEmail) {
           const p = dbLocal.userProfiles?.[authorizedEmail];
           const s = (dbLocal.students || []).find((st: any) => (st.email || st.studentEmail || '').toLowerCase().trim() === authorizedEmail);
@@ -3039,11 +3027,9 @@ export async function resolveCanonicalStudentIdentity(
         try {
           const profile = dbLocal.userProfiles?.[authorizedEmail];
           const student = (dbLocal.students || []).find((s: any) => (s.email || s.studentEmail || '').toLowerCase().trim() === authorizedEmail);
-          const lesson = (dbLocal.liveLessons || []).find((l: any) => (l.studentEmail || '').toLowerCase().trim() === authorizedEmail && l.studentUid && isValidCanonicalUid(l.studentUid));
           const lUid = (profile?.uid && isValidCanonicalUid(profile.uid) ? profile.uid : '') ||
             (student?.uid && isValidCanonicalUid(student.uid) ? student.uid : '') ||
-            (student?.studentUid && isValidCanonicalUid(student.studentUid) ? student.studentUid : '') ||
-            (lesson?.studentUid && isValidCanonicalUid(lesson.studentUid) ? lesson.studentUid : '');
+            (student?.studentUid && isValidCanonicalUid(student.studentUid) ? student.studentUid : '');
           if (lUid && lUid !== caller.uid) {
             return {
               authorized: true,
@@ -5513,25 +5499,32 @@ export async function scheduleLessonAtomicServer(
   // 5. Deterministic Lesson ID for exact deduplication and idempotency
   const deterministicLessonId = requestId || `lesson-${studentAuthUid}-${startTime}`;
 
-  // 6. Gather existing lessons for conflict check
+  // 6. Gather existing lessons for conflict check (canonical Firestore lessons)
   const allExistingLessons: any[] = [];
   if (Array.isArray(existingLessons)) {
     allExistingLessons.push(...existingLessons);
   }
-  if (dbState && Array.isArray(dbState.liveLessons)) {
-    allExistingLessons.push(...dbState.liveLessons);
-  }
   try {
-    const [tSnap, tPubSnap, sSnap] = await Promise.all([
+    const [tSnap, tAuthSnap, tPubSnap, tEmailSnap, sSnap, sEmailSnap] = await Promise.all([
       db.collection('lessons').where('teacherUid', '==', canonicalTeacherUid).get().catch(() => null),
+      db.collection('lessons').where('teacherAuthUid', '==', canonicalTeacherUid).get().catch(() => null),
       (resolvedPublicTutorId && resolvedPublicTutorId !== canonicalTeacherUid
         ? db.collection('lessons').where('teacherUid', '==', resolvedPublicTutorId).get().catch(() => null)
         : null),
+      (resolvedTeacherEmail
+        ? db.collection('lessons').where('teacherEmail', '==', resolvedTeacherEmail).get().catch(() => null)
+        : null),
       db.collection('lessons').where('studentUid', '==', studentAuthUid).get().catch(() => null),
+      (cleanStudentEmail
+        ? db.collection('lessons').where('studentEmail', '==', cleanStudentEmail).get().catch(() => null)
+        : null),
     ]);
     if (tSnap) tSnap.forEach((d) => allExistingLessons.push({ id: d.id, ...d.data() }));
+    if (tAuthSnap) tAuthSnap.forEach((d) => allExistingLessons.push({ id: d.id, ...d.data() }));
     if (tPubSnap) tPubSnap.forEach((d) => allExistingLessons.push({ id: d.id, ...d.data() }));
+    if (tEmailSnap) tEmailSnap.forEach((d) => allExistingLessons.push({ id: d.id, ...d.data() }));
     if (sSnap) sSnap.forEach((d) => allExistingLessons.push({ id: d.id, ...d.data() }));
+    if (sEmailSnap) sEmailSnap.forEach((d) => allExistingLessons.push({ id: d.id, ...d.data() }));
   } catch (queryErr) {
     console.warn('[serverFirestore] Warning: Querying existing lessons encountered error:', queryErr);
   }
@@ -5547,7 +5540,7 @@ export async function scheduleLessonAtomicServer(
   const candidateConflict = consolidatedLessons.find((l) => {
     const isCancelled = l.status === 'cancelled' || l.status === 'canceled' || Boolean(l.cancelledAt);
     if (isCancelled) return false;
-    if (l.status && l.status !== 'scheduled') return false;
+    if (l.status && l.status !== 'scheduled' && l.status !== 'confirmed') return false;
 
     // The exact same lesson ID (e.g. repeated idempotent submission) is not an overlapping conflict
     if (l.id === deterministicLessonId) return false;
@@ -5837,18 +5830,10 @@ export async function scheduleLessonAtomicServer(
     };
   }
 
-  // 9. Synchronize in-memory AppDb exclusively AFTER confirmed Firestore transaction
+  // 9. Synchronize in-memory student profile metadata exclusively AFTER confirmed Firestore transaction
   if (dbState) {
     try {
-      if (!Array.isArray(dbState.liveLessons)) dbState.liveLessons = [];
       const effectiveLesson = txData.lesson;
-      const existingIdx = dbState.liveLessons.findIndex((l: any) => l.id === deterministicLessonId);
-      if (existingIdx >= 0) {
-        dbState.liveLessons[existingIdx] = effectiveLesson;
-      } else {
-        dbState.liveLessons.unshift(effectiveLesson);
-      }
-
       if (!dbState.userProfiles) dbState.userProfiles = {};
       const profileKey = cleanStudentEmail || studentAuthUid;
       dbState.userProfiles[profileKey] = {
@@ -5929,6 +5914,1392 @@ export async function scheduleLessonAtomicServer(
     onboardingCompleted: txData.onboardingCompleted,
     statusCode: 200,
   };
+}
+
+export interface LessonLifecycleCallerParams {
+  lessonId: string;
+  callerUid: string;
+  callerEmail?: string;
+  callerRole?: string;
+  callerEmailVerified?: boolean;
+}
+
+export interface LessonLifecycleResult {
+  success: boolean;
+  statusCode: number;
+  error?: string;
+  code?: string;
+  isIdempotent?: boolean;
+  lesson?: any;
+  remainingLessons?: number;
+  creditRefunded?: boolean;
+  deletedId?: string;
+}
+
+interface LessonCallerContext {
+  isAuthorized: boolean;
+  isAdmin: boolean;
+  isStudent: boolean;
+  isTeacher: boolean;
+  teacherResolution: ResolvedTeacherIdentity | null;
+}
+
+async function resolveLessonCallerContext(
+  lessonData: any,
+  callerUid: string,
+  callerEmail?: string,
+  callerRole?: string,
+  callerEmailVerified?: boolean
+): Promise<LessonCallerContext> {
+  const cleanCallerUid = (callerUid || '').trim();
+  const cleanCallerEmail = (callerEmail || '').toLowerCase().trim();
+  const isAdmin = callerRole === 'admin';
+
+  const lessonStudentUid = (lessonData?.studentUid || '').trim();
+  const lessonStudentEmail = (lessonData?.studentEmail || '').toLowerCase().trim();
+  const isStudent = Boolean(
+    cleanCallerUid &&
+      (lessonStudentUid
+        ? lessonStudentUid === cleanCallerUid
+        : Boolean(cleanCallerEmail && callerEmailVerified !== false && lessonStudentEmail === cleanCallerEmail))
+  );
+
+  let teacherResolution: ResolvedTeacherIdentity | null = null;
+  let isTeacher = false;
+  if (cleanCallerUid) {
+    try {
+      teacherResolution = await resolveTeacherCanonicalIdentity({
+        teacherUid: cleanCallerUid,
+        teacherEmail: cleanCallerEmail || undefined,
+      });
+    } catch {
+      teacherResolution = null;
+    }
+
+    if (teacherResolution && teacherResolution.isApproved) {
+      const lessonTeacherIds = new Set(
+        [
+          lessonData?.teacherUid,
+          lessonData?.teacherAuthUid,
+          lessonData?.tutorUid,
+          lessonData?.teacherPublicId,
+        ]
+          .filter((v) => typeof v === 'string' && v.trim().length > 0)
+          .map((v) => String(v).trim())
+      );
+
+      const lessonTeacherEmail = (lessonData?.teacherEmail || lessonData?.tutorEmail || '').toLowerCase().trim();
+      const matchesId =
+        lessonTeacherIds.has(cleanCallerUid) ||
+        lessonTeacherIds.has(teacherResolution.canonicalUid) ||
+        Boolean(teacherResolution.publicTutorId && lessonTeacherIds.has(teacherResolution.publicTutorId));
+      const matchesEmail = Boolean(
+        lessonTeacherEmail &&
+          ((teacherResolution.email && teacherResolution.email.toLowerCase().trim() === lessonTeacherEmail) ||
+            (cleanCallerEmail && callerEmailVerified !== false && cleanCallerEmail === lessonTeacherEmail))
+      );
+
+      isTeacher = matchesId || matchesEmail;
+    }
+  }
+
+  return {
+    isAuthorized: isAdmin || isStudent || isTeacher,
+    isAdmin,
+    isStudent,
+    isTeacher,
+    teacherResolution,
+  };
+}
+
+function collectLessonParticipantRefs(db: Firestore, lessonData: any, lessonId: string) {
+  const studentUid = (lessonData?.studentUid || '').trim();
+  const validStudentUid = studentUid && isValidCanonicalUid(studentUid) ? studentUid : '';
+
+  const teacherUserUids = Array.from(
+    new Set(
+      [lessonData?.teacherAuthUid, lessonData?.teacherUid]
+        .filter((v): v is string => typeof v === 'string' && isValidCanonicalUid(v.trim()) && v.trim() !== validStudentUid)
+        .map((v) => v.trim())
+    )
+  );
+
+  const tutorSubIds = Array.from(
+    new Set(
+      [lessonData?.teacherAuthUid, lessonData?.teacherUid, lessonData?.teacherPublicId]
+        .filter((v): v is string => typeof v === 'string' && v.trim().length > 0 && !isGenericTutorId(v.trim()))
+        .map((v) => v.trim())
+    )
+  );
+
+  return {
+    validStudentUid,
+    studentRef: validStudentUid ? db.collection('users').doc(validStudentUid) : null,
+    studentSubLessonRef: validStudentUid
+      ? db.collection('users').doc(validStudentUid).collection('lessons').doc(lessonId)
+      : null,
+    teacherUserRefs: teacherUserUids.map((uid) => ({
+      uid,
+      userRef: db.collection('users').doc(uid),
+      subLessonRef: db.collection('users').doc(uid).collection('lessons').doc(lessonId),
+    })),
+    tutorSubRefs: tutorSubIds.map((id) => ({
+      id,
+      subLessonRef: db.collection('tutors').doc(id).collection('lessons').doc(lessonId),
+    })),
+  };
+}
+
+async function hasFirestoreLessonConflict(params: {
+  db: Firestore;
+  excludeLessonId: string;
+  startTime: number;
+  endTime: number;
+  lessonData: any;
+}): Promise<{ conflict: boolean; isTeacherConflict?: boolean }> {
+  const { db, excludeLessonId, startTime, endTime, lessonData } = params;
+
+  const teacherIds = Array.from(
+    new Set(
+      [lessonData?.teacherAuthUid, lessonData?.teacherUid, lessonData?.tutorUid, lessonData?.teacherPublicId]
+        .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+        .map((v) => v.trim())
+    )
+  );
+  const teacherEmails = Array.from(
+    new Set(
+      [lessonData?.teacherEmail, lessonData?.tutorEmail]
+        .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+        .map((v) => v.toLowerCase().trim())
+    )
+  );
+  const studentUid = (lessonData?.studentUid || '').trim();
+  const studentEmail = (lessonData?.studentEmail || '').toLowerCase().trim();
+
+  const queries: Promise<any>[] = [];
+  for (const tId of teacherIds) {
+    queries.push(db.collection('lessons').where('teacherUid', '==', tId).get().catch(() => null));
+    queries.push(db.collection('lessons').where('teacherAuthUid', '==', tId).get().catch(() => null));
+  }
+  for (const tEmail of teacherEmails) {
+    queries.push(db.collection('lessons').where('teacherEmail', '==', tEmail).get().catch(() => null));
+  }
+  if (studentUid) {
+    queries.push(db.collection('lessons').where('studentUid', '==', studentUid).get().catch(() => null));
+  }
+  if (studentEmail) {
+    queries.push(db.collection('lessons').where('studentEmail', '==', studentEmail).get().catch(() => null));
+  }
+
+  const snaps = await Promise.all(queries);
+  const byId = new Map<string, any>();
+  for (const snap of snaps) {
+    if (!snap) continue;
+    snap.forEach((doc: any) => {
+      if (doc && doc.id) {
+        byId.set(doc.id, { id: doc.id, ...doc.data() });
+      }
+    });
+  }
+
+  for (const l of byId.values()) {
+    if (!l || l.id === excludeLessonId) continue;
+    const isCancelled = l.status === 'cancelled' || l.status === 'canceled' || Boolean(l.cancelledAt);
+    if (isCancelled) continue;
+    if (l.status && l.status !== 'scheduled' && l.status !== 'confirmed') continue;
+    if (!l.startDateTime || !l.endDateTime) continue;
+
+    const lStart = new Date(l.startDateTime).getTime();
+    const lEnd = new Date(l.endDateTime).getTime();
+    if (isNaN(lStart) || isNaN(lEnd)) continue;
+    if (!(lStart < endTime && lEnd > startTime)) continue;
+
+    const lTeacherIds = [l.teacherUid, l.teacherAuthUid, l.tutorUid, l.teacherPublicId]
+      .filter(Boolean)
+      .map((v: any) => String(v).trim());
+    const lTeacherEmail = (l.teacherEmail || l.tutorEmail || '').toLowerCase().trim();
+    const isSameTeacher =
+      teacherIds.some((id) => lTeacherIds.includes(id)) ||
+      (lTeacherEmail !== '' && teacherEmails.includes(lTeacherEmail));
+
+    const lStudentUid = (l.studentUid || '').trim();
+    const lStudentEmail = (l.studentEmail || '').toLowerCase().trim();
+    const isSameStudent =
+      (studentUid !== '' && lStudentUid === studentUid) ||
+      (studentEmail !== '' && lStudentEmail === studentEmail);
+
+    if (isSameTeacher || isSameStudent) {
+      return { conflict: true, isTeacherConflict: isSameTeacher };
+    }
+  }
+
+  return { conflict: false };
+}
+
+function mapLessonTxError(err: any, actionLabel: string): LessonLifecycleResult {
+  if (err instanceof SchedulingTransactionError) {
+    return {
+      success: false,
+      error: err.message,
+      statusCode: err.statusCode,
+    };
+  }
+
+  const msg = String(err?.message || '');
+  const code = err?.code;
+
+  if (isPermissionError(err)) {
+    return {
+      success: false,
+      error: `Permissão negada no Firestore ao executar ${actionLabel}.`,
+      statusCode: 403,
+    };
+  }
+
+  const isTimeout =
+    code === 4 ||
+    code === 'deadline-exceeded' ||
+    msg.includes('DEADLINE_EXCEEDED') ||
+    msg.includes('timeout') ||
+    msg.includes('ETIMEDOUT');
+  if (isTimeout) {
+    return {
+      success: false,
+      error: `Tempo limite esgotado ao persistir ${actionLabel} no Firestore.`,
+      statusCode: 504,
+    };
+  }
+
+  const isUnavailable =
+    code === 14 ||
+    code === 'unavailable' ||
+    msg.includes('UNAVAILABLE') ||
+    msg.includes('ECONNREFUSED');
+  if (isUnavailable) {
+    return {
+      success: false,
+      error: 'Serviço Firestore temporariamente indisponível.',
+      statusCode: 503,
+    };
+  }
+
+  console.error(`[serverFirestore] Unexpected error in ${actionLabel}:`, msg);
+  return {
+    success: false,
+    error: `Falha de persistência atômica ao processar ${actionLabel}.`,
+    statusCode: 500,
+  };
+}
+
+function updateUserScheduledLessonsArray(
+  userData: any,
+  lessonId: string,
+  updates: Record<string, any> | null,
+  removeFromArray: boolean
+): any[] | undefined {
+  if (!userData || !Array.isArray(userData.scheduledLessons)) return undefined;
+  if (removeFromArray) {
+    return userData.scheduledLessons.filter((l: any) => l?.id !== lessonId);
+  }
+  if (!updates) return userData.scheduledLessons;
+  return userData.scheduledLessons.map((l: any) => (l?.id === lessonId ? { ...l, ...updates } : l));
+}
+
+/**
+ * ARCH.2D: Atomic lesson completion in Firestore (default).
+ * Preserves Native Friends Notes, prevents invalid status transitions, and is idempotent.
+ */
+export async function completeLessonAtomicServer(
+  params: LessonLifecycleCallerParams
+): Promise<LessonLifecycleResult> {
+  const lessonId = (params.lessonId || '').trim();
+  const callerUid = (params.callerUid || '').trim();
+  if (!callerUid) {
+    return { success: false, statusCode: 401, error: 'Autenticação necessária.' };
+  }
+  if (!lessonId) {
+    return { success: false, statusCode: 400, error: 'Identificador da aula ausente.' };
+  }
+
+  const db = getFirestoreDb();
+  if (!db || isCloudWriteDisabled) {
+    return { success: false, statusCode: 503, error: 'Serviço de persistência Firestore (default) indisponível.' };
+  }
+
+  const lessonRef = db.collection('lessons').doc(lessonId);
+  const preSnap = await lessonRef.get().catch(() => null);
+  if (!preSnap || !preSnap.exists) {
+    return { success: false, statusCode: 404, error: 'Aula não encontrada no Firestore.' };
+  }
+
+  const preData = preSnap.data() || {};
+  const auth = await resolveLessonCallerContext(
+    preData,
+    callerUid,
+    params.callerEmail,
+    params.callerRole,
+    params.callerEmailVerified
+  );
+  if (!auth.isAuthorized) {
+    return { success: false, statusCode: 403, error: 'Acesso negado: você não tem permissão para concluir esta aula.' };
+  }
+
+  const refs = collectLessonParticipantRefs(db, preData, lessonId);
+  const nowIso = new Date().toISOString();
+
+  try {
+    const txRes = await db.runTransaction(async (transaction) => {
+      const [lessonSnap, studentSnap, ...teacherUserSnaps] = await Promise.all([
+        transaction.get(lessonRef),
+        refs.studentRef ? transaction.get(refs.studentRef) : Promise.resolve(null),
+        ...refs.teacherUserRefs.map((t) => transaction.get(t.userRef)),
+      ]);
+
+      if (!lessonSnap.exists) {
+        throw new SchedulingTransactionError('Aula não encontrada no Firestore.', 404);
+      }
+
+      const latest = lessonSnap.data() || {};
+      if (latest.status === 'completed') {
+        return {
+          isIdempotent: true,
+          lesson: { ...latest, id: lessonId },
+        };
+      }
+
+      if (
+        latest.status === 'cancelled' ||
+        latest.status === 'canceled' ||
+        latest.status === 'not_completed' ||
+        Boolean(latest.cancelledAt)
+      ) {
+        throw new SchedulingTransactionError(
+          'Transição inválida: não é possível concluir uma aula cancelada ou marcada como não realizada.',
+          409
+        );
+      }
+
+      const updates: Record<string, any> = {
+        status: 'completed',
+        completedAt: latest.completedAt || nowIso,
+        completedBy: auth.isAdmin ? 'admin' : auth.isTeacher ? 'teacher' : 'student',
+        updatedAt: nowIso,
+      };
+
+      const mergedLesson = { ...latest, ...updates, id: lessonId };
+      transaction.set(lessonRef, updates, { merge: true });
+      if (refs.studentSubLessonRef) {
+        transaction.set(refs.studentSubLessonRef, mergedLesson, { merge: true });
+      }
+      for (const tRef of refs.teacherUserRefs) {
+        transaction.set(tRef.subLessonRef, mergedLesson, { merge: true });
+      }
+      for (const tuRef of refs.tutorSubRefs) {
+        transaction.set(tuRef.subLessonRef, mergedLesson, { merge: true });
+      }
+
+      if (refs.studentRef && studentSnap && studentSnap.exists) {
+        const nextScheduled = updateUserScheduledLessonsArray(studentSnap.data(), lessonId, updates, true);
+        if (nextScheduled !== undefined) {
+          transaction.set(refs.studentRef, { scheduledLessons: nextScheduled, updatedAt: nowIso }, { merge: true });
+        }
+      }
+      refs.teacherUserRefs.forEach((tRef, idx) => {
+        const tSnap = teacherUserSnaps[idx];
+        if (tSnap && tSnap.exists) {
+          const nextScheduled = updateUserScheduledLessonsArray(tSnap.data(), lessonId, updates, true);
+          if (nextScheduled !== undefined) {
+            transaction.set(tRef.userRef, { scheduledLessons: nextScheduled, updatedAt: nowIso }, { merge: true });
+          }
+        }
+      });
+
+      return {
+        isIdempotent: false,
+        lesson: mergedLesson,
+      };
+    });
+
+    return {
+      success: true,
+      statusCode: 200,
+      isIdempotent: txRes.isIdempotent,
+      lesson: txRes.lesson,
+    };
+  } catch (err) {
+    return mapLessonTxError(err, 'conclusão da aula');
+  }
+}
+
+/**
+ * ARCH.2D: Atomic non-completion in Firestore (default).
+ * Restores +1 paid credit once (and only once) when teacher is responsible on a non-trial lesson.
+ */
+export async function markLessonNotCompletedAtomicServer(
+  params: LessonLifecycleCallerParams & {
+    responsible: 'student' | 'teacher';
+    reason?: string;
+  }
+): Promise<LessonLifecycleResult> {
+  const lessonId = (params.lessonId || '').trim();
+  const callerUid = (params.callerUid || '').trim();
+  const responsible = params.responsible;
+  const reason = typeof params.reason === 'string' ? params.reason.trim() : '';
+
+  if (!callerUid) {
+    return { success: false, statusCode: 401, error: 'Autenticação necessária.' };
+  }
+  if (!lessonId) {
+    return { success: false, statusCode: 400, error: 'Identificador da aula ausente.' };
+  }
+  if (responsible !== 'student' && responsible !== 'teacher') {
+    return { success: false, statusCode: 400, error: 'Responsável inválido. Informe "student" ou "teacher".' };
+  }
+
+  const db = getFirestoreDb();
+  if (!db || isCloudWriteDisabled) {
+    return { success: false, statusCode: 503, error: 'Serviço de persistência Firestore (default) indisponível.' };
+  }
+
+  const lessonRef = db.collection('lessons').doc(lessonId);
+  const preSnap = await lessonRef.get().catch(() => null);
+  if (!preSnap || !preSnap.exists) {
+    return { success: false, statusCode: 404, error: 'Aula não encontrada no Firestore.' };
+  }
+
+  const preData = preSnap.data() || {};
+  const auth = await resolveLessonCallerContext(
+    preData,
+    callerUid,
+    params.callerEmail,
+    params.callerRole,
+    params.callerEmailVerified
+  );
+  if (!auth.isAuthorized) {
+    return { success: false, statusCode: 403, error: 'Acesso negado: você não tem permissão para atualizar esta aula.' };
+  }
+
+  if (responsible === 'teacher' && !auth.isAdmin && !auth.isTeacher) {
+    return {
+      success: false,
+      statusCode: 403,
+      error: 'Proibido: apenas o Amigo Nativo ou administrador pode registrar não realização por responsabilidade do professor com estorno de crédito.',
+    };
+  }
+
+  const refs = collectLessonParticipantRefs(db, preData, lessonId);
+  const nowIso = new Date().toISOString();
+
+  try {
+    const txRes = await db.runTransaction(async (transaction) => {
+      const [lessonSnap, studentSnap, ...teacherUserSnaps] = await Promise.all([
+        transaction.get(lessonRef),
+        refs.studentRef ? transaction.get(refs.studentRef) : Promise.resolve(null),
+        ...refs.teacherUserRefs.map((t) => transaction.get(t.userRef)),
+      ]);
+
+      if (!lessonSnap.exists) {
+        throw new SchedulingTransactionError('Aula não encontrada no Firestore.', 404);
+      }
+
+      const latest = lessonSnap.data() || {};
+      const studentData = studentSnap && studentSnap.exists ? (studentSnap.data() || {}) : null;
+
+      if (latest.status === 'not_completed') {
+        if (latest.notCompletedResponsible === responsible) {
+          return {
+            isIdempotent: true,
+            lesson: { ...latest, id: lessonId },
+            remainingLessons: typeof studentData?.availableLessons === 'number' ? studentData.availableLessons : undefined,
+            creditRefunded: Boolean(latest.creditRefunded),
+          };
+        }
+        throw new SchedulingTransactionError(
+          'Transição inválida: esta aula já foi registrada como não realizada com outra responsabilidade.',
+          409
+        );
+      }
+
+      if (
+        latest.status === 'completed' ||
+        latest.status === 'cancelled' ||
+        latest.status === 'canceled' ||
+        Boolean(latest.cancelledAt)
+      ) {
+        throw new SchedulingTransactionError(
+          'Transição inválida: não é possível marcar como não realizada uma aula já concluída ou cancelada.',
+          409
+        );
+      }
+
+      const shouldRefund =
+        responsible === 'teacher' &&
+        !Boolean(latest.isTrialLesson) &&
+        latest.creditRefunded !== true;
+
+      let nextAvailable = typeof studentData?.availableLessons === 'number' ? studentData.availableLessons : undefined;
+      let actuallyRefunded = false;
+
+      if (shouldRefund && refs.studentRef && studentData && typeof studentData.availableLessons === 'number') {
+        nextAvailable = studentData.availableLessons + 1;
+        actuallyRefunded = true;
+      }
+
+      const updates: Record<string, any> = {
+        status: 'not_completed',
+        notCompletedResponsible: responsible,
+        notCompletedReason: reason,
+        notCompletedAt: latest.notCompletedAt || nowIso,
+        notCompletedRecordedBy: auth.isAdmin ? 'admin' : auth.isTeacher ? 'teacher' : 'student',
+        updatedAt: nowIso,
+      };
+      if (actuallyRefunded) {
+        updates.creditRefunded = true;
+        updates.creditRefundedAt = nowIso;
+      }
+
+      const mergedLesson = { ...latest, ...updates, id: lessonId };
+      transaction.set(lessonRef, updates, { merge: true });
+      if (refs.studentSubLessonRef) {
+        transaction.set(refs.studentSubLessonRef, mergedLesson, { merge: true });
+      }
+      for (const tRef of refs.teacherUserRefs) {
+        transaction.set(tRef.subLessonRef, mergedLesson, { merge: true });
+      }
+      for (const tuRef of refs.tutorSubRefs) {
+        transaction.set(tuRef.subLessonRef, mergedLesson, { merge: true });
+      }
+
+      if (refs.studentRef && studentData) {
+        const studentPatch: Record<string, any> = { updatedAt: nowIso };
+        if (actuallyRefunded && nextAvailable !== undefined) {
+          studentPatch.availableLessons = nextAvailable;
+        }
+        const nextScheduled = updateUserScheduledLessonsArray(studentData, lessonId, updates, true);
+        if (nextScheduled !== undefined) {
+          studentPatch.scheduledLessons = nextScheduled;
+        }
+        if (Object.keys(studentPatch).length > 1) {
+          transaction.set(refs.studentRef, studentPatch, { merge: true });
+        }
+      }
+
+      refs.teacherUserRefs.forEach((tRef, idx) => {
+        const tSnap = teacherUserSnaps[idx];
+        if (tSnap && tSnap.exists) {
+          const nextScheduled = updateUserScheduledLessonsArray(tSnap.data(), lessonId, updates, true);
+          if (nextScheduled !== undefined) {
+            transaction.set(tRef.userRef, { scheduledLessons: nextScheduled, updatedAt: nowIso }, { merge: true });
+          }
+        }
+      });
+
+      return {
+        isIdempotent: false,
+        lesson: mergedLesson,
+        remainingLessons: nextAvailable,
+        creditRefunded: actuallyRefunded,
+      };
+    });
+
+    return {
+      success: true,
+      statusCode: 200,
+      isIdempotent: txRes.isIdempotent,
+      lesson: txRes.lesson,
+      remainingLessons: txRes.remainingLessons,
+      creditRefunded: txRes.creditRefunded,
+    };
+  } catch (err) {
+    return mapLessonTxError(err, 'registro de aula não realizada');
+  }
+}
+
+/**
+ * ARCH.2D: Atomic reschedule proposal in Firestore (default).
+ * Checks Firestore slot conflicts and derives proposedBy from verified caller role.
+ */
+export async function proposeRescheduleAtomicServer(
+  params: LessonLifecycleCallerParams & {
+    newStartIso: string;
+    newEndIso: string;
+    reason?: string;
+    requestedProposedBy?: string;
+  }
+): Promise<LessonLifecycleResult> {
+  const lessonId = (params.lessonId || '').trim();
+  const callerUid = (params.callerUid || '').trim();
+  const newStartIso = (params.newStartIso || '').trim();
+  const newEndIso = (params.newEndIso || '').trim();
+  const reason = typeof params.reason === 'string' ? params.reason.trim() : '';
+
+  if (!callerUid) {
+    return { success: false, statusCode: 401, error: 'Autenticação necessária.' };
+  }
+  if (!lessonId) {
+    return { success: false, statusCode: 400, error: 'Identificador da aula ausente.' };
+  }
+
+  const newStartMs = new Date(newStartIso).getTime();
+  const newEndMs = new Date(newEndIso).getTime();
+  if (!newStartIso || !newEndIso || isNaN(newStartMs) || isNaN(newEndMs) || newStartMs >= newEndMs) {
+    return { success: false, statusCode: 400, error: 'Novo horário de início ou término inválido.' };
+  }
+
+  const db = getFirestoreDb();
+  if (!db || isCloudWriteDisabled) {
+    return { success: false, statusCode: 503, error: 'Serviço de persistência Firestore (default) indisponível.' };
+  }
+
+  const lessonRef = db.collection('lessons').doc(lessonId);
+  const preSnap = await lessonRef.get().catch(() => null);
+  if (!preSnap || !preSnap.exists) {
+    return { success: false, statusCode: 404, error: 'Aula não encontrada no Firestore.' };
+  }
+
+  const preData = preSnap.data() || {};
+  const auth = await resolveLessonCallerContext(
+    preData,
+    callerUid,
+    params.callerEmail,
+    params.callerRole,
+    params.callerEmailVerified
+  );
+  if (!auth.isAuthorized) {
+    return { success: false, statusCode: 403, error: 'Acesso negado: você não tem permissão para propor reagendamento desta aula.' };
+  }
+
+  const conflictCheck = await hasFirestoreLessonConflict({
+    db,
+    excludeLessonId: lessonId,
+    startTime: newStartMs,
+    endTime: newEndMs,
+    lessonData: preData,
+  });
+  if (conflictCheck.conflict) {
+    return {
+      success: false,
+      statusCode: 409,
+      error: conflictCheck.isTeacherConflict
+        ? 'Bloqueio de Conflito: O Amigo Nativo já possui outra aula agendada neste horário.'
+        : 'Bloqueio de Conflito: O aluno já possui outra aula agendada neste horário.',
+    };
+  }
+
+  const effectiveProposedBy: 'teacher' | 'student' = auth.isAdmin
+    ? params.requestedProposedBy === 'student'
+      ? 'student'
+      : 'teacher'
+    : auth.isTeacher
+    ? 'teacher'
+    : 'student';
+
+  const refs = collectLessonParticipantRefs(db, preData, lessonId);
+  const nowIso = new Date().toISOString();
+
+  try {
+    const txRes = await db.runTransaction(async (transaction) => {
+      const [lessonSnap, studentSnap, ...teacherUserSnaps] = await Promise.all([
+        transaction.get(lessonRef),
+        refs.studentRef ? transaction.get(refs.studentRef) : Promise.resolve(null),
+        ...refs.teacherUserRefs.map((t) => transaction.get(t.userRef)),
+      ]);
+
+      if (!lessonSnap.exists) {
+        throw new SchedulingTransactionError('Aula não encontrada no Firestore.', 404);
+      }
+
+      const latest = lessonSnap.data() || {};
+      if (
+        latest.status === 'cancelled' ||
+        latest.status === 'canceled' ||
+        latest.status === 'completed' ||
+        latest.status === 'not_completed' ||
+        Boolean(latest.cancelledAt)
+      ) {
+        throw new SchedulingTransactionError(
+          'Não é possível reagendar uma aula já concluída, cancelada ou marcada como não realizada.',
+          409
+        );
+      }
+
+      const proposalFields = {
+        proposedNewStartDateTime: newStartIso,
+        proposedNewEndDateTime: newEndIso,
+        rescheduleNotes: reason,
+        proposedBy: effectiveProposedBy,
+        proposalStatus:
+          effectiveProposedBy === 'teacher'
+            ? 'pending_student_reschedule'
+            : 'pending_teacher_reschedule',
+        proposedAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      const mergedLesson = { ...latest, ...proposalFields, id: lessonId };
+      transaction.set(lessonRef, proposalFields, { merge: true });
+      if (refs.studentSubLessonRef) {
+        transaction.set(refs.studentSubLessonRef, mergedLesson, { merge: true });
+      }
+      for (const tRef of refs.teacherUserRefs) {
+        transaction.set(tRef.subLessonRef, mergedLesson, { merge: true });
+      }
+      for (const tuRef of refs.tutorSubRefs) {
+        transaction.set(tuRef.subLessonRef, mergedLesson, { merge: true });
+      }
+
+      if (refs.studentRef && studentSnap && studentSnap.exists) {
+        const nextScheduled = updateUserScheduledLessonsArray(studentSnap.data(), lessonId, proposalFields, false);
+        if (nextScheduled !== undefined) {
+          transaction.set(refs.studentRef, { scheduledLessons: nextScheduled, updatedAt: nowIso }, { merge: true });
+        }
+      }
+      refs.teacherUserRefs.forEach((tRef, idx) => {
+        const tSnap = teacherUserSnaps[idx];
+        if (tSnap && tSnap.exists) {
+          const nextScheduled = updateUserScheduledLessonsArray(tSnap.data(), lessonId, proposalFields, false);
+          if (nextScheduled !== undefined) {
+            transaction.set(tRef.userRef, { scheduledLessons: nextScheduled, updatedAt: nowIso }, { merge: true });
+          }
+        }
+      });
+
+      return { lesson: mergedLesson };
+    });
+
+    return {
+      success: true,
+      statusCode: 200,
+      lesson: txRes.lesson,
+    };
+  } catch (err) {
+    return mapLessonTxError(err, 'proposta de reagendamento');
+  }
+}
+
+/**
+ * ARCH.2D: Atomic reschedule acceptance in Firestore (default).
+ * Validates pending proposal, counterparty authorization, and conflict check without creating duplicate lessons or debiting credits.
+ */
+export async function acceptRescheduleAtomicServer(
+  params: LessonLifecycleCallerParams
+): Promise<LessonLifecycleResult> {
+  const lessonId = (params.lessonId || '').trim();
+  const callerUid = (params.callerUid || '').trim();
+
+  if (!callerUid) {
+    return { success: false, statusCode: 401, error: 'Autenticação necessária.' };
+  }
+  if (!lessonId) {
+    return { success: false, statusCode: 400, error: 'Identificador da aula ausente.' };
+  }
+
+  const db = getFirestoreDb();
+  if (!db || isCloudWriteDisabled) {
+    return { success: false, statusCode: 503, error: 'Serviço de persistência Firestore (default) indisponível.' };
+  }
+
+  const lessonRef = db.collection('lessons').doc(lessonId);
+  const preSnap = await lessonRef.get().catch(() => null);
+  if (!preSnap || !preSnap.exists) {
+    return { success: false, statusCode: 404, error: 'Aula não encontrada no Firestore.' };
+  }
+
+  const preData = preSnap.data() || {};
+  const auth = await resolveLessonCallerContext(
+    preData,
+    callerUid,
+    params.callerEmail,
+    params.callerRole,
+    params.callerEmailVerified
+  );
+  if (!auth.isAuthorized) {
+    return { success: false, statusCode: 403, error: 'Acesso negado: você não tem permissão para aceitar reagendamento desta aula.' };
+  }
+
+  if (
+    preData.status === 'cancelled' ||
+    preData.status === 'canceled' ||
+    preData.status === 'completed' ||
+    preData.status === 'not_completed' ||
+    Boolean(preData.cancelledAt)
+  ) {
+    return { success: false, statusCode: 409, error: 'Esta aula não está mais ativa para reagendamento.' };
+  }
+
+  if (!preData.proposedNewStartDateTime) {
+    return { success: false, statusCode: 409, error: 'Nenhuma proposta de reagendamento pendente encontrada.' };
+  }
+
+  // Only the receiving party (or admin) can accept a reschedule proposal
+  const awaitingStudent =
+    preData.proposedBy === 'teacher' || preData.proposalStatus === 'pending_student_reschedule';
+  const awaitingTeacher =
+    preData.proposedBy === 'student' || preData.proposalStatus === 'pending_teacher_reschedule';
+
+  if (!auth.isAdmin) {
+    if (awaitingStudent && !auth.isStudent) {
+      return {
+        success: false,
+        statusCode: 403,
+        error: 'Proibido: aguardando confirmação do aluno para esta proposta de reagendamento.',
+      };
+    }
+    if (awaitingTeacher && !auth.isTeacher) {
+      return {
+        success: false,
+        statusCode: 403,
+        error: 'Proibido: aguardando confirmação do Amigo Nativo para esta proposta de reagendamento.',
+      };
+    }
+  }
+
+  const newStartIso = String(preData.proposedNewStartDateTime);
+  const newEndIso = String(preData.proposedNewEndDateTime || preData.endDateTime || '');
+  const newStartMs = new Date(newStartIso).getTime();
+  const newEndMs = new Date(newEndIso).getTime();
+  if (isNaN(newStartMs) || isNaN(newEndMs) || newStartMs >= newEndMs) {
+    return { success: false, statusCode: 400, error: 'Horário proposto inválido para aceite.' };
+  }
+
+  const conflictCheck = await hasFirestoreLessonConflict({
+    db,
+    excludeLessonId: lessonId,
+    startTime: newStartMs,
+    endTime: newEndMs,
+    lessonData: preData,
+  });
+  if (conflictCheck.conflict) {
+    return {
+      success: false,
+      statusCode: 409,
+      error: conflictCheck.isTeacherConflict
+        ? 'Bloqueio de Conflito: O horário proposto já foi ocupado na agenda do Amigo Nativo.'
+        : 'Bloqueio de Conflito: O aluno já possui outra aula agendada neste horário.',
+    };
+  }
+
+  const refs = collectLessonParticipantRefs(db, preData, lessonId);
+  const nowIso = new Date().toISOString();
+
+  try {
+    const txRes = await db.runTransaction(async (transaction) => {
+      const [lessonSnap, studentSnap, ...teacherUserSnaps] = await Promise.all([
+        transaction.get(lessonRef),
+        refs.studentRef ? transaction.get(refs.studentRef) : Promise.resolve(null),
+        ...refs.teacherUserRefs.map((t) => transaction.get(t.userRef)),
+      ]);
+
+      if (!lessonSnap.exists) {
+        throw new SchedulingTransactionError('Aula não encontrada no Firestore.', 404);
+      }
+
+      const latest = lessonSnap.data() || {};
+      if (
+        latest.status === 'cancelled' ||
+        latest.status === 'canceled' ||
+        latest.status === 'completed' ||
+        latest.status === 'not_completed' ||
+        Boolean(latest.cancelledAt)
+      ) {
+        throw new SchedulingTransactionError('Esta aula não está mais ativa para reagendamento.', 409);
+      }
+      if (!latest.proposedNewStartDateTime) {
+        throw new SchedulingTransactionError('Proposta de reagendamento não está mais pendente.', 409);
+      }
+
+      const acceptUpdates = {
+        startDateTime: latest.proposedNewStartDateTime,
+        endDateTime: latest.proposedNewEndDateTime || latest.endDateTime,
+        rescheduledFrom: {
+          startDateTime: latest.startDateTime,
+          endDateTime: latest.endDateTime,
+        },
+        rescheduledAt: nowIso,
+        rescheduledBy: latest.proposedBy,
+        rescheduledReason: latest.rescheduleNotes || '',
+        proposedNewStartDateTime: null,
+        proposedNewEndDateTime: null,
+        proposalStatus: null,
+        updatedAt: nowIso,
+      };
+
+      const mergedLesson = { ...latest, ...acceptUpdates, id: lessonId };
+      transaction.set(lessonRef, acceptUpdates, { merge: true });
+      if (refs.studentSubLessonRef) {
+        transaction.set(refs.studentSubLessonRef, mergedLesson, { merge: true });
+      }
+      for (const tRef of refs.teacherUserRefs) {
+        transaction.set(tRef.subLessonRef, mergedLesson, { merge: true });
+      }
+      for (const tuRef of refs.tutorSubRefs) {
+        transaction.set(tuRef.subLessonRef, mergedLesson, { merge: true });
+      }
+
+      if (refs.studentRef && studentSnap && studentSnap.exists) {
+        const nextScheduled = updateUserScheduledLessonsArray(studentSnap.data(), lessonId, acceptUpdates, false);
+        if (nextScheduled !== undefined) {
+          transaction.set(refs.studentRef, { scheduledLessons: nextScheduled, updatedAt: nowIso }, { merge: true });
+        }
+      }
+      refs.teacherUserRefs.forEach((tRef, idx) => {
+        const tSnap = teacherUserSnaps[idx];
+        if (tSnap && tSnap.exists) {
+          const nextScheduled = updateUserScheduledLessonsArray(tSnap.data(), lessonId, acceptUpdates, false);
+          if (nextScheduled !== undefined) {
+            transaction.set(tRef.userRef, { scheduledLessons: nextScheduled, updatedAt: nowIso }, { merge: true });
+          }
+        }
+      });
+
+      return { lesson: mergedLesson };
+    });
+
+    return {
+      success: true,
+      statusCode: 200,
+      lesson: txRes.lesson,
+    };
+  } catch (err) {
+    return mapLessonTxError(err, 'aceite de reagendamento');
+  }
+}
+
+/**
+ * ARCH.2D: Atomic reschedule decline in Firestore (default).
+ * Clears proposed schedule fields while preserving original lesson time and notes.
+ */
+export async function declineRescheduleAtomicServer(
+  params: LessonLifecycleCallerParams
+): Promise<LessonLifecycleResult> {
+  const lessonId = (params.lessonId || '').trim();
+  const callerUid = (params.callerUid || '').trim();
+
+  if (!callerUid) {
+    return { success: false, statusCode: 401, error: 'Autenticação necessária.' };
+  }
+  if (!lessonId) {
+    return { success: false, statusCode: 400, error: 'Identificador da aula ausente.' };
+  }
+
+  const db = getFirestoreDb();
+  if (!db || isCloudWriteDisabled) {
+    return { success: false, statusCode: 503, error: 'Serviço de persistência Firestore (default) indisponível.' };
+  }
+
+  const lessonRef = db.collection('lessons').doc(lessonId);
+  const preSnap = await lessonRef.get().catch(() => null);
+  if (!preSnap || !preSnap.exists) {
+    return { success: false, statusCode: 404, error: 'Aula não encontrada no Firestore.' };
+  }
+
+  const preData = preSnap.data() || {};
+  const auth = await resolveLessonCallerContext(
+    preData,
+    callerUid,
+    params.callerEmail,
+    params.callerRole,
+    params.callerEmailVerified
+  );
+  if (!auth.isAuthorized) {
+    return { success: false, statusCode: 403, error: 'Acesso negado: você não tem permissão para recusar reagendamento desta aula.' };
+  }
+
+  const refs = collectLessonParticipantRefs(db, preData, lessonId);
+  const nowIso = new Date().toISOString();
+
+  try {
+    const txRes = await db.runTransaction(async (transaction) => {
+      const [lessonSnap, studentSnap, ...teacherUserSnaps] = await Promise.all([
+        transaction.get(lessonRef),
+        refs.studentRef ? transaction.get(refs.studentRef) : Promise.resolve(null),
+        ...refs.teacherUserRefs.map((t) => transaction.get(t.userRef)),
+      ]);
+
+      if (!lessonSnap.exists) {
+        throw new SchedulingTransactionError('Aula não encontrada no Firestore.', 404);
+      }
+
+      const latest = lessonSnap.data() || {};
+      if (
+        latest.status === 'cancelled' ||
+        latest.status === 'canceled' ||
+        latest.status === 'completed' ||
+        latest.status === 'not_completed' ||
+        Boolean(latest.cancelledAt)
+      ) {
+        throw new SchedulingTransactionError('Esta aula não está mais ativa para alteração de reagendamento.', 409);
+      }
+
+      if (!latest.proposedNewStartDateTime && !latest.proposalStatus) {
+        return { isIdempotent: true, lesson: { ...latest, id: lessonId } };
+      }
+
+      const declineUpdates = {
+        proposedNewStartDateTime: null,
+        proposedNewEndDateTime: null,
+        proposalStatus: null,
+        rescheduleDeclinedAt: nowIso,
+        rescheduleDeclinedBy: auth.isAdmin ? 'admin' : auth.isTeacher ? 'teacher' : 'student',
+        updatedAt: nowIso,
+      };
+
+      const mergedLesson = { ...latest, ...declineUpdates, id: lessonId };
+      transaction.set(lessonRef, declineUpdates, { merge: true });
+      if (refs.studentSubLessonRef) {
+        transaction.set(refs.studentSubLessonRef, mergedLesson, { merge: true });
+      }
+      for (const tRef of refs.teacherUserRefs) {
+        transaction.set(tRef.subLessonRef, mergedLesson, { merge: true });
+      }
+      for (const tuRef of refs.tutorSubRefs) {
+        transaction.set(tuRef.subLessonRef, mergedLesson, { merge: true });
+      }
+
+      if (refs.studentRef && studentSnap && studentSnap.exists) {
+        const nextScheduled = updateUserScheduledLessonsArray(studentSnap.data(), lessonId, declineUpdates, false);
+        if (nextScheduled !== undefined) {
+          transaction.set(refs.studentRef, { scheduledLessons: nextScheduled, updatedAt: nowIso }, { merge: true });
+        }
+      }
+      refs.teacherUserRefs.forEach((tRef, idx) => {
+        const tSnap = teacherUserSnaps[idx];
+        if (tSnap && tSnap.exists) {
+          const nextScheduled = updateUserScheduledLessonsArray(tSnap.data(), lessonId, declineUpdates, false);
+          if (nextScheduled !== undefined) {
+            transaction.set(tRef.userRef, { scheduledLessons: nextScheduled, updatedAt: nowIso }, { merge: true });
+          }
+        }
+      });
+
+      return { isIdempotent: false, lesson: mergedLesson };
+    });
+
+    return {
+      success: true,
+      statusCode: 200,
+      isIdempotent: txRes.isIdempotent,
+      lesson: txRes.lesson,
+    };
+  } catch (err) {
+    return mapLessonTxError(err, 'recusa de reagendamento');
+  }
+}
+
+/**
+ * ARCH.2D: Atomic lesson cancellation in Firestore (default).
+ * Derives cancelledBy safely from caller role, enforces idempotency, and restores +1 paid credit
+ * once when cancelled by teacher or admin on a non-trial lesson.
+ */
+export async function cancelLessonAtomicServer(
+  params: LessonLifecycleCallerParams & {
+    requestedCancelledBy?: string;
+    reason?: string;
+  }
+): Promise<LessonLifecycleResult> {
+  const lessonId = (params.lessonId || '').trim();
+  const callerUid = (params.callerUid || '').trim();
+  const reason = typeof params.reason === 'string' ? params.reason.trim() : '';
+
+  if (!callerUid) {
+    return { success: false, statusCode: 401, error: 'Autenticação necessária.' };
+  }
+  if (!lessonId) {
+    return { success: false, statusCode: 400, error: 'Identificador da aula ausente.' };
+  }
+
+  const db = getFirestoreDb();
+  if (!db || isCloudWriteDisabled) {
+    return { success: false, statusCode: 503, error: 'Serviço de persistência Firestore (default) indisponível.' };
+  }
+
+  const lessonRef = db.collection('lessons').doc(lessonId);
+  const preSnap = await lessonRef.get().catch(() => null);
+  if (!preSnap || !preSnap.exists) {
+    return { success: false, statusCode: 404, error: 'Aula não encontrada no Firestore.' };
+  }
+
+  const preData = preSnap.data() || {};
+  const auth = await resolveLessonCallerContext(
+    preData,
+    callerUid,
+    params.callerEmail,
+    params.callerRole,
+    params.callerEmailVerified
+  );
+  if (!auth.isAuthorized) {
+    return { success: false, statusCode: 403, error: 'Acesso negado: você não tem permissão para cancelar esta aula.' };
+  }
+
+  // Server-authoritative responsibility derivation: students cannot self-authorize teacher fault refunds
+  const effectiveCancelledBy: 'student' | 'teacher' | 'admin' = auth.isAdmin
+    ? params.requestedCancelledBy === 'teacher'
+      ? 'teacher'
+      : params.requestedCancelledBy === 'student'
+      ? 'student'
+      : 'admin'
+    : auth.isTeacher
+    ? 'teacher'
+    : 'student';
+
+  const refs = collectLessonParticipantRefs(db, preData, lessonId);
+  const nowIso = new Date().toISOString();
+
+  try {
+    const txRes = await db.runTransaction(async (transaction) => {
+      const [lessonSnap, studentSnap, ...teacherUserSnaps] = await Promise.all([
+        transaction.get(lessonRef),
+        refs.studentRef ? transaction.get(refs.studentRef) : Promise.resolve(null),
+        ...refs.teacherUserRefs.map((t) => transaction.get(t.userRef)),
+      ]);
+
+      if (!lessonSnap.exists) {
+        throw new SchedulingTransactionError('Aula não encontrada no Firestore.', 404);
+      }
+
+      const latest = lessonSnap.data() || {};
+      const studentData = studentSnap && studentSnap.exists ? (studentSnap.data() || {}) : null;
+
+      if (latest.status === 'completed' || latest.status === 'not_completed') {
+        throw new SchedulingTransactionError(
+          'Transição inválida: não é possível cancelar uma aula já concluída ou marcada como não realizada.',
+          409
+        );
+      }
+
+      if (latest.status === 'cancelled' || latest.status === 'canceled' || Boolean(latest.cancelledAt)) {
+        return {
+          isIdempotent: true,
+          lesson: { ...latest, id: lessonId },
+          remainingLessons: typeof studentData?.availableLessons === 'number' ? studentData.availableLessons : undefined,
+          creditRefunded: Boolean(latest.creditRefunded),
+        };
+      }
+
+      const shouldRefund =
+        (effectiveCancelledBy === 'teacher' || effectiveCancelledBy === 'admin') &&
+        !Boolean(latest.isTrialLesson) &&
+        latest.creditRefunded !== true;
+
+      let nextAvailable = typeof studentData?.availableLessons === 'number' ? studentData.availableLessons : undefined;
+      let actuallyRefunded = false;
+
+      if (shouldRefund && refs.studentRef && studentData && typeof studentData.availableLessons === 'number') {
+        nextAvailable = studentData.availableLessons + 1;
+        actuallyRefunded = true;
+      }
+
+      const cancelUpdates: Record<string, any> = {
+        status: 'cancelled',
+        cancelledAt: nowIso,
+        cancelledBy: effectiveCancelledBy,
+        cancellationReason: reason || 'Cancelled by user',
+        proposalStatus: null,
+        proposedNewStartDateTime: null,
+        proposedNewEndDateTime: null,
+        updatedAt: nowIso,
+      };
+      if (actuallyRefunded) {
+        cancelUpdates.creditRefunded = true;
+        cancelUpdates.creditRefundedAt = nowIso;
+      }
+
+      const mergedLesson = { ...latest, ...cancelUpdates, id: lessonId };
+      transaction.set(lessonRef, cancelUpdates, { merge: true });
+      if (refs.studentSubLessonRef) {
+        transaction.set(refs.studentSubLessonRef, mergedLesson, { merge: true });
+      }
+      for (const tRef of refs.teacherUserRefs) {
+        transaction.set(tRef.subLessonRef, mergedLesson, { merge: true });
+      }
+      for (const tuRef of refs.tutorSubRefs) {
+        transaction.set(tuRef.subLessonRef, mergedLesson, { merge: true });
+      }
+
+      if (refs.studentRef && studentData) {
+        const studentPatch: Record<string, any> = { updatedAt: nowIso };
+        if (actuallyRefunded && nextAvailable !== undefined) {
+          studentPatch.availableLessons = nextAvailable;
+        }
+        const nextScheduled = updateUserScheduledLessonsArray(studentData, lessonId, cancelUpdates, true);
+        if (nextScheduled !== undefined) {
+          studentPatch.scheduledLessons = nextScheduled;
+        }
+        if (Object.keys(studentPatch).length > 1) {
+          transaction.set(refs.studentRef, studentPatch, { merge: true });
+        }
+      }
+
+      refs.teacherUserRefs.forEach((tRef, idx) => {
+        const tSnap = teacherUserSnaps[idx];
+        if (tSnap && tSnap.exists) {
+          const nextScheduled = updateUserScheduledLessonsArray(tSnap.data(), lessonId, cancelUpdates, true);
+          if (nextScheduled !== undefined) {
+            transaction.set(tRef.userRef, { scheduledLessons: nextScheduled, updatedAt: nowIso }, { merge: true });
+          }
+        }
+      });
+
+      return {
+        isIdempotent: false,
+        lesson: mergedLesson,
+        remainingLessons: nextAvailable,
+        creditRefunded: actuallyRefunded,
+      };
+    });
+
+    return {
+      success: true,
+      statusCode: 200,
+      isIdempotent: txRes.isIdempotent,
+      lesson: txRes.lesson,
+      remainingLessons: txRes.remainingLessons,
+      creditRefunded: txRes.creditRefunded,
+    };
+  } catch (err) {
+    return mapLessonTxError(err, 'cancelamento da aula');
+  }
+}
+
+/**
+ * ARCH.2D: Atomic lesson deletion in Firestore (default).
+ * Removes root lesson and participant subcollection links; restores +1 paid credit if an admin
+ * deletes an active scheduled non-trial lesson that has not yet been refunded.
+ */
+export async function deleteLessonAtomicServer(
+  params: LessonLifecycleCallerParams
+): Promise<LessonLifecycleResult> {
+  const lessonId = (params.lessonId || '').trim();
+  const callerUid = (params.callerUid || '').trim();
+
+  if (!callerUid) {
+    return { success: false, statusCode: 401, error: 'Autenticação necessária.' };
+  }
+  if (!lessonId) {
+    return { success: false, statusCode: 400, error: 'Identificador da aula ausente.' };
+  }
+
+  const db = getFirestoreDb();
+  if (!db || isCloudWriteDisabled) {
+    return { success: false, statusCode: 503, error: 'Serviço de persistência Firestore (default) indisponível.' };
+  }
+
+  const lessonRef = db.collection('lessons').doc(lessonId);
+  const preSnap = await lessonRef.get().catch(() => null);
+  if (!preSnap || !preSnap.exists) {
+    return { success: false, statusCode: 404, error: 'Aula não encontrada no Firestore.' };
+  }
+
+  const preData = preSnap.data() || {};
+  const auth = await resolveLessonCallerContext(
+    preData,
+    callerUid,
+    params.callerEmail,
+    params.callerRole,
+    params.callerEmailVerified
+  );
+  if (!auth.isAuthorized) {
+    return { success: false, statusCode: 403, error: 'Acesso negado: você não tem permissão para excluir esta aula.' };
+  }
+
+  // Only admin may delete active/completed lessons; participants may only delete already-cancelled records
+  const isAlreadyCancelled =
+    preData.status === 'cancelled' || preData.status === 'canceled' || Boolean(preData.cancelledAt);
+  if (!auth.isAdmin && !isAlreadyCancelled) {
+    return {
+      success: false,
+      statusCode: 403,
+      error: 'Proibido: utilize a rota de cancelamento para cancelar aulas ativas. Apenas administradores podem excluir registros ativos.',
+    };
+  }
+
+  const refs = collectLessonParticipantRefs(db, preData, lessonId);
+  const nowIso = new Date().toISOString();
+
+  try {
+    const txRes = await db.runTransaction(async (transaction) => {
+      const [lessonSnap, studentSnap, ...teacherUserSnaps] = await Promise.all([
+        transaction.get(lessonRef),
+        refs.studentRef ? transaction.get(refs.studentRef) : Promise.resolve(null),
+        ...refs.teacherUserRefs.map((t) => transaction.get(t.userRef)),
+      ]);
+
+      if (!lessonSnap.exists) {
+        throw new SchedulingTransactionError('Aula não encontrada no Firestore.', 404);
+      }
+
+      const latest = lessonSnap.data() || {};
+      const studentData = studentSnap && studentSnap.exists ? (studentSnap.data() || {}) : null;
+
+      const isActiveScheduled =
+        (!latest.status || latest.status === 'scheduled' || latest.status === 'confirmed') &&
+        !Boolean(latest.cancelledAt);
+
+      const shouldRefund =
+        auth.isAdmin &&
+        isActiveScheduled &&
+        !Boolean(latest.isTrialLesson) &&
+        latest.creditRefunded !== true;
+
+      let nextAvailable = typeof studentData?.availableLessons === 'number' ? studentData.availableLessons : undefined;
+      let actuallyRefunded = false;
+
+      if (shouldRefund && refs.studentRef && studentData && typeof studentData.availableLessons === 'number') {
+        nextAvailable = studentData.availableLessons + 1;
+        actuallyRefunded = true;
+      }
+
+      transaction.delete(lessonRef);
+      if (refs.studentSubLessonRef) {
+        transaction.delete(refs.studentSubLessonRef);
+      }
+      for (const tRef of refs.teacherUserRefs) {
+        transaction.delete(tRef.subLessonRef);
+      }
+      for (const tuRef of refs.tutorSubRefs) {
+        transaction.delete(tuRef.subLessonRef);
+      }
+
+      if (refs.studentRef && studentData) {
+        const studentPatch: Record<string, any> = { updatedAt: nowIso };
+        if (actuallyRefunded && nextAvailable !== undefined) {
+          studentPatch.availableLessons = nextAvailable;
+        }
+        const nextScheduled = updateUserScheduledLessonsArray(studentData, lessonId, null, true);
+        if (nextScheduled !== undefined) {
+          studentPatch.scheduledLessons = nextScheduled;
+        }
+        if (Object.keys(studentPatch).length > 1) {
+          transaction.set(refs.studentRef, studentPatch, { merge: true });
+        }
+      }
+
+      refs.teacherUserRefs.forEach((tRef, idx) => {
+        const tSnap = teacherUserSnaps[idx];
+        if (tSnap && tSnap.exists) {
+          const nextScheduled = updateUserScheduledLessonsArray(tSnap.data(), lessonId, null, true);
+          if (nextScheduled !== undefined) {
+            transaction.set(tRef.userRef, { scheduledLessons: nextScheduled, updatedAt: nowIso }, { merge: true });
+          }
+        }
+      });
+
+      return {
+        remainingLessons: nextAvailable,
+        creditRefunded: actuallyRefunded,
+      };
+    });
+
+    return {
+      success: true,
+      statusCode: 200,
+      deletedId: lessonId,
+      remainingLessons: txRes.remainingLessons,
+      creditRefunded: txRes.creditRefunded,
+    };
+  } catch (err) {
+    return mapLessonTxError(err, 'exclusão da aula');
+  }
 }
 
 /**
@@ -6100,22 +7471,10 @@ export async function verifyTeacherLessonAccessServer(
     } catch {}
   }
 
-  // 5. Fallback verification via server authoritative in-memory db (getAuthoritativeDb)
+  // 5. Fallback verification via server authoritative in-memory db (getAuthoritativeDb) for student/tutor profile assignment
   const dbLocal = getAuthoritativeDb();
   if (dbLocal) {
     try {
-      const hasLesson = (dbLocal.liveLessons || []).some((l: any) => {
-        if (!l || l.status === 'cancelled') return false;
-        const lTeacherUid = (l.teacherUid || (l as any).tutorUid || '').trim();
-        const lTeacherEmail = (l.teacherEmail || (l as any).tutorEmail || '').toLowerCase().trim();
-        const lStudentEmail = (l.studentEmail || '').toLowerCase().trim();
-        const lStudentUid = (l.studentUid || '').trim();
-        const tMatch = (cleanTeacherUid && (lTeacherUid === cleanTeacherUid || lTeacherUid === `tutor-${cleanTeacherUid}`)) || (cleanTeacherEmail && lTeacherEmail === cleanTeacherEmail);
-        const sMatch = (cleanStudentEmail && lStudentEmail === cleanStudentEmail) || (cleanStudentUid && lStudentUid === cleanStudentUid);
-        return tMatch && sMatch;
-      });
-      if (hasLesson) return true;
-
       const student = (dbLocal.students || []).find((s: any) => {
         const sEmail = (s.email || s.studentEmail || '').toLowerCase().trim();
         const sUid = (s.uid || s.studentUid || s.id || '').trim();
@@ -6227,17 +7586,25 @@ export async function verifyCanonicalPedagogicalLinkServer(
     // 3. Check canonical Firestore (default): lessons collection
     try {
       for (const tId of allowedTeacherIds) {
-        const lessonSnap = await db
-          .collection('lessons')
-          .where('studentUid', '==', cleanStudentUid)
-          .where('teacherUid', '==', tId)
-          .get();
-        if (!lessonSnap.empty) {
-          const hasValidLesson = lessonSnap.docs.some((d) => {
+        const [lessonSnap, lessonAuthSnap] = await Promise.all([
+          db
+            .collection('lessons')
+            .where('studentUid', '==', cleanStudentUid)
+            .where('teacherUid', '==', tId)
+            .get(),
+          db
+            .collection('lessons')
+            .where('studentUid', '==', cleanStudentUid)
+            .where('teacherAuthUid', '==', tId)
+            .get(),
+        ]);
+        const allDocs = [...(lessonSnap?.docs || []), ...(lessonAuthSnap?.docs || [])];
+        if (allDocs.length > 0) {
+          const hasValidLesson = allDocs.some((d) => {
             const lData = d.data();
             return lData.status !== 'cancelled' && lData.status !== 'canceled';
           });
-          if (hasValidLesson || lessonSnap.docs.length > 0) {
+          if (hasValidLesson || allDocs.length > 0) {
             return true;
           }
         }
@@ -6249,7 +7616,7 @@ export async function verifyCanonicalPedagogicalLinkServer(
     }
   }
 
-  // 4. Check authoritative in-memory / local state (getAuthoritativeDb)
+  // 4. Check authoritative in-memory / local state (getAuthoritativeDb) for profile assignment
   if (dbLocal) {
     // 4a. Check student profile in dbLocal.students or dbLocal.userProfiles
     const student = (dbLocal.students || []).find(
@@ -6276,24 +7643,6 @@ export async function verifyCanonicalPedagogicalLinkServer(
     ).trim();
 
     if (assignedUid && allowedTeacherIds.has(assignedUid)) {
-      return true;
-    }
-
-    // 4b. Check lessons in dbLocal.liveLessons
-    const hasLesson = (dbLocal.liveLessons || []).some((l: any) => {
-      if (!l) return false;
-      const lStudentUid = (l.studentUid || '').trim();
-      const lTeacherUid = (l.teacherUid || (l as any).tutorUid || (l as any).teacherId || '').trim();
-      const match =
-        lStudentUid === cleanStudentUid &&
-        allowedTeacherIds.has(lTeacherUid);
-      if (match && l.status !== 'cancelled' && l.status !== 'canceled') {
-        return true;
-      }
-      return match;
-    });
-
-    if (hasLesson) {
       return true;
     }
   }

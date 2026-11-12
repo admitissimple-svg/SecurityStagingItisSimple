@@ -118,6 +118,13 @@ import {
   isGenericTutorId,
   normalizeTutorName,
   scheduleLessonAtomicServer,
+  completeLessonAtomicServer,
+  markLessonNotCompletedAtomicServer,
+  proposeRescheduleAtomicServer,
+  acceptRescheduleAtomicServer,
+  declineRescheduleAtomicServer,
+  cancelLessonAtomicServer,
+  deleteLessonAtomicServer,
   recordDailyReminderShownServer,
   fetchSessionNotesProgressServer,
   savePedagogicalTransformationToFirestoreServer,
@@ -754,24 +761,7 @@ function mergeDbWithDefaults(parsed: any): AppDb {
       const deletedStudentList: string[] = Array.isArray(parsed?.deletedStudentEmails) ? parsed.deletedStudentEmails : [];
       return !email || !deletedStudentList.includes(email);
     }),
-    liveLessons: (Array.isArray(parsed?.liveLessons) ? parsed.liveLessons : []).map((l: any) => {
-      if (l && (l.cancelledAt || l.cancelledBy || l.cancellationReason) && l.status !== 'cancelled') {
-        l.status = 'cancelled';
-      }
-      if (!l.studentEmail || l.studentEmail.trim() === '') {
-        if (l.studentUid) {
-          const allProfiles = Object.values(parsed?.userProfiles || {});
-          const foundProfile = (allProfiles as any[]).find((p: any) => p.id === l.studentUid || p.uid === l.studentUid);
-          const foundStudent = (Array.isArray(parsed?.students) ? parsed.students : []).find((s: any) => s.studentUid === l.studentUid || s.id === l.studentUid);
-          if (foundProfile?.email) {
-            l.studentEmail = foundProfile.email.toLowerCase().trim();
-          } else if (foundStudent?.email || foundStudent?.studentEmail) {
-            l.studentEmail = (foundStudent.email || foundStudent.studentEmail).toLowerCase().trim();
-          }
-        }
-      }
-      return l;
-    }),
+    liveLessons: [],
     contractedLessons: (parsed && parsed.contractedLessons) || {},
     userProfiles: (parsed && parsed.userProfiles) || DEFAULT_DB.userProfiles,
     youtubePlaylists:
@@ -1144,48 +1134,8 @@ export async function initCloudPersistence() {
         return em && !allDeletedStudentEmails.includes(em);
       });
 
-      // Merge liveLessons by id, keeping only valid lessons
-      const localLessons = inMemoryDb.liveLessons || [];
-      const cloudLessons = Array.isArray(cloudState.liveLessons) ? cloudState.liveLessons : [];
-      const lessonMap = new Map<string, any>();
-      cloudLessons.forEach((l: any) => {
-        if (l.id) lessonMap.set(l.id, l);
-      });
-      localLessons.forEach((l: any) => {
-        if (l.id) {
-          const existing = lessonMap.get(l.id) || {};
-          const merged = { ...existing, ...l };
-          if (existing.cancelledAt || l.cancelledAt || existing.status === 'cancelled' || l.status === 'cancelled') {
-            merged.status = 'cancelled';
-            merged.cancelledAt = l.cancelledAt || existing.cancelledAt || new Date().toISOString();
-            merged.cancelledBy = l.cancelledBy || existing.cancelledBy || 'student';
-          }
-          lessonMap.set(l.id, merged);
-        }
-      });
-      const mergedLiveLessons = Array.from(lessonMap.values())
-        .map((l: any) => {
-          if (l && (l.cancelledAt || l.cancelledBy || l.cancellationReason) && l.status !== 'cancelled') {
-            l.status = 'cancelled';
-          }
-          if (!l.studentEmail || l.studentEmail.trim() === '') {
-            if (l.studentUid) {
-              const allProfiles = Object.values(inMemoryDb?.userProfiles || cloudState?.userProfiles || {});
-              const foundProfile = (allProfiles as any[]).find((p: any) => p.id === l.studentUid || p.uid === l.studentUid);
-              const foundStudent = (Array.isArray(inMemoryDb?.students) ? inMemoryDb.students : []).find((s: any) => s.studentUid === l.studentUid || s.id === l.studentUid);
-              if (foundProfile?.email) {
-                l.studentEmail = foundProfile.email.toLowerCase().trim();
-              } else if (foundStudent?.email || foundStudent?.studentEmail) {
-                l.studentEmail = (foundStudent.email || foundStudent.studentEmail).toLowerCase().trim();
-              }
-            }
-          }
-          return l;
-        })
-        .filter((l: any) => {
-          const sEmail = (l.studentEmail || '').toLowerCase().trim();
-          return !allDeletedStudentEmails.includes(sEmail);
-        });
+      // ARCH.2D.2: Do not hydrate or reintroduce legacy lessons from app_state/lessons or inMemoryDb.liveLessons.
+      // Canonical lessons reside exclusively in Firestore (default) collection `lessons/{lessonId}`.
 
       // Filter and clean student media assignments, routines and progress maps to remove deleted students
       const isAllowedKey = (k: string) => {
@@ -1241,15 +1191,16 @@ export async function initCloudPersistence() {
         ...(cloudState.studentListenedTracks || {}),
       };
 
+      const { liveLessons: _ignoredCloudLiveLessons, ...cloudStateWithoutLegacyLessons } = cloudState;
       inMemoryDb = mergeDbWithDefaults({
         ...inMemoryDb,
-        ...cloudState,
+        ...cloudStateWithoutLegacyLessons,
         authUsers: mergedAuthUsers,
         userProfiles: mergedUserProfiles,
         tutorsList: mergedTutorsList,
         teachers: mergedTeachers,
         students: mergedStudents,
-        liveLessons: mergedLiveLessons,
+        liveLessons: [],
         studentVideoAssignments: cleanVideoAssignments,
         studentSpotifyAssignments: cleanSpotifyAssignments,
         studentRoutinesMap: cleanStudentRoutines,
@@ -7748,7 +7699,7 @@ app.get(
       const lessonsById = new Map<string, any>();
 
       if (isAdmin) {
-        // Authoritative admin: can query all canonical lessons
+        // Authoritative admin: can query all canonical lessons from Firestore (default)
         const snapshot = await firestore.collection('lessons').get();
         for (const doc of snapshot.docs) {
           lessonsById.set(doc.id, {
@@ -7756,45 +7707,68 @@ app.get(
             id: doc.id,
           });
         }
-
-        const legacyLessons = readDb().liveLessons || [];
-        for (const lesson of legacyLessons) {
-          if (lesson?.id && !lessonsById.has(lesson.id)) {
-            lessonsById.set(lesson.id, lesson);
-          }
-        }
       } else if (isTeacher) {
-        // Teacher (Native Friend): execute strictly filtered queries to avoid unrestricted scan
+        // Teacher (Native Friend): execute strictly filtered canonical queries (no unrestricted scan)
         const publicTutorId = teacherInfo.publicTutorId;
+        const teacherAuthUid = (teacherInfo.authUid || '').trim();
         const teacherEmail = (teacherInfo.email || email).toLowerCase().trim();
 
-        const queryPromises: Promise<any>[] = [];
+        // Query subcollections first so canonical root `lessons/{lessonId}` always takes precedence
+        const subcollectionPromises: Promise<any>[] = [];
+        const rootQueryPromises: Promise<any>[] = [];
 
         if (publicTutorId) {
-          queryPromises.push(
+          subcollectionPromises.push(
+            firestore.collection('tutors').doc(publicTutorId).collection('lessons').get().catch(() => ({ docs: [] }))
+          );
+          rootQueryPromises.push(
             firestore.collection('lessons').where('teacherUid', '==', publicTutorId).get().catch(() => ({ docs: [] })),
             firestore.collection('lessons').where('tutorUid', '==', publicTutorId).get().catch(() => ({ docs: [] })),
-            firestore.collection('tutors').doc(publicTutorId).collection('lessons').get().catch(() => ({ docs: [] }))
+            firestore.collection('lessons').where('teacherPublicId', '==', publicTutorId).get().catch(() => ({ docs: [] }))
           );
         }
 
-        if (uid && uid !== publicTutorId) {
-          queryPromises.push(
-            firestore.collection('lessons').where('teacherUid', '==', uid).get().catch(() => ({ docs: [] })),
-            firestore.collection('lessons').where('tutorUid', '==', uid).get().catch(() => ({ docs: [] })),
+        if (uid) {
+          subcollectionPromises.push(
             firestore.collection('users').doc(uid).collection('lessons').get().catch(() => ({ docs: [] }))
+          );
+          if (uid !== publicTutorId) {
+            rootQueryPromises.push(
+              firestore.collection('lessons').where('teacherUid', '==', uid).get().catch(() => ({ docs: [] })),
+              firestore.collection('lessons').where('tutorUid', '==', uid).get().catch(() => ({ docs: [] })),
+              firestore.collection('lessons').where('teacherAuthUid', '==', uid).get().catch(() => ({ docs: [] }))
+            );
+          } else {
+            rootQueryPromises.push(
+              firestore.collection('lessons').where('teacherAuthUid', '==', uid).get().catch(() => ({ docs: [] }))
+            );
+          }
+        }
+
+        if (teacherAuthUid && teacherAuthUid !== uid) {
+          subcollectionPromises.push(
+            firestore.collection('users').doc(teacherAuthUid).collection('lessons').get().catch(() => ({ docs: [] }))
+          );
+          rootQueryPromises.push(
+            firestore.collection('lessons').where('teacherUid', '==', teacherAuthUid).get().catch(() => ({ docs: [] })),
+            firestore.collection('lessons').where('tutorUid', '==', teacherAuthUid).get().catch(() => ({ docs: [] })),
+            firestore.collection('lessons').where('teacherAuthUid', '==', teacherAuthUid).get().catch(() => ({ docs: [] }))
           );
         }
 
         if (teacherEmail) {
-          queryPromises.push(
+          rootQueryPromises.push(
             firestore.collection('lessons').where('teacherEmail', '==', teacherEmail).get().catch(() => ({ docs: [] })),
             firestore.collection('lessons').where('tutorEmail', '==', teacherEmail).get().catch(() => ({ docs: [] }))
           );
         }
 
-        const snapshots = await Promise.all(queryPromises);
-        for (const snap of snapshots) {
+        const [subSnapshots, rootSnapshots] = await Promise.all([
+          Promise.all(subcollectionPromises),
+          Promise.all(rootQueryPromises),
+        ]);
+
+        for (const snap of subSnapshots) {
           if (snap && snap.docs) {
             for (const doc of snap.docs) {
               lessonsById.set(doc.id, {
@@ -7805,56 +7779,37 @@ app.get(
           }
         }
 
-        // Legacy lessons compatibility: check if matching teacher
-        const legacyLessons = readDb().liveLessons || [];
-        for (const lesson of legacyLessons) {
-          if (!lesson?.id) continue;
-          const existing = lessonsById.get(lesson.id);
-          if (existing) {
-            if (lesson.status === 'completed' || lesson.completedAt) {
-              lessonsById.set(lesson.id, {
-                ...existing,
-                ...lesson,
-                status: 'completed',
-                completedAt: lesson.completedAt || existing.completedAt || new Date().toISOString(),
-              });
-            } else if (lesson.status === 'cancelled' || lesson.cancelledAt) {
-              lessonsById.set(lesson.id, {
-                ...existing,
-                ...lesson,
-                status: 'cancelled',
-                cancelledAt: lesson.cancelledAt || existing.cancelledAt || new Date().toISOString(),
+        for (const snap of rootSnapshots) {
+          if (snap && snap.docs) {
+            for (const doc of snap.docs) {
+              lessonsById.set(doc.id, {
+                ...doc.data(),
+                id: doc.id,
               });
             }
-            continue;
-          }
-          const lTeacherUid = (lesson.teacherUid || lesson.tutorUid || '').trim();
-          const lTeacherEmail = (lesson.teacherEmail || lesson.tutorEmail || '').toLowerCase().trim();
-
-          const matches =
-            (publicTutorId && lTeacherUid === publicTutorId) ||
-            (uid && lTeacherUid === uid) ||
-            (teacherEmail && lTeacherEmail === teacherEmail);
-
-          if (matches) {
-            lessonsById.set(lesson.id, lesson);
           }
         }
       } else {
-        // Student: execute strictly filtered queries to avoid unrestricted scan
-        const queryPromises: Promise<any>[] = [
-          firestore.collection('lessons').where('studentUid', '==', uid).get().catch(() => ({ docs: [] })),
+        // Student: execute strictly filtered canonical queries (no unrestricted scan)
+        const subcollectionPromises: Promise<any>[] = [
           firestore.collection('users').doc(uid).collection('lessons').get().catch(() => ({ docs: [] })),
+        ];
+        const rootQueryPromises: Promise<any>[] = [
+          firestore.collection('lessons').where('studentUid', '==', uid).get().catch(() => ({ docs: [] })),
         ];
 
         if (email) {
-          queryPromises.push(
+          rootQueryPromises.push(
             firestore.collection('lessons').where('studentEmail', '==', email).get().catch(() => ({ docs: [] }))
           );
         }
 
-        const snapshots = await Promise.all(queryPromises);
-        for (const snap of snapshots) {
+        const [subSnapshots, rootSnapshots] = await Promise.all([
+          Promise.all(subcollectionPromises),
+          Promise.all(rootQueryPromises),
+        ]);
+
+        for (const snap of subSnapshots) {
           if (snap && snap.docs) {
             for (const doc of snap.docs) {
               lessonsById.set(doc.id, {
@@ -7865,38 +7820,14 @@ app.get(
           }
         }
 
-        // Legacy lessons compatibility: check if matching student
-        const legacyLessons = readDb().liveLessons || [];
-        for (const lesson of legacyLessons) {
-          if (!lesson?.id) continue;
-          const existing = lessonsById.get(lesson.id);
-          if (existing) {
-            if (lesson.status === 'completed' || lesson.completedAt) {
-              lessonsById.set(lesson.id, {
-                ...existing,
-                ...lesson,
-                status: 'completed',
-                completedAt: lesson.completedAt || existing.completedAt || new Date().toISOString(),
-              });
-            } else if (lesson.status === 'cancelled' || lesson.cancelledAt) {
-              lessonsById.set(lesson.id, {
-                ...existing,
-                ...lesson,
-                status: 'cancelled',
-                cancelledAt: lesson.cancelledAt || existing.cancelledAt || new Date().toISOString(),
+        for (const snap of rootSnapshots) {
+          if (snap && snap.docs) {
+            for (const doc of snap.docs) {
+              lessonsById.set(doc.id, {
+                ...doc.data(),
+                id: doc.id,
               });
             }
-            continue;
-          }
-          const lStudentUid = (lesson.studentUid || '').trim();
-          const lStudentEmail = (lesson.studentEmail || '').toLowerCase().trim();
-
-          const matches =
-            lStudentUid === uid ||
-            (Boolean(email) && lStudentEmail === email);
-
-          if (matches) {
-            lessonsById.set(lesson.id, lesson);
           }
         }
       }
@@ -7934,6 +7865,12 @@ app.get(
 
     try {
       const firestore = getFirestoreDb();
+      if (!firestore) {
+        return res.status(503).json({
+          error: 'Firestore unavailable',
+        });
+      }
+
       const rawTarget = (
         req.params.teacherId ||
         req.params.tutorId ||
@@ -7970,55 +7907,88 @@ app.get(
       if (queryUid) candidateTargets.add(queryUid);
 
       let publicTutorId = '';
-      let teacherAuthUid = '';
+      let teacherAuthUid = queryUid;
       let teacherEmail = queryEmail;
 
-      if (firestore) {
-        // Attempt to resolve tutor profile from Firestore
-        for (const target of candidateTargets) {
-          try {
-            // Direct doc lookup in tutors
-            const tutorDoc = await firestore.collection('tutors').doc(target).get().catch(() => null);
-            if (tutorDoc && tutorDoc.exists) {
-              const tData = tutorDoc.data();
+      // Attempt to resolve tutor profile from canonical Firestore collections
+      for (const target of candidateTargets) {
+        try {
+          // Direct doc lookup in tutors
+          const tutorDoc = await firestore.collection('tutors').doc(target).get().catch(() => null);
+          if (tutorDoc && tutorDoc.exists) {
+            const tData = tutorDoc.data();
+            if (tData) {
+              publicTutorId = tData.publicTutorId || tutorDoc.id;
+              teacherAuthUid = tData.authUid || tData.uid || teacherAuthUid || '';
+              if (!teacherEmail && tData.email) teacherEmail = tData.email.toLowerCase().trim();
+              break;
+            }
+          }
+
+          // By publicTutorId
+          const qPub = await firestore.collection('tutors').where('publicTutorId', '==', target).limit(1).get().catch(() => null);
+          if (qPub && !qPub.empty) {
+            const tData = qPub.docs[0].data();
+            if (tData) {
+              publicTutorId = tData.publicTutorId || qPub.docs[0].id;
+              teacherAuthUid = tData.authUid || tData.uid || teacherAuthUid || '';
+              if (!teacherEmail && tData.email) teacherEmail = tData.email.toLowerCase().trim();
+              break;
+            }
+          }
+
+          // By authUid
+          const qAuthUid = await firestore.collection('tutors').where('authUid', '==', target).limit(1).get().catch(() => null);
+          if (qAuthUid && !qAuthUid.empty) {
+            const tData = qAuthUid.docs[0].data();
+            if (tData) {
+              publicTutorId = tData.publicTutorId || qAuthUid.docs[0].id;
+              teacherAuthUid = tData.authUid || tData.uid || target;
+              if (!teacherEmail && tData.email) teacherEmail = tData.email.toLowerCase().trim();
+              break;
+            }
+          }
+
+          // By uid
+          const qUid = await firestore.collection('tutors').where('uid', '==', target).limit(1).get().catch(() => null);
+          if (qUid && !qUid.empty) {
+            const tData = qUid.docs[0].data();
+            if (tData) {
+              publicTutorId = tData.publicTutorId || qUid.docs[0].id;
+              teacherAuthUid = tData.authUid || tData.uid || target;
+              if (!teacherEmail && tData.email) teacherEmail = tData.email.toLowerCase().trim();
+              break;
+            }
+          }
+
+          // By email
+          if (target.includes('@')) {
+            const qEm = await firestore.collection('tutors').where('email', '==', target.toLowerCase().trim()).limit(1).get().catch(() => null);
+            if (qEm && !qEm.empty) {
+              const tData = qEm.docs[0].data();
               if (tData) {
-                publicTutorId = tData.publicTutorId || tutorDoc.id;
-                teacherAuthUid = tData.authUid || tData.uid || '';
-                if (!teacherEmail && tData.email) teacherEmail = tData.email.toLowerCase().trim();
+                publicTutorId = tData.publicTutorId || qEm.docs[0].id;
+                teacherAuthUid = tData.authUid || tData.uid || teacherAuthUid || '';
+                teacherEmail = tData.email.toLowerCase().trim();
                 break;
               }
             }
-
-            // By publicTutorId
-            const qPub = await firestore.collection('tutors').where('publicTutorId', '==', target).limit(1).get().catch(() => null);
-            if (qPub && !qPub.empty) {
-              const tData = qPub.docs[0].data();
-              if (tData) {
-                publicTutorId = tData.publicTutorId || qPub.docs[0].id;
-                teacherAuthUid = tData.authUid || tData.uid || '';
-                if (!teacherEmail && tData.email) teacherEmail = tData.email.toLowerCase().trim();
+          } else {
+            const userDoc = await firestore.collection('users').doc(target).get().catch(() => null);
+            if (userDoc && userDoc.exists) {
+              const uData = userDoc.data();
+              if (uData && (uData.role === 'teacher' || uData.isTeacher || uData.approved || uData.publicTutorId)) {
+                publicTutorId = uData.publicTutorId || publicTutorId;
+                teacherAuthUid = uData.authUid || uData.uid || userDoc.id;
+                if (!teacherEmail && uData.email) teacherEmail = uData.email.toLowerCase().trim();
                 break;
               }
             }
-
-            // By email
-            if (target.includes('@')) {
-              const qEm = await firestore.collection('tutors').where('email', '==', target.toLowerCase().trim()).limit(1).get().catch(() => null);
-              if (qEm && !qEm.empty) {
-                const tData = qEm.docs[0].data();
-                if (tData) {
-                  publicTutorId = tData.publicTutorId || qEm.docs[0].id;
-                  teacherAuthUid = tData.authUid || tData.uid || '';
-                  teacherEmail = tData.email.toLowerCase().trim();
-                  break;
-                }
-              }
-            }
-          } catch {}
-        }
+          }
+        } catch {}
       }
 
-      // If not resolved from Firestore tutors, check dbState
+      // Fallback tutor metadata lookup in tutorsList only if not resolved from Firestore tutors/users
       const db = readDb();
       if (!publicTutorId && db.tutorsList) {
         const found = db.tutorsList.find((t: any) => {
@@ -8032,7 +8002,7 @@ app.get(
         });
         if (found) {
           publicTutorId = found.publicTutorId || found.id || '';
-          teacherAuthUid = found.authUid || found.uid || '';
+          teacherAuthUid = found.authUid || found.uid || teacherAuthUid || '';
           if (!teacherEmail && found.email) teacherEmail = found.email.toLowerCase().trim();
         }
       }
@@ -8043,52 +8013,60 @@ app.get(
 
       const activeLessonsMap = new Map<string, any>();
 
-      // Fetch active scheduled lessons for this teacher from Firestore
-      if (firestore) {
-        const queryPromises: Promise<any>[] = [];
-        if (publicTutorId) {
-          queryPromises.push(
-            firestore.collection('lessons').where('teacherUid', '==', publicTutorId).get().catch(() => ({ docs: [] })),
-            firestore.collection('lessons').where('tutorUid', '==', publicTutorId).get().catch(() => ({ docs: [] })),
-            firestore.collection('tutors').doc(publicTutorId).collection('lessons').get().catch(() => ({ docs: [] }))
-          );
-        }
-        if (teacherAuthUid && teacherAuthUid !== publicTutorId) {
-          queryPromises.push(
+      // Fetch active scheduled lessons strictly from canonical Firestore (default)
+      const subcollectionPromises: Promise<any>[] = [];
+      const rootQueryPromises: Promise<any>[] = [];
+
+      if (publicTutorId) {
+        subcollectionPromises.push(
+          firestore.collection('tutors').doc(publicTutorId).collection('lessons').get().catch(() => ({ docs: [] }))
+        );
+        rootQueryPromises.push(
+          firestore.collection('lessons').where('teacherUid', '==', publicTutorId).get().catch(() => ({ docs: [] })),
+          firestore.collection('lessons').where('tutorUid', '==', publicTutorId).get().catch(() => ({ docs: [] })),
+          firestore.collection('lessons').where('teacherPublicId', '==', publicTutorId).get().catch(() => ({ docs: [] }))
+        );
+      }
+      if (teacherAuthUid) {
+        subcollectionPromises.push(
+          firestore.collection('users').doc(teacherAuthUid).collection('lessons').get().catch(() => ({ docs: [] }))
+        );
+        if (teacherAuthUid !== publicTutorId) {
+          rootQueryPromises.push(
             firestore.collection('lessons').where('teacherUid', '==', teacherAuthUid).get().catch(() => ({ docs: [] })),
             firestore.collection('lessons').where('tutorUid', '==', teacherAuthUid).get().catch(() => ({ docs: [] })),
-            firestore.collection('users').doc(teacherAuthUid).collection('lessons').get().catch(() => ({ docs: [] }))
+            firestore.collection('lessons').where('teacherAuthUid', '==', teacherAuthUid).get().catch(() => ({ docs: [] }))
+          );
+        } else {
+          rootQueryPromises.push(
+            firestore.collection('lessons').where('teacherAuthUid', '==', teacherAuthUid).get().catch(() => ({ docs: [] }))
           );
         }
-        if (teacherEmail) {
-          queryPromises.push(
-            firestore.collection('lessons').where('teacherEmail', '==', teacherEmail).get().catch(() => ({ docs: [] })),
-            firestore.collection('lessons').where('tutorEmail', '==', teacherEmail).get().catch(() => ({ docs: [] }))
-          );
-        }
+      }
+      if (teacherEmail) {
+        rootQueryPromises.push(
+          firestore.collection('lessons').where('teacherEmail', '==', teacherEmail).get().catch(() => ({ docs: [] })),
+          firestore.collection('lessons').where('tutorEmail', '==', teacherEmail).get().catch(() => ({ docs: [] }))
+        );
+      }
 
-        const snapshots = await Promise.all(queryPromises);
-        for (const snap of snapshots) {
-          if (snap && snap.docs) {
-            for (const doc of snap.docs) {
-              activeLessonsMap.set(doc.id, doc.data());
-            }
+      const [subSnapshots, rootSnapshots] = await Promise.all([
+        Promise.all(subcollectionPromises),
+        Promise.all(rootQueryPromises),
+      ]);
+
+      for (const snap of subSnapshots) {
+        if (snap && snap.docs) {
+          for (const doc of snap.docs) {
+            activeLessonsMap.set(doc.id, doc.data());
           }
         }
       }
-
-      // Check legacy liveLessons
-      const legacyLessons = db.liveLessons || [];
-      for (const lesson of legacyLessons) {
-        if (!lesson?.id || activeLessonsMap.has(lesson.id)) continue;
-        const lTeacherUid = (lesson.teacherUid || lesson.tutorUid || '').trim();
-        const lTeacherEmail = (lesson.teacherEmail || lesson.tutorEmail || '').toLowerCase().trim();
-        const matches =
-          (publicTutorId && lTeacherUid === publicTutorId) ||
-          (teacherAuthUid && lTeacherUid === teacherAuthUid) ||
-          (teacherEmail && lTeacherEmail === teacherEmail);
-        if (matches) {
-          activeLessonsMap.set(lesson.id, lesson);
+      for (const snap of rootSnapshots) {
+        if (snap && snap.docs) {
+          for (const doc of snap.docs) {
+            activeLessonsMap.set(doc.id, doc.data());
+          }
         }
       }
 
@@ -8152,7 +8130,7 @@ app.post('/api/lessons/schedule', firebaseAuthMiddleware, async (req, res) => {
   const verifiedStudentEmail = (verifiedUser.email || '').toLowerCase().trim();
 
   // Defense-in-depth: Reject attempt to schedule on behalf of another student
-  if (req.body.studentUid && req.body.studentUid.trim() !== studentAuthUid) {
+  if (req.body.studentUid && String(req.body.studentUid).trim() !== studentAuthUid) {
     return res.status(403).json({
       error: 'Proibido: tentativa de agendar aula em nome de outro estudante.',
       message: 'Student UID does not match authenticated token UID',
@@ -8161,7 +8139,7 @@ app.post('/api/lessons/schedule', firebaseAuthMiddleware, async (req, res) => {
   if (
     req.body.studentEmail &&
     verifiedStudentEmail &&
-    req.body.studentEmail.toLowerCase().trim() !== verifiedStudentEmail
+    String(req.body.studentEmail).toLowerCase().trim() !== verifiedStudentEmail
   ) {
     return res.status(403).json({
       error: 'Proibido: tentativa de agendar aula com e-mail divergente do token autenticado.',
@@ -8169,7 +8147,6 @@ app.post('/api/lessons/schedule', firebaseAuthMiddleware, async (req, res) => {
     });
   }
 
-  const db = readDb();
   try {
     const result = await scheduleLessonAtomicServer({
       studentAuthUid,
@@ -8186,8 +8163,6 @@ app.post('/api/lessons/schedule', firebaseAuthMiddleware, async (req, res) => {
       description: req.body.description,
       isTrialLesson: Boolean(req.body.isTrialLesson),
       requestId: req.body.requestId || req.body.id,
-      existingLessons: db.liveLessons,
-      dbState: db,
     });
 
     if (!result.success) {
@@ -8197,11 +8172,6 @@ app.post('/api/lessons/schedule', firebaseAuthMiddleware, async (req, res) => {
       });
     }
 
-    try {
-      await writeDbSync(db);
-    } catch (syncErr) {
-      console.warn('[serverApp] Warning: Failed to sync local app_db after confirmed Firestore transaction:', syncErr);
-    }
     return res.status(200).json(result);
   } catch (err: any) {
     console.error('Error in POST /api/lessons/schedule:', err);
@@ -8214,455 +8184,290 @@ app.post('/api/lessons/schedule', firebaseAuthMiddleware, async (req, res) => {
 
 app.post(['/api/lessons', '/api/live-lessons'], firebaseAuthMiddleware, async (req, res) => {
   if (!req.user || !req.user.uid) {
-    return res.status(401).json({ error: 'Unauthorized', message: 'Autenticação necessária para registrar aulas.' });
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Autenticação necessária para registrar aulas.',
+    });
   }
-  const callerUid = req.user.uid;
+
+  const callerUid = req.user.uid.trim();
+  const callerEmail = (req.user.email || '').toLowerCase().trim();
   const isCallerAdmin = req.user.role === 'admin';
-  const db = readDb();
-  const { lesson, lessons } = req.body;
-  const newLesson = lesson || (req.body.id ? req.body : null);
+  const { lesson, lessons } = req.body || {};
+
   if (Array.isArray(lessons)) {
-    if (!isCallerAdmin) {
-      return res.status(403).json({ error: 'Forbidden', message: 'Apenas administradores podem atualizar a lista completa de aulas.' });
-    }
-    db.liveLessons = lessons;
-  } else if (newLesson && newLesson.id) {
-    // If caller is student, strictly lock studentUid to caller's authenticated UID
-    if (!isCallerAdmin) {
-      let isCallerTeacher = false;
-      try {
-        const tRes = await resolveTeacherCanonicalIdentity({ teacherUid: callerUid, teacherEmail: req.user.email, dbState: db });
-        if (tRes && tRes.isApproved) isCallerTeacher = true;
-      } catch {}
-      if (!isCallerTeacher) {
-        newLesson.studentUid = callerUid;
-      }
-    }
-    // Auto-resolve studentEmail if blank
-    if (!newLesson.studentEmail || newLesson.studentEmail.trim() === '') {
-      if (req.query.email || req.query.studentEmail) {
-        newLesson.studentEmail = ((req.query.email || req.query.studentEmail) as string).toLowerCase().trim();
-      } else if (newLesson.studentUid) {
-        const allUsers = Object.values(db.authUsers || {});
-        const allProfiles = Object.values(db.userProfiles || {});
-        const foundUser = (allUsers as any[]).find((u: any) => u.uid === newLesson.studentUid || u.id === newLesson.studentUid)
-          || (allProfiles as any[]).find((p: any) => p.uid === newLesson.studentUid || p.id === newLesson.studentUid)
-          || (db.students || []).find((s: any) => s.studentUid === newLesson.studentUid || s.id === newLesson.studentUid);
-        if (foundUser?.email) {
-          newLesson.studentEmail = foundUser.email.toLowerCase().trim();
-        }
-      }
-    }
+    return res.status(403).json({
+      error: 'Operação em lote em memória descontinuada. Utilize o agendamento canônico individual no Firestore.',
+      message: 'Bulk liveLessons array overwrite is disabled under canonical Firestore persistence.',
+    });
+  }
 
-    // Auto-resolve studentUid and teacherUid to individualize activity between the two UIDs
-    if (!newLesson.studentUid && newLesson.studentEmail) {
-      const sEmail = newLesson.studentEmail.toLowerCase().trim();
-      const allUsers = Object.values(db.authUsers || {});
-      const allProfiles = Object.values(db.userProfiles || {});
-      const foundUser = (allUsers as any[]).find((u: any) => (u.email || '').toLowerCase().trim() === sEmail)
-        || (allProfiles as any[]).find((p: any) => (p.email || '').toLowerCase().trim() === sEmail)
-      const resolvedStudentUid = (foundUser?.uid && isValidCanonicalUid(foundUser.uid))
-        ? foundUser.uid
-        : (foundUser?.id && isValidCanonicalUid(foundUser.id) ? foundUser.id : '');
-      if (resolvedStudentUid) {
-        newLesson.studentUid = resolvedStudentUid;
-      }
-    }
-    if (!newLesson.teacherUid || !isValidCanonicalUid(newLesson.teacherUid)) {
-      const tTarget = newLesson.teacherId || newLesson.teacherUid || newLesson.teacherEmail || newLesson.tutorEmail;
-      const teacherRes = await resolveTeacherCanonicalIdentity({
-        teacherId: typeof tTarget === 'string' ? tTarget : undefined,
-        teacherEmail: newLesson.teacherEmail || newLesson.tutorEmail,
-        dbState: db,
-      });
-      if (teacherRes && isValidCanonicalUid(teacherRes.canonicalUid)) {
-        if (!teacherRes.isApproved) {
-          return res.status(400).json({ error: 'O Amigo Nativo selecionado ainda não foi aprovado para receber aulas.' });
-        }
-        newLesson.teacherUid = teacherRes.canonicalUid;
-        newLesson.teacherAuthUid = teacherRes.canonicalUid;
-        if (!newLesson.teacherEmail) newLesson.teacherEmail = teacherRes.email;
-        if (!newLesson.teacherName) newLesson.teacherName = teacherRes.name;
-      } else {
-        return res.status(400).json({ error: 'Identificador canônico do Amigo Nativo não comprovado.' });
-      }
-    }
+  const payload = lesson || (req.body && (req.body.startDateTime || req.body.id) ? req.body : null);
+  if (!payload || typeof payload !== 'object') {
+    return res.status(400).json({
+      error: 'Dados da aula não informados.',
+      message: 'Missing lesson payload.',
+    });
+  }
 
-    // Conflict Check (Strict Anti-Duplicity Rule - Individualized by teacher and student UIDs/emails)
-    const proposedTeacher = (newLesson.teacherEmail || newLesson.tutorEmail || '').toLowerCase().trim();
-    const proposedTeacherUid = (newLesson.teacherUid || newLesson.tutorUid || '').trim();
-    const proposedStudent = (newLesson.studentEmail || '').toLowerCase().trim();
-    const proposedStudentUid = (newLesson.studentUid || '').trim();
+  const firestore = getFirestoreDb();
+  if (!firestore) {
+    return res.status(503).json({
+      error: 'Serviço Firestore (default) indisponível.',
+      message: 'Firestore unavailable.',
+    });
+  }
 
-    if ((proposedTeacher || proposedTeacherUid) && newLesson.startDateTime && newLesson.endDateTime && newLesson.status === 'scheduled' && !newLesson.cancelledAt) {
-      const pStart = new Date(newLesson.startDateTime).getTime();
-      const pEnd = new Date(newLesson.endDateTime).getTime();
-      const conflict = (db.liveLessons || []).find((l: any) => {
-        if (l.id === newLesson.id) return false;
-        if (l.status === 'cancelled' || l.status === 'canceled' || Boolean(l.cancelledAt)) return false;
-        if (l.status && l.status !== 'scheduled') return false;
+  let targetStudentUid = callerUid;
+  let targetStudentEmail = callerEmail;
+  let targetStudentName = typeof payload.studentName === 'string' ? payload.studentName : undefined;
 
-        const lTeacher = (l.teacherEmail || l.tutorEmail || '').toLowerCase().trim();
-        const lTeacherUid = (l.teacherUid || l.tutorUid || '').trim();
-        const lStudent = (l.studentEmail || '').toLowerCase().trim();
-        const lStudentUid = (l.studentUid || '').trim();
+  if (isCallerAdmin) {
+    const requestedUid = typeof payload.studentUid === 'string' ? payload.studentUid.trim() : '';
+    const requestedEmail = typeof payload.studentEmail === 'string' ? payload.studentEmail.toLowerCase().trim() : '';
 
-        // Check if teacher has an active conflict
-        const isSameTeacher = (proposedTeacherUid && lTeacherUid && proposedTeacherUid === lTeacherUid) ||
-                              (proposedTeacher && lTeacher && proposedTeacher === lTeacher);
-
-        // Check if student has an active conflict
-        const isSameStudent = (proposedStudentUid && lStudentUid && proposedStudentUid === lStudentUid) ||
-                              (proposedStudent && lStudent && proposedStudent === lStudent);
-
-        if (!isSameTeacher && !isSameStudent) return false;
-        if (!l.startDateTime || !l.endDateTime) return false;
-        const lStart = new Date(l.startDateTime).getTime();
-        const lEnd = new Date(l.endDateTime).getTime();
-        return lStart < pEnd && lEnd > pStart;
-      });
-      if (conflict) {
-        return res.status(409).json({
-          error: 'Conflito de Horário: Já existe uma aula agendada neste horário para este Amigo Nativo ou Aluno.',
-          conflict,
+    if (requestedUid) {
+      if (!isValidCanonicalUid(requestedUid)) {
+        return res.status(400).json({
+          error: 'UID canônico de estudante inválido. Criação de IDs sintéticos proibida.',
         });
       }
-    }
-
-    const idx = (db.liveLessons || []).findIndex((l: any) => l.id === newLesson.id);
-    if (idx >= 0) {
-      db.liveLessons[idx] = newLesson;
+      const uSnap = await firestore.collection('users').doc(requestedUid).get().catch(() => null);
+      if (!uSnap || !uSnap.exists) {
+        return res.status(404).json({
+          error: 'Estudante não encontrado no Firestore (default).',
+        });
+      }
+      const uData = uSnap.data() || {};
+      targetStudentUid = requestedUid;
+      targetStudentEmail = (uData.email || requestedEmail || '').toLowerCase().trim();
+      targetStudentName = targetStudentName || uData.name;
+    } else if (requestedEmail) {
+      const qSnap = await firestore.collection('users').where('email', '==', requestedEmail).limit(1).get().catch(() => null);
+      if (!qSnap || qSnap.empty) {
+        return res.status(404).json({
+          error: 'Estudante não encontrado no Firestore (default) para o e-mail informado.',
+        });
+      }
+      const uDoc = qSnap.docs[0];
+      const uData = uDoc.data() || {};
+      const resolvedUid = (uData.uid || uDoc.id || '').trim();
+      if (!isValidCanonicalUid(resolvedUid)) {
+        return res.status(400).json({
+          error: 'Registro do estudante não possui UID canônico válido.',
+        });
+      }
+      targetStudentUid = resolvedUid;
+      targetStudentEmail = (uData.email || requestedEmail).toLowerCase().trim();
+      targetStudentName = targetStudentName || uData.name;
     } else {
-      if (!db.liveLessons) db.liveLessons = [];
-      db.liveLessons.unshift(newLesson);
+      return res.status(400).json({
+        error: 'Informe studentUid ou studentEmail canônico para agendamento administrativo.',
+      });
     }
-
-    // Bidirectional sync: ensure student is linked to this teacher in db.students if unassigned
-    const cleanStudentEmail = (newLesson.studentEmail || '').toLowerCase().trim();
-    const cleanTeacherEmail = (newLesson.teacherEmail || newLesson.tutorEmail || '').toLowerCase().trim();
-    const cleanTeacherName = newLesson.teacherName || newLesson.tutorName || '';
-    if (cleanStudentEmail && cleanTeacherEmail) {
-      const studentIdx = (db.students || []).findIndex(
-        (s: any) => (s.email || s.studentEmail || '').toLowerCase() === cleanStudentEmail
-      );
-      if (studentIdx >= 0) {
-        const existingTeacher = (db.students[studentIdx].teacherEmail || '').toLowerCase().trim();
-        const shouldUpdateTeacher = !existingTeacher || existingTeacher === cleanTeacherEmail;
-        db.students[studentIdx] = {
-          ...db.students[studentIdx],
-          teacherEmail: shouldUpdateTeacher ? cleanTeacherEmail : db.students[studentIdx].teacherEmail,
-          teacherName: shouldUpdateTeacher ? (cleanTeacherName || db.students[studentIdx].teacherName) : db.students[studentIdx].teacherName,
-          teacherUid: shouldUpdateTeacher ? (newLesson.teacherUid || db.students[studentIdx].teacherUid) : db.students[studentIdx].teacherUid,
-          studentUid: newLesson.studentUid || db.students[studentIdx].studentUid || db.students[studentIdx].uid,
-          status: 'active',
-        };
-      } else {
-        if (!db.students) db.students = [];
-        db.students.push({
-          id: `st-${Date.now()}`,
-          name: newLesson.studentName || cleanStudentEmail.split('@')[0],
-          studentName: newLesson.studentName || cleanStudentEmail.split('@')[0],
-          email: cleanStudentEmail,
-          studentEmail: cleanStudentEmail,
-          studentUid: newLesson.studentUid,
-          level: 'iniciante',
-          studentLevel: 'iniciante',
-          goal: 'English for everyday life & work',
-          learningGoal: 'English for everyday life & work',
-          teacherEmail: cleanTeacherEmail,
-          teacherName: cleanTeacherName,
-          teacherUid: newLesson.teacherUid,
-          status: 'active',
-          createdAt: new Date().toISOString(),
-        });
-      }
-
-      // Also ensure student profile has their assigned teacher and active enrollment
-      if (db.userProfiles) {
-        if (!db.userProfiles[cleanStudentEmail]) {
-          db.userProfiles[cleanStudentEmail] = {
-            id: (newLesson.studentUid && isValidCanonicalUid(newLesson.studentUid))
-              ? newLesson.studentUid
-              : (db.authUsers?.[cleanStudentEmail]?.uid && isValidCanonicalUid(db.authUsers[cleanStudentEmail].uid) ? db.authUsers[cleanStudentEmail].uid : ''),
-            name: newLesson.studentName || cleanStudentEmail.split('@')[0],
-            email: cleanStudentEmail,
-            teacherEmail: cleanTeacherEmail,
-            teacherName: cleanTeacherName,
-            teacherUid: newLesson.teacherUid,
-            enrollmentStatus: 'active',
-            contractedLessons: Math.max(db.contractedLessons?.[cleanStudentEmail] || 0, 1),
-            createdAt: new Date().toISOString(),
-          };
-        } else {
-          db.userProfiles[cleanStudentEmail] = {
-            ...db.userProfiles[cleanStudentEmail],
-            teacherEmail: cleanTeacherEmail,
-            teacherName: cleanTeacherName || db.userProfiles[cleanStudentEmail].teacherName,
-            teacherUid: newLesson.teacherUid || db.userProfiles[cleanStudentEmail].teacherUid,
-            enrollmentStatus: 'active',
-            contractedLessons: Math.max(db.userProfiles[cleanStudentEmail].contractedLessons || 0, 1),
-          };
-        }
-      }
+  } else {
+    if (payload.studentUid && String(payload.studentUid).trim() !== callerUid) {
+      return res.status(403).json({
+        error: 'Proibido: tentativa de agendar aula em nome de outro estudante.',
+        message: 'Student UID does not match authenticated token UID',
+      });
+    }
+    if (
+      payload.studentEmail &&
+      callerEmail &&
+      String(payload.studentEmail).toLowerCase().trim() !== callerEmail
+    ) {
+      return res.status(403).json({
+        error: 'Proibido: tentativa de agendar aula com e-mail divergente do token autenticado.',
+        message: 'Student email does not match authenticated token email',
+      });
     }
   }
-  await writeDbSync(db);
-  res.json(db.liveLessons);
-});
 
-async function syncLessonUpdateToFirestore(lessonId: string, updates: Record<string, any>, lessonMeta?: any) {
   try {
-    const firestore = getFirestoreDb();
-    if (!firestore || !lessonId) return;
-    const cleanUpdates = JSON.parse(JSON.stringify(updates));
-    const nowIso = new Date().toISOString();
-    cleanUpdates.updatedAt = cleanUpdates.updatedAt || nowIso;
+    const result = await scheduleLessonAtomicServer({
+      studentAuthUid: targetStudentUid,
+      studentEmail: targetStudentEmail,
+      studentName: targetStudentName,
+      teacherIdOrEmail:
+        payload.teacherId ||
+        payload.tutorId ||
+        payload.teacherUid ||
+        payload.tutorUid ||
+        payload.teacherEmail ||
+        payload.tutorEmail,
+      teacherUid: payload.teacherUid || payload.tutorUid,
+      teacherEmail: payload.teacherEmail || payload.tutorEmail,
+      teacherName: payload.teacherName || payload.tutorName,
+      meetLink: payload.meetLink,
+      startDateTime: payload.startDateTime,
+      endDateTime: payload.endDateTime,
+      title: payload.title,
+      description: payload.description,
+      isTrialLesson: Boolean(payload.isTrialLesson),
+      requestId: payload.requestId || payload.id,
+    });
 
-    // 1. Root lessons collection
-    await firestore.collection('lessons').doc(lessonId).set(cleanUpdates, { merge: true });
-
-    // 2. Resolve student and teacher doc IDs
-    let studentUid = (lessonMeta?.studentUid || '').trim();
-    let teacherUid = (lessonMeta?.teacherUid || lessonMeta?.tutorUid || '').trim();
-    if (!studentUid || !teacherUid) {
-      try {
-        const docSnap = await firestore.collection('lessons').doc(lessonId).get();
-        if (docSnap.exists) {
-          const d = docSnap.data() || {};
-          if (!studentUid) studentUid = (d.studentUid || '').trim();
-          if (!teacherUid) teacherUid = (d.teacherUid || d.tutorUid || '').trim();
-        }
-      } catch {}
+    if (!result.success) {
+      return res.status(result.statusCode || 400).json({
+        error: result.error,
+        message: result.error,
+      });
     }
 
-    const studentDocs = [studentUid && isValidCanonicalUid(studentUid) ? studentUid : ''].filter(Boolean);
-    const teacherDocs = [teacherUid && isValidCanonicalUid(teacherUid) ? teacherUid : ''].filter(Boolean);
-
-    for (const sId of studentDocs) {
-      try {
-        await firestore.collection('users').doc(sId).collection('lessons').doc(lessonId).set(cleanUpdates, { merge: true });
-        const uSnap = await firestore.collection('users').doc(sId).get();
-        if (uSnap.exists) {
-          const uData = uSnap.data();
-          if (Array.isArray(uData?.scheduledLessons)) {
-            const updatedScheduled = (cleanUpdates.status === 'cancelled' || cleanUpdates.status === 'completed' || Boolean(cleanUpdates.completedAt))
-              ? uData.scheduledLessons.filter((l: any) => l.id !== lessonId)
-              : uData.scheduledLessons.map((l: any) => (l.id === lessonId ? { ...l, ...cleanUpdates } : l));
-            await firestore.collection('users').doc(sId).set({ scheduledLessons: updatedScheduled, updatedAt: nowIso }, { merge: true });
-          }
-        }
-      } catch {}
-    }
-
-    for (const tId of teacherDocs) {
-      try {
-        await firestore.collection('users').doc(tId).collection('lessons').doc(lessonId).set(cleanUpdates, { merge: true });
-        const tSnap = await firestore.collection('users').doc(tId).get();
-        if (tSnap.exists) {
-          const tData = tSnap.data();
-          if (Array.isArray(tData?.scheduledLessons)) {
-            const updatedScheduled = (cleanUpdates.status === 'cancelled' || cleanUpdates.status === 'completed' || Boolean(cleanUpdates.completedAt))
-              ? tData.scheduledLessons.filter((l: any) => l.id !== lessonId)
-              : tData.scheduledLessons.map((l: any) => (l.id === lessonId ? { ...l, ...cleanUpdates } : l));
-            await firestore.collection('users').doc(tId).set({ scheduledLessons: updatedScheduled, updatedAt: nowIso }, { merge: true });
-          }
-        }
-      } catch {}
-    }
-  } catch (fsErr) {
-    console.warn('[syncLessonUpdateToFirestore] notice:', fsErr);
+    return res.status(200).json(result);
+  } catch (err: any) {
+    console.error('Error in POST /api/lessons:', err);
+    return res.status(500).json({
+      error: 'Erro interno ao processar agendamento de aula.',
+      message: err instanceof Error ? err.message : String(err),
+    });
   }
-}
+});
 
-app.post('/api/lessons/:id/complete', async (req, res) => {
-  const db = readDb();
-  const id = decodeURIComponent(req.params.id);
-  const nowIso = new Date().toISOString();
-  let found = false;
-  db.liveLessons = (db.liveLessons || []).map((l) => {
-    if (l.id === id) {
-      found = true;
-      return { ...l, status: 'completed', completedAt: l.completedAt || nowIso, updatedAt: nowIso };
-    }
-    return l;
+app.post('/api/lessons/:id/complete', firebaseAuthMiddleware, async (req, res) => {
+  if (!req.user || !req.user.uid) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  const lessonId = decodeURIComponent(req.params.id || '');
+  const result = await completeLessonAtomicServer({
+    lessonId,
+    callerUid: req.user.uid,
+    callerEmail: req.user.email,
+    callerRole: req.user.role,
+    callerEmailVerified: req.user.email_verified,
   });
-  let target = (db.liveLessons || []).find((l: any) => l.id === id);
-  if (!found || !target) {
-    const firestore = getFirestoreDb();
-    if (firestore) {
-      try {
-        const snap = await firestore.collection('lessons').doc(id).get();
-        if (snap.exists) {
-          const fsData = snap.data() || {};
-          target = {
-            ...fsData,
-            id: snap.id,
-            status: 'completed',
-            completedAt: fsData.completedAt || nowIso,
-            updatedAt: nowIso,
-          };
-          db.liveLessons.push(target);
-        }
-      } catch (err) {
-        console.warn('[completeLesson] Firestore check notice:', err);
-      }
-    }
+  if (!result.success) {
+    return res.status(result.statusCode).json({ error: result.error, message: result.error });
   }
-  await writeDbSync(db);
-  await syncLessonUpdateToFirestore(id, { status: 'completed', completedAt: nowIso }, target);
-  res.json({ success: true, lesson: target, liveLessons: db.liveLessons });
-});
-
-app.post('/api/lessons/:id/not-completed', async (req, res) => {
-  const db = readDb();
-  const id = decodeURIComponent(req.params.id);
-  const { responsible, reason } = req.body;
-  const nowIso = new Date().toISOString();
-  db.liveLessons = db.liveLessons.map((l) =>
-    l.id === id
-      ? {
-          ...l,
-          status: 'not_completed',
-          notCompletedResponsible: responsible,
-          notCompletedReason: reason,
-        }
-      : l
-  );
-  await writeDbSync(db);
-  const target = (db.liveLessons || []).find((l: any) => l.id === id);
-  await syncLessonUpdateToFirestore(
-    id,
-    { status: 'not_completed', notCompletedResponsible: responsible, notCompletedReason: reason, updatedAt: nowIso },
-    target
-  );
-  res.json({ success: true, liveLessons: db.liveLessons });
-});
-
-app.post('/api/lessons/:id/reschedule', async (req, res) => {
-  const db = readDb();
-  const id = decodeURIComponent(req.params.id);
-  const { newStartIso, newEndIso, reason, proposedBy } = req.body;
-  const isTeacher = proposedBy === 'teacher';
-  const nowIso = new Date().toISOString();
-  const proposalFields = {
-    proposedNewStartDateTime: newStartIso,
-    proposedNewEndDateTime: newEndIso,
-    rescheduleNotes: reason,
-    proposedBy: isTeacher ? 'teacher' : 'student',
-    proposalStatus: isTeacher
-      ? 'pending_student_reschedule'
-      : 'pending_teacher_reschedule',
-    proposedAt: nowIso,
-  };
-  db.liveLessons = db.liveLessons.map((l) =>
-    l.id === id
-      ? {
-          ...l,
-          ...proposalFields,
-        }
-      : l
-  );
-  await writeDbSync(db);
-  const target = (db.liveLessons || []).find((l: any) => l.id === id);
-  await syncLessonUpdateToFirestore(id, proposalFields, target);
-  res.json({ success: true, liveLessons: db.liveLessons });
-});
-
-app.post('/api/lessons/:id/accept-reschedule', async (req, res) => {
-  const db = readDb();
-  const id = decodeURIComponent(req.params.id);
-  const nowIso = new Date().toISOString();
-  let acceptUpdates: any = null;
-  db.liveLessons = db.liveLessons.map((l) => {
-    if (l.id === id && l.proposedNewStartDateTime) {
-      acceptUpdates = {
-        startDateTime: l.proposedNewStartDateTime,
-        endDateTime: l.proposedNewEndDateTime || l.endDateTime,
-        rescheduledFrom: {
-          startDateTime: l.startDateTime,
-          endDateTime: l.endDateTime,
-        },
-        rescheduledAt: nowIso,
-        rescheduledBy: l.proposedBy,
-        rescheduledReason: l.rescheduleNotes,
-        proposedNewStartDateTime: null,
-        proposedNewEndDateTime: null,
-        proposalStatus: null,
-      };
-      return {
-        ...l,
-        ...acceptUpdates,
-        proposedNewStartDateTime: undefined,
-        proposedNewEndDateTime: undefined,
-        proposalStatus: undefined,
-      };
-    }
-    return l;
+  return res.status(200).json({
+    success: true,
+    isIdempotent: Boolean(result.isIdempotent),
+    lesson: result.lesson,
   });
-  await writeDbSync(db);
-  const target = (db.liveLessons || []).find((l: any) => l.id === id);
-  if (acceptUpdates) {
-    await syncLessonUpdateToFirestore(id, acceptUpdates, target);
+});
+
+app.post('/api/lessons/:id/not-completed', firebaseAuthMiddleware, async (req, res) => {
+  if (!req.user || !req.user.uid) {
+    return res.status(401).json({ error: 'Authentication required' });
   }
-  res.json({ success: true, liveLessons: db.liveLessons });
+  const lessonId = decodeURIComponent(req.params.id || '');
+  const { responsible, reason } = req.body || {};
+  const result = await markLessonNotCompletedAtomicServer({
+    lessonId,
+    callerUid: req.user.uid,
+    callerEmail: req.user.email,
+    callerRole: req.user.role,
+    callerEmailVerified: req.user.email_verified,
+    responsible,
+    reason,
+  });
+  if (!result.success) {
+    return res.status(result.statusCode).json({ error: result.error, message: result.error });
+  }
+  return res.status(200).json({
+    success: true,
+    isIdempotent: Boolean(result.isIdempotent),
+    lesson: result.lesson,
+    remainingLessons: result.remainingLessons,
+    creditRefunded: Boolean(result.creditRefunded),
+  });
 });
 
-app.post('/api/lessons/:id/decline-reschedule', async (req, res) => {
-  const db = readDb();
-  const id = decodeURIComponent(req.params.id);
-  db.liveLessons = db.liveLessons.map((l) =>
-    l.id === id
-      ? {
-          ...l,
-          proposedNewStartDateTime: undefined,
-          proposedNewEndDateTime: undefined,
-          proposalStatus: undefined,
-        }
-      : l
-  );
-  await writeDbSync(db);
-  const target = (db.liveLessons || []).find((l: any) => l.id === id);
-  await syncLessonUpdateToFirestore(
-    id,
-    { proposedNewStartDateTime: null, proposedNewEndDateTime: null, proposalStatus: null },
-    target
-  );
-  res.json({ success: true, liveLessons: db.liveLessons });
+app.post('/api/lessons/:id/reschedule', firebaseAuthMiddleware, async (req, res) => {
+  if (!req.user || !req.user.uid) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  const lessonId = decodeURIComponent(req.params.id || '');
+  const { newStartIso, newEndIso, reason, proposedBy } = req.body || {};
+  const result = await proposeRescheduleAtomicServer({
+    lessonId,
+    callerUid: req.user.uid,
+    callerEmail: req.user.email,
+    callerRole: req.user.role,
+    callerEmailVerified: req.user.email_verified,
+    newStartIso,
+    newEndIso,
+    reason,
+    requestedProposedBy: proposedBy,
+  });
+  if (!result.success) {
+    return res.status(result.statusCode).json({ error: result.error, message: result.error });
+  }
+  return res.status(200).json({
+    success: true,
+    lesson: result.lesson,
+  });
 });
 
-app.post('/api/lessons/:id/cancel', async (req, res) => {
-  const db = readDb();
-  const id = decodeURIComponent(req.params.id);
+app.post('/api/lessons/:id/accept-reschedule', firebaseAuthMiddleware, async (req, res) => {
+  if (!req.user || !req.user.uid) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  const lessonId = decodeURIComponent(req.params.id || '');
+  const result = await acceptRescheduleAtomicServer({
+    lessonId,
+    callerUid: req.user.uid,
+    callerEmail: req.user.email,
+    callerRole: req.user.role,
+    callerEmailVerified: req.user.email_verified,
+  });
+  if (!result.success) {
+    return res.status(result.statusCode).json({ error: result.error, message: result.error });
+  }
+  return res.status(200).json({
+    success: true,
+    lesson: result.lesson,
+  });
+});
+
+app.post('/api/lessons/:id/decline-reschedule', firebaseAuthMiddleware, async (req, res) => {
+  if (!req.user || !req.user.uid) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  const lessonId = decodeURIComponent(req.params.id || '');
+  const result = await declineRescheduleAtomicServer({
+    lessonId,
+    callerUid: req.user.uid,
+    callerEmail: req.user.email,
+    callerRole: req.user.role,
+    callerEmailVerified: req.user.email_verified,
+  });
+  if (!result.success) {
+    return res.status(result.statusCode).json({ error: result.error, message: result.error });
+  }
+  return res.status(200).json({
+    success: true,
+    isIdempotent: Boolean(result.isIdempotent),
+    lesson: result.lesson,
+  });
+});
+
+app.post('/api/lessons/:id/cancel', firebaseAuthMiddleware, async (req, res) => {
+  if (!req.user || !req.user.uid) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  const lessonId = decodeURIComponent(req.params.id || '');
   const { cancelledBy, reason } = req.body || {};
-  const nowIso = new Date().toISOString();
-  const target = (db.liveLessons || []).find((l: any) => l.id === id);
-  const cancelUpdates = {
-    status: 'cancelled',
-    cancelledAt: nowIso,
-    cancelledBy: cancelledBy || target?.cancelledBy || 'user',
-    cancellationReason: reason || target?.cancellationReason || 'Cancelled by user',
-    proposalStatus: null,
-    proposedNewStartDateTime: null,
-    proposedNewEndDateTime: null,
-  };
-  db.liveLessons = (db.liveLessons || []).map((l: any) =>
-    l.id === id ||
-    (target &&
-      target.studentEmail &&
-      (l.studentEmail || '').toLowerCase() === target.studentEmail.toLowerCase() &&
-      l.startDateTime === target.startDateTime)
-      ? {
-          ...l,
-          ...cancelUpdates,
-          proposalStatus: undefined,
-          proposedNewStartDateTime: undefined,
-          proposedNewEndDateTime: undefined,
-        }
-      : l
-  );
-  await writeDbSync(db);
-  await syncLessonUpdateToFirestore(id, cancelUpdates, target);
-  res.json({ success: true, liveLessons: db.liveLessons });
+  const result = await cancelLessonAtomicServer({
+    lessonId,
+    callerUid: req.user.uid,
+    callerEmail: req.user.email,
+    callerRole: req.user.role,
+    callerEmailVerified: req.user.email_verified,
+    requestedCancelledBy: cancelledBy,
+    reason,
+  });
+  if (!result.success) {
+    return res.status(result.statusCode).json({ error: result.error, message: result.error });
+  }
+  return res.status(200).json({
+    success: true,
+    isIdempotent: Boolean(result.isIdempotent),
+    lesson: result.lesson,
+    remainingLessons: result.remainingLessons,
+    creditRefunded: Boolean(result.creditRefunded),
+  });
 });
 
 /**
@@ -8808,22 +8613,24 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
     }
   }
 
-  // 6. Lesson check (optional)
+  // 6. Lesson check (canonical Firestore lessons/{lessonId} only — decoupled from db.liveLessons)
   const lessonId = (explicitLessonId || req.body?.lessonId || (req.body?.id && !req.body.id.startsWith('session_') ? req.body.id : '')).trim();
   let lesson: any = null;
   if (lessonId) {
-    lesson = (db.liveLessons || []).find((l: any) => l.id === lessonId);
-    if (!lesson) {
-      try {
-        const fs = getFirestoreDb();
-        if (fs) {
-          const lSnap = await fs.collection('lessons').doc(lessonId).get().catch(() => null);
-          if (lSnap && lSnap.exists) {
-            lesson = lSnap.data();
+    try {
+      const fs = getFirestoreDb();
+      if (fs) {
+        const lSnap = await fs.collection('lessons').doc(lessonId).get().catch(() => null);
+        if (lSnap && lSnap.exists) {
+          lesson = lSnap.data();
+        } else {
+          const userLessonSnap = await fs.collection('users').doc(studentUid).collection('lessons').doc(lessonId).get().catch(() => null);
+          if (userLessonSnap && userLessonSnap.exists) {
+            lesson = userLessonSnap.data();
           }
         }
-      } catch {}
-    }
+      }
+    } catch {}
     if (lesson) {
       if (lesson.studentUid && lesson.studentUid !== studentUid) {
         return res.status(403).json({
@@ -8832,7 +8639,25 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
           message: 'The specified lesson belongs to a different student. Save blocked.',
         });
       }
-      if (!isCallerAdmin && lesson.teacherUid && lesson.teacherUid !== teacherUid) {
+      const lessonTeacherUids = [
+        lesson.teacherUid,
+        lesson.teacherAuthUid,
+        lesson.tutorUid,
+        lesson.teacherPublicId,
+      ]
+        .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+        .map((v) => v.trim());
+      const callerTeacherUids = new Set(
+        [
+          teacherUid,
+          callerUid,
+          teacherResolution?.authUid,
+          teacherResolution?.publicTutorId,
+        ]
+          .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+          .map((v) => v.trim())
+      );
+      if (!isCallerAdmin && lessonTeacherUids.length > 0 && !lessonTeacherUids.some((id) => callerTeacherUids.has(id))) {
         return res.status(403).json({
           error: 'TEACHER_LESSON_MISMATCH',
           code: 'TEACHER_LESSON_MISMATCH',
@@ -8930,32 +8755,6 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
     changeSummary: req.body?.changeSummary,
   });
 
-  // 9. Synchronize liveLessons in memory if lesson exists
-  if (lessonId && Array.isArray(db.liveLessons)) {
-    db.liveLessons = db.liveLessons.map((l: any) => {
-      if (l.id === lessonId) {
-        return {
-          ...l,
-          title: topic || l.title,
-          liveNotes: rawContent,
-          recommendations: rawContent,
-          sessionNotesDocument: rawContent,
-          pronunciationNotes: req.body?.pronunciationNotes ?? l.pronunciationNotes,
-          grammarAndPhrasing: req.body?.grammarAndPhrasing ?? l.grammarAndPhrasing,
-          vocabularyNotes: Array.isArray(req.body?.vocabularyNotes) ? req.body.vocabularyNotes : l.vocabularyNotes,
-          notesLastSavedAt: new Date().toISOString(),
-          studentUid,
-          teacherUid,
-          driveFileId: noteDoc.driveFileId || l.driveFileId,
-          driveFileUrl: noteDoc.driveFileUrl || l.driveFileUrl,
-          driveFolderName: noteDoc.driveFolderName || l.driveFolderName,
-          driveLastSyncedAt: noteDoc.driveLastSyncedAt || l.driveLastSyncedAt,
-        };
-      }
-      return l;
-    });
-  }
-
   if (!db.sessionNotesMap) db.sessionNotesMap = {};
   db.sessionNotesMap[sessionKey] = noteDoc;
 
@@ -8967,14 +8766,13 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
     id: sessionKey,
   });
 
-  await writeDbSync(db);
-
-  // 10. Persist canonically to Firestore (default) under session_notes/{sessionKey} and users/{studentUid}/session_notes
+  // 10. Persist canonically to Firestore (default) under session_notes/{sessionKey}, users/{studentUid}/session_notes, and lessons/{lessonId}
+  // ARCH.2D.2: Decoupled from db.liveLessons and writeDbSync (never triggers app_state/lessons write).
   await saveSessionNotesToFirestoreServer(sessionKey, noteDoc).catch((err) => {
     console.warn('Backend Firestore session notes save notice:', err);
   });
 
-  return res.json({ success: true, sessionNote: noteDoc, liveLessons: db.liveLessons });
+  return res.json({ success: true, sessionNote: noteDoc });
 }
 
 // Save live lesson notes & automatically migrate vocabulary to student's personal dictionary
@@ -10466,23 +10264,6 @@ app.post('/api/drive/sync-session-notes', async (req, res) => {
       };
     }
 
-    if (lessonId && Array.isArray(db.liveLessons)) {
-      db.liveLessons = db.liveLessons.map((l: any) => {
-        if (l.id === lessonId) {
-          return {
-            ...l,
-            ...(topic ? { title: topic } : {}),
-            ...(content ? { liveNotes: content, recommendations: content, sessionNotesDocument: content } : {}),
-            driveFileId: driveRes.fileId,
-            driveFileUrl: driveRes.webViewLink,
-            driveFolderName: driveRes.folderName,
-            driveLastSyncedAt: nowIso,
-          };
-        }
-        return l;
-      });
-    }
-
     // Invalidate cached pedagogical transformation for this session
     invalidatePedagogicalCache(db, {
       canonicalSessionKey: effectiveKey,
@@ -10492,6 +10273,27 @@ app.post('/api/drive/sync-session-notes', async (req, res) => {
 
     await writeDbSync(db);
     saveSessionNotesToFirestoreServer(effectiveKey, db.sessionNotesMap[effectiveKey]).catch(() => null);
+    if (lessonId) {
+      const firestore = getFirestoreDb();
+      if (firestore) {
+        firestore
+          .collection('lessons')
+          .doc(lessonId)
+          .set(
+            {
+              ...(topic ? { title: topic } : {}),
+              ...(content ? { liveNotes: content, recommendations: content, sessionNotesDocument: content } : {}),
+              driveFileId: driveRes.fileId,
+              driveFileUrl: driveRes.webViewLink,
+              driveFolderName: driveRes.folderName,
+              driveLastSyncedAt: nowIso,
+              updatedAt: nowIso,
+            },
+            { merge: true }
+          )
+          .catch(() => null);
+      }
+    }
 
     res.json({
       success: true,
@@ -10685,31 +10487,43 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
         );
     }
 
-    if (!foundDoc && Array.isArray(db.liveLessons)) {
-      const matchLesson = db.liveLessons.find((l: any) => l.id === targetKey || l.id === cleanId);
-      if (matchLesson && (matchLesson.sessionNotesDocument || matchLesson.liveNotes || matchLesson.recommendations)) {
-        const lDate = matchLesson.sessionDate || (matchLesson.startDateTime ? matchLesson.startDateTime.split('T')[0] : '');
-        const rawContent = matchLesson.sessionNotesDocument || matchLesson.liveNotes || matchLesson.recommendations || '';
-        foundDoc = {
-          id: matchLesson.id,
-          sessionKey: matchLesson.id,
-          sessionDate: lDate,
-          lessonId: matchLesson.id,
-          studentEmail: matchLesson.studentEmail,
-          studentUid: matchLesson.studentUid,
-          teacherEmail: matchLesson.teacherEmail || matchLesson.tutorEmail || '',
-          teacherName: matchLesson.teacherName || matchLesson.tutorName || 'Native Friend',
-          teacherUid: matchLesson.teacherUid || '',
-          topic: matchLesson.title || 'Conversation & Fluency',
-          content: rawContent,
-          rawContent,
-          driveFileId: matchLesson.driveFileId,
-          driveFileUrl: matchLesson.driveFileUrl,
-          driveFolderName: matchLesson.driveFolderName,
-          driveLastSyncedAt: matchLesson.driveLastSyncedAt,
-          updatedAt: matchLesson.updatedAt || matchLesson.notesLastSavedAt || new Date().toISOString(),
-        };
-      }
+    if (!foundDoc) {
+      try {
+        const fs = getFirestoreDb();
+        if (fs) {
+          const candidateIds = Array.from(new Set([targetKey, cleanId].filter(Boolean)));
+          for (const cid of candidateIds) {
+            const lSnap = await fs.collection('lessons').doc(cid).get().catch(() => null);
+            if (lSnap && lSnap.exists) {
+              const matchLesson = lSnap.data();
+              if (matchLesson && (matchLesson.sessionNotesDocument || matchLesson.liveNotes || matchLesson.recommendations)) {
+                const lDate = matchLesson.sessionDate || (matchLesson.startDateTime ? matchLesson.startDateTime.split('T')[0] : '');
+                const rawContent = matchLesson.sessionNotesDocument || matchLesson.liveNotes || matchLesson.recommendations || '';
+                foundDoc = {
+                  id: lSnap.id,
+                  sessionKey: lSnap.id,
+                  sessionDate: lDate,
+                  lessonId: lSnap.id,
+                  studentEmail: matchLesson.studentEmail,
+                  studentUid: matchLesson.studentUid,
+                  teacherEmail: matchLesson.teacherEmail || matchLesson.tutorEmail || '',
+                  teacherName: matchLesson.teacherName || matchLesson.tutorName || 'Native Friend',
+                  teacherUid: matchLesson.teacherUid || '',
+                  topic: matchLesson.title || 'Conversation & Fluency',
+                  content: rawContent,
+                  rawContent,
+                  driveFileId: matchLesson.driveFileId,
+                  driveFileUrl: matchLesson.driveFileUrl,
+                  driveFolderName: matchLesson.driveFolderName,
+                  driveLastSyncedAt: matchLesson.driveLastSyncedAt,
+                  updatedAt: matchLesson.updatedAt || matchLesson.notesLastSavedAt || new Date().toISOString(),
+                };
+                break;
+              }
+            }
+          }
+        }
+      } catch {}
     }
 
     if (foundDoc) {
@@ -10771,41 +10585,47 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
       }
     });
 
-    // 3c. Overlay liveLessons notes matching targetStudentUid
-    if (Array.isArray(db.liveLessons)) {
-      db.liveLessons.forEach((l: any) => {
-        if (l.studentUid === targetStudentUid) {
-          const noteContent = l.sessionNotesDocument || l.liveNotes || l.recommendations || '';
-          if (noteContent && noteContent.trim()) {
-            const lDate = l.sessionDate || (l.startDateTime ? l.startDateTime.split('T')[0] : '');
-            const cleanLessonId = l.id ? l.id.replace(/^lesson_/, '') : '';
-            const mapKey = cleanLessonId ? `lesson_${cleanLessonId}` : (l.id || `session_${lDate}_${targetStudentUid}`);
-            if (!map.has(mapKey)) {
-              map.set(mapKey, {
-                id: mapKey,
-                sessionKey: mapKey,
-                sessionDate: lDate,
-                lessonId: l.id,
-                startDateTime: l.startDateTime,
-                studentEmail: l.studentEmail,
-                studentUid: l.studentUid,
-                teacherEmail: l.teacherEmail || l.tutorEmail || '',
-                teacherName: l.teacherName || l.tutorName || 'Native Friend',
-                teacherUid: l.teacherUid || '',
-                topic: l.title || 'Conversation & Fluency',
-                content: noteContent,
-                rawContent: noteContent,
-                driveFileId: l.driveFileId,
-                driveFileUrl: l.driveFileUrl,
-                driveFolderName: l.driveFolderName,
-                driveLastSyncedAt: l.driveLastSyncedAt,
-                updatedAt: l.updatedAt || l.notesLastSavedAt || new Date().toISOString(),
-              });
+    // 3c. Overlay canonical Firestore lessons/{lessonId} notes matching targetStudentUid
+    try {
+      const fs = getFirestoreDb();
+      if (fs) {
+        const lessonsSnap = await fs.collection('lessons').where('studentUid', '==', targetStudentUid).get().catch(() => null);
+        if (lessonsSnap && !lessonsSnap.empty) {
+          lessonsSnap.docs.forEach((doc: any) => {
+            const l = doc.data();
+            const lId = doc.id || l.id;
+            const noteContent = l?.sessionNotesDocument || l?.liveNotes || l?.recommendations || '';
+            if (noteContent && noteContent.trim()) {
+              const lDate = l.sessionDate || (l.startDateTime ? l.startDateTime.split('T')[0] : '');
+              const cleanLessonId = lId ? String(lId).replace(/^lesson_/, '') : '';
+              const mapKey = cleanLessonId ? `lesson_${cleanLessonId}` : (lId || `session_${lDate}_${targetStudentUid}`);
+              if (!map.has(mapKey)) {
+                map.set(mapKey, {
+                  id: mapKey,
+                  sessionKey: mapKey,
+                  sessionDate: lDate,
+                  lessonId: lId,
+                  startDateTime: l.startDateTime,
+                  studentEmail: l.studentEmail,
+                  studentUid: l.studentUid,
+                  teacherEmail: l.teacherEmail || l.tutorEmail || '',
+                  teacherName: l.teacherName || l.tutorName || 'Native Friend',
+                  teacherUid: l.teacherUid || '',
+                  topic: l.title || 'Conversation & Fluency',
+                  content: noteContent,
+                  rawContent: noteContent,
+                  driveFileId: l.driveFileId,
+                  driveFileUrl: l.driveFileUrl,
+                  driveFolderName: l.driveFolderName,
+                  driveLastSyncedAt: l.driveLastSyncedAt,
+                  updatedAt: l.updatedAt || l.notesLastSavedAt || new Date().toISOString(),
+                });
+              }
             }
-          }
+          });
         }
-      });
-    }
+      }
+    } catch {}
 
     const getRealLessonTimestamp = (item: any): number => {
       if (item?.startDateTime && typeof item.startDateTime === 'string') {
@@ -11284,26 +11104,17 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
   let cleanUid = callerUid;
   let effectiveEmail = callerEmail;
 
-  // Look up lesson metadata from canonical Firestore database first, then fallback
+  // Look up lesson metadata from canonical Firestore lessons/{lessonId}
   let foundLesson: any = null;
   if (lessonId) {
     const firestore = getFirestoreDb();
     if (firestore) {
       try {
-        const lSnap1 = await firestore.collection('liveLessons').doc(lessonId).get();
-        if (lSnap1.exists) {
-          foundLesson = lSnap1.data();
-        } else {
-          const lSnap2 = await firestore.collection('lessons').doc(lessonId).get();
-          if (lSnap2.exists) {
-            foundLesson = lSnap2.data();
-          }
+        const lSnap = await firestore.collection('lessons').doc(lessonId).get();
+        if (lSnap.exists) {
+          foundLesson = lSnap.data();
         }
       } catch {}
-    }
-
-    if (!foundLesson && Array.isArray(db.liveLessons)) {
-      foundLesson = db.liveLessons.find((l: any) => l.id === lessonId);
     }
   }
 
@@ -11774,13 +11585,29 @@ app.get('/api/weekly-learning-insights', firebaseAuthMiddleware, async (req, res
     } catch {}
 
     if (!canonicalStudentUid) {
+      let lessonStudentUid = '';
+      try {
+        const fsDb = getFirestoreDb();
+        if (fsDb) {
+          const lSnap = await fsDb.collection('lessons').where('studentEmail', '==', canonicalStudentEmail).limit(10).get();
+          if (lSnap && !lSnap.empty) {
+            for (const d of lSnap.docs) {
+              const lData = d.data();
+              if (lData?.studentUid && isValidCanonicalUid(lData.studentUid) && lData.studentUid !== callerUid) {
+                lessonStudentUid = lData.studentUid;
+                break;
+              }
+            }
+          }
+        }
+      } catch {}
+
       const profile = db.userProfiles?.[canonicalStudentEmail];
       const student = (db.students || []).find((s: any) => (s.email || s.studentEmail || '').toLowerCase().trim() === canonicalStudentEmail);
-      const lesson = (db.liveLessons || []).find((l: any) => (l.studentEmail || '').toLowerCase().trim() === canonicalStudentEmail && l.studentUid && isValidCanonicalUid(l.studentUid) && l.studentUid !== callerUid);
       const lUid = (profile?.uid && isValidCanonicalUid(profile.uid) && profile.uid !== callerUid ? profile.uid : '') ||
         (student?.uid && isValidCanonicalUid(student.uid) && student.uid !== callerUid ? student.uid : '') ||
         (student?.studentUid && isValidCanonicalUid(student.studentUid) && student.studentUid !== callerUid ? student.studentUid : '') ||
-        (lesson?.studentUid && isValidCanonicalUid(lesson.studentUid) && lesson.studentUid !== callerUid ? lesson.studentUid : '');
+        lessonStudentUid;
       if (lUid) {
         canonicalStudentUid = lUid;
       }
@@ -11919,13 +11746,29 @@ app.get('/api/lesson-insights', firebaseAuthMiddleware, async (req, res) => {
     }
 
     if (!canonicalStudentUid) {
+      let lessonStudentUid = '';
+      try {
+        const fsDb = getFirestoreDb();
+        if (fsDb) {
+          const lSnap = await fsDb.collection('lessons').where('studentEmail', '==', canonicalStudentEmail).limit(10).get();
+          if (lSnap && !lSnap.empty) {
+            for (const d of lSnap.docs) {
+              const lData = d.data();
+              if (lData?.studentUid && isValidCanonicalUid(lData.studentUid) && lData.studentUid !== callerUid) {
+                lessonStudentUid = lData.studentUid;
+                break;
+              }
+            }
+          }
+        }
+      } catch {}
+
       const profile = db.userProfiles?.[canonicalStudentEmail];
       const student = (db.students || []).find((s: any) => (s.email || s.studentEmail || '').toLowerCase().trim() === canonicalStudentEmail);
-      const lesson = (db.liveLessons || []).find((l: any) => (l.studentEmail || '').toLowerCase().trim() === canonicalStudentEmail && l.studentUid && isValidCanonicalUid(l.studentUid) && l.studentUid !== callerUid);
       const lUid = (profile?.uid && isValidCanonicalUid(profile.uid) && profile.uid !== callerUid ? profile.uid : '') ||
         (student?.uid && isValidCanonicalUid(student.uid) && student.uid !== callerUid ? student.uid : '') ||
         (student?.studentUid && isValidCanonicalUid(student.studentUid) && student.studentUid !== callerUid ? student.studentUid : '') ||
-        (lesson?.studentUid && isValidCanonicalUid(lesson.studentUid) && lesson.studentUid !== callerUid ? lesson.studentUid : '');
+        lessonStudentUid;
       if (lUid) {
         canonicalStudentUid = lUid;
       }
@@ -12052,13 +11895,29 @@ app.post('/api/lesson-insights/generate', firebaseAuthMiddleware, async (req, re
     }
 
     if (!canonicalStudentUid) {
+      let lessonStudentUid = '';
+      try {
+        const fsDb = getFirestoreDb();
+        if (fsDb) {
+          const lSnap = await fsDb.collection('lessons').where('studentEmail', '==', canonicalStudentEmail).limit(10).get();
+          if (lSnap && !lSnap.empty) {
+            for (const d of lSnap.docs) {
+              const lData = d.data();
+              if (lData?.studentUid && isValidCanonicalUid(lData.studentUid) && lData.studentUid !== callerUid) {
+                lessonStudentUid = lData.studentUid;
+                break;
+              }
+            }
+          }
+        }
+      } catch {}
+
       const profile = db.userProfiles?.[canonicalStudentEmail];
       const student = (db.students || []).find((s: any) => (s.email || s.studentEmail || '').toLowerCase().trim() === canonicalStudentEmail);
-      const lesson = (db.liveLessons || []).find((l: any) => (l.studentEmail || '').toLowerCase().trim() === canonicalStudentEmail && l.studentUid && isValidCanonicalUid(l.studentUid) && l.studentUid !== callerUid);
       const lUid = (profile?.uid && isValidCanonicalUid(profile.uid) && profile.uid !== callerUid ? profile.uid : '') ||
         (student?.uid && isValidCanonicalUid(student.uid) && student.uid !== callerUid ? student.uid : '') ||
         (student?.studentUid && isValidCanonicalUid(student.studentUid) && student.studentUid !== callerUid ? student.studentUid : '') ||
-        (lesson?.studentUid && isValidCanonicalUid(lesson.studentUid) && lesson.studentUid !== callerUid ? lesson.studentUid : '');
+        lessonStudentUid;
       if (lUid) {
         canonicalStudentUid = lUid;
       }
@@ -13031,19 +12890,44 @@ app.get('/api/students/verify-link', async (req, res) => {
     return res.json({ isLinked: true, reason: 'assigned_student' });
   }
 
-  // Check scheduled lessons
-  const hasLesson = (db.liveLessons || []).some((l: any) => {
-    const lStudentEmail = (l.studentEmail || '').toLowerCase().trim();
-    const lStudentUid = (l.studentUid || '').trim();
-    const lTeacherEmail = (l.teacherEmail || (l as any).tutorEmail || '').toLowerCase().trim();
-    const lTeacherUid = (l.teacherUid || (l as any).tutorUid || '').trim();
-
-    const studentMatches = (studentEmail && lStudentEmail === studentEmail) || (studentUid && lStudentUid === studentUid);
-    const teacherMatches =
-      (teacherEmail && lTeacherEmail === teacherEmail) ||
-      (teacherUid && (lTeacherUid === teacherUid || lTeacherUid === `tutor-${teacherUid}` || teacherUid === `tutor-${lTeacherUid}`));
-    return studentMatches && teacherMatches && l.status !== 'cancelled';
-  });
+  // Check canonical Firestore lessons
+  let hasLesson = false;
+  try {
+    const fs = getFirestoreDb();
+    if (fs) {
+      const queries: Promise<any>[] = [];
+      if (studentUid) {
+        queries.push(fs.collection('lessons').where('studentUid', '==', studentUid).get().catch(() => ({ docs: [] })));
+      }
+      if (studentEmail) {
+        queries.push(fs.collection('lessons').where('studentEmail', '==', studentEmail).get().catch(() => ({ docs: [] })));
+      }
+      const snaps = await Promise.all(queries);
+      for (const snap of snaps) {
+        if (!snap?.docs) continue;
+        for (const doc of snap.docs) {
+          const l = doc.data();
+          if (!l || l.status === 'cancelled') continue;
+          const lTeacherEmail = (l.teacherEmail || l.tutorEmail || '').toLowerCase().trim();
+          const lTeacherUid = (l.teacherUid || l.tutorUid || l.teacherAuthUid || '').trim();
+          const lTeacherAuthUid = (l.teacherAuthUid || '').trim();
+          const teacherMatches =
+            (teacherEmail && lTeacherEmail === teacherEmail) ||
+            (teacherUid && (
+              lTeacherUid === teacherUid ||
+              lTeacherAuthUid === teacherUid ||
+              lTeacherUid === `tutor-${teacherUid}` ||
+              teacherUid === `tutor-${lTeacherUid}`
+            ));
+          if (teacherMatches) {
+            hasLesson = true;
+            break;
+          }
+        }
+        if (hasLesson) break;
+      }
+    }
+  } catch {}
 
   if (hasLesson) {
     return res.json({ isLinked: true, reason: 'active_lesson' });
@@ -13052,12 +12936,27 @@ app.get('/api/students/verify-link', async (req, res) => {
   return res.json({ isLinked: false, reason: 'unauthorized_uid_pair' });
 });
 
-app.delete(['/api/lessons/:id', '/api/live-lessons/:id'], (req, res) => {
-  const db = readDb();
-  const id = decodeURIComponent(req.params.id);
-  db.liveLessons = db.liveLessons.filter((l) => l.id !== id);
-  writeDb(db);
-  res.json({ success: true, liveLessons: db.liveLessons });
+app.delete(['/api/lessons/:id', '/api/live-lessons/:id'], firebaseAuthMiddleware, async (req, res) => {
+  if (!req.user || !req.user.uid) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  const lessonId = decodeURIComponent(req.params.id || '');
+  const result = await deleteLessonAtomicServer({
+    lessonId,
+    callerUid: req.user.uid,
+    callerEmail: req.user.email,
+    callerRole: req.user.role,
+    callerEmailVerified: req.user.email_verified,
+  });
+  if (!result.success) {
+    return res.status(result.statusCode).json({ error: result.error, message: result.error });
+  }
+  return res.status(200).json({
+    success: true,
+    deletedId: result.deletedId,
+    remainingLessons: result.remainingLessons,
+    creditRefunded: Boolean(result.creditRefunded),
+  });
 });
 
 // 6. Chat Messages Endpoints
@@ -16359,34 +16258,57 @@ export async function authorizeStudentAccess(
       return uidMatches || emailMatches;
     });
 
-    // Lesson-based assignment check in liveLessons
-    const isAssignedByLesson = (db.liveLessons || []).some((l: any) => {
-      if (l.status === 'cancelled') return false;
+    // Lesson-based assignment check in canonical Firestore lessons
+    let isAssignedByLesson = false;
+    if (!isAssignedDirectly) {
+      try {
+        const fs = getFirestoreDb();
+        if (fs) {
+          const lessonQueries: Promise<any>[] = [];
+          if (cleanUid) {
+            lessonQueries.push(fs.collection('lessons').where('studentUid', '==', cleanUid).get().catch(() => ({ docs: [] })));
+          }
+          if (cleanEmail) {
+            lessonQueries.push(fs.collection('lessons').where('studentEmail', '==', cleanEmail).get().catch(() => ({ docs: [] })));
+          }
+          const lessonSnaps = await Promise.all(lessonQueries);
+          for (const snap of lessonSnaps) {
+            if (!snap?.docs) continue;
+            for (const doc of snap.docs) {
+              const l = doc.data();
+              if (!l || l.status === 'cancelled') continue;
 
-      const lStudentEmail = (l.studentEmail || '').toLowerCase().trim();
-      const lStudentUid = (l.studentUid || '').trim();
-      const lTeacherEmail = (l.teacherEmail || l.tutorEmail || '').toLowerCase().trim();
-      const lTeacherUid = (l.teacherUid || l.tutorUid || '').trim();
+              const lStudentEmail = (l.studentEmail || '').toLowerCase().trim();
+              const lStudentUid = (l.studentUid || '').trim();
+              const lTeacherEmail = (l.teacherEmail || l.tutorEmail || '').toLowerCase().trim();
+              const lTeacherUid = (l.teacherUid || l.tutorUid || '').trim();
+              const lTeacherAuthUid = (l.teacherAuthUid || '').trim();
 
-      // Lesson student must match the canonical student:
-      const studentMatches =
-        (cleanUid && lStudentUid && lStudentUid === cleanUid) ||
-        (cleanEmail && lStudentEmail && lStudentEmail === cleanEmail);
+              const studentMatches =
+                (cleanUid && lStudentUid && lStudentUid === cleanUid) ||
+                (cleanEmail && lStudentEmail && lStudentEmail === cleanEmail);
 
-      // Lesson student must NOT contradict the canonical student:
-      if (lStudentUid && cleanUid && lStudentUid !== cleanUid) return false;
-      if (lStudentEmail && cleanEmail && lStudentEmail !== cleanEmail) return false;
+              if (lStudentUid && cleanUid && lStudentUid !== cleanUid) continue;
+              if (lStudentEmail && cleanEmail && lStudentEmail !== cleanEmail) continue;
 
-      // Lesson teacher must match the caller:
-      const teacherMatches =
-        (lTeacherUid &&
-          (lTeacherUid === callerUid ||
-            lTeacherUid === `tutor-${callerUid}` ||
-            callerUid === `tutor-${lTeacherUid}`)) ||
-        (callerEmailVerified && callerEmail && lTeacherEmail && lTeacherEmail === callerEmail);
+              const teacherMatches =
+                (lTeacherUid &&
+                  (lTeacherUid === callerUid ||
+                    lTeacherUid === `tutor-${callerUid}` ||
+                    callerUid === `tutor-${lTeacherUid}`)) ||
+                (lTeacherAuthUid && lTeacherAuthUid === callerUid) ||
+                (callerEmailVerified && callerEmail && lTeacherEmail && lTeacherEmail === callerEmail);
 
-      return studentMatches && teacherMatches;
-    });
+              if (studentMatches && teacherMatches) {
+                isAssignedByLesson = true;
+                break;
+              }
+            }
+            if (isAssignedByLesson) break;
+          }
+        }
+      } catch {}
+    }
 
     if (isAssignedDirectly || isAssignedByLesson) {
       return {

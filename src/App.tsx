@@ -112,7 +112,6 @@ import {
   saveStudentJournalEntryToFirestore,
   fetchStudentJournalFromFirestore,
   saveLiveLessonToFirestore,
-  updateLiveLessonInFirestore,
   deleteLiveLessonFromFirestore,
   fetchStudentLessonsFromFirestore,
   subscribeToStudentLessons,
@@ -151,7 +150,6 @@ import {
   migrateLegacyLocalStorageToFirestore,
   scheduleLessonWithTransaction,
   purchasePackageWithTransaction,
-  cancelLessonWithTransaction,
   isValidCanonicalUid,
   normalizeUid,
   normalizeWeekId,
@@ -5362,7 +5360,7 @@ export default function App() {
     }
   };
 
-  // Handler: Cancel lesson (preserves student balance if teacher unforeseen)
+  // Handler: Cancel lesson (server-authoritative Firestore transaction + credit sync)
   const handleCancelLesson = async (
     lessonId: string,
     reason?: string,
@@ -5380,18 +5378,11 @@ export default function App() {
         : 'Cancelado por motivo próprio');
 
     const target = lessons.find((l) => l.id === lessonId);
-    const targetStudentUid = target?.studentUid || (!isTeacher ? currentAccount?.uid : undefined);
-    const targetStudentEmail = target?.studentEmail || (!isTeacher ? currentAccount?.email : undefined);
-    const targetTeacherUid = target?.teacherUid || (isTeacher ? currentAccount?.uid : undefined);
     const nowIso = new Date().toISOString();
 
-    setLessons((prev) => {
-      return prev.map((l) =>
-        l.id === lessonId ||
-        (target &&
-          l.studentEmail &&
-          l.studentEmail.toLowerCase() === (target.studentEmail || '').toLowerCase() &&
-          l.startDateTime === target.startDateTime)
+    setLessons((prev) =>
+      prev.map((l) =>
+        l.id === lessonId
           ? {
               ...l,
               status: 'cancelled',
@@ -5400,67 +5391,74 @@ export default function App() {
               cancellationReason: finalReason,
             }
           : l
-      );
-    });
-
-    // Atomic Firestore transaction: cancels lesson across root & subcollections and restores balance if teacher/admin
-    await cancelLessonWithTransaction({
-      lessonId,
-      studentUid: targetStudentUid,
-      studentEmail: targetStudentEmail,
-      cancelledBy: finalCancelledBy,
-      cancellationReason: finalReason,
-    }).catch((err) => console.warn('cancelLessonWithTransaction notice:', err));
-
-    // Persist cancellation in Firestore with complete lesson metadata
-    await updateLiveLessonInFirestore(
-      lessonId,
-      {
-        status: 'cancelled',
-        cancelledAt: nowIso,
-        cancelledBy: finalCancelledBy,
-        cancellationReason: finalReason,
-      },
-      targetStudentUid,
-      targetTeacherUid,
-      target,
-      targetStudentEmail
+      )
     );
 
     try {
-      await fetch(`/api/lessons/${lessonId}/cancel`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          cancelledBy: finalCancelledBy,
-          reason: finalReason,
-        }),
+      const res = await apiClient.post<{
+        success: boolean;
+        lesson?: LiveLesson;
+        remainingLessons?: number;
+        creditRefunded?: boolean;
+      }>(`/api/lessons/${encodeURIComponent(lessonId)}/cancel`, {
+        cancelledBy: finalCancelledBy,
+        reason: finalReason,
       });
-    } catch {
-      // local fallback
-    }
 
-    setNotifications((prev) => [
-      {
-        id: `cancel-${Date.now()}`,
-        title: currentLanguage === 'en' ? 'Lesson Cancelled' : 'Aula Cancelada',
-        message:
-          currentLanguage === 'en'
-            ? finalCancelledBy === 'teacher'
-              ? 'The session was cancelled due to native tutor unforeseen circumstances. Your lesson balance was NOT deducted.'
-              : 'The session has been cancelled and counted in completed lessons.'
-            : finalCancelledBy === 'teacher'
-            ? 'A aula foi cancelada por imprevisto do amigo nativo. O seu saldo NÃO foi deduzido.'
-            : 'A aula foi cancelada por motivo próprio e contabilizada nas aulas realizadas.',
-        type: finalCancelledBy === 'teacher' ? 'success' : 'info',
-        timestamp: new Date().toISOString(),
-        read: false,
-      },
-      ...prev,
-    ]);
+      if (res?.lesson) {
+        setLessons((prev) => prev.map((l) => (l.id === lessonId ? { ...l, ...res.lesson } : l)));
+      }
+      if (typeof res?.remainingLessons === 'number' && !isTeacher) {
+        setUserProfile((prev) => ({
+          ...prev,
+          availableLessons: res.remainingLessons,
+        }));
+      }
+      revalidateLessons().catch(() => {});
+
+      const effectiveCancelledBy = res?.lesson?.cancelledBy || finalCancelledBy;
+      setNotifications((prev) => [
+        {
+          id: `cancel-${Date.now()}`,
+          title: currentLanguage === 'en' ? 'Lesson Cancelled' : 'Aula Cancelada',
+          message:
+            currentLanguage === 'en'
+              ? effectiveCancelledBy === 'teacher' || effectiveCancelledBy === 'admin'
+                ? 'The session was cancelled due to native tutor unforeseen circumstances. Your lesson balance was NOT deducted.'
+                : 'The session has been cancelled and counted in completed lessons.'
+              : effectiveCancelledBy === 'teacher' || effectiveCancelledBy === 'admin'
+              ? 'A aula foi cancelada por imprevisto do amigo nativo. O seu saldo NÃO foi deduzido.'
+              : 'A aula foi cancelada por motivo próprio e contabilizada nas aulas realizadas.',
+          type: effectiveCancelledBy === 'teacher' || effectiveCancelledBy === 'admin' ? 'success' : 'info',
+          timestamp: new Date().toISOString(),
+          read: false,
+        },
+        ...prev,
+      ]);
+    } catch (err: any) {
+      console.error('[handleCancelLesson] Error cancelling lesson:', err);
+      revalidateLessons().catch(() => {});
+      setNotifications((prev) => [
+        {
+          id: `cancel-err-${Date.now()}`,
+          title: currentLanguage === 'en' ? 'Cancellation Error' : 'Erro ao Cancelar',
+          message:
+            err?.message ||
+            (target
+              ? currentLanguage === 'en'
+                ? 'Could not cancel this lesson on the server.'
+                : 'Não foi possível confirmar o cancelamento da aula no servidor.'
+              : 'Lesson not found'),
+          type: 'warning',
+          timestamp: new Date().toISOString(),
+          read: false,
+        },
+        ...prev,
+      ]);
+    }
   };
 
-  // Handler: Mark Not Completed
+  // Handler: Mark Not Completed (server-authoritative Firestore transaction + credit sync)
   const handleConfirmNotCompleted = async (
     lessonId: string,
     responsible: 'student' | 'teacher',
@@ -5479,21 +5477,44 @@ export default function App() {
       )
     );
 
-    // Persist not completed in Firestore
-    updateLiveLessonInFirestore(lessonId, {
-      status: 'not_completed',
-      notCompletedResponsible: responsible,
-      notCompletedReason: reason,
-    }, currentAccount?.uid);
-
     try {
-      await fetch(`/api/lessons/${lessonId}/not-completed`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ responsible, reason }),
+      const res = await apiClient.post<{
+        success: boolean;
+        lesson?: LiveLesson;
+        remainingLessons?: number;
+      }>(`/api/lessons/${encodeURIComponent(lessonId)}/not-completed`, {
+        responsible,
+        reason,
       });
-    } catch {
-      // local fallback
+
+      if (res?.lesson) {
+        setLessons((prev) => prev.map((l) => (l.id === lessonId ? { ...l, ...res.lesson } : l)));
+      }
+      if (typeof res?.remainingLessons === 'number' && !isTeacher) {
+        setUserProfile((prev) => ({
+          ...prev,
+          availableLessons: res.remainingLessons,
+        }));
+      }
+      revalidateLessons().catch(() => {});
+    } catch (err: any) {
+      console.error('[handleConfirmNotCompleted] Error updating lesson:', err);
+      revalidateLessons().catch(() => {});
+      setNotifications((prev) => [
+        {
+          id: `not-completed-err-${Date.now()}`,
+          title: currentLanguage === 'en' ? 'Error' : 'Erro',
+          message:
+            err?.message ||
+            (currentLanguage === 'en'
+              ? 'Could not record lesson non-completion on server.'
+              : 'Não foi possível registrar aula não realizada no servidor.'),
+          type: 'warning',
+          timestamp: new Date().toISOString(),
+          read: false,
+        },
+        ...prev,
+      ]);
     }
   };
 
@@ -5550,13 +5571,32 @@ export default function App() {
     );
 
     try {
-      await fetch(`/api/lessons/${lessonId}/reschedule`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ newStartIso, newEndIso, reason, proposedBy }),
-      });
-    } catch {
-      // local fallback
+      const res = await apiClient.post<{ success: boolean; lesson?: LiveLesson }>(
+        `/api/lessons/${encodeURIComponent(lessonId)}/reschedule`,
+        { newStartIso, newEndIso, reason, proposedBy }
+      );
+      if (res?.lesson) {
+        setLessons((prev) => prev.map((l) => (l.id === lessonId ? { ...l, ...res.lesson } : l)));
+      }
+      revalidateLessons().catch(() => {});
+    } catch (err: any) {
+      console.error('[handleConfirmReschedule] Error proposing reschedule:', err);
+      revalidateLessons().catch(() => {});
+      setNotifications((prev) => [
+        {
+          id: `reschedule-err-${Date.now()}`,
+          title: currentLanguage === 'en' ? 'Reschedule Error' : 'Erro ao Reagendar',
+          message:
+            err?.message ||
+            (currentLanguage === 'en'
+              ? 'Could not propose reschedule on server.'
+              : 'Não foi possível propor o reagendamento no servidor.'),
+          type: 'warning',
+          timestamp: new Date().toISOString(),
+          read: false,
+        },
+        ...prev,
+      ]);
     }
   };
 
@@ -5609,11 +5649,32 @@ export default function App() {
     );
 
     try {
-      await fetch(`/api/lessons/${lessonId}/accept-reschedule`, {
-        method: 'POST',
-      });
-    } catch {
-      // local fallback
+      const res = await apiClient.post<{ success: boolean; lesson?: LiveLesson }>(
+        `/api/lessons/${encodeURIComponent(lessonId)}/accept-reschedule`,
+        {}
+      );
+      if (res?.lesson) {
+        setLessons((prev) => prev.map((l) => (l.id === lessonId ? { ...l, ...res.lesson } : l)));
+      }
+      revalidateLessons().catch(() => {});
+    } catch (err: any) {
+      console.error('[handleAcceptReschedule] Error accepting reschedule:', err);
+      revalidateLessons().catch(() => {});
+      setNotifications((prev) => [
+        {
+          id: `accept-reschedule-err-${Date.now()}`,
+          title: currentLanguage === 'en' ? 'Reschedule Error' : 'Erro ao Aceitar Reagendamento',
+          message:
+            err?.message ||
+            (currentLanguage === 'en'
+              ? 'Could not accept reschedule on server.'
+              : 'Não foi possível aceitar o reagendamento no servidor.'),
+          type: 'warning',
+          timestamp: new Date().toISOString(),
+          read: false,
+        },
+        ...prev,
+      ]);
     }
   };
 
@@ -5633,11 +5694,17 @@ export default function App() {
     );
 
     try {
-      await fetch(`/api/lessons/${lessonId}/decline-reschedule`, {
-        method: 'POST',
-      });
-    } catch {
-      // local fallback
+      const res = await apiClient.post<{ success: boolean; lesson?: LiveLesson }>(
+        `/api/lessons/${encodeURIComponent(lessonId)}/decline-reschedule`,
+        {}
+      );
+      if (res?.lesson) {
+        setLessons((prev) => prev.map((l) => (l.id === lessonId ? { ...l, ...res.lesson } : l)));
+      }
+      revalidateLessons().catch(() => {});
+    } catch (err: any) {
+      console.error('[handleDeclineReschedule] Error declining reschedule:', err);
+      revalidateLessons().catch(() => {});
     }
   };
 
