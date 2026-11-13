@@ -359,8 +359,6 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     watchedHistory,
     saveVideoForDay,
     markVideoAsWatched,
-    resetRepeatFlags,
-    resetRoutinesForNewWeek,
     resetAllDaysImmediately,
     selectNextUnwatchedVideo: pickNextUnwatched,
     isLoading: isRoutineLoading,

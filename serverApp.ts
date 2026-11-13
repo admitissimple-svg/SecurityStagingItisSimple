@@ -157,6 +157,12 @@ import {
   saveStudentCurrentRoutineServer,
   saveCurrentRoutineFeedbackServer,
   saveTeacherSpotifyOverrideServer,
+  fetchWeeklyHistoryServer,
+  fetchAllWeeklyHistoriesServer,
+  fetchAccumulatedConsumedHistoryServer,
+  saveWeeklyHistoryServer,
+  closeWeeklyHistorySnapshotServer,
+  prepareNewWeeklyCycleServer,
 } from './src/serverFirestore';
 import { normalizeDictionaryWord } from './src/utils/studentDictionaryLibrary';
 import { buildWeeklyLearningInsights } from './src/utils/weeklyLearningInsights';
@@ -7030,13 +7036,34 @@ app.get('/api/student-routines', firebaseAuthMiddleware, async (req, res) => {
 
   const { canonicalStudentUid, canonicalStudentEmail } = authCtx;
   const requestedCycle = req.query.weeklyCycle !== undefined ? String(req.query.weeklyCycle) : undefined;
-  const ctx = await fetchCanonicalRoutineContextServer(canonicalStudentUid, requestedCycle);
+  let ctx = await fetchCanonicalRoutineContextServer(canonicalStudentUid, requestedCycle);
 
   if (!ctx) {
     return res.status(503).json({
       error: 'FirestoreUnavailable',
       message: 'Could not read canonical student routines from Firestore (default).',
     });
+  }
+
+  // ARCH.2E.2D / ARCH.2E.2D.2: Recover interrupted post-transaction new-week preparation if still pending
+  if (ctx.userProfile?.cycleTransition?.status === 'pending_preparation') {
+    const pendingTargetCycle =
+      ctx.userProfile.cycleTransition.targetCycle ||
+      ctx.userProfile.weeklyCycle ||
+      ctx.activeCycle;
+    const recoveredPrep = await prepareNewWeeklyCycleServer({
+      uid: canonicalStudentUid,
+      studentEmail: canonicalStudentEmail || ctx.studentEmail,
+      targetCycle: pendingTargetCycle,
+      previousCycle: ctx.userProfile.cycleTransition.previousCycle,
+      attemptId: ctx.userProfile.cycleTransition.attemptId || undefined,
+      level: ctx.level,
+      routineVideoTime: ctx.userProfile?.routineVideoTime,
+    });
+    if (recoveredPrep.ok) {
+      const refreshedCtx = await fetchCanonicalRoutineContextServer(canonicalStudentUid, requestedCycle);
+      if (refreshedCtx) ctx = refreshedCtx;
+    }
   }
 
   const vidTime = ctx.userProfile?.routineVideoTime;
@@ -7217,117 +7244,159 @@ app.get('/api/student-routines', firebaseAuthMiddleware, async (req, res) => {
 // HOTFIX 2.3.5E: In-process lock map per student UID to serialize concurrent requests on the same process
 const inProcessCycleLocks = new Map<string, Promise<any>>();
 
-app.post(['/api/student-routines/start-new-week', '/api/student/reset-week'], async (req, res) => {
-  // 1. Authenticate Firebase ID Token
-  const authHeader = req.headers.authorization || '';
-  let authenticatedUid = '';
-  let authenticatedEmail = '';
-  let tokenVerified = false;
-
-  if (authHeader.startsWith('Bearer ')) {
-    const token = authHeader.substring(7).trim();
-    try {
-      const adminAuth = getFirebaseAdminAuth();
-      const decoded = await adminAuth.verifyIdToken(token);
-      if (decoded?.uid) {
-        authenticatedUid = decoded.uid;
-        authenticatedEmail = (decoded.email || '').toLowerCase().trim();
-        tokenVerified = true;
-      }
-    } catch (authErr) {
-      return res.status(401).json({
-        error: 'Unauthorized',
-        message: 'Invalid or expired Firebase ID token.',
-      });
-    }
-  }
-
-  // Non-test mode strictly requires valid Firebase authentication
-  const isTestOrDiag = process.env.NODE_ENV === 'test' || isDiagnosticMode() || process.env.ALLOW_MOCK_TEST_AUTH === 'true';
-  if (!tokenVerified && !isTestOrDiag) {
-    return res.status(401).json({
-      error: 'Unauthorized',
-      message: 'Authentication required: Firebase ID token is missing or unverified.',
+app.post(['/api/student-routines/start-new-week', '/api/student/reset-week'], firebaseAuthMiddleware, async (req, res) => {
+  // Reject explicit synthetic/non-canonical UIDs immediately before authorization
+  const rawBodyUid = ((req.body?.uid as string) || (req.body?.studentUid as string) || '').trim();
+  if (rawBodyUid && !isValidCanonicalUid(rawBodyUid)) {
+    return res.status(422).json({
+      success: false,
+      error: 'Unprocessable Entity',
+      message: 'Invalid or synthetic student UID rejected.',
     });
   }
 
-  const rawBodyUid = ((req.body.uid as string) || (req.body.studentUid as string) || '').trim();
-  const rawBodyEmail = ((req.body.studentEmail as string) || (req.body.email as string) || '').toLowerCase().trim();
+  const authCtx = await authorizeHomeworkChecksAccess(req, res, 'write');
+  if (!authCtx) return;
 
-  // Authoritative identity derivation:
-  // If token is authenticated, authenticatedUid & authenticatedEmail are strictly authoritative
-  const effectiveUid = authenticatedUid || (isTestOrDiag ? rawBodyUid : '');
-  const effectiveEmail = authenticatedEmail || (isTestOrDiag ? rawBodyEmail : '');
-
-  if (!effectiveUid && !effectiveEmail) {
-    return res.status(401).json({ error: 'Unauthorized', message: 'Missing valid student credentials' });
+  const { canonicalStudentUid, canonicalStudentEmail } = authCtx;
+  if (!isValidCanonicalUid(canonicalStudentUid)) {
+    return res.status(422).json({
+      success: false,
+      error: 'Unprocessable Entity',
+      message: 'Canonical Firebase Auth UID is required.',
+    });
   }
 
-  const expectedCycle = typeof req.body.expectedCycle === 'number' ? req.body.expectedCycle : undefined;
-  const attemptId = typeof req.body.attemptId === 'string' ? req.body.attemptId.trim() : '';
+  if (!getFirestoreDb()) {
+    return res.status(503).json({
+      success: false,
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
+  }
 
-  // Concurrency serialization lock per effective student
-  const lockKey = effectiveUid || effectiveEmail;
-  if (lockKey) {
-    const activeLock = inProcessCycleLocks.get(lockKey);
-    if (activeLock) {
-      try {
-        await activeLock;
-      } catch {}
-    }
+  // ARCH.2E.2D.2: Require explicit non-empty attemptId and explicit positive integer expectedCycle
+  const rawAttemptId = req.body?.attemptId;
+  if (typeof rawAttemptId !== 'string' || !rawAttemptId.trim() || rawAttemptId.trim().length > 200) {
+    return res.status(400).json({
+      success: false,
+      error: 'InvalidOrMissingAttemptId',
+      message: 'attemptId is required and must be a non-empty string.',
+    });
+  }
+  const attemptId = rawAttemptId.trim();
+
+  const rawExpected = req.body?.expectedCycle;
+  const parsedExpected =
+    typeof rawExpected === 'number'
+      ? Number.isSafeInteger(rawExpected) && rawExpected > 0
+        ? rawExpected
+        : null
+      : typeof rawExpected === 'string' &&
+        /^[1-9][0-9]*$/.test(rawExpected.trim()) &&
+        Number.isSafeInteger(Number(rawExpected.trim()))
+      ? Number(rawExpected.trim())
+      : null;
+
+  if (parsedExpected === null) {
+    return res.status(400).json({
+      success: false,
+      error: 'InvalidOrMissingExpectedCycle',
+      message: 'expectedCycle is required and must be an explicit positive integer.',
+    });
+  }
+  const expectedCycle = parsedExpected;
+
+  // Concurrency serialization lock per canonical student UID
+  const lockKey = canonicalStudentUid;
+  const activeLock = inProcessCycleLocks.get(lockKey);
+  if (activeLock) {
+    try {
+      await activeLock;
+    } catch {}
   }
 
   let releaseCycleLock!: () => void;
   const lockPromise = new Promise<void>((resolve) => {
     releaseCycleLock = resolve;
   });
-  if (lockKey) {
-    inProcessCycleLocks.set(lockKey, lockPromise);
-  }
+  inProcessCycleLocks.set(lockKey, lockPromise);
 
   try {
-    const db = readDb();
-    if (!db.cycleAttempts) db.cycleAttempts = {};
-
-    const resolved = resolveStudentIdentifiers(db, effectiveEmail, effectiveUid);
-    const targetKeys = Array.from(new Set([resolved.uid, resolved.email, effectiveEmail, effectiveUid].filter(Boolean) as string[]));
-
-    if (targetKeys.length === 0) {
-      return res.status(400).json({ error: 'Missing student identifier (email or uid)' });
-    }
-
-    const rawLevel = (req.body.level as string) || '';
+    const rawLevel = ((req.body?.level as string) || (req.body?.studentLevel as string) || '').trim();
     const weeklyStudyDaysTarget =
-      typeof req.body.weeklyStudyDaysTarget === 'number' && req.body.weeklyStudyDaysTarget >= 1 && req.body.weeklyStudyDaysTarget <= 7
+      typeof req.body?.weeklyStudyDaysTarget === 'number' &&
+      req.body.weeklyStudyDaysTarget >= 1 &&
+      req.body.weeklyStudyDaysTarget <= 7
         ? req.body.weeklyStudyDaysTarget
         : undefined;
-    const weeklyStudyDays = Array.isArray(req.body.weeklyStudyDays) ? req.body.weeklyStudyDays : undefined;
+    const VALID_DAYS: DayOfWeek[] = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+    const weeklyStudyDays: DayOfWeek[] | undefined = Array.isArray(req.body?.weeklyStudyDays)
+      ? req.body.weeklyStudyDays.filter((d: any): d is DayOfWeek => typeof d === 'string' && VALID_DAYS.includes(d as DayOfWeek))
+      : undefined;
 
-    // 2a. Idempotency Check: if exact same attemptId was already confirmed, return cached result immediately without reset
-    const primaryKey = resolved.uid || resolved.email;
-    const cachedAttempt = primaryKey ? db.cycleAttempts[primaryKey] : null;
-    if (attemptId && cachedAttempt && cachedAttempt.attemptId === attemptId && cachedAttempt.result) {
-      return res.status(200).json(cachedAttempt.result);
-    }
+    // 1. Read authoritative persisted cycle & transition state from Firestore (default)
+    let fsStatus = await fetchStudentCycleStatusFromServerFirestore(canonicalStudentUid);
+    let currentCycle = fsStatus?.currentCycle ?? 1;
 
-    // Determine current persisted cycle (Firestore is authoritative if available)
-    let currentCycle =
-      db.userProfiles?.[resolved.email]?.weeklyCycle ||
-      db.students?.find((s: any) => s.email?.toLowerCase() === resolved.email || (resolved.uid && s.uid === resolved.uid))?.weeklyCycle ||
-      1;
-
-    if (resolved.uid) {
-      const fsStatus = await fetchStudentCycleStatusFromServerFirestore(resolved.uid);
-      if (fsStatus) {
-        currentCycle = fsStatus.currentCycle;
-        if (attemptId && fsStatus.lastCycleAttemptId === attemptId && fsStatus.lastCycleResult) {
-          return res.status(200).json(fsStatus.lastCycleResult);
-        }
+    // 2. Idempotency check FIRST (before rejecting expectedCycle that became old due to this confirmed advance)
+    if (fsStatus?.lastCycleAttemptId === attemptId || fsStatus?.cycleTransition?.attemptId === attemptId) {
+      const recordedPrevCycle =
+        typeof fsStatus?.cycleTransition?.previousCycle === 'number' && fsStatus.cycleTransition.previousCycle > 0
+          ? fsStatus.cycleTransition.previousCycle
+          : null;
+      if (recordedPrevCycle !== null && expectedCycle !== recordedPrevCycle) {
+        return res.status(409).json({
+          error: 'AttemptIdCycleMismatch',
+          message: `Attempt ${attemptId} was already committed for cycle ${recordedPrevCycle}, not expectedCycle ${expectedCycle}.`,
+          expectedCycle,
+          persistedCycle: currentCycle,
+          currentCycle,
+          success: false,
+        });
       }
+
+      if (fsStatus?.cycleTransition?.status === 'pending_preparation') {
+        const recoveredPrep = await prepareNewWeeklyCycleServer({
+          uid: canonicalStudentUid,
+          studentEmail: canonicalStudentEmail || fsStatus.studentEmail,
+          targetCycle: fsStatus.cycleTransition.targetCycle || currentCycle,
+          previousCycle: fsStatus.cycleTransition.previousCycle ?? Math.max(1, currentCycle - 1),
+          attemptId,
+          weeklyStudyDaysTarget: weeklyStudyDaysTarget ?? fsStatus.weeklyStudyDaysTarget,
+          weeklyStudyDays: weeklyStudyDays && weeklyStudyDays.length > 0 ? weeklyStudyDays : fsStatus.weeklyStudyDays,
+          level: rawLevel || fsStatus.level,
+          routineVideoTime: fsStatus.routineVideoTime,
+        });
+        if (!recoveredPrep.ok) {
+          return res.status(recoveredPrep.statusCode || 500).json({
+            success: false,
+            error: recoveredPrep.code || 'CyclePreparationFailed',
+            message: recoveredPrep.error || 'Failed to finalize interrupted new week preparation.',
+            weeklyCycle: currentCycle,
+            preparationPending: true,
+            inProgress: Boolean(recoveredPrep.inProgress),
+            attemptId,
+          });
+        }
+        return res.status(200).json(recoveredPrep.result);
+      }
+
+      if (fsStatus?.lastCycleResult) {
+        return res.status(200).json(fsStatus.lastCycleResult);
+      }
+
+      return res.status(200).json({
+        success: true,
+        weeklyCycle: currentCycle,
+        previousCycle: recordedPrevCycle ?? Math.max(1, currentCycle - 1),
+        attemptId,
+        message: 'New weekly cycle already activated for this attemptId.',
+      });
     }
 
-    // 2b. Cycle conflict detection: expectedCycle vs currentCycle
-    if (expectedCycle !== undefined && currentCycle !== expectedCycle) {
+    // 3. Cycle conflict check: expectedCycle vs persisted canonical cycle
+    if (currentCycle !== expectedCycle) {
       return res.status(409).json({
         error: 'Cycle Conflict',
         message: `Expected cycle ${expectedCycle} does not match current persisted cycle ${currentCycle}.`,
@@ -7338,362 +7407,447 @@ app.post(['/api/student-routines/start-new-week', '/api/student/reset-week'], as
       });
     }
 
-    const nextCycle = currentCycle + 1;
-
-    // 2c. Multi-instance Firestore Transaction
-    if (resolved.uid) {
-      const txResult = await advanceWeeklyCycleTransactionServer(
-        resolved.uid,
-        expectedCycle,
-        attemptId,
-        nextCycle,
-        {
-          weeklyStudyDaysTarget,
-          weeklyStudyDays,
-        }
-      );
-
-      if (txResult.conflict) {
-        return res.status(409).json({
-          error: 'Cycle Conflict',
-          message: `Expected cycle ${expectedCycle} does not match current persisted cycle ${txResult.persistedCycle}.`,
-          expectedCycle,
-          persistedCycle: txResult.persistedCycle,
-          currentCycle: txResult.persistedCycle,
+    // 3b. Do not close or advance past a cycle whose own preparation is still pending
+    if (fsStatus?.cycleTransition?.status === 'pending_preparation' && fsStatus.cycleTransition.targetCycle === currentCycle) {
+      const pendingPrep = await prepareNewWeeklyCycleServer({
+        uid: canonicalStudentUid,
+        studentEmail: canonicalStudentEmail || fsStatus.studentEmail,
+        targetCycle: fsStatus.cycleTransition.targetCycle || currentCycle,
+        previousCycle: fsStatus.cycleTransition.previousCycle ?? Math.max(1, currentCycle - 1),
+        attemptId: fsStatus.cycleTransition.attemptId || undefined,
+        weeklyStudyDaysTarget: fsStatus.weeklyStudyDaysTarget,
+        weeklyStudyDays: fsStatus.weeklyStudyDays,
+        level: fsStatus.level,
+        routineVideoTime: fsStatus.routineVideoTime,
+      });
+      if (!pendingPrep.ok) {
+        return res.status(pendingPrep.statusCode || 409).json({
           success: false,
+          error: pendingPrep.code || 'CyclePreparationPending',
+          message: pendingPrep.error || 'Current cycle preparation is still pending or in progress.',
+          weeklyCycle: currentCycle,
+          preparationPending: true,
+          inProgress: Boolean(pendingPrep.inProgress),
         });
       }
-
-      if (txResult.isIdempotentReplay && cachedAttempt?.result) {
-        return res.status(200).json(cachedAttempt.result);
-      }
+      fsStatus = (await fetchStudentCycleStatusFromServerFirestore(canonicalStudentUid)) || fsStatus;
+      currentCycle = fsStatus?.currentCycle ?? currentCycle;
     }
 
-    // Persist weeklyStudyDaysTarget and weeklyStudyDays if provided
-    if (!db.weeklyStudyDaysTargets) db.weeklyStudyDaysTargets = {};
-    if (!db.weeklyStudyDays) db.weeklyStudyDays = {};
-    targetKeys.forEach((k) => {
-      if (weeklyStudyDaysTarget) db.weeklyStudyDaysTargets[k] = weeklyStudyDaysTarget;
-      if (weeklyStudyDays) db.weeklyStudyDays[k] = weeklyStudyDays;
+    // 4. Close outgoing week snapshot in users/{uid}/weeklyHistory/week-{currentCycle} BEFORE advancing cycle
+    const closeRes = await closeWeeklyHistorySnapshotServer({
+      uid: canonicalStudentUid,
+      closingCycle: currentCycle,
+      attemptId,
+      studentEmail: canonicalStudentEmail || fsStatus?.studentEmail,
+      clientWatchedVideos: Array.isArray(req.body?.watchedVideosHistory) ? req.body.watchedVideosHistory : undefined,
+      clientListenedTracks: Array.isArray(req.body?.listenedTracksHistory) ? req.body.listenedTracksHistory : undefined,
     });
-
-    if (resolved.email && db.userProfiles?.[resolved.email]) {
-      if (weeklyStudyDaysTarget) db.userProfiles[resolved.email].weeklyStudyDaysTarget = weeklyStudyDaysTarget;
-      if (weeklyStudyDays) db.userProfiles[resolved.email].weeklyStudyDays = weeklyStudyDays;
-      db.userProfiles[resolved.email].weeklyCycle = nextCycle;
-    }
-
-    if (db.students) {
-      db.students = db.students.map((s: any) => {
-        if (s.email?.toLowerCase() === resolved.email || (resolved.uid && s.uid === resolved.uid)) {
-          return {
-            ...s,
-            weeklyCycle: nextCycle,
-            weeklyStudyDaysTarget: weeklyStudyDaysTarget || s.weeklyStudyDaysTarget,
-            weeklyStudyDays: weeklyStudyDays || s.weeklyStudyDays,
-          };
-        }
-        return s;
+    if (!closeRes.ok) {
+      return res.status(closeRes.statusCode || 500).json({
+        success: false,
+        error: 'WeeklyHistoryCloseFailed',
+        message: closeRes.error || 'Failed to close weekly history before advancing cycle.',
+        currentCycle,
       });
     }
 
-    // 3. Move all currently assigned videos and tracks to consumed history, merging global watched history
-    if (!db.studentWatchedVideos) db.studentWatchedVideos = {};
-    if (!db.studentListenedTracks) db.studentListenedTracks = {};
-
-    const clientWatchedHistory: string[] = Array.isArray(req.body.watchedVideosHistory)
-      ? req.body.watchedVideosHistory
-      : [];
-
-    targetKeys.forEach((k) => {
-      if (!db.studentWatchedVideos[k]) db.studentWatchedVideos[k] = [];
-
-      clientWatchedHistory.forEach((id: string) => {
-        const vid = extractServerYouTubeId(id);
-        if (vid && !db.studentWatchedVideos[k].includes(vid)) {
-          db.studentWatchedVideos[k].push(vid);
-        }
-      });
-
-      const existingVideos = db.studentVideoAssignments?.[k] || [];
-      if (Array.isArray(existingVideos)) {
-        existingVideos.forEach((v: any) => {
-          const vid = extractServerYouTubeId(v.videoId || v.videoUrl);
-          if (vid && !db.studentWatchedVideos[k].includes(vid)) {
-            db.studentWatchedVideos[k].push(vid);
-          }
-        });
+    // 5. Transactional cycle advance in users/{uid} (marks cycleTransition.status = 'pending_preparation')
+    const txResult = await advanceWeeklyCycleTransactionServer(
+      canonicalStudentUid,
+      expectedCycle,
+      attemptId,
+      currentCycle + 1,
+      {
+        weeklyStudyDaysTarget,
+        weeklyStudyDays,
       }
-
-      const clientListenedHistory: string[] = Array.isArray(req.body.listenedTracksHistory)
-        ? req.body.listenedTracksHistory
-        : [];
-      if (!db.studentListenedTracks[k]) db.studentListenedTracks[k] = [];
-      clientListenedHistory.forEach((id: string) => {
-        const tid = extractSpotifyTrackId(id);
-        if (tid && !db.studentListenedTracks[k].includes(tid)) {
-          db.studentListenedTracks[k].push(tid);
-        }
-      });
-
-      if (db.studentVideoAssignments?.[k]) {
-        db.studentVideoAssignments[k] = [];
-      }
-      if (db.studentSpotifyAssignments?.[k]) {
-        db.studentSpotifyAssignments[k] = [];
-      }
-    });
-
-    // Reset weekly activity checks and reset routine completion/repeat flags for the new week
-    if (!db.studentWeeklyChecks) db.studentWeeklyChecks = {};
-    if (!db.studentAwaitingTopicSelection) db.studentAwaitingTopicSelection = {};
-
-    targetKeys.forEach((k) => {
-      db.studentWeeklyChecks[k] = {};
-      db.studentAwaitingTopicSelection[k] = true;
-      db.studentVideoAssignments[k] = [];
-
-      if (db.studentRoutinesMap?.[k]) {
-        Object.keys(db.studentRoutinesMap[k]).forEach((dayKey) => {
-          const dayActs = db.studentRoutinesMap[k][dayKey];
-          if (Array.isArray(dayActs)) {
-            dayActs.forEach((act: any) => {
-              act.learnedWords = [];
-              act.completed = false;
-              act.completedToday = false;
-              act.completedVideoToday = false;
-              act.completedAudioToday = false;
-              act.isRepeatVideo = false;
-              act.repeatVideo = false;
-              const isVideoAct =
-                act.id?.endsWith('1') ||
-                act.activityName?.toLowerCase().includes('vídeo') ||
-                act.activityName?.toLowerCase().includes('video') ||
-                act.activityName === 'Your Suggestion' ||
-                act.activityName === 'Sua Sugestão' ||
-                Boolean(act.playlistId) ||
-                Boolean(act.playlistTitle) ||
-                Boolean(act.isRepeatVideo) ||
-                (act.teacherVideos && act.teacherVideos.length > 0);
-              if (isVideoAct) {
-                act.activityName = 'Video of the Day';
-                act.playlistId = '';
-                act.playlistTitle = '';
-                act.teacherVideos = [];
-              }
-            });
-          }
-        });
-      }
-    });
-
-    // Ingest past listened tracks history
-    const clientListenedHistory: string[] = Array.isArray(req.body.listenedTracksHistory)
-      ? req.body.listenedTracksHistory
-      : [];
-
-    targetKeys.forEach((k) => {
-      if (!db.studentListenedTracks) db.studentListenedTracks = {};
-      if (!db.studentListenedTracks[k]) db.studentListenedTracks[k] = [];
-      clientListenedHistory.forEach((id: string) => {
-        const tid = extractSpotifyTrackId(id);
-        if (tid && !db.studentListenedTracks[k].includes(tid)) {
-          db.studentListenedTracks[k].push(tid);
-        }
-      });
-    });
-
-    // Distribute Spotify tracks for new week
-    const studentLevel = normalizeStudentLevel(rawLevel || resolveStudentLevel(db, resolved.email, resolved.uid)).key;
-    const weeklyStudyDaysList: DayOfWeek[] | undefined = Array.isArray(req.body.weeklyStudyDays)
-      ? req.body.weeklyStudyDays
-      : undefined;
-    const newTracks = await distributeWeeklySpotifyForStudent(
-      db,
-      resolved.email,
-      resolved.uid,
-      studentLevel,
-      undefined,
-      undefined,
-      weeklyStudyDaysList
     );
 
-    let newVideos: any[] = [];
-    writeDb(db);
-
-    const rawRoutines =
-      (resolved.uid && db.studentRoutinesMap?.[resolved.uid]) ||
-      (resolved.email && db.studentRoutinesMap?.[resolved.email]) ||
-      db.routinesByDay ||
-      defaultRoutinesByDay;
-
-    const routines: any = {};
-    Object.keys(rawRoutines).forEach((d) => {
-      routines[d] = (rawRoutines[d] || []).map((act: any) => {
-        const isVideoAct =
-          act.id?.endsWith('1') ||
-          act.activityName?.toLowerCase().includes('vídeo') ||
-          act.activityName?.toLowerCase().includes('video') ||
-          act.activityName === 'Your Suggestion' ||
-          act.activityName === 'Sua Sugestão' ||
-          Boolean(act.playlistId) ||
-          Boolean(act.playlistTitle) ||
-          Boolean(act.isRepeatVideo) ||
-          (act.teacherVideos && act.teacherVideos.length > 0);
-        const shouldResetVideo = isVideoAct && (!req.body.autoAssignVideos || req.body.resetTopicsToChooseTopic);
-        return {
-          ...act,
-          learnedWords: [],
-          completed: false,
-          completedToday: false,
-          completedVideoToday: false,
-          completedAudioToday: false,
-          isRepeatVideo: false,
-          repeatVideo: false,
-          ...(shouldResetVideo ? {
-            activityName: 'Video of the Day',
-            playlistId: '',
-            playlistTitle: '',
-            teacherVideos: [],
-          } : {}),
-        };
+    if (txResult.conflict) {
+      return res.status(409).json({
+        error: 'Cycle Conflict',
+        message: `Expected cycle ${expectedCycle} does not match current persisted cycle ${txResult.persistedCycle}.`,
+        expectedCycle,
+        persistedCycle: txResult.persistedCycle,
+        currentCycle: txResult.persistedCycle,
+        success: false,
       });
+    }
+
+    if (!txResult.success) {
+      return res.status(txResult.statusCode || 500).json({
+        success: false,
+        error: 'CycleAdvanceFailed',
+        message: txResult.error || 'Failed to advance weekly cycle in Firestore.',
+        currentCycle,
+      });
+    }
+
+    if (
+      txResult.isIdempotentReplay &&
+      txResult.cycleTransition?.status === 'completed' &&
+      txResult.lastCycleResult
+    ) {
+      return res.status(200).json(txResult.lastCycleResult);
+    }
+
+    // 6. Coordinated idempotent & recoverable preparation for the new weekly cycle
+    const prepRes = await prepareNewWeeklyCycleServer({
+      uid: canonicalStudentUid,
+      studentEmail: canonicalStudentEmail || fsStatus?.studentEmail,
+      targetCycle: txResult.persistedCycle,
+      previousCycle: txResult.previousCycle ?? currentCycle,
+      attemptId,
+      weeklyStudyDaysTarget: weeklyStudyDaysTarget ?? fsStatus?.weeklyStudyDaysTarget,
+      weeklyStudyDays: weeklyStudyDays && weeklyStudyDays.length > 0 ? weeklyStudyDays : fsStatus?.weeklyStudyDays,
+      level: rawLevel || fsStatus?.level,
+      routineVideoTime: fsStatus?.routineVideoTime,
     });
 
-    // 5. Cloud Firestore synchronization linked to UID
-    if (resolved.uid) {
-      try {
-        await resetDailyRoutinesForNewWeekInFirestoreServer(resolved.uid, nextCycle);
-        const watched = db.studentWatchedVideos[resolved.uid] || [];
-        for (const vidId of watched) {
-          await addWatchedVideoToUserDoc(resolved.uid, vidId);
-        }
-
-        await saveStudentAssignmentsByUid(resolved.uid, {
-          uid: resolved.uid,
-          email: resolved.email,
-          level: studentLevel,
-          weeklyCycle: nextCycle,
-          weeklyStudyDaysTarget: weeklyStudyDaysTarget || db.weeklyStudyDaysTargets?.[resolved.uid] || 7,
-          weeklyStudyDays: weeklyStudyDays || db.weeklyStudyDays?.[resolved.uid] || [],
-          videoAssignments: newVideos,
-          spotifyAssignments: newTracks,
-          routines,
-          watchedVideos: db.studentWatchedVideos[resolved.uid] || [],
-          listenedTracks: db.studentListenedTracks[resolved.uid] || [],
-          updatedAt: new Date().toISOString(),
-        });
-      } catch (e) {
-        console.warn('Firestore sync notice for start-new-week:', e);
-      }
-    }
-    saveAppStateToFirestore(db).catch(() => {});
-
-    const confirmedResult = {
-      success: true,
-      weeklyCycle: nextCycle,
-      weeklyStudyDaysTarget: weeklyStudyDaysTarget || db.weeklyStudyDaysTargets?.[resolved.email] || 7,
-      weeklyStudyDays: weeklyStudyDays || db.weeklyStudyDays?.[resolved.email] || [],
-      message: 'New weekly cycle activated successfully',
-      routines,
-      videoAssignments: newVideos,
-      spotifyAssignments: newTracks,
-      attemptId: attemptId || undefined,
-    };
-
-    if (attemptId && primaryKey) {
-      db.cycleAttempts[primaryKey] = { attemptId, result: confirmedResult };
-      if (resolved.uid) {
-        saveLastCycleResultToFirestore(resolved.uid, attemptId, confirmedResult).catch(() => {});
-      }
+    if (!prepRes.ok) {
+      return res.status(prepRes.statusCode || 500).json({
+        success: false,
+        error: prepRes.code || 'CyclePreparationFailed',
+        message: prepRes.error || 'Cycle advanced, but new week preparation failed and must be retried.',
+        weeklyCycle: txResult.persistedCycle,
+        preparationPending: true,
+        inProgress: Boolean(prepRes.inProgress),
+        attemptId,
+      });
     }
 
-    return res.json(confirmedResult);
+    return res.status(200).json(prepRes.result);
   } finally {
-    if (lockKey && inProcessCycleLocks.get(lockKey) === lockPromise) {
+    if (inProcessCycleLocks.get(lockKey) === lockPromise) {
       inProcessCycleLocks.delete(lockKey);
     }
     if (releaseCycleLock) releaseCycleLock();
   }
 });
 
-// HOTFIX 2.3.5E: Recovery endpoint to verify current cycle and attempt status
-app.get(['/api/student-routines/cycle-status', '/api/student-routines/start-new-week'], async (req, res) => {
-  let callerUid = '';
-  let callerEmail = '';
-  const authHeader = req.headers.authorization || '';
-  if (authHeader.startsWith('Bearer ')) {
-    const token = authHeader.substring(7).trim();
-    try {
-      const adminAuth = getFirebaseAdminAuth();
-      const decoded = await adminAuth.verifyIdToken(token);
-      if (decoded?.uid) {
-        callerUid = decoded.uid;
-        callerEmail = (decoded.email || '').toLowerCase().trim();
+// HOTFIX 2.3.5E / ARCH.2E.2D: Authenticated canonical recovery endpoint to verify current cycle and attempt status
+app.get(['/api/student-routines/cycle-status', '/api/student-routines/start-new-week'], firebaseAuthMiddleware, async (req, res) => {
+  const rawQueryUid = ((req.query?.studentUid as string) || (req.query?.uid as string) || '').trim();
+  if (rawQueryUid && !isValidCanonicalUid(rawQueryUid)) {
+    return res.status(422).json({
+      success: false,
+      error: 'Unprocessable Entity',
+      message: 'Invalid or synthetic student UID rejected.',
+    });
+  }
+
+  const authCtx = await authorizeStudentRoutineAccess(req, res, {
+    allowMissingTargetFallbackToCaller: true,
+    requireApprovedTeacherIfTutor: true,
+  });
+  if (!authCtx) return;
+
+  const { canonicalStudentUid, canonicalStudentEmail } = authCtx;
+  if (!isValidCanonicalUid(canonicalStudentUid)) {
+    return res.status(422).json({
+      success: false,
+      error: 'Unprocessable Entity',
+      message: 'Canonical Firebase Auth UID is required.',
+    });
+  }
+
+  const attemptId = ((req.query?.attemptId as string) || '').trim();
+  let fsStatus = await fetchStudentCycleStatusFromServerFirestore(canonicalStudentUid);
+  if (!fsStatus && !getFirestoreDb()) {
+    return res.status(503).json({
+      success: false,
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
+  }
+
+  let currentCycle = fsStatus?.currentCycle ?? 1;
+  let lastCycleAttemptId = fsStatus?.lastCycleAttemptId || '';
+  let lastCycleResult = fsStatus?.lastCycleResult || null;
+  let preparationPending = fsStatus?.cycleTransition?.status === 'pending_preparation';
+  let recoveryInProgress = false;
+  let recoveryError: string | undefined;
+
+  // Recover interrupted preparation automatically on cycle-status check (fenced + leased across instances)
+  if (preparationPending && fsStatus?.cycleTransition) {
+    const recoveryPrep = await prepareNewWeeklyCycleServer({
+      uid: canonicalStudentUid,
+      studentEmail: canonicalStudentEmail || fsStatus.studentEmail,
+      targetCycle: fsStatus.cycleTransition.targetCycle || currentCycle,
+      previousCycle: fsStatus.cycleTransition.previousCycle,
+      attemptId: fsStatus.cycleTransition.attemptId || undefined,
+      weeklyStudyDaysTarget: fsStatus.weeklyStudyDaysTarget,
+      weeklyStudyDays: fsStatus.weeklyStudyDays,
+      level: fsStatus.level,
+      routineVideoTime: fsStatus.routineVideoTime,
+    });
+    if (recoveryPrep.ok) {
+      preparationPending = false;
+      lastCycleResult = recoveryPrep.result;
+      fsStatus = (await fetchStudentCycleStatusFromServerFirestore(canonicalStudentUid)) || fsStatus;
+      currentCycle = fsStatus?.currentCycle ?? currentCycle;
+      lastCycleAttemptId = fsStatus?.lastCycleAttemptId || lastCycleAttemptId;
+    } else {
+      recoveryInProgress = Boolean(recoveryPrep.inProgress);
+      recoveryError = recoveryPrep.error;
+      const refreshedStatus = await fetchStudentCycleStatusFromServerFirestore(canonicalStudentUid);
+      if (refreshedStatus) {
+        fsStatus = refreshedStatus;
+        currentCycle = refreshedStatus.currentCycle ?? currentCycle;
+        lastCycleAttemptId = refreshedStatus.lastCycleAttemptId || lastCycleAttemptId;
+        preparationPending = refreshedStatus.cycleTransition?.status === 'pending_preparation';
+        if (!preparationPending) {
+          lastCycleResult = refreshedStatus.lastCycleResult || null;
+        }
       }
-    } catch {}
-  }
-
-  const db = readDb();
-  const queryUid = ((req.query.studentUid as string) || (req.query.uid as string) || '').trim();
-  const queryEmail = ((req.query.studentEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
-  const attemptId = ((req.query.attemptId as string) || '').trim();
-
-  const effectiveUid = callerUid || queryUid;
-  const effectiveEmail = callerEmail || queryEmail;
-
-  const resolved = resolveStudentIdentifiers(db, effectiveEmail, effectiveUid);
-  if (!resolved.uid && !resolved.email) {
-    return res.status(400).json({ error: 'Missing student identifier' });
-  }
-
-  let currentCycle =
-    db.userProfiles?.[resolved.email]?.weeklyCycle ||
-    db.students?.find((s: any) => s.email?.toLowerCase() === resolved.email || (resolved.uid && s.uid === resolved.uid))?.weeklyCycle ||
-    1;
-
-  let lastCycleAttemptId =
-    (resolved.uid && db.cycleAttempts?.[resolved.uid]?.attemptId) ||
-    (resolved.email && db.cycleAttempts?.[resolved.email]?.attemptId) ||
-    '';
-  let lastCycleResult =
-    (resolved.uid && db.cycleAttempts?.[resolved.uid]?.result) ||
-    (resolved.email && db.cycleAttempts?.[resolved.email]?.result) ||
-    null;
-
-  if (resolved.uid) {
-    const fsStatus = await fetchStudentCycleStatusFromServerFirestore(resolved.uid);
-    if (fsStatus) {
-      currentCycle = fsStatus.currentCycle;
-      if (fsStatus.lastCycleAttemptId) lastCycleAttemptId = fsStatus.lastCycleAttemptId;
-      if (fsStatus.lastCycleResult) lastCycleResult = fsStatus.lastCycleResult;
     }
   }
 
-  const rawRoutines =
-    (resolved.uid && db.studentRoutinesMap?.[resolved.uid]) ||
-    (resolved.email && db.studentRoutinesMap?.[resolved.email]) ||
-    db.routinesByDay ||
-    defaultRoutinesByDay;
+  const ctx = await fetchCanonicalRoutineContextServer(canonicalStudentUid, currentCycle);
+  const routines = lastCycleResult?.routines || createCleanStudentRoutines(fsStatus?.routineVideoTime);
+  if (!lastCycleResult?.routines && ctx?.routinesByDayRaw) {
+    for (const d of Object.keys(routines)) {
+      const rawDay = ctx.routinesByDayRaw[d];
+      if (rawDay && Array.isArray(routines[d as DayOfWeek]) && routines[d as DayOfWeek].length > 0) {
+        const first = { ...routines[d as DayOfWeek][0] };
+        if (rawDay.videoId) {
+          first.activityName = rawDay.playlistTitle || rawDay.title || first.activityName;
+          first.playlistId = rawDay.playlistId || '';
+          first.playlistTitle = rawDay.playlistTitle || '';
+          first.teacherVideos = [
+            {
+              id: rawDay.videoId,
+              videoId: rawDay.videoId,
+              title: rawDay.title || rawDay.videoTitle || 'Daily Video Practice',
+              url: rawDay.url || `https://www.youtube.com/watch?v=${rawDay.videoId}`,
+              playlistId: rawDay.playlistId || '',
+              playlistTitle: rawDay.playlistTitle || '',
+              isRepeatVideo: Boolean(rawDay.isRepeatVideo),
+              instructions: rawDay.instructions || '',
+              duration: rawDay.duration || '5-10 min',
+              addedAt: rawDay.updatedAt || new Date().toISOString(),
+            },
+          ];
+        }
+        if (Array.isArray(rawDay.learnedWords)) {
+          first.learnedWords = rawDay.learnedWords;
+        }
+        first.completedToday = Boolean(rawDay.completedToday);
+        routines[d as DayOfWeek] = [first, ...routines[d as DayOfWeek].slice(1)];
+      }
+    }
+  }
+
+  const attemptMatches = Boolean(attemptId && lastCycleAttemptId === attemptId);
+  const attemptConfirmed = attemptId ? attemptMatches && !preparationPending : undefined;
 
   return res.json({
     success: true,
-    studentUid: resolved.uid,
-    studentEmail: resolved.email,
+    studentUid: canonicalStudentUid,
+    studentEmail: canonicalStudentEmail || fsStatus?.studentEmail || '',
     currentCycle,
     weeklyCycle: currentCycle,
     lastCycleAttemptId,
-    attemptConfirmed: attemptId ? lastCycleAttemptId === attemptId : undefined,
-    lastCycleResult,
-    routines: rawRoutines,
-    weeklyStudyDaysTarget:
-      (resolved.uid && db.weeklyStudyDaysTargets?.[resolved.uid]) ||
-      (resolved.email && db.weeklyStudyDaysTargets?.[resolved.email]) ||
-      7,
-    weeklyStudyDays:
-      (resolved.uid && db.weeklyStudyDays?.[resolved.uid]) ||
-      (resolved.email && db.weeklyStudyDays?.[resolved.email]) ||
-      [],
+    attemptConfirmed,
+    preparationPending,
+    recoveryInProgress,
+    ...(recoveryError ? { recoveryError } : {}),
+    cycleTransition: fsStatus?.cycleTransition || null,
+    lastCycleResult: preparationPending ? null : lastCycleResult,
+    routines,
+    weeklyStudyDaysTarget: fsStatus?.weeklyStudyDaysTarget ?? 7,
+    weeklyStudyDays: fsStatus?.weeklyStudyDays ?? ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'],
+  });
+});
+
+// ARCH.2E.2D: Canonical Firestore (default) Weekly History Read & Record Endpoints
+app.get('/api/student-history', firebaseAuthMiddleware, async (req, res) => {
+  const rawQueryUid = ((req.query?.studentUid as string) || (req.query?.uid as string) || '').trim();
+  if (rawQueryUid && !isValidCanonicalUid(rawQueryUid)) {
+    return res.status(422).json({
+      success: false,
+      error: 'Unprocessable Entity',
+      message: 'Invalid or synthetic student UID rejected.',
+    });
+  }
+
+  const authCtx = await authorizeStudentRoutineAccess(req, res, {
+    allowMissingTargetFallbackToCaller: true,
+    requireApprovedTeacherIfTutor: true,
+  });
+  if (!authCtx) return;
+
+  if (!getFirestoreDb()) {
+    return res.status(503).json({
+      success: false,
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
+  }
+
+  const { canonicalStudentUid } = authCtx;
+  const rawWeek = req.query?.weekId || req.query?.week || req.query?.weeklyCycle;
+  const includeAll = String(req.query?.includeAll || '').toLowerCase() === 'true';
+  const includeAccumulated = String(req.query?.includeAccumulated || '').toLowerCase() === 'true';
+
+  let canonicalWeekId: string | null = null;
+  if (rawWeek !== undefined && rawWeek !== '') {
+    const cycle = extractPositiveIntegerCycle(rawWeek);
+    if (cycle === null) {
+      return res.status(400).json({
+        success: false,
+        error: 'InvalidWeekId',
+        message: 'Invalid week identifier. Expected positive integer cycle or week-{cycle}.',
+      });
+    }
+    canonicalWeekId = `week-${cycle}`;
+  }
+
+  const [weeklyHistory, allHistories, accumulated] = await Promise.all([
+    canonicalWeekId ? fetchWeeklyHistoryServer(canonicalStudentUid, canonicalWeekId) : Promise.resolve(null),
+    includeAll ? fetchAllWeeklyHistoriesServer(canonicalStudentUid) : Promise.resolve(undefined),
+    includeAccumulated ? fetchAccumulatedConsumedHistoryServer(canonicalStudentUid) : Promise.resolve(undefined),
+  ]);
+
+  return res.json({
+    success: true,
+    studentUid: canonicalStudentUid,
+    ...(canonicalWeekId ? { weekId: canonicalWeekId, weeklyHistory } : {}),
+    ...(allHistories !== undefined ? { allHistories } : {}),
+    ...(accumulated !== undefined ? { accumulated } : {}),
+  });
+});
+
+app.post('/api/student-history/record', firebaseAuthMiddleware, async (req, res) => {
+  const rawBodyUid = ((req.body?.uid as string) || (req.body?.studentUid as string) || '').trim();
+  if (rawBodyUid && !isValidCanonicalUid(rawBodyUid)) {
+    return res.status(422).json({
+      success: false,
+      error: 'Unprocessable Entity',
+      message: 'Invalid or synthetic student UID rejected.',
+    });
+  }
+
+  const authCtx = await authorizeHomeworkChecksAccess(req, res, 'write');
+  if (!authCtx) return;
+
+  if (!getFirestoreDb()) {
+    return res.status(503).json({
+      success: false,
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
+  }
+
+  const { canonicalStudentUid, canonicalStudentEmail } = authCtx;
+  const rawWeek = req.body?.weekId || req.body?.week || req.body?.weeklyCycle;
+  let cycle: number | null = extractPositiveIntegerCycle(rawWeek);
+  if (cycle === null) {
+    cycle = await resolveStudentWeeklyCycle(canonicalStudentUid, canonicalStudentEmail);
+  }
+  if (cycle === null) {
+    return res.status(400).json({
+      success: false,
+      error: 'MissingWeekId',
+      message: 'A valid positive weekId or weeklyCycle is required.',
+    });
+  }
+
+  const canonicalWeekId = `week-${cycle}`;
+  const existing = await fetchWeeklyHistoryServer(canonicalStudentUid, canonicalWeekId);
+  const fsStatus = await fetchStudentCycleStatusFromServerFirestore(canonicalStudentUid);
+  const activeCycle = fsStatus?.currentCycle ?? 1;
+
+  // Reject mutating an already closed past cycle history
+  if (cycle < activeCycle && existing?.closedAt) {
+    return res.status(409).json({
+      success: false,
+      error: 'STALE_CYCLE',
+      code: 'STALE_CYCLE',
+      activeCycle,
+      requestedCycle: cycle,
+      message: `Closed history for ${canonicalWeekId} cannot be overwritten while active cycle is ${activeCycle}.`,
+    });
+  }
+
+  const recordType = String(req.body?.type || 'merge').trim().toLowerCase();
+  const nativeFriendUid = typeof req.body?.nativeFriendUid === 'string' ? req.body.nativeFriendUid.trim() : '';
+  const payload: Record<string, any> = {
+    studentUid: canonicalStudentUid,
+    ...(canonicalStudentEmail ? { studentEmail: canonicalStudentEmail } : {}),
+    weekId: canonicalWeekId,
+    weeklyCycle: cycle,
+    ...(nativeFriendUid ? { assignedNativeFriendUID: nativeFriendUid, nativeFriendUID: nativeFriendUid } : {}),
+  };
+
+  if (recordType === 'video' && req.body?.video) {
+    const v = req.body.video;
+    const rawVid = v.videoId || v.id || v.url || '';
+    const cleanVidId = (extractServerYouTubeId(rawVid) || String(rawVid || '')).trim();
+    if (!cleanVidId) {
+      return res.status(400).json({ success: false, error: 'InvalidVideo', message: 'Missing videoId.' });
+    }
+    const cleanTitle = (v.videoTitle || v.title || 'Daily Video Practice').trim();
+    payload.consumedVideoIds = [
+      {
+        ...v,
+        id: cleanVidId,
+        videoId: cleanVidId,
+        videoTitle: cleanTitle,
+        title: cleanTitle,
+        watchedAt: v.watchedAt || new Date().toISOString(),
+      },
+    ];
+    await addWatchedVideoCanonicalServer(canonicalStudentUid, cleanVidId, cleanTitle);
+  } else if (recordType === 'track' && req.body?.track) {
+    const t = req.body.track;
+    const rawTrackId = t.trackId || t.id || t.trackUrl || t.url || '';
+    const cleanTrackId = (extractSpotifyTrackId(rawTrackId) || String(rawTrackId || '')).trim();
+    if (!cleanTrackId) {
+      return res.status(400).json({ success: false, error: 'InvalidTrack', message: 'Missing trackId.' });
+    }
+    const cleanTitle = (t.title || t.trackTitle || 'Daily Spotify Listening').trim();
+    const cleanArtist = (t.artist || t.artistOrHost || 'Spotify Artist').trim();
+    payload.consumedTrackIds = [
+      {
+        ...t,
+        id: cleanTrackId,
+        trackId: cleanTrackId,
+        title: cleanTitle,
+        artist: cleanArtist,
+        listenedAt: t.listenedAt || new Date().toISOString(),
+      },
+    ];
+    await addListenedTrackCanonicalServer(canonicalStudentUid, cleanTrackId, cleanTitle, cleanArtist);
+  } else if (recordType === 'vocabulary' && Array.isArray(req.body?.words)) {
+    payload.weeklyVocabulary = req.body.words;
+  } else if (req.body?.data && typeof req.body.data === 'object') {
+    const { closedAt: _ignoredClosedAt, closedForAttemptId: _ignoredAttempt, ...safeData } = req.body.data;
+    Object.assign(payload, safeData);
+  } else {
+    return res.status(400).json({
+      success: false,
+      error: 'InvalidPayload',
+      message: 'Unsupported history record payload.',
+    });
+  }
+
+  const saveRes = await saveWeeklyHistoryServer(canonicalStudentUid, canonicalWeekId, payload);
+  if (!saveRes.ok) {
+    return res.status(saveRes.statusCode || 500).json({
+      success: false,
+      error: 'FirestorePersistenceFailed',
+      message: saveRes.error || 'Failed to persist weekly history in Firestore.',
+    });
+  }
+
+  return res.json({
+    success: true,
+    studentUid: canonicalStudentUid,
+    weekId: canonicalWeekId,
+    weeklyCycle: cycle,
+    weeklyHistory: saveRes.data,
   });
 });
 

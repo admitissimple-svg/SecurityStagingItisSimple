@@ -3,6 +3,7 @@ import { getFirebaseAdminApp, ALLOWED_STAGING_PROJECT_ID } from './serverFirebas
 import { normalizeDictionaryWord } from './utils/studentDictionaryLibrary';
 import { isGenericPedagogicalDefinition } from './serverGeminiSecurity';
 import { isLegacyGenericTransformation } from './utils/pedagogicalTransformer';
+import { createCleanStudentRoutines } from './data/defaultRoutines';
 
 /**
  * Active identifiers for staging persistence.
@@ -2282,6 +2283,12 @@ export async function saveRoutineVideoSubcollection(
         ? Math.max(canonicalUserCycle, passedCycle ?? canonicalUserCycle)
         : (passedCycle ?? 1);
 
+    const dayRef = userRef.collection('routines').doc(cleanDay);
+    const dSnap = await withTimeout(dayRef.get(), 3500);
+    const dData = dSnap && dSnap.exists ? (dSnap.data() || {}) : null;
+    const existingDayCycle = parsePositiveCycleInternal(dData?.weeklyCycle);
+    const isMigratingFromOlderCycle = existingDayCycle !== null && existingDayCycle < targetCycle;
+
     const firstVideo = (Array.isArray(data?.teacherVideos) && data.teacherVideos.length > 0) ? data.teacherVideos[0] : null;
     const rawVidId = data?.videoId ?? firstVideo?.videoId ?? firstVideo?.id ?? data?.url ?? firstVideo?.url ?? '';
     const cleanVidId = data?.videoId === ''
@@ -2296,7 +2303,23 @@ export async function saveRoutineVideoSubcollection(
     const isRepeat = Boolean(data?.isRepeatVideo || firstVideo?.isRepeatVideo || cleanPlaylistId === 'repeat_previous_video');
     const isCustom = Boolean(data?.isCustomSuggestion || firstVideo?.isCustomSuggestion || cleanPlaylistId === 'custom_suggestion' || cleanPlaylistTitle === 'Your Suggestion' || cleanPlaylistTitle === 'Sua Sugestão');
 
+    const olderCycleResetFields = isMigratingFromOlderCycle
+      ? {
+          teacherVideos: [],
+          teacherSpotify: null,
+          teacherOverrideTrack: null,
+          teacherFeedback: null,
+          teacherNotes: '',
+          completed: false,
+          completedToday: false,
+          completedVideoToday: false,
+          completedAudioToday: false,
+          learnedWords: [],
+        }
+      : {};
+
     const sanitized = removeUndefinedFields({
+      ...olderCycleResetFields,
       ...(data && typeof data === 'object' ? data : {}),
       id: data?.id || (cleanVidId ? `vid-${cleanVidId}` : `vid-${cleanDay}`),
       videoId: cleanVidId,
@@ -2315,7 +2338,7 @@ export async function saveRoutineVideoSubcollection(
       updatedAt: data?.updatedAt || new Date().toISOString(),
     });
 
-    const savePromise = userRef.collection('routines').doc(cleanDay).set(sanitized, { merge: true }).then(() => true);
+    const savePromise = dayRef.set(sanitized, { merge: !isMigratingFromOlderCycle }).then(() => true);
     const saveResult = await withTimeout(savePromise, 4500);
     if (!saveResult) return false;
 
@@ -2703,15 +2726,44 @@ export async function saveStudentRoutineDayFieldsServer(
 
     const activeCycle = canonicalUserCycle ?? passedCycle ?? 1;
     const now = new Date().toISOString();
+    const existingDayCycle = parsePositiveCycleInternal(dData.weeklyCycle);
+    const isMigratingFromOlderCycle = existingDayCycle !== null && existingDayCycle < activeCycle;
+
+    const olderCycleDefaults = isMigratingFromOlderCycle
+      ? {
+          videoId: '',
+          title: '',
+          videoTitle: '',
+          url: '',
+          playlistId: '',
+          playlistTitle: '',
+          isRepeatVideo: false,
+          isCustomSuggestion: false,
+          teacherVideos: [],
+          teacherSpotify: null,
+          teacherOverrideTrack: null,
+          teacherFeedback: null,
+          teacherNotes: '',
+          activityId: 'act-1',
+          instructions: '',
+          duration: '',
+          completed: false,
+          completedToday: false,
+          completedVideoToday: false,
+          completedAudioToday: false,
+          learnedWords: [],
+        }
+      : {};
 
     const sanitizedFields = removeUndefinedFields({
+      ...olderCycleDefaults,
       dayOfWeek: cleanDay,
-      weeklyCycle: parsePositiveCycleInternal(dData.weeklyCycle) === activeCycle ? activeCycle : activeCycle,
+      weeklyCycle: activeCycle,
       ...fields,
       updatedAt: now,
     });
 
-    const daySaved = await withTimeout(dayRef.set(sanitizedFields, { merge: true }).then(() => true), 4500);
+    const daySaved = await withTimeout(dayRef.set(sanitizedFields, { merge: !isMigratingFromOlderCycle }).then(() => true), 4500);
     if (!daySaved) {
       return { success: false, activeCycle, error: 'Timeout saving daily routine document', code: 'WRITE_FAILED' };
     }
@@ -3651,12 +3703,14 @@ export async function resetDailyRoutinesForNewWeekInFirestoreServer(
   targetCycle: number,
   days: string[] = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
 ): Promise<boolean> {
+  if (isCloudWriteDisabled) return false;
   const db = getFirestoreDb();
   if (!db || !uid) return false;
 
   try {
     const userRef = db.collection('users').doc(uid);
     const routinesCol = userRef.collection('routines');
+    const nowIso = new Date().toISOString();
 
     const emptyRoutinesByDay: Record<string, any> = {};
 
@@ -3669,6 +3723,12 @@ export async function resetDailyRoutinesForNewWeekInFirestoreServer(
         playlistId: '',
         playlistTitle: '',
         isRepeatVideo: false,
+        isCustomSuggestion: false,
+        teacherVideos: [],
+        teacherSpotify: null,
+        teacherOverrideTrack: null,
+        teacherFeedback: null,
+        teacherNotes: '',
         dayOfWeek: day,
         activityId: 'act-1',
         instructions: '',
@@ -3679,29 +3739,34 @@ export async function resetDailyRoutinesForNewWeekInFirestoreServer(
         completedAudioToday: false,
         learnedWords: [],
         weeklyCycle: targetCycle,
-        updatedAt: new Date().toISOString(),
+        updatedAt: nowIso,
       };
       emptyRoutinesByDay[day] = resetPayload;
       return routinesCol.doc(day).set(resetPayload, { merge: true });
     });
 
-    await withTimeout(Promise.all(resetPromises), 5000);
+    const daysRes = await withTimeout(Promise.all(resetPromises).then(() => true), 5000);
+    if (!daysRes) return false;
 
-    await withTimeout(
-      userRef.set(
-        {
-          weeklyCycle: targetCycle,
-          routinesByDay: emptyRoutinesByDay,
-          updatedAt: new Date().toISOString(),
-        },
-        { merge: true }
-      ),
+    const rootRes = await withTimeout(
+      userRef
+        .set(
+          {
+            weeklyCycle: targetCycle,
+            routinesByDay: emptyRoutinesByDay,
+            updatedAt: nowIso,
+          },
+          { merge: true }
+        )
+        .then(() => true),
       3500
     );
 
-    return true;
+    return Boolean(rootRes);
   } catch (err: any) {
-    if (!isPermissionError(err)) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+    } else {
       console.warn('[serverFirestore] Error in resetDailyRoutinesForNewWeekInFirestoreServer:', err);
     }
     return false;
@@ -9557,15 +9622,63 @@ export class CycleConflictError extends Error {
   }
 }
 
+export interface CyclePreparationSteps {
+  routinesReset?: boolean;
+  routinesResetDays?: string[];
+  weeklyChecksInitialized?: boolean;
+  assignmentsCleared?: boolean;
+  weeklyHistoryInitialized?: boolean;
+}
+
+export interface CyclePreparationLease {
+  ownerId: string;
+  fencingToken: number;
+  attemptId?: string | null;
+  targetCycle: number;
+  acquiredAt: string;
+  expiresAt: string;
+  heartbeatAt?: string;
+}
+
+export class PreparationFencingError extends Error {
+  public code: string;
+  public statusCode: number;
+  constructor(code: string, message: string, statusCode = 409) {
+    super(message);
+    this.name = 'PreparationFencingError';
+    this.code = code;
+    this.statusCode = statusCode;
+  }
+}
+
+export interface CycleTransitionRecord {
+  attemptId?: string | null;
+  previousCycle: number;
+  targetCycle: number;
+  status: 'pending_preparation' | 'completed';
+  startedAt?: string;
+  completedAt?: string;
+  lastError?: string | null;
+  steps?: CyclePreparationSteps;
+  lease?: CyclePreparationLease | null;
+  fencingEpoch?: number;
+}
+
 export interface CycleStatusRecord {
   currentCycle: number;
   lastCycleAttemptId?: string;
   lastCycleResult?: any;
+  cycleTransition?: CycleTransitionRecord | null;
+  weeklyStudyDaysTarget?: number;
+  weeklyStudyDays?: string[];
+  studentEmail?: string;
+  level?: string;
+  routineVideoTime?: string;
   updatedAt?: string;
 }
 
 /**
- * HOTFIX 2.3.5E: Fetches current persisted cycle and last confirmed attempt from Firestore
+ * HOTFIX 2.3.5E / ARCH.2E.2D: Fetches current persisted cycle, transition state, and last confirmed attempt from Firestore
  */
 export async function fetchStudentCycleStatusFromServerFirestore(
   studentUid: string
@@ -9573,14 +9686,26 @@ export async function fetchStudentCycleStatusFromServerFirestore(
   const db = getFirestoreDb();
   if (!db || !studentUid) return null;
   try {
-    const userDoc = await db.collection('users').doc(studentUid).get();
-    if (!userDoc.exists) return null;
-    const d = userDoc.data();
+    const userDoc = await withTimeout(db.collection('users').doc(studentUid).get(), 4500);
+    if (!userDoc || !userDoc.exists) return null;
+    const d = userDoc.data() || {};
     return {
-      currentCycle: typeof d?.weeklyCycle === 'number' && d.weeklyCycle > 0 ? d.weeklyCycle : 1,
-      lastCycleAttemptId: d?.lastCycleAttemptId,
-      lastCycleResult: d?.lastCycleResult,
-      updatedAt: d?.updatedAt,
+      currentCycle: parsePositiveCycleFromFirestore(d.weeklyCycle) ?? 1,
+      lastCycleAttemptId: d.lastCycleAttemptId || undefined,
+      lastCycleResult: d.lastCycleResult || null,
+      cycleTransition: d.cycleTransition || null,
+      weeklyStudyDaysTarget:
+        typeof d.weeklyStudyDaysTarget === 'number' && d.weeklyStudyDaysTarget >= 1 && d.weeklyStudyDaysTarget <= 7
+          ? d.weeklyStudyDaysTarget
+          : 7,
+      weeklyStudyDays:
+        Array.isArray(d.weeklyStudyDays) && d.weeklyStudyDays.length > 0
+          ? d.weeklyStudyDays
+          : [...DEFAULT_STUDY_DAYS],
+      studentEmail: (d.email || '').toLowerCase().trim(),
+      level: (d.englishLevel || d.level || d.userLevel || 'intermediate').toString(),
+      routineVideoTime: d.routineVideoTime || undefined,
+      updatedAt: d.updatedAt,
     };
   } catch {
     return null;
@@ -9588,36 +9713,845 @@ export async function fetchStudentCycleStatusFromServerFirestore(
 }
 
 /**
- * HOTFIX 2.3.5E: Persists the confirmed cycle advance result on users/{studentUID}
+ * HOTFIX 2.3.5E / ARCH.2E.2D: Persists the confirmed cycle advance result on users/{studentUID}
  */
 export async function saveLastCycleResultToFirestore(
   studentUid: string,
   attemptId: string,
   result: any
-): Promise<void> {
+): Promise<boolean> {
   const db = getFirestoreDb();
-  if (!db || !studentUid || getIsCloudWriteDisabled()) return;
+  if (!db || !studentUid || getIsCloudWriteDisabled()) return false;
   try {
-    await db.collection('users').doc(studentUid).set(
-      {
-        lastCycleAttemptId: attemptId,
-        lastCycleResult: result,
-        updatedAt: new Date().toISOString(),
-      },
-      { merge: true }
+    const ok = await withTimeout(
+      db
+        .collection('users')
+        .doc(studentUid)
+        .set(
+          removeUndefinedFields({
+            lastCycleAttemptId: attemptId,
+            lastCycleResult: result,
+            updatedAt: new Date().toISOString(),
+          }),
+          { merge: true }
+        )
+        .then(() => true),
+      4500
     );
-  } catch {}
+    return Boolean(ok);
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      setIsCloudWriteDisabled(true);
+    }
+    return false;
+  }
 }
 
 /**
- * HOTFIX 2.3.5E: Atomically validates and commits weeklyCycle advance in Firestore using runTransaction.
- * Guarantees cross-instance protection against duplicate or concurrent cycle increments.
+ * ARCH.2E.2D: Fetches a single weeklyHistory document from users/{uid}/weeklyHistory/{weekId}
+ */
+export async function fetchWeeklyHistoryServer(
+  studentUid: string,
+  weekId: string
+): Promise<any | null> {
+  const db = getFirestoreDb();
+  if (!db || !studentUid) return null;
+  const cleanWeek = (weekId || 'week-1').trim();
+  try {
+    const snap = await withTimeout(
+      db.collection('users').doc(studentUid).collection('weeklyHistory').doc(cleanWeek).get(),
+      4500
+    );
+    if (!snap || !snap.exists) return null;
+    return snap.data() || null;
+  } catch (err: any) {
+    if (!isPermissionError(err)) {
+      console.warn('[serverFirestore] fetchWeeklyHistoryServer notice:', err);
+    }
+    return null;
+  }
+}
+
+/**
+ * ARCH.2E.2D: Fetches all weeklyHistory documents from users/{uid}/weeklyHistory
+ */
+export async function fetchAllWeeklyHistoriesServer(studentUid: string): Promise<any[]> {
+  const db = getFirestoreDb();
+  if (!db || !studentUid) return [];
+  try {
+    const snap = await withTimeout(
+      db.collection('users').doc(studentUid).collection('weeklyHistory').get(),
+      4500
+    );
+    if (!snap || snap.empty) return [];
+    const list: any[] = [];
+    snap.forEach((docSnap: any) => {
+      const data = docSnap.data();
+      if (data) {
+        list.push({
+          ...data,
+          weekId: data.weekId || docSnap.id,
+          studentUid: data.studentUid || studentUid,
+        });
+      }
+    });
+    list.sort((a, b) => {
+      const ca = parsePositiveCycleFromFirestore(a.weeklyCycle ?? a.weekId) ?? 0;
+      const cb = parsePositiveCycleFromFirestore(b.weeklyCycle ?? b.weekId) ?? 0;
+      return ca - cb;
+    });
+    return list;
+  } catch (err: any) {
+    if (!isPermissionError(err)) {
+      console.warn('[serverFirestore] fetchAllWeeklyHistoriesServer notice:', err);
+    }
+    return [];
+  }
+}
+
+function mergeConsumedVideos(existing: any[] = [], incoming: any[] = []): any[] {
+  const byId = new Map<string, any>();
+  const orderedKeys: string[] = [];
+  const ingest = (item: any) => {
+    if (!item || typeof item !== 'object') return;
+    const rawId = item.videoId || item.id || item.url || '';
+    const cleanId = (extractYouTubeIdInternal(rawId) || String(rawId || '')).trim();
+    if (!cleanId) return;
+    const key = cleanId.toLowerCase();
+    const prev = byId.get(key);
+    const normalized = {
+      ...(prev || {}),
+      ...item,
+      id: cleanId,
+      videoId: cleanId,
+      videoTitle: (item.videoTitle || item.title || prev?.videoTitle || prev?.title || 'Daily Video Practice').trim(),
+      title: (item.title || item.videoTitle || prev?.title || prev?.videoTitle || 'Daily Video Practice').trim(),
+    };
+    if (!prev) orderedKeys.push(key);
+    byId.set(key, normalized);
+  };
+  existing.forEach(ingest);
+  incoming.forEach(ingest);
+  return orderedKeys.map((k) => byId.get(k));
+}
+
+function mergeConsumedTracks(existing: any[] = [], incoming: any[] = []): any[] {
+  const byId = new Map<string, any>();
+  const orderedKeys: string[] = [];
+  const ingest = (item: any) => {
+    if (!item || typeof item !== 'object') return;
+    const rawId = item.trackId || item.id || item.trackUrl || item.url || '';
+    const cleanId = (extractSpotifyTrackIdInternal(rawId) || String(rawId || '')).trim();
+    if (!cleanId) return;
+    const key = cleanId.toLowerCase();
+    const prev = byId.get(key);
+    const normalized = {
+      ...(prev || {}),
+      ...item,
+      id: cleanId,
+      trackId: cleanId,
+      title: (item.title || item.trackTitle || prev?.title || prev?.trackTitle || 'Daily Track').trim(),
+      artist: (item.artist || item.artistOrHost || prev?.artist || prev?.artistOrHost || 'Spotify Artist').trim(),
+    };
+    if (!prev) orderedKeys.push(key);
+    byId.set(key, normalized);
+  };
+  existing.forEach(ingest);
+  incoming.forEach(ingest);
+  return orderedKeys.map((k) => byId.get(k));
+}
+
+function mergeWeeklyVocabularyItems(existing: any[] = [], incoming: any[] = []): any[] {
+  const byWord = new Map<string, any>();
+  const orderedKeys: string[] = [];
+  const ingest = (item: any) => {
+    if (!item) return;
+    const rawWord = typeof item === 'string' ? item : item.word || '';
+    const cleanWord = String(rawWord || '').trim();
+    if (!cleanWord) return;
+    const key = cleanWord.toLowerCase();
+    const prev = byWord.get(key);
+    const itemObj = typeof item === 'string' ? { word: cleanWord } : item;
+    const normalized = {
+      ...(prev || {}),
+      ...itemObj,
+      word: cleanWord,
+    };
+    if (!prev) orderedKeys.push(key);
+    byWord.set(key, normalized);
+  };
+  existing.forEach(ingest);
+  incoming.forEach(ingest);
+  return orderedKeys.map((k) => byWord.get(k));
+}
+
+/**
+ * ARCH.2E.2D: Safe merge write to users/{uid}/weeklyHistory/{weekId}
+ */
+export async function saveWeeklyHistoryServer(
+  studentUid: string,
+  weekId: string,
+  data: Partial<Record<string, any>>,
+  options?: { createOnlyIfMissing?: boolean; skipIfClosed?: boolean }
+): Promise<{ ok: boolean; skipped?: boolean; data?: any; error?: string; statusCode?: number }> {
+  if (getIsCloudWriteDisabled()) {
+    return { ok: false, statusCode: 500, error: 'Firestore cloud writes disabled by IAM.' };
+  }
+  const db = getFirestoreDb();
+  if (!db || !studentUid) {
+    return { ok: false, statusCode: 503, error: 'Canonical Firestore database unavailable.' };
+  }
+
+  const cleanWeek = (weekId || 'week-1').trim();
+  const parsedCycle = parsePositiveCycleFromFirestore(data.weeklyCycle ?? cleanWeek) ?? 1;
+  const docRef = db.collection('users').doc(studentUid).collection('weeklyHistory').doc(cleanWeek);
+
+  try {
+    const existingSnap = await withTimeout(docRef.get(), 4500);
+    const existing = existingSnap && existingSnap.exists ? (existingSnap.data() || {}) : null;
+
+    if (options?.createOnlyIfMissing && existing) {
+      return { ok: true, skipped: true, data: existing };
+    }
+
+    if (existing?.closedAt) {
+      if (options?.skipIfClosed) {
+        return { ok: true, skipped: true, data: existing };
+      }
+      return {
+        ok: false,
+        statusCode: 409,
+        error: `Weekly history ${cleanWeek} is already closed and cannot be overwritten.`,
+      };
+    }
+
+    const nowIso = new Date().toISOString();
+    const mergedVideos = mergeConsumedVideos(
+      Array.isArray(existing?.consumedVideoIds) ? existing.consumedVideoIds : [],
+      Array.isArray(data.consumedVideoIds) ? data.consumedVideoIds : []
+    );
+    const mergedTracks = mergeConsumedTracks(
+      Array.isArray(existing?.consumedTrackIds) ? existing.consumedTrackIds : [],
+      Array.isArray(data.consumedTrackIds) ? data.consumedTrackIds : []
+    );
+    const mergedVocab = mergeWeeklyVocabularyItems(
+      Array.isArray(existing?.weeklyVocabulary) ? existing.weeklyVocabulary : [],
+      Array.isArray(data.weeklyVocabulary) ? data.weeklyVocabulary : []
+    );
+
+    const payload = removeUndefinedFields({
+      ...(existing || {}),
+      ...data,
+      studentUid,
+      weekId: cleanWeek,
+      weeklyCycle: parsedCycle,
+      consumedVideoIds: mergedVideos,
+      consumedTrackIds: mergedTracks,
+      weeklyVocabulary: mergedVocab,
+      ...(existing?.weeklyChecks || data.weeklyChecks
+        ? { weeklyChecks: { ...(existing?.weeklyChecks || {}), ...(data.weeklyChecks || {}) } }
+        : {}),
+      ...(existing?.activitiesSnapshot || data.activitiesSnapshot
+        ? { activitiesSnapshot: { ...(existing?.activitiesSnapshot || {}), ...(data.activitiesSnapshot || {}) } }
+        : {}),
+      updatedAt: nowIso,
+    });
+
+    const saved = await withTimeout(docRef.set(payload, { merge: true }).then(() => true), 4500);
+    if (!saved) {
+      return { ok: false, statusCode: 500, error: 'Failed to persist weeklyHistory in Firestore.' };
+    }
+    return { ok: true, data: payload };
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      setIsCloudWriteDisabled(true);
+    }
+    console.warn('[serverFirestore] saveWeeklyHistoryServer error:', err);
+    return { ok: false, statusCode: 500, error: err?.message || 'Firestore write failed.' };
+  }
+}
+
+/**
+ * ARCH.2E.2D: Fetches accumulated consumed video IDs, track IDs, and vocabulary from canonical Firestore (default) ONLY.
+ */
+export async function fetchAccumulatedConsumedHistoryServer(studentUid: string): Promise<{
+  videoIds: string[];
+  trackIds: string[];
+  allVideos: any[];
+  allTracks: any[];
+  allVocabulary: any[];
+}> {
+  const db = getFirestoreDb();
+  if (!db || !studentUid) {
+    return { videoIds: [], trackIds: [], allVideos: [], allTracks: [], allVocabulary: [] };
+  }
+
+  const videoSet = new Set<string>();
+  const trackSet = new Set<string>();
+  let allVideos: any[] = [];
+  let allTracks: any[] = [];
+  let allVocabulary: any[] = [];
+
+  try {
+    const [histories, userSnap, assignSnap] = await Promise.all([
+      fetchAllWeeklyHistoriesServer(studentUid),
+      withTimeout(db.collection('users').doc(studentUid).get(), 4500).catch(() => null),
+      withTimeout(db.collection('student_assignments').doc(studentUid).get(), 4500).catch(() => null),
+    ]);
+
+    for (const hist of histories) {
+      if (Array.isArray(hist.consumedVideoIds)) {
+        allVideos = mergeConsumedVideos(allVideos, hist.consumedVideoIds);
+        for (const v of hist.consumedVideoIds) {
+          const clean = (extractYouTubeIdInternal(v?.videoId || v?.id || v?.url || '') || v?.videoId || v?.id || '').trim();
+          if (clean) videoSet.add(clean);
+        }
+      }
+      if (Array.isArray(hist.consumedTrackIds)) {
+        allTracks = mergeConsumedTracks(allTracks, hist.consumedTrackIds);
+        for (const t of hist.consumedTrackIds) {
+          const clean = (extractSpotifyTrackIdInternal(t?.trackId || t?.id || t?.url || '') || t?.trackId || t?.id || '').trim();
+          if (clean) trackSet.add(clean);
+        }
+      }
+      if (Array.isArray(hist.weeklyVocabulary)) {
+        allVocabulary = mergeWeeklyVocabularyItems(allVocabulary, hist.weeklyVocabulary);
+      }
+    }
+
+    const uData = userSnap && userSnap.exists ? (userSnap.data() || {}) : {};
+    const aData = assignSnap && assignSnap.exists ? (assignSnap.data() || {}) : {};
+
+    if (Array.isArray(uData.studentJournal)) {
+      for (const entry of uData.studentJournal) {
+        if (!entry || !entry.id) continue;
+        if (entry.type === 'video') {
+          const vid = (extractYouTubeIdInternal(entry.id || entry.url || '') || String(entry.id)).trim();
+          if (vid) {
+            videoSet.add(vid);
+            allVideos = mergeConsumedVideos(allVideos, [
+              {
+                id: vid,
+                videoId: vid,
+                videoTitle: entry.title || 'Daily Routine Video',
+                title: entry.title || 'Daily Routine Video',
+                watchedAt: (entry.timestamp ? new Date(entry.timestamp).toISOString() : entry.date) || '',
+                dayOfWeek: entry.dayOfWeek,
+              },
+            ]);
+          }
+        } else if (entry.type === 'audio') {
+          const tid = (extractSpotifyTrackIdInternal(entry.id || entry.url || '') || String(entry.id)).trim();
+          if (tid) {
+            trackSet.add(tid);
+            allTracks = mergeConsumedTracks(allTracks, [
+              {
+                id: tid,
+                trackId: tid,
+                title: entry.title || 'Daily Track',
+                artist: entry.artist || 'Spotify Artist',
+                listenedAt: (entry.timestamp ? new Date(entry.timestamp).toISOString() : entry.date) || '',
+                dayOfWeek: entry.dayOfWeek,
+                url: entry.url || '',
+              },
+            ]);
+          }
+        }
+      }
+    }
+
+    const watchedSources = [
+      ...(Array.isArray(uData.watchedVideosHistory) ? uData.watchedVideosHistory : []),
+      ...(Array.isArray(uData.watchedVideos) ? uData.watchedVideos : []),
+      ...(Array.isArray(aData.watchedVideos) ? aData.watchedVideos : []),
+    ];
+    for (const item of watchedSources) {
+      const raw = typeof item === 'string' ? item : item?.videoId || item?.id || item?.url || '';
+      const vid = (extractYouTubeIdInternal(raw) || String(raw || '')).trim();
+      if (vid) {
+        videoSet.add(vid);
+        if (!allVideos.some((v) => (v.videoId || v.id || '').toLowerCase() === vid.toLowerCase())) {
+          allVideos = mergeConsumedVideos(allVideos, [
+            {
+              id: vid,
+              videoId: vid,
+              videoTitle: (typeof item === 'object' && (item.videoTitle || item.title)) || 'Daily Video Practice',
+              title: (typeof item === 'object' && (item.title || item.videoTitle)) || 'Daily Video Practice',
+              watchedAt: (typeof item === 'object' && item.watchedAt) || '',
+            },
+          ]);
+        }
+      }
+    }
+
+    const listenedSources = [
+      ...(Array.isArray(uData.listenedTracksHistory) ? uData.listenedTracksHistory : []),
+      ...(Array.isArray(uData.listenedTracks) ? uData.listenedTracks : []),
+      ...(Array.isArray(aData.listenedTracks) ? aData.listenedTracks : []),
+    ];
+    for (const item of listenedSources) {
+      const raw = typeof item === 'string' ? item : item?.trackId || item?.id || item?.trackUrl || item?.url || '';
+      const tid = (extractSpotifyTrackIdInternal(raw) || String(raw || '')).trim();
+      if (tid) {
+        trackSet.add(tid);
+        if (!allTracks.some((t) => (t.trackId || t.id || '').toLowerCase() === tid.toLowerCase())) {
+          allTracks = mergeConsumedTracks(allTracks, [
+            {
+              id: tid,
+              trackId: tid,
+              title: (typeof item === 'object' && (item.title || item.trackTitle)) || 'Daily Spotify Listening',
+              artist: (typeof item === 'object' && (item.artist || item.artistOrHost)) || 'Spotify Artist',
+              listenedAt: (typeof item === 'object' && item.listenedAt) || '',
+            },
+          ]);
+        }
+      }
+    }
+  } catch (err: any) {
+    if (!isPermissionError(err)) {
+      console.warn('[serverFirestore] fetchAccumulatedConsumedHistoryServer notice:', err);
+    }
+  }
+
+  return {
+    videoIds: Array.from(videoSet),
+    trackIds: Array.from(trackSet),
+    allVideos,
+    allTracks,
+    allVocabulary,
+  };
+}
+
+/**
+ * ARCH.2E.2D: Closes the outgoing cycle snapshot in users/{uid}/weeklyHistory/week-{closingCycle}
+ * BEFORE advancing weeklyCycle.
+ * - Preserves existing videos, tracks, activities, checks, and homework summary.
+ * - Never invents completed activities.
+ * - Never overwrites past closed histories.
+ * - Never deletes or modifies Homework.
+ */
+export async function closeWeeklyHistorySnapshotServer(params: {
+  uid: string;
+  closingCycle: number;
+  attemptId?: string;
+  studentEmail?: string;
+  clientWatchedVideos?: string[];
+  clientListenedTracks?: string[];
+}): Promise<{ ok: boolean; alreadyClosed?: boolean; history?: any; error?: string; statusCode?: number }> {
+  if (getIsCloudWriteDisabled()) {
+    return { ok: false, statusCode: 500, error: 'Firestore writes disabled by IAM.' };
+  }
+  const db = getFirestoreDb();
+  if (!db || !params.uid) {
+    return { ok: false, statusCode: 503, error: 'Canonical Firestore database unavailable.' };
+  }
+
+  const { uid, closingCycle, attemptId, studentEmail } = params;
+  const weekId = `week-${closingCycle}`;
+  const userRef = db.collection('users').doc(uid);
+
+  try {
+    const [userSnap, routinesSnap, assignSnap, checksCtx, hwSnap, historySnap] = await Promise.all([
+      withTimeout(userRef.get(), 4500),
+      withTimeout(userRef.collection('routines').get(), 4500),
+      withTimeout(db.collection('student_assignments').doc(uid).get(), 4500),
+      fetchCanonicalWeeklyChecksServer(uid, weekId, closingCycle),
+      withTimeout(userRef.collection('homework').doc(weekId).get(), 4500),
+      withTimeout(userRef.collection('weeklyHistory').doc(weekId).get(), 4500),
+    ]);
+
+    const uData = userSnap && userSnap.exists ? (userSnap.data() || {}) : {};
+    const aData = assignSnap && assignSnap.exists ? (assignSnap.data() || {}) : {};
+    const existingHistory = historySnap && historySnap.exists ? (historySnap.data() || {}) : null;
+    const hwData = hwSnap && hwSnap.exists ? (hwSnap.data() || {}) : null;
+
+    const currentPersistedCycle = parsePositiveCycleFromFirestore(uData.weeklyCycle) ?? 1;
+
+    // Never reopen or overwrite an already closed history snapshot
+    if (existingHistory?.closedAt) {
+      return { ok: true, alreadyClosed: true, history: existingHistory };
+    }
+    if (currentPersistedCycle > closingCycle && existingHistory) {
+      return { ok: true, alreadyClosed: true, history: existingHistory };
+    }
+
+    const nowIso = new Date().toISOString();
+    const checksMap: Record<string, boolean> = checksCtx?.checks ? { ...checksCtx.checks } : {};
+    const watchedHistoryIds = new Set<string>();
+    const addWatchedId = (raw: any) => {
+      const s = typeof raw === 'string' ? raw : raw?.videoId || raw?.id || raw?.url || '';
+      const clean = (extractYouTubeIdInternal(s) || String(s || '')).trim();
+      if (clean) watchedHistoryIds.add(clean);
+    };
+    (Array.isArray(uData.watchedVideosHistory) ? uData.watchedVideosHistory : []).forEach(addWatchedId);
+    (Array.isArray(uData.watchedVideos) ? uData.watchedVideos : []).forEach(addWatchedId);
+    (Array.isArray(aData.watchedVideos) ? aData.watchedVideos : []).forEach(addWatchedId);
+
+    const listenedHistoryIds = new Set<string>();
+    const addListenedId = (raw: any) => {
+      const s = typeof raw === 'string' ? raw : raw?.trackId || raw?.id || raw?.trackUrl || raw?.url || '';
+      const clean = (extractSpotifyTrackIdInternal(s) || String(s || '')).trim();
+      if (clean) listenedHistoryIds.add(clean);
+    };
+    (Array.isArray(uData.listenedTracksHistory) ? uData.listenedTracksHistory : []).forEach(addListenedId);
+    (Array.isArray(uData.listenedTracks) ? uData.listenedTracks : []).forEach(addListenedId);
+    (Array.isArray(aData.listenedTracks) ? aData.listenedTracks : []).forEach(addListenedId);
+
+    // Collect day routines belonging strictly to closingCycle
+    const dayRoutinesMap: Record<string, any> = {};
+    if (uData.routinesByDay && typeof uData.routinesByDay === 'object') {
+      for (const [day, r] of Object.entries(uData.routinesByDay)) {
+        if (!r || typeof r !== 'object') continue;
+        const rCycle = parsePositiveCycleFromFirestore((r as any).weeklyCycle);
+        if (rCycle === null || rCycle === closingCycle) {
+          dayRoutinesMap[day] = { ...(r as any), dayOfWeek: day };
+        }
+      }
+    }
+    if (routinesSnap && !routinesSnap.empty) {
+      routinesSnap.forEach((docSnap: any) => {
+        const d = docSnap.data();
+        if (!d) return;
+        const rCycle = parsePositiveCycleFromFirestore(d.weeklyCycle);
+        if (rCycle === null || rCycle === closingCycle) {
+          dayRoutinesMap[docSnap.id] = { ...(dayRoutinesMap[docSnap.id] || {}), ...d, dayOfWeek: docSnap.id };
+        }
+      });
+    }
+
+    const collectedVideos: any[] = [];
+    const collectedTracks: any[] = [];
+    const collectedVocab: any[] = [];
+    const activitiesSnapshot: Record<string, any> = {};
+    const wordsToSaveToDictionary: any[] = [];
+
+    // 1. Journal entries explicitly belonging to closingCycle
+    const journal = Array.isArray(uData.studentJournal) ? uData.studentJournal : [];
+    for (const entry of journal) {
+      if (!entry || !entry.id) continue;
+      const entryWeek = parsePositiveCycleFromFirestore(entry.week);
+      const belongsToCycle = entryWeek !== null ? entryWeek === closingCycle : closingCycle === 1;
+      if (!belongsToCycle) continue;
+
+      if (entry.type === 'video') {
+        const vid = (extractYouTubeIdInternal(entry.id || entry.url || '') || String(entry.id)).trim();
+        if (vid) {
+          watchedHistoryIds.add(vid);
+          collectedVideos.push({
+            id: vid,
+            videoId: vid,
+            videoTitle: entry.title || 'Daily Routine Video',
+            title: entry.title || 'Daily Routine Video',
+            watchedAt: (entry.timestamp ? new Date(entry.timestamp).toISOString() : entry.date) || nowIso,
+            dayOfWeek: entry.dayOfWeek,
+            url: entry.url || `https://www.youtube.com/watch?v=${vid}`,
+          });
+        }
+      } else if (entry.type === 'audio') {
+        const tid = (extractSpotifyTrackIdInternal(entry.id || entry.url || '') || String(entry.id)).trim();
+        if (tid) {
+          listenedHistoryIds.add(tid);
+          collectedTracks.push({
+            id: tid,
+            trackId: tid,
+            title: entry.title || 'Daily Track',
+            artist: entry.artist || 'Spotify Artist',
+            listenedAt: (entry.timestamp ? new Date(entry.timestamp).toISOString() : entry.date) || nowIso,
+            dayOfWeek: entry.dayOfWeek,
+            url: entry.url || '',
+          });
+        }
+      }
+    }
+
+    // 2. Routine day snapshots (strictly preserving real completions — never inventing completions)
+    for (const day of DEFAULT_STUDY_DAYS) {
+      const r = dayRoutinesMap[day];
+      if (!r) continue;
+
+      const rawVid = r.videoId || (Array.isArray(r.teacherVideos) && r.teacherVideos[0]?.videoId) || (Array.isArray(r.teacherVideos) && r.teacherVideos[0]?.url) || r.url || '';
+      const cleanVid = (extractYouTubeIdInternal(rawVid) || (typeof r.videoId === 'string' ? r.videoId : '')).trim();
+      const videoCompleted = Boolean(r.completedVideoToday || r.completedToday || r.completed || checksMap[`video_day_${day}`]);
+
+      const spot = r.teacherSpotify && typeof r.teacherSpotify === 'object' ? r.teacherSpotify : null;
+      const spotRawId = spot ? (spot.trackId || spot.id || spot.url || spot.trackUrl || '') : '';
+      const cleanTrackId = spotRawId ? (extractSpotifyTrackIdInternal(spotRawId) || String(spotRawId)).trim() : '';
+      const audioCompleted = Boolean(r.completedAudioToday || checksMap[`audio_day_${day}`]);
+
+      const dayWords: string[] = Array.isArray(r.learnedWords)
+        ? r.learnedWords.map((w: any) => String(w || '').trim()).filter(Boolean)
+        : [];
+
+      if (cleanVid && (videoCompleted || watchedHistoryIds.has(cleanVid))) {
+        watchedHistoryIds.add(cleanVid);
+        collectedVideos.push({
+          id: cleanVid,
+          videoId: cleanVid,
+          videoTitle: r.videoTitle || r.title || 'Daily Video Practice',
+          title: r.title || r.videoTitle || 'Daily Video Practice',
+          watchedAt: r.updatedAt || nowIso,
+          dayOfWeek: day,
+          url: r.url || `https://www.youtube.com/watch?v=${cleanVid}`,
+        });
+      }
+
+      if (cleanTrackId && (audioCompleted || listenedHistoryIds.has(cleanTrackId))) {
+        listenedHistoryIds.add(cleanTrackId);
+        collectedTracks.push({
+          id: cleanTrackId,
+          trackId: cleanTrackId,
+          title: spot?.title || spot?.trackTitle || 'Daily Track',
+          artist: spot?.artistOrHost || spot?.artist || 'Spotify Artist',
+          listenedAt: r.updatedAt || nowIso,
+          dayOfWeek: day,
+          url: spot?.url || spot?.trackUrl || '',
+        });
+      }
+
+      dayWords.forEach((word) => {
+        collectedVocab.push({
+          word,
+          definitionEn: '',
+          translationPt: '',
+          learnedAt: r.updatedAt || nowIso,
+          sourceDay: day,
+        });
+        wordsToSaveToDictionary.push({
+          id: `routine_${normalizeDictionaryWord(word).replace(/[^a-zA-Z0-9_-]/g, '_')}_c${closingCycle}`,
+          word,
+          originalWord: word,
+          normalizedWord: normalizeDictionaryWord(word),
+          learnedAt: r.updatedAt || nowIso,
+          source: 'routine',
+          sourceActivityName: `${r.playlistTitle || r.title || 'Daily Routine'} (${day})`,
+          sourceDay: day,
+          routineRef: { day, activityName: r.playlistTitle || r.title || 'Video of the Day', activityId: r.activityId || 'act-1' },
+        });
+      });
+
+      if (cleanVid || cleanTrackId || dayWords.length > 0 || videoCompleted || audioCompleted) {
+        activitiesSnapshot[day] = removeUndefinedFields({
+          dayOfWeek: day,
+          videoId: cleanVid || '',
+          videoTitle: cleanVid ? (r.videoTitle || r.title || '') : '',
+          playlistId: r.playlistId || '',
+          playlistTitle: r.playlistTitle || '',
+          videoCompleted,
+          audioTrackId: cleanTrackId || '',
+          audioTitle: cleanTrackId ? (spot?.title || spot?.trackTitle || '') : '',
+          audioCompleted,
+          learnedWords: dayWords,
+        });
+      }
+    }
+
+    // 3. Also check spotifyAssignments belonging to closingCycle ONLY if already completed/listened
+    if (Array.isArray(aData.spotifyAssignments)) {
+      for (const sa of aData.spotifyAssignments) {
+        if (!sa || typeof sa !== 'object') continue;
+        const saCycle = parsePositiveCycleFromFirestore(sa.weeklyCycle);
+        if (saCycle !== null && saCycle !== closingCycle) continue;
+        const tid = (extractSpotifyTrackIdInternal(sa.trackId || sa.id || sa.trackUrl || sa.url || '') || '').trim();
+        const day = (sa.day || sa.dayOfWeek || '').toLowerCase().trim();
+        if (tid && (listenedHistoryIds.has(tid) || (day && checksMap[`audio_day_${day}`]))) {
+          listenedHistoryIds.add(tid);
+          collectedTracks.push({
+            id: tid,
+            trackId: tid,
+            title: sa.trackTitle || sa.title || 'Daily Track',
+            artist: sa.artistOrHost || sa.artist || 'Spotify Artist',
+            listenedAt: sa.listenedAt || nowIso,
+            dayOfWeek: day || undefined,
+            url: sa.trackUrl || sa.url || '',
+          });
+        }
+      }
+    }
+
+    // 4. Preserve client-provided watched/listened exclusivity hints ONLY into exclusivity sets (not as fake completions in history)
+    if (Array.isArray(params.clientWatchedVideos)) {
+      params.clientWatchedVideos.forEach((raw) => {
+        const clean = (extractYouTubeIdInternal(raw) || String(raw || '')).trim();
+        if (clean) watchedHistoryIds.add(clean);
+      });
+    }
+    if (Array.isArray(params.clientListenedTracks)) {
+      params.clientListenedTracks.forEach((raw) => {
+        const clean = (extractSpotifyTrackIdInternal(raw) || String(raw || '')).trim();
+        if (clean) listenedHistoryIds.add(clean);
+      });
+    }
+
+    // 5. Read-only Homework summary (NEVER deletes or modifies homework)
+    const homeworkProgress = hwData
+      ? removeUndefinedFields({
+          hasHomework: true,
+          isCompleted: Boolean(hwData.isCompleted),
+          score: typeof hwData.score === 'number' ? hwData.score : undefined,
+          totalWordsCollected:
+            typeof hwData.totalWordsCollected === 'number'
+              ? hwData.totalWordsCollected
+              : Array.isArray(hwData.vocabularyList)
+              ? hwData.vocabularyList.length
+              : 0,
+          completedPartsByDay: hwData.completedPartsByDay || {},
+          submittedAt: hwData.submittedAt || null,
+        })
+      : null;
+
+    const assignedTeacherUid = uData.assignedNativeFriendUID || uData.nativeFriendUID || uData.teacherUid || undefined;
+    const resolvedEmail = (studentEmail || uData.email || '').toLowerCase().trim();
+
+    const histRef = userRef.collection('weeklyHistory').doc(weekId);
+    const closeTxResult = await withTimeout(
+      db.runTransaction(async (tx) => {
+        const [uTxSnap, hTxSnap] = await Promise.all([tx.get(userRef), tx.get(histRef)]);
+        const existingTx = hTxSnap && hTxSnap.exists ? (hTxSnap.data() || {}) : null;
+        if (existingTx?.closedAt) {
+          return { ok: true, alreadyClosed: true, data: existingTx };
+        }
+        const txPersistedCycle = parsePositiveCycleFromFirestore(uTxSnap?.data()?.weeklyCycle) ?? 1;
+        if (txPersistedCycle > closingCycle && existingTx) {
+          return { ok: true, alreadyClosed: true, data: existingTx };
+        }
+
+        const mergedVideos = mergeConsumedVideos(
+          Array.isArray(existingTx?.consumedVideoIds) ? existingTx.consumedVideoIds : [],
+          collectedVideos
+        );
+        const mergedTracks = mergeConsumedTracks(
+          Array.isArray(existingTx?.consumedTrackIds) ? existingTx.consumedTrackIds : [],
+          collectedTracks
+        );
+        const mergedVocab = mergeWeeklyVocabularyItems(
+          Array.isArray(existingTx?.weeklyVocabulary) ? existingTx.weeklyVocabulary : [],
+          collectedVocab
+        );
+
+        const histPayload = removeUndefinedFields({
+          ...(existingTx || {}),
+          studentUid: uid,
+          ...(resolvedEmail ? { studentEmail: resolvedEmail } : {}),
+          ...(assignedTeacherUid ? { assignedNativeFriendUID: assignedTeacherUid, nativeFriendUID: assignedTeacherUid } : {}),
+          weekId,
+          weeklyCycle: closingCycle,
+          consumedVideoIds: mergedVideos,
+          consumedTrackIds: mergedTracks,
+          weeklyVocabulary: mergedVocab,
+          weeklyChecks: { ...(existingTx?.weeklyChecks || {}), ...checksMap },
+          homeworkProgress,
+          activitiesSnapshot: { ...(existingTx?.activitiesSnapshot || {}), ...activitiesSnapshot },
+          weeklyStudyDaysTarget: checksCtx?.weeklyStudyDaysTarget || uData.weeklyStudyDaysTarget || 7,
+          weeklyStudyDays: checksCtx?.weeklyStudyDays || uData.weeklyStudyDays || [...DEFAULT_STUDY_DAYS],
+          closedAt: nowIso,
+          closedForAttemptId: attemptId || existingTx?.closedForAttemptId || null,
+          updatedAt: nowIso,
+        });
+
+        tx.set(histRef, histPayload, { merge: true });
+        return { ok: true, alreadyClosed: false, data: histPayload };
+      }),
+      4500
+    );
+
+    if (!closeTxResult || !closeTxResult.ok) {
+      return { ok: false, statusCode: 500, error: 'Failed to persist weeklyHistory snapshot.' };
+    }
+    if (closeTxResult.alreadyClosed) {
+      return { ok: true, alreadyClosed: true, history: closeTxResult.data };
+    }
+    const saveRes = { ok: true, data: closeTxResult.data };
+
+    // Preserve genuinely learned routine words in My Dictionary if present
+    if (wordsToSaveToDictionary.length > 0) {
+      try {
+        await saveStudentVocabularyToFirestoreServer(uid, wordsToSaveToDictionary, resolvedEmail || undefined);
+      } catch (vocabErr) {
+        console.warn('[serverFirestore] Notice preserving routine vocabulary into dictionary during week close:', vocabErr);
+      }
+    }
+
+    // Persist exclusivity history sets in users/{uid} & student_assignments/{uid}
+    const existingUserWatched = Array.isArray(uData.watchedVideosHistory) ? [...uData.watchedVideosHistory] : [];
+    const seenWatchedLower = new Set(
+      existingUserWatched
+        .map((item: any) => (typeof item === 'string' ? item : item?.videoId || item?.id || '').toLowerCase().trim())
+        .filter(Boolean)
+    );
+    watchedHistoryIds.forEach((vid) => {
+      if (!seenWatchedLower.has(vid.toLowerCase())) {
+        seenWatchedLower.add(vid.toLowerCase());
+        const meta = collectedVideos.find((v) => v.videoId.toLowerCase() === vid.toLowerCase());
+        existingUserWatched.push({
+          videoId: vid,
+          videoTitle: meta?.videoTitle || 'Daily Video Practice',
+          watchedAt: meta?.watchedAt || nowIso,
+        });
+      }
+    });
+
+    const existingUserListened = Array.isArray(uData.listenedTracksHistory) ? [...uData.listenedTracksHistory] : [];
+    const seenListenedLower = new Set(
+      existingUserListened
+        .map((item: any) => (typeof item === 'string' ? item : item?.trackId || item?.id || '').toLowerCase().trim())
+        .filter(Boolean)
+    );
+    listenedHistoryIds.forEach((tid) => {
+      if (!seenListenedLower.has(tid.toLowerCase())) {
+        seenListenedLower.add(tid.toLowerCase());
+        const meta = collectedTracks.find((t) => t.trackId.toLowerCase() === tid.toLowerCase());
+        existingUserListened.push({
+          trackId: tid,
+          id: tid,
+          trackTitle: meta?.title || 'Daily Spotify Listening',
+          title: meta?.title || 'Daily Spotify Listening',
+          artist: meta?.artist || 'Spotify Artist',
+          listenedAt: meta?.listenedAt || nowIso,
+        });
+      }
+    });
+
+    await Promise.all([
+      withTimeout(
+        userRef
+          .set(
+            {
+              watchedVideosHistory: existingUserWatched,
+              listenedTracksHistory: existingUserListened,
+              updatedAt: nowIso,
+            },
+            { merge: true }
+          )
+          .then(() => true),
+        4500
+      ),
+      saveStudentAssignmentsCanonicalServer(uid, {
+        watchedVideos: Array.from(watchedHistoryIds),
+        listenedTracks: Array.from(listenedHistoryIds),
+      }),
+    ]);
+
+    return { ok: true, history: saveRes.data };
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      setIsCloudWriteDisabled(true);
+    }
+    console.warn('[serverFirestore] closeWeeklyHistorySnapshotServer error:', err);
+    return { ok: false, statusCode: 500, error: err?.message || 'Failed to close weekly history snapshot.' };
+  }
+}
+
+/**
+ * HOTFIX 2.3.5E / ARCH.2E.2D: Atomically validates and commits weeklyCycle advance in Firestore using runTransaction.
+ * Guarantees cross-instance protection against duplicate or concurrent cycle increments,
+ * marks cycleTransition as 'pending_preparation' for crash/partial-failure recovery,
+ * and never returns fake success when Firestore is unavailable or errors.
  */
 export async function advanceWeeklyCycleTransactionServer(
   studentUid: string,
   expectedCycle: number | undefined,
   attemptId: string | undefined,
-  newCycle: number,
+  _requestedNewCycle?: number,
   metadata?: {
     weeklyStudyDaysTarget?: number;
     weeklyStudyDays?: string[];
@@ -9625,27 +10559,60 @@ export async function advanceWeeklyCycleTransactionServer(
 ): Promise<{
   success: boolean;
   persistedCycle: number;
+  previousCycle?: number;
   isIdempotentReplay?: boolean;
   conflict?: boolean;
+  cycleTransition?: CycleTransitionRecord | null;
+  lastCycleResult?: any;
+  error?: string;
+  statusCode?: number;
 }> {
   const db = getFirestoreDb();
-  if (!db || !studentUid || getIsCloudWriteDisabled()) {
-    return { success: true, persistedCycle: newCycle };
+  if (!db || !studentUid) {
+    return {
+      success: false,
+      persistedCycle: expectedCycle ?? 1,
+      error: 'Canonical Firestore database unavailable.',
+      statusCode: 503,
+    };
+  }
+  if (getIsCloudWriteDisabled()) {
+    return {
+      success: false,
+      persistedCycle: expectedCycle ?? 1,
+      error: 'Firestore writes disabled by IAM.',
+      statusCode: 500,
+    };
   }
 
   try {
     const userRef = db.collection('users').doc(studentUid);
     const result = await db.runTransaction(async (transaction) => {
       const userSnap = await transaction.get(userRef);
-      const fsData = userSnap.data() || {};
-      const persistedCycle =
-        typeof fsData.weeklyCycle === 'number' && fsData.weeklyCycle > 0
-          ? fsData.weeklyCycle
-          : 1;
+      const fsData = (userSnap && userSnap.exists ? userSnap.data() : null) || {};
+      const persistedCycle = parsePositiveCycleFromFirestore(fsData.weeklyCycle) ?? 1;
 
-      // 1. Idempotency check: if lastCycleAttemptId matches attemptId, this attempt already completed
-      if (attemptId && fsData.lastCycleAttemptId === attemptId) {
-        return { success: true, persistedCycle, isIdempotentReplay: true };
+      // 1. Idempotency check FIRST (before cycle conflict check on expectedCycle that became old due to this advance)
+      if (
+        attemptId &&
+        (fsData.lastCycleAttemptId === attemptId || fsData.cycleTransition?.attemptId === attemptId)
+      ) {
+        const recordedPrevCycle = parsePositiveCycleFromFirestore(fsData.cycleTransition?.previousCycle);
+        if (expectedCycle !== undefined && recordedPrevCycle !== null && expectedCycle !== recordedPrevCycle) {
+          throw new CycleConflictError(
+            persistedCycle,
+            expectedCycle,
+            `Attempt ${attemptId} was already committed for cycle ${recordedPrevCycle} -> ${persistedCycle}.`
+          );
+        }
+        return {
+          success: true,
+          persistedCycle,
+          previousCycle: recordedPrevCycle ?? Math.max(1, persistedCycle - 1),
+          isIdempotentReplay: true,
+          cycleTransition: fsData.cycleTransition || null,
+          lastCycleResult: fsData.lastCycleResult || null,
+        };
       }
 
       // 2. Conflict check: if expectedCycle is provided and differs from persistedCycle
@@ -9653,34 +10620,775 @@ export async function advanceWeeklyCycleTransactionServer(
         throw new CycleConflictError(persistedCycle, expectedCycle);
       }
 
-      // 3. Atomically write updated cycle and attemptId
+      // 3. Always compute targetCycle from persistedCycle (client weeklyCycle is never authoritative)
+      const targetCycle = persistedCycle + 1;
       const nowIso = new Date().toISOString();
+      const prevEpoch =
+        typeof fsData.cycleTransition?.fencingEpoch === 'number' && Number.isFinite(fsData.cycleTransition.fencingEpoch)
+          ? fsData.cycleTransition.fencingEpoch
+          : 0;
+      const transition: CycleTransitionRecord = {
+        attemptId: attemptId || null,
+        previousCycle: persistedCycle,
+        targetCycle,
+        status: 'pending_preparation',
+        startedAt: nowIso,
+        lastError: null,
+        steps: {
+          routinesReset: false,
+          routinesResetDays: [],
+          weeklyChecksInitialized: false,
+          assignmentsCleared: false,
+          weeklyHistoryInitialized: false,
+        },
+        lease: null,
+        fencingEpoch: prevEpoch,
+      };
+
       transaction.set(
         userRef,
         {
-          weeklyCycle: newCycle,
+          weeklyCycle: targetCycle,
           lastCycleAttemptId: attemptId || null,
           weeklyStudyDaysTarget: metadata?.weeklyStudyDaysTarget || fsData.weeklyStudyDaysTarget || 7,
-          weeklyStudyDays: metadata?.weeklyStudyDays || fsData.weeklyStudyDays || [],
+          weeklyStudyDays:
+            metadata?.weeklyStudyDays && metadata.weeklyStudyDays.length > 0
+              ? metadata.weeklyStudyDays
+              : Array.isArray(fsData.weeklyStudyDays) && fsData.weeklyStudyDays.length > 0
+              ? fsData.weeklyStudyDays
+              : [...DEFAULT_STUDY_DAYS],
+          awaitingTopicSelection: true,
+          cycleTransition: transition,
           updatedAt: nowIso,
         },
         { merge: true }
       );
 
-      return { success: true, persistedCycle: newCycle };
+      return {
+        success: true,
+        persistedCycle: targetCycle,
+        previousCycle: persistedCycle,
+        isIdempotentReplay: false,
+        cycleTransition: transition,
+      };
     });
 
     return result;
   } catch (err: any) {
     if (err instanceof CycleConflictError) {
-      return { success: false, conflict: true, persistedCycle: err.actualCycle };
+      return { success: false, conflict: true, persistedCycle: err.actualCycle, statusCode: 409 };
     }
     if (isPermissionError(err)) {
       setIsCloudWriteDisabled(true);
-      return { success: true, persistedCycle: newCycle };
     }
-    console.warn('[serverFirestore] advanceWeeklyCycleTransactionServer notice:', err);
-    return { success: true, persistedCycle: newCycle };
+    console.warn('[serverFirestore] advanceWeeklyCycleTransactionServer error:', err);
+    return {
+      success: false,
+      persistedCycle: expectedCycle ?? 1,
+      error: err?.message || 'Weekly cycle transaction failed.',
+      statusCode: 500,
+    };
   }
 }
+
+function assertPreparationFencing(
+  uData: Record<string, any>,
+  expectedTargetCycle: number,
+  expectedOwnerId: string,
+  expectedFencingToken: number,
+  expectedAttemptId?: string
+): CycleTransitionRecord {
+  const persistedCycle = parsePositiveCycleFromFirestore(uData?.weeklyCycle) ?? 1;
+  if (persistedCycle !== expectedTargetCycle) {
+    throw new PreparationFencingError(
+      'STALE_RECOVERY_CYCLE',
+      `Fencing rejected preparation: persisted cycle ${persistedCycle} !== targetCycle ${expectedTargetCycle}.`,
+      409
+    );
+  }
+  const tr = uData?.cycleTransition as CycleTransitionRecord | undefined;
+  if (!tr || tr.targetCycle !== expectedTargetCycle || tr.status !== 'pending_preparation') {
+    throw new PreparationFencingError(
+      'TRANSITION_NOT_PENDING',
+      `Fencing rejected preparation: cycleTransition status is ${tr?.status || 'missing'}.`,
+      409
+    );
+  }
+  if (expectedAttemptId && tr.attemptId && tr.attemptId !== expectedAttemptId) {
+    throw new PreparationFencingError(
+      'ATTEMPT_MISMATCH',
+      `Fencing rejected preparation: attemptId mismatch.`,
+      409
+    );
+  }
+  if (!tr.lease || tr.lease.ownerId !== expectedOwnerId || tr.lease.fencingToken !== expectedFencingToken) {
+    throw new PreparationFencingError(
+      'LEASE_LOST_FENCED',
+      `Fencing rejected preparation: lease ownership lost (active owner=${tr.lease?.ownerId || 'none'}, token=${tr.lease?.fencingToken ?? 'none'}).`,
+      409
+    );
+  }
+  return tr;
+}
+
+/**
+ * ARCH.2E.2D / ARCH.2E.2D.2: Non-destructive, fenced, and durably step-tracked post-transaction
+ * preparation for the new weekly cycle.
+ * - Acquires a Firestore-persisted lease with monotonic fencingToken on users/{uid}.cycleTransition.
+ * - Validates fencing ownership inside every step's Firestore transaction.
+ * - Skips already-completed steps and never overwrites valid data already persisted for targetCycle.
+ * - Marks cycleTransition.status = 'completed' ONLY after all 4 steps are durably confirmed.
+ */
+export async function prepareNewWeeklyCycleServer(params: {
+  uid: string;
+  studentEmail?: string;
+  targetCycle: number;
+  previousCycle?: number;
+  attemptId?: string;
+  weeklyStudyDaysTarget?: number;
+  weeklyStudyDays?: string[];
+  level?: string;
+  routineVideoTime?: string;
+  leaseTtlMs?: number;
+}): Promise<{
+  ok: boolean;
+  result?: any;
+  alreadyPrepared?: boolean;
+  inProgress?: boolean;
+  code?: string;
+  error?: string;
+  statusCode?: number;
+}> {
+  if (getIsCloudWriteDisabled()) {
+    return { ok: false, statusCode: 500, error: 'Firestore writes disabled by IAM.' };
+  }
+  const db = getFirestoreDb();
+  if (!db || !params.uid) {
+    return { ok: false, statusCode: 503, error: 'Canonical Firestore database unavailable.' };
+  }
+
+  const { uid, targetCycle, attemptId } = params;
+  const userRef = db.collection('users').doc(uid);
+  const effectiveLeaseTtlMs =
+    typeof params.leaseTtlMs === 'number' && Number.isFinite(params.leaseTtlMs) && params.leaseTtlMs >= 20
+      ? params.leaseTtlMs
+      : 15000;
+  const executionOwnerId = `prep_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  let acquiredFencingToken: number | null = null;
+
+  try {
+    // 0. Acquire distributed Firestore lease + monotonic fencing token via transaction
+    const leaseAcquireRes = await withTimeout(
+      db.runTransaction(async (tx) => {
+        const uSnap = await tx.get(userRef);
+        if (!uSnap || !uSnap.exists) {
+          return { action: 'user_not_found' as const };
+        }
+        const uData = uSnap.data() || {};
+        const persistedCycle = parsePositiveCycleFromFirestore(uData.weeklyCycle) ?? 1;
+
+        if (persistedCycle > targetCycle) {
+          return { action: 'stale_cycle' as const, persistedCycle };
+        }
+        if (persistedCycle < targetCycle) {
+          return { action: 'cycle_not_advanced' as const, persistedCycle };
+        }
+
+        const tr = uData.cycleTransition as CycleTransitionRecord | undefined;
+        if (!tr || tr.targetCycle !== targetCycle) {
+          return { action: 'invalid_transition' as const };
+        }
+        if (attemptId && tr.attemptId && tr.attemptId !== attemptId) {
+          return { action: 'attempt_mismatch' as const };
+        }
+        if (tr.status === 'completed') {
+          return {
+            action: 'already_completed' as const,
+            result: uData.lastCycleResult || null,
+            uData,
+          };
+        }
+        if (tr.status !== 'pending_preparation') {
+          return { action: 'invalid_transition' as const };
+        }
+
+        const nowMs = Date.now();
+        const nowIso = new Date(nowMs).toISOString();
+        const existingLease = tr.lease;
+        if (existingLease && existingLease.ownerId && existingLease.ownerId !== executionOwnerId) {
+          const expiresMs = Date.parse(existingLease.expiresAt);
+          if (!Number.isNaN(expiresMs) && expiresMs > nowMs) {
+            return {
+              action: 'in_progress' as const,
+              ownerId: existingLease.ownerId,
+              expiresAt: existingLease.expiresAt,
+            };
+          }
+        }
+
+        const nextToken =
+          (typeof tr.fencingEpoch === 'number' && Number.isFinite(tr.fencingEpoch) ? tr.fencingEpoch : 0) + 1;
+        const newLease: CyclePreparationLease = {
+          ownerId: executionOwnerId,
+          fencingToken: nextToken,
+          attemptId: attemptId || tr.attemptId || null,
+          targetCycle,
+          acquiredAt: nowIso,
+          expiresAt: new Date(nowMs + effectiveLeaseTtlMs).toISOString(),
+          heartbeatAt: nowIso,
+        };
+
+        const nextTransition: CycleTransitionRecord = {
+          ...tr,
+          steps: {
+            routinesReset: Boolean(tr.steps?.routinesReset),
+            routinesResetDays: Array.isArray(tr.steps?.routinesResetDays) ? [...tr.steps!.routinesResetDays!] : [],
+            weeklyChecksInitialized: Boolean(tr.steps?.weeklyChecksInitialized),
+            assignmentsCleared: Boolean(tr.steps?.assignmentsCleared),
+            weeklyHistoryInitialized: Boolean(tr.steps?.weeklyHistoryInitialized),
+          },
+          fencingEpoch: nextToken,
+          lease: newLease,
+        };
+
+        tx.set(
+          userRef,
+          removeUndefinedFields({
+            cycleTransition: nextTransition,
+            updatedAt: nowIso,
+          }),
+          { merge: true }
+        );
+
+        return {
+          action: 'acquired' as const,
+          fencingToken: nextToken,
+          transition: nextTransition,
+          uData,
+        };
+      }),
+      4500
+    );
+
+    if (!leaseAcquireRes) {
+      return { ok: false, statusCode: 500, error: 'Failed to acquire preparation lease in Firestore.' };
+    }
+    if (leaseAcquireRes.action === 'already_completed') {
+      if (leaseAcquireRes.result) {
+        return { ok: true, alreadyPrepared: true, result: leaseAcquireRes.result };
+      }
+      return {
+        ok: true,
+        alreadyPrepared: true,
+        result: {
+          success: true,
+          weeklyCycle: targetCycle,
+          previousCycle: params.previousCycle ?? Math.max(1, targetCycle - 1),
+          message: 'New weekly cycle activated successfully',
+          ...(attemptId ? { attemptId } : {}),
+        },
+      };
+    }
+    if (leaseAcquireRes.action === 'in_progress') {
+      return {
+        ok: false,
+        inProgress: true,
+        statusCode: 409,
+        code: 'PREPARATION_IN_PROGRESS',
+        error: 'New week preparation is already in progress on another worker.',
+      };
+    }
+    if (leaseAcquireRes.action === 'stale_cycle') {
+      return {
+        ok: false,
+        statusCode: 409,
+        code: 'STALE_RECOVERY_CYCLE',
+        error: `Stale recovery rejected: persisted cycle ${leaseAcquireRes.persistedCycle} is newer than targetCycle ${targetCycle}.`,
+      };
+    }
+    if (leaseAcquireRes.action !== 'acquired') {
+      return {
+        ok: false,
+        statusCode: 409,
+        code: 'INVALID_PREPARATION_STATE',
+        error: `Preparation cannot proceed (${leaseAcquireRes.action}).`,
+      };
+    }
+
+    acquiredFencingToken = leaseAcquireRes.fencingToken;
+    const fencingToken = leaseAcquireRes.fencingToken;
+    const initialUData = leaseAcquireRes.uData;
+    const initialSteps = leaseAcquireRes.transition.steps || {};
+
+    const assignSnapPre = await withTimeout(db.collection('student_assignments').doc(uid).get(), 4500).catch(() => null);
+    const aDataPre = assignSnapPre && assignSnapPre.exists ? (assignSnapPre.data() || {}) : {};
+
+    const effectiveStudyTarget =
+      params.weeklyStudyDaysTarget ||
+      (typeof initialUData.weeklyStudyDaysTarget === 'number' &&
+      initialUData.weeklyStudyDaysTarget >= 1 &&
+      initialUData.weeklyStudyDaysTarget <= 7
+        ? initialUData.weeklyStudyDaysTarget
+        : 7);
+    const effectiveStudyDays =
+      params.weeklyStudyDays && params.weeklyStudyDays.length > 0
+        ? params.weeklyStudyDays
+        : Array.isArray(initialUData.weeklyStudyDays) && initialUData.weeklyStudyDays.length > 0
+        ? initialUData.weeklyStudyDays
+        : [...DEFAULT_STUDY_DAYS];
+    const resolvedEmail = (params.studentEmail || initialUData.email || aDataPre.email || '').toLowerCase().trim();
+    const resolvedLevel = (
+      params.level ||
+      initialUData.englishLevel ||
+      initialUData.level ||
+      aDataPre.level ||
+      'intermediate'
+    ).toString();
+    const videoTime = params.routineVideoTime || initialUData.routineVideoTime;
+    const newWeekId = `week-${targetCycle}`;
+
+    const makeRenewedLease = (existingLease?: CyclePreparationLease | null): CyclePreparationLease => {
+      const nowMs = Date.now();
+      const nowIso = new Date(nowMs).toISOString();
+      return {
+        ownerId: executionOwnerId,
+        fencingToken,
+        attemptId: attemptId || existingLease?.attemptId || null,
+        targetCycle,
+        acquiredAt: existingLease?.acquiredAt || nowIso,
+        expiresAt: new Date(nowMs + effectiveLeaseTtlMs).toISOString(),
+        heartbeatAt: nowIso,
+      };
+    };
+
+    // 1. Non-destructive daily routines reset per day (fenced transaction per un-migrated day)
+    if (!initialSteps.routinesReset) {
+      const routinesCol = userRef.collection('routines');
+      const alreadyDoneDays = new Set<string>(
+        Array.isArray(initialSteps.routinesResetDays) ? initialSteps.routinesResetDays : []
+      );
+
+      for (const day of DEFAULT_STUDY_DAYS) {
+        if (alreadyDoneDays.has(day)) continue;
+
+        const dayRef = routinesCol.doc(day);
+        const dayOk = await withTimeout(
+          db.runTransaction(async (tx) => {
+            const [uTxSnap, dTxSnap] = await Promise.all([tx.get(userRef), tx.get(dayRef)]);
+            const uTxData = (uTxSnap && uTxSnap.exists ? uTxSnap.data() : null) || {};
+            const tr = assertPreparationFencing(uTxData, targetCycle, executionOwnerId, fencingToken, attemptId);
+
+            const currentDaysSet = new Set<string>(
+              Array.isArray(tr.steps?.routinesResetDays) ? tr.steps!.routinesResetDays! : []
+            );
+            if (tr.steps?.routinesReset || currentDaysSet.has(day)) {
+              return true;
+            }
+
+            const nowIso = new Date().toISOString();
+            const dData = dTxSnap && dTxSnap.exists ? (dTxSnap.data() || {}) : null;
+            const dCycle = parsePositiveCycleFromFirestore(dData?.weeklyCycle);
+            const rootDay = uTxData.routinesByDay?.[day] && typeof uTxData.routinesByDay[day] === 'object'
+              ? uTxData.routinesByDay[day]
+              : null;
+            const rootDayCycle = parsePositiveCycleFromFirestore(rootDay?.weeklyCycle);
+
+            // Preserve any day already belonging to targetCycle (e.g., partial resume or user already saved new cycle video/audio/words)
+            const dayAlreadyAtTarget = dCycle === targetCycle;
+            let rootDayUpdate: Record<string, any> | undefined;
+
+            if (!dayAlreadyAtTarget) {
+              const resetPayload = {
+                videoId: '',
+                title: '',
+                videoTitle: '',
+                url: '',
+                playlistId: '',
+                playlistTitle: '',
+                isRepeatVideo: false,
+                isCustomSuggestion: false,
+                teacherVideos: [],
+                teacherSpotify: null,
+                teacherOverrideTrack: null,
+                teacherFeedback: null,
+                teacherNotes: '',
+                dayOfWeek: day,
+                activityId: 'act-1',
+                instructions: '',
+                duration: '',
+                completed: false,
+                completedToday: false,
+                completedVideoToday: false,
+                completedAudioToday: false,
+                learnedWords: [],
+                weeklyCycle: targetCycle,
+                updatedAt: nowIso,
+              };
+              tx.set(dayRef, resetPayload, { merge: false });
+              rootDayUpdate = resetPayload;
+            } else if (rootDayCycle !== targetCycle && dData) {
+              rootDayUpdate = dData;
+            }
+
+            currentDaysSet.add(day);
+            const updatedDays = DEFAULT_STUDY_DAYS.filter((d) => currentDaysSet.has(d));
+            const allDaysDone = updatedDays.length === DEFAULT_STUDY_DAYS.length;
+
+            const userPatch: Record<string, any> = {
+              cycleTransition: {
+                ...tr,
+                steps: {
+                  ...(tr.steps || {}),
+                  routinesResetDays: updatedDays,
+                  routinesReset: allDaysDone,
+                },
+                lease: makeRenewedLease(tr.lease),
+              },
+              updatedAt: nowIso,
+            };
+            if (rootDayUpdate) {
+              userPatch.routinesByDay = { [day]: rootDayUpdate };
+            }
+            tx.set(userRef, removeUndefinedFields(userPatch), { merge: true });
+            return true;
+          }),
+          4500
+        );
+        if (!dayOk) {
+          throw new Error(`Timed out resetting daily routine for ${day}.`);
+        }
+      }
+    }
+
+    // 2. Non-destructive S-Path weeklyChecks initialization for week-{targetCycle} (never overwrite existing checks with {})
+    if (!initialSteps.weeklyChecksInitialized) {
+      const weekRef = userRef.collection('weeklyChecks').doc(newWeekId);
+      const checksOk = await withTimeout(
+        db.runTransaction(async (tx) => {
+          const [uTxSnap, wTxSnap] = await Promise.all([tx.get(userRef), tx.get(weekRef)]);
+          const uTxData = (uTxSnap && uTxSnap.exists ? uTxSnap.data() : null) || {};
+          const tr = assertPreparationFencing(uTxData, targetCycle, executionOwnerId, fencingToken, attemptId);
+
+          if (tr.steps?.weeklyChecksInitialized) {
+            return true;
+          }
+
+          const nowIso = new Date().toISOString();
+          const wData = wTxSnap && wTxSnap.exists ? (wTxSnap.data() || {}) : null;
+          const preservedChecks: Record<string, boolean> = wData
+            ? {
+                ...(wData.weeklyChecks || {}),
+                ...(wData.sPathChecks || {}),
+                ...(wData.checks || {}),
+              }
+            : {};
+
+          const weekDocPayload = removeUndefinedFields({
+            id: newWeekId,
+            weekId: newWeekId,
+            weeklyCycle: targetCycle,
+            checks: preservedChecks,
+            studentUid: uid,
+            ...(resolvedEmail ? { studentEmail: resolvedEmail } : {}),
+            updatedAt: nowIso,
+          });
+
+          // Write target check doc first so mock failure never marks userRef step complete
+          tx.set(weekRef, weekDocPayload, { merge: true });
+          tx.set(
+            userRef,
+            removeUndefinedFields({
+              weeklyStudyDaysTarget: effectiveStudyTarget,
+              weeklyStudyDays: effectiveStudyDays,
+              cycleTransition: {
+                ...tr,
+                steps: {
+                  ...(tr.steps || {}),
+                  weeklyChecksInitialized: true,
+                },
+                lease: makeRenewedLease(tr.lease),
+              },
+              updatedAt: nowIso,
+            }),
+            { merge: true }
+          );
+          return true;
+        }),
+        4500
+      );
+      if (!checksOk) {
+        throw new Error(`Timed out initializing weeklyChecks/${newWeekId}.`);
+      }
+    }
+
+    // 3. Non-destructive student_assignments/{uid} cleanup: remove ONLY older-cycle assignments, preserve targetCycle & history
+    const cleanRoutines = createCleanStudentRoutines(videoTime);
+    if (!initialSteps.assignmentsCleared) {
+      const assignRef = db.collection('student_assignments').doc(uid);
+      const assignOk = await withTimeout(
+        db.runTransaction(async (tx) => {
+          const [uTxSnap, aTxSnap] = await Promise.all([tx.get(userRef), tx.get(assignRef)]);
+          const uTxData = (uTxSnap && uTxSnap.exists ? uTxSnap.data() : null) || {};
+          const tr = assertPreparationFencing(uTxData, targetCycle, executionOwnerId, fencingToken, attemptId);
+
+          if (tr.steps?.assignmentsCleared) {
+            return true;
+          }
+
+          const nowIso = new Date().toISOString();
+          const aData = aTxSnap && aTxSnap.exists ? (aTxSnap.data() || {}) : {};
+
+          const keptVideoAssignments = (Array.isArray(aData.videoAssignments) ? aData.videoAssignments : []).filter(
+            (item: any) => parsePositiveCycleFromFirestore(item?.weeklyCycle) === targetCycle
+          );
+          const keptSpotifyAssignments = (Array.isArray(aData.spotifyAssignments) ? aData.spotifyAssignments : []).filter(
+            (item: any) => parsePositiveCycleFromFirestore(item?.weeklyCycle) === targetCycle
+          );
+
+          const hasTargetVideo = keptVideoAssignments.some((a: any) => Boolean(a.videoId || a.videoUrl));
+          const mergedRoutines: Record<string, any> = {};
+          const aDataCycle = parsePositiveCycleFromFirestore(aData.weeklyCycle);
+          for (const day of DEFAULT_STUDY_DAYS) {
+            const hasDayTargetAssign =
+              keptVideoAssignments.some((a: any) => (a.day || a.dayOfWeek) === day) ||
+              keptSpotifyAssignments.some((s: any) => (s.day || s.dayOfWeek) === day);
+            const existingRoutineDayCycle = parsePositiveCycleFromFirestore(aData.routines?.[day]?.weeklyCycle);
+            if (
+              aData.routines?.[day] &&
+              (existingRoutineDayCycle === targetCycle || (hasDayTargetAssign && aDataCycle === targetCycle))
+            ) {
+              mergedRoutines[day] = aData.routines[day];
+            } else {
+              mergedRoutines[day] = (cleanRoutines as any)[day];
+            }
+          }
+
+          const assignPayload = removeUndefinedFields({
+            uid,
+            ...(resolvedEmail ? { email: resolvedEmail } : {}),
+            level: resolvedLevel,
+            weeklyCycle: targetCycle,
+            weeklyStudyDaysTarget: effectiveStudyTarget,
+            weeklyStudyDays: effectiveStudyDays,
+            videoAssignments: keptVideoAssignments,
+            spotifyAssignments: keptSpotifyAssignments,
+            awaitingTopicSelection: !hasTargetVideo,
+            routines: mergedRoutines,
+            watchedVideos: Array.isArray(aData.watchedVideos) ? aData.watchedVideos : [],
+            listenedTracks: Array.isArray(aData.listenedTracks) ? aData.listenedTracks : [],
+            ...(aData.spotifyCycles ? { spotifyCycles: aData.spotifyCycles } : {}),
+            updatedAt: nowIso,
+          });
+
+          tx.set(assignRef, assignPayload, { merge: true });
+          tx.set(
+            userRef,
+            removeUndefinedFields({
+              awaitingTopicSelection: !hasTargetVideo,
+              cycleTransition: {
+                ...tr,
+                steps: {
+                  ...(tr.steps || {}),
+                  assignmentsCleared: true,
+                },
+                lease: makeRenewedLease(tr.lease),
+              },
+              updatedAt: nowIso,
+            }),
+            { merge: true }
+          );
+          return true;
+        }),
+        4500
+      );
+      if (!assignOk) {
+        throw new Error('Timed out updating student_assignments for new cycle.');
+      }
+    }
+
+    // 4. Non-destructive weeklyHistory/week-{targetCycle} creation (create only if missing)
+    if (!initialSteps.weeklyHistoryInitialized) {
+      const histRef = userRef.collection('weeklyHistory').doc(newWeekId);
+      const histOk = await withTimeout(
+        db.runTransaction(async (tx) => {
+          const [uTxSnap, hTxSnap] = await Promise.all([tx.get(userRef), tx.get(histRef)]);
+          const uTxData = (uTxSnap && uTxSnap.exists ? uTxSnap.data() : null) || {};
+          const tr = assertPreparationFencing(uTxData, targetCycle, executionOwnerId, fencingToken, attemptId);
+
+          if (tr.steps?.weeklyHistoryInitialized) {
+            return true;
+          }
+
+          const nowIso = new Date().toISOString();
+          if (!hTxSnap || !hTxSnap.exists) {
+            tx.set(
+              histRef,
+              removeUndefinedFields({
+                studentUid: uid,
+                ...(resolvedEmail ? { studentEmail: resolvedEmail } : {}),
+                weekId: newWeekId,
+                weeklyCycle: targetCycle,
+                consumedVideoIds: [],
+                consumedTrackIds: [],
+                weeklyVocabulary: [],
+                weeklyStudyDaysTarget: effectiveStudyTarget,
+                weeklyStudyDays: effectiveStudyDays,
+                updatedAt: nowIso,
+              }),
+              { merge: true }
+            );
+          }
+
+          tx.set(
+            userRef,
+            removeUndefinedFields({
+              cycleTransition: {
+                ...tr,
+                steps: {
+                  ...(tr.steps || {}),
+                  weeklyHistoryInitialized: true,
+                },
+                lease: makeRenewedLease(tr.lease),
+              },
+              updatedAt: nowIso,
+            }),
+            { merge: true }
+          );
+          return true;
+        }),
+        4500
+      );
+      if (!histOk) {
+        throw new Error(`Timed out initializing weeklyHistory/${newWeekId}.`);
+      }
+    }
+
+    // 5. Finalize cycleTransition.status = 'completed' ONLY after confirming all 4 steps inside fenced transaction
+    const assignRefFinal = db.collection('student_assignments').doc(uid);
+    const finalizedResult = await withTimeout(
+      db.runTransaction(async (tx) => {
+        const [uTxSnap, aTxSnap] = await Promise.all([tx.get(userRef), tx.get(assignRefFinal)]);
+        const uTxData = (uTxSnap && uTxSnap.exists ? uTxSnap.data() : null) || {};
+        const tr = assertPreparationFencing(uTxData, targetCycle, executionOwnerId, fencingToken, attemptId);
+
+        const steps = tr.steps || {};
+        if (
+          !steps.routinesReset ||
+          !steps.weeklyChecksInitialized ||
+          !steps.assignmentsCleared ||
+          !steps.weeklyHistoryInitialized
+        ) {
+          throw new Error('Cannot mark cycleTransition completed before all preparation steps are confirmed.');
+        }
+
+        const nowIso = new Date().toISOString();
+        const aDataFinal = aTxSnap && aTxSnap.exists ? (aTxSnap.data() || {}) : {};
+        const finalVideoAssignments = (Array.isArray(aDataFinal.videoAssignments) ? aDataFinal.videoAssignments : []).filter(
+          (item: any) => parsePositiveCycleFromFirestore(item?.weeklyCycle) === targetCycle
+        );
+        const finalSpotifyAssignments = (Array.isArray(aDataFinal.spotifyAssignments) ? aDataFinal.spotifyAssignments : []).filter(
+          (item: any) => parsePositiveCycleFromFirestore(item?.weeklyCycle) === targetCycle
+        );
+
+        const confirmedResult = removeUndefinedFields({
+          success: true,
+          weeklyCycle: targetCycle,
+          previousCycle: params.previousCycle ?? tr.previousCycle ?? Math.max(1, targetCycle - 1),
+          weeklyStudyDaysTarget: effectiveStudyTarget,
+          weeklyStudyDays: effectiveStudyDays,
+          message: 'New weekly cycle activated successfully',
+          routines: cleanRoutines,
+          videoAssignments: finalVideoAssignments,
+          spotifyAssignments: finalSpotifyAssignments,
+          ...(attemptId ? { attemptId } : {}),
+        });
+
+        const completedTransition: CycleTransitionRecord = {
+          attemptId: attemptId || tr.attemptId || null,
+          previousCycle: params.previousCycle ?? tr.previousCycle ?? Math.max(1, targetCycle - 1),
+          targetCycle,
+          status: 'completed',
+          startedAt: tr.startedAt || nowIso,
+          completedAt: nowIso,
+          lastError: null,
+          steps,
+          lease: null,
+          fencingEpoch: tr.fencingEpoch,
+        };
+
+        tx.set(
+          userRef,
+          removeUndefinedFields({
+            weeklyCycle: targetCycle,
+            weeklyStudyDaysTarget: effectiveStudyTarget,
+            weeklyStudyDays: effectiveStudyDays,
+            awaitingTopicSelection: !finalVideoAssignments.some((a: any) => Boolean(a.videoId || a.videoUrl)),
+            lastCycleAttemptId: attemptId || uTxData.lastCycleAttemptId || null,
+            lastCycleResult: confirmedResult,
+            cycleTransition: completedTransition,
+            updatedAt: nowIso,
+          }),
+          { merge: true }
+        );
+
+        return confirmedResult;
+      }),
+      4500
+    );
+
+    if (!finalizedResult) {
+      return { ok: false, statusCode: 500, error: 'Failed to finalize cycleTransition status in Firestore.' };
+    }
+
+    return { ok: true, result: finalizedResult };
+  } catch (err: any) {
+    if (err instanceof PreparationFencingError) {
+      console.warn('[serverFirestore] prepareNewWeeklyCycleServer fenced:', err.message);
+      return { ok: false, statusCode: err.statusCode, code: err.code, error: err.message };
+    }
+    if (isPermissionError(err)) {
+      setIsCloudWriteDisabled(true);
+    }
+
+    // Best-effort lease release ONLY if we still hold the fencingToken, preserving pending_preparation
+    if (acquiredFencingToken !== null) {
+      const tokenToRelease = acquiredFencingToken;
+      await withTimeout(
+        db
+          .runTransaction(async (tx) => {
+            const uSnap = await tx.get(userRef);
+            if (!uSnap || !uSnap.exists) return;
+            const uData = uSnap.data() || {};
+            const tr = uData.cycleTransition as CycleTransitionRecord | undefined;
+            if (
+              tr &&
+              tr.targetCycle === targetCycle &&
+              tr.status === 'pending_preparation' &&
+              tr.lease?.ownerId === executionOwnerId &&
+              tr.lease?.fencingToken === tokenToRelease
+            ) {
+              tx.set(
+                userRef,
+                {
+                  cycleTransition: {
+                    ...tr,
+                    lease: null,
+                    lastError: err?.message || 'Preparation failed',
+                  },
+                  updatedAt: new Date().toISOString(),
+                },
+                { merge: true }
+              );
+            }
+          })
+          .catch(() => {}),
+        2000
+      ).catch(() => {});
+    }
+
+    console.warn('[serverFirestore] prepareNewWeeklyCycleServer error:', err);
+    return { ok: false, statusCode: 500, error: err?.message || 'Failed to prepare new weekly cycle.' };
+  }
+}
+
 

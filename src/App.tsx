@@ -4525,17 +4525,6 @@ export default function App() {
           weeklyHomeworkRef.current = null;
         }
 
-        // Reset S-Path checks for the new week in Firestore users/{studentUID} with reset: true
-        saveStudentWeeklyChecksToFirestore(
-          uid,
-          {},
-          studentEmail,
-          userProfile?.weeklyNativeLessonsTarget || 1,
-          effectiveStudyTarget,
-          effectiveCycle,
-          true
-        );
-
         // Automatic positioning on Today if in active study plan, otherwise first active study day
         const today = getTodayDayOfWeek();
         const effectiveDay = chosenDays.includes(today) ? today : (chosenDays[0] || 'monday');
@@ -4551,8 +4540,8 @@ export default function App() {
               ? `🎉 Week ${effectiveCycle} Started!`
               : `🎉 Semana ${effectiveCycle} Iniciada!`,
             message: currentLanguage === 'en'
-              ? `Study goal calibrated to ${effectiveStudyTarget} days/week. Fresh curated YouTube videos and Spotify audios have been assigned.`
-              : `Meta de estudos calibrada para ${effectiveStudyTarget} dias/semana. Novos vídeos do YouTube e áudios do Spotify foram atribuídos.`,
+              ? `Study goal calibrated to ${effectiveStudyTarget} days/week. Your new weekly cycle is ready.`
+              : `Meta de estudos calibrada para ${effectiveStudyTarget} dias/semana. Seu novo ciclo semanal está pronto.`,
             type: 'success',
             timestamp: new Date().toISOString(),
             read: false,

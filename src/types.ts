@@ -454,6 +454,20 @@ export interface WeeklyHistoryDoc {
   consumedVideoIds: ConsumedVideoItem[];
   consumedTrackIds: ConsumedTrackItem[];
   weeklyVocabulary: WeeklyVocabularyItem[];
+  weeklyChecks?: Record<string, boolean>;
+  homeworkProgress?: {
+    hasHomework: boolean;
+    isCompleted: boolean;
+    score?: number;
+    totalWordsCollected: number;
+    completedPartsByDay?: Record<string, boolean>;
+    submittedAt?: string | null;
+  } | null;
+  activitiesSnapshot?: Record<string, any>;
+  weeklyStudyDaysTarget?: number;
+  weeklyStudyDays?: DayOfWeek[];
+  closedAt?: string;
+  closedForAttemptId?: string;
   updatedAt?: string;
 }
 

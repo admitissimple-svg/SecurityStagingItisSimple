@@ -1,28 +1,13 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import {
-  doc,
-  getDoc,
-  setDoc,
-  collection,
-  getDocs,
-  onSnapshot,
-  query,
-  where,
-} from 'firebase/firestore';
-import { getDb, auth } from '../firebase';
+import { auth } from '../firebase';
 import {
   WeeklyHistoryDoc,
   ConsumedVideoItem,
   ConsumedTrackItem,
   WeeklyVocabularyItem,
-  DayOfWeek,
 } from '../types';
-import {
-  addVideoToWatchedHistoryInFirestore,
-  addTrackToListenedHistoryInFirestore,
-  extractVideoIdFromHistoryItem,
-  extractVideoTitleFromHistoryItem,
-} from './useRoutine';
+import { extractVideoIdFromHistoryItem, getAuthHeaders } from './useRoutine';
+import { isSyntheticLegacyUid } from '../utils/tutorConsolidation';
 
 export interface UseStudentHistoryParams {
   studentUid?: string;
@@ -66,11 +51,11 @@ export async function verifyStudentNativeFriendLink(
 ): Promise<boolean> {
   const cleanStudent = cleanDocId(studentUid);
   const cleanTeacher = cleanDocId(nativeFriendUid);
-  const currentEmail = (nativeFriendEmail || auth.currentUser?.email || '').toLowerCase().trim();
+  const currentEmail = (nativeFriendEmail || auth?.currentUser?.email || '').toLowerCase().trim();
   if (!cleanStudent) return false;
 
   // 1. Admin bypass - Admins oversee all students and tutors via verified Custom Claims
-  if (auth.currentUser) {
+  if (auth?.currentUser) {
     try {
       const tokenResult = await auth.currentUser.getIdTokenResult();
       if (tokenResult?.claims?.role === 'admin' || tokenResult?.claims?.admin === true) {
@@ -81,7 +66,7 @@ export async function verifyStudentNativeFriendLink(
 
   // 2. Student accessing their own history (only if no teacher is querying)
   if (!cleanTeacher) return true;
-  if (!cleanTeacher && auth.currentUser && (auth.currentUser.uid === cleanStudent || auth.currentUser.email?.toLowerCase().trim() === cleanStudent)) {
+  if (!cleanTeacher && auth?.currentUser && (auth.currentUser.uid === cleanStudent || auth.currentUser.email?.toLowerCase().trim() === cleanStudent)) {
     return true;
   }
 
@@ -115,7 +100,7 @@ export async function verifyStudentNativeFriendLink(
 }
 
 /**
- * Fetch specific weekly history doc
+ * Fetch specific weekly history doc via authenticated backend API (Firestore default)
  */
 export async function fetchWeeklyHistory(
   studentUid: string,
@@ -123,16 +108,17 @@ export async function fetchWeeklyHistory(
 ): Promise<WeeklyHistoryDoc | null> {
   const cleanStudent = cleanDocId(studentUid);
   const cleanWeek = (weekId || 'week-1').trim();
-  if (!cleanStudent) return null;
+  if (!cleanStudent || isSyntheticLegacyUid(cleanStudent)) return null;
 
   try {
-    const db = getDb();
-    const docRef = doc(db, 'users', cleanStudent, 'weeklyHistory', cleanWeek);
-    const snap = await getDoc(docRef);
-    if (snap.exists()) {
-      return snap.data() as WeeklyHistoryDoc;
-    }
-    return null;
+    const headers = await getAuthHeaders();
+    const res = await fetch(
+      `/api/student-history?studentUid=${encodeURIComponent(cleanStudent)}&weekId=${encodeURIComponent(cleanWeek)}`,
+      { method: 'GET', headers }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    return (data && data.weeklyHistory) || null;
   } catch (err) {
     console.warn(`Failed to fetch weekly history for ${cleanStudent}/${cleanWeek}:`, err);
     return null;
@@ -140,21 +126,21 @@ export async function fetchWeeklyHistory(
 }
 
 /**
- * Fetch all weekly histories for a student to ensure exclusive non-repeating cycle history
+ * Fetch all weekly histories for a student via authenticated backend API (Firestore default)
  */
 export async function fetchAllWeeklyHistories(studentUid: string): Promise<WeeklyHistoryDoc[]> {
   const cleanStudent = cleanDocId(studentUid);
-  if (!cleanStudent) return [];
+  if (!cleanStudent || isSyntheticLegacyUid(cleanStudent)) return [];
 
   try {
-    const db = getDb();
-    const subColRef = collection(db, 'users', cleanStudent, 'weeklyHistory');
-    const snap = await getDocs(subColRef);
-    const list: WeeklyHistoryDoc[] = [];
-    snap.forEach((d) => {
-      list.push(d.data() as WeeklyHistoryDoc);
-    });
-    return list;
+    const headers = await getAuthHeaders();
+    const res = await fetch(
+      `/api/student-history?studentUid=${encodeURIComponent(cleanStudent)}&includeAll=true`,
+      { method: 'GET', headers }
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data?.allHistories) ? (data.allHistories as WeeklyHistoryDoc[]) : [];
   } catch (err) {
     console.warn(`Failed to fetch all weekly histories for ${cleanStudent}:`, err);
     return [];
@@ -162,7 +148,7 @@ export async function fetchAllWeeklyHistories(studentUid: string): Promise<Weekl
 }
 
 /**
- * Fetch all accumulated consumed video IDs and track IDs across all historical cycles
+ * Fetch all accumulated consumed video IDs and track IDs across all historical cycles via backend API
  */
 export async function fetchAccumulatedConsumedIds(studentUid: string): Promise<{
   videoIds: Set<string>;
@@ -177,97 +163,37 @@ export async function fetchAccumulatedConsumedIds(studentUid: string): Promise<{
   const allTracks: ConsumedTrackItem[] = [];
   const allVocabulary: WeeklyVocabularyItem[] = [];
 
-  const histories = await fetchAllWeeklyHistories(studentUid);
-  for (const hist of histories) {
-    if (Array.isArray(hist.consumedVideoIds)) {
-      for (const v of hist.consumedVideoIds) {
-        const id = v.id || v.videoId;
-        if (id) videoIds.add(id);
-        allVideos.push(v);
-      }
-    }
-    if (Array.isArray(hist.consumedTrackIds)) {
-      for (const t of hist.consumedTrackIds) {
-        const id = t.id || t.trackId;
-        if (id) trackIds.add(id);
-        allTracks.push(t);
-      }
-    }
-    if (Array.isArray(hist.weeklyVocabulary)) {
-      for (const w of hist.weeklyVocabulary) {
-        allVocabulary.push(w);
-      }
-    }
+  const cleanStudent = cleanDocId(studentUid);
+  if (!cleanStudent || isSyntheticLegacyUid(cleanStudent)) {
+    return { videoIds, trackIds, allVideos, allTracks, allVocabulary };
   }
 
-  // Also inspect student's main user profile watchedVideosHistory & studentJournal for unified source of truth
   try {
-    const db = getDb();
-    const cleanStudent = cleanDocId(studentUid);
-    const userSnap = await getDoc(doc(db, 'users', cleanStudent));
-    if (userSnap.exists()) {
-      const data = userSnap.data();
-
-      // 1. From studentJournal (Single Source of Truth)
-      if (Array.isArray(data.studentJournal)) {
-        data.studentJournal.forEach((entry: any) => {
-          if (entry && entry.type === 'video' && entry.id) {
-            const vid = extractVideoIdFromHistoryItem(entry.id) || entry.id;
-            if (vid) {
-              videoIds.add(vid);
-              allVideos.push({
-                id: vid,
-                videoId: vid,
-                videoTitle: entry.title || 'Daily Routine Video',
-                title: entry.title || 'Daily Routine Video',
-                watchedAt: (entry.timestamp ? new Date(entry.timestamp).toISOString() : entry.date) || '',
-                dayOfWeek: entry.dayOfWeek,
-              });
-            }
-          } else if (entry && entry.type === 'audio' && entry.id) {
-            const trkId = entry.id;
-            if (trkId) {
-              trackIds.add(trkId);
-              allTracks.push({
-                id: trkId,
-                trackId: trkId,
-                title: entry.title || 'Daily Track',
-                artist: entry.artist || 'Spotify Artist',
-                listenedAt: (entry.timestamp ? new Date(entry.timestamp).toISOString() : entry.date) || '',
-                dayOfWeek: entry.dayOfWeek,
-                url: entry.url,
-              });
-            }
-          }
-        });
-      }
-
-      // 2. From watchedVideosHistory
-      const history = data.watchedVideosHistory || data.watchedVideos || [];
-      if (Array.isArray(history)) {
-        history.forEach((item: any) => {
-          const vid = extractVideoIdFromHistoryItem(item);
-          if (vid && !videoIds.has(vid)) {
-            videoIds.add(vid);
-            const title = extractVideoTitleFromHistoryItem(item);
-            allVideos.push({
-              id: vid,
-              videoId: vid,
-              videoTitle: title,
-              title: title,
-              watchedAt: (item && typeof item === 'object' && item.watchedAt) || '',
-            });
-          }
-        });
+    const headers = await getAuthHeaders();
+    const res = await fetch(
+      `/api/student-history?studentUid=${encodeURIComponent(cleanStudent)}&includeAccumulated=true`,
+      { method: 'GET', headers }
+    );
+    if (res.ok) {
+      const data = await res.json();
+      const acc = data?.accumulated;
+      if (acc) {
+        if (Array.isArray(acc.videoIds)) acc.videoIds.forEach((id: string) => id && videoIds.add(id));
+        if (Array.isArray(acc.trackIds)) acc.trackIds.forEach((id: string) => id && trackIds.add(id));
+        if (Array.isArray(acc.allVideos)) allVideos.push(...acc.allVideos);
+        if (Array.isArray(acc.allTracks)) allTracks.push(...acc.allTracks);
+        if (Array.isArray(acc.allVocabulary)) allVocabulary.push(...acc.allVocabulary);
       }
     }
-  } catch {}
+  } catch (err) {
+    console.warn(`Failed to fetch accumulated consumed IDs for ${cleanStudent}:`, err);
+  }
 
   return { videoIds, trackIds, allVideos, allTracks, allVocabulary };
 }
 
 /**
- * Save or merge weekly history document in Firestore: users/{studentUid}/weeklyHistory/{weekId}
+ * Save or merge weekly history document via authenticated backend API
  */
 export async function saveWeeklyHistory(
   studentUid: string,
@@ -276,20 +202,23 @@ export async function saveWeeklyHistory(
 ): Promise<boolean> {
   const cleanStudent = cleanDocId(studentUid);
   const cleanWeek = (weekId || 'week-1').trim();
-  if (!cleanStudent) return false;
+  if (!cleanStudent || isSyntheticLegacyUid(cleanStudent)) return false;
 
   try {
-    const db = getDb();
-    const docRef = doc(db, 'users', cleanStudent, 'weeklyHistory', cleanWeek);
-    const payload: Partial<WeeklyHistoryDoc> = {
-      ...data,
-      studentUid: cleanStudent,
-      weekId: cleanWeek,
-      updatedAt: new Date().toISOString(),
-    };
-
-    await setDoc(docRef, payload, { merge: true });
-    return true;
+    const headers = await getAuthHeaders();
+    const res = await fetch('/api/student-history/record', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        studentUid: cleanStudent,
+        weekId: cleanWeek,
+        type: 'merge',
+        data,
+      }),
+    });
+    if (!res.ok) return false;
+    const json = await res.json().catch(() => null);
+    return Boolean(json?.success);
   } catch (err) {
     console.error(`Failed to save weekly history for ${cleanStudent}/${cleanWeek}:`, err);
     return false;
@@ -297,7 +226,7 @@ export async function saveWeeklyHistory(
 }
 
 /**
- * Record a watched video into the weekly history
+ * Record a watched video into the weekly history via authenticated backend API
  */
 export async function recordConsumedVideo(
   studentUid: string,
@@ -309,51 +238,28 @@ export async function recordConsumedVideo(
   const cleanWeek = (weekId || 'week-1').trim();
   const rawId = video?.videoId || video?.id || '';
   const cleanVidId = extractVideoIdFromHistoryItem(rawId) || rawId.trim();
-  if (!cleanStudent || !cleanVidId) return false;
-  const cleanTitle = (video.videoTitle || video.title || 'Daily Video Practice').trim();
-
-  const formattedVideoItem: ConsumedVideoItem = {
-    ...video,
-    id: cleanVidId,
-    videoId: cleanVidId,
-    videoTitle: cleanTitle,
-    title: cleanTitle,
-    watchedAt: video.watchedAt || new Date().toISOString(),
-  };
+  if (!cleanStudent || isSyntheticLegacyUid(cleanStudent) || !cleanVidId) return false;
 
   try {
-    const existing = await fetchWeeklyHistory(cleanStudent, cleanWeek);
-    const currentVideos = existing?.consumedVideoIds ? [...existing.consumedVideoIds] : [];
-
-    // Avoid duplicate video record in the same week
-    const existsIndex = currentVideos.findIndex(
-      (v) => (v.id || v.videoId || '').toLowerCase() === cleanVidId.toLowerCase()
-    );
-    if (existsIndex >= 0) {
-      currentVideos[existsIndex] = { ...currentVideos[existsIndex], ...formattedVideoItem };
-    } else {
-      currentVideos.push(formattedVideoItem);
-    }
-
-    const payload: Partial<WeeklyHistoryDoc> = {
-      studentUid: cleanStudent,
-      weekId: cleanWeek,
-      consumedVideoIds: currentVideos,
-      updatedAt: new Date().toISOString(),
-    };
-    if (nativeFriendUid) {
-      payload.assignedNativeFriendUID = nativeFriendUid;
-      payload.nativeFriendUID = nativeFriendUid;
-    }
-
-    const saved = await saveWeeklyHistory(cleanStudent, cleanWeek, payload);
-
-    // Also persist strictly to users/{cleanStudent}/watchedVideosHistory
-    addVideoToWatchedHistoryInFirestore(cleanStudent, cleanVidId, cleanTitle).catch((err) =>
-      console.warn('Notice saving to users watchedVideosHistory:', err)
-    );
-
-    return saved;
+    const headers = await getAuthHeaders();
+    const res = await fetch('/api/student-history/record', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        studentUid: cleanStudent,
+        weekId: cleanWeek,
+        type: 'video',
+        video: {
+          ...video,
+          id: cleanVidId,
+          videoId: cleanVidId,
+        },
+        ...(nativeFriendUid ? { nativeFriendUid } : {}),
+      }),
+    });
+    if (!res.ok) return false;
+    const json = await res.json().catch(() => null);
+    return Boolean(json?.success);
   } catch (err) {
     console.error('Failed to record consumed video:', err);
     return false;
@@ -361,7 +267,7 @@ export async function recordConsumedVideo(
 }
 
 /**
- * Record a listened Spotify track into the weekly history
+ * Record a listened Spotify track into the weekly history via authenticated backend API
  */
 export async function recordConsumedTrack(
   studentUid: string,
@@ -371,43 +277,24 @@ export async function recordConsumedTrack(
 ): Promise<boolean> {
   const cleanStudent = cleanDocId(studentUid);
   const cleanWeek = (weekId || 'week-1').trim();
-  if (!cleanStudent || !track || !track.id) return false;
+  if (!cleanStudent || isSyntheticLegacyUid(cleanStudent) || !track || (!track.id && !track.trackId)) return false;
 
   try {
-    const existing = await fetchWeeklyHistory(cleanStudent, cleanWeek);
-    const currentTracks = existing?.consumedTrackIds ? [...existing.consumedTrackIds] : [];
-
-    const existsIndex = currentTracks.findIndex(
-      (t) => (t.id || t.trackId) === (track.id || track.trackId)
-    );
-    if (existsIndex >= 0) {
-      currentTracks[existsIndex] = { ...currentTracks[existsIndex], ...track };
-    } else {
-      currentTracks.push(track);
-    }
-
-    const payload: Partial<WeeklyHistoryDoc> = {
-      studentUid: cleanStudent,
-      weekId: cleanWeek,
-      consumedTrackIds: currentTracks,
-      updatedAt: new Date().toISOString(),
-    };
-    if (nativeFriendUid) {
-      payload.assignedNativeFriendUID = nativeFriendUid;
-      payload.nativeFriendUID = nativeFriendUid;
-    }
-
-    const saved = await saveWeeklyHistory(cleanStudent, cleanWeek, payload);
-
-    // Also persist strictly to users/{cleanStudent}/listenedTracksHistory
-    const trackIdToSave = track.trackId || track.id;
-    if (trackIdToSave) {
-      addTrackToListenedHistoryInFirestore(cleanStudent, trackIdToSave, track.title, track.artist).catch((err) =>
-        console.warn('Notice saving to users listenedTracksHistory:', err)
-      );
-    }
-
-    return saved;
+    const headers = await getAuthHeaders();
+    const res = await fetch('/api/student-history/record', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        studentUid: cleanStudent,
+        weekId: cleanWeek,
+        type: 'track',
+        track,
+        ...(nativeFriendUid ? { nativeFriendUid } : {}),
+      }),
+    });
+    if (!res.ok) return false;
+    const json = await res.json().catch(() => null);
+    return Boolean(json?.success);
   } catch (err) {
     console.error('Failed to record consumed track:', err);
     return false;
@@ -415,7 +302,7 @@ export async function recordConsumedTrack(
 }
 
 /**
- * Record learned vocabulary words into the weekly history
+ * Record learned vocabulary words into the weekly history via authenticated backend API
  */
 export async function recordWeeklyVocabulary(
   studentUid: string,
@@ -425,35 +312,24 @@ export async function recordWeeklyVocabulary(
 ): Promise<boolean> {
   const cleanStudent = cleanDocId(studentUid);
   const cleanWeek = (weekId || 'week-1').trim();
-  if (!cleanStudent || !Array.isArray(words) || words.length === 0) return false;
+  if (!cleanStudent || isSyntheticLegacyUid(cleanStudent) || !Array.isArray(words) || words.length === 0) return false;
 
   try {
-    const existing = await fetchWeeklyHistory(cleanStudent, cleanWeek);
-    const currentVocab = existing?.weeklyVocabulary ? [...existing.weeklyVocabulary] : [];
-
-    for (const w of words) {
-      const cleanWord = (w.word || '').trim().toLowerCase();
-      if (!cleanWord) continue;
-      const idx = currentVocab.findIndex((item) => (item.word || '').trim().toLowerCase() === cleanWord);
-      if (idx >= 0) {
-        currentVocab[idx] = { ...currentVocab[idx], ...w };
-      } else {
-        currentVocab.push(w);
-      }
-    }
-
-    const payload: Partial<WeeklyHistoryDoc> = {
-      studentUid: cleanStudent,
-      weekId: cleanWeek,
-      weeklyVocabulary: currentVocab,
-      updatedAt: new Date().toISOString(),
-    };
-    if (nativeFriendUid) {
-      payload.assignedNativeFriendUID = nativeFriendUid;
-      payload.nativeFriendUID = nativeFriendUid;
-    }
-
-    return await saveWeeklyHistory(cleanStudent, cleanWeek, payload);
+    const headers = await getAuthHeaders();
+    const res = await fetch('/api/student-history/record', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        studentUid: cleanStudent,
+        weekId: cleanWeek,
+        type: 'vocabulary',
+        words,
+        ...(nativeFriendUid ? { nativeFriendUid } : {}),
+      }),
+    });
+    if (!res.ok) return false;
+    const json = await res.json().catch(() => null);
+    return Boolean(json?.success);
   } catch (err) {
     console.error('Failed to record weekly vocabulary:', err);
     return false;
@@ -462,7 +338,7 @@ export async function recordWeeklyVocabulary(
 
 /**
  * Custom React Hook: useStudentHistory
- * Manages consolidated weekly history with strict UID isolation
+ * Manages consolidated weekly history via canonical backend APIs with strict UID isolation
  */
 export function useStudentHistory({
   studentUid,
@@ -498,7 +374,7 @@ export function useStudentHistory({
     let active = true;
 
     async function checkAuth() {
-      if (!effectiveUid) {
+      if (!effectiveUid || isSyntheticLegacyUid(effectiveUid)) {
         if (active) {
           setIsAuthorized(false);
           setIsLoading(false);
@@ -507,12 +383,10 @@ export function useStudentHistory({
       }
 
       if (!cleanTeacherUid && !nativeFriendEmail) {
-        // Accessed by student themselves
         if (active) setIsAuthorized(true);
         return;
       }
 
-      // Teacher is accessing - strictly verify assignedNativeFriendUID
       setIsLoading(true);
       const isLinked = await verifyStudentNativeFriendLink(effectiveUid, cleanTeacherUid, studentEmail, nativeFriendEmail);
       if (active) {
@@ -532,15 +406,8 @@ export function useStudentHistory({
     };
   }, [effectiveUid, cleanTeacherUid, studentEmail, nativeFriendEmail]);
 
-  // Real-time listener on weeklyHistory document if authorized
-  useEffect(() => {
-    // Immediately clear state for new student so that old student data never lingers
-    setWeeklyHistory(null);
-    setAllHistories([]);
-    setAccumulatedVideoIds(new Set());
-    setAccumulatedTrackIds(new Set());
-
-    if (!effectiveUid || !isAuthorized) {
+  const loadHistoryFromBackend = useCallback(async () => {
+    if (!effectiveUid || isSyntheticLegacyUid(effectiveUid) || !isAuthorized) {
       if (isMountedRef.current) {
         setIsLoading(false);
       }
@@ -548,145 +415,66 @@ export function useStudentHistory({
     }
 
     setIsLoading(true);
-    const db = getDb();
-    const docRef = doc(db, 'users', effectiveUid, 'weeklyHistory', effectiveWeekId);
-
-    const unsubscribe = onSnapshot(
-      docRef,
-      (snapshot) => {
-        if (!isMountedRef.current) return;
-        const historyData: WeeklyHistoryDoc = snapshot.exists()
-          ? (snapshot.data() as WeeklyHistoryDoc)
-          : {
-              studentUid: effectiveUid,
-              studentEmail: studentEmail || '',
-              assignedNativeFriendUID: cleanTeacherUid,
-              nativeFriendUID: cleanTeacherUid,
-              weekId: effectiveWeekId,
-              weeklyCycle: weeklyCycle || 1,
-              consumedVideoIds: [],
-              consumedTrackIds: [],
-              weeklyVocabulary: [],
-              updatedAt: new Date().toISOString(),
-            };
-
-        // Complement with studentJournal from user doc for real-time mobile sync
-        getDoc(doc(db, 'users', effectiveUid))
-          .then((uSnap) => {
-            if (uSnap.exists() && isMountedRef.current) {
-              const uData = uSnap.data();
-              if (Array.isArray(uData.studentJournal)) {
-                const targetCycle = weeklyCycle || 1;
-                const journalVideos = uData.studentJournal.filter(
-                  (e: any) => e && e.type === 'video' && (!e.week || e.week === targetCycle)
-                );
-                const journalTracks = uData.studentJournal.filter(
-                  (e: any) => e && e.type === 'audio' && (!e.week || e.week === targetCycle)
-                );
-
-                const existingVids = new Set((historyData.consumedVideoIds || []).map((v) => v.id || v.videoId));
-                journalVideos.forEach((jv: any) => {
-                  if (jv.id && !existingVids.has(jv.id)) {
-                    historyData.consumedVideoIds.push({
-                      id: jv.id,
-                      videoId: jv.id,
-                      videoTitle: jv.title || 'Daily Routine Video',
-                      title: jv.title || 'Daily Routine Video',
-                      watchedAt: (jv.timestamp ? new Date(jv.timestamp).toISOString() : jv.date) || '',
-                      dayOfWeek: jv.dayOfWeek,
-                    });
-                  }
-                });
-
-                const existingTrks = new Set((historyData.consumedTrackIds || []).map((t) => t.id || t.trackId));
-                journalTracks.forEach((jt: any) => {
-                  if (jt.id && !existingTrks.has(jt.id)) {
-                    historyData.consumedTrackIds.push({
-                      id: jt.id,
-                      trackId: jt.id,
-                      title: jt.title || 'Daily Track',
-                      artist: jt.artist || 'Spotify Artist',
-                      coverUrl: jt.coverUrl || '',
-                      listenedAt: (jt.timestamp ? new Date(jt.timestamp).toISOString() : jt.date) || '',
-                      dayOfWeek: jt.dayOfWeek,
-                      url: jt.url || '',
-                    });
-                  }
-                });
-
-                setWeeklyHistory({ ...historyData });
-              }
-            }
-          })
-          .catch(() => {});
-
-        // If tracks are empty, complement with currentRoutine
-        if (!historyData.consumedTrackIds || historyData.consumedTrackIds.length === 0) {
-          getDoc(doc(db, 'users', effectiveUid, 'currentRoutine', 'active'))
-            .then((rSnap) => {
-              if (rSnap.exists() && isMountedRef.current) {
-                const rData = rSnap.data();
-                if (rData.currentSpotifyTrack) {
-                  const trk = rData.currentSpotifyTrack;
-                  historyData.consumedTrackIds = [
-                    {
-                      id: trk.id || 'track-1',
-                      trackId: trk.id || 'track-1',
-                      title: trk.title,
-                      artist: trk.artist,
-                      coverUrl: trk.coverUrl,
-                      listenedAt: new Date().toISOString(),
-                      dayOfWeek: trk.dayOfWeek,
-                    },
-                  ];
-                  setWeeklyHistory({ ...historyData });
-                }
-              }
-            })
-            .catch(() => {});
-        }
-
+    try {
+      const headers = await getAuthHeaders();
+      const res = await fetch(
+        `/api/student-history?studentUid=${encodeURIComponent(effectiveUid)}&weekId=${encodeURIComponent(effectiveWeekId)}&includeAll=true&includeAccumulated=true`,
+        { method: 'GET', headers }
+      );
+      if (!isMountedRef.current) return;
+      if (res.ok) {
+        const data = await res.json();
+        const historyData: WeeklyHistoryDoc = data?.weeklyHistory || {
+          studentUid: effectiveUid,
+          studentEmail: studentEmail || '',
+          assignedNativeFriendUID: cleanTeacherUid,
+          nativeFriendUID: cleanTeacherUid,
+          weekId: effectiveWeekId,
+          weeklyCycle: weeklyCycle || 1,
+          consumedVideoIds: [],
+          consumedTrackIds: [],
+          weeklyVocabulary: [],
+          updatedAt: new Date().toISOString(),
+        };
         setWeeklyHistory(historyData);
-        setIsLoading(false);
-      },
-      (err) => {
-        console.warn(`Firestore onSnapshot notice for weeklyHistory ${effectiveUid}:`, err);
-        if (isMountedRef.current) {
-          setIsLoading(false);
+        if (Array.isArray(data?.allHistories)) {
+          setAllHistories(data.allHistories);
         }
+        const vSet = new Set<string>(Array.isArray(data?.accumulated?.videoIds) ? data.accumulated.videoIds : []);
+        const tSet = new Set<string>(Array.isArray(data?.accumulated?.trackIds) ? data.accumulated.trackIds : []);
+        setAccumulatedVideoIds(vSet);
+        setAccumulatedTrackIds(tSet);
       }
-    );
-
-    // Also fetch all past cycles for accumulated uniqueness
-    fetchAccumulatedConsumedIds(effectiveUid).then((accumulated) => {
-      if (!isMountedRef.current) return;
-      setAccumulatedVideoIds(accumulated.videoIds);
-      setAccumulatedTrackIds(accumulated.trackIds);
-    });
-
-    fetchAllWeeklyHistories(effectiveUid).then((all) => {
-      if (!isMountedRef.current) return;
-      setAllHistories(all);
-    });
-
-    return () => {
-      unsubscribe();
-    };
+    } catch (err) {
+      console.warn(`Notice loading weeklyHistory from backend for ${effectiveUid}:`, err);
+    } finally {
+      if (isMountedRef.current) {
+        setIsLoading(false);
+      }
+    }
   }, [effectiveUid, effectiveWeekId, isAuthorized, cleanTeacherUid, studentEmail, weeklyCycle]);
 
-  // Record actions
+  useEffect(() => {
+    setWeeklyHistory(null);
+    setAllHistories([]);
+    setAccumulatedVideoIds(new Set());
+    setAccumulatedTrackIds(new Set());
+    loadHistoryFromBackend();
+  }, [loadHistoryFromBackend]);
+
   const recordVideo = useCallback(
     async (video: ConsumedVideoItem): Promise<boolean> => {
       if (!effectiveUid || !isAuthorized) return false;
       setIsSaving(true);
       try {
         const ok = await recordConsumedVideo(effectiveUid, effectiveWeekId, video, cleanTeacherUid);
+        if (ok) await loadHistoryFromBackend();
         return ok;
       } finally {
         if (isMountedRef.current) setIsSaving(false);
       }
     },
-    [effectiveUid, effectiveWeekId, isAuthorized, cleanTeacherUid]
+    [effectiveUid, effectiveWeekId, isAuthorized, cleanTeacherUid, loadHistoryFromBackend]
   );
 
   const recordTrack = useCallback(
@@ -695,12 +483,13 @@ export function useStudentHistory({
       setIsSaving(true);
       try {
         const ok = await recordConsumedTrack(effectiveUid, effectiveWeekId, track, cleanTeacherUid);
+        if (ok) await loadHistoryFromBackend();
         return ok;
       } finally {
         if (isMountedRef.current) setIsSaving(false);
       }
     },
-    [effectiveUid, effectiveWeekId, isAuthorized, cleanTeacherUid]
+    [effectiveUid, effectiveWeekId, isAuthorized, cleanTeacherUid, loadHistoryFromBackend]
   );
 
   const recordVocabulary = useCallback(
@@ -709,29 +498,18 @@ export function useStudentHistory({
       setIsSaving(true);
       try {
         const ok = await recordWeeklyVocabulary(effectiveUid, effectiveWeekId, words, cleanTeacherUid);
+        if (ok) await loadHistoryFromBackend();
         return ok;
       } finally {
         if (isMountedRef.current) setIsSaving(false);
       }
     },
-    [effectiveUid, effectiveWeekId, isAuthorized, cleanTeacherUid]
+    [effectiveUid, effectiveWeekId, isAuthorized, cleanTeacherUid, loadHistoryFromBackend]
   );
 
   const refreshHistory = useCallback(async () => {
-    if (!effectiveUid || !isAuthorized) return;
-    setIsLoading(true);
-    try {
-      const data = await fetchWeeklyHistory(effectiveUid, effectiveWeekId);
-      if (isMountedRef.current) {
-        if (data) setWeeklyHistory(data);
-        const accumulated = await fetchAccumulatedConsumedIds(effectiveUid);
-        setAccumulatedVideoIds(accumulated.videoIds);
-        setAccumulatedTrackIds(accumulated.trackIds);
-      }
-    } finally {
-      if (isMountedRef.current) setIsLoading(false);
-    }
-  }, [effectiveUid, effectiveWeekId, isAuthorized]);
+    await loadHistoryFromBackend();
+  }, [loadHistoryFromBackend]);
 
   return {
     weeklyHistory,

@@ -378,70 +378,49 @@ export async function addTrackToListenedHistoryInFirestore(
 }
 
 /**
- * Resets "Repeat Previous Video" (isRepeatVideo: false) for all days.
+ * Deprecated legacy wrapper: previously redirected to /api/student-routines/start-new-week.
+ * Blocked to prevent accidental weeklyCycle advancement or destructive routine wipes.
+ * Preserved as an export solely for backwards compatibility.
  */
 export async function resetRepeatFlagsInFirestore(
   studentUid: string,
-  targetDays: DayOfWeek[] = ALL_DAYS_OF_WEEK
+  _targetDays: DayOfWeek[] = ALL_DAYS_OF_WEEK
 ): Promise<boolean> {
   const cleanUid = normalizeStudentIdForPath(studentUid);
   if (!cleanUid) return false;
-
-  try {
-    const headers = await getAuthHeaders();
-    const res = await fetch('/api/student-routines/start-new-week', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        studentUid: cleanUid,
-        uid: cleanUid,
-        resetTopicsToChooseTopic: false,
-        weeklyStudyDays: targetDays,
-      }),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+  console.warn(
+    '[useRoutine] resetRepeatFlagsInFirestore is deprecated and blocked; repeat flags must never advance weeklyCycle.'
+  );
+  return false;
 }
 
 /**
- * Completely resets daily routines for a new weekly cycle:
- * Clears topic/playlistId, videoId, and repeat flags so all days start cleanly on "Choose a Topic".
+ * Deprecated legacy wrapper: previously redirected to /api/student-routines/start-new-week.
+ * Blocked to prevent destructive uncoordinated resets outside StartNewWeekHandler.executeStartNewWeek.
+ * Preserved as an export solely for backwards compatibility.
  */
 export async function resetDailyRoutinesForNewWeekInFirestore(
   studentUid: string,
-  targetDays: DayOfWeek[] = ALL_DAYS_OF_WEEK
+  _targetDays: DayOfWeek[] = ALL_DAYS_OF_WEEK
 ): Promise<boolean> {
   const cleanUid = normalizeStudentIdForPath(studentUid);
   if (!cleanUid) return false;
-
-  try {
-    const headers = await getAuthHeaders();
-    const res = await fetch('/api/student-routines/start-new-week', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        studentUid: cleanUid,
-        uid: cleanUid,
-        resetTopicsToChooseTopic: true,
-        weeklyStudyDays: targetDays,
-      }),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+  console.warn(
+    '[useRoutine] resetDailyRoutinesForNewWeekInFirestore is deprecated and blocked; use executeStartNewWeek instead.'
+  );
+  return false;
 }
 
 /**
  * Initializes clean, default isolated routine records for a newly registered student.
+ * Does NOT call start-new-week so cycle 1 is preserved cleanly during onboarding.
  */
 export async function initializeCleanStudentRoutinesInFirestore(
   studentUid: string,
-  targetDays: DayOfWeek[] = ALL_DAYS_OF_WEEK
+  _targetDays: DayOfWeek[] = ALL_DAYS_OF_WEEK
 ): Promise<boolean> {
-  return await resetDailyRoutinesForNewWeekInFirestore(studentUid, targetDays);
+  const cleanUid = normalizeStudentIdForPath(studentUid);
+  return Boolean(cleanUid);
 }
 
 /**
@@ -819,49 +798,23 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
   );
 
   const resetRepeatFlags = useCallback(
-    async (studyDays?: DayOfWeek[]) => {
+    async (_studyDays?: DayOfWeek[]) => {
       if (!effectiveUid) return false;
-      setRoutinesByDay((prev) => {
-        const updated = { ...prev };
-        Object.keys(updated).forEach((d) => {
-          const dayKey = d as DayOfWeek;
-          if (updated[dayKey]) {
-            updated[dayKey] = { ...updated[dayKey]!, isRepeatVideo: false };
-          }
-        });
-        return updated;
-      });
-      return await resetRepeatFlagsInFirestore(effectiveUid, studyDays);
+      console.warn(
+        '[useRoutine] resetRepeatFlags is deprecated and blocked; it will not clear routines or advance weeklyCycle.'
+      );
+      return false;
     },
     [effectiveUid]
   );
 
   const resetRoutinesForNewWeek = useCallback(
-    async (studyDays?: DayOfWeek[]) => {
+    async (_studyDays?: DayOfWeek[]) => {
       if (!effectiveUid) return false;
-
-      const cleanRoutines: Partial<Record<DayOfWeek, SavedRoutineVideo>> = {};
-      ALL_DAYS_OF_WEEK.forEach((d) => {
-        cleanRoutines[d] = {
-          videoId: '',
-          title: '',
-          videoTitle: '',
-          url: '',
-          playlistId: '',
-          playlistTitle: '',
-          isRepeatVideo: false,
-          dayOfWeek: d,
-          activityId: 'act-1',
-          instructions: '',
-          duration: '',
-          completed: false,
-          completedToday: false,
-          updatedAt: new Date().toISOString(),
-        };
-      });
-      setRoutinesByDay(cleanRoutines);
-
-      return await resetDailyRoutinesForNewWeekInFirestore(effectiveUid, studyDays);
+      console.warn(
+        '[useRoutine] resetRoutinesForNewWeek is deprecated and blocked; use executeStartNewWeek instead.'
+      );
+      return false;
     },
     [effectiveUid]
   );
