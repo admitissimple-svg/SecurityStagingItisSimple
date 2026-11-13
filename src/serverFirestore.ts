@@ -1226,21 +1226,13 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
         return null;
       }
 
-      // ARCH.2A: Canonical persistence strictly in (default) /users and /tutors.
-      // Never reconstruct userProfiles, authUsers, or students from unconfirmed app_state/main_data caches
+      // ARCH.2A + ARCH.2G.3: Canonical persistence strictly in (default) /users and /tutors.
+      // Never reconstruct or enrich userProfiles, authUsers, or students from unconfirmed app_state/main_data caches
       // or isolated activity maps (studentRoutinesMap, studentVideoAssignments, studentSpotifyAssignments, studentWeeklyChecks).
       const mergedUserProfiles: Record<string, any> = {};
       const mergedAuthUsers: Record<string, any> = {};
       const studentMap = new Map<string, any>();
-
-      const legacyProfilesMap = (mainData?.userProfiles && typeof mainData.userProfiles === 'object') ? mainData.userProfiles : {};
-      const legacyStudentsByEmail = new Map<string, any>();
-      if (Array.isArray(mainData?.students)) {
-        mainData.students.forEach((s: any) => {
-          const sKey = (s?.studentEmail || s?.email || '').toLowerCase().trim();
-          if (sKey) legacyStudentsByEmail.set(sKey, s);
-        });
-      }
+      const confirmedUserTokens = new Set<string>();
 
       if (directUsersResult.ok) {
         directUsers.forEach((u: any) => {
@@ -1253,30 +1245,24 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
               : (u.id && isValidCanonicalUid(u.id) ? u.id : null);
           if (!canonicalUid) return;
 
-          const uRole = (u.role || u.userRole || '').toLowerCase().trim();
+          confirmedUserTokens.add(key);
+          confirmedUserTokens.add(canonicalUid.toLowerCase());
 
-          // Optional enrichment from main_data ONLY when canonical /users doc exists and UID is compatible
-          const rawLegacyProfile = legacyProfilesMap[key];
-          const legacyProfUid = rawLegacyProfile?.uid || rawLegacyProfile?.id;
-          const isLegacyProfCompatible =
-            rawLegacyProfile &&
-            typeof rawLegacyProfile === 'object' &&
-            (!legacyProfUid || !isValidCanonicalUid(legacyProfUid) || legacyProfUid === canonicalUid);
+          const uRole = (u.role || u.userRole || '').toLowerCase().trim();
 
           if (uRole !== 'teacher' && uRole !== 'tutor' && uRole !== 'native_friend') {
             mergedUserProfiles[key] = {
-              ...(isLegacyProfCompatible ? rawLegacyProfile : {}),
               ...u,
               id: canonicalUid,
               uid: canonicalUid,
-              name: u.name || (isLegacyProfCompatible ? rawLegacyProfile?.name : undefined) || key.split('@')[0],
+              name: u.name || key.split('@')[0],
               email: key,
-              level: u.level || u.englishLevel || (isLegacyProfCompatible ? rawLegacyProfile?.level : undefined) || 'iniciante',
-              enrollmentStatus: u.enrollmentStatus || (isLegacyProfCompatible ? rawLegacyProfile?.enrollmentStatus : undefined) || 'active',
-              learningGoal: u.learningGoal || u.goal || (isLegacyProfCompatible ? rawLegacyProfile?.learningGoal : undefined) || 'English for everyday life & work',
-              weeklyStudyDaysTarget: u.weeklyStudyDaysTarget ?? (isLegacyProfCompatible ? rawLegacyProfile?.weeklyStudyDaysTarget : undefined) ?? 7,
-              weeklyStudyDays: u.weeklyStudyDays || (isLegacyProfCompatible ? rawLegacyProfile?.weeklyStudyDays : undefined) || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'],
-              createdAt: u.createdAt || (isLegacyProfCompatible ? rawLegacyProfile?.createdAt : undefined) || new Date().toISOString(),
+              level: u.level || u.englishLevel || 'iniciante',
+              enrollmentStatus: u.enrollmentStatus || 'active',
+              learningGoal: u.learningGoal || u.goal || 'English for everyday life & work',
+              weeklyStudyDaysTarget: u.weeklyStudyDaysTarget ?? 7,
+              weeklyStudyDays: u.weeklyStudyDays || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'],
+              createdAt: u.createdAt || new Date().toISOString(),
             };
           } else {
             mergedUserProfiles[key] = {
@@ -1298,29 +1284,21 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
           };
 
           if (uRole === 'student' || !uRole) {
-            const rawLegacyStudent = legacyStudentsByEmail.get(key);
-            const legacyStudentUid = rawLegacyStudent?.uid || rawLegacyStudent?.studentUid || rawLegacyStudent?.id;
-            const isLegacyStudentCompatible =
-              rawLegacyStudent &&
-              typeof rawLegacyStudent === 'object' &&
-              (!legacyStudentUid || !isValidCanonicalUid(legacyStudentUid) || legacyStudentUid === canonicalUid);
-
             studentMap.set(key, {
-              ...(isLegacyStudentCompatible ? rawLegacyStudent : {}),
               ...u,
               id: canonicalUid,
               studentUid: canonicalUid,
               uid: canonicalUid,
-              name: u.name || (isLegacyStudentCompatible ? (rawLegacyStudent?.name || rawLegacyStudent?.studentName) : undefined) || key.split('@')[0],
-              studentName: u.name || (isLegacyStudentCompatible ? (rawLegacyStudent?.studentName || rawLegacyStudent?.name) : undefined) || key.split('@')[0],
+              name: u.name || key.split('@')[0],
+              studentName: u.name || key.split('@')[0],
               email: key,
               studentEmail: key,
-              level: u.level || u.englishLevel || (isLegacyStudentCompatible ? (rawLegacyStudent?.level || rawLegacyStudent?.studentLevel) : undefined) || 'iniciante',
-              studentLevel: u.level || u.englishLevel || (isLegacyStudentCompatible ? (rawLegacyStudent?.studentLevel || rawLegacyStudent?.level) : undefined) || 'iniciante',
-              goal: u.learningGoal || u.goal || (isLegacyStudentCompatible ? (rawLegacyStudent?.goal || rawLegacyStudent?.learningGoal) : undefined) || 'English for everyday life & work',
-              learningGoal: u.learningGoal || u.goal || (isLegacyStudentCompatible ? (rawLegacyStudent?.learningGoal || rawLegacyStudent?.goal) : undefined) || 'English for everyday life & work',
-              contractedLessons: u.contractedLessons ?? (isLegacyStudentCompatible ? rawLegacyStudent?.contractedLessons : undefined) ?? 5,
-              completedLessonsCount: u.completedLessonsCount ?? (isLegacyStudentCompatible ? rawLegacyStudent?.completedLessonsCount : undefined) ?? 0,
+              level: u.level || u.englishLevel || 'iniciante',
+              studentLevel: u.level || u.englishLevel || 'iniciante',
+              goal: u.learningGoal || u.goal || 'English for everyday life & work',
+              learningGoal: u.learningGoal || u.goal || 'English for everyday life & work',
+              contractedLessons: u.contractedLessons ?? 0,
+              completedLessonsCount: u.completedLessonsCount ?? 0,
               status: u.status || 'active',
               activeSince: (u.createdAt || new Date().toISOString()).split('T')[0],
               createdAt: u.createdAt || new Date().toISOString(),
@@ -1341,6 +1319,8 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
       confirmedAdminTeachers.forEach((adminTeacher: any) => {
         const key = (adminTeacher.email || '').toLowerCase().trim();
         const adminUid = (adminTeacher.uid || adminTeacher.id).trim();
+        if (key) confirmedUserTokens.add(key);
+        if (adminUid) confirmedUserTokens.add(adminUid.toLowerCase());
         if (key && !mergedAuthUsers[key]) {
           mergedAuthUsers[key] = {
             uid: adminUid,
@@ -1353,30 +1333,39 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
         }
       });
 
-      const hydratedMainData = {
-        ...(mainData || {}),
-        userProfiles: mergedUserProfiles,
-        authUsers: mergedAuthUsers,
-        students: Array.from(studentMap.values()),
+      // Canonical consolidation of tutors strictly from /tutors and /users (role=='teacher').
+      // app_state/tutors entries are NEVER merged back ahead of or in place of directTutors.
+      const consolidatedTutorsList = directTutorsResult.ok
+        ? consolidateTutorsList([...directTutors])
+        : [];
+
+      consolidatedTutorsList.forEach((dt: any) => {
+        const dtEmail = (dt?.email || '').toLowerCase().trim();
+        const dtUid = (dt?.authUid || dt?.uid || dt?.id || '').toLowerCase().trim();
+        if (dtEmail) confirmedUserTokens.add(dtEmail);
+        if (dtUid) confirmedUserTokens.add(dtUid);
+      });
+
+      const isConfirmedKey = (rawKey: string): boolean => {
+        if (!directUsersResult.ok && !directTutorsResult.ok) return false;
+        const clean = (rawKey || '').toLowerCase().trim();
+        if (!clean) return false;
+        if (confirmedUserTokens.has(clean)) return true;
+        const baseToken = clean.split('::')[0].trim();
+        if (baseToken && confirmedUserTokens.has(baseToken)) return true;
+        return false;
       };
 
-      // Canonical consolidation of tutors strictly anchored in /tutors and /users (role=='teacher').
-      // app_state/tutors entries without canonical confirmation in directTutors are never resurrected.
-      const stateTutors = Array.isArray(tutors?.tutorsList) ? tutors.tutorsList : [];
-      const confirmedStateTutors = directTutorsResult.ok
-        ? stateTutors.filter((st: any) => {
-            const stEmail = (st?.email || '').toLowerCase().trim();
-            const stUid = (st?.authUid || st?.uid || st?.id || '').trim();
-            return directTutors.some((dt: any) => {
-              const dtEmail = (dt?.email || '').toLowerCase().trim();
-              const dtUid = (dt?.authUid || dt?.uid || dt?.id || '').trim();
-              return (stUid && dtUid && stUid === dtUid) || (stEmail && dtEmail && stEmail === dtEmail);
-            });
-          })
-        : [];
-      const consolidatedTutorsList = directTutorsResult.ok
-        ? consolidateTutorsList([...confirmedStateTutors, ...directTutors])
-        : [];
+      const filterConfirmedMap = (rawMap: any): Record<string, any> => {
+        if (!rawMap || typeof rawMap !== 'object' || Array.isArray(rawMap)) return {};
+        const out: Record<string, any> = {};
+        for (const [k, v] of Object.entries(rawMap)) {
+          if (isConfirmedKey(k)) {
+            out[k] = v;
+          }
+        }
+        return out;
+      };
 
       const existingStateTeachers = Array.isArray(tutors?.teachers) ? tutors.teachers : [];
       const confirmedStateTeachers = existingStateTeachers.filter((tc: any) => {
@@ -1396,29 +1385,60 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
       });
 
       const mergedTutorsDoc = {
-        ...(tutors || {}),
+        deletedTutorIds: Array.isArray(tutors?.deletedTutorIds) ? tutors.deletedTutorIds : [],
+        deletedTutorEmails: Array.isArray(tutors?.deletedTutorEmails) ? tutors.deletedTutorEmails : [],
         tutorsList: consolidatedTutorsList,
         teachers: confirmedStateTeachers,
       };
 
-      const sanitizedMainData: Record<string, any> = { ...hydratedMainData };
-      delete sanitizedMainData.liveLessons;
-      delete sanitizedMainData.lessons;
-      delete sanitizedMainData.scheduledLessons;
-      delete sanitizedMainData.sessionNotesMap;
-      delete sanitizedMainData.sessionNotesProgressMap;
-      delete sanitizedMainData.pedagogicalTransformationsMap;
+      // Strictly whitelist structural fields from app_state/main_data; strip all legacy identity, PII, session, and test residue
+      const sanitizedMainData: Record<string, any> = {
+        ...(mainData?.landingContent !== undefined ? { landingContent: mainData.landingContent } : {}),
+        ...(mainData?.spotifyPlaylists !== undefined ? { spotifyPlaylists: mainData.spotifyPlaylists } : {}),
+        ...(mainData?.weeklyHomework !== undefined ? { weeklyHomework: mainData.weeklyHomework } : {}),
+        ...(mainData?.studentHomeworkMap !== undefined ? { studentHomeworkMap: filterConfirmedMap(mainData.studentHomeworkMap) } : {}),
+        ...(Array.isArray(mainData?.deletedStudentEmails) ? { deletedStudentEmails: mainData.deletedStudentEmails } : {}),
+        ...(mainData?.updatedAt !== undefined ? { updatedAt: mainData.updatedAt } : {}),
+        userProfiles: mergedUserProfiles,
+        authUsers: mergedAuthUsers,
+        students: Array.from(studentMap.values()),
+      };
 
-      const sanitizedLessonsDoc: Record<string, any> = lessons ? { ...lessons } : {};
-      delete sanitizedLessonsDoc.liveLessons;
-      delete sanitizedLessonsDoc.lessons;
-      delete sanitizedLessonsDoc.scheduledLessons;
+      const sanitizedRoutinesDoc: Record<string, any> = routines
+        ? {
+            ...(routines.routinesByDay !== undefined ? { routinesByDay: routines.routinesByDay } : {}),
+            ...(routines.weeklyNativeTargets !== undefined ? { weeklyNativeTargets: routines.weeklyNativeTargets } : {}),
+            studentRoutinesMap: filterConfirmedMap(routines.studentRoutinesMap),
+            studentCurrentRoutines: filterConfirmedMap(routines.studentCurrentRoutines),
+            studentWeeklyChecks: filterConfirmedMap(routines.studentWeeklyChecks),
+          }
+        : {};
+
+      const sanitizedAssignmentsDoc: Record<string, any> = assignments
+        ? {
+            studentVideoAssignments: filterConfirmedMap(assignments.studentVideoAssignments),
+            studentSpotifyAssignments: filterConfirmedMap(assignments.studentSpotifyAssignments),
+            studentWatchedVideos: filterConfirmedMap(assignments.studentWatchedVideos),
+            studentListenedTracks: filterConfirmedMap(assignments.studentListenedTracks),
+            studentAwaitingTopicSelection: filterConfirmedMap(assignments.studentAwaitingTopicSelection),
+            weeklyStudyDays: filterConfirmedMap(assignments.weeklyStudyDays),
+            weeklyStudyDaysTargets: filterConfirmedMap(assignments.weeklyStudyDaysTargets),
+          }
+        : {};
+
+      const sanitizedLessonsDoc: Record<string, any> = lessons
+        ? {
+            ...(lessons.contractedLessons !== undefined ? { contractedLessons: filterConfirmedMap(lessons.contractedLessons) } : {}),
+            ...(lessons.weeklyHomework !== undefined ? { weeklyHomework: lessons.weeklyHomework } : {}),
+            ...(lessons.studentHomeworkMap !== undefined ? { studentHomeworkMap: filterConfirmedMap(lessons.studentHomeworkMap) } : {}),
+          }
+        : {};
 
       return {
         ...sanitizedMainData,
-        ...(routines || {}),
+        ...sanitizedRoutinesDoc,
         ...mergedTutorsDoc,
-        ...(assignments || {}),
+        ...sanitizedAssignmentsDoc,
         ...sanitizedLessonsDoc,
         ...(ytPlaylists && ytPlaylists.playlists ? { youtubePlaylists: ytPlaylists.playlists } : {}),
       };
@@ -1617,76 +1637,14 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
       updatedAt: new Date().toISOString(),
     };
 
-    const mainData = { ...sanitized };
-    delete sanitized.studentDictionaryMap;
-    delete sanitized.sessionNotesMap;
-    delete sanitized.sessionNotesProgressMap;
-    delete sanitized.pedagogicalTransformationsMap;
-    delete mainData.studentDictionaryMap;
-    delete mainData.sessionNotesMap;
-    delete mainData.sessionNotesProgressMap;
-    delete mainData.pedagogicalTransformationsMap;
-    delete mainData.studentRoutinesMap;
-    delete mainData.studentCurrentRoutines;
-    delete mainData.routinesByDay;
-    delete mainData.studentWeeklyChecks;
-    delete mainData.weeklyNativeTargets;
-    delete mainData.tutorsList;
-    delete mainData.teachers;
-    delete mainData.deletedTutorEmails;
-    delete mainData.deletedTutorIds;
-    delete mainData.studentVideoAssignments;
-    delete mainData.studentSpotifyAssignments;
-    delete mainData.studentWatchedVideos;
-    delete mainData.studentListenedTracks;
-    delete mainData.studentAwaitingTopicSelection;
-    delete mainData.weeklyStudyDays;
-    delete mainData.weeklyStudyDaysTargets;
-    delete mainData.liveLessons;
-    delete mainData.lessons;
-    delete mainData.scheduledLessons;
-    delete mainData.contractedLessons;
-    delete mainData.weeklyHomework;
-    delete mainData.studentHomeworkMap;
-    mainData.updatedAt = new Date().toISOString();
+    const mainData: Record<string, any> = {
+      ...(sanitized.landingContent !== undefined ? { landingContent: sanitized.landingContent } : {}),
+      ...(sanitized.spotifyPlaylists !== undefined ? { spotifyPlaylists: sanitized.spotifyPlaylists } : {}),
+      ...(Array.isArray(sanitized.deletedStudentEmails) ? { deletedStudentEmails: sanitized.deletedStudentEmails } : {}),
+      updatedAt: new Date().toISOString(),
+    };
 
-    // Security Hardening 4B.17B & Isolamento do JSON de Testes: Eliminate plaintext passwords & local JSON from state trees
-    if (mainData.authUsers && typeof mainData.authUsers === 'object') {
-      const cleanAuthUsers: Record<string, any> = {};
-      for (const [k, v] of Object.entries(mainData.authUsers)) {
-        if (v && typeof v === 'object' && !isLocalJsonOrTestRecord(v)) {
-          const userObj = { ...(v as any) };
-          delete userObj.password;
-          const uUid = userObj.uid || userObj.id;
-          if (uUid && isValidCanonicalUid(uUid)) {
-            cleanAuthUsers[k] = userObj;
-          }
-        }
-      }
-      mainData.authUsers = cleanAuthUsers;
-    }
-    if (mainData.userProfiles && typeof mainData.userProfiles === 'object') {
-      const cleanProfiles: Record<string, any> = {};
-      for (const [k, v] of Object.entries(mainData.userProfiles)) {
-        if (v && typeof v === 'object' && !isLocalJsonOrTestRecord(v)) {
-          const profObj = { ...(v as any) };
-          delete profObj.password;
-          const pUid = profObj.uid || profObj.id;
-          if (pUid && isValidCanonicalUid(pUid)) {
-            cleanProfiles[k] = profObj;
-          }
-        }
-      }
-      mainData.userProfiles = cleanProfiles;
-    }
-    if (Array.isArray(mainData.students)) {
-      mainData.students = mainData.students
-        .filter((s: any) => !isLocalJsonOrTestRecord(s))
-        .map((s: any) => {
-          if (s) delete s.password;
-          return s;
-        });
-    }
+    // Strip all legacy identity/PII/session/residue keys; canonical identities reside strictly in /users and /tutors
     if (Array.isArray(tutorsData.tutorsList)) {
       for (const t of tutorsData.tutorsList) {
         if (t) delete t.password;
@@ -1698,110 +1656,7 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
       }
     }
 
-    let tutorsDocToWrite = tutorsData;
-    const hasIntentionalDeletion = Array.isArray(tutorsData.deletedTutorEmails) && tutorsData.deletedTutorEmails.length > 0;
-    if ((!tutorsData.tutorsList || tutorsData.tutorsList.length === 0) && !hasIntentionalDeletion) {
-      try {
-        const existingSnap = await db.collection('app_state').doc('tutors').get().catch(() => null);
-        if (existingSnap && existingSnap.exists) {
-          const exData = existingSnap.data();
-          if (Array.isArray(exData?.tutorsList) && exData.tutorsList.length > 0) {
-            tutorsDocToWrite = {
-              ...tutorsData,
-              tutorsList: exData.tutorsList,
-              teachers: (tutorsData.teachers && tutorsData.teachers.length > 1) ? tutorsData.teachers : (exData.teachers || tutorsData.teachers),
-              updatedAt: new Date().toISOString(),
-            };
-          }
-        }
-      } catch {}
-    }
-
-    if (Array.isArray(tutorsDocToWrite.tutorsList)) {
-      for (const t of tutorsDocToWrite.tutorsList) {
-        if (t) delete t.password;
-      }
-    }
-    if (Array.isArray(tutorsDocToWrite.teachers)) {
-      for (const t of tutorsDocToWrite.teachers) {
-        if (t) delete t.password;
-      }
-    }
-
-    const tutorSavePromises = (Array.isArray(tutorsDocToWrite.tutorsList) ? tutorsDocToWrite.tutorsList : []).map(async (tut: any) => {
-      if (tut && (tut.authUid || tut.uid || tut.id || tut.email)) {
-        const cEmail = (tut.email || '').toLowerCase().trim();
-        const candidateAuthUid = (tut.authUid && isValidCanonicalUid(tut.authUid) ? tut.authUid : null) ||
-          (tut.uid && isValidCanonicalUid(tut.uid) ? tut.uid : null) ||
-          (tut.id && isValidCanonicalUid(tut.id) ? tut.id : null);
-
-        if (candidateAuthUid) {
-          // Rule 1, 2, 3 & 4: Inspect canonical user document in users/{candidateAuthUid}
-          const userSnap = await db.collection('users').doc(candidateAuthUid).get().catch(() => null);
-          const existingUser = userSnap && userSnap.exists ? userSnap.data() : null;
-          const canonicalRole = (existingUser?.role || existingUser?.userRole || '').toLowerCase();
-
-          // STRICT RULE 4: If canonical user is a student, app_state/tutors sync MUST NEVER overwrite role or promote to teacher!
-          if (canonicalRole === 'student') {
-            console.warn(`[saveAppStateToFirestore] Skipping teacher role write for registered student ${candidateAuthUid} (${cEmail}) during tutors sync.`);
-            return;
-          }
-
-          const nameSlug = tut.name && typeof tut.name === 'string' && !isGenericTutorId(tut.name)
-            ? normalizeTutorName(tut.name).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
-            : '';
-          const publicTutorId =
-            (tut.publicTutorId && !isGenericTutorId(tut.publicTutorId) ? tut.publicTutorId : null) ||
-            (tut.id && !isValidCanonicalUid(tut.id) && !isGenericTutorId(tut.id) ? tut.id : null) ||
-            (cEmail ? `tutor-${cEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : null) ||
-            (nameSlug && !isGenericTutorId(nameSlug) ? nameSlug : null) ||
-            candidateAuthUid;
-
-          // Rule 6: If canonical profile does not exist or user is not an approved teacher,
-          // do NOT elevate or create users/{candidateAuthUid} with role 'teacher'!
-          // Only sync public catalog data to tutors/{candidateAuthUid}.
-          const isLegitimateTeacher = Boolean(
-            existingUser &&
-            canonicalRole === 'teacher' &&
-            existingUser.approvalStatus === 'approved' &&
-            existingUser.isApproved === true
-          );
-
-          const tutorDocData = {
-            ...tut,
-            id: candidateAuthUid,
-            uid: candidateAuthUid,
-            authUid: candidateAuthUid,
-            publicTutorId,
-            email: cEmail,
-            role: 'teacher',
-            approvalStatus: existingUser?.approvalStatus || tut.approvalStatus || 'pending',
-            isApproved: Boolean(existingUser?.isApproved === true || tut.isApproved === true),
-            updatedAt: tut.updatedAt || new Date().toISOString(),
-          };
-          delete tutorDocData.password;
-
-          // Sync public catalog record in tutors/{candidateAuthUid}
-          const pTutors = db.collection('tutors').doc(candidateAuthUid).set(tutorDocData, { merge: true }).catch(() => null);
-
-          if (!isLegitimateTeacher) {
-            // Non-teacher or unverified user: NEVER grant privileges in users/{candidateAuthUid}
-            return pTutors;
-          }
-
-          // Legitimate approved teacher: sync tutor metadata to users/{candidateAuthUid} while preserving canonical role
-          const teacherUserData = {
-            ...tutorDocData,
-            role: canonicalRole, // strictly preserve existing canonical role
-            approvalStatus: existingUser?.approvalStatus || 'approved',
-            isApproved: Boolean(existingUser?.isApproved),
-          };
-          const pUsers = db.collection('users').doc(candidateAuthUid).set(teacherUserData, { merge: true }).catch(() => null);
-          return Promise.all([pTutors, pUsers]);
-        }
-      }
-      return Promise.resolve();
-    });
+    const tutorsDocToWrite = tutorsData;
 
     const savePromises = Promise.all([
       db.collection('app_state').doc('main_data').set(mainData, { merge: true }),
@@ -1809,7 +1664,6 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
       db.collection('app_state').doc('tutors').set(tutorsDocToWrite, { merge: true }),
       db.collection('app_state').doc('assignments').set(assignmentsData, { merge: true }),
       db.collection('app_state').doc('lessons').set(lessonsData, { merge: true }),
-      ...tutorSavePromises,
       ...(cachedYtPlaylists ? [saveYouTubePlaylistsToFirestore(cachedYtPlaylists)] : []),
     ]).then(() => true);
 
@@ -4152,33 +4006,18 @@ export async function resolveCanonicalStudentIdentity(
       }
     }
 
-    // B2. Check server authoritative store (getAuthoritativeDb) for assigned student profile link
+    // B2. Check server authoritative store (getAuthoritativeDb) for assigned student profile link (direct link only)
     if (!hasAuthorizedLink && dbLocal && authorizedEmail) {
       try {
-        if (!hasAuthorizedLink && authorizedEmail) {
+        const deletedStudents: string[] = Array.isArray(dbLocal.deletedStudentEmails) ? dbLocal.deletedStudentEmails : [];
+        if (!deletedStudents.includes(authorizedEmail)) {
           const p = dbLocal.userProfiles?.[authorizedEmail];
           const s = (dbLocal.students || []).find((st: any) => (st.email || st.studentEmail || '').toLowerCase().trim() === authorizedEmail);
           const pTeacherUid = (p?.teacherUid || p?.assignedNativeFriendUID || s?.teacherUid || s?.assignedTeacherId || '').trim();
           const pTeacherEmail = (p?.teacherEmail || s?.teacherEmail || '').toLowerCase().trim();
-          const isDirectMatch = (pTeacherUid && (pTeacherUid === caller.uid || pTeacherUid === `tutor-${caller.uid}`)) || (pTeacherEmail && pTeacherEmail === callerEmail);
+          const isDirectMatch = (pTeacherUid && (pTeacherUid === caller.uid || pTeacherUid === `tutor-${caller.uid}`)) || (pTeacherEmail && callerEmail && pTeacherEmail === callerEmail);
 
-          const isApprovedTutor = (dbLocal.teachers || []).some((t: any) =>
-            (t.uid && (t.uid === caller.uid || t.id === caller.uid)) ||
-            (t.id && (t.id === caller.uid || t.id === `tutor-${caller.uid}`)) ||
-            (t.authUid && t.authUid === caller.uid) ||
-            (callerEmail && t.email && t.email.toLowerCase().trim() === callerEmail)
-          ) || (dbLocal.tutorsList || []).some((t: any) =>
-            (t.uid && (t.uid === caller.uid || t.id === caller.uid)) ||
-            (t.id && (t.id === caller.uid || t.id === `tutor-${caller.uid}`)) ||
-            (t.authUid && t.authUid === caller.uid) ||
-            (callerEmail && t.email && t.email.toLowerCase().trim() === callerEmail)
-          );
-          const isConflict = Boolean(
-            pTeacherEmail && callerEmail && pTeacherEmail !== callerEmail &&
-            pTeacherUid && pTeacherUid !== caller.uid && pTeacherUid !== `tutor-${caller.uid}`
-          );
-
-          if (isDirectMatch || (isApprovedTutor && !isConflict)) {
+          if (isDirectMatch) {
             hasAuthorizedLink = true;
             const foundUid = p?.uid || s?.uid || s?.studentUid;
             if ((!candidateUid || candidateUid.includes('@') || !isValidCanonicalUid(candidateUid)) && foundUid && isValidCanonicalUid(foundUid) && foundUid !== caller.uid) {
@@ -9897,6 +9736,11 @@ export async function deleteLessonAtomicServer(
  * HOTFIX PONTUAL — Insights & Icebreakers Persistence
  */
 const localInsightsMap = new Map<string, any>();
+const MAX_LOCAL_INSIGHTS_CACHE = 200;
+
+export function clearLocalInsightsCache(): void {
+  localInsightsMap.clear();
+}
 
 /**
  * Fetches saved lesson insights snapshot from Firestore collection 'lesson_insights'
@@ -9911,9 +9755,16 @@ export async function fetchLessonInsightsFromFirestoreServer(lessonId: string): 
       const snap = await db.collection('lesson_insights').doc(cleanId).get();
       if (snap.exists) {
         const data = { id: snap.id, ...snap.data() };
+        if (localInsightsMap.size >= MAX_LOCAL_INSIGHTS_CACHE) {
+          const oldestKey = localInsightsMap.keys().next().value;
+          if (oldestKey) localInsightsMap.delete(oldestKey);
+        }
         localInsightsMap.set(cleanId, data);
         return data;
       }
+      // Canonical Firestore confirms document does not exist: evict any stale local cache
+      localInsightsMap.delete(cleanId);
+      return null;
     } catch (err: any) {
       if (!isPermissionError(err)) {
         console.warn('[serverFirestore] fetchLessonInsights notice:', err);
@@ -9936,6 +9787,10 @@ export async function saveLessonInsightsToFirestoreServer(lessonId: string, data
     lessonId: cleanId,
     updatedAt: new Date().toISOString(),
   });
+  if (localInsightsMap.size >= MAX_LOCAL_INSIGHTS_CACHE) {
+    const oldestKey = localInsightsMap.keys().next().value;
+    if (oldestKey) localInsightsMap.delete(oldestKey);
+  }
   localInsightsMap.set(cleanId, payload);
 
   const db = getFirestoreDb();
@@ -10062,46 +9917,27 @@ export async function verifyTeacherLessonAccessServer(
     } catch {}
   }
 
-  // 5. Fallback verification via server authoritative in-memory db (getAuthoritativeDb) for student/tutor profile assignment
+  // 5. Fallback verification via server authoritative in-memory db (direct link only)
   const dbLocal = getAuthoritativeDb();
   if (dbLocal) {
     try {
-      const student = (dbLocal.students || []).find((s: any) => {
-        const sEmail = (s.email || s.studentEmail || '').toLowerCase().trim();
-        const sUid = (s.uid || s.studentUid || s.id || '').trim();
-        return (cleanStudentEmail && sEmail === cleanStudentEmail) || (cleanStudentUid && sUid === cleanStudentUid);
-      });
-      const prof = cleanStudentEmail ? dbLocal.userProfiles?.[cleanStudentEmail] : null;
-      if (student || prof) {
-        const sTeacherUid = (student?.teacherUid || (student as any)?.assignedTeacherId || (student as any)?.assignedNativeFriendUID || prof?.teacherUid || prof?.assignedNativeFriendUID || '').trim();
-        const sTeacherEmail = (student?.teacherEmail || prof?.teacherEmail || '').toLowerCase().trim();
-        const isDirect =
-          (cleanTeacherUid && (sTeacherUid === cleanTeacherUid || sTeacherUid === `tutor-${cleanTeacherUid}`)) ||
-          (cleanTeacherEmail && sTeacherEmail === cleanTeacherEmail);
-        const isConflict = Boolean(
-          sTeacherEmail && cleanTeacherEmail && sTeacherEmail !== cleanTeacherEmail &&
-          sTeacherUid && cleanTeacherUid && sTeacherUid !== cleanTeacherUid && sTeacherUid !== `tutor-${cleanTeacherUid}`
-        );
-        const isApprovedTutor = (dbLocal.teachers || []).some((t: any) =>
-          (cleanTeacherUid && (t.uid === cleanTeacherUid || t.id === cleanTeacherUid || t.authUid === cleanTeacherUid || t.id === `tutor-${cleanTeacherUid}`)) ||
-          (cleanTeacherEmail && t.email?.toLowerCase().trim() === cleanTeacherEmail)
-        ) || (dbLocal.tutorsList || []).some((t: any) =>
-          (cleanTeacherUid && (t.uid === cleanTeacherUid || t.id === cleanTeacherUid || t.authUid === cleanTeacherUid || t.id === `tutor-${cleanTeacherUid}`)) ||
-          (cleanTeacherEmail && t.email?.toLowerCase().trim() === cleanTeacherEmail)
-        );
-        if (isDirect || (isApprovedTutor && !isConflict)) {
-          return true;
-        }
-      } else if (cleanStudentEmail || cleanStudentUid) {
-        const isApprovedTutor = (dbLocal.teachers || []).some((t: any) =>
-          (cleanTeacherUid && (t.uid === cleanTeacherUid || t.id === cleanTeacherUid || t.authUid === cleanTeacherUid || t.id === `tutor-${cleanTeacherUid}`)) ||
-          (cleanTeacherEmail && t.email?.toLowerCase().trim() === cleanTeacherEmail)
-        ) || (dbLocal.tutorsList || []).some((t: any) =>
-          (cleanTeacherUid && (t.uid === cleanTeacherUid || t.id === cleanTeacherUid || t.authUid === cleanTeacherUid || t.id === `tutor-${cleanTeacherUid}`)) ||
-          (cleanTeacherEmail && t.email?.toLowerCase().trim() === cleanTeacherEmail)
-        );
-        if (isApprovedTutor) {
-          return true;
+      const deletedStudents: string[] = Array.isArray(dbLocal.deletedStudentEmails) ? dbLocal.deletedStudentEmails : [];
+      if (!cleanStudentEmail || !deletedStudents.includes(cleanStudentEmail)) {
+        const student = (dbLocal.students || []).find((s: any) => {
+          const sEmail = (s.email || s.studentEmail || '').toLowerCase().trim();
+          const sUid = (s.uid || s.studentUid || s.id || '').trim();
+          return (cleanStudentEmail && sEmail === cleanStudentEmail) || (cleanStudentUid && sUid === cleanStudentUid);
+        });
+        const prof = cleanStudentEmail ? dbLocal.userProfiles?.[cleanStudentEmail] : null;
+        if (student || prof) {
+          const sTeacherUid = (student?.teacherUid || (student as any)?.assignedTeacherId || (student as any)?.assignedNativeFriendUID || prof?.teacherUid || prof?.assignedNativeFriendUID || '').trim();
+          const sTeacherEmail = (student?.teacherEmail || prof?.teacherEmail || '').toLowerCase().trim();
+          const isDirect =
+            (cleanTeacherUid && (sTeacherUid === cleanTeacherUid || sTeacherUid === `tutor-${cleanTeacherUid}`)) ||
+            (cleanTeacherEmail && sTeacherEmail === cleanTeacherEmail);
+          if (isDirect) {
+            return true;
+          }
         }
       }
     } catch {}

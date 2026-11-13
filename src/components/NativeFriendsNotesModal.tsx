@@ -82,6 +82,12 @@ const inFlightVocabSyncPromises = new Map<string, Promise<StudentDictionaryEntry
 // Completed synchronization keys for canonical UID + session key + content hash to prevent redundant background syncs
 const completedVocabSyncKeys = new Set<string>();
 
+export function clearNativeFriendsNotesModalCache(): void {
+  sessionNotesModalMemoryCache.clear();
+  inFlightVocabSyncPromises.clear();
+  completedVocabSyncKeys.clear();
+}
+
 /**
  * Extracts real lesson date and timestamp strictly distinguished from analysis creation/update dates.
  * Never uses updatedAt or createdAt to simulate or override actual lesson timing.

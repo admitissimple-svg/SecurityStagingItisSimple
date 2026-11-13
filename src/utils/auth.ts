@@ -182,6 +182,13 @@ export const KNOWN_ADMIN_EMAILS = new Set([
 let cachedAdminEmailFromServer: string | null = null;
 let lastAdminCheckTime = 0;
 
+export function clearAuthClientMemoryCache(): void {
+  inMemoryToken = null;
+  inMemoryGoogleAccessToken = null;
+  cachedAdminEmailFromServer = null;
+  lastAdminCheckTime = 0;
+}
+
 /**
  * Checks whether an authenticated user is an authorized administrator candidate.
  * Combines token claims, email verification, known bootstrap emails, and /api/auth/admin-status.

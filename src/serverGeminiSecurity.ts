@@ -1385,6 +1385,16 @@ export interface GeminiContingencyResult {
  * - Aborts IMMEDIATELY on non-recoverable errors (auth, forbidden, bad argument, shared quota).
  * - Zero artificial fallback responses: returns transparent error when all models are exhausted.
  */
+let testGeminiAttemptExecutor: ((model: string, params: any) => Promise<any>) | null = null;
+
+export function setGeminiAttemptExecutorForTesting(
+  executor: ((model: string, params: any) => Promise<any>) | null
+): void {
+  if (process.env.NODE_ENV === 'test') {
+    testGeminiAttemptExecutor = executor;
+  }
+}
+
 export async function executeGeminiWithContingency(
   params: {
     feature: GeminiFeature;
@@ -1400,6 +1410,8 @@ export async function executeGeminiWithContingency(
   },
   attemptExecutor?: (model: string, params: any) => Promise<any>
 ): Promise<GeminiContingencyResult> {
+  const effectiveAttemptExecutor =
+    attemptExecutor || (process.env.NODE_ENV === 'test' ? testGeminiAttemptExecutor || undefined : undefined);
   const cascadeStartTime = Date.now();
   const models = params.modelsOverride && params.modelsOverride.length > 0
     ? params.modelsOverride.slice(0, 3)
@@ -1442,8 +1454,8 @@ export async function executeGeminiWithContingency(
 
     let attempt: any = null;
     try {
-      if (attemptExecutor) {
-        attempt = await attemptExecutor(currentModel, { ...params, timeoutMs: attemptTimeoutMs });
+      if (effectiveAttemptExecutor) {
+        attempt = await effectiveAttemptExecutor(currentModel, { ...params, timeoutMs: attemptTimeoutMs });
       } else {
         attempt = await executeGeminiSingleAttempt({
           ...params,
@@ -1635,4 +1647,5 @@ export function resetGeminiSecurityStateForTesting(): void {
   localRateLimits.clear();
   localInflightLocks.clear();
   forcedDistributedCostControl = null;
+  testGeminiAttemptExecutor = null;
 }

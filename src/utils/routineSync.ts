@@ -119,6 +119,10 @@ export interface StudentCurrentRoutineDoc {
 // In-memory debounce cache to prevent unnecessary writes if the track hasn't changed
 const lastSyncedSignatureMap = new Map<string, string>();
 
+export function clearRoutineSyncMemoryCache(): void {
+  lastSyncedSignatureMap.clear();
+}
+
 /**
  * Normalizes a student ID/email to a safe Firestore document path token.
  * Prioritizes the authenticated Firebase Auth user UID when available.

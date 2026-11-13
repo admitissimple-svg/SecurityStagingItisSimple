@@ -57,7 +57,12 @@ export interface StoredDriveFile {
 }
 
 // In-memory registry for platform-managed Drive files (no file-system storage)
+const MAX_IN_MEMORY_DRIVE_FILES = 200;
 let inMemoryDriveStore: Record<string, StoredDriveFile> = {};
+
+export function clearInMemoryDriveStore(): void {
+  inMemoryDriveStore = {};
+}
 
 function persistDriveStore() {
   // Pure in-memory cache to avoid internal environment storage
@@ -292,6 +297,12 @@ export async function syncSessionNotesWithPlatformDrive(
     updatedAt: nowIso,
   };
 
+  if (!inMemoryDriveStore[finalFileId]) {
+    const existingKeys = Object.keys(inMemoryDriveStore);
+    if (existingKeys.length >= MAX_IN_MEMORY_DRIVE_FILES) {
+      delete inMemoryDriveStore[existingKeys[0]];
+    }
+  }
   inMemoryDriveStore[finalFileId] = storedRecord;
   persistDriveStore();
 

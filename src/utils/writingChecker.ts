@@ -8,6 +8,10 @@ const DAILY_SENTENCE_CACHE_VERSION = 'v4';
 // Isolated client-side cache for Sentence of the Day to prevent redundant API calls and quota exhaustion
 const dailySentenceClientCache = new Map<string, WritingEvaluationResult>();
 
+export function clearDailySentenceClientCache(): void {
+  dailySentenceClientCache.clear();
+}
+
 /**
  * Shared deterministic grammar & vocabulary analyzer for English sentences.
  * Catches lowercase pronoun "i", verb tense mismatches (e.g., "Today was... because I pass" -> "passed"),

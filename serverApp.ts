@@ -171,6 +171,7 @@ import {
   saveWeeklyHistoryServer,
   closeWeeklyHistorySnapshotServer,
   prepareNewWeeklyCycleServer,
+  clearLocalInsightsCache,
 } from './src/serverFirestore';
 import { normalizeDictionaryWord } from './src/utils/studentDictionaryLibrary';
 import { buildWeeklyLearningInsights } from './src/utils/weeklyLearningInsights';
@@ -182,6 +183,7 @@ import {
   GOOGLE_DRIVE_SESSION_FOLDER,
   formatSessionNotesFileName,
   getPlatformGoogleAccessToken,
+  clearInMemoryDriveStore,
 } from './src/serverGoogleDrive';
 import { COMMON_ROUTINE_DICTIONARY, getDictionaryDefinition, NATIVE_FRIENDS_DICTIONARY_DATABASE } from './src/data/dictionaryDatabase';
 import { defaultRoutinesByDay, createCleanStudentRoutines } from './src/data/defaultRoutines';
@@ -204,6 +206,7 @@ import {
   getSpotifyConfigStatus,
   getSpotifyAccessToken,
   clearSpotifyPlaylistCache,
+  resetCachedSpotifyToken,
   OFFICIAL_SPOTIFY_PLAYLISTS,
   SpotifyLevel,
   SpotifyTrack,
@@ -266,7 +269,7 @@ import {
   markAsVerifiedUser,
 } from './src/middleware/firebaseAuth';
 import { getFirebaseAdminAuth } from './src/serverFirebaseAdmin';
-import { getPtaxClosingD1 } from './src/serverPtax';
+import { getPtaxClosingD1, clearPtaxMemoryCache } from './src/serverPtax';
 import {
   isDiagnosticMode,
   isAuthorizedOriginStrict,
@@ -629,8 +632,60 @@ const DEFAULT_DB: AppDb = {
   youtubePlaylists: DEFAULT_CURATED_PLAYLISTS,
 };
 
+function createCleanDefaultDb(): AppDb {
+  return {
+    teachers: [],
+    tutorsList: [],
+    deletedTutorIds: [],
+    deletedTutorEmails: [],
+    deletedStudentEmails: [...PURGED_OBSOLETE_STUDENTS],
+    students: [],
+    meetSettings: {},
+    teacherSettings: {},
+    liveLessons: [],
+    chatMessages: [],
+    routinesByDay: JSON.parse(JSON.stringify(defaultRoutinesByDay)),
+    studentRoutinesMap: {},
+    contractedLessons: {},
+    userProfiles: {},
+    emailLogs: [],
+    weeklyHomework: null,
+    studentHomeworkMap: {},
+    landingContent: JSON.parse(JSON.stringify(DEFAULT_LANDING_CONTENT)),
+    dictionary: {},
+    studentWeeklyChecks: {},
+    weeklyNativeTargets: {},
+    weeklyStudyDaysTargets: {},
+    weeklyStudyDays: {},
+    studentJournalMap: {},
+    studentActivityJournal: {},
+    transactions: [],
+    studentVideoAssignments: {},
+    studentWatchedVideos: {},
+    studentSpotifyAssignments: {},
+    studentListenedTracks: {},
+    studentAwaitingTopicSelection: {},
+    spotifyPlaylists: {},
+    sessionNotesMap: {},
+    sessionNotesProgressMap: {},
+    pedagogicalTransformationsMap: {},
+    authUsers: {},
+    youtubePlaylists: JSON.parse(JSON.stringify(DEFAULT_CURATED_PLAYLISTS)),
+  };
+}
+
+function setBoundedMapEntry<K, V>(map: Map<K, V>, key: K, value: V, maxSize: number): void {
+  if (!map.has(key) && map.size >= maxSize) {
+    const oldestKey = map.keys().next().value;
+    if (oldestKey !== undefined) {
+      map.delete(oldestKey);
+    }
+  }
+  map.set(key, value);
+}
+
 // In-memory runtime state hydrated exclusively from Cloud Firestore
-let inMemoryDb: AppDb = DEFAULT_DB;
+let inMemoryDb: AppDb = createCleanDefaultDb();
 
 /**
  * Merges user profile records ensuring authentic canonical Firebase UIDs are never overwritten by placeholders
@@ -928,13 +983,31 @@ export async function writeDbSync(db: AppDb): Promise<void> {
   });
 }
 
-// Initial hydration from Firestore on server startup
+export function resetInMemoryDbForTesting(): void {
+  if (syncTimeout) {
+    clearTimeout(syncTimeout);
+    syncTimeout = null;
+  }
+  inMemoryDb = createCleanDefaultDb();
+  isCloudHydrated = false;
+  resetAllServerMemoryCaches();
+}
+
+// Initial hydration from Firestore on server startup (strictly read-only, starting from clean memory)
 export async function initCloudPersistence() {
   if (isDiagnosticMode()) {
     return; // Strictly disabled in DIAGNOSTIC_ONLY mode
   }
+  if (syncTimeout) {
+    clearTimeout(syncTimeout);
+    syncTimeout = null;
+  }
+  inMemoryDb = createCleanDefaultDb();
+  resetAllServerMemoryCaches();
+  isCloudHydrated = false;
+
   try {
-    // Fetch latest state directly from Cloud Firestore
+    // Fetch latest state directly from Cloud Firestore (default)
     const cloudState = await fetchAppStateFromFirestore();
     if (cloudState && typeof cloudState === 'object') {
       console.log('Successfully hydrated database from Firebase Firestore cloud');
@@ -964,8 +1037,8 @@ export async function initCloudPersistence() {
         }
       }
 
-      // ARCH.2A: Hydrate userProfiles and authUsers strictly from canonically confirmed cloudState
-      // (which is anchored in Firestore (default) /users and /tutors, never unconfirmed caches).
+      // ARCH.2A + ARCH.2G.3: Hydrate userProfiles and authUsers strictly from canonically confirmed cloudState
+      // (anchored in Firestore (default) /users and /tutors, never unconfirmed caches or prior RAM).
       const mergedUserProfiles: Record<string, any> = {};
       Object.keys(cloudState.userProfiles || {}).forEach((key) => {
         mergedUserProfiles[key] = cloudState.userProfiles[key];
@@ -981,9 +1054,7 @@ export async function initCloudPersistence() {
         }
       });
 
-      // Merge tutorsList strictly requiring canonical confirmation from /tutors or /users (role=='teacher')
-      const localTutors = inMemoryDb.tutorsList || [];
-      const cloudTutors = Array.isArray(cloudState.tutorsList) ? cloudState.tutorsList : [];
+      // Merge tutorsList strictly from /tutors or /users (role=='teacher'), ignoring pre-restart RAM or app_state leftovers
       let directTutors: any[] = [];
       let directTutorsOk = false;
       try {
@@ -996,33 +1067,6 @@ export async function initCloudPersistence() {
       const tutorMap = new Map<string, any>();
 
       if (directTutorsOk) {
-        const confirmedKeys = new Set<string>();
-        directTutors.forEach((t: any) => {
-          const em = (t.email || '').toLowerCase().trim();
-          const uid = (t.authUid || t.uid || t.id || '').toLowerCase().trim();
-          if (em) confirmedKeys.add(em);
-          if (uid) confirmedKeys.add(uid);
-        });
-        const isConfirmedTutor = (t: any) => {
-          const em = (t?.email || '').toLowerCase().trim();
-          const uid = (t?.authUid || t?.uid || t?.id || '').toLowerCase().trim();
-          return (em && confirmedKeys.has(em)) || (uid && confirmedKeys.has(uid));
-        };
-
-        // 1. Local memory tutors only if canonically confirmed
-        localTutors.filter(isConfirmedTutor).forEach((t: any) => {
-          const key = (t.email || t.id || '').toLowerCase().trim();
-          if (key) tutorMap.set(key, t);
-        });
-        // 2. Cloud state tutors only if canonically confirmed
-        cloudTutors.filter(isConfirmedTutor).forEach((t: any) => {
-          const key = (t.email || t.id || '').toLowerCase().trim();
-          if (key) {
-            const existing = tutorMap.get(key) || {};
-            tutorMap.set(key, { ...existing, ...t });
-          }
-        });
-        // 3. Direct collection /tutors/ & /users/ over everything (authoritative source of truth)
         directTutors.forEach((t: any) => {
           const key = (t.email || t.id || '').toLowerCase().trim();
           if (key) {
@@ -1032,16 +1076,12 @@ export async function initCloudPersistence() {
         });
       }
 
-      // Track deleted tutors across reboots
-      const localDeletedTutorEmails: string[] = inMemoryDb.deletedTutorEmails || [];
+      // Track deleted tutors strictly from cloudState
       const cloudDeletedTutorEmails: string[] = Array.isArray(cloudState.deletedTutorEmails) ? cloudState.deletedTutorEmails : [];
-      const allDeletedTutorEmails = Array.from(new Set([...localDeletedTutorEmails, ...cloudDeletedTutorEmails]));
-      inMemoryDb.deletedTutorEmails = allDeletedTutorEmails;
+      const allDeletedTutorEmails = Array.from(new Set(cloudDeletedTutorEmails));
 
-      const localDeletedTutorIds: string[] = inMemoryDb.deletedTutorIds || [];
       const cloudDeletedTutorIds: string[] = Array.isArray(cloudState.deletedTutorIds) ? cloudState.deletedTutorIds : [];
-      const allDeletedTutorIds = Array.from(new Set([...localDeletedTutorIds, ...cloudDeletedTutorIds]));
-      inMemoryDb.deletedTutorIds = allDeletedTutorIds;
+      const allDeletedTutorIds = Array.from(new Set(cloudDeletedTutorIds));
 
       const mergedTutorsList = Array.from(tutorMap.values()).filter((t: any) => {
         const em = (t.email || '').toLowerCase().trim();
@@ -1050,13 +1090,8 @@ export async function initCloudPersistence() {
       });
 
       // Merge teachers list preserving legitimate admins and canonically confirmed tutors only
-      const localTeachers = inMemoryDb.teachers || [];
       const cloudTeachers = Array.isArray(cloudState.teachers) ? cloudState.teachers : [];
       const teacherMap = new Map<string, any>();
-      localTeachers.forEach((t: any) => {
-        const key = (t.email || '').toLowerCase().trim();
-        if (key && (t.role === 'admin' || !allDeletedTutorEmails.includes(key))) teacherMap.set(key, t);
-      });
       cloudTeachers.forEach((t: any) => {
         const key = (t.email || '').toLowerCase().trim();
         if (key && (t.role === 'admin' || !allDeletedTutorEmails.includes(key))) {
@@ -1064,7 +1099,6 @@ export async function initCloudPersistence() {
           teacherMap.set(key, { ...existing, ...t });
         }
       });
-      // Ensure all canonically confirmed tutors have teacher entries
       mergedTutorsList.forEach((t: any) => {
         const key = (t.email || '').toLowerCase().trim();
         if (key && !teacherMap.has(key)) {
@@ -1135,11 +1169,8 @@ export async function initCloudPersistence() {
         }
       });
 
-      // Merge students list by email, strictly anchored in canonically confirmed cloudState.students
-      const localDeletedStudents: string[] = inMemoryDb.deletedStudentEmails || [];
       const cloudDeletedStudents: string[] = Array.isArray(cloudState.deletedStudentEmails) ? cloudState.deletedStudentEmails : [];
-      const allDeletedStudentEmails = Array.from(new Set([...localDeletedStudents, ...cloudDeletedStudents, ...PURGED_OBSOLETE_STUDENTS]));
-      inMemoryDb.deletedStudentEmails = allDeletedStudentEmails;
+      const allDeletedStudentEmails = Array.from(new Set([...cloudDeletedStudents, ...PURGED_OBSOLETE_STUDENTS]));
 
       // Purge deleted user profiles and auth users (never purge teachers/tutors)
       Object.keys(mergedUserProfiles).forEach((em) => {
@@ -1172,53 +1203,54 @@ export async function initCloudPersistence() {
         return em && !allDeletedStudentEmails.includes(em);
       });
 
-      // ARCH.2D.2: Do not hydrate or reintroduce legacy lessons from app_state/lessons or inMemoryDb.liveLessons.
-      // Canonical lessons reside exclusively in Firestore (default) collection `lessons/{lessonId}`.
+      // Filter student media assignments, routines and progress maps strictly against confirmed active users & non-deleted students
+      const activeAccountTokens = new Set<string>();
+      mergedStudents.forEach((s: any) => {
+        const em = (s.email || s.studentEmail || '').toLowerCase().trim();
+        const sUid = (s.uid || s.studentUid || s.id || '').toLowerCase().trim();
+        if (em) activeAccountTokens.add(em);
+        if (sUid) activeAccountTokens.add(sUid);
+      });
+      Object.entries(mergedUserProfiles).forEach(([em, p]: [string, any]) => {
+        const cleanEm = em.toLowerCase().trim();
+        const pUid = (p?.uid || p?.id || '').toLowerCase().trim();
+        if (cleanEm) activeAccountTokens.add(cleanEm);
+        if (pUid) activeAccountTokens.add(pUid);
+      });
 
-      // Filter and clean student media assignments, routines and progress maps to remove deleted students
       const isAllowedKey = (k: string) => {
         const lk = k.toLowerCase().trim();
         for (const purged of allDeletedStudentEmails) {
           if (lk.includes(purged) || lk.includes(purged.replace(/[^a-zA-Z0-9]/g, '-'))) return false;
         }
-        return true;
+        const base = lk.split('::')[0].trim();
+        return activeAccountTokens.has(lk) || (Boolean(base) && activeAccountTokens.has(base));
       };
 
-      const rawVideoAssignments = {
-        ...(inMemoryDb.studentVideoAssignments || {}),
-        ...(cloudState.studentVideoAssignments || {}),
-      };
       const cleanVideoAssignments: Record<string, any> = {};
-      Object.entries(rawVideoAssignments).forEach(([k, v]) => {
+      Object.entries(cloudState.studentVideoAssignments || {}).forEach(([k, v]) => {
         if (isAllowedKey(k)) cleanVideoAssignments[k] = v;
       });
 
-      const rawSpotifyAssignments = {
-        ...(inMemoryDb.studentSpotifyAssignments || {}),
-        ...(cloudState.studentSpotifyAssignments || {}),
-      };
       const cleanSpotifyAssignments: Record<string, any> = {};
-      Object.entries(rawSpotifyAssignments).forEach(([k, v]) => {
+      Object.entries(cloudState.studentSpotifyAssignments || {}).forEach(([k, v]) => {
         if (isAllowedKey(k)) cleanSpotifyAssignments[k] = v;
       });
 
-      const rawStudentRoutines = {
-        ...(inMemoryDb.studentRoutinesMap || {}),
-        ...(cloudState.studentRoutinesMap || {}),
-      };
       const cleanStudentRoutines: Record<string, any> = {};
-      Object.entries(rawStudentRoutines).forEach(([k, v]) => {
+      Object.entries(cloudState.studentRoutinesMap || {}).forEach(([k, v]) => {
         if (isAllowedKey(k)) cleanStudentRoutines[k] = v;
       });
 
-      const mergedWatchedVideos = {
-        ...(inMemoryDb.studentWatchedVideos || {}),
-        ...(cloudState.studentWatchedVideos || {}),
-      };
-      const mergedListenedTracks = {
-        ...(inMemoryDb.studentListenedTracks || {}),
-        ...(cloudState.studentListenedTracks || {}),
-      };
+      const cleanWatchedVideos: Record<string, any> = {};
+      Object.entries(cloudState.studentWatchedVideos || {}).forEach(([k, v]) => {
+        if (isAllowedKey(k)) cleanWatchedVideos[k] = v;
+      });
+
+      const cleanListenedTracks: Record<string, any> = {};
+      Object.entries(cloudState.studentListenedTracks || {}).forEach(([k, v]) => {
+        if (isAllowedKey(k)) cleanListenedTracks[k] = v;
+      });
 
       const {
         liveLessons: _ignoredCloudLiveLessons,
@@ -1228,25 +1260,46 @@ export async function initCloudPersistence() {
         sessionNotesMap: _ignoredCloudSessionNotesMap,
         sessionNotesProgressMap: _ignoredCloudSessionNotesProgressMap,
         pedagogicalTransformationsMap: _ignoredCloudPedagogicalTransformationsMap,
-        ...cloudStateWithoutLegacyLessons
+        meetSettings: _ignoredCloudMeetSettings,
+        teacherSettings: _ignoredCloudTeacherSettings,
+        chatMessages: _ignoredCloudChatMessages,
+        dictionary: _ignoredCloudDictionary,
+        studentActivityJournal: _ignoredCloudStudentActivityJournal,
+        studentJournalMap: _ignoredCloudStudentJournalMap,
+        studentSpotifyCycles: _ignoredCloudSpotifyCycles,
+        cycleAttempts: _ignoredCloudCycleAttempts,
+        transactions: _ignoredCloudTransactions,
+        emailLogs: _ignoredCloudEmailLogs,
+        ...cloudStateWithoutLegacyResidue
       } = cloudState;
+
       inMemoryDb = mergeDbWithDefaults({
-        ...inMemoryDb,
-        ...cloudStateWithoutLegacyLessons,
+        ...createCleanDefaultDb(),
+        ...cloudStateWithoutLegacyResidue,
+        deletedTutorEmails: allDeletedTutorEmails,
+        deletedTutorIds: allDeletedTutorIds,
+        deletedStudentEmails: allDeletedStudentEmails,
         authUsers: mergedAuthUsers,
         userProfiles: mergedUserProfiles,
         tutorsList: mergedTutorsList,
         teachers: mergedTeachers,
         students: mergedStudents,
         liveLessons: [],
+        meetSettings: {},
+        teacherSettings: {},
+        chatMessages: [],
+        dictionary: {},
+        studentActivityJournal: {},
+        studentJournalMap: {},
+        transactions: [],
+        emailLogs: [],
         studentVideoAssignments: cleanVideoAssignments,
         studentSpotifyAssignments: cleanSpotifyAssignments,
         studentRoutinesMap: cleanStudentRoutines,
-        studentWatchedVideos: mergedWatchedVideos,
-        studentListenedTracks: mergedListenedTracks,
+        studentWatchedVideos: cleanWatchedVideos,
+        studentListenedTracks: cleanListenedTracks,
       });
       isCloudHydrated = true;
-      await saveAppStateToFirestore(inMemoryDb);
     } else {
       console.warn('Could not fetch app_state from Firestore cloud. Attempting recovery from direct collections...');
       const directTutors = await fetchTutorsFromFirestore().catch(() => []);
@@ -1277,7 +1330,6 @@ export async function initCloudPersistence() {
     console.warn('Cloud persistence init notice:', err);
     isCloudHydrated = true;
   }
-
 }
 
 // Register isolated diagnostic routes (/api/health, /api/diagnostic/health, /api/diagnostic/firestore)
@@ -4486,7 +4538,7 @@ app.all('/api/dictionary/define', firebaseAuthMiddleware, async (req, res) => {
   const lowerWord = cleanWord.toLowerCase();
   let studentLevel = (req.body?.studentLevel || req.body?.level || req.query?.level || 'intermediate') as string;
 
-  // Authoritative CEFR level for authenticated student
+  // Authoritative CEFR level for authenticated student (RAM + Firestore canonical fallback)
   if (caller.role === 'student') {
     const db = readDb();
     const callerEmail = (caller.email || '').toLowerCase().trim();
@@ -4495,8 +4547,14 @@ app.all('/api/dictionary/define', firebaseAuthMiddleware, async (req, res) => {
       (callerEmail && (s.email || '').toLowerCase().trim() === callerEmail)
     );
     const profile = db.userProfiles?.[caller.uid] || (callerEmail && db.userProfiles?.[callerEmail]);
-    if (profile?.level || profile?.englishLevel || registeredStudent?.level || registeredStudent?.englishLevel) {
-      studentLevel = profile?.level || profile?.englishLevel || registeredStudent?.level || registeredStudent?.englishLevel;
+    const ramLevel = profile?.level || profile?.englishLevel || registeredStudent?.level || registeredStudent?.englishLevel;
+    if (ramLevel) {
+      studentLevel = ramLevel;
+    } else {
+      const fsUserDoc = await fetchUserFromFirestore(callerEmail, caller.uid).catch(() => null);
+      if (fsUserDoc?.level || fsUserDoc?.englishLevel) {
+        studentLevel = fsUserDoc.level || fsUserDoc.englishLevel;
+      }
     }
   }
 
@@ -4531,8 +4589,8 @@ app.all('/api/dictionary/define', firebaseAuthMiddleware, async (req, res) => {
       source: 'native_notes_standard',
       notFound: false,
     };
-    pedagogicalDictCache.set(cacheKey, curatedResult);
-    pedagogicalDictCache.set(lowerWord, curatedResult);
+    setBoundedMapEntry(pedagogicalDictCache, cacheKey, curatedResult, 500);
+    setBoundedMapEntry(pedagogicalDictCache, lowerWord, curatedResult, 500);
     return res.json(curatedResult);
   }
 
@@ -4583,8 +4641,8 @@ app.all('/api/dictionary/define', firebaseAuthMiddleware, async (req, res) => {
   }
 
   if (aiResult) {
-    pedagogicalDictCache.set(cacheKey, aiResult);
-    pedagogicalDictCache.set(lowerWord, aiResult);
+    setBoundedMapEntry(pedagogicalDictCache, cacheKey, aiResult, 500);
+    setBoundedMapEntry(pedagogicalDictCache, lowerWord, aiResult, 500);
     return res.json(aiResult);
   }
 
@@ -4602,8 +4660,8 @@ app.all('/api/dictionary/define', firebaseAuthMiddleware, async (req, res) => {
       source: 'native_notes_standard',
       notFound: false,
     };
-    pedagogicalDictCache.set(cacheKey, offlineResult);
-    pedagogicalDictCache.set(lowerWord, offlineResult);
+    setBoundedMapEntry(pedagogicalDictCache, cacheKey, offlineResult, 500);
+    setBoundedMapEntry(pedagogicalDictCache, lowerWord, offlineResult, 500);
     return res.json(offlineResult);
   }
 
@@ -4687,8 +4745,8 @@ app.all('/api/dictionary/define', firebaseAuthMiddleware, async (req, res) => {
               source: 'native_notes_standard',
               notFound: false,
             };
-            pedagogicalDictCache.set(cacheKey, result);
-            pedagogicalDictCache.set(lowerWord, result);
+            setBoundedMapEntry(pedagogicalDictCache, cacheKey, result, 500);
+            setBoundedMapEntry(pedagogicalDictCache, lowerWord, result, 500);
             return res.json(result);
           }
         }
@@ -4756,8 +4814,8 @@ async function lookupServerDictionaryWord(cleanWord: string, studentLevel?: stri
   // 3. Query Gemini AI for personalized entry
   const aiRes = await queryAiPedagogicalDefinition(trimmed, studentLevel || 'intermediate', cefr);
   if (aiRes) {
-    pedagogicalDictCache.set(cacheKey, aiRes);
-    pedagogicalDictCache.set(lower, aiRes);
+    setBoundedMapEntry(pedagogicalDictCache, cacheKey, aiRes, 500);
+    setBoundedMapEntry(pedagogicalDictCache, lower, aiRes, 500);
     return {
       word: trimmed,
       definitionEn: aiRes.definitionEn,
@@ -4832,7 +4890,7 @@ async function lookupServerDictionaryWord(cleanWord: string, studentLevel?: stri
   };
 }
 
-// 3. Meet Settings & Teacher Settings Endpoints
+// 3. Meet Settings & Teacher Settings Endpoints (Read-only, filtered against deleted tutors)
 app.get(['/api/meet-settings', '/api/teacher-settings'], async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.setHeader('Pragma', 'no-cache');
@@ -4840,99 +4898,78 @@ app.get(['/api/meet-settings', '/api/teacher-settings'], async (req, res) => {
 
   const db = readDb();
   const teacherEmail = ((req.query.teacherEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
-  const uid = (req.query.uid as string) || '';
+  const uid = ((req.query.uid as string) || '').trim();
+  const deletedEmails = new Set((db.deletedTutorEmails || []).map((e: string) => (e || '').toLowerCase().trim()).filter(Boolean));
+  const deletedIds = new Set((db.deletedTutorIds || []).map((i: string) => (i || '').trim()).filter(Boolean));
   const verifiedCaller = await getVerifiedUserFromRequest(req);
   const isCallerAdmin = verifiedCaller?.role === 'admin';
 
   if (isCallerAdmin || (!teacherEmail && !uid)) {
-    const settings = { ...db.meetSettings, ...db.teacherSettings };
-    return res.json(settings);
-  }
-
-  if (teacherEmail || uid) {
-    let specific =
-      (teacherEmail ? (db.meetSettings[teacherEmail] || db.teacherSettings[teacherEmail]) : null) ||
-      (uid ? (db.meetSettings[uid] || db.teacherSettings[uid]) : null) ||
-      null;
-
-    // Check tutor match from db.tutorsList
-    const tutorMatch = (db.tutorsList || []).find(
-      (t: any) =>
-        (teacherEmail && (t.email || '').toLowerCase().trim() === teacherEmail) ||
-        (uid && t.uid === uid)
-    );
-
-    // If specific is not yet found or missing availability, attempt to retrieve from Firestore
-    if (!specific || (!specific.availability && !specific.availableHoursByDay)) {
-      try {
-        const firestoreData = await fetchTeacherAvailabilityFromFirestore(uid || teacherEmail);
-        if (firestoreData) {
-          specific = {
-            ...(specific || {}),
-            ...firestoreData,
-          };
-          if (teacherEmail) {
-            db.meetSettings[teacherEmail] = specific;
-            db.teacherSettings[teacherEmail] = specific;
-          }
-          if (uid) {
-            db.meetSettings[uid] = specific;
-            db.teacherSettings[uid] = specific;
-          }
-        }
-      } catch (err) {
-        console.warn('Could not read teacher availability from Firestore:', err);
+    const rawSettings = { ...(db.meetSettings || {}), ...(db.teacherSettings || {}) };
+    const filteredSettings: Record<string, any> = {};
+    for (const [k, v] of Object.entries(rawSettings)) {
+      const kLower = k.toLowerCase().trim();
+      const vEmail = ((v as any)?.teacherEmail || '').toLowerCase().trim();
+      const vUid = ((v as any)?.uid || '').trim();
+      if (deletedEmails.has(kLower) || deletedEmails.has(vEmail) || deletedIds.has(k) || deletedIds.has(vUid)) {
+        continue;
       }
+      filteredSettings[k] = v;
     }
-
-    const finalResult = {
-      ...(specific || {}),
-      teacherEmail: teacherEmail || specific?.teacherEmail || tutorMatch?.email || '',
-      uid: uid || specific?.uid || tutorMatch?.uid || '',
-    };
-
-    // If meet link is missing, fallback to tutor profile meetUrl
-    if (!finalResult.meetLink && tutorMatch) {
-      finalResult.meetLink = tutorMatch.meetUrl || tutorMatch.meetLink || '';
-    }
-
-    // If availability was stored on tutorMatch, merge it
-    if (!finalResult.availability && tutorMatch?.availability) {
-      finalResult.availability = tutorMatch.availability;
-    }
-    if (!finalResult.availableHoursByDay && tutorMatch?.availableHoursByDay) {
-      finalResult.availableHoursByDay = tutorMatch.availableHoursByDay;
-    }
-    if (!finalResult.availableDays && tutorMatch?.availableDays) {
-      finalResult.availableDays = tutorMatch.availableDays;
-    }
-
-    return res.json(finalResult);
+    return res.json(filteredSettings);
   }
 
-  // Return all known meet settings, merging from tutorsList if available
-  const allSettings = { ...(db.meetSettings || {}), ...(db.teacherSettings || {}) };
-  if (Array.isArray(db.tutorsList)) {
-    db.tutorsList.forEach((tut: any) => {
-      const email = (tut.email || '').toLowerCase().trim();
-      const mUrl = (tut.meetUrl || tut.meetLink || '').trim();
-      const isGeneric = !mUrl || mUrl.toLowerCase().includes('meet.google.com/new');
-      if (email && (!allSettings[email] || !allSettings[email].meetLink)) {
-        allSettings[email] = {
-          teacherEmail: email,
-          meetLink: isGeneric ? '' : mUrl,
-          workingHoursStart: tut.workingHoursStart || '08:00',
-          workingHoursEnd: tut.workingHoursEnd || '18:00',
-          slotDurationMinutes: tut.slotDurationMinutes || 30,
-          availableDays: tut.availableDays || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'],
-          availability: tut.availability || tut.availableHoursByDay || {},
-          availableHoursByDay: tut.availableHoursByDay || tut.availability || {},
-          timezone: tut.timezone || 'America/Toronto',
+  if ((teacherEmail && deletedEmails.has(teacherEmail)) || (uid && deletedIds.has(uid))) {
+    return res.json({ teacherEmail: '', uid: '' });
+  }
+
+  let specific =
+    (teacherEmail ? (db.meetSettings?.[teacherEmail] || db.teacherSettings?.[teacherEmail]) : null) ||
+    (uid ? (db.meetSettings?.[uid] || db.teacherSettings?.[uid]) : null) ||
+    null;
+
+  // Check canonical tutor match from db.tutorsList
+  const tutorMatch = (db.tutorsList || []).find(
+    (t: any) =>
+      (teacherEmail && (t.email || '').toLowerCase().trim() === teacherEmail) ||
+      (uid && (t.uid === uid || t.authUid === uid || t.id === uid))
+  );
+
+  // If specific is not yet found or missing availability, attempt read-only retrieval from Firestore
+  if (!specific || (!specific.availability && !specific.availableHoursByDay)) {
+    try {
+      const firestoreData = await fetchTeacherAvailabilityFromFirestore(uid || teacherEmail);
+      if (firestoreData) {
+        specific = {
+          ...(specific || {}),
+          ...firestoreData,
         };
       }
-    });
+    } catch (err) {
+      console.warn('Could not read teacher availability from Firestore:', err);
+    }
   }
-  res.json(allSettings);
+
+  const finalResult = {
+    ...(specific || {}),
+    teacherEmail: teacherEmail || specific?.teacherEmail || tutorMatch?.email || '',
+    uid: uid || specific?.uid || tutorMatch?.uid || '',
+  };
+
+  if (!finalResult.meetLink && tutorMatch) {
+    finalResult.meetLink = tutorMatch.meetUrl || tutorMatch.meetLink || '';
+  }
+  if (!finalResult.availability && tutorMatch?.availability) {
+    finalResult.availability = tutorMatch.availability;
+  }
+  if (!finalResult.availableHoursByDay && tutorMatch?.availableHoursByDay) {
+    finalResult.availableHoursByDay = tutorMatch.availableHoursByDay;
+  }
+  if (!finalResult.availableDays && tutorMatch?.availableDays) {
+    finalResult.availableDays = tutorMatch.availableDays;
+  }
+
+  return res.json(finalResult);
 });
 
 app.post(['/api/meet-settings', '/api/teacher-settings'], async (req, res) => {
@@ -5468,7 +5505,7 @@ app.get('/api/user-profile', async (req, res) => {
     return res.status(400).json({ error: 'Email or UID parameter is required' });
   }
 
-  // 1. Authoritative Firestore document inspection
+  // 1. Authoritative Firestore document inspection (strictly canonical source of truth)
   let fsUser: any = null;
   if (email || uid) {
     try {
@@ -5476,15 +5513,24 @@ app.get('/api/user-profile', async (req, res) => {
     } catch {}
   }
 
+  const deletedStudentEmails = Array.isArray(db.deletedStudentEmails) ? db.deletedStudentEmails : [];
+  if (!fsUser && email && deletedStudentEmails.includes(email)) {
+    return res.json({
+      success: true,
+      profile: null,
+      message: 'Profile not found',
+    });
+  }
+
   // 2. Identify student identity: an account with student role or student history is locked to student profile
   const studentInDb = (db.students || []).find(
-    (s: any) => (s.email || s.studentEmail || '').toLowerCase() === email || (uid && s.uid === uid)
+    (s: any) => (email && (s.email || s.studentEmail || '').toLowerCase() === email) || (uid && s.uid === uid)
   );
   const isStudentUser =
     fsUser?.role === 'student' ||
-    Boolean(db.userProfiles?.[email]) ||
-    Boolean(studentInDb) ||
-    Boolean(fsUser?.learningGoal || fsUser?.studentLevel || fsUser?.contractedLessons !== undefined);
+    Boolean(fsUser?.learningGoal || fsUser?.studentLevel || fsUser?.contractedLessons !== undefined) ||
+    Boolean(email && db.userProfiles?.[email]) ||
+    Boolean(studentInDb);
 
   // 3. Teacher profile check: Strictly requires verified administrative approval and no conflicting student status
   let isApprovedTeacherUser = false;
@@ -5517,78 +5563,50 @@ app.get('/api/user-profile', async (req, res) => {
     });
   }
 
-  let profile = db.userProfiles?.[email] || null;
-  const student = (db.students || []).find(
-    (s) => (s.email || s.studentEmail || '').toLowerCase() === email
-  );
+  // Strictly read-only: Firestore fsUser takes precedence over stale RAM caches
+  let profile: any = null;
+  const cachedProfile = email ? db.userProfiles?.[email] : null;
+  const canonicalResolvedUid =
+    (uid && isValidCanonicalUid(uid) ? uid : null) ||
+    (fsUser?.uid && isValidCanonicalUid(fsUser.uid) ? fsUser.uid : null) ||
+    (fsUser?.id && isValidCanonicalUid(fsUser.id) ? fsUser.id : null) ||
+    (cachedProfile?.uid && isValidCanonicalUid(cachedProfile.uid) ? cachedProfile.uid : null) ||
+    (studentInDb?.uid && isValidCanonicalUid(studentInDb.uid) ? studentInDb.uid : null) ||
+    '';
 
-  if (profile && student) {
-    const fallbackTeacherEmail = student.teacherEmail || null;
-    const fallbackTeacherName = student.teacherName || null;
-    const canonicalResolvedUid = (uid && !uid.startsWith('usr-') && !uid.startsWith('st-')) ? uid : (profile.uid || (profile.id && !profile.id.startsWith('usr-') && !profile.id.startsWith('st-') ? profile.id : null) || student.uid || student.id || profile.id);
-    // Fill in any missing fields from student without overwriting existing profile data
+  if (fsUser) {
     profile = {
-      ...profile,
-      id: canonicalResolvedUid,
-      uid: canonicalResolvedUid,
-      name: profile.name || student.name || student.studentName,
-      role: 'student',
-      level: profile.level || student.level || student.studentLevel,
-      learningGoal: profile.learningGoal || student.goal || student.learningGoal,
-      routineVideoTime: profile.routineVideoTime || student.routineVideoTime || '09:00',
-      routineAudioTime: profile.routineAudioTime || student.routineAudioTime || '14:00',
-      dailyPhraseTime: profile.dailyPhraseTime || student.dailyPhraseTime || '20:00',
-      contractedLessons: profile.contractedLessons ?? student.contractedLessons ?? db.contractedLessons?.[email] ?? 5,
-      completedLessonsCount: profile.completedLessonsCount ?? student.completedLessonsCount ?? 0,
-      teacherEmail: profile.teacherEmail !== undefined ? profile.teacherEmail : fallbackTeacherEmail,
-      teacherName: profile.teacherName !== undefined ? profile.teacherName : fallbackTeacherName,
-    };
-    db.userProfiles[email] = profile;
-    writeDb(db);
-  } else if (!profile && student) {
-    const fallbackTeacherEmail = student.teacherEmail || null;
-    const fallbackTeacherName = student.teacherName || null;
-    const canonicalResolvedUid = (uid && !uid.startsWith('usr-') && !uid.startsWith('st-')) ? uid : (student.uid || student.id || `usr-${Date.now()}`);
-    profile = {
-      id: canonicalResolvedUid,
-      uid: canonicalResolvedUid,
-      name: student.name || student.studentName,
-      email,
-      role: 'student',
-      level: student.level || student.studentLevel || 'iniciante',
-      teacherEmail: fallbackTeacherEmail,
-      teacherName: fallbackTeacherName,
-      routineVideoTime: student.routineVideoTime || '09:00',
-      routineAudioTime: student.routineAudioTime || '14:00',
-      dailyPhraseTime: student.dailyPhraseTime || '20:00',
-      enrollmentStatus: student.status || 'active',
-      learningGoal: student.goal || student.learningGoal || 'English for everyday life & work',
-      streakDays: 0,
-      streakCount: 0,
-      points: 0,
-      dailyGoalMinutes: 30,
-      completedTodayMinutes: 0,
-      contractedLessons: student.contractedLessons ?? db.contractedLessons?.[email] ?? 5,
-      completedLessonsCount: student.completedLessonsCount ?? 0,
-      createdAt: student.createdAt || new Date().toISOString(),
-      avatar: student.avatar || student.picture,
-      picture: student.picture || student.avatar,
-    };
-    if (!db.userProfiles) db.userProfiles = {};
-    db.userProfiles[email] = profile;
-    writeDb(db);
-  } else if (!profile && fsUser) {
-    profile = {
+      ...(cachedProfile && (!cachedProfile.uid || cachedProfile.uid === canonicalResolvedUid) ? cachedProfile : {}),
       ...fsUser,
-      id: fsUser.id || fsUser.uid || uid,
-      uid: fsUser.uid || fsUser.id || uid,
+      id: canonicalResolvedUid || fsUser.id || fsUser.uid,
+      uid: canonicalResolvedUid || fsUser.uid || fsUser.id,
       email: fsUser.email || email,
       role: fsUser.role === 'teacher' ? 'teacher' : 'student',
+      contractedLessons: fsUser.contractedLessons ?? studentInDb?.contractedLessons ?? 0,
+      completedLessonsCount: fsUser.completedLessonsCount ?? studentInDb?.completedLessonsCount ?? 0,
     };
-    if (!db.userProfiles) db.userProfiles = {};
-    db.userProfiles[email] = profile;
-    writeDb(db);
-  } else if (!profile && !student) {
+  } else if (cachedProfile || studentInDb) {
+    const base = cachedProfile || {};
+    const st = studentInDb || ({} as any);
+    profile = {
+      ...st,
+      ...base,
+      id: canonicalResolvedUid || base.id || st.id || '',
+      uid: canonicalResolvedUid || base.uid || st.uid || '',
+      name: base.name || st.name || st.studentName,
+      email,
+      role: base.role || 'student',
+      level: base.level || st.level || st.studentLevel || 'iniciante',
+      learningGoal: base.learningGoal || st.goal || st.learningGoal || 'English for everyday life & work',
+      routineVideoTime: base.routineVideoTime || st.routineVideoTime || '09:00',
+      routineAudioTime: base.routineAudioTime || st.routineAudioTime || '14:00',
+      dailyPhraseTime: base.dailyPhraseTime || st.dailyPhraseTime || '20:00',
+      contractedLessons: base.contractedLessons ?? st.contractedLessons ?? db.contractedLessons?.[email] ?? 0,
+      completedLessonsCount: base.completedLessonsCount ?? st.completedLessonsCount ?? 0,
+      teacherEmail: base.teacherEmail !== undefined ? base.teacherEmail : (st.teacherEmail || null),
+      teacherName: base.teacherName !== undefined ? base.teacherName : (st.teacherName || null),
+    };
+  } else {
     return res.json({
       success: true,
       profile: null,
@@ -5597,7 +5615,6 @@ app.get('/api/user-profile', async (req, res) => {
   }
 
   if (profile) {
-    // Populate authoritative credits from Firestore user doc if present
     if (fsUser) {
       if (typeof fsUser.contractedLessons === 'number') {
         profile.contractedLessons = fsUser.contractedLessons;
@@ -5626,8 +5643,9 @@ app.get('/api/user-profile', async (req, res) => {
       profile.weeklyStudyDaysTarget = studyTarget;
     }
     let journalEntries = Array.isArray(profile.studentJournal) ? profile.studentJournal : [];
-    if (uid && isValidCanonicalUid(uid)) {
-      const canonicalActivityRes = await fetchStudentActivityJournalFromServerFirestore(uid).catch(() => null);
+    const targetUid = canonicalResolvedUid || uid;
+    if (targetUid && isValidCanonicalUid(targetUid)) {
+      const canonicalActivityRes = await fetchStudentActivityJournalFromServerFirestore(targetUid).catch(() => null);
       if (canonicalActivityRes && canonicalActivityRes.ok) {
         journalEntries = canonicalActivityRes.entries;
       }
@@ -6018,7 +6036,12 @@ app.get('/api/financial/ptax', async (req, res) => {
       });
     }
   } else {
-    ptaxRateLimitMap.set(clientIp, { count: 1, resetTime: now + PTAX_RATE_LIMIT_WINDOW_MS });
+    if (ptaxRateLimitMap.size >= 1000) {
+      for (const [ip, rec] of ptaxRateLimitMap.entries()) {
+        if (now >= rec.resetTime) ptaxRateLimitMap.delete(ip);
+      }
+    }
+    setBoundedMapEntry(ptaxRateLimitMap, clientIp, { count: 1, resetTime: now + PTAX_RATE_LIMIT_WINDOW_MS }, 1000);
   }
 
   try {
@@ -16620,11 +16643,14 @@ async function syncYouTubePlaylistsFromApi(force = false, oauthToken?: string): 
 }
 
 // Automatically detect new playlists and videos added to the YouTube channel every 15 minutes
-setInterval(() => {
+const youtubePeriodicSyncTimer = setInterval(() => {
   syncYouTubePlaylistsFromApi(true).catch((err) => {
     console.warn('Background periodic YouTube sync notice:', err);
   });
 }, 15 * 60 * 1000);
+if (typeof youtubePeriodicSyncTimer?.unref === 'function') {
+  youtubePeriodicSyncTimer.unref();
+}
 
 async function syncSpotifyPlaylistsFromApi(force = false): Promise<any> {
   const configStatus = getSpotifyConfigStatus();
@@ -19633,7 +19659,7 @@ async function generateDirectMemorizationAi(
   if (!apiKey || !Array.isArray(words) || words.length === 0) return null;
 
   const vidKey = videoContext?.videoId ? `_vid_${videoContext.videoId}` : '';
-  const cacheKey = `${words.map((w) => w.toLowerCase().trim()).sort().join('|')}_${studentLevel.toLowerCase()}${vidKey}`;
+  const cacheKey = `direct:${words.map((w) => w.toLowerCase().trim()).sort().join('|')}_${studentLevel.toLowerCase()}${vidKey}`;
   const cached = aiMemorizationCache.get(cacheKey);
   if (cached && Date.now() < cached.expiry) {
     const cachedStory = cached.data?.readingPassage?.text || '';
@@ -19798,11 +19824,16 @@ Required JSON Structure:
           });
         }
 
-        // Cache successful AI response for 2 hours
-        aiMemorizationCache.set(cacheKey, {
-          data: parsed,
-          expiry: Date.now() + 2 * 60 * 60 * 1000,
-        });
+        // Cache successful AI response for 2 hours (bounded)
+        setBoundedMapEntry(
+          aiMemorizationCache,
+          cacheKey,
+          {
+            data: parsed,
+            expiry: Date.now() + 2 * 60 * 60 * 1000,
+          },
+          100
+        );
         return parsed;
       }
     }
@@ -19914,7 +19945,7 @@ app.post('/api/homework/generate-ai', firebaseAuthMiddleware, async (req, res) =
     }
 
     const vidKey = videoContext?.videoId ? `_vid_${videoContext.videoId}` : '';
-    const cacheKey = `${cleanWords.map((w: string) => w.toLowerCase().trim()).sort().join('|')}_${studentLevel.toLowerCase()}${vidKey}`;
+    const cacheKey = `resp:${targetStudentUid || callerUid}:${cleanWords.map((w: string) => w.toLowerCase().trim()).sort().join('|')}_${String(effectiveLevel).toLowerCase()}${vidKey}`;
     const cachedResponse = aiMemorizationCache.get(cacheKey);
     if (cachedResponse && Date.now() < cachedResponse.expiry) {
       const cachedText = cachedResponse.data?.homework?.readingPassage?.text || '';
@@ -20057,7 +20088,7 @@ app.post('/api/homework/generate-ai', firebaseAuthMiddleware, async (req, res) =
 
     const payload = { success: true, homework: finalHomeworkData, videoContext: videoContext || undefined };
     if (!hasGenericBoilerplate(finalHomeworkData) && wasAiGenerated) {
-      aiMemorizationCache.set(cacheKey, { data: payload, expiry: Date.now() + 60 * 60 * 1000 });
+      setBoundedMapEntry(aiMemorizationCache, cacheKey, { data: payload, expiry: Date.now() + 60 * 60 * 1000 }, 100);
     }
     res.json(payload);
   } catch (error: any) {
@@ -21363,9 +21394,25 @@ const homeworkEvalCache = new Map<string, { data: any; expiry: number }>();
 // In-memory cache for live lesson generated vocabulary to prevent duplicate generation
 const lessonVocabCache = new Map<string, any[]>();
 
-export function resetResidualCachesForTesting(): void {
+export function resetAllServerMemoryCaches(): void {
   homeworkEvalCache.clear();
   lessonVocabCache.clear();
+  pedagogicalDictCache.clear();
+  aiMemorizationCache.clear();
+  dailySentenceEvaluationCache.clear();
+  ptaxRateLimitMap.clear();
+  institutionalYouTubeToken = null;
+  institutionalYouTubeTokenUpdatedAt = 0;
+  lastYouTubeSyncTime = 0;
+  clearLocalInsightsCache();
+  clearInMemoryDriveStore();
+  clearPtaxMemoryCache();
+  clearSpotifyPlaylistCache();
+  resetCachedSpotifyToken();
+}
+
+export function resetResidualCachesForTesting(): void {
+  resetAllServerMemoryCaches();
 }
 
 // 13. Comprehensive AI Homework Evaluator (All 4 Interactive Stages)
@@ -21459,7 +21506,7 @@ app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
         return String(curChoice ?? '') === String(prevChoice ?? '');
       });
       if (sentencesMatch && quizMatch) {
-        homeworkEvalCache.set(evalCacheKey, { data: existingHw.aiEvaluation, expiry: Date.now() + 600000 });
+        setBoundedMapEntry(homeworkEvalCache, evalCacheKey, { data: existingHw.aiEvaluation, expiry: Date.now() + 600000 }, 200);
         return res.json({ success: true, evaluation: existingHw.aiEvaluation, cached: true });
       }
     }
@@ -21917,7 +21964,7 @@ Output STRICT JSON matching this schema:
 
     // Cache evaluated result only after confirmed persistence
     if (isValidHomeworkEvaluation(evaluationResponse)) {
-      homeworkEvalCache.set(evalCacheKey, { data: evaluationResponse, expiry: Date.now() + 600000 });
+      setBoundedMapEntry(homeworkEvalCache, evalCacheKey, { data: evaluationResponse, expiry: Date.now() + 600000 }, 200);
     }
 
     return res.json({
@@ -22043,7 +22090,7 @@ Return a JSON array of objects with the exact schema:
   }
 
   if (generatedEntries && generatedEntries.length > 0) {
-    lessonVocabCache.set(vocabCacheKey, generatedEntries);
+    setBoundedMapEntry(lessonVocabCache, vocabCacheKey, generatedEntries, 200);
     return res.json({ success: true, entries: generatedEntries });
   }
 

@@ -153,6 +153,7 @@ import {
 } from './utils/studentPersistence';
 import { buildConsolidatedActiveDictionary } from './utils/studentDictionaryLibrary';
 import { clearDictionaryMemoryCache } from './utils/dictionaryService';
+import { clearAllClientSessionCaches, purgeLegacyBrowserStorage } from './utils/sessionCacheCleanup';
 import {
   isGenericTutorId,
   normalizeTutorName,
@@ -310,19 +311,50 @@ export default function App() {
     }
   }, [currentAccount?.uid, currentAccount?.email]);
 
+  const previousAuthUidRef = useRef<string | null>(null);
+
   // FASE IDENTITY-CRITICAL.2: Resolução Canônica e Autoritativa de Identidade
   // Elimina concorrência de listeners, escritas indevidas no login/F5 e fallbacks silenciosos para student.
   useEffect(() => {
     let isCancelled = false;
+    purgeLegacyBrowserStorage({ preserveFirebaseAuth: true, clearSessionStorage: false });
 
     const unsubscribe = onAuthStateChanged(auth, async (fbUser) => {
       if (isCancelled) return;
 
+      const nextUid = fbUser?.uid || null;
+      const prevUid = previousAuthUidRef.current;
+
       if (!fbUser || !fbUser.email) {
+        if (prevUid) {
+          clearAllClientSessionCaches({ preserveFirebaseAuth: true });
+          activeStudentUidRef.current = '';
+          activeJournalLoadUidRef.current = '';
+          setDailyJournalEntries([]);
+          setStudentDictionaryEntries([]);
+          setExcludedDictionaryWords([]);
+          setLessons([]);
+          setStudents([]);
+          setNotifications([]);
+        }
+        previousAuthUidRef.current = null;
         setCurrentAccount(null);
         setIsAuthReady(true);
         return;
       }
+
+      if (prevUid && prevUid !== nextUid) {
+        clearAllClientSessionCaches({ preserveFirebaseAuth: true });
+        activeStudentUidRef.current = '';
+        activeJournalLoadUidRef.current = '';
+        setDailyJournalEntries([]);
+        setStudentDictionaryEntries([]);
+        setExcludedDictionaryWords([]);
+        setLessons([]);
+        setStudents([]);
+        setNotifications([]);
+      }
+      previousAuthUidRef.current = nextUid;
 
       const cleanEmail = fbUser.email.toLowerCase().trim();
       const fbUid = fbUser.uid;
@@ -3447,9 +3479,11 @@ export default function App() {
     tutorData?: any
   ) => {
     const effectiveAuthUid = auth.currentUser?.uid || account.uid || account.id || initialProfile?.uid || initialProfile?.id || '';
-    if (currentAccount && currentAccount.email.toLowerCase() !== account.email.toLowerCase()) {
-      clearDictionaryMemoryCache();
-      clearAllLocalPersistenceCaches();
+    if (
+      (currentAccount?.uid && effectiveAuthUid && currentAccount.uid !== effectiveAuthUid) ||
+      (currentAccount && currentAccount.email.toLowerCase() !== account.email.toLowerCase())
+    ) {
+      clearAllClientSessionCaches({ preserveFirebaseAuth: true });
     }
     const safeAccount: GoogleAccount = {
       ...account,
@@ -3585,10 +3619,10 @@ export default function App() {
     try {
       firebaseSignOutAuth(auth).catch(() => {});
     } catch {}
+    previousAuthUidRef.current = null;
     activeStudentUidRef.current = '';
     activeJournalLoadUidRef.current = '';
-    clearDictionaryMemoryCache();
-    clearAllLocalPersistenceCaches();
+    clearAllClientSessionCaches({ preserveFirebaseAuth: true });
     setCurrentAccount(null);
     setUserProfile(createDefaultStudentProfile(null));
     setDailyJournalEntries([]);
@@ -3597,9 +3631,6 @@ export default function App() {
     setLessons([]);
     setStudents([]);
     setNotifications([]);
-    if (typeof window !== 'undefined' && window.sessionStorage) {
-      window.sessionStorage.removeItem('its_simple_preselected_tutor_id');
-    }
     setIsTutorPreselected(false);
     setOnboardingInitialTutorId('');
     setViewMode('landing');

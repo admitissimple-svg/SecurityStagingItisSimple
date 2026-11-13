@@ -159,6 +159,7 @@ export interface SpotifyPlaylistCacheEntry {
 
 // In-memory runtime cache: zero localStorage reliance
 const spotifyMemoryCache = new Map<string, SpotifyPlaylistCacheEntry>();
+const studentSpotifyLevelMemoryMap = new Map<string, NormalizedStudentLevel>();
 
 /**
  * Checks in-memory cache and purges legacy localStorage entries permanently.
@@ -174,8 +175,24 @@ export function checkAndInvalidateSpotifyCache(): void {
   if (typeof window !== 'undefined' && window.localStorage) {
     try {
       (['beginner', 'intermediate', 'advanced'] as NormalizedStudentLevel[]).forEach((lvl) => {
-        localStorage.removeItem(`its_simple_spotify_playlist_v3_${lvl}`);
-        localStorage.removeItem(`its_simple_spotify_playlist_v5_${lvl}`);
+        window.localStorage.removeItem(`its_simple_spotify_playlist_v3_${lvl}`);
+        window.localStorage.removeItem(`its_simple_spotify_playlist_v5_${lvl}`);
+      });
+      const keysToRemove: string[] = [];
+      for (let i = 0; i < window.localStorage.length; i++) {
+        const key = window.localStorage.key(i);
+        if (
+          key &&
+          (key.startsWith('its_simple_spotify_level_pref_') ||
+            key.startsWith('its_simple_spotify_playlist_'))
+        ) {
+          keysToRemove.push(key);
+        }
+      }
+      keysToRemove.forEach((key) => {
+        try {
+          window.localStorage.removeItem(key);
+        } catch {}
       });
     } catch {}
   }
@@ -267,26 +284,22 @@ export async function fetchTracksForStudentLevel(
 export const SPOTIFY_STUDENT_LEVEL_STORAGE_KEY_PREFIX = 'its_simple_spotify_level_pref_';
 
 export function getStoredStudentSpotifyLevel(studentKey?: string): NormalizedStudentLevel | null {
-  if (typeof window === 'undefined' || !window.localStorage) return null;
-  try {
-    const raw = studentKey
-      ? window.localStorage.getItem(`${SPOTIFY_STUDENT_LEVEL_STORAGE_KEY_PREFIX}${studentKey.toLowerCase().trim()}`)
-      : null;
-    const fallback = window.localStorage.getItem('its_simple_spotify_level_pref_current');
-    return resolveCanonicalStudentLevel(raw || fallback);
-  } catch {
-    return null;
-  }
+  const cleanKey = (studentKey || '').toLowerCase().trim();
+  if (!cleanKey) return null;
+  const cached = studentSpotifyLevelMemoryMap.get(cleanKey);
+  return cached ? resolveCanonicalStudentLevel(cached) : null;
 }
 
 export function setStoredStudentSpotifyLevel(studentKey: string | undefined, level: NormalizedStudentLevel): void {
-  if (typeof window === 'undefined' || !window.localStorage) return;
-  try {
-    if (studentKey) {
-      window.localStorage.setItem(`${SPOTIFY_STUDENT_LEVEL_STORAGE_KEY_PREFIX}${studentKey.toLowerCase().trim()}`, level);
-    }
-    window.localStorage.setItem('its_simple_spotify_level_pref_current', level);
-  } catch {}
+  const cleanKey = (studentKey || '').toLowerCase().trim();
+  if (!cleanKey) return;
+  studentSpotifyLevelMemoryMap.set(cleanKey, level);
+}
+
+export function clearSpotifyMemoryCaches(): void {
+  spotifyMemoryCache.clear();
+  studentSpotifyLevelMemoryMap.clear();
+  checkAndInvalidateSpotifyCache();
 }
 
 /**

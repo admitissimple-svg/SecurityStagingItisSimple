@@ -14,6 +14,10 @@ import { assertSafeFirestoreWrite, stampSchemaVersion } from './firestoreSchemaV
 // ZERO dependency on localStorage: Cloud Firestore is the 100% persistent master
 const inMemoryDmCache = new Map<string, DirectMessage[]>();
 
+export function clearDirectMessagesMemoryCache(): void {
+  inMemoryDmCache.clear();
+}
+
 export enum OperationType {
   CREATE = 'create',
   UPDATE = 'update',

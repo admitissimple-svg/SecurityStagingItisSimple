@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import {
   signInWithEmailAndPassword,
   signInWithPopup,
@@ -12,6 +12,7 @@ import { auth, googleAuthProvider, getDb } from '../firebase';
 import { GoogleAccount, UserProfile, UserRole, EnglishLevel, NativeFriendTutor } from '../types';
 import { setGoogleOAuthToken, getGoogleOAuthToken, requestGoogleDriveAuth } from '../utils/auth';
 import { DEFAULT_STUDENT_TIMEZONE } from '../utils/timezone';
+import { clearAllClientSessionCaches, purgeLegacyBrowserStorage } from '../utils/sessionCacheCleanup';
 
 export interface AuthUserDoc {
   uid: string;
@@ -104,6 +105,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [googleOAuthToken, setGoogleOAuthTokenState] = useState<string | null>(getGoogleOAuthToken());
+  const previousUidRef = useRef<string | null>(null);
 
   const connectGoogleDrive = useCallback(async (hintEmail?: string): Promise<string | null> => {
     const targetEmail = hintEmail || currentAccount?.email || undefined;
@@ -141,6 +143,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   // Sync Firebase Auth session on mount and attach real-time onSnapshot listener to users/{user.uid}
   useEffect(() => {
+    purgeLegacyBrowserStorage({ preserveFirebaseAuth: true, clearSessionStorage: false });
     let userDocUnsub: (() => void) | null = null;
 
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
@@ -148,6 +151,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         userDocUnsub();
         userDocUnsub = null;
       }
+      const nextUid = user?.uid || null;
+      const prevUid = previousUidRef.current;
+      if ((prevUid && !nextUid) || (prevUid && nextUid && prevUid !== nextUid)) {
+        clearAllClientSessionCaches({ preserveFirebaseAuth: true });
+        setUserProfile(null);
+        setGoogleOAuthTokenState(null);
+      }
+      previousUidRef.current = nextUid;
       setFirebaseUser(user);
 
       if (user) {
@@ -499,6 +510,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } catch {
       // ignore
     }
+    previousUidRef.current = null;
+    clearAllClientSessionCaches({ preserveFirebaseAuth: true });
     setGoogleOAuthToken(null);
     setGoogleOAuthTokenState(null);
     setCurrentAccount(null);
