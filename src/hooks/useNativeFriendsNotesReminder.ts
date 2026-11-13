@@ -251,36 +251,38 @@ export function useNativeFriendsNotesReminder({
         if (resolvedEmail) queryParams.set('studentEmail', resolvedEmail);
 
         const idToken = await auth?.currentUser?.getIdToken().catch(() => null);
-        const res = await fetch(`/api/session-notes?${queryParams.toString()}`, {
-          headers: {
-            ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
-          },
-        });
-        if (res.ok) {
-          const serverNotes = await res.json();
-          if (Array.isArray(serverNotes)) {
-            serverNotes.forEach((n: any) => {
-              if (n && n.content && n.content.trim()) {
-                const { timestamp, dateStr } = extractRealLessonDateAndTimestamp({
-                  sessionDate: n.sessionDate,
-                  startDateTime: n.startDateTime,
-                  id: n.id,
-                  key: n.id,
-                });
-                const key = n.id || (dateStr ? `session_${dateStr}` : 'session');
-                if (!sessionsMap.has(key)) {
-                  sessionsMap.set(key, {
-                    key,
-                    lessonId: n.lessonId,
-                    dateStr: dateStr || 'Session',
-                    topic: n.topic || 'In-Session Notes',
-                    teacherName: n.teacherName || 'Native Friend',
-                    rawContent: n.content,
-                    timestamp,
+        if (idToken) {
+          const res = await fetch(`/api/session-notes?${queryParams.toString()}`, {
+            headers: {
+              Authorization: `Bearer ${idToken}`,
+            },
+          });
+          if (res.ok) {
+            const serverNotes = await res.json();
+            if (Array.isArray(serverNotes)) {
+              serverNotes.forEach((n: any) => {
+                if (n && n.content && n.content.trim()) {
+                  const { timestamp, dateStr } = extractRealLessonDateAndTimestamp({
+                    sessionDate: n.sessionDate,
+                    startDateTime: n.startDateTime,
+                    id: n.id,
+                    key: n.id,
                   });
+                  const key = n.id || (dateStr ? `session_${dateStr}` : 'session');
+                  if (!sessionsMap.has(key)) {
+                    sessionsMap.set(key, {
+                      key,
+                      lessonId: n.lessonId,
+                      dateStr: dateStr || 'Session',
+                      topic: n.topic || 'In-Session Notes',
+                      teacherName: n.teacherName || 'Native Friend',
+                      rawContent: n.content,
+                      timestamp,
+                    });
+                  }
                 }
-              }
-            });
+              });
+            }
           }
         }
       } catch (apiErr) {
@@ -339,20 +341,27 @@ export function useNativeFriendsNotesReminder({
     // 2b. Check Server API fallback
     if (!exists) {
       try {
-        const queryParams = new URLSearchParams();
-        if (resolvedUid) queryParams.set('studentUid', resolvedUid);
-        if (resolvedEmail) queryParams.set('studentEmail', resolvedEmail);
+        const idToken = await auth?.currentUser?.getIdToken().catch(() => null);
+        if (idToken) {
+          const queryParams = new URLSearchParams();
+          if (resolvedUid) queryParams.set('studentUid', resolvedUid);
+          if (resolvedEmail) queryParams.set('studentEmail', resolvedEmail);
 
-        const res = await fetch(`/api/session-notes/progress?${queryParams.toString()}`);
-        if (res.ok) {
-          const progressData = await res.json();
-          if (progressData) {
-            exists = true;
-            loadedSessionKey = progressData.lastSessionKey || '';
-            loadedStepIndex = typeof progressData.stepIndex === 'number' ? progressData.stepIndex : 0;
-            loadedAssignedDate = progressData.lastAssignedDate || progressData.lastAssignedReviewDate || '';
-            loadedReviewedDate = progressData.lastReviewedDate || '';
-            loadedReminderShownDate = progressData.lastReminderShownDate || '';
+          const res = await fetch(`/api/session-notes/progress?${queryParams.toString()}`, {
+            headers: {
+              Authorization: `Bearer ${idToken}`,
+            },
+          });
+          if (res.ok) {
+            const progressData = await res.json();
+            if (progressData) {
+              exists = true;
+              loadedSessionKey = progressData.lastSessionKey || '';
+              loadedStepIndex = typeof progressData.stepIndex === 'number' ? progressData.stepIndex : 0;
+              loadedAssignedDate = progressData.lastAssignedDate || progressData.lastAssignedReviewDate || '';
+              loadedReviewedDate = progressData.lastReviewedDate || '';
+              loadedReminderShownDate = progressData.lastReminderShownDate || '';
+            }
           }
         }
       } catch (err) {
@@ -504,19 +513,25 @@ export function useNativeFriendsNotesReminder({
 
       // Save to Server API
       try {
-        await fetch('/api/session-notes/progress', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            studentUid: resolvedUid,
-            studentEmail: resolvedEmail,
-            lastSessionKey: sessionKey,
-            stepIndex: newStepIndex,
-            lastAssignedDate: cyclePayload.lastAssignedDate,
-            lastReviewedDate: cyclePayload.lastReviewedDate,
-            lastReviewedTab: cyclePayload.lastReviewedTab,
-          }),
-        });
+        const idToken = await auth?.currentUser?.getIdToken().catch(() => null);
+        if (idToken) {
+          await fetch('/api/session-notes/progress', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${idToken}`,
+            },
+            body: JSON.stringify({
+              studentUid: resolvedUid,
+              studentEmail: resolvedEmail,
+              lastSessionKey: sessionKey,
+              stepIndex: newStepIndex,
+              lastAssignedDate: cyclePayload.lastAssignedDate,
+              lastReviewedDate: cyclePayload.lastReviewedDate,
+              lastReviewedTab: cyclePayload.lastReviewedTab,
+            }),
+          });
+        }
       } catch (err) {
         console.warn('useNativeFriendsNotesReminder: Server progress save notice:', err);
       }
@@ -864,9 +879,14 @@ export function useNativeFriendsNotesReminder({
   const claimDailyReminder = useCallback(async (): Promise<{ canShow: boolean; alreadyShown: boolean }> => {
     if (!resolvedUid && !resolvedEmail) return { canShow: false, alreadyShown: true };
     try {
+      const idToken = await auth?.currentUser?.getIdToken().catch(() => null);
+      if (!idToken) return { canShow: false, alreadyShown: false };
       const res = await fetch('/api/session-notes/reminder/claim', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+        },
         body: JSON.stringify({
           studentUid: resolvedUid,
           studentEmail: resolvedEmail,

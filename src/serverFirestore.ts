@@ -2453,10 +2453,11 @@ export async function fetchCanonicalRoutineContextServer(
     const userRef = db.collection('users').doc(uid);
     const assignRef = db.collection('student_assignments').doc(uid);
 
-    const [userSnap, routinesSnap, assignSnap] = await Promise.all([
+    const [userSnap, routinesSnap, assignSnap, activityJournalSnap] = await Promise.all([
       withTimeout(userRef.get(), 4500),
       withTimeout(userRef.collection('routines').get(), 4500),
       withTimeout(assignRef.get(), 4500),
+      withTimeout(userRef.collection('activity_journal').get(), 4500).catch(() => null),
     ]);
 
     const uData = (userSnap && userSnap.exists ? userSnap.data() : null) || {};
@@ -2554,7 +2555,26 @@ export async function fetchCanonicalRoutineContextServer(
     (Array.isArray(uData.watchedVideos) ? uData.watchedVideos : []).forEach(addWatchedId);
     (Array.isArray(aData.watchedVideos) ? aData.watchedVideos : []).forEach(addWatchedId);
 
-    const journal = Array.isArray(uData.studentJournal) ? uData.studentJournal : [];
+    const activityJournalMap = new Map<string, any>();
+    if (activityJournalSnap && !activityJournalSnap.empty) {
+      activityJournalSnap.forEach((docSnap: any) => {
+        const d = docSnap.data();
+        if (d) {
+          const eid = String(d.id || docSnap.id || '').trim();
+          if (eid) activityJournalMap.set(eid, { ...d, id: eid });
+        }
+      });
+    }
+    const legacyJournal = Array.isArray(uData.studentJournal) ? uData.studentJournal : [];
+    legacyJournal.forEach((entry: any) => {
+      if (entry && entry.id) {
+        const eid = String(entry.id).trim();
+        if (eid && !activityJournalMap.has(eid)) {
+          activityJournalMap.set(eid, entry);
+        }
+      }
+    });
+    const journal = Array.from(activityJournalMap.values());
     journal.forEach((entry: any) => {
       if (entry && entry.type === 'video') {
         addWatchedId(entry.id);
@@ -3466,9 +3486,24 @@ export async function fetchRoutineVideosFromFirestoreServer(
 
   try {
     const userRef = db.collection('users').doc(uid);
-    const userSnap = await withTimeout(userRef.get(), 4000);
+    const [userSnap, activityJournalSnap, routinesSnap] = await Promise.all([
+      withTimeout(userRef.get(), 4000),
+      withTimeout(userRef.collection('activity_journal').get(), 4000).catch(() => null),
+      withTimeout(userRef.collection('routines').get(), 4000),
+    ]);
 
     let activeCycle = result.weeklyCycle;
+    const journalMap = new Map<string, any>();
+    if (activityJournalSnap && !activityJournalSnap.empty) {
+      activityJournalSnap.forEach((docSnap: any) => {
+        const d = docSnap.data();
+        if (d) {
+          const eid = String(d.id || docSnap.id || '').trim();
+          if (eid) journalMap.set(eid, { ...d, id: eid });
+        }
+      });
+    }
+
     if (userSnap && userSnap.exists) {
       const uData = userSnap.data() || {};
       const uCycle = typeof uData.weeklyCycle === 'number' ? uData.weeklyCycle : typeof uData.weeklyCycle === 'string' ? parseInt(uData.weeklyCycle.replace(/\D/g, ''), 10) : NaN;
@@ -3482,7 +3517,13 @@ export async function fetchRoutineVideosFromFirestoreServer(
       result.weeklyCycle = activeCycle;
 
       const history = uData.watchedVideosHistory || uData.watchedVideos || [];
-      const journal = Array.isArray(uData.studentJournal) ? uData.studentJournal : [];
+      const legacyJournal = Array.isArray(uData.studentJournal) ? uData.studentJournal : [];
+      legacyJournal.forEach((entry: any) => {
+        if (entry && entry.id && !journalMap.has(String(entry.id).trim())) {
+          journalMap.set(String(entry.id).trim(), entry);
+        }
+      });
+      const journal = Array.from(journalMap.values());
       const idsFromHistory = Array.isArray(history)
         ? history.map((item: any) => (typeof item === 'string' ? item : item?.videoId || item?.id || '')).filter(Boolean)
         : [];
@@ -3504,9 +3545,13 @@ export async function fetchRoutineVideosFromFirestoreServer(
           }
         });
       }
+    } else if (journalMap.size > 0) {
+      result.watchedVideosHistory = Array.from(journalMap.values())
+        .filter((entry: any) => entry && entry.type === 'video' && entry.id)
+        .map((entry: any) => (typeof entry.id === 'string' ? entry.id : entry.id?.videoId || ''))
+        .filter(Boolean);
     }
 
-    const routinesSnap = await withTimeout(userRef.collection('routines').get(), 4000);
     if (routinesSnap && !routinesSnap.empty) {
       routinesSnap.forEach((docSnap: any) => {
         const data = docSnap.data();
@@ -5848,29 +5893,8 @@ export async function recordLessonReviewInStudentJournalServer(params: {
     try {
       const userRef = db.collection('users').doc(cleanUid);
       const subDocRef = userRef.collection('journal').doc(entryId);
-
+      // ARCH.2F.2A: Persist exclusively in users/{studentUid}/journal/{entryId} (no root array mirror)
       await subDocRef.set(sanitized, { merge: true });
-
-      // Atomically update dailyJournalEntries array in users/{studentUid}
-      const userSnap = await userRef.get();
-      let currentList: any[] = [];
-      if (userSnap.exists) {
-        const uData = userSnap.data();
-        if (Array.isArray(uData?.dailyJournalEntries)) {
-          currentList = uData.dailyJournalEntries;
-        }
-      }
-
-      const filtered = currentList.filter((e: any) => e.id !== entryId);
-      const updatedList = [sanitized, ...filtered];
-
-      await userRef.set(
-        {
-          dailyJournalEntries: updatedList,
-          updatedAt: new Date().toISOString(),
-        },
-        { merge: true }
-      );
     } catch (fsErr) {
       if (!isPermissionError(fsErr)) {
         console.warn('Firestore recordLessonReviewInStudentJournal notice:', fsErr);
@@ -5881,32 +5905,403 @@ export async function recordLessonReviewInStudentJournalServer(params: {
   return { success: true, entry: sanitized };
 }
 
+function sanitizeJournalDocId(rawId: string): string {
+  const clean = String(rawId || '').trim().replace(/\//g, '_');
+  if (!clean) return `entry_${Date.now()}`;
+  const safe = clean.replace(/[^a-zA-Z0-9._-]/g, '_');
+  return safe || `entry_${Date.now()}`;
+}
+
+function buildActivitySlotKey(entry: any): string | null {
+  const type = String(entry?.type || '').toLowerCase().trim();
+  const day = String(entry?.dayOfWeek || '').toLowerCase().trim();
+  const cycle = parsePositiveCycleFromFirestore(entry?.week);
+  if (!type || !day || cycle === null) return null;
+  return `${type}__${day}__${cycle}`;
+}
+
 /**
- * Direct persistence for Student Journal entries to users/{docId}
+ * ARCH.2F.2A: Canonical Daily Journal save helper.
+ * Persists strictly in users/{uid}/journal/{entryId} without root array mirrors.
  */
-export async function saveStudentJournalToFirestore(docId: string, journal: any[]): Promise<boolean> {
-  if (isCloudWriteDisabled) return false;
+export async function saveStudentDailyJournalEntryServer(
+  uid: string,
+  entry: any
+): Promise<{ ok: boolean; entry?: any; error?: string; statusCode?: number }> {
+  if (isCloudWriteDisabled) {
+    return { ok: false, statusCode: 500, error: 'Firestore writes disabled by IAM credentials.' };
+  }
   const db = getFirestoreDb();
-  if (!db || !docId) return false;
+  if (!db || !uid) {
+    return { ok: false, statusCode: 503, error: 'Canonical Firestore database unavailable.' };
+  }
+  if (!entry || !entry.id || String(entry.id).trim() === '') {
+    return { ok: false, statusCode: 400, error: 'Valid entry with id is required.' };
+  }
+
   try {
-    const sanitized = JSON.parse(JSON.stringify(journal || []));
-    await db.collection('users').doc(docId).set(
-      {
-        studentJournal: sanitized,
-        updatedAt: new Date().toISOString(),
-      },
-      { merge: true }
-    );
-    return true;
+    const cleanUid = uid.trim();
+    const docId = sanitizeJournalDocId(String(entry.id));
+    const nowIso = new Date().toISOString();
+    const cleanEntry = removeUndefinedFields({
+      ...entry,
+      id: String(entry.id).trim(),
+      studentUid: cleanUid,
+      createdAt: entry.createdAt || nowIso,
+      updatedAt: nowIso,
+    });
+    await db.collection('users').doc(cleanUid).collection('journal').doc(docId).set(cleanEntry, { merge: true });
+    return { ok: true, entry: cleanEntry };
   } catch (err: any) {
     if (isPermissionError(err)) {
       isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote student journal save restricted by IAM, continuing with local state.');
-    } else {
-      console.warn('Firestore saveStudentJournal error:', err);
+      return { ok: false, statusCode: 500, error: 'Firestore write restricted by IAM credentials.' };
     }
-    return false;
+    console.warn('[serverFirestore] saveStudentDailyJournalEntryServer error:', err);
+    return { ok: false, statusCode: 500, error: err?.message || 'Failed to save journal entry to Firestore.' };
   }
+}
+
+/**
+ * ARCH.2F.2A: Fetch Activity Journal from canonical users/{uid}/activity_journal/{entryId}
+ * with read-only legacy fallback (users/{uid}/studentJournal & users/{uid}.studentJournal).
+ */
+export async function fetchStudentActivityJournalFromServerFirestore(
+  uid: string
+): Promise<{ ok: boolean; entries: any[]; error?: string; statusCode?: number }> {
+  const db = getFirestoreDb();
+  if (!db || !uid) {
+    return { ok: false, entries: [], statusCode: 503, error: 'Canonical Firestore database unavailable.' };
+  }
+
+  try {
+    const cleanUid = uid.trim();
+    const userRef = db.collection('users').doc(cleanUid);
+    const [canonicalSnap, legacySubSnap, userSnap] = await Promise.all([
+      withTimeout(userRef.collection('activity_journal').get(), 4500),
+      withTimeout(userRef.collection('studentJournal').get(), 4500).catch(() => null),
+      withTimeout(userRef.get(), 4500).catch(() => null),
+    ]);
+
+    if (canonicalSnap === null) {
+      return { ok: false, entries: [], statusCode: 503, error: 'Timed out reading Activity Journal from Firestore.' };
+    }
+
+    const byId = new Map<string, any>();
+    const occupiedSlots = new Set<string>();
+
+    const addEntryIfNovel = (raw: any, isCanonical: boolean) => {
+      if (!raw || typeof raw !== 'object') return;
+      const eid = String(raw.id || '').trim();
+      if (!eid) return;
+      const normalized = { ...raw, id: eid };
+      const slotKey = buildActivitySlotKey(normalized);
+
+      if (isCanonical) {
+        if (!byId.has(eid)) {
+          byId.set(eid, normalized);
+          if (slotKey) occupiedSlots.add(slotKey);
+        }
+        return;
+      }
+
+      if (byId.has(eid)) return;
+      if (slotKey && occupiedSlots.has(slotKey)) return;
+      byId.set(eid, normalized);
+      if (slotKey) occupiedSlots.add(slotKey);
+    };
+
+    canonicalSnap.forEach((docSnap: any) => {
+      const d = docSnap.data();
+      if (d) {
+        addEntryIfNovel({ ...d, id: d.id || docSnap.id }, true);
+      }
+    });
+
+    if (legacySubSnap && !legacySubSnap.empty) {
+      legacySubSnap.forEach((docSnap: any) => {
+        const d = docSnap.data();
+        if (d) {
+          addEntryIfNovel({ ...d, id: d.id || docSnap.id }, false);
+        }
+      });
+    }
+
+    if (userSnap && userSnap.exists) {
+      const uData = userSnap.data() || {};
+      if (Array.isArray(uData.studentJournal)) {
+        uData.studentJournal.forEach((item: any) => addEntryIfNovel(item, false));
+      }
+    }
+
+    const entries = Array.from(byId.values()).sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0));
+    return { ok: true, entries };
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+      return { ok: false, entries: [], statusCode: 500, error: 'Firestore read restricted by IAM.' };
+    }
+    console.warn('[serverFirestore] fetchStudentActivityJournalFromServerFirestore error:', err);
+    return { ok: false, entries: [], statusCode: 500, error: err?.message || 'Failed to read Activity Journal from Firestore.' };
+  }
+}
+
+const VALID_ACTIVITY_JOURNAL_TYPES = new Set(['video', 'audio', 'memorization', 'live_lesson']);
+
+/**
+ * ARCH.2F.2A: Persist Activity Journal entry strictly in users/{uid}/activity_journal/{entryId}.
+ * Guarantees idempotency on (id) and (type, dayOfWeek, week) slot without writing root arrays, RAM, or app_state.
+ */
+export async function upsertStudentActivityJournalEntryServer(
+  uid: string,
+  rawEntry: any,
+  fallbackEmail?: string
+): Promise<{ ok: boolean; entry?: any; entries?: any[]; error?: string; statusCode?: number }> {
+  if (isCloudWriteDisabled) {
+    return { ok: false, statusCode: 500, error: 'Firestore writes disabled by IAM credentials.' };
+  }
+  const db = getFirestoreDb();
+  if (!db || !uid) {
+    return { ok: false, statusCode: 503, error: 'Canonical Firestore database unavailable.' };
+  }
+  if (!rawEntry || typeof rawEntry !== 'object' || !rawEntry.type) {
+    return { ok: false, statusCode: 400, error: 'Valid activity entry with type is required.' };
+  }
+
+  const normalizedType = String(rawEntry.type).trim();
+  if (!VALID_ACTIVITY_JOURNAL_TYPES.has(normalizedType)) {
+    return { ok: false, statusCode: 400, error: `Invalid activity type '${normalizedType}'.` };
+  }
+
+  try {
+    const cleanUid = uid.trim();
+    const userRef = db.collection('users').doc(cleanUid);
+    const activityCol = userRef.collection('activity_journal');
+
+    const isExplicitWeekSupplied =
+      rawEntry.week !== undefined &&
+      rawEntry.week !== null &&
+      (typeof rawEntry.week !== 'string' || rawEntry.week.trim() !== '');
+
+    let resolvedWeek: number | null = null;
+    if (isExplicitWeekSupplied) {
+      resolvedWeek = parsePositiveCycleFromFirestore(rawEntry.week);
+      if (resolvedWeek === null) {
+        return {
+          ok: false,
+          statusCode: 400,
+          error: `Explicit week '${rawEntry.week}' is malformed.`,
+        };
+      }
+    } else {
+      const userSnap = await withTimeout(userRef.get(), 4000).catch(() => null);
+      const uData = userSnap && userSnap.exists ? userSnap.data() : null;
+      resolvedWeek = parsePositiveCycleFromFirestore(uData?.weeklyCycle) ?? 1;
+    }
+
+    const cleanDay = rawEntry.dayOfWeek ? String(rawEntry.dayOfWeek).toLowerCase().trim() : undefined;
+    const cleanEmail = (rawEntry.studentEmail || fallbackEmail || '').toLowerCase().trim();
+    const rawId = rawEntry.id ? String(rawEntry.id).trim() : '';
+    const canonicalEntryId = rawId
+      ? rawId
+      : `${normalizedType}_${cleanDay || 'any'}_${resolvedWeek}_${Date.now()}`;
+    const docId = sanitizeJournalDocId(canonicalEntryId);
+    const nowIso = new Date().toISOString();
+
+    const sanitizedEntry = removeUndefinedFields({
+      id: canonicalEntryId,
+      type: normalizedType,
+      date: rawEntry.date || nowIso.split('T')[0],
+      timestamp: Number(rawEntry.timestamp) || Date.now(),
+      studentUid: cleanUid,
+      week: resolvedWeek,
+      ...(cleanDay ? { dayOfWeek: cleanDay } : {}),
+      ...(cleanEmail ? { studentEmail: cleanEmail } : {}),
+      ...(rawEntry.title ? { title: String(rawEntry.title).trim() } : {}),
+      ...(rawEntry.artist ? { artist: String(rawEntry.artist).trim() } : {}),
+      ...(rawEntry.partNumber !== undefined && rawEntry.partNumber !== null ? { partNumber: Number(rawEntry.partNumber) } : {}),
+      ...(rawEntry.url ? { url: String(rawEntry.url).trim() } : {}),
+      ...(rawEntry.details ? { details: String(rawEntry.details).trim() } : {}),
+      ...(rawEntry.completedAt ? { completedAt: rawEntry.completedAt } : {}),
+      ...(rawEntry.isRepeat !== undefined ? { isRepeat: Boolean(rawEntry.isRepeat) } : {}),
+      ...(rawEntry.isRepeatVideo !== undefined ? { isRepeatVideo: Boolean(rawEntry.isRepeatVideo) } : {}),
+      updatedAt: nowIso,
+    });
+
+    await activityCol.doc(docId).set(sanitizedEntry, { merge: true });
+
+    // Remove superseded docs for the same (type, dayOfWeek, week) slot in activity_journal to maintain strict idempotency
+    if (cleanDay) {
+      const existingSnap = await withTimeout(activityCol.where('type', '==', normalizedType).get(), 4000).catch(() => null);
+      if (existingSnap && !existingSnap.empty) {
+        const cleanupPromises: Promise<any>[] = [];
+        existingSnap.forEach((docSnap: any) => {
+          if (docSnap.id === docId) return;
+          const d = docSnap.data();
+          const dDay = d?.dayOfWeek ? String(d.dayOfWeek).toLowerCase().trim() : '';
+          const dWeek = parsePositiveCycleFromFirestore(d?.week);
+          if (dDay === cleanDay && dWeek === resolvedWeek) {
+            cleanupPromises.push(docSnap.ref.delete().catch(() => {}));
+          }
+        });
+        if (cleanupPromises.length > 0) {
+          await Promise.all(cleanupPromises);
+        }
+      }
+    }
+
+    const refreshed = await fetchStudentActivityJournalFromServerFirestore(cleanUid);
+    return {
+      ok: true,
+      entry: sanitizedEntry,
+      entries: refreshed.ok ? refreshed.entries : [sanitizedEntry],
+    };
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+      return { ok: false, statusCode: 500, error: 'Firestore writes disabled by IAM credentials.' };
+    }
+    console.warn('[serverFirestore] upsertStudentActivityJournalEntryServer error:', err);
+    return { ok: false, statusCode: 500, error: err?.message || 'Failed to save activity journal entry.' };
+  }
+}
+
+/**
+ * ARCH.2F.2A: Delete Activity Journal entry from users/{uid}/activity_journal/{entryId}.
+ * Also removes matching legacy entry from users/{uid}/studentJournal or users/{uid}.studentJournal ONLY if present,
+ * ensuring deleted activities never reappear while never creating new root mirrors.
+ */
+export async function deleteStudentActivityJournalEntryServer(
+  uid: string,
+  params: { entryId?: string; id?: string; type?: string; dayOfWeek?: string; week?: number | string | null }
+): Promise<{ ok: boolean; deletedIds?: string[]; entries?: any[]; error?: string; statusCode?: number }> {
+  if (isCloudWriteDisabled) {
+    return { ok: false, statusCode: 500, error: 'Firestore writes disabled by IAM credentials.' };
+  }
+  const db = getFirestoreDb();
+  if (!db || !uid) {
+    return { ok: false, statusCode: 503, error: 'Canonical Firestore database unavailable.' };
+  }
+
+  const targetEntryId = String(params.entryId || params.id || '').trim();
+  const targetType = params.type ? String(params.type).trim() : '';
+  const targetDay = params.dayOfWeek ? String(params.dayOfWeek).toLowerCase().trim() : '';
+  const isExplicitWeekSupplied =
+    params.week !== undefined &&
+    params.week !== null &&
+    (typeof params.week !== 'string' || params.week.trim() !== '');
+
+  let resolvedCycle: number | null = null;
+  if (isExplicitWeekSupplied) {
+    resolvedCycle = parsePositiveCycleFromFirestore(params.week);
+    if (resolvedCycle === null) {
+      return { ok: false, statusCode: 400, error: `Explicit week '${params.week}' is malformed.` };
+    }
+  }
+
+  if (!targetEntryId && !targetType) {
+    return { ok: false, statusCode: 400, error: 'entryId/id or type is required to delete activity.' };
+  }
+
+  try {
+    const cleanUid = uid.trim();
+    const userRef = db.collection('users').doc(cleanUid);
+    const activityCol = userRef.collection('activity_journal');
+    const legacySubCol = userRef.collection('studentJournal');
+
+    const [canonicalSnap, legacySubSnap, userSnap] = await Promise.all([
+      withTimeout(activityCol.get(), 4500),
+      withTimeout(legacySubCol.get(), 4500).catch(() => null),
+      withTimeout(userRef.get(), 4500).catch(() => null),
+    ]);
+
+    if (canonicalSnap === null) {
+      return { ok: false, statusCode: 503, error: 'Timed out accessing Activity Journal in Firestore.' };
+    }
+
+    const uData = userSnap && userSnap.exists ? (userSnap.data() || {}) : null;
+
+    if (!targetEntryId && resolvedCycle === null) {
+      resolvedCycle = parsePositiveCycleFromFirestore(uData?.weeklyCycle);
+      if (resolvedCycle === null) {
+        return {
+          ok: false,
+          statusCode: 400,
+          error: 'Week identity cannot be determined for activity deletion without entryId.',
+        };
+      }
+    }
+
+    const sanitizedTargetDocId = targetEntryId ? sanitizeJournalDocId(targetEntryId) : '';
+    const matchesTarget = (d: any, docId?: string): boolean => {
+      if (!d && !docId) return false;
+      const eid = String(d?.id || docId || '').trim();
+      if (targetEntryId && (eid === targetEntryId || docId === targetEntryId || docId === sanitizedTargetDocId)) {
+        return true;
+      }
+      if (!targetType) return false;
+      const dType = String(d?.type || '').trim();
+      if (dType !== targetType) return false;
+      const dDay = String(d?.dayOfWeek || '').toLowerCase().trim();
+      if (targetDay && dDay !== targetDay) return false;
+      if (resolvedCycle !== null) {
+        const dCycle = parsePositiveCycleFromFirestore(d?.week);
+        if (dCycle !== resolvedCycle && !(resolvedCycle === 1 && dCycle === null)) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    const deletedIds: string[] = [];
+    const deletePromises: Promise<any>[] = [];
+
+    canonicalSnap.forEach((docSnap: any) => {
+      const d = docSnap.data();
+      if (matchesTarget(d, docSnap.id)) {
+        deletedIds.push(String(d?.id || docSnap.id));
+        deletePromises.push(docSnap.ref.delete());
+      }
+    });
+
+    if (legacySubSnap && !legacySubSnap.empty) {
+      legacySubSnap.forEach((docSnap: any) => {
+        const d = docSnap.data();
+        if (matchesTarget(d, docSnap.id)) {
+          deletePromises.push(docSnap.ref.delete().catch(() => {}));
+        }
+      });
+    }
+
+    await Promise.all(deletePromises);
+
+    // Strip deleted item(s) from legacy users/{uid}.studentJournal ONLY if the legacy array already exists and contains matches
+    if (uData && Array.isArray(uData.studentJournal) && uData.studentJournal.some((e: any) => matchesTarget(e))) {
+      const filteredLegacy = uData.studentJournal.filter((e: any) => !matchesTarget(e));
+      await userRef.set({ studentJournal: filteredLegacy, updatedAt: new Date().toISOString() }, { merge: true });
+    }
+
+    const refreshed = await fetchStudentActivityJournalFromServerFirestore(cleanUid);
+    return {
+      ok: true,
+      deletedIds,
+      entries: refreshed.ok ? refreshed.entries : [],
+    };
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+      return { ok: false, statusCode: 500, error: 'Firestore delete restricted by IAM credentials.' };
+    }
+    console.warn('[serverFirestore] deleteStudentActivityJournalEntryServer error:', err);
+    return { ok: false, statusCode: 500, error: err?.message || 'Failed to delete activity journal entry.' };
+  }
+}
+
+/**
+ * Legacy helper retained only for backwards export compatibility (no-op mirror avoided).
+ */
+export async function saveStudentJournalToFirestore(_docId: string, _journal: any[]): Promise<boolean> {
+  return true;
 }
 
 /**
@@ -6130,16 +6525,20 @@ export async function deleteStudentJournalEntryFromServerFirestore(
   try {
     const cleanUid = studentUid.trim();
     const userRef = db.collection('users').doc(cleanUid);
+    const sanitizedId = sanitizeJournalDocId(entryId);
 
-    // 1. Delete from subcollection
-    await userRef.collection('journal').doc(entryId).delete().catch(() => {});
+    // 1. Delete from canonical subcollection users/{studentUid}/journal/{entryId}
+    await userRef.collection('journal').doc(entryId).delete();
+    if (sanitizedId && sanitizedId !== entryId) {
+      await userRef.collection('journal').doc(sanitizedId).delete().catch(() => {});
+    }
 
-    // 2. Remove from dailyJournalEntries array in user doc
+    // 2. Clean legacy dailyJournalEntries array ONLY if it already exists and contains this entryId
     const userSnap = await userRef.get().catch(() => null);
     if (userSnap && userSnap.exists) {
       const data = userSnap.data();
-      if (Array.isArray(data?.dailyJournalEntries)) {
-        const filtered = data.dailyJournalEntries.filter((e: any) => e.id !== entryId);
+      if (Array.isArray(data?.dailyJournalEntries) && data.dailyJournalEntries.some((e: any) => e?.id === entryId)) {
+        const filtered = data.dailyJournalEntries.filter((e: any) => e?.id !== entryId);
         await userRef.set(
           { dailyJournalEntries: filtered, updatedAt: new Date().toISOString() },
           { merge: true }
@@ -9378,62 +9777,118 @@ export async function getStudentActivitiesBetweenLessonsServer(
     }
   }
 
+  const parseActivityTimeMs = (raw: any, fallbackDate?: any, isEndOfDayDateFallback: boolean = false): number => {
+    if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) return raw;
+    if (typeof raw === 'string' && raw.trim()) {
+      const t = new Date(raw.trim()).getTime();
+      if (!isNaN(t) && t > 0) return t;
+    }
+    if (typeof fallbackDate === 'string' && fallbackDate.trim()) {
+      const s = fallbackDate.trim();
+      const iso = /^\d{4}-\d{2}-\d{2}$/.test(s)
+        ? `${s}T${isEndOfDayDateFallback ? '23:59:59.999' : '12:00:00.000'}Z`
+        : s;
+      const t = new Date(iso).getTime();
+      if (!isNaN(t) && t > 0) return t;
+    }
+    return 0;
+  };
+
   const cutoffIso = prevLesson?.startDateTime || (prevLesson?.date ? `${prevLesson.date}T00:00:00.000Z` : null);
   const cutoffTime = cutoffIso ? new Date(cutoffIso).getTime() : 0;
+  const hasExactCurrentStart = Boolean(currentLesson?.startDateTime);
   const currentIso = currentLesson?.startDateTime || (currentLesson?.date ? `${currentLesson.date}T23:59:59.999Z` : new Date().toISOString());
   const currentTime = new Date(currentIso).getTime();
+  const upperWindowTime = hasExactCurrentStart ? currentTime + 3 * 3600000 : currentTime + 86400000;
 
-  // 3. Query Studied Videos and Vocabulary
-  const rawVideos: Array<{ id?: string; title: string; dayOfWeek?: string; date?: string; timestamp?: number }> = [];
+  // 3. Query Studied Videos and Vocabulary from canonical Firestore (default)
+  const rawVideos: Array<{ id?: string; title: string; dayOfWeek?: string; date?: string; timestamp: number; sourceRank: number }> = [];
   const rawWords: any[] = [];
 
-  const targetDocIds = Array.from(new Set([effectiveUid, cleanUid].filter(Boolean)));
-  for (const docId of targetDocIds) {
-    if (db) {
-      try {
-        const journalSnap = await db.collection('users').doc(docId).collection('journal').get();
-        journalSnap.forEach((docSnap) => {
-          const d = docSnap.data();
-          if (d && (d.type === 'video' || d.activityType === 'video') && (d.title || d.videoTitle)) {
-            rawVideos.push({
-              id: d.id || d.videoId,
-              title: d.title || d.videoTitle,
-              dayOfWeek: d.dayOfWeek,
-              date: d.date,
-              timestamp: d.timestamp || (d.date ? new Date(d.date).getTime() : 0),
-            });
-          }
-        });
-      } catch {}
-
-      try {
-        const whSnap = await db.collection('users').doc(docId).collection('weeklyHistory').get();
-        whSnap.forEach((docSnap) => {
-          const wh = docSnap.data();
-          if (Array.isArray(wh?.consumedVideoIds)) {
-            wh.consumedVideoIds.forEach((v: any) => {
-              if (v && (v.title || v.videoTitle)) {
-                rawVideos.push({
-                  id: v.id || v.videoId,
-                  title: v.title || v.videoTitle,
-                  dayOfWeek: v.dayOfWeek,
-                  date: v.date,
-                  timestamp: v.timestamp || (v.watchedAt ? new Date(v.watchedAt).getTime() : 0),
-                });
-              }
-            });
-          }
-        });
-      } catch {}
-    }
+  const targetDocIds = Array.from(
+    new Set([canonicalUid, ...(isValidCanonicalUid(cleanUid) ? [cleanUid] : [])].filter(Boolean))
+  );
+  if (targetDocIds.length === 0 && cleanUid && !cleanUid.includes('@')) {
+    targetDocIds.push(cleanUid);
   }
 
   let userDocData: any = null;
   for (const docId of targetDocIds) {
     if (db) {
       try {
-        const uSnap = await db.collection('users').doc(docId).get();
-        if (uSnap.exists) {
+        const userRef = db.collection('users').doc(docId);
+        const [activitySnap, legacySubSnap, whSnap, vocabSnap, uSnap] = await Promise.all([
+          withTimeout(userRef.collection('activity_journal').get(), 4500).catch(() => null),
+          withTimeout(userRef.collection('studentJournal').get(), 4500).catch(() => null),
+          withTimeout(userRef.collection('weeklyHistory').get(), 4500).catch(() => null),
+          withTimeout(userRef.collection('vocabulary').get(), 4500).catch(() => null),
+          withTimeout(userRef.get(), 4500).catch(() => null),
+        ]);
+
+        if (activitySnap && !activitySnap.empty) {
+          activitySnap.forEach((docSnap: any) => {
+            const d = docSnap.data();
+            if (d && (d.type === 'video' || d.activityType === 'video') && (d.title || d.videoTitle)) {
+              rawVideos.push({
+                id: d.id || d.videoId || docSnap.id,
+                title: d.title || d.videoTitle,
+                dayOfWeek: d.dayOfWeek,
+                date: d.date,
+                timestamp: parseActivityTimeMs(d.timestamp ?? d.completedAt ?? d.createdAt ?? d.updatedAt, d.date),
+                sourceRank: 1,
+              });
+            }
+          });
+        }
+
+        if (legacySubSnap && !legacySubSnap.empty) {
+          legacySubSnap.forEach((docSnap: any) => {
+            const d = docSnap.data();
+            if (d && (d.type === 'video' || d.activityType === 'video') && (d.title || d.videoTitle)) {
+              rawVideos.push({
+                id: d.id || d.videoId || docSnap.id,
+                title: d.title || d.videoTitle,
+                dayOfWeek: d.dayOfWeek,
+                date: d.date,
+                timestamp: parseActivityTimeMs(d.timestamp ?? d.completedAt ?? d.createdAt, d.date),
+                sourceRank: 2,
+              });
+            }
+          });
+        }
+
+        if (whSnap && !whSnap.empty) {
+          whSnap.forEach((docSnap: any) => {
+            const wh = docSnap.data();
+            if (Array.isArray(wh?.consumedVideoIds)) {
+              wh.consumedVideoIds.forEach((v: any) => {
+                if (v && (v.title || v.videoTitle)) {
+                  rawVideos.push({
+                    id: v.id || v.videoId,
+                    title: v.title || v.videoTitle,
+                    dayOfWeek: v.dayOfWeek,
+                    date: v.date,
+                    timestamp: parseActivityTimeMs(v.timestamp ?? v.watchedAt, v.date),
+                    sourceRank: 3,
+                  });
+                }
+              });
+            }
+            if (Array.isArray(wh?.weeklyVocabulary)) {
+              wh.weeklyVocabulary.forEach((w: any) => {
+                if (w && w.word && !rawWords.some((rw) => (rw.word || '').toLowerCase() === (w.word || '').toLowerCase())) {
+                  rawWords.push(w);
+                }
+              });
+            }
+          });
+        }
+
+        if (vocabSnap && !vocabSnap.empty) {
+          vocabSnap.forEach((docSnap: any) => rawWords.push(docSnap.data()));
+        }
+
+        if (uSnap && uSnap.exists) {
           userDocData = uSnap.data();
           if (Array.isArray(userDocData?.studentJournal)) {
             userDocData.studentJournal.forEach((d: any) => {
@@ -9443,76 +9898,51 @@ export async function getStudentActivitiesBetweenLessonsServer(
                   title: d.title || d.videoTitle,
                   dayOfWeek: d.dayOfWeek,
                   date: d.date,
-                  timestamp: d.timestamp || (d.date ? new Date(d.date).getTime() : 0),
+                  timestamp: parseActivityTimeMs(d.timestamp ?? d.completedAt ?? d.createdAt, d.date),
+                  sourceRank: 4,
                 });
               }
             });
           }
-          break;
+          if (Array.isArray(userDocData?.vocabulary)) {
+            userDocData.vocabulary.forEach((item: any) => {
+              if (item?.word && !rawWords.some((w) => (w.word || '').toLowerCase().trim() === (item.word || '').toLowerCase().trim())) {
+                rawWords.push(item);
+              }
+            });
+          }
         }
       } catch {}
     }
   }
 
-  // Also inspect in-memory/server profile for studentJournal, watchedVideosHistory, and vocabulary
-  if (cleanEmail) {
-    try {
-      const dbLocal = getAuthoritativeDb();
-      const prof = dbLocal?.userProfiles?.[cleanEmail];
-      if (prof) {
-        if (Array.isArray(prof.studentJournal)) {
-          prof.studentJournal.forEach((d: any) => {
-            if (d && (d.type === 'video' || d.activityType === 'video') && (d.title || d.videoTitle)) {
-              rawVideos.push({
-                id: d.id || d.videoId,
-                title: d.title || d.videoTitle,
-                dayOfWeek: d.dayOfWeek,
-                date: d.date,
-                timestamp: d.timestamp || (d.date ? new Date(d.date).getTime() : 0),
-              });
-            }
-          });
-        }
-        if (Array.isArray(prof.watchedVideosHistory)) {
-          prof.watchedVideosHistory.forEach((item: any) => {
-            const vTitle = typeof item === 'string' ? item : item?.title || item?.videoTitle;
-            if (vTitle) {
-              rawVideos.push({
-                id: item?.id || item?.videoId || 'video',
-                title: vTitle,
-                date: item?.date || item?.watchedAt,
-                timestamp: item?.timestamp || (item?.watchedAt ? new Date(item.watchedAt).getTime() : 0),
-              });
-            }
-          });
-        }
-        if (Array.isArray(prof.vocabulary)) {
-          prof.vocabulary.forEach((item: any) => {
-            if (item?.word && !rawWords.some((w) => (w.word || '').toLowerCase().trim() === item.word.toLowerCase().trim())) {
-              rawWords.push(item);
-            }
-          });
-        }
-      }
-    } catch {}
-  }
+  // Prioritize canonical activity_journal entries and newest timestamps first
+  rawVideos.sort((a, b) => {
+    if (a.sourceRank !== b.sourceRank) return a.sourceRank - b.sourceRank;
+    return (b.timestamp || 0) - (a.timestamp || 0);
+  });
 
   // Filter videos between cutoffTime and currentTime
   const filteredVideos: Array<{ id?: string; title: string; dayOfWeek?: string; date?: string }> = [];
-  const seenVideoTitles = new Set<string>();
+  const seenVideoKeys = new Set<string>();
 
   for (const v of rawVideos) {
     if (!v.title) continue;
-    const norm = v.title.toLowerCase().trim();
-    if (seenVideoTitles.has(norm)) continue;
+    const normTitle = v.title.toLowerCase().trim();
+    const normId = (v.id ? String(v.id).toLowerCase().trim() : '') || normTitle;
+    if (seenVideoKeys.has(normTitle) || (v.id && seenVideoKeys.has(normId))) continue;
 
-    if (cutoffTime > 0) {
-      const itemTime = v.timestamp || (v.date ? new Date(v.date).getTime() : 0);
-      if (itemTime > 0 && (itemTime < cutoffTime || itemTime > currentTime + 86400000)) {
+    const itemTime = v.timestamp || parseActivityTimeMs(undefined, v.date, true);
+    if (cutoffTime > 0 && itemTime > 0) {
+      if (itemTime < cutoffTime || itemTime > upperWindowTime) {
         continue;
       }
+    } else if (currentTime > 0 && itemTime > upperWindowTime) {
+      continue;
     }
-    seenVideoTitles.add(norm);
+
+    seenVideoKeys.add(normTitle);
+    if (v.id) seenVideoKeys.add(normId);
     filteredVideos.push({
       id: v.id,
       title: v.title,
@@ -9520,38 +9950,6 @@ export async function getStudentActivitiesBetweenLessonsServer(
       date: v.date,
     });
     if (filteredVideos.length >= 5) break;
-  }
-
-  // 4. Query 5 Words activity vocabulary
-  for (const docId of targetDocIds) {
-    if (db) {
-      try {
-        const vocabSnap = await db.collection('users').doc(docId).collection('vocabulary').get();
-        vocabSnap.forEach((docSnap) => rawWords.push(docSnap.data()));
-      } catch {}
-
-      try {
-        const whSnap = await db.collection('users').doc(docId).collection('weeklyHistory').get();
-        whSnap.forEach((docSnap) => {
-          const wh = docSnap.data();
-          if (Array.isArray(wh?.weeklyVocabulary)) {
-            wh.weeklyVocabulary.forEach((w: any) => {
-              if (w && w.word && !rawWords.some((rw) => (rw.word || '').toLowerCase() === (w.word || '').toLowerCase())) {
-                rawWords.push(w);
-              }
-            });
-          }
-        });
-      } catch {}
-    }
-  }
-
-  if (Array.isArray(userDocData?.vocabulary)) {
-    userDocData.vocabulary.forEach((item: any) => {
-      if (!rawWords.some((w) => (w.word || '').toLowerCase().trim() === (item.word || '').toLowerCase().trim())) {
-        rawWords.push(item);
-      }
-    });
   }
 
   // Filter 5 Words: routine words studied between cutoffTime and currentTime
@@ -9571,11 +9969,13 @@ export async function getStudentActivitiesBetweenLessonsServer(
 
     if (!isRoutine) continue;
 
-    if (cutoffTime > 0) {
-      const learnedTime = new Date(w.learnedAt || w.date || w.createdAt || w.updatedAt || 0).getTime();
-      if (learnedTime > 0 && (learnedTime < cutoffTime || learnedTime > currentTime + 86400000)) {
+    const learnedTime = parseActivityTimeMs(w.learnedAt ?? w.createdAt ?? w.updatedAt, w.date, true);
+    if (cutoffTime > 0 && learnedTime > 0) {
+      if (learnedTime < cutoffTime || learnedTime > upperWindowTime) {
         continue;
       }
+    } else if (currentTime > 0 && learnedTime > upperWindowTime) {
+      continue;
     }
 
     seenWords.add(cleanW);
@@ -9993,10 +10393,11 @@ export async function fetchAccumulatedConsumedHistoryServer(studentUid: string):
   let allVocabulary: any[] = [];
 
   try {
-    const [histories, userSnap, assignSnap] = await Promise.all([
+    const [histories, userSnap, assignSnap, activityJournalSnap] = await Promise.all([
       fetchAllWeeklyHistoriesServer(studentUid),
       withTimeout(db.collection('users').doc(studentUid).get(), 4500).catch(() => null),
       withTimeout(db.collection('student_assignments').doc(studentUid).get(), 4500).catch(() => null),
+      withTimeout(db.collection('users').doc(studentUid).collection('activity_journal').get(), 4500).catch(() => null),
     ]);
 
     for (const hist of histories) {
@@ -10022,11 +10423,28 @@ export async function fetchAccumulatedConsumedHistoryServer(studentUid: string):
     const uData = userSnap && userSnap.exists ? (userSnap.data() || {}) : {};
     const aData = assignSnap && assignSnap.exists ? (assignSnap.data() || {}) : {};
 
+    const journalMap = new Map<string, any>();
+    if (activityJournalSnap && !activityJournalSnap.empty) {
+      activityJournalSnap.forEach((docSnap: any) => {
+        const d = docSnap.data();
+        if (d) {
+          const eid = String(d.id || docSnap.id || '').trim();
+          if (eid) journalMap.set(eid, { ...d, id: eid });
+        }
+      });
+    }
     if (Array.isArray(uData.studentJournal)) {
       for (const entry of uData.studentJournal) {
-        if (!entry || !entry.id) continue;
-        if (entry.type === 'video') {
-          const vid = (extractYouTubeIdInternal(entry.id || entry.url || '') || String(entry.id)).trim();
+        if (entry && entry.id && !journalMap.has(String(entry.id).trim())) {
+          journalMap.set(String(entry.id).trim(), entry);
+        }
+      }
+    }
+
+    for (const entry of journalMap.values()) {
+      if (!entry || !entry.id) continue;
+      if (entry.type === 'video') {
+        const vid = (extractYouTubeIdInternal(entry.id || entry.url || '') || String(entry.id)).trim();
           if (vid) {
             videoSet.add(vid);
             allVideos = mergeConsumedVideos(allVideos, [
@@ -10058,7 +10476,6 @@ export async function fetchAccumulatedConsumedHistoryServer(studentUid: string):
           }
         }
       }
-    }
 
     const watchedSources = [
       ...(Array.isArray(uData.watchedVideosHistory) ? uData.watchedVideosHistory : []),
@@ -10151,13 +10568,14 @@ export async function closeWeeklyHistorySnapshotServer(params: {
   const userRef = db.collection('users').doc(uid);
 
   try {
-    const [userSnap, routinesSnap, assignSnap, checksCtx, hwSnap, historySnap] = await Promise.all([
+    const [userSnap, routinesSnap, assignSnap, checksCtx, hwSnap, historySnap, activityJournalSnap] = await Promise.all([
       withTimeout(userRef.get(), 4500),
       withTimeout(userRef.collection('routines').get(), 4500),
       withTimeout(db.collection('student_assignments').doc(uid).get(), 4500),
       fetchCanonicalWeeklyChecksServer(uid, weekId, closingCycle),
       withTimeout(userRef.collection('homework').doc(weekId).get(), 4500),
       withTimeout(userRef.collection('weeklyHistory').doc(weekId).get(), 4500),
+      withTimeout(userRef.collection('activity_journal').get(), 4500).catch(() => null),
     ]);
 
     const uData = userSnap && userSnap.exists ? (userSnap.data() || {}) : {};
@@ -10225,8 +10643,25 @@ export async function closeWeeklyHistorySnapshotServer(params: {
     const activitiesSnapshot: Record<string, any> = {};
     const wordsToSaveToDictionary: any[] = [];
 
-    // 1. Journal entries explicitly belonging to closingCycle
-    const journal = Array.isArray(uData.studentJournal) ? uData.studentJournal : [];
+    // 1. Journal entries explicitly belonging to closingCycle (canonical activity_journal + legacy fallback)
+    const closingJournalMap = new Map<string, any>();
+    if (activityJournalSnap && !activityJournalSnap.empty) {
+      activityJournalSnap.forEach((docSnap: any) => {
+        const d = docSnap.data();
+        if (d) {
+          const eid = String(d.id || docSnap.id || '').trim();
+          if (eid) closingJournalMap.set(eid, { ...d, id: eid });
+        }
+      });
+    }
+    if (Array.isArray(uData.studentJournal)) {
+      for (const entry of uData.studentJournal) {
+        if (entry && entry.id && !closingJournalMap.has(String(entry.id).trim())) {
+          closingJournalMap.set(String(entry.id).trim(), entry);
+        }
+      }
+    }
+    const journal = Array.from(closingJournalMap.values());
     for (const entry of journal) {
       if (!entry || !entry.id) continue;
       const entryWeek = parsePositiveCycleFromFirestore(entry.week);

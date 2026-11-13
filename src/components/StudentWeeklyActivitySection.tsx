@@ -162,50 +162,47 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
     );
   }, [todayDay, activeStudyDays, activeWeekCycle]);
 
-  // Real-time studentJournal state for multi-device sync
-  const [localJournal, setLocalJournal] = useState<StudentJournalEntry[]>(userProfile?.studentJournal || []);
+  // Real-time studentJournal state synced strictly from canonical server API
+  const [localJournal, setLocalJournal] = useState<StudentJournalEntry[]>(() =>
+    Array.isArray(propStudentJournal) && propStudentJournal.length > 0
+      ? propStudentJournal
+      : (Array.isArray(userProfile?.studentJournal) ? userProfile.studentJournal : [])
+  );
+  const [hasServerJournalSync, setHasServerJournalSync] = useState<boolean>(false);
 
   useEffect(() => {
-    if (propStudentJournal && Array.isArray(propStudentJournal)) {
-      setLocalJournal(propStudentJournal);
-    } else if (userProfile?.studentJournal && Array.isArray(userProfile.studentJournal)) {
-      setLocalJournal(userProfile.studentJournal);
+    if (Array.isArray(propStudentJournal)) {
+      if (propStudentJournal.length > 0 || hasServerJournalSync) {
+        setLocalJournal(propStudentJournal);
+      }
     }
-  }, [propStudentJournal, userProfile?.studentJournal]);
+  }, [propStudentJournal, hasServerJournalSync]);
 
-  // Real-time listener for cross-device synchronization (e.g. mobile to desktop)
+  // Real-time authenticated subscription via /api/student-journal/activity + CustomEvent
   useEffect(() => {
     if (!studentUid && !studentEmail) return;
     const unsub = subscribeToStudentJournal(studentUid, studentEmail, (journal) => {
       if (Array.isArray(journal)) {
+        setHasServerJournalSync(true);
         setLocalJournal(journal);
       }
     });
     return () => unsub();
   }, [studentUid, studentEmail]);
 
-  // Single Source of Truth: Merge prop, real-time listener, and profile journal by entry id
+  // Authoritative Activity Journal list (never resurrects deleted entries from stale userProfile.studentJournal)
   const activeJournal = useMemo(() => {
+    const source = hasServerJournalSync
+      ? localJournal
+      : (Array.isArray(propStudentJournal) && propStudentJournal.length > 0 ? propStudentJournal : localJournal);
     const map = new Map<string, StudentJournalEntry>();
-    if (Array.isArray(propStudentJournal)) {
-      propStudentJournal.forEach((e) => {
-        if (e && e.id) map.set(e.id, e);
-      });
-    }
-    if (Array.isArray(localJournal)) {
-      localJournal.forEach((e) => {
-        if (e && e.id) map.set(e.id, e);
-      });
-    }
-    if (Array.isArray(userProfile?.studentJournal)) {
-      userProfile.studentJournal.forEach((e) => {
-        if (e && e.id && !map.has(e.id)) map.set(e.id, e);
-      });
-    }
+    (source || []).forEach((e) => {
+      if (e && e.id) map.set(e.id, e);
+    });
     const list = Array.from(map.values());
     list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
     return list;
-  }, [propStudentJournal, localJournal, userProfile?.studentJournal]);
+  }, [hasServerJournalSync, propStudentJournal, localJournal]);
 
   // Local state for dictionary entries loaded directly from server database if not passed by parent
   const [loadedDictEntries, setLoadedDictEntries] = useState<StudentDictionaryEntry[]>([]);
@@ -678,7 +675,7 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
       );
     }
 
-    // Persist directly to studentJournal in Firestore users/{studentUID} strictly with activeWeekCycle
+    // Persist directly to canonical Activity Journal strictly with activeWeekCycle
     if (newChecked) {
       recordActivityInStudentJournal(
         studentUid,
@@ -693,7 +690,8 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
         },
         studentEmail
       ).then((res) => {
-        if (res.updatedJournal) {
+        if (res.success && Array.isArray(res.updatedJournal)) {
+          setHasServerJournalSync(true);
           setLocalJournal(res.updatedJournal);
         }
       });
@@ -705,7 +703,8 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
         activeWeekCycle,
         studentEmail
       ).then((res) => {
-        if (res.updatedJournal) {
+        if (res.success && Array.isArray(res.updatedJournal)) {
+          setHasServerJournalSync(true);
           setLocalJournal(res.updatedJournal);
         }
       });

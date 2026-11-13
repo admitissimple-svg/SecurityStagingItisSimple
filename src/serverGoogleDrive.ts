@@ -13,6 +13,7 @@ export const ACTIVE_GOOGLE_CLOUD_PROJECT_ID = 'itissimple-security-staging';
 export interface PlatformDriveSyncParams {
   studentName?: string;
   studentEmail?: string;
+  studentUid?: string;
   sessionDate?: string;
   content: string;
   topic?: string;
@@ -21,6 +22,7 @@ export interface PlatformDriveSyncParams {
   sessionKey?: string;
   teacherEmail?: string;
   teacherName?: string;
+  teacherUid?: string;
 }
 
 export interface PlatformDriveSyncResult {
@@ -43,7 +45,9 @@ export interface StoredDriveFile {
   folderName: string;
   studentName?: string;
   studentEmail?: string;
+  studentUid?: string;
   teacherEmail?: string;
+  teacherUid?: string;
   sessionDate?: string;
   topic?: string;
   content: string;
@@ -112,10 +116,12 @@ export async function syncSessionNotesWithPlatformDrive(
   const fileName = formatSessionNotesFileName(studentName, sessionDate);
   const teacherEmail = (params.teacherEmail || '').toLowerCase().trim();
   const studentEmail = (params.studentEmail || '').toLowerCase().trim();
+  const studentUid = (params.studentUid || '').trim();
+  const teacherUid = (params.teacherUid || '').trim();
   const sessionKey =
     params.sessionKey ||
     params.lessonId ||
-    `session_${sessionDate}_${studentEmail ? studentEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : 'notes'}`;
+    `session_${sessionDate}_${studentUid ? studentUid.replace(/[^a-zA-Z0-9_-]/g, '_') : (studentEmail ? studentEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : 'notes')}`;
 
   // 1. Attempt to execute via Google Drive v3 REST API using platform credentials
   let directApiSuccess = false;
@@ -240,9 +246,11 @@ export async function syncSessionNotesWithPlatformDrive(
 
   if (!finalFileId) {
     // Check if we already have this file in our platform store
-    const existingEntry = Object.values(inMemoryDriveStore).find(
-      (doc) => doc.fileName === fileName && doc.studentEmail === studentEmail
-    );
+    const existingEntry = Object.values(inMemoryDriveStore).find((doc) => {
+      if (doc.fileName !== fileName) return false;
+      if (studentUid && doc.studentUid) return doc.studentUid === studentUid;
+      return Boolean(studentEmail && doc.studentEmail === studentEmail);
+    });
     if (existingEntry) {
       finalFileId = existingEntry.fileId;
       isUpdated = true;
@@ -265,6 +273,7 @@ export async function syncSessionNotesWithPlatformDrive(
       : `/api/drive/files/${finalFileId}`);
 
   // Store in platform drive store
+  const existingRecord = inMemoryDriveStore[finalFileId];
   const storedRecord: StoredDriveFile = {
     fileId: finalFileId,
     fileName,
@@ -272,12 +281,14 @@ export async function syncSessionNotesWithPlatformDrive(
     folderName: GOOGLE_DRIVE_SESSION_FOLDER,
     studentName,
     studentEmail,
+    ...(studentUid || existingRecord?.studentUid ? { studentUid: studentUid || existingRecord?.studentUid } : {}),
     teacherEmail,
+    ...(teacherUid || existingRecord?.teacherUid ? { teacherUid: teacherUid || existingRecord?.teacherUid } : {}),
     sessionDate,
     topic: params.topic || 'Native Friend Live Coaching',
     content: params.content,
     webViewLink: finalWebViewLink,
-    createdAt: inMemoryDriveStore[finalFileId]?.createdAt || nowIso,
+    createdAt: existingRecord?.createdAt || nowIso,
     updatedAt: nowIso,
   };
 
@@ -310,10 +321,14 @@ export function getStoredDriveFile(fileId: string): StoredDriveFile | null {
 export function listStoredDriveFiles(filter?: {
   studentEmail?: string;
   teacherEmail?: string;
+  studentUid?: string;
+  teacherUid?: string;
 }): StoredDriveFile[] {
   const all = Object.values(inMemoryDriveStore);
   if (!filter) return all;
   return all.filter((f) => {
+    if (filter.studentUid && f.studentUid !== filter.studentUid) return false;
+    if (filter.teacherUid && f.teacherUid !== filter.teacherUid) return false;
     if (filter.studentEmail && f.studentEmail !== filter.studentEmail) return false;
     if (filter.teacherEmail && f.teacherEmail !== filter.teacherEmail) return false;
     return true;

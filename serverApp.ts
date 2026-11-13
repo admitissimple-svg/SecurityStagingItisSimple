@@ -101,7 +101,6 @@ import {
   deleteTutorFromFirestore,
   deleteUserByEmailFromFirestore,
   saveSessionNotesProgressToFirestore,
-  saveStudentJournalToFirestore,
   deleteStudentJournalEntryFromServerFirestore,
   fetchUserDocumentFromFirestore,
   fetchTutorDocumentFromFirestore,
@@ -136,6 +135,10 @@ import {
   recordLessonReviewInStudentJournalServer,
   reconstructTransformationFromJournalAndDictionaryServer,
   fetchStudentDailyJournalFromServerFirestore,
+  saveStudentDailyJournalEntryServer,
+  fetchStudentActivityJournalFromServerFirestore,
+  upsertStudentActivityJournalEntryServer,
+  deleteStudentActivityJournalEntryServer,
   removeUndefinedFields,
   fetchLessonInsightsFromFirestoreServer,
   saveLessonInsightsToFirestoreServer,
@@ -2784,7 +2787,9 @@ app.post('/api/auth/google', async (req, res) => {
       streakCount: baseExisting?.streakCount ?? 0,
       points: baseExisting?.points ?? 0,
       completedLessonsCount: baseExisting?.completedLessonsCount ?? 0,
-      studentJournal: Array.isArray(baseExisting?.studentJournal) ? baseExisting.studentJournal : [],
+      ...(Array.isArray(baseExisting?.studentJournal) && baseExisting.studentJournal.length > 0
+        ? { studentJournal: baseExisting.studentJournal }
+        : {}),
       createdAt: baseExisting?.createdAt || nowIso,
       updatedAt: nowIso,
     };
@@ -5619,11 +5624,13 @@ app.get('/api/user-profile', async (req, res) => {
     if (studyTarget !== undefined) {
       profile.weeklyStudyDaysTarget = studyTarget;
     }
-    const journalEntries =
-      (email && db.studentActivityJournal?.[email]) ||
-      (uid && db.studentActivityJournal?.[uid]) ||
-      profile.studentJournal ||
-      [];
+    let journalEntries = Array.isArray(profile.studentJournal) ? profile.studentJournal : [];
+    if (uid && isValidCanonicalUid(uid)) {
+      const canonicalActivityRes = await fetchStudentActivityJournalFromServerFirestore(uid).catch(() => null);
+      if (canonicalActivityRes && canonicalActivityRes.ok) {
+        journalEntries = canonicalActivityRes.entries;
+      }
+    }
     profile.studentJournal = journalEntries;
     if (!profile.role) {
       profile.role = 'student';
@@ -5798,7 +5805,7 @@ app.post('/api/user-profile', async (req, res) => {
     nativeFriendUID: resolvedTeacherUid && isValidCanonicalUid(resolvedTeacherUid) ? resolvedTeacherUid : null,
     teacherMeetUrl: rawProfile.teacherMeetUrl ?? existing.teacherMeetUrl ?? null,
     enrollmentStatus: rawProfile.enrollmentStatus || existing.enrollmentStatus || (updatedTeacherEmail ? 'active' : 'not_enrolled'),
-    studentJournal: rawProfile.studentJournal || existing.studentJournal || db.studentActivityJournal?.[targetEmail] || [],
+    ...(Array.isArray(existing.studentJournal) && existing.studentJournal.length > 0 ? { studentJournal: existing.studentJournal } : {}),
     weeklyStudyDaysTarget: resolvedStudyDaysTarget,
     weeklyStudyDays: resolvedStudyDays,
     routineVideoTime: rawProfile.routineVideoTime || existing.routineVideoTime || '09:00',
@@ -5820,7 +5827,7 @@ app.post('/api/user-profile', async (req, res) => {
   }
 
   // 3. PERSISTENCE IN FIRESTORE VIA FIREBASE ADMIN SDK
-  // Canonical record strictly in users/{targetUid}
+  // Canonical record strictly in users/{targetUid} (without creating root journal array mirrors)
   const firestoreDb = getFirestoreDb();
   let persistedToFirestore = false;
   let canonicalContractedFromFs: number | undefined = undefined;
@@ -5840,7 +5847,10 @@ app.post('/api/user-profile', async (req, res) => {
         }
       }
 
-      await firestoreDb.collection('users').doc(targetUid).set(updatedProfileObj, { merge: true });
+      const firestoreProfilePayload = { ...updatedProfileObj };
+      delete firestoreProfilePayload.studentJournal;
+      delete firestoreProfilePayload.dailyJournalEntries;
+      await firestoreDb.collection('users').doc(targetUid).set(firestoreProfilePayload, { merge: true });
       persistedToFirestore = true;
 
       if (firestoreDb && targetUid && updatedProfileObj.teacherUid) {
@@ -6609,10 +6619,7 @@ function distributeWeeklyYouTubeForStudent(
       if (vid) consumedVideoIds.add(vid);
     });
 
-    const journalEntries = [
-      ...((db.studentActivityJournal?.[k]) || []),
-      ...((db.userProfiles?.[k]?.studentJournal) || []),
-    ];
+    const journalEntries = [...((db.userProfiles?.[k]?.studentJournal) || [])];
     journalEntries.forEach((entry: any) => {
       if (entry && entry.type === 'video' && entry.id) {
         const vid = extractServerYouTubeId(entry.id);
@@ -9902,6 +9909,23 @@ async function resolveApprovedTeacherForSessionNotes(
   }).catch(() => null);
 
   if (canonicalRes && canonicalRes.role === 'teacher' && canonicalRes.identityStatus === 'authorized') {
+    const rawObj = canonicalRes.rawDoc || {};
+    const tutorRec = rawObj.tutor || rawObj;
+    const userRec = rawObj.user || rawObj;
+    const isExplicitlyUnapproved =
+      tutorRec?.approvalStatus === 'pending' ||
+      tutorRec?.approvalStatus === 'rejected' ||
+      tutorRec?.status === 'pending' ||
+      tutorRec?.status === 'rejected' ||
+      tutorRec?.isApproved === false ||
+      userRec?.approvalStatus === 'pending' ||
+      userRec?.approvalStatus === 'rejected' ||
+      userRec?.status === 'pending' ||
+      userRec?.status === 'rejected' ||
+      userRec?.isApproved === false;
+    if (isExplicitlyUnapproved) {
+      return { isApproved: false, callerKind: 'pending_teacher', resolution: null };
+    }
     return {
       isApproved: true,
       callerKind: 'teacher',
@@ -10734,11 +10758,355 @@ app.get('/api/session-notes/:id/versions', firebaseAuthMiddleware, async (req, r
   });
 });
 
+// Shared canonical student UID lookup for Native Friends Notes, Drive Sync, Progress, and Reminder routes
+async function resolveCanonicalStudentUidForSessionNotes(params: {
+  studentUid?: string;
+  studentEmail?: string;
+  db: any;
+  excludeUid?: string;
+}): Promise<{ valid: boolean; uid: string; email: string; code?: string; message?: string }> {
+  const cleanUid = (params.studentUid || '').trim();
+  const cleanEmail = (params.studentEmail || '').toLowerCase().trim();
+  const excludeUid = (params.excludeUid || '').trim();
+
+  if (cleanUid) {
+    if (!isValidCanonicalUid(cleanUid)) {
+      return {
+        valid: false,
+        uid: '',
+        email: cleanEmail,
+        code: 'CANONICAL_STUDENT_UID_REQUIRED',
+        message: 'A valid canonical student UID is required.',
+      };
+    }
+    if (excludeUid && cleanUid === excludeUid) {
+      return {
+        valid: false,
+        uid: '',
+        email: cleanEmail,
+        code: 'INVALID_PEDAGOGICAL_IDENTITY',
+        message: 'Teacher UID cannot be substituted as student UID.',
+      };
+    }
+    let resolvedEmail = cleanEmail;
+    if (!resolvedEmail) {
+      const fs = getFirestoreDb();
+      if (fs) {
+        try {
+          const uSnap = await fs.collection('users').doc(cleanUid).get().catch(() => null);
+          if (uSnap && uSnap.exists) {
+            resolvedEmail = String(uSnap.data()?.email || '').toLowerCase().trim();
+          }
+        } catch {}
+      }
+      if (!resolvedEmail && params.db) {
+        const localStudent = (params.db.students || []).find(
+          (s: any) => s.uid === cleanUid || s.id === cleanUid || s.studentUid === cleanUid
+        );
+        if (localStudent?.email) {
+          resolvedEmail = String(localStudent.email).toLowerCase().trim();
+        }
+      }
+    }
+    return { valid: true, uid: cleanUid, email: resolvedEmail };
+  }
+
+  if (!cleanEmail) {
+    return {
+      valid: false,
+      uid: '',
+      email: '',
+      code: 'MISSING_STUDENT_IDENTIFIER',
+      message: 'Canonical student identifier is required.',
+    };
+  }
+
+  const fs = getFirestoreDb();
+  if (fs) {
+    try {
+      const uSnap = await fs.collection('users').where('email', '==', cleanEmail).limit(5).get();
+      if (uSnap && !uSnap.empty) {
+        for (const docSnap of uSnap.docs) {
+          const candidate = isValidCanonicalUid(docSnap.id)
+            ? docSnap.id
+            : String(docSnap.data()?.uid || '').trim();
+          if (candidate && isValidCanonicalUid(candidate) && (!excludeUid || candidate !== excludeUid)) {
+            return { valid: true, uid: candidate, email: cleanEmail };
+          }
+        }
+      }
+    } catch {}
+  }
+
+  try {
+    const adminAuth = getFirebaseAdminAuth();
+    if (adminAuth && typeof adminAuth.getUserByEmail === 'function') {
+      const userRec = await adminAuth.getUserByEmail(cleanEmail).catch(() => null);
+      if (
+        userRec?.uid &&
+        isValidCanonicalUid(userRec.uid) &&
+        (!excludeUid || userRec.uid !== excludeUid)
+      ) {
+        return {
+          valid: true,
+          uid: userRec.uid,
+          email: (userRec.email || cleanEmail).toLowerCase().trim(),
+        };
+      }
+    }
+  } catch {}
+
+  if (params.db) {
+    const profile = params.db.userProfiles?.[cleanEmail];
+    const student = (params.db.students || []).find(
+      (s: any) => (s.email || s.studentEmail || '').toLowerCase().trim() === cleanEmail
+    );
+    const authUser = Object.values(params.db.authUsers || {}).find(
+      (u: any) => (u.email || '').toLowerCase().trim() === cleanEmail
+    ) as any;
+    const candidates = [profile?.uid, student?.uid, student?.studentUid, authUser?.uid];
+    for (const cand of candidates) {
+      if (
+        typeof cand === 'string' &&
+        isValidCanonicalUid(cand.trim()) &&
+        (!excludeUid || cand.trim() !== excludeUid)
+      ) {
+        return { valid: true, uid: cand.trim(), email: cleanEmail };
+      }
+    }
+  }
+
+  if (fs) {
+    try {
+      const lSnap = await fs.collection('lessons').where('studentEmail', '==', cleanEmail).limit(10).get();
+      if (lSnap && !lSnap.empty) {
+        for (const lDoc of lSnap.docs) {
+          const cand = String(lDoc.data()?.studentUid || '').trim();
+          if (cand && isValidCanonicalUid(cand) && (!excludeUid || cand !== excludeUid)) {
+            return { valid: true, uid: cand, email: cleanEmail };
+          }
+        }
+      }
+    } catch {}
+  }
+
+  return {
+    valid: false,
+    uid: '',
+    email: cleanEmail,
+    code: 'CANONICAL_STUDENT_UID_REQUIRED',
+    message: 'Unable to resolve canonical student UID.',
+  };
+}
+
+// Shared authorization & lookup helper for /api/drive/files/:fileId and /download
+async function authorizeAndFindDriveFile(
+  req: any,
+  res: any,
+  fileId: string
+): Promise<{
+  handled: boolean;
+  storedFile: ReturnType<typeof getStoredDriveFile>;
+  sessionDoc: any;
+  lessonDoc: any;
+}> {
+  if (!req.user || !req.user.uid) {
+    res.status(401).json({ error: 'Unauthorized', message: 'Authentication required.' });
+    return { handled: true, storedFile: null, sessionDoc: null, lessonDoc: null };
+  }
+
+  const callerUid = String(req.user.uid || '').trim();
+  const callerEmail = String(req.user.email || '').toLowerCase().trim();
+  if (!isValidCanonicalUid(callerUid)) {
+    res.status(403).json({
+      error: 'Forbidden',
+      code: 'CANONICAL_UID_REQUIRED',
+      message: 'A valid canonical UID is required.',
+    });
+    return { handled: true, storedFile: null, sessionDoc: null, lessonDoc: null };
+  }
+
+  const storedFile = getStoredDriveFile(fileId);
+  const db = readDb();
+
+  let sessionDoc: any =
+    Object.values(db.sessionNotesMap || {}).find(
+      (s: any) => s && (s.driveFileId === fileId || s.id === fileId)
+    ) || null;
+  let lessonDoc: any = null;
+
+  if (!sessionDoc) {
+    try {
+      const directNote = await fetchSessionNotesFromFirestoreServer(fileId);
+      if (directNote) sessionDoc = directNote;
+    } catch {}
+  }
+
+  const fs = getFirestoreDb();
+  if (fs) {
+    if (!sessionDoc) {
+      try {
+        const snSnap = await fs.collection('session_notes').where('driveFileId', '==', fileId).limit(1).get();
+        if (snSnap && !snSnap.empty) {
+          sessionDoc = { id: snSnap.docs[0].id, ...snSnap.docs[0].data() };
+        }
+      } catch {}
+    }
+    if (!lessonDoc) {
+      try {
+        const targetLessonId = sessionDoc?.lessonId || fileId;
+        if (targetLessonId) {
+          const lDirect = await fs.collection('lessons').doc(targetLessonId).get().catch(() => null);
+          if (lDirect && lDirect.exists) {
+            lessonDoc = { id: lDirect.id, ...lDirect.data() };
+          }
+        }
+        if (!lessonDoc) {
+          const lSnap = await fs.collection('lessons').where('driveFileId', '==', fileId).limit(1).get();
+          if (lSnap && !lSnap.empty) {
+            lessonDoc = { id: lSnap.docs[0].id, ...lSnap.docs[0].data() };
+          }
+        }
+      } catch {}
+    }
+  }
+
+  if (!storedFile && !sessionDoc && !(lessonDoc && (lessonDoc.driveFileId === fileId || lessonDoc.sessionNotesDocument || lessonDoc.liveNotes))) {
+    return { handled: false, storedFile: null, sessionDoc: null, lessonDoc: null };
+  }
+
+  const ownerStudentUid = String(
+    storedFile?.studentUid || sessionDoc?.studentUid || lessonDoc?.studentUid || ''
+  ).trim();
+  const ownerStudentEmail = String(
+    storedFile?.studentEmail || sessionDoc?.studentEmail || lessonDoc?.studentEmail || ''
+  ).toLowerCase().trim();
+  const ownerTeacherUid = String(
+    storedFile?.teacherUid || sessionDoc?.teacherUid || lessonDoc?.teacherUid || lessonDoc?.teacherAuthUid || ''
+  ).trim();
+
+  const isCallerAdmin = req.user.role === 'admin';
+  if (!isCallerAdmin) {
+    const authCheck = await resolveApprovedTeacherForSessionNotes(callerUid, req.user.email, req.user.role, db);
+    if (authCheck.callerKind === 'conflict') {
+      res.status(403).json({
+        error: 'Forbidden',
+        code: 'IDENTITY_CONFLICT',
+        message: 'Identity conflict detected on this account.',
+      });
+      return { handled: true, storedFile: null, sessionDoc: null, lessonDoc: null };
+    }
+    if (authCheck.callerKind === 'pending_teacher') {
+      res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHER_NOT_APPROVED',
+        message: 'Your Native Friend profile is pending administrator approval.',
+      });
+      return { handled: true, storedFile: null, sessionDoc: null, lessonDoc: null };
+    }
+    if (req.user.role === 'teacher' && !authCheck.isApproved) {
+      res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHER_NOT_APPROVED',
+        message: 'Only approved Native Friends can access session files.',
+      });
+      return { handled: true, storedFile: null, sessionDoc: null, lessonDoc: null };
+    }
+
+    if (authCheck.isApproved) {
+      let teacherAuthorized = Boolean(ownerTeacherUid && ownerTeacherUid === callerUid);
+      if (!teacherAuthorized && ownerStudentUid && isValidCanonicalUid(ownerStudentUid)) {
+        teacherAuthorized = await verifyCanonicalPedagogicalLinkServer(callerUid, ownerStudentUid);
+      }
+      if (!teacherAuthorized) {
+        res.status(403).json({
+          error: 'Forbidden',
+          code: 'UNAUTHORIZED_PEDAGOGICAL_LINK',
+          message: 'Native Friend is not authorized to access this Google Drive session file.',
+        });
+        return { handled: true, storedFile: null, sessionDoc: null, lessonDoc: null };
+      }
+    } else {
+      const isStudentOwner =
+        (Boolean(ownerStudentUid) && ownerStudentUid === callerUid) ||
+        (!ownerStudentUid && Boolean(ownerStudentEmail && callerEmail && ownerStudentEmail === callerEmail));
+      if (!isStudentOwner) {
+        res.status(403).json({
+          error: 'Forbidden',
+          message: 'You are not authorized to access another student\'s Google Drive session file.',
+        });
+        return { handled: true, storedFile: null, sessionDoc: null, lessonDoc: null };
+      }
+    }
+  }
+
+  return { handled: false, storedFile, sessionDoc, lessonDoc };
+}
+
 // Dedicated Google Drive Session Notes Sync Endpoint (uses platform credentials mapped to teacher's email)
-app.post('/api/drive/sync-session-notes', async (req, res) => {
+app.post('/api/drive/sync-session-notes', firebaseAuthMiddleware, async (req, res) => {
+  if (!req.user || !req.user.uid) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required.' });
+  }
+
+  const callerUid = String(req.user.uid || '').trim();
+  const callerEmail = String(req.user.email || '').toLowerCase().trim();
+  if (!isValidCanonicalUid(callerUid)) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      code: 'CANONICAL_UID_REQUIRED',
+      message: 'A valid canonical UID is required.',
+    });
+  }
+
+  const isCallerAdmin = req.user.role === 'admin';
+  const db = readDb();
+
+  let teacherResolution: any = null;
+  if (!isCallerAdmin) {
+    const authCheck = await resolveApprovedTeacherForSessionNotes(callerUid, req.user.email, req.user.role, db);
+    if (authCheck.isApproved) {
+      teacherResolution = authCheck.resolution;
+    } else if (authCheck.callerKind === 'conflict') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'IDENTITY_CONFLICT',
+        message: 'Identity conflict detected on this account.',
+      });
+    } else if (authCheck.callerKind === 'pending_teacher') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHER_NOT_APPROVED',
+        message: 'Your Native Friend profile is pending administrator approval and cannot sync Drive notes.',
+      });
+    } else {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'STUDENTS_CANNOT_SYNC_DRIVE',
+        message: 'Only approved Native Friends or administrators can sync session notes to Google Drive.',
+      });
+    }
+
+    if (req.body?.teacherUid && String(req.body.teacherUid).trim() !== callerUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHER_MISMATCH',
+        message: 'Invalid teacherUid parameter for the authenticated teacher.',
+      });
+    }
+    if (req.body?.teacherEmail && callerEmail && String(req.body.teacherEmail).toLowerCase().trim() !== callerEmail) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHER_MISMATCH',
+        message: 'Invalid teacherEmail parameter for the authenticated teacher.',
+      });
+    }
+  }
+
   const {
     studentName,
     studentEmail,
+    studentUid: rawStudentUid,
     sessionDate,
     content,
     topic,
@@ -10747,29 +11115,199 @@ app.post('/api/drive/sync-session-notes', async (req, res) => {
     sessionKey,
     teacherEmail,
     teacherName,
+    teacherUid: rawTeacherUid,
   } = req.body || {};
 
-  try {
-    const cleanDate = (sessionDate || new Date().toISOString().split('T')[0]).trim();
-    const cleanStudentEmail = (studentEmail || '').toLowerCase().trim();
-    const cleanTeacherEmail = (teacherEmail || '').toLowerCase().trim();
-    const effectiveKey = sessionKey || lessonId || `session_${cleanDate}_${cleanStudentEmail.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+  const cleanDate = String(sessionDate || new Date().toISOString().split('T')[0]).trim();
+  const cleanStudentEmail = String(studentEmail || '').toLowerCase().trim();
+  const cleanLessonId = String(lessonId || '').trim();
+  const cleanSessionKey = String(sessionKey || '').trim();
+  const cleanExistingFileId = String(existingFileId || '').trim();
+  const requestedStudentUid = String(rawStudentUid || '').trim();
 
+  if (requestedStudentUid && !isValidCanonicalUid(requestedStudentUid)) {
+    return res.status(400).json({
+      error: 'CANONICAL_STUDENT_UID_REQUIRED',
+      code: 'CANONICAL_STUDENT_UID_REQUIRED',
+      message: 'A valid canonical student UID is required.',
+    });
+  }
+
+  const effectiveTeacherUid =
+    isCallerAdmin && rawTeacherUid && isValidCanonicalUid(String(rawTeacherUid))
+      ? String(rawTeacherUid).trim()
+      : callerUid;
+  const effectiveTeacherEmail = isCallerAdmin
+    ? String(teacherEmail || callerEmail || '').toLowerCase().trim()
+    : callerEmail || String(teacherResolution?.email || '').toLowerCase().trim();
+  const effectiveTeacherName =
+    teacherResolution?.name || String(teacherName || (req.user as any)?.name || 'Native Friend').trim();
+
+  // Check existing Drive file ownership if existingFileId is provided
+  if (cleanExistingFileId && !isCallerAdmin) {
+    const storedExisting = getStoredDriveFile(cleanExistingFileId);
+    const noteByFileId = Object.values(db.sessionNotesMap || {}).find(
+      (s: any) => s && (s.driveFileId === cleanExistingFileId || s.id === cleanExistingFileId)
+    ) as any;
+
+    if (storedExisting) {
+      if (storedExisting.teacherUid && storedExisting.teacherUid !== callerUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          code: 'TEACHER_MISMATCH',
+          message: 'Teacher is not authorized to overwrite another teacher\'s Drive file.',
+        });
+      }
+      if (storedExisting.studentUid && requestedStudentUid && storedExisting.studentUid !== requestedStudentUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          code: 'STUDENT_UID_MISMATCH',
+          message: 'Provided studentUid does not match the Drive file owner.',
+        });
+      }
+    }
+    if (noteByFileId) {
+      if (noteByFileId.teacherUid && noteByFileId.teacherUid !== callerUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          code: 'TEACHER_MISMATCH',
+          message: 'Teacher is not authorized to overwrite another teacher\'s session note.',
+        });
+      }
+      if (noteByFileId.studentUid && requestedStudentUid && noteByFileId.studentUid !== requestedStudentUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          code: 'STUDENT_UID_MISMATCH',
+          message: 'Provided studentUid does not match the session note owner.',
+        });
+      }
+    }
+  }
+
+  // Check lesson ownership if lessonId is provided
+  let lesson: any = null;
+  if (cleanLessonId) {
+    const fs = getFirestoreDb();
+    if (fs) {
+      try {
+        const lSnap = await fs.collection('lessons').doc(cleanLessonId).get().catch(() => null);
+        if (lSnap && lSnap.exists) {
+          lesson = lSnap.data();
+        }
+      } catch {}
+    }
+    if (lesson) {
+      if (lesson.studentUid && requestedStudentUid && lesson.studentUid !== requestedStudentUid) {
+        return res.status(403).json({
+          error: 'STUDENT_LESSON_MISMATCH',
+          code: 'STUDENT_LESSON_MISMATCH',
+          message: 'The specified lesson belongs to a different student.',
+        });
+      }
+      const lessonTeacherUids = [
+        lesson.teacherUid,
+        lesson.teacherAuthUid,
+        lesson.tutorUid,
+        lesson.teacherPublicId,
+      ]
+        .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+        .map((v) => v.trim());
+      const callerTeacherUids = new Set(
+        [
+          callerUid,
+          teacherResolution?.authUid,
+          teacherResolution?.publicTutorId,
+        ]
+          .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+          .map((v) => v.trim())
+      );
+      if (!isCallerAdmin && lessonTeacherUids.length > 0 && !lessonTeacherUids.some((id) => callerTeacherUids.has(id))) {
+        return res.status(403).json({
+          error: 'TEACHER_LESSON_MISMATCH',
+          code: 'TEACHER_LESSON_MISMATCH',
+          message: 'Native Friend is not authorized to sync Drive notes for this lesson.',
+        });
+      }
+    }
+  }
+
+  // Resolve canonical student UID
+  const candidateSeedUid = requestedStudentUid || String(lesson?.studentUid || '').trim();
+  const candidateSeedEmail = cleanStudentEmail || String(lesson?.studentEmail || '').toLowerCase().trim();
+  const studentRes = await resolveCanonicalStudentUidForSessionNotes({
+    studentUid: candidateSeedUid,
+    studentEmail: candidateSeedEmail,
+    db,
+    excludeUid: isCallerAdmin ? undefined : callerUid,
+  });
+
+  if (!studentRes.valid || !studentRes.uid) {
+    return res.status(400).json({
+      error: studentRes.code || 'CANONICAL_STUDENT_UID_REQUIRED',
+      code: studentRes.code || 'CANONICAL_STUDENT_UID_REQUIRED',
+      message: studentRes.message || 'Canonical student UID is required to sync Drive session notes.',
+    });
+  }
+
+  const targetStudentUid = studentRes.uid;
+  const targetStudentEmail = studentRes.email || candidateSeedEmail;
+
+  if (targetStudentUid === effectiveTeacherUid || targetStudentUid === callerUid) {
+    return res.status(400).json({
+      error: 'INVALID_PEDAGOGICAL_IDENTITY',
+      code: 'INVALID_PEDAGOGICAL_IDENTITY',
+      message: 'Teacher UID cannot be identical to student UID.',
+    });
+  }
+
+  const effectiveKey = cleanSessionKey || cleanLessonId || `session_${cleanDate}_${targetStudentUid}`;
+  const { existingDoc } = await resolveExistingSessionNoteWithKeyFallback(db, effectiveKey);
+
+  if (existingDoc) {
+    if (existingDoc.studentUid && existingDoc.studentUid !== targetStudentUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'STUDENT_UID_MISMATCH',
+        message: 'Existing session note belongs to a different student.',
+      });
+    }
+    if (!isCallerAdmin && existingDoc.teacherUid && existingDoc.teacherUid !== callerUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHER_MISMATCH',
+        message: 'Teacher is not authorized to modify another teacher\'s session note.',
+      });
+    }
+  }
+
+  if (!isCallerAdmin) {
+    const isLinked = await verifyCanonicalPedagogicalLinkServer(callerUid, targetStudentUid);
+    if (!isLinked) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'UNAUTHORIZED_PEDAGOGICAL_LINK',
+        message: 'Native Friend does not have an authorized pedagogical link with this student.',
+      });
+    }
+  }
+
+  try {
     const driveRes = await syncSessionNotesWithPlatformDrive({
-      studentName: studentName || (cleanStudentEmail ? cleanStudentEmail.split('@')[0] : 'Student'),
-      studentEmail: cleanStudentEmail,
+      studentName: studentName || (targetStudentEmail ? targetStudentEmail.split('@')[0] : 'Student'),
+      studentEmail: targetStudentEmail,
+      studentUid: targetStudentUid,
       sessionDate: cleanDate,
       content: content || '',
       topic: topic || 'Native Friend Live Coaching',
-      existingFileId: existingFileId || undefined,
-      lessonId: lessonId || undefined,
+      existingFileId: cleanExistingFileId || undefined,
+      lessonId: cleanLessonId || undefined,
       sessionKey: effectiveKey,
-      teacherEmail: cleanTeacherEmail,
-      teacherName: teacherName || 'Native Friend',
+      teacherEmail: effectiveTeacherEmail,
+      teacherName: effectiveTeacherName,
+      teacherUid: effectiveTeacherUid,
     });
 
     const nowIso = driveRes.syncedAt || new Date().toISOString();
-    const db = readDb();
 
     if (!db.sessionNotesMap) db.sessionNotesMap = {};
     if (db.sessionNotesMap[effectiveKey]) {
@@ -10777,18 +11315,27 @@ app.post('/api/drive/sync-session-notes', async (req, res) => {
       db.sessionNotesMap[effectiveKey].driveFileUrl = driveRes.webViewLink;
       db.sessionNotesMap[effectiveKey].driveFolderName = driveRes.folderName;
       db.sessionNotesMap[effectiveKey].driveLastSyncedAt = nowIso;
+      if (!db.sessionNotesMap[effectiveKey].studentUid) db.sessionNotesMap[effectiveKey].studentUid = targetStudentUid;
+      if (!db.sessionNotesMap[effectiveKey].teacherUid) db.sessionNotesMap[effectiveKey].teacherUid = effectiveTeacherUid;
+      if (targetStudentEmail && !db.sessionNotesMap[effectiveKey].studentEmail) db.sessionNotesMap[effectiveKey].studentEmail = targetStudentEmail;
+      if (effectiveTeacherEmail && !db.sessionNotesMap[effectiveKey].teacherEmail) db.sessionNotesMap[effectiveKey].teacherEmail = effectiveTeacherEmail;
       if (content) db.sessionNotesMap[effectiveKey].content = content;
       if (topic) db.sessionNotesMap[effectiveKey].topic = topic;
+      db.sessionNotesMap[effectiveKey].updatedAt = nowIso;
     } else {
       db.sessionNotesMap[effectiveKey] = {
         id: effectiveKey,
+        sessionKey: effectiveKey,
         sessionDate: cleanDate,
-        lessonId: lessonId || '',
-        studentEmail: cleanStudentEmail,
-        teacherEmail: cleanTeacherEmail,
-        teacherName: teacherName || 'Native Friend',
+        lessonId: cleanLessonId || '',
+        studentUid: targetStudentUid,
+        studentEmail: targetStudentEmail,
+        teacherUid: effectiveTeacherUid,
+        teacherEmail: effectiveTeacherEmail,
+        teacherName: effectiveTeacherName,
         topic: topic || '',
         content: content || '',
+        rawContent: content || '',
         driveFileId: driveRes.fileId,
         driveFileUrl: driveRes.webViewLink,
         driveFolderName: driveRes.folderName,
@@ -10801,21 +11348,23 @@ app.post('/api/drive/sync-session-notes', async (req, res) => {
     invalidatePedagogicalCache(db, {
       canonicalSessionKey: effectiveKey,
       sessionKey: effectiveKey,
-      lessonId: lessonId || undefined,
+      lessonId: cleanLessonId || undefined,
     });
 
     await writeDbSync(db);
     saveSessionNotesToFirestoreServer(effectiveKey, db.sessionNotesMap[effectiveKey]).catch(() => null);
-    if (lessonId) {
+    if (cleanLessonId) {
       const firestore = getFirestoreDb();
       if (firestore) {
         firestore
           .collection('lessons')
-          .doc(lessonId)
+          .doc(cleanLessonId)
           .set(
             {
               ...(topic ? { title: topic } : {}),
               ...(content ? { liveNotes: content, recommendations: content, sessionNotesDocument: content } : {}),
+              studentUid: targetStudentUid,
+              teacherUid: effectiveTeacherUid,
               driveFileId: driveRes.fileId,
               driveFileUrl: driveRes.webViewLink,
               driveFolderName: driveRes.folderName,
@@ -10845,19 +11394,21 @@ app.post('/api/drive/sync-session-notes', async (req, res) => {
 });
 
 // View Google Drive Session Notes Document
-app.get('/api/drive/files/:fileId', (req, res) => {
-  const fileId = req.params.fileId;
-  const storedFile = getStoredDriveFile(fileId);
+app.get('/api/drive/files/:fileId', firebaseAuthMiddleware, async (req, res) => {
+  const fileId = decodeURIComponent(String(req.params.fileId || '')).trim();
+  const authRes = await authorizeAndFindDriveFile(req, res, fileId);
+  if (authRes.handled) return;
+
+  const { storedFile, sessionDoc, lessonDoc } = authRes;
 
   if (!storedFile) {
-    // If not found in drive store, check sessionNotesMap
-    const db = readDb();
-    const sessionDoc = Object.values(db.sessionNotesMap || {}).find(
-      (s: any) => s.driveFileId === fileId || s.id === fileId
-    );
-
-    if (sessionDoc) {
-      const fileName = formatSessionNotesFileName((sessionDoc as any).studentEmail?.split('@')[0], (sessionDoc as any).sessionDate);
+    const docSource = sessionDoc || lessonDoc;
+    if (docSource) {
+      const fileName = formatSessionNotesFileName(
+        docSource.studentEmail?.split('@')[0],
+        docSource.sessionDate || (docSource.startDateTime ? docSource.startDateTime.split('T')[0] : undefined)
+      );
+      const docContent = docSource.content || docSource.rawContent || docSource.sessionNotesDocument || docSource.liveNotes || 'No content.';
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       return res.send(`<!DOCTYPE html>
 <html>
@@ -10879,7 +11430,7 @@ app.get('/api/drive/files/:fileId', (req, res) => {
       </div>
       <a href="/api/drive/files/${fileId}/download" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-xl shadow transition">Download File</a>
     </div>
-    <div class="bg-slate-50 p-6 rounded-xl border border-slate-200 whitespace-pre-wrap leading-relaxed text-sm font-sans">${(sessionDoc as any).content || 'No content.'}</div>
+    <div class="bg-slate-50 p-6 rounded-xl border border-slate-200 whitespace-pre-wrap leading-relaxed text-sm font-sans">${docContent}</div>
   </div>
 </body>
 </html>`);
@@ -10916,9 +11467,12 @@ app.get('/api/drive/files/:fileId', (req, res) => {
 });
 
 // Download raw Google Drive Session Notes Document
-app.get('/api/drive/files/:fileId/download', (req, res) => {
-  const fileId = req.params.fileId;
-  const storedFile = getStoredDriveFile(fileId);
+app.get('/api/drive/files/:fileId/download', firebaseAuthMiddleware, async (req, res) => {
+  const fileId = decodeURIComponent(String(req.params.fileId || '')).trim();
+  const authRes = await authorizeAndFindDriveFile(req, res, fileId);
+  if (authRes.handled) return;
+
+  const { storedFile, sessionDoc, lessonDoc } = authRes;
 
   if (storedFile) {
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
@@ -10926,19 +11480,27 @@ app.get('/api/drive/files/:fileId/download', (req, res) => {
     return res.send(storedFile.content);
   }
 
-  const db = readDb();
-  const sessionDoc = Object.values(db.sessionNotesMap || {}).find(
-    (s: any) => s.driveFileId === fileId || s.id === fileId
-  );
-
-  if (sessionDoc) {
-    const fileName = formatSessionNotesFileName((sessionDoc as any).studentEmail?.split('@')[0], (sessionDoc as any).sessionDate);
+  const docSource = sessionDoc || lessonDoc;
+  if (docSource) {
+    const fileName = formatSessionNotesFileName(
+      docSource.studentEmail?.split('@')[0],
+      docSource.sessionDate || (docSource.startDateTime ? docSource.startDateTime.split('T')[0] : undefined)
+    );
+    const docContent = docSource.content || docSource.rawContent || docSource.sessionNotesDocument || docSource.liveNotes || '';
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${fileName}.txt"`);
-    return res.send((sessionDoc as any).content || '');
+    return res.send(docContent);
   }
 
   res.status(404).json({ error: 'File not found.' });
+});
+
+// Protected catch-all for any unmatched /api/drive/files/* subpaths
+app.use('/api/drive/files', firebaseAuthMiddleware, (req, res) => {
+  if (!req.user || !req.user.uid) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required.' });
+  }
+  return res.status(404).json({ error: 'File not found.' });
 });
 
 // Retrieve Native Friend In-Session Notes & Recommendations
@@ -11225,85 +11787,348 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
 });
 
 // Retrieve Native Friends Notes Sequential Review Progress
-app.get('/api/session-notes/progress', async (req, res) => {
-  const db = readDb();
-  const studentUid = ((req.query.studentUid as string) || (req.query.uid as string) || '').trim();
-  const studentEmail = ((req.query.studentEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
-  const key = studentUid || studentEmail;
-  if (!key) return res.status(400).json({ error: 'Missing student identifier' });
+app.get('/api/session-notes/progress', firebaseAuthMiddleware, async (req, res) => {
+  if (!req.user || !req.user.uid) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required.' });
+  }
 
-  let progress = (db.sessionNotesProgressMap && db.sessionNotesProgressMap[key]) || null;
-  if ((!progress || !progress.lastReminderShownDate) && studentUid) {
-    const fsProgress = await fetchSessionNotesProgressServer(studentUid);
+  const callerUid = String(req.user.uid || '').trim();
+  const callerEmail = String(req.user.email || '').toLowerCase().trim();
+  if (!isValidCanonicalUid(callerUid)) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      code: 'CANONICAL_UID_REQUIRED',
+      message: 'A valid canonical UID is required.',
+    });
+  }
+
+  const db = readDb();
+  const isCallerAdmin = req.user.role === 'admin';
+  const rawStudentUid = typeof req.query.studentUid === 'string'
+    ? req.query.studentUid.trim()
+    : (typeof req.query.uid === 'string' ? req.query.uid.trim() : '');
+  const rawStudentEmail = typeof req.query.studentEmail === 'string'
+    ? req.query.studentEmail.toLowerCase().trim()
+    : (typeof req.query.email === 'string' ? req.query.email.toLowerCase().trim() : '');
+
+  let targetStudentUid = '';
+
+  if (isCallerAdmin) {
+    if (rawStudentUid && !isValidCanonicalUid(rawStudentUid)) {
+      return res.status(400).json({
+        error: 'CANONICAL_STUDENT_UID_REQUIRED',
+        code: 'CANONICAL_STUDENT_UID_REQUIRED',
+        message: 'A valid canonical student UID is required.',
+      });
+    }
+    const resolved = await resolveCanonicalStudentUidForSessionNotes({
+      studentUid: rawStudentUid,
+      studentEmail: rawStudentEmail,
+      db,
+    });
+    if (!resolved.valid || !resolved.uid) {
+      return res.status(400).json({
+        error: resolved.code || 'CANONICAL_STUDENT_UID_REQUIRED',
+        code: resolved.code || 'CANONICAL_STUDENT_UID_REQUIRED',
+        message: resolved.message || 'Valid canonical student identifier is required.',
+      });
+    }
+    targetStudentUid = resolved.uid;
+  } else {
+    const authCheck = await resolveApprovedTeacherForSessionNotes(callerUid, req.user.email, req.user.role, db);
+    if (authCheck.callerKind === 'conflict') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'IDENTITY_CONFLICT',
+        message: 'Identity conflict detected on this account.',
+      });
+    }
+    if (authCheck.callerKind === 'pending_teacher') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHER_NOT_APPROVED',
+        message: 'Your Native Friend profile is pending administrator approval.',
+      });
+    }
+    if (req.user.role === 'teacher' && !authCheck.isApproved) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHER_NOT_APPROVED',
+        message: 'Only approved Native Friends can inspect student review progress.',
+      });
+    }
+
+    if (authCheck.isApproved) {
+      if (!rawStudentUid && !rawStudentEmail) {
+        return res.status(400).json({
+          error: 'MISSING_STUDENT_IDENTIFIER',
+          code: 'MISSING_STUDENT_IDENTIFIER',
+          message: 'Target canonical student identifier is required.',
+        });
+      }
+      if (rawStudentUid && !isValidCanonicalUid(rawStudentUid)) {
+        return res.status(400).json({
+          error: 'CANONICAL_STUDENT_UID_REQUIRED',
+          code: 'CANONICAL_STUDENT_UID_REQUIRED',
+          message: 'A valid canonical student UID is required.',
+        });
+      }
+      const resolved = await resolveCanonicalStudentUidForSessionNotes({
+        studentUid: rawStudentUid,
+        studentEmail: rawStudentEmail,
+        db,
+        excludeUid: callerUid,
+      });
+      if (!resolved.valid || !resolved.uid) {
+        return res.status(resolved.code === 'INVALID_PEDAGOGICAL_IDENTITY' ? 403 : 400).json({
+          error: resolved.code || 'CANONICAL_STUDENT_UID_REQUIRED',
+          code: resolved.code || 'CANONICAL_STUDENT_UID_REQUIRED',
+          message: resolved.message || 'Valid canonical student identifier is required.',
+        });
+      }
+      const isLinked = await verifyCanonicalPedagogicalLinkServer(callerUid, resolved.uid);
+      if (!isLinked) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          code: 'UNAUTHORIZED_PEDAGOGICAL_LINK',
+          message: 'Native Friend does not have an authorized pedagogical link with this student.',
+        });
+      }
+      targetStudentUid = resolved.uid;
+    } else {
+      // Student self-access only
+      if (rawStudentUid && rawStudentUid !== callerUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Students can only access their own review progress.',
+        });
+      }
+      if (rawStudentEmail && (!callerEmail || rawStudentEmail !== callerEmail)) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Students can only access their own review progress.',
+        });
+      }
+      targetStudentUid = callerUid;
+    }
+  }
+
+  let progress = (db.sessionNotesProgressMap && db.sessionNotesProgressMap[targetStudentUid]) || null;
+  if (!progress || !progress.lastReminderShownDate) {
+    const fsProgress = await fetchSessionNotesProgressServer(targetStudentUid);
     if (fsProgress) {
       if (!db.sessionNotesProgressMap) db.sessionNotesProgressMap = {};
       progress = {
         ...(progress || {}),
         ...fsProgress,
       };
-      db.sessionNotesProgressMap[key] = progress;
+      db.sessionNotesProgressMap[targetStudentUid] = progress;
     }
   }
   return res.json(progress || null);
 });
 
 // Update Native Friends Notes Sequential Review Progress
-app.post('/api/session-notes/progress', async (req, res) => {
-  const { studentUid, studentEmail, lastSessionKey, stepIndex, lastReviewedTab, lastReviewedDate, lastAssignedDate } = req.body || {};
-  const key = (studentUid || studentEmail || '').trim();
-  if (!key) return res.status(400).json({ error: 'Missing student identifier' });
+app.post('/api/session-notes/progress', firebaseAuthMiddleware, async (req, res) => {
+  if (!req.user || !req.user.uid) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required.' });
+  }
+
+  const callerUid = String(req.user.uid || '').trim();
+  const callerEmail = String(req.user.email || '').toLowerCase().trim();
+  if (!isValidCanonicalUid(callerUid)) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      code: 'CANONICAL_UID_REQUIRED',
+      message: 'A valid canonical UID is required.',
+    });
+  }
+
   const db = readDb();
+  const isCallerAdmin = req.user.role === 'admin';
+  const { studentUid, studentEmail, lastSessionKey, stepIndex, lastReviewedTab, lastReviewedDate } = req.body || {};
+  const rawStudentUid = typeof studentUid === 'string' ? studentUid.trim() : '';
+  const rawStudentEmail = typeof studentEmail === 'string' ? studentEmail.toLowerCase().trim() : '';
+
+  let targetStudentUid = '';
+  let targetStudentEmail = '';
+
+  if (isCallerAdmin) {
+    if (rawStudentUid && !isValidCanonicalUid(rawStudentUid)) {
+      return res.status(400).json({
+        error: 'CANONICAL_STUDENT_UID_REQUIRED',
+        code: 'CANONICAL_STUDENT_UID_REQUIRED',
+        message: 'A valid canonical student UID is required.',
+      });
+    }
+    const resolved = await resolveCanonicalStudentUidForSessionNotes({
+      studentUid: rawStudentUid,
+      studentEmail: rawStudentEmail,
+      db,
+    });
+    if (!resolved.valid || !resolved.uid) {
+      return res.status(400).json({
+        error: resolved.code || 'CANONICAL_STUDENT_UID_REQUIRED',
+        code: resolved.code || 'CANONICAL_STUDENT_UID_REQUIRED',
+        message: resolved.message || 'Valid canonical student identifier is required.',
+      });
+    }
+    targetStudentUid = resolved.uid;
+    targetStudentEmail = resolved.email || rawStudentEmail;
+  } else {
+    const authCheck = await resolveApprovedTeacherForSessionNotes(callerUid, req.user.email, req.user.role, db);
+    if (authCheck.callerKind === 'conflict') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'IDENTITY_CONFLICT',
+        message: 'Identity conflict detected on this account.',
+      });
+    }
+    if (authCheck.callerKind === 'pending_teacher') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHER_NOT_APPROVED',
+        message: 'Your Native Friend profile is pending administrator approval.',
+      });
+    }
+    if (authCheck.isApproved || req.user.role === 'teacher') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHERS_CANNOT_MODIFY_STUDENT_PROGRESS',
+        message: 'Teachers cannot modify a student\'s personal review progress.',
+      });
+    }
+
+    if (rawStudentUid && rawStudentUid !== callerUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Students can only update their own review progress.',
+      });
+    }
+    if (rawStudentEmail && (!callerEmail || rawStudentEmail !== callerEmail)) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Students can only update their own review progress.',
+      });
+    }
+    targetStudentUid = callerUid;
+    targetStudentEmail = callerEmail;
+  }
+
   db.sessionNotesProgressMap = db.sessionNotesProgressMap || {};
-  const existingProg = db.sessionNotesProgressMap[key] || {};
+  const existingProg = db.sessionNotesProgressMap[targetStudentUid] || {};
 
   const updatedProgress = {
     ...existingProg,
-    studentUid: studentUid || existingProg.studentUid || '',
-    studentEmail: (studentEmail || existingProg.studentEmail || '').toLowerCase().trim(),
-    lastSessionKey: lastSessionKey !== undefined ? lastSessionKey : (existingProg.lastSessionKey || ''),
-    stepIndex: typeof stepIndex === 'number' ? stepIndex : (existingProg.stepIndex || 0),
-    lastReviewedTab: lastReviewedTab !== undefined ? lastReviewedTab : (existingProg.lastReviewedTab || ''),
-    lastReviewedDate: lastReviewedDate !== undefined ? lastReviewedDate : (existingProg.lastReviewedDate || ''),
-    lastAssignedDate: req.body?.lastAssignedDate !== undefined ? req.body.lastAssignedDate : (existingProg.lastAssignedDate || ''),
+    studentUid: targetStudentUid,
+    studentEmail: targetStudentEmail || existingProg.studentEmail || '',
+    lastSessionKey: typeof lastSessionKey === 'string' ? lastSessionKey : (existingProg.lastSessionKey || ''),
+    stepIndex: typeof stepIndex === 'number' && Number.isFinite(stepIndex) && stepIndex >= 0 ? Math.floor(stepIndex) : (existingProg.stepIndex || 0),
+    lastReviewedTab: typeof lastReviewedTab === 'string' ? lastReviewedTab : (existingProg.lastReviewedTab || ''),
+    lastReviewedDate: typeof lastReviewedDate === 'string' ? lastReviewedDate : (existingProg.lastReviewedDate || ''),
+    lastAssignedDate: typeof req.body?.lastAssignedDate === 'string' ? req.body.lastAssignedDate : (existingProg.lastAssignedDate || ''),
     lastReminderShownDate: existingProg.lastReminderShownDate || '',
     updatedAt: new Date().toISOString(),
   };
 
-  db.sessionNotesProgressMap[key] = updatedProgress;
+  db.sessionNotesProgressMap[targetStudentUid] = updatedProgress;
   await writeDbSync(db);
 
-  saveSessionNotesProgressToFirestore(key, updatedProgress).catch(() => {});
+  saveSessionNotesProgressToFirestore(targetStudentUid, updatedProgress).catch(() => {});
   return res.json({ success: true, progress: updatedProgress });
 });
 
 // Atomic Daily Reminder Claim Endpoint (Presented AT MOST ONCE per day per student)
-app.post('/api/session-notes/reminder/claim', async (req, res) => {
-  const caller = await getVerifiedUserFromRequest(req);
-  const { studentUid, studentEmail, timeZone, dateStr } = req.body || {};
+app.post('/api/session-notes/reminder/claim', firebaseAuthMiddleware, async (req, res) => {
+  if (!req.user || !req.user.uid) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required.' });
+  }
 
-  let effectiveUid = (studentUid || '').trim();
-  let effectiveEmail = (studentEmail || '').toLowerCase().trim();
-
-  if (caller) {
-    const identityRes = await resolveCanonicalStudentIdentity({
-      caller,
-      studentEmail,
-      studentUid,
+  const callerUid = String(req.user.uid || '').trim();
+  const callerEmail = String(req.user.email || '').toLowerCase().trim();
+  if (!isValidCanonicalUid(callerUid)) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      code: 'CANONICAL_UID_REQUIRED',
+      message: 'A valid canonical UID is required.',
     });
-    if (identityRes.authorized && identityRes.canonicalStudentUid) {
-      effectiveUid = identityRes.canonicalStudentUid;
-      effectiveEmail = identityRes.studentEmail || effectiveEmail;
+  }
+
+  const db = readDb();
+  const isCallerAdmin = req.user.role === 'admin';
+  const { studentUid, studentEmail, timeZone, dateStr } = req.body || {};
+  const rawStudentUid = typeof studentUid === 'string' ? studentUid.trim() : '';
+  const rawStudentEmail = typeof studentEmail === 'string' ? studentEmail.toLowerCase().trim() : '';
+
+  let effectiveUid = '';
+  let effectiveEmail = '';
+
+  if (isCallerAdmin) {
+    if (rawStudentUid && !isValidCanonicalUid(rawStudentUid)) {
+      return res.status(400).json({
+        error: 'CANONICAL_STUDENT_UID_REQUIRED',
+        code: 'CANONICAL_STUDENT_UID_REQUIRED',
+        message: 'A valid canonical student UID is required.',
+      });
     }
+    const resolved = await resolveCanonicalStudentUidForSessionNotes({
+      studentUid: rawStudentUid,
+      studentEmail: rawStudentEmail,
+      db,
+    });
+    if (!resolved.valid || !resolved.uid) {
+      return res.status(400).json({
+        error: resolved.code || 'CANONICAL_STUDENT_UID_REQUIRED',
+        code: resolved.code || 'CANONICAL_STUDENT_UID_REQUIRED',
+        message: resolved.message || 'Valid canonical student identifier is required.',
+      });
+    }
+    effectiveUid = resolved.uid;
+    effectiveEmail = resolved.email || rawStudentEmail;
+  } else {
+    const authCheck = await resolveApprovedTeacherForSessionNotes(callerUid, req.user.email, req.user.role, db);
+    if (authCheck.callerKind === 'conflict') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'IDENTITY_CONFLICT',
+        message: 'Identity conflict detected on this account.',
+      });
+    }
+    if (authCheck.callerKind === 'pending_teacher') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHER_NOT_APPROVED',
+        message: 'Your Native Friend profile is pending administrator approval.',
+      });
+    }
+    if (authCheck.isApproved || req.user.role === 'teacher') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHERS_CANNOT_CLAIM_STUDENT_REMINDER',
+        message: 'Teachers cannot claim daily student reminders.',
+      });
+    }
+
+    if (rawStudentUid && rawStudentUid !== callerUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Students can only claim daily reminders for their own account.',
+      });
+    }
+    if (rawStudentEmail && (!callerEmail || rawStudentEmail !== callerEmail)) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Students can only claim daily reminders for their own account.',
+      });
+    }
+    effectiveUid = callerUid;
+    effectiveEmail = callerEmail;
   }
 
-  if (!effectiveUid && !effectiveEmail) {
-    return res.status(400).json({ error: 'Missing student identifier' });
-  }
-
-  const primaryKey = effectiveUid || effectiveEmail;
-  const effectiveTz = sanitizeTimeZone(timeZone || 'America/Sao_Paulo');
+  const effectiveTz = sanitizeTimeZone(typeof timeZone === 'string' && timeZone ? timeZone : 'America/Sao_Paulo');
+  const validDateStr = typeof dateStr === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(dateStr.trim()) ? dateStr.trim() : '';
   const todayInTz =
-    dateStr ||
+    validDateStr ||
     new Intl.DateTimeFormat('en-CA', {
       timeZone: effectiveTz,
       year: 'numeric',
@@ -11311,16 +12136,15 @@ app.post('/api/session-notes/reminder/claim', async (req, res) => {
       day: '2-digit',
     }).format(new Date());
 
-  const result = await recordDailyReminderShownServer(primaryKey, todayInTz);
+  const result = await recordDailyReminderShownServer(effectiveUid, todayInTz);
 
-  const db = readDb();
   if (!db.sessionNotesProgressMap) db.sessionNotesProgressMap = {};
-  const existingProg = db.sessionNotesProgressMap[primaryKey] || {};
-  db.sessionNotesProgressMap[primaryKey] = {
+  const existingProg = db.sessionNotesProgressMap[effectiveUid] || {};
+  db.sessionNotesProgressMap[effectiveUid] = {
     ...existingProg,
     studentUid: effectiveUid,
-    studentEmail: effectiveEmail,
-    lastReminderShownDate: todayInTz,
+    studentEmail: effectiveEmail || existingProg.studentEmail || '',
+    lastReminderShownDate: result.lastReminderShownDate || todayInTz,
     updatedAt: new Date().toISOString(),
   };
   await writeDbSync(db);
@@ -11860,15 +12684,6 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
         });
         if (journalRes.success && journalRes.entry) {
           recordedJournalEntry = journalRes.entry;
-          if (!db.studentJournalMap) db.studentJournalMap = {};
-          const currentJournal =
-            (cleanUid && db.studentJournalMap[cleanUid]) ||
-            (effectiveEmail && db.studentJournalMap[effectiveEmail]) ||
-            [];
-          const filteredJournal = currentJournal.filter((e: any) => e.id !== journalRes.entry.id);
-          const updatedJournal = [journalRes.entry, ...filteredJournal];
-          if (cleanUid) db.studentJournalMap[cleanUid] = updatedJournal;
-          if (effectiveEmail) db.studentJournalMap[effectiveEmail] = updatedJournal;
         }
       } catch (journalErr) {
         console.warn('Backend My Journal lesson review save notice:', journalErr);
@@ -11904,26 +12719,177 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
 
 // Retrieve cached pedagogical transformation
 app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
-  const db = readDb();
-  const sessionKey = (req.query.sessionKey as string) || (req.query.id as string) || '';
-  const queryLessonId = (req.query.lessonId as string) || '';
-  const studentUid = (req.query.studentUid as string) || '';
-  const language = ((req.query.language as string) || (req.query.lang as string) || '').toLowerCase().trim();
-  const contentHash = ((req.query.contentHash as string) || '').trim();
-
-  const caller = req.user!;
-  if (caller.role === 'student') {
-    if (studentUid && caller.uid !== studentUid) {
-      return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to student notes.' });
-    }
+  if (!req.user || !req.user.uid) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required.' });
   }
 
+  const caller = req.user;
+  const callerUid = String(caller.uid || '').trim();
+  const callerEmail = String(caller.email || '').toLowerCase().trim();
+  if (!isValidCanonicalUid(callerUid)) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      code: 'CANONICAL_UID_REQUIRED',
+      message: 'A valid canonical UID is required.',
+    });
+  }
+
+  const db = readDb();
+  const sessionKey = typeof req.query.sessionKey === 'string'
+    ? req.query.sessionKey.trim()
+    : (typeof req.query.id === 'string' ? req.query.id.trim() : '');
+  const queryLessonId = typeof req.query.lessonId === 'string' ? req.query.lessonId.trim() : '';
+  const queryStudentUid = typeof req.query.studentUid === 'string'
+    ? req.query.studentUid.trim()
+    : (typeof req.query.uid === 'string' ? req.query.uid.trim() : '');
+  const queryStudentEmail = typeof req.query.studentEmail === 'string'
+    ? req.query.studentEmail.toLowerCase().trim()
+    : (typeof req.query.email === 'string' ? req.query.email.toLowerCase().trim() : '');
+  const language = typeof req.query.language === 'string'
+    ? req.query.language.toLowerCase().trim()
+    : (typeof req.query.lang === 'string' ? req.query.lang.toLowerCase().trim() : '');
+  const contentHash = typeof req.query.contentHash === 'string' ? req.query.contentHash.trim() : '';
+
+  const isCallerAdmin = caller.role === 'admin';
+  let isCallerTeacher = false;
+
+  if (!isCallerAdmin) {
+    const authCheck = await resolveApprovedTeacherForSessionNotes(callerUid, caller.email, caller.role, db);
+    if (authCheck.callerKind === 'conflict') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'IDENTITY_CONFLICT',
+        message: 'Identity conflict detected on this account.',
+      });
+    }
+    if (authCheck.callerKind === 'pending_teacher') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHER_NOT_APPROVED',
+        message: 'Your Native Friend profile is pending administrator approval.',
+      });
+    }
+    if (caller.role === 'teacher' && !authCheck.isApproved) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHER_NOT_APPROVED',
+        message: 'Only approved Native Friends can query student pedagogical notes.',
+      });
+    }
+    isCallerTeacher = authCheck.isApproved;
+  }
+
+  // Enforce query parameter boundaries across ALL routes (even when sessionKey/lessonId or studentUid are absent)
+  let resolvedTeacherTargetStudentUid = '';
+  if (!isCallerAdmin && !isCallerTeacher) {
+    if (queryStudentUid && queryStudentUid !== callerUid) {
+      return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to student notes.' });
+    }
+    if (queryStudentEmail && (!callerEmail || queryStudentEmail !== callerEmail)) {
+      return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to student notes.' });
+    }
+  } else if (isCallerTeacher && !isCallerAdmin) {
+    if (queryStudentUid || queryStudentEmail) {
+      if (queryStudentUid && !isValidCanonicalUid(queryStudentUid)) {
+        return res.status(400).json({
+          error: 'CANONICAL_STUDENT_UID_REQUIRED',
+          code: 'CANONICAL_STUDENT_UID_REQUIRED',
+          message: 'A valid canonical student UID is required.',
+        });
+      }
+      const resolved = await resolveCanonicalStudentUidForSessionNotes({
+        studentUid: queryStudentUid,
+        studentEmail: queryStudentEmail,
+        db,
+        excludeUid: callerUid,
+      });
+      if (!resolved.valid || !resolved.uid) {
+        return res.status(resolved.code === 'INVALID_PEDAGOGICAL_IDENTITY' ? 403 : 403).json({
+          error: 'Forbidden',
+          code: resolved.code || 'UNAUTHORIZED_PEDAGOGICAL_LINK',
+          message: resolved.message || 'Teacher is not authorized to query this student.',
+        });
+      }
+      const isLinked = await verifyCanonicalPedagogicalLinkServer(callerUid, resolved.uid);
+      if (!isLinked) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          code: 'UNAUTHORIZED_PEDAGOGICAL_LINK',
+          message: 'Native Friend does not have an authorized pedagogical link with this student.',
+        });
+      }
+      resolvedTeacherTargetStudentUid = resolved.uid;
+    }
+  } else if (isCallerAdmin && queryStudentUid && !isValidCanonicalUid(queryStudentUid)) {
+    return res.status(400).json({
+      error: 'CANONICAL_STUDENT_UID_REQUIRED',
+      code: 'CANONICAL_STUDENT_UID_REQUIRED',
+      message: 'A valid canonical student UID is required.',
+    });
+  }
+
+  const linkCache = new Map<string, boolean>();
+  const checkTeacherLinkCached = async (targetUid: string): Promise<boolean> => {
+    const cleanTarget = targetUid.trim();
+    if (!cleanTarget || !isValidCanonicalUid(cleanTarget) || cleanTarget === callerUid) return false;
+    if (linkCache.has(cleanTarget)) return linkCache.get(cleanTarget)!;
+    const ok = await verifyCanonicalPedagogicalLinkServer(callerUid, cleanTarget);
+    linkCache.set(cleanTarget, ok);
+    return ok;
+  };
+
+  const canCallerAccessRecord = async (
+    record: any,
+    fallbackOwner?: { studentUid?: string; studentEmail?: string; teacherUid?: string }
+  ): Promise<boolean> => {
+    if (!record || typeof record !== 'object') return false;
+    const rStudentUid = String(record.studentUid || fallbackOwner?.studentUid || '').trim();
+    const rStudentEmail = String(record.studentEmail || fallbackOwner?.studentEmail || '').toLowerCase().trim();
+    const rTeacherUid = String(record.teacherUid || fallbackOwner?.teacherUid || '').trim();
+
+    if (isCallerAdmin) {
+      if (queryStudentUid && rStudentUid && rStudentUid !== queryStudentUid) return false;
+      return true;
+    }
+
+    if (isCallerTeacher) {
+      if (resolvedTeacherTargetStudentUid && rStudentUid && rStudentUid !== resolvedTeacherTargetStudentUid) {
+        return false;
+      }
+      if (rTeacherUid && rTeacherUid === callerUid) {
+        if (!rStudentUid || (await checkTeacherLinkCached(rStudentUid))) {
+          return true;
+        }
+      }
+      if (rStudentUid && (await checkTeacherLinkCached(rStudentUid))) {
+        return true;
+      }
+      return false;
+    }
+
+    // Student caller: strict ownership (never return unattributed records or email-matches when studentUid differs)
+    if (rStudentUid) {
+      return rStudentUid === callerUid;
+    }
+    if (rStudentEmail && callerEmail) {
+      return rStudentEmail === callerEmail;
+    }
+    return false;
+  };
+
   if (sessionKey || queryLessonId) {
+    const canonicalStudentContextUid = isCallerAdmin
+      ? queryStudentUid
+      : (isCallerTeacher ? resolvedTeacherTargetStudentUid : callerUid);
+    const canonicalStudentContextEmail = isCallerAdmin
+      ? queryStudentEmail
+      : (isCallerTeacher ? queryStudentEmail : callerEmail);
+
     const canonicalKey = getCanonicalSessionKey({
       lessonId: queryLessonId || undefined,
       sessionKey,
-      studentUid: caller.uid,
-      studentEmail: caller.email,
+      studentUid: canonicalStudentContextUid || undefined,
+      studentEmail: canonicalStudentContextEmail || undefined,
     });
     const candidateKeys = Array.from(new Set([
       sessionKey,
@@ -11934,28 +12900,103 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
       sessionKey ? sessionKey.replace(/^session_/, '').replace(/^lesson_/, '') : '',
     ].filter(Boolean)));
 
+    // 0. Inspect underlying session_notes or lessons ownership BEFORE looking up or reconstructing transformations
+    let underlyingOwner: { studentUid?: string; studentEmail?: string; teacherUid?: string } | undefined;
+    for (const key of candidateKeys) {
+      const memNote = db.sessionNotesMap?.[key];
+      if (memNote) {
+        underlyingOwner = {
+          studentUid: memNote.studentUid,
+          studentEmail: memNote.studentEmail,
+          teacherUid: memNote.teacherUid,
+        };
+        if (!(await canCallerAccessRecord(memNote))) {
+          return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to student notes.' });
+        }
+        break;
+      }
+    }
+
+    if (!underlyingOwner) {
+      for (const key of candidateKeys) {
+        try {
+          const fsNote = await fetchSessionNotesFromFirestoreServer(key);
+          if (fsNote) {
+            underlyingOwner = {
+              studentUid: fsNote.studentUid,
+              studentEmail: fsNote.studentEmail,
+              teacherUid: fsNote.teacherUid,
+            };
+            if (!(await canCallerAccessRecord(fsNote))) {
+              return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to student notes.' });
+            }
+            break;
+          }
+        } catch {}
+      }
+    }
+
+    if (!underlyingOwner) {
+      const fs = getFirestoreDb();
+      if (fs) {
+        for (const cid of Array.from(new Set([queryLessonId, queryLessonId.replace(/^lesson_/, ''), sessionKey].filter(Boolean)))) {
+          try {
+            const lSnap = await fs.collection('lessons').doc(cid).get().catch(() => null);
+            if (lSnap && lSnap.exists) {
+              const lData = lSnap.data() || {};
+              underlyingOwner = {
+                studentUid: lData.studentUid,
+                studentEmail: lData.studentEmail,
+                teacherUid: lData.teacherUid || lData.teacherAuthUid,
+              };
+              if (!(await canCallerAccessRecord(lData))) {
+                return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to student notes.' });
+              }
+              break;
+            }
+          } catch {}
+        }
+      }
+    }
+
     let transformation: any = null;
     // 1. Check in-memory pedagogicalTransformationsMap across candidate keys
     for (const key of candidateKeys) {
-      if (db.pedagogicalTransformationsMap?.[key]) {
-        const candidate = db.pedagogicalTransformationsMap[key];
-        if (candidate && candidate.isAiGenerated && !candidate.isProvisional && !isLegacyGenericTransformation(candidate, candidate.rawNotesSnippet)) {
-          if (!contentHash || candidate.contentHash === contentHash) {
-            transformation = candidate;
+      const directCand = db.pedagogicalTransformationsMap?.[key];
+      if (directCand) {
+        if (!(await canCallerAccessRecord(directCand, underlyingOwner))) {
+          return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to student notes.' });
+        }
+        if (directCand.isAiGenerated && !directCand.isProvisional && !isLegacyGenericTransformation(directCand, directCand.rawNotesSnippet)) {
+          if ((!language || directCand.language === language) && (!contentHash || directCand.contentHash === contentHash)) {
+            transformation = directCand;
             break;
           }
         }
       }
-      const match = Object.entries(db.pedagogicalTransformationsMap || {}).find(([k, v]: [string, any]) => {
-        const matchKey = k === key || k.startsWith(`${key}__`);
-        const matchLang = !language || v?.language === language;
-        const matchHash = !contentHash || v?.contentHash === contentHash;
-        return matchKey && matchLang && matchHash && v?.isAiGenerated && !v?.isProvisional && !isLegacyGenericTransformation(v, v?.rawNotesSnippet);
-      });
-      if (match) {
-        transformation = match[1];
-        break;
+
+      const matchingEntries = Object.entries(db.pedagogicalTransformationsMap || {}).filter(
+        ([k]: [string, any]) => k === key || k.startsWith(`${key}__`)
+      );
+      for (const [, v] of matchingEntries) {
+        if (!v || typeof v !== 'object') continue;
+        if (!(await canCallerAccessRecord(v, underlyingOwner))) {
+          return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to student notes.' });
+        }
+        const matchLang = !language || (v as any).language === language;
+        const matchHash = !contentHash || (v as any).contentHash === contentHash;
+        if (
+          matchLang &&
+          matchHash &&
+          (v as any).isAiGenerated &&
+          !(v as any).isProvisional &&
+          !isLegacyGenericTransformation(v as any, (v as any).rawNotesSnippet)
+        ) {
+          transformation = v;
+          break;
+        }
       }
+      if (transformation) break;
     }
 
     // 2. Firestore fallback lookup if in-memory cache misses
@@ -11964,12 +13005,14 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
         try {
           const fsMatch = await fetchPedagogicalTransformationFromFirestoreServer(key, { language, contentHash });
           if (fsMatch && fsMatch.isAiGenerated && !fsMatch.isProvisional && !isLegacyGenericTransformation(fsMatch, fsMatch.rawNotesSnippet)) {
+            if (!(await canCallerAccessRecord(fsMatch, underlyingOwner))) {
+              return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to student notes.' });
+            }
             transformation = fsMatch;
-            const storeKey = fsMatch.cacheKey || `${sessionKey || queryLessonId}__hash_${fsMatch.contentHash || 'any'}__lang_${fsMatch.language || language || 'pt'}`;
+            const ownerScope = fsMatch.studentUid ? `__uid_${fsMatch.studentUid}` : '';
+            const storeKey = fsMatch.cacheKey || `${sessionKey || queryLessonId}${ownerScope}__hash_${fsMatch.contentHash || 'any'}__lang_${fsMatch.language || language || 'pt'}`;
             if (!db.pedagogicalTransformationsMap) db.pedagogicalTransformationsMap = {};
             db.pedagogicalTransformationsMap[storeKey] = fsMatch;
-            if (sessionKey) db.pedagogicalTransformationsMap[sessionKey] = fsMatch;
-            if (queryLessonId) db.pedagogicalTransformationsMap[queryLessonId] = fsMatch;
             break;
           }
         } catch (fsErr) {
@@ -11978,18 +13021,20 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
       }
     }
 
-    // 3. View Journal & My Dictionary fallback: recognize already fed definitions
-    if (!transformation && caller.role === 'student') {
+    // 3. View Journal & My Dictionary fallback: recognize already fed definitions (strictly for caller student)
+    if (!transformation && !isCallerAdmin && !isCallerTeacher) {
       for (const key of candidateKeys) {
         try {
-          const reconstructed = await reconstructTransformationFromJournalAndDictionaryServer(caller.uid, key);
+          const reconstructed = await reconstructTransformationFromJournalAndDictionaryServer(callerUid, key);
           if (reconstructed && (reconstructed.vocabularyAndExpressions?.length > 0 || reconstructed.mistakesAnalysis?.length > 0 || reconstructed.grammarPoints?.length > 0)) {
-            transformation = reconstructed;
-            const storeKey = `${sessionKey || queryLessonId}__reconstructed__lang_${language || 'pt'}`;
+            transformation = {
+              ...reconstructed,
+              studentUid: callerUid,
+              studentEmail: reconstructed.studentEmail || callerEmail,
+            };
+            const storeKey = `${sessionKey || queryLessonId}__uid_${callerUid}__reconstructed__lang_${language || 'pt'}`;
             if (!db.pedagogicalTransformationsMap) db.pedagogicalTransformationsMap = {};
-            db.pedagogicalTransformationsMap[storeKey] = reconstructed;
-            if (sessionKey) db.pedagogicalTransformationsMap[sessionKey] = reconstructed;
-            if (queryLessonId) db.pedagogicalTransformationsMap[queryLessonId] = reconstructed;
+            db.pedagogicalTransformationsMap[storeKey] = transformation;
             break;
           }
         } catch (recErr) {
@@ -11999,13 +13044,8 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
     }
 
     if (transformation) {
-      if (caller.role === 'student') {
-        const callerEmail = (caller.email || '').toLowerCase().trim();
-        const tEmail = (transformation.studentEmail || '').toLowerCase().trim();
-        const tUid = transformation.studentUid || '';
-        if ((tUid && tUid !== caller.uid) || (tEmail && tEmail !== callerEmail)) {
-          return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to student notes.' });
-        }
+      if (!(await canCallerAccessRecord(transformation, underlyingOwner))) {
+        return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to student notes.' });
       }
       return res.json(transformation);
     }
@@ -12014,25 +13054,50 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
     return res.json(null);
   }
 
-  if (caller.role === 'student') {
-    const callerEmail = (caller.email || '').toLowerCase().trim();
-    const list = Object.values(db.pedagogicalTransformationsMap || {}).filter(
-      (t: any) =>
-        ((t.studentUid && t.studentUid === caller.uid) ||
-         (t.studentEmail && (t.studentEmail || '').toLowerCase().trim() === callerEmail)) &&
-        (!language || t.language === language)
-    );
+  // Listing endpoint when both sessionKey and lessonId are absent
+  if (!isCallerAdmin && !isCallerTeacher) {
+    const list = Object.values(db.pedagogicalTransformationsMap || {}).filter((t: any) => {
+      if (!t || typeof t !== 'object') return false;
+      if (language && t.language !== language) return false;
+      const tUid = String(t.studentUid || '').trim();
+      const tEmail = String(t.studentEmail || '').toLowerCase().trim();
+      if (tUid) return tUid === callerUid;
+      return Boolean(callerEmail && tEmail && tEmail === callerEmail);
+    });
     return res.json(list);
   }
 
-  if (studentUid) {
-    const list = Object.values(db.pedagogicalTransformationsMap || {}).filter(
-      (t: any) => t.studentUid === studentUid && (!language || t.language === language)
-    );
+  if (isCallerTeacher && !isCallerAdmin) {
+    const authorizedList: any[] = [];
+    for (const t of Object.values(db.pedagogicalTransformationsMap || {})) {
+      if (!t || typeof t !== 'object') continue;
+      if (language && (t as any).language !== language) continue;
+      if (resolvedTeacherTargetStudentUid && String((t as any).studentUid || '').trim() !== resolvedTeacherTargetStudentUid) {
+        continue;
+      }
+      if (await canCallerAccessRecord(t)) {
+        authorizedList.push(t);
+      }
+    }
+    return res.json(authorizedList);
+  }
+
+  // Admin caller
+  if (queryStudentUid || queryStudentEmail) {
+    const list = Object.values(db.pedagogicalTransformationsMap || {}).filter((t: any) => {
+      if (!t || typeof t !== 'object') return false;
+      if (language && t.language !== language) return false;
+      if (queryStudentUid && t.studentUid !== queryStudentUid) return false;
+      if (queryStudentEmail && String(t.studentEmail || '').toLowerCase().trim() !== queryStudentEmail) return false;
+      return true;
+    });
     return res.json(list);
   }
 
-  res.json(Object.values(db.pedagogicalTransformationsMap || {}));
+  const adminList = Object.values(db.pedagogicalTransformationsMap || {}).filter(
+    (t: any) => !language || (t && t.language === language)
+  );
+  return res.json(adminList);
 });
 
 // ============================================================================
@@ -13133,13 +14198,18 @@ ${batchToEnrich.map((w, i) => `${i + 1}. ${w}`).join('\n')}`;
 });
 
 
-// Endpoint: Get student journal entries (Requires authentication; strictly uses caller UID)
-// Endpoint: Get student journal entries (Requires authentication; strictly uses caller UID)
+// Endpoint: Get student journal entries (Requires authentication; strictly uses canonical UID)
 app.get('/api/student-journal', firebaseAuthMiddleware, async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   const caller = req.user!;
   const callerUid = caller.uid;
-  const callerEmail = (caller.email || '').toLowerCase().trim();
+
+  if (!getFirestoreDb()) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
+  }
 
   const requestedUid = ((req.query.uid as string) || (req.query.studentUid as string) || '').trim();
   const requestedEmail = ((req.query.email as string) || (req.query.studentEmail as string) || '').toLowerCase().trim();
@@ -13163,11 +14233,18 @@ app.get('/api/student-journal', firebaseAuthMiddleware, async (req, res) => {
     targetUid = identityRes.canonicalStudentUid || callerUid;
   }
 
+  if (!isValidCanonicalUid(targetUid)) {
+    return res.status(422).json({
+      error: 'Unprocessable Entity',
+      message: 'Invalid or non-canonical student UID.',
+    });
+  }
+
   const fsEntries = await fetchStudentDailyJournalFromServerFirestore(targetUid);
   return res.json(fsEntries || []);
 });
 
-// Endpoint: Save student journal entry (Requires authentication; strictly uses caller UID)
+// Endpoint: Save student daily journal entry (Requires authentication; persists solely in users/{uid}/journal/{entryId})
 app.post('/api/student-journal', firebaseAuthMiddleware, async (req, res) => {
   const caller = req.user!;
   const callerUid = caller.uid;
@@ -13175,14 +14252,21 @@ app.post('/api/student-journal', firebaseAuthMiddleware, async (req, res) => {
   const { studentUid, studentEmail, entry } = req.body || {};
   const cleanUid = (studentUid || '').trim();
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
+  const entryUid = (entry?.studentUid || '').trim();
+  const entryEmail = (entry?.studentEmail || '').toLowerCase().trim();
 
   if (caller.role !== 'admin') {
-    if (cleanUid && cleanUid !== callerUid) {
+    if (caller.role === 'teacher') {
+      return res.status(403).json({ error: 'Forbidden', message: 'Teachers cannot modify student journal entries.' });
+    }
+    if ((cleanUid && cleanUid !== callerUid) || (entryUid && entryUid !== callerUid)) {
       return res.status(403).json({ error: 'Forbidden', message: 'Cannot write journal of another user.' });
     }
-    if (cleanEmail && callerEmail && cleanEmail !== callerEmail) {
+    if ((cleanEmail && callerEmail && cleanEmail !== callerEmail) || (entryEmail && callerEmail && entryEmail !== callerEmail)) {
       return res.status(403).json({ error: 'Forbidden', message: 'Cannot write journal of another user.' });
     }
+  } else if (cleanUid && entryUid && cleanUid !== entryUid) {
+    return res.status(403).json({ error: 'Forbidden', message: 'Conflicting studentUid in payload.' });
   }
 
   if (!entry || !entry.id) {
@@ -13190,39 +14274,22 @@ app.post('/api/student-journal', firebaseAuthMiddleware, async (req, res) => {
   }
 
   const targetUid = (caller.role === 'admin' && cleanUid) ? cleanUid : callerUid;
-  const db = getFirestoreDb();
-  if (!db) {
-    return res.status(500).json({ error: 'Firestore database not available' });
+  if (!isValidCanonicalUid(targetUid)) {
+    return res.status(422).json({ error: 'Unprocessable Entity', message: 'Invalid or non-canonical student UID.' });
   }
 
-  try {
-    const cleanEntry = removeUndefinedFields({
-      ...entry,
-      studentUid: targetUid,
-      updatedAt: new Date().toISOString(),
+  const saveRes = await saveStudentDailyJournalEntryServer(targetUid, entry);
+  if (!saveRes.ok) {
+    return res.status(saveRes.statusCode || 500).json({
+      success: false,
+      error: saveRes.error || 'Failed to save journal entry to Firestore',
     });
-
-    const userRef = db.collection('users').doc(targetUid);
-    await userRef.collection('journal').doc(cleanEntry.id).set(cleanEntry, { merge: true });
-
-    const userSnap = await userRef.get().catch(() => null);
-    if (userSnap && userSnap.exists) {
-      const uData = userSnap.data();
-      const currentList = Array.isArray(uData?.dailyJournalEntries) ? uData.dailyJournalEntries : [];
-      const filtered = currentList.filter((e: any) => e.id !== cleanEntry.id);
-      await userRef.set({ dailyJournalEntries: [cleanEntry, ...filtered], updatedAt: new Date().toISOString() }, { merge: true });
-    } else {
-      await userRef.set({ dailyJournalEntries: [cleanEntry], updatedAt: new Date().toISOString() }, { merge: true });
-    }
-
-    return res.json({ success: true, entry: cleanEntry });
-  } catch (fsErr: any) {
-    console.warn('save journal error:', fsErr);
-    return res.status(500).json({ error: 'Failed to save journal entry to Firestore', details: fsErr?.message });
   }
+
+  return res.json({ success: true, entry: saveRes.entry });
 });
 
-// Endpoint: Delete student journal entry with strict Firebase Auth and canonical UID verification
+// Endpoint: Delete student daily journal entry with strict Firebase Auth and canonical UID verification
 app.delete('/api/student-journal', firebaseAuthMiddleware, async (req, res) => {
   const caller = req.user!;
   const callerUid = caller.uid;
@@ -13233,6 +14300,12 @@ app.delete('/api/student-journal', firebaseAuthMiddleware, async (req, res) => {
 
   // Security Gate: Non-admin users can ONLY delete entries from their own canonical UID
   if (caller.role !== 'admin') {
+    if (caller.role === 'teacher') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Teachers cannot delete student journal entries.',
+      });
+    }
     if (requestedUid && requestedUid !== callerUid) {
       return res.status(403).json({
         error: 'Forbidden',
@@ -13248,6 +14321,14 @@ app.delete('/api/student-journal', firebaseAuthMiddleware, async (req, res) => {
   }
 
   const targetUid = (caller.role === 'admin' && requestedUid) ? requestedUid : callerUid;
+  if (!isValidCanonicalUid(targetUid)) {
+    return res.status(422).json({ error: 'Unprocessable Entity', message: 'Invalid or non-canonical student UID.' });
+  }
+
+  if (!getFirestoreDb()) {
+    return res.status(503).json({ error: 'FirestoreUnavailable', message: 'Canonical Firestore (default) database is unavailable.' });
+  }
+
   const entryId = (req.query.id as string) || (req.body?.id as string) || (req.body?.entryId as string) || '';
 
   if (!entryId) {
@@ -13263,98 +14344,155 @@ app.delete('/api/student-journal', firebaseAuthMiddleware, async (req, res) => {
   return res.json({ success: true, deletedId: entryId });
 });
 
-// Endpoint: Student Journal Activity Log (Multi-device cloud synchronization for video, audio, memorization, lesson)
-app.get('/api/student-journal/activity', (req, res) => {
+async function authorizeJournalActivityAccess(
+  req: express.Request,
+  res: express.Response,
+  action: 'read' | 'write'
+) {
+  const nestedEntry = (req.body && req.body.entry && typeof req.body.entry === 'object') ? req.body.entry : null;
+  const topUid = ((req.body?.studentUid as string) || (req.body?.uid as string) || (req.query?.studentUid as string) || (req.query?.uid as string) || '').trim();
+  const topEmail = ((req.body?.studentEmail as string) || (req.body?.email as string) || (req.query?.studentEmail as string) || (req.query?.email as string) || '').toLowerCase().trim();
+  const nestedUid = ((nestedEntry?.studentUid as string) || (nestedEntry?.uid as string) || '').trim();
+  const nestedEmail = ((nestedEntry?.studentEmail as string) || (nestedEntry?.email as string) || '').toLowerCase().trim();
+
+  if (topUid && nestedUid && topUid !== nestedUid) {
+    res.status(403).json({
+      error: 'Forbidden',
+      message: 'Conflicting studentUid between request payload and nested activity entry.',
+    });
+    return null;
+  }
+  if (topEmail && nestedEmail && topEmail !== nestedEmail) {
+    res.status(403).json({
+      error: 'Forbidden',
+      message: 'Conflicting studentEmail between request payload and nested activity entry.',
+    });
+    return null;
+  }
+
+  let effectiveReq: express.Request = req;
+  if ((!topUid && nestedUid) || (!topEmail && nestedEmail)) {
+    effectiveReq = Object.create(req, {
+      body: {
+        value: {
+          ...(req.body || {}),
+          ...(topUid ? {} : nestedUid ? { studentUid: nestedUid } : {}),
+          ...(topEmail ? {} : nestedEmail ? { studentEmail: nestedEmail } : {}),
+        },
+        configurable: true,
+      },
+    });
+  }
+
+  const authCtx = await authorizeStudentRoutineAccess(effectiveReq, res, {
+    allowMissingTargetFallbackToCaller: true,
+    requireApprovedTeacherIfTutor: true,
+  });
+  if (!authCtx) return null;
+
+  if (action === 'write' && authCtx.effectiveRole === 'teacher') {
+    res.status(403).json({
+      error: 'Forbidden',
+      message: 'Teachers are not authorized to modify student activity journal.',
+    });
+    return null;
+  }
+
+  return authCtx;
+}
+
+// Endpoint: Student Activity Journal (ARCH.2F.2A Canonical Firestore-only: users/{uid}/activity_journal/{entryId})
+app.get('/api/student-journal/activity', firebaseAuthMiddleware, async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-  const db = readDb();
-  const studentEmail = ((req.query.studentEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
-  const uid = ((req.query.studentUid as string) || (req.query.uid as string) || '').trim();
+  const authCtx = await authorizeJournalActivityAccess(req, res, 'read');
+  if (!authCtx) return;
 
-  if (!db.studentActivityJournal) db.studentActivityJournal = {};
-  const fromEmail = (studentEmail && db.studentActivityJournal[studentEmail]) || [];
-  const fromUid = (uid && db.studentActivityJournal[uid]) || [];
-  const map = new Map<string, any>();
-  [...fromEmail, ...fromUid].forEach((e: any) => {
-    if (e?.id) map.set(e.id, e);
+  const fsRes = await fetchStudentActivityJournalFromServerFirestore(authCtx.canonicalStudentUid);
+  if (!fsRes.ok) {
+    return res.status(fsRes.statusCode || 500).json({
+      success: false,
+      error: fsRes.error || 'Failed to retrieve activity journal from Firestore.',
+    });
+  }
+
+  return res.json({
+    success: true,
+    studentUid: authCtx.canonicalStudentUid,
+    entries: fsRes.entries,
   });
-  const list = Array.from(map.values()).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-  res.json({ success: true, entries: list });
 });
 
-app.post('/api/student-journal/activity', async (req, res) => {
-  const db = readDb();
-  const { studentEmail, studentUid, entry } = req.body || {};
-  const cleanEmail = (studentEmail || '').toLowerCase().trim();
-  const cleanUid = (studentUid || '').trim();
+app.post('/api/student-journal/activity', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeJournalActivityAccess(req, res, 'write');
+  if (!authCtx) return;
 
-  if (!entry || (!cleanEmail && !cleanUid)) {
-    return res.status(400).json({ error: 'entry and studentEmail or studentUid are required' });
+  const entry = req.body?.entry;
+  if (!entry || typeof entry !== 'object') {
+    return res.status(400).json({
+      success: false,
+      error: 'entry object is required',
+    });
   }
 
-  if (!db.studentActivityJournal) db.studentActivityJournal = {};
-  const current = (cleanEmail && db.studentActivityJournal[cleanEmail]) || (cleanUid && db.studentActivityJournal[cleanUid]) || [];
-  const filtered = current.filter((e: any) => {
-    if (e.id === entry.id) return false;
-    if (
-      e.type === entry.type &&
-      e.week === entry.week &&
-      e.dayOfWeek &&
-      entry.dayOfWeek &&
-      e.dayOfWeek === entry.dayOfWeek
-    ) {
-      return false;
-    }
-    return true;
+  const saveRes = await upsertStudentActivityJournalEntryServer(
+    authCtx.canonicalStudentUid,
+    entry,
+    authCtx.canonicalStudentEmail
+  );
+
+  if (!saveRes.ok) {
+    return res.status(saveRes.statusCode || 500).json({
+      success: false,
+      error: saveRes.error || 'Failed to persist activity journal entry to Firestore.',
+    });
+  }
+
+  return res.json({
+    success: true,
+    firestoreConfirmed: true,
+    studentUid: authCtx.canonicalStudentUid,
+    entry: saveRes.entry,
+    entries: saveRes.entries || [],
   });
-  const updated = [entry, ...filtered];
-  if (cleanEmail) db.studentActivityJournal[cleanEmail] = updated;
-  if (cleanUid) db.studentActivityJournal[cleanUid] = updated;
-
-  if (cleanEmail && db.userProfiles?.[cleanEmail]) {
-    db.userProfiles[cleanEmail].studentJournal = updated;
-  }
-  if (cleanUid && db.userProfiles?.[cleanUid]) {
-    db.userProfiles[cleanUid].studentJournal = updated;
-  }
-
-  // Direct atomic write to Cloud Firestore by UID
-  const docId = cleanUid || cleanEmail;
-  if (docId) {
-    saveStudentJournalToFirestore(docId, updated).catch(() => {});
-  }
-
-  await writeDbSync(db);
-  res.json({ success: true, entries: updated });
 });
 
-app.delete('/api/student-journal/activity', async (req, res) => {
-  const db = readDb();
-  const { studentEmail, studentUid, type, dayOfWeek, week } = req.body || {};
-  const cleanEmail = (studentEmail || '').toLowerCase().trim();
-  const cleanUid = (studentUid || '').trim();
+app.delete('/api/student-journal/activity', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeJournalActivityAccess(req, res, 'write');
+  if (!authCtx) return;
 
-  if (!db.studentActivityJournal) db.studentActivityJournal = {};
-  const current = (cleanEmail && db.studentActivityJournal[cleanEmail]) || (cleanUid && db.studentActivityJournal[cleanUid]) || [];
-  const updated = current.filter((e: any) => !(e.type === type && e.dayOfWeek === dayOfWeek && e.week === week));
+  const entryId = ((req.body?.entryId as string) || (req.body?.id as string) || (req.query?.entryId as string) || (req.query?.id as string) || '').trim();
+  const type = ((req.body?.type as string) || (req.query?.type as string) || '').trim();
+  const dayOfWeek = ((req.body?.dayOfWeek as string) || (req.query?.dayOfWeek as string) || '').trim();
+  const week = req.body?.week ?? req.body?.weeklyCycle ?? req.body?.weekId ?? req.query?.week ?? req.query?.weeklyCycle ?? req.query?.weekId;
 
-  if (cleanEmail) db.studentActivityJournal[cleanEmail] = updated;
-  if (cleanUid) db.studentActivityJournal[cleanUid] = updated;
-
-  if (cleanEmail && db.userProfiles?.[cleanEmail]) {
-    db.userProfiles[cleanEmail].studentJournal = updated;
-  }
-  if (cleanUid && db.userProfiles?.[cleanUid]) {
-    db.userProfiles[cleanUid].studentJournal = updated;
+  if (!entryId && !type) {
+    return res.status(400).json({
+      success: false,
+      error: 'entryId/id or type is required to delete an activity journal entry.',
+    });
   }
 
-  // Direct atomic write to Cloud Firestore by UID
-  const docId = cleanUid || cleanEmail;
-  if (docId) {
-    saveStudentJournalToFirestore(docId, updated).catch(() => {});
+  const delRes = await deleteStudentActivityJournalEntryServer(authCtx.canonicalStudentUid, {
+    entryId: entryId || undefined,
+    type: type || undefined,
+    dayOfWeek: dayOfWeek || undefined,
+    week,
+  });
+
+  if (!delRes.ok) {
+    return res.status(delRes.statusCode || 500).json({
+      success: false,
+      error: delRes.error || 'Failed to delete activity journal entry from Firestore.',
+    });
   }
 
-  await writeDbSync(db);
-  res.json({ success: true, entries: updated });
+  return res.json({
+    success: true,
+    firestoreConfirmed: true,
+    studentUid: authCtx.canonicalStudentUid,
+    deletedIds: delRes.deletedIds || [],
+    entries: delRes.entries || [],
+  });
 });
 
 // Endpoint: Strict UID correlation verification between Student and Native Friend

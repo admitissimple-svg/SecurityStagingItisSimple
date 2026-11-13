@@ -1230,6 +1230,17 @@ export async function saveStudentJournalEntryToFirestore(
     throw new Error('Server did not confirm journal entry persistence');
   }
 
+  if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+    window.dispatchEvent(
+      new CustomEvent('its-simple:daily-journal-updated', {
+        detail: {
+          studentUid: cleanUid,
+          entry: sanitizedEntry,
+        },
+      })
+    );
+  }
+
   return true;
 }
 
@@ -2664,30 +2675,75 @@ export async function saveMemorizationCompletionToFirestore(
       return false;
     }
 
-    // 2c. Multi-device studentJournal activity log
-    const journalEntryId = `memorization_${day}_${resolvedCycle}`;
-    const journalEntry: StudentJournalEntry = {
-      id: journalEntryId,
-      type: 'memorization',
-      date: getDateForDayInCurrentWeek(day),
-      dayOfWeek: day,
-      week: resolvedCycle,
-      timestamp: Date.now(),
-      title: 'Weekly Memorization Activity',
-      details: `Completed Memorization for ${day}`,
-      studentUid: canonicalUid,
-      studentEmail: cleanEmail,
-    };
-
-    fetch('/api/student-journal/activity', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
+    // 2c. Multi-device canonical Activity Journal log (POST on complete, DELETE on uncheck)
+    let activityUpdatedEntries: StudentJournalEntry[] | undefined;
+    if (isCompleted) {
+      const journalEntryId = `memorization_${day}_${resolvedCycle}`;
+      const journalEntry: StudentJournalEntry = {
+        id: journalEntryId,
+        type: 'memorization',
+        date: getDateForDayInCurrentWeek(day),
+        dayOfWeek: day,
+        week: resolvedCycle,
+        timestamp: Date.now(),
+        title: 'Weekly Memorization Activity',
+        details: `Completed Memorization for ${day}`,
         studentUid: canonicalUid,
-        ...(safeStudentEmail ? { studentEmail: safeStudentEmail } : {}),
-        entry: journalEntry,
-      }),
-    }).catch(() => {});
+        studentEmail: cleanEmail,
+      };
+
+      const actRes = await fetch('/api/student-journal/activity', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          studentUid: canonicalUid,
+          ...(safeStudentEmail ? { studentEmail: safeStudentEmail } : {}),
+          entry: journalEntry,
+        }),
+      }).catch(() => null);
+
+      if (actRes && actRes.ok) {
+        const actJson = await actRes.json().catch(() => null);
+        if (Array.isArray(actJson?.entries)) {
+          activityUpdatedEntries = actJson.entries;
+        }
+      } else if (actRes) {
+        console.warn(`[studentPersistence] saveMemorizationCompletionToFirestore: activity POST failed HTTP ${actRes.status}`);
+      }
+    } else {
+      const delRes = await fetch('/api/student-journal/activity', {
+        method: 'DELETE',
+        headers,
+        body: JSON.stringify({
+          studentUid: canonicalUid,
+          ...(safeStudentEmail ? { studentEmail: safeStudentEmail } : {}),
+          type: 'memorization',
+          dayOfWeek: day,
+          week: resolvedCycle,
+        }),
+      }).catch(() => null);
+
+      if (delRes && delRes.ok) {
+        const delJson = await delRes.json().catch(() => null);
+        if (Array.isArray(delJson?.entries)) {
+          activityUpdatedEntries = delJson.entries;
+        }
+      } else if (delRes) {
+        console.warn(`[studentPersistence] saveMemorizationCompletionToFirestore: activity DELETE failed HTTP ${delRes.status}`);
+      }
+    }
+
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(
+        new CustomEvent('its-simple:activity-journal-updated', {
+          detail: {
+            studentUid: canonicalUid,
+            studentEmail: safeStudentEmail || cleanEmail,
+            entries: activityUpdatedEntries,
+          },
+        })
+      );
+    }
 
     // Update in-memory session cache scoped to resolvedWeekId upon confirmed persistence
     const currentCached = getCachedWeeklyChecks(canonicalUid, cleanEmail, resolvedWeekId);
@@ -2943,67 +2999,52 @@ export function eliminateUndefinedFields<T>(obj: T): T {
 }
 
 /**
- * Persist an activity record directly to the student profile document: users/{studentUID}
- * Maintains an array and subcollection `studentJournal`.
- * Each completed activity record saves: { id, type, date, week, timestamp, dayOfWeek, ... }
+ * Persist an activity record to canonical Firestore (default) `users/{studentUID}/activity_journal/{entryId}`
+ * strictly via authenticated backend API `/api/student-journal/activity`.
+ * Zero Firebase Web SDK client writes or root array mirrors.
  */
 export async function recordActivityInStudentJournal(
   studentUid: string,
   entry: StudentJournalEntry,
   studentEmail?: string
 ): Promise<{ success: boolean; updatedJournal: StudentJournalEntry[] }> {
-  const db = getDb();
-  const cleanUid = normalizeUid(studentUid, studentEmail);
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
+  const cleanUid = normalizeUid(studentUid, cleanEmail);
+
+  if (!cleanUid) {
+    return { success: false, updatedJournal: [] };
+  }
+
+  // Strict week identity resolution:
+  // If an explicit week is supplied and malformed, reject immediately rather than silently substituting Week 1.
+  const isExplicitWeekSupplied =
+    entry.week !== undefined &&
+    entry.week !== null &&
+    (typeof entry.week !== 'string' || (entry.week as string).trim() !== '');
+
+  let resolvedWeek: number | null = null;
+  if (isExplicitWeekSupplied) {
+    resolvedWeek = parseWeekCycleNumber(entry.week);
+    if (resolvedWeek === null) {
+      console.warn(
+        `[studentPersistence] recordActivityInStudentJournal: Explicit week '${entry.week}' is malformed. Rejecting operation without substituting Week 1 or weeklyCycle.`
+      );
+      return { success: false, updatedJournal: [] };
+    }
+  }
 
   try {
-    let existingJournal: StudentJournalEntry[] = [];
-    let userData: any = null;
-    let userRef: any = null;
-
-    // 1. Fetch current user document to resolve data and weeklyCycle
-    if (db && cleanUid) {
-      userRef = doc(db, 'users', cleanUid);
-      const userSnap = await withFirestoreTimeout(getDoc(userRef), 2000, null);
-      if (userSnap && userSnap.exists()) {
-        userData = userSnap.data();
-        if (Array.isArray(userData?.studentJournal)) {
-          existingJournal = userData.studentJournal;
-        }
-      }
+    const token = await getAccessToken().catch(() => null);
+    if (typeof window !== 'undefined' && !token) {
+      console.warn('[studentPersistence] recordActivityInStudentJournal: missing Firebase ID token.');
+      return { success: false, updatedJournal: [] };
     }
 
-    // 2. Strict week identity resolution:
-    // First resolve an explicitly supplied valid week.
-    // If the week is missing, resolve it from the student's persisted weeklyCycle.
-    // If an explicitly supplied week is malformed, reject it rather than silently replacing it.
-    // If no valid week can be determined, do not write or remove weekly completion checks.
-    // Never substitute Week 1 automatically.
-    const isExplicitWeekSupplied = entry.week !== undefined && entry.week !== null && (typeof entry.week !== 'string' || (entry.week as string).trim() !== '');
-
-    let resolvedWeek: number | null = null;
-    if (isExplicitWeekSupplied) {
-      resolvedWeek = parseWeekCycleNumber(entry.week);
-      if (resolvedWeek === null) {
-        // Explicit week is malformed: reject rather than silently replacing
-        console.warn(
-          `[studentPersistence] recordActivityInStudentJournal: Explicit week '${entry.week}' is malformed. Rejecting operation without substituting Week 1 or weeklyCycle.`
-        );
-        return { success: false, updatedJournal: existingJournal };
-      }
-    } else {
-      // Week is missing: resolve from student's persisted weeklyCycle
-      resolvedWeek = parseWeekCycleNumber(userData?.weeklyCycle) ?? 1;
-    }
-
-    if (!resolvedWeek) {
-      resolvedWeek = 1;
-    }
-
-    const sanitizedEntry: StudentJournalEntry = {
+    const weekPart = resolvedWeek ?? 'current';
+    const sanitizedEntry: Record<string, any> = {
       id: String(
         entry.id && !entry.id.startsWith('video_') && !entry.id.startsWith('audio_') && !entry.id.startsWith('memorization_')
-          ? `${entry.type}_${entry.dayOfWeek || 'any'}_${resolvedWeek}_${entry.id}`
+          ? `${entry.type}_${entry.dayOfWeek || 'any'}_${weekPart}_${entry.id}`
           : (entry.id || `${entry.type}_${entry.dayOfWeek || 'any'}_${Date.now()}`)
       ).trim(),
       type: entry.type,
@@ -3012,7 +3053,7 @@ export async function recordActivityInStudentJournal(
       studentUid: cleanUid,
       ...(entry.dayOfWeek ? { dayOfWeek: entry.dayOfWeek } : {}),
       ...(cleanEmail ? { studentEmail: cleanEmail } : {}),
-      week: resolvedWeek,
+      ...(resolvedWeek !== null ? { week: resolvedWeek } : {}),
     };
 
     if (entry.title) sanitizedEntry.title = String(entry.title).trim();
@@ -3021,149 +3062,71 @@ export async function recordActivityInStudentJournal(
     if (entry.url) sanitizedEntry.url = String(entry.url).trim();
     if (entry.details) sanitizedEntry.details = String(entry.details).trim();
     if ((entry as any).completedAt) (sanitizedEntry as any).completedAt = (entry as any).completedAt;
+    if ((entry as any).isRepeat !== undefined) (sanitizedEntry as any).isRepeat = Boolean((entry as any).isRepeat);
+    if ((entry as any).isRepeatVideo !== undefined) (sanitizedEntry as any).isRepeatVideo = Boolean((entry as any).isRepeatVideo);
 
-    if (db && cleanUid && userRef) {
-      // Check if entry for same type + dayOfWeek + week already exists, or same id
-      const filtered = existingJournal.filter((e) => {
-        if (!e) return false;
-        if (e.id && e.id === sanitizedEntry.id) return false;
-        if (
-          e.type === sanitizedEntry.type &&
-          e.week === sanitizedEntry.week &&
-          e.dayOfWeek &&
-          sanitizedEntry.dayOfWeek &&
-          e.dayOfWeek.toLowerCase() === sanitizedEntry.dayOfWeek.toLowerCase()
-        ) {
-          return false;
-        }
-        return true;
-      });
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
 
-      const updatedJournal = [sanitizedEntry, ...filtered];
+    const res = await fetch('/api/student-journal/activity', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        studentUid: cleanUid,
+        ...(cleanEmail ? { studentEmail: cleanEmail } : {}),
+        entry: eliminateUndefinedFields(sanitizedEntry),
+      }),
+    });
 
-      // Prepare updated weeklyChecks and watched/listened arrays for complete cross-compatibility
-      const stepId = mapJournalTypeToStepId(sanitizedEntry.type);
-      const checkKey = stepId && stepId !== 'tutor_live' && sanitizedEntry.dayOfWeek ? `${stepId}_${sanitizedEntry.dayOfWeek.toLowerCase()}` : null;
-      const currentChecks = userData?.weeklyChecks || {};
-      const updatedChecks = checkKey ? { ...currentChecks, [checkKey]: true } : currentChecks;
-
-      const entryCycle = resolvedWeek;
-      const targetWeekId = `week-${entryCycle}`;
-
-      // Update week-specific weeklyChecks document users/{cleanUid}/weeklyChecks/{targetWeekId}
-      if (checkKey) {
-        try {
-          const weekDocRef = doc(db, 'users', cleanUid, 'weeklyChecks', targetWeekId);
-          let existingWeekChecks: Record<string, boolean> = {};
-          const wSnap = await withFirestoreTimeout(getDoc(weekDocRef), 1500, null);
-          if (wSnap && wSnap.exists()) {
-            const wData = wSnap.data();
-            existingWeekChecks = {
-              ...(wData?.checks || {}),
-              ...(wData?.weeklyChecks || {}),
-              ...(wData?.sPathChecks || {}),
-            };
-          } else {
-            existingWeekChecks = { ...(currentChecks || {}) };
-          }
-
-          const updatedWeekChecks = {
-            ...existingWeekChecks,
-            [checkKey]: true,
-          };
-
-          const cleanWeekChecksPayload = eliminateUndefinedFields(
-            stampSchemaVersion({
-              id: targetWeekId,
-              weekId: targetWeekId,
-              weeklyCycle: entryCycle,
-              checks: updatedWeekChecks,
-              weeklyChecks: updatedWeekChecks,
-              sPathChecks: updatedWeekChecks,
-              updatedAt: new Date().toISOString(),
-              studentUid: cleanUid,
-              studentEmail: cleanEmail || null,
-            })
-          );
-
-          await withFirestoreTimeout(
-            setDoc(weekDocRef, cleanWeekChecksPayload, { merge: true }),
-            2000,
-            null
-          );
-
-          cacheWeeklyChecksLocally(cleanUid, cleanEmail, updatedWeekChecks, targetWeekId);
-        } catch (weekErr) {
-          console.warn(`Notice updating weekDoc for ${targetWeekId}:`, weekErr);
-        }
-      }
-
-      const payload: Record<string, any> = {
-        studentJournal: updatedJournal,
-        updatedAt: new Date().toISOString(),
-        weeklyChecks: updatedChecks,
-        sPathChecks: updatedChecks,
-      };
-
-      if (sanitizedEntry.type === 'video' && sanitizedEntry.id) {
-        const curWatched = userData?.watchedVideosHistory || [];
-        if (!curWatched.includes(sanitizedEntry.id)) {
-          payload.watchedVideosHistory = [...curWatched, sanitizedEntry.id];
-        }
-      } else if (sanitizedEntry.type === 'audio' && sanitizedEntry.id) {
-        const curListened = userData?.listenedTracksHistory || [];
-        const exists = curListened.some((t: any) =>
-          typeof t === 'string' ? t === sanitizedEntry.id : t?.id === sanitizedEntry.id || t?.trackId === sanitizedEntry.id
-        );
-        if (!exists) {
-          payload.listenedTracksHistory = [
-            ...curListened,
-            { id: sanitizedEntry.id, trackId: sanitizedEntry.id, title: sanitizedEntry.title || '', artist: sanitizedEntry.artist || '' },
-          ];
-        }
-      }
-
-      const cleanUserPayload = eliminateUndefinedFields(payload);
-      const cleanSanitizedEntry = eliminateUndefinedFields(sanitizedEntry);
-
-      // Direct write to users/{cleanUid} with safe fallback
-      if (cleanUid && isValidCanonicalUid(cleanUid) && userRef) {
-        try {
-          await withFirestoreTimeout(setDoc(userRef, cleanUserPayload, { merge: true }), 3500, null);
-
-          // Write discrete entry to subcollection users/{cleanUid}/studentJournal/{entryId}
-          const entryRef = doc(db, 'users', cleanUid, 'studentJournal', cleanSanitizedEntry.id);
-          await withFirestoreTimeout(setDoc(entryRef, cleanSanitizedEntry, { merge: true }), 2000, null);
-        } catch (fsErr) {
-          console.warn('[studentPersistence] Firestore journal direct write notice:', fsErr);
-        }
-      }
-
-      // Mirror to server backend API
-      try {
-        fetch('/api/student-journal/activity', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            studentUid: cleanUid,
-            studentEmail: cleanEmail,
-            entry: sanitizedEntry,
-          }),
-        }).catch(() => {});
-      } catch {}
-
-      return { success: true, updatedJournal };
+    if (!res.ok) {
+      console.error(`[studentPersistence] recordActivityInStudentJournal: failed HTTP ${res.status}`);
+      return { success: false, updatedJournal: [] };
     }
 
-    return { success: false, updatedJournal: existingJournal };
+    const data = await res.json().catch(() => null);
+    if (!data || data.success === false) {
+      console.error('[studentPersistence] recordActivityInStudentJournal: server rejected:', data);
+      return { success: false, updatedJournal: [] };
+    }
+
+    const updatedJournal: StudentJournalEntry[] = Array.isArray(data.entries)
+      ? [...data.entries].sort((a, b) => (b?.timestamp || 0) - (a?.timestamp || 0))
+      : [sanitizedEntry];
+
+    const effectiveWeek = parseWeekCycleNumber(data?.entry?.week ?? resolvedWeek);
+    const stepId = mapJournalTypeToStepId(sanitizedEntry.type);
+    const checkKey =
+      stepId && stepId !== 'tutor_live' && sanitizedEntry.dayOfWeek
+        ? `${stepId}_${sanitizedEntry.dayOfWeek.toLowerCase()}`
+        : null;
+    if (checkKey && effectiveWeek !== null) {
+      const targetWeekId = `week-${effectiveWeek}`;
+      const currentCached = getCachedWeeklyChecks(cleanUid, cleanEmail, targetWeekId);
+      cacheWeeklyChecksLocally(cleanUid, cleanEmail, { ...currentCached, [checkKey]: true }, targetWeekId);
+    }
+
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(
+        new CustomEvent('its-simple:activity-journal-updated', {
+          detail: {
+            studentUid: cleanUid,
+            studentEmail: cleanEmail,
+            entries: updatedJournal,
+          },
+        })
+      );
+    }
+
+    return { success: true, updatedJournal };
   } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, `users/${cleanUid}/studentJournal`);
+    console.warn('[studentPersistence] recordActivityInStudentJournal error:', error);
     return { success: false, updatedJournal: [] };
   }
 }
 
 /**
- * Remove an activity record from studentJournal (e.g. when unchecking an activity circle)
+ * Remove an activity record from canonical Firestore `users/{studentUID}/activity_journal`
+ * strictly via authenticated backend API `DELETE /api/student-journal/activity`.
  */
 export async function removeActivityFromStudentJournal(
   studentUid: string,
@@ -3172,276 +3135,230 @@ export async function removeActivityFromStudentJournal(
   week?: number | string | null,
   studentEmail?: string
 ): Promise<{ success: boolean; updatedJournal: StudentJournalEntry[] }> {
-  const db = getDb();
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
   const cleanUid = normalizeUid(studentUid, cleanEmail);
 
+  if (!cleanUid) {
+    return { success: false, updatedJournal: [] };
+  }
+
+  // Strict week identity resolution:
+  // If an explicitly supplied week is malformed, reject rather than silently replacing it.
+  const isExplicitWeekSupplied =
+    week !== undefined &&
+    week !== null &&
+    (typeof week !== 'string' || (week as string).trim() !== '');
+
+  let resolvedCycle: number | null = null;
+  if (isExplicitWeekSupplied) {
+    resolvedCycle = parseWeekCycleNumber(week);
+    if (resolvedCycle === null) {
+      console.warn(
+        `[studentPersistence] removeActivityFromStudentJournal: Explicit week '${week}' is malformed. Rejecting operation without substituting Week 1 or weeklyCycle.`
+      );
+      return { success: false, updatedJournal: [] };
+    }
+  }
+
   try {
-    let updatedJournal: StudentJournalEntry[] = [];
-    if (db && cleanUid) {
-      const userRef = doc(db, 'users', cleanUid);
-      const userSnap = await withFirestoreTimeout(getDoc(userRef), 2000, null);
-      if (userSnap && userSnap.exists()) {
-        const data = userSnap.data();
-        const curJournal: StudentJournalEntry[] = Array.isArray(data?.studentJournal) ? data.studentJournal : [];
+    const token = await getAccessToken().catch(() => null);
+    if (typeof window !== 'undefined' && !token) {
+      console.warn('[studentPersistence] removeActivityFromStudentJournal: missing Firebase ID token.');
+      return { success: false, updatedJournal: [] };
+    }
 
-        // Strict week identity resolution:
-        // First resolve an explicitly supplied valid week.
-        // If the week is missing, resolve it from the student's persisted weeklyCycle.
-        // If an explicitly supplied week is malformed, reject it rather than silently replacing it.
-        // If no valid week can be determined, do not write or remove weekly completion checks.
-        // Never substitute Week 1 automatically.
-        const isExplicitWeekSupplied = week !== undefined && week !== null && (typeof week !== 'string' || (week as string).trim() !== '');
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
 
-        let resolvedCycle: number | null = null;
-        if (isExplicitWeekSupplied) {
-          resolvedCycle = parseWeekCycleNumber(week);
-          if (resolvedCycle === null) {
-            // Explicitly supplied week is malformed: reject rather than silently replacing
-            console.warn(
-              `[studentPersistence] removeActivityFromStudentJournal: Explicit week '${week}' is malformed. Rejecting operation without substituting Week 1 or weeklyCycle.`
-            );
-            return { success: false, updatedJournal: curJournal };
-          }
-        } else {
-          // Week is missing: resolve from student's persisted weeklyCycle
-          resolvedCycle = parseWeekCycleNumber(data?.weeklyCycle);
-        }
+    const res = await fetch('/api/student-journal/activity', {
+      method: 'DELETE',
+      headers,
+      body: JSON.stringify({
+        studentUid: cleanUid,
+        ...(cleanEmail ? { studentEmail: cleanEmail } : {}),
+        type,
+        dayOfWeek,
+        ...(resolvedCycle !== null ? { week: resolvedCycle } : {}),
+      }),
+    });
 
-        if (!resolvedCycle) {
-          console.warn(
-            `[studentPersistence] removeActivityFromStudentJournal: Week identity cannot be determined for student ${cleanUid}. Refusing to remove weekly completion checks or default to Week 1.`
-          );
-          return { success: false, updatedJournal: curJournal };
-        }
+    if (!res.ok) {
+      console.error(`[studentPersistence] removeActivityFromStudentJournal: failed HTTP ${res.status}`);
+      return { success: false, updatedJournal: [] };
+    }
 
-        const targetCycle = resolvedCycle;
-        const targetWeekId = `week-${targetCycle}`;
+    const data = await res.json().catch(() => null);
+    if (!data || data.success === false) {
+      console.error('[studentPersistence] removeActivityFromStudentJournal: server rejected:', data);
+      return { success: false, updatedJournal: [] };
+    }
 
-        const toDelete: StudentJournalEntry[] = [];
-        updatedJournal = curJournal.filter((e) => {
-          if (e.type === type && e.week === targetCycle && e.dayOfWeek === dayOfWeek) {
-            toDelete.push(e);
-            return false;
-          }
-          return true;
-        });
+    const updatedJournal: StudentJournalEntry[] = Array.isArray(data.entries)
+      ? [...data.entries].sort((a, b) => (b?.timestamp || 0) - (a?.timestamp || 0))
+      : [];
 
-        const stepId = mapJournalTypeToStepId(type);
-        const checkKey = stepId && dayOfWeek ? `${stepId}_${dayOfWeek}` : null;
-        const curChecks = data.weeklyChecks || {};
-        const updatedChecks = checkKey ? { ...curChecks, [checkKey]: false } : curChecks;
+    const stepId = mapJournalTypeToStepId(type);
+    const checkKey = stepId && dayOfWeek ? `${stepId}_${String(dayOfWeek).toLowerCase()}` : null;
+    if (checkKey && resolvedCycle !== null) {
+      const targetWeekId = `week-${resolvedCycle}`;
+      const currentCached = getCachedWeeklyChecks(cleanUid, cleanEmail, targetWeekId);
+      cacheWeeklyChecksLocally(cleanUid, cleanEmail, { ...currentCached, [checkKey]: false }, targetWeekId);
+    }
 
-        // Update week-specific weeklyChecks document
-        try {
-          const weekDocRef = doc(db, 'users', cleanUid, 'weeklyChecks', targetWeekId);
-          let existingWeekChecks: Record<string, boolean> = {};
-          const wSnap = await withFirestoreTimeout(getDoc(weekDocRef), 1500, null);
-          if (wSnap && wSnap.exists()) {
-            const wData = wSnap.data();
-            existingWeekChecks = {
-              ...(wData?.checks || {}),
-              ...(wData?.weeklyChecks || {}),
-              ...(wData?.sPathChecks || {}),
-            };
-          }
-          const updatedWeekChecks = checkKey
-            ? {
-                ...existingWeekChecks,
-                [checkKey]: false,
-              }
-            : existingWeekChecks;
-          await withFirestoreTimeout(
-            setDoc(
-              weekDocRef,
-              stampSchemaVersion({
-                id: targetWeekId,
-                weekId: targetWeekId,
-                weeklyCycle: targetCycle,
-                checks: updatedWeekChecks,
-                weeklyChecks: updatedWeekChecks,
-                sPathChecks: updatedWeekChecks,
-                updatedAt: new Date().toISOString(),
-                studentUid: cleanUid,
-                studentEmail: cleanEmail || null,
-              }),
-              { merge: true }
-            ),
-            2000,
-            null
-          );
-          cacheWeeklyChecksLocally(cleanUid, cleanEmail, updatedWeekChecks, targetWeekId);
-        } catch (weekErr) {
-          console.warn(`Notice updating weekDoc in removeActivity:`, weekErr);
-        }
-
-        const payload: Record<string, any> = {
-          studentJournal: updatedJournal,
-          updatedAt: new Date().toISOString(),
-        };
-
-        // Only update legacy root weeklyChecks for Week 1 (backward compatibility)
-        if (targetCycle === 1) {
-          payload.weeklyChecks = updatedChecks;
-          payload.sPathChecks = updatedChecks;
-        }
-
-        await withFirestoreTimeout(setDoc(userRef, payload, { merge: true }), 3000, null);
-
-        // Delete from subcollection
-        for (const item of toDelete) {
-          if (item?.id) {
-            const subRef = doc(db, 'users', cleanUid, 'studentJournal', item.id);
-            await withFirestoreTimeout(deleteDoc(subRef), 1500, null);
-          }
-        }
-
-        // Mirror delete to server
-        fetch('/api/student-journal/activity', {
-          method: 'DELETE',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(
+        new CustomEvent('its-simple:activity-journal-updated', {
+          detail: {
             studentUid: cleanUid,
             studentEmail: cleanEmail,
-            type,
-            dayOfWeek,
-            week: targetCycle,
-          }),
-        }).catch(() => {});
-
-        return { success: true, updatedJournal };
-      }
+            entries: updatedJournal,
+          },
+        })
+      );
     }
-    return { success: false, updatedJournal: [] };
+
+    return { success: true, updatedJournal };
   } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, `users/${cleanUid}/studentJournal/remove`);
+    console.warn('[studentPersistence] removeActivityFromStudentJournal error:', error);
     return { success: false, updatedJournal: [] };
   }
 }
 
 /**
- * Fetch the complete studentJournal array from Firestore users/{studentUID}
+ * Fetch the complete Activity Journal array from authenticated backend API `/api/student-journal/activity`
+ * backed strictly by Firestore (default) `users/{studentUID}/activity_journal`.
  */
 export async function fetchStudentJournalActivitiesFromFirestore(
   studentUid: string,
   studentEmail?: string
 ): Promise<StudentJournalEntry[]> {
-  const db = getDb();
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
   const cleanUid = normalizeUid(studentUid, cleanEmail);
-  if (!db || !cleanUid) return [];
+  if (!cleanUid && !cleanEmail) return [];
 
   try {
-    const journalMap = new Map<string, StudentJournalEntry>();
-
-    // 1. Direct fetch from users/{cleanUid} document
-    const userRef = doc(db, 'users', cleanUid);
-    const userSnap = await withFirestoreTimeout(getDoc(userRef), 2500, null);
-    if (userSnap && userSnap.exists()) {
-      const data = userSnap.data();
-      if (Array.isArray(data?.studentJournal)) {
-        data.studentJournal.forEach((entry: StudentJournalEntry) => {
-          if (entry && entry.id) journalMap.set(entry.id, entry);
-        });
-      }
+    const token = await getAccessToken().catch(() => null);
+    if (typeof window !== 'undefined' && !token) {
+      return [];
     }
 
-    // 2. Fetch from subcollection users/{cleanUid}/studentJournal
-    const subColRef = collection(db, 'users', cleanUid, 'studentJournal');
-    const subSnap = await withFirestoreTimeout(getDocs(subColRef), 2000, null);
-    if (subSnap && !subSnap.empty) {
-      subSnap.forEach((d) => {
-        const entry = d.data() as StudentJournalEntry;
-        if (entry && entry.id && !journalMap.has(entry.id)) {
-          journalMap.set(entry.id, entry);
-        }
-      });
+    const params = new URLSearchParams();
+    if (cleanUid) params.set('studentUid', cleanUid);
+    if (cleanEmail) params.set('studentEmail', cleanEmail);
+
+    const headers: Record<string, string> = {
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
+    };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const res = await fetch(`/api/student-journal/activity?${params.toString()}`, { headers });
+    if (!res.ok) {
+      return [];
     }
 
-    // 3. Fallback: check legacy email doc if different and migrate
-    if (journalMap.size === 0 && cleanEmail) {
-      const legacyDocId = `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
-      if (legacyDocId !== cleanUid) {
-        const altRef = doc(db, 'users', legacyDocId);
-        const altSnap = await withFirestoreTimeout(getDoc(altRef), 2000, null);
-        if (altSnap && altSnap.exists()) {
-          const altData = altSnap.data();
-          if (Array.isArray(altData?.studentJournal)) {
-            altData.studentJournal.forEach((entry: StudentJournalEntry) => {
-              if (entry && entry.id) journalMap.set(entry.id, entry);
-            });
-            // Migrate to cleanUid
-            if (journalMap.size > 0 && cleanUid) {
-              setDoc(doc(db, 'users', cleanUid), {
-                studentJournal: Array.from(journalMap.values()),
-                updatedAt: new Date().toISOString(),
-              }, { merge: true }).catch(() => {});
-            }
-          }
-        }
-      }
+    const apiData = await res.json().catch(() => null);
+    if (!Array.isArray(apiData?.entries)) {
+      return [];
     }
 
-    // 4. Server API fallback if still empty
-    if (journalMap.size === 0 && (cleanEmail || cleanUid)) {
-      try {
-        const res = await fetch(
-          `/api/student-journal/activity?studentEmail=${encodeURIComponent(cleanEmail)}&studentUid=${encodeURIComponent(cleanUid)}`
-        );
-        if (res.ok) {
-          const apiData = await res.json();
-          if (Array.isArray(apiData?.entries)) {
-            apiData.entries.forEach((e: StudentJournalEntry) => {
-              if (e && e.id) journalMap.set(e.id, e);
-            });
-          }
-        }
-      } catch {}
-    }
-
-    const list = Array.from(journalMap.values());
-    list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    const list = [...apiData.entries] as StudentJournalEntry[];
+    list.sort((a, b) => (b?.timestamp || 0) - (a?.timestamp || 0));
     return list;
   } catch (error) {
-    handleFirestoreError(error, OperationType.GET, `users/${cleanUid}/studentJournal`);
+    console.warn('[studentPersistence] fetchStudentJournalActivitiesFromFirestore error:', error);
     return [];
   }
 }
 
 /**
- * Real-time subscription to studentJournal on users/{studentUID}
- * Ensures instantaneous cross-device synchronization between mobile and desktop!
+ * Real-time authenticated subscription to student Activity Journal via `/api/student-journal/activity`.
+ * Replaces blocked Firebase Web SDK onSnapshot with auth state hydration + cross-component event reactivity.
  */
 export function subscribeToStudentJournal(
   studentUid: string,
   studentEmail: string | undefined,
   callback: (journal: StudentJournalEntry[]) => void
 ): () => void {
-  const db = getDb();
-  const cleanUid = normalizeUid(studentUid, studentEmail);
-  if (!db || !cleanUid) {
+  const cleanEmail = (studentEmail || '').toLowerCase().trim();
+  const cleanUid = normalizeUid(studentUid, cleanEmail);
+  if (!cleanUid && !cleanEmail) {
     return () => {};
   }
 
-  const userRef = doc(db, 'users', cleanUid);
-  const unsubscribe = onSnapshot(
-    userRef,
-    (snap) => {
-      if (snap.exists()) {
-        const data = snap.data();
-        if (Array.isArray(data?.studentJournal)) {
-          const entries = [...data.studentJournal];
-          entries.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-          callback(entries);
-        }
-      }
-    },
-    (err) => {
-      console.warn('Real-time notice for studentJournal listener:', err);
-    }
-  );
+  let isCancelled = false;
 
-  return unsubscribe;
+  const fetchLatest = async () => {
+    if (isCancelled) return;
+    try {
+      const token = await getAccessToken().catch(() => null);
+      if (isCancelled) return;
+      if (typeof window !== 'undefined' && !token) return;
+
+      const params = new URLSearchParams();
+      if (cleanUid) params.set('studentUid', cleanUid);
+      if (cleanEmail) params.set('studentEmail', cleanEmail);
+
+      const headers: Record<string, string> = {
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+      };
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+
+      const res = await fetch(`/api/student-journal/activity?${params.toString()}`, { headers });
+      if (isCancelled || !res.ok) return;
+
+      const data = await res.json().catch(() => null);
+      if (isCancelled || !Array.isArray(data?.entries)) return;
+
+      const sorted = [...data.entries] as StudentJournalEntry[];
+      sorted.sort((a, b) => (b?.timestamp || 0) - (a?.timestamp || 0));
+      callback(sorted);
+    } catch (err) {
+      console.warn('Activity journal API sync notice:', err);
+    }
+  };
+
+  fetchLatest();
+
+  let unsubAuth: (() => void) | null = null;
+  if (typeof window !== 'undefined' && auth) {
+    try {
+      unsubAuth = onAuthStateChanged(auth, (user) => {
+        if (user && !isCancelled) {
+          fetchLatest();
+        }
+      });
+    } catch {}
+  }
+
+  const handleUpdatedEvent = (ev: Event) => {
+    if (isCancelled) return;
+    const detail = (ev as CustomEvent)?.detail;
+    const detailUid = String(detail?.studentUid || '').trim();
+    const detailEmail = String(detail?.studentEmail || '').toLowerCase().trim();
+    const uidMatch = !detailUid || !cleanUid || detailUid === cleanUid || detailUid === auth?.currentUser?.uid;
+    const emailMatch = !detailEmail || !cleanEmail || detailEmail === cleanEmail;
+    if (!uidMatch && !emailMatch) return;
+
+    if (Array.isArray(detail?.entries)) {
+      const sorted = [...detail.entries] as StudentJournalEntry[];
+      sorted.sort((a, b) => (b?.timestamp || 0) - (a?.timestamp || 0));
+      callback(sorted);
+    } else {
+      fetchLatest();
+    }
+  };
+
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('its-simple:activity-journal-updated', handleUpdatedEvent);
+  }
+
+  return () => {
+    isCancelled = true;
+    if (unsubAuth) unsubAuth();
+    if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      window.removeEventListener('its-simple:activity-journal-updated', handleUpdatedEvent);
+    }
+  };
 }
 
 /**
@@ -4267,8 +4184,8 @@ export function subscribeToStudentHomeworkProgress(
 }
 
 /**
- * Retrieve student daily journal entries via secure backend API.
- * Avoids client-side onSnapshot rule blocking while providing consistent data.
+ * Retrieve and reactively subscribe to student daily journal entries via secure backend API.
+ * Uses auth hydration + CustomEvent notifications without client-side onSnapshot.
  */
 export function subscribeToStudentDailyJournal(
   studentUid: string,
@@ -4280,18 +4197,52 @@ export function subscribeToStudentDailyJournal(
   if (!cleanUid) return () => {};
 
   let isSubscribed = true;
-  fetchStudentJournalFromFirestore(cleanUid, cleanEmail)
-    .then((entries) => {
+
+  const fetchLatest = async () => {
+    if (!isSubscribed) return;
+    try {
+      const currentUser = auth.currentUser;
+      if (!currentUser) return;
+      const entries = await fetchStudentJournalFromFirestore(cleanUid, cleanEmail);
       if (isSubscribed && Array.isArray(entries)) {
         callback(entries);
       }
-    })
-    .catch((err) => {
-      console.warn('Initial journal load notice:', err);
-    });
+    } catch (err) {
+      console.warn('Daily journal sync notice:', err);
+    }
+  };
+
+  fetchLatest();
+
+  let unsubAuth: (() => void) | null = null;
+  if (typeof window !== 'undefined' && auth) {
+    try {
+      unsubAuth = onAuthStateChanged(auth, (user) => {
+        if (user && isSubscribed) {
+          fetchLatest();
+        }
+      });
+    } catch {}
+  }
+
+  const handleUpdatedEvent = (ev: Event) => {
+    if (!isSubscribed) return;
+    const detail = (ev as CustomEvent)?.detail;
+    const detailUid = String(detail?.studentUid || '').trim();
+    if (detailUid && detailUid !== cleanUid && detailUid !== auth?.currentUser?.uid) return;
+    fetchLatest();
+  };
+
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('its-simple:daily-journal-updated', handleUpdatedEvent);
+  }
 
   return () => {
     isSubscribed = false;
+    if (unsubAuth) unsubAuth();
+    if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      window.removeEventListener('its-simple:daily-journal-updated', handleUpdatedEvent);
+    }
   };
 }
 
@@ -4331,7 +4282,18 @@ export async function deleteStudentJournalEntryFromFirestore(
       return false;
     }
     const resJson = await response.json().catch(() => null);
-    return Boolean(resJson && resJson.success);
+    const ok = Boolean(resJson && resJson.success);
+    if (ok && typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(
+        new CustomEvent('its-simple:daily-journal-updated', {
+          detail: {
+            studentUid: cleanUid,
+            deletedEntryId: entryId,
+          },
+        })
+      );
+    }
+    return ok;
   } catch (error) {
     console.warn('deleteStudentJournalEntryFromFirestore error:', error);
     return false;

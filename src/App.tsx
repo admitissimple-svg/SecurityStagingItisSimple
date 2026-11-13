@@ -1828,9 +1828,9 @@ export default function App() {
           const loadedCycle = parseWeekCycleNumber(loadedProfile?.weeklyCycle);
           fetchStudentJournalActivitiesFromFirestore(uid, email)
             .then((journalData) => {
-              if (Array.isArray(journalData) && journalData.length > 0) {
+              if (Array.isArray(journalData)) {
                 setStudentJournal(journalData);
-                if (loadedCycle !== null) {
+                if (loadedCycle !== null && journalData.length > 0) {
                   const derivedChecks = deriveWeeklyChecksFromJournal(journalData, loadedCycle);
                   setWeeklyChecks((prev) => ({ ...prev, ...derivedChecks }));
                 }
@@ -2285,14 +2285,34 @@ export default function App() {
 
   useEffect(() => {
     const uid = auth.currentUser?.uid || currentAccount?.uid || '';
+    const email = auth.currentUser?.email || currentAccount?.email || '';
     if (!uid) {
       activeJournalLoadUidRef.current = '';
       setDailyJournalEntries([]);
       return;
     }
 
+    activeJournalLoadUidRef.current = uid;
     loadDailyJournalEntries(uid);
-  }, [auth.currentUser?.uid, currentAccount?.uid, loadDailyJournalEntries]);
+    const unsubDaily = subscribeToStudentDailyJournal(uid, email, (entries) => {
+      if (activeJournalLoadUidRef.current === uid && Array.isArray(entries)) {
+        const seen = new Set<string>();
+        const uniqueData: DailyJournalEntry[] = [];
+        entries.forEach((item) => {
+          if (!item) return;
+          const id = String(item.id || '').trim();
+          if (!id) {
+            uniqueData.push(item);
+          } else if (!seen.has(id)) {
+            seen.add(id);
+            uniqueData.push(item);
+          }
+        });
+        setDailyJournalEntries(uniqueData);
+      }
+    });
+    return () => unsubDaily();
+  }, [auth.currentUser?.uid, currentAccount?.uid, currentAccount?.email, loadDailyJournalEntries]);
 
   // Real-time synchronization of studentJournal across all devices (Mobile <-> Desktop)
   useEffect(() => {
@@ -2308,7 +2328,7 @@ export default function App() {
         if (activeCycle !== null) {
           const derivedChecks = deriveWeeklyChecksFromJournal(journal, activeCycle);
           const currentCached = getCachedWeeklyChecks(uid, email, activeCycle);
-          setWeeklyChecks({ ...currentCached, ...derivedChecks });
+          setWeeklyChecks((prev) => ({ ...currentCached, ...prev, ...derivedChecks }));
         }
       }
     });
@@ -3920,7 +3940,7 @@ export default function App() {
           },
           email
         ).then((res) => {
-          if (res.updatedJournal) {
+          if (res.success && res.updatedJournal) {
             setStudentJournal(res.updatedJournal);
           }
         });
@@ -4239,7 +4259,7 @@ export default function App() {
             },
             email
           ).then((res) => {
-            if (res.updatedJournal) setStudentJournal(res.updatedJournal);
+            if (res.success && res.updatedJournal) setStudentJournal(res.updatedJournal);
           });
         } else {
           removeActivityFromStudentJournal(
@@ -4249,7 +4269,7 @@ export default function App() {
             activeCycle,
             email
           ).then((res) => {
-            if (res.updatedJournal) setStudentJournal(res.updatedJournal);
+            if (res.success && res.updatedJournal) setStudentJournal(res.updatedJournal);
           });
         }
 
