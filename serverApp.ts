@@ -9066,18 +9066,23 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
   let teacherResolution: any = null;
   let isCallerTeacher = false;
   if (!isCallerAdmin) {
-    try {
-      teacherResolution = await resolveTeacherCanonicalIdentity({
-        teacherUid: callerUid,
-        teacherEmail: req.user.email,
-        dbState: db,
+    const authCheck = await resolveApprovedTeacherForSessionNotes(callerUid, req.user.email, req.user.role, db);
+    if (authCheck.isApproved) {
+      isCallerTeacher = true;
+      teacherResolution = authCheck.resolution;
+    } else if (authCheck.callerKind === 'conflict') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'IDENTITY_CONFLICT',
+        message: 'Identity conflict detected on this account. Operation blocked to preserve canonical integrity.',
       });
-      if (teacherResolution && teacherResolution.isApproved) {
-        isCallerTeacher = true;
-      }
-    } catch {}
-
-    if (!teacherResolution || !teacherResolution.isApproved) {
+    } else if (authCheck.callerKind === 'pending_teacher') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'TEACHER_NOT_APPROVED',
+        message: 'Your Native Friend profile is pending administrator approval and cannot save pedagogical session notes yet.',
+      });
+    } else {
       return res.status(403).json({
         error: 'Forbidden',
         code: 'FORBIDDEN',
