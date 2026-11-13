@@ -1,9 +1,7 @@
-import { doc, setDoc, onSnapshot, getDoc } from 'firebase/firestore';
 import { onAuthStateChanged } from 'firebase/auth';
-import { getDb, auth } from '../firebase';
+import { auth } from '../firebase';
 import { DayOfWeek, TeacherOverrideTrack } from '../types';
 import { getSpotifyEmbedUrl } from './spotify';
-import { recordConsumedTrack } from '../hooks/useStudentHistory';
 import { isValidCanonicalUid } from './tutorConsolidation';
 
 export enum OperationType {
@@ -36,12 +34,12 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   const errInfo: FirestoreErrorInfo = {
     error: error instanceof Error ? error.message : String(error),
     authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-      emailVerified: auth.currentUser?.emailVerified,
-      isAnonymous: auth.currentUser?.isAnonymous,
-      tenantId: auth.currentUser?.tenantId,
-      providerInfo: auth.currentUser?.providerData?.map((provider) => ({
+      userId: auth?.currentUser?.uid,
+      email: auth?.currentUser?.email,
+      emailVerified: auth?.currentUser?.emailVerified,
+      isAnonymous: auth?.currentUser?.isAnonymous,
+      tenantId: auth?.currentUser?.tenantId,
+      providerInfo: auth?.currentUser?.providerData?.map((provider) => ({
         providerId: provider.providerId,
         email: provider.email,
       })) || [],
@@ -69,6 +67,18 @@ export async function withFirestoreTimeout<T>(
   return Promise.race([safePromise, timeoutPromise]).finally(() => {
     if (timer) clearTimeout(timer);
   });
+}
+
+async function getAuthTokenForSync(): Promise<string | null> {
+  try {
+    if (auth && !auth.currentUser && typeof (auth as any).authStateReady === 'function') {
+      await (auth as any).authStateReady().catch(() => {});
+    }
+    if (auth?.currentUser) {
+      return await auth.currentUser.getIdToken();
+    }
+  } catch {}
+  return null;
 }
 
 export interface CurrentSpotifyTrack {
@@ -99,8 +109,10 @@ export interface StudentCurrentRoutineDoc {
   nativeFriendUid?: string;
   nativeFriendEmail?: string;
   weekId: string;
+  weeklyCycle?: number;
   currentSpotifyTrack?: CurrentSpotifyTrack | null;
   teacherFeedback?: Record<string, StudentTrackFeedback>;
+  teacherOverrides?: Record<string, TeacherOverrideTrack | null>;
   updatedAt?: string;
 }
 
@@ -149,25 +161,24 @@ export function normalizeStudentIdForPath(rawIdOrEmail: string): string {
 }
 
 /**
- * Persists the student's Spotify Song of the Day to Firestore:
- * Path 1: users/{studentUID}/currentRoutine/weekData (Primary live document)
- * Path 2: users/{studentUID}/currentRoutine/{weekId} (Weekly cycle archive)
- * Path 3: users/{studentUID}/routines/{currentDayOfWeek} (Daily routine record)
+ * Persists the student's Spotify Song of the Day via authenticated backend API
+ * to canonical Firestore (default) documents.
  */
 export async function syncStudentSpotifyTrackToFirestore(
   studentUid: string,
-  weekId: string = 'week-1',
+  weekId: string = 'weekData',
   track: CurrentSpotifyTrack | null,
   extra?: {
     studentEmail?: string;
     nativeFriendUid?: string;
     nativeFriendEmail?: string;
     dayOfWeek?: DayOfWeek;
+    weeklyCycle?: number;
   }
 ): Promise<boolean> {
   const cleanStudentUid = normalizeStudentIdForPath(studentUid);
   if (!cleanStudentUid) return false;
-  const safeWeekId = weekId || 'week-1';
+  const safeWeekId = weekId || 'weekData';
   const targetDay = track?.dayOfWeek || extra?.dayOfWeek;
 
   // Build signature to avoid redundant round-trips
@@ -176,12 +187,18 @@ export async function syncStudentSpotifyTrackToFirestore(
     : `${cleanStudentUid}:${safeWeekId}:null`;
 
   if (lastSyncedSignatureMap.get(`${cleanStudentUid}:${safeWeekId}`) === trackSignature) {
-    return true; // Already up-to-date
+    return true;
   }
 
-  const payload: Partial<StudentCurrentRoutineDoc> = {
+  const token = await getAuthTokenForSync();
+  if (!token) {
+    return false;
+  }
+
+  const payload = {
     studentUid: cleanStudentUid,
     weekId: safeWeekId,
+    ...(extra?.weeklyCycle !== undefined ? { weeklyCycle: extra.weeklyCycle } : {}),
     currentSpotifyTrack: track
       ? {
           id: track.id || '',
@@ -193,78 +210,32 @@ export async function syncStudentSpotifyTrackToFirestore(
           ...(track.level ? { level: track.level } : {}),
         }
       : null,
-    updatedAt: new Date().toISOString(),
+    ...(targetDay ? { dayOfWeek: targetDay } : {}),
     ...(extra?.studentEmail ? { studentEmail: extra.studentEmail } : {}),
     ...(extra?.nativeFriendUid ? { nativeFriendUid: extra.nativeFriendUid } : {}),
     ...(extra?.nativeFriendEmail ? { nativeFriendEmail: extra.nativeFriendEmail } : {}),
   };
 
-  // 1. Mirror to authorized server backend REST endpoint for safe public delivery
-  fetch('/api/routines/current-routine', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  }).catch(() => {});
-
-  // For unauthenticated visitors, utilize exclusively authorized server REST API above
-  if (!auth.currentUser && typeof (auth as any)?.authStateReady === 'function') {
-    try {
-      await (auth as any).authStateReady();
-    } catch {}
-  }
-
-  if (!auth.currentUser) {
-    lastSyncedSignatureMap.set(`${cleanStudentUid}:${safeWeekId}`, trackSignature);
-    return true;
-  }
-
   try {
-    const db = getDb();
+    const res = await fetch('/api/routines/current-routine', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(payload),
+    });
 
-    // 1. Primary Live Document: users/{studentUID}/currentRoutine/weekData
-    const weekDataRef = doc(db, 'users', cleanStudentUid, 'currentRoutine', 'weekData');
-    await setDoc(weekDataRef, payload, { merge: true });
+    if (!res.ok) {
+      return false;
+    }
 
-    // 2. Weekly Cycle Document: users/{studentUID}/currentRoutine/{weekId}
-    const routineDocRef = doc(db, 'users', cleanStudentUid, 'currentRoutine', safeWeekId);
-    await setDoc(routineDocRef, payload, { merge: true });
-
-    // 3. Daily Document: users/{studentUID}/routines/{currentDayOfWeek}
-    if (targetDay) {
-      const dayDocRef = doc(db, 'users', cleanStudentUid, 'routines', targetDay);
-      await setDoc(
-        dayDocRef,
-        {
-          currentSpotifyTrack: payload.currentSpotifyTrack,
-          dayOfWeek: targetDay,
-          updatedAt: payload.updatedAt,
-          ...(extra?.studentEmail ? { studentEmail: extra.studentEmail } : {}),
-          ...(extra?.nativeFriendUid ? { nativeFriendUid: extra.nativeFriendUid } : {}),
-        },
-        { merge: true }
-      );
+    const data = await res.json().catch(() => null);
+    if (!data?.success) {
+      return false;
     }
 
     lastSyncedSignatureMap.set(`${cleanStudentUid}:${safeWeekId}`, trackSignature);
-
-    // Record into weekly history subcollection: users/{studentUID}/weeklyHistory/{weekId}
-    if (track && track.id) {
-      recordConsumedTrack(
-        cleanStudentUid,
-        safeWeekId,
-        {
-          id: track.id,
-          trackId: track.id,
-          title: track.title,
-          artist: track.artist,
-          coverUrl: track.coverUrl,
-          dayOfWeek: targetDay,
-          listenedAt: new Date().toISOString(),
-        },
-        extra?.nativeFriendUid
-      ).catch(() => {});
-    }
-
     return true;
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, `users/${cleanStudentUid}/currentRoutine/weekData`);
@@ -273,20 +244,16 @@ export async function syncStudentSpotifyTrackToFirestore(
 }
 
 /**
- * Subscribes to the student's current weekly routine in real time using onSnapshot.
- * Listens in parallel to:
- * 1. users/{studentUID}/currentRoutine/weekData (Primary live document)
- * 2. users/{studentUID}/currentRoutine/{weekId} (Weekly cycle document)
- * 3. users/{studentUID}/routines/{currentDayOfWeek} (Daily routine document)
- * Returns a composite unsubscribe callback.
+ * Subscribes to the student's current weekly routine via authenticated backend API.
  */
 export function subscribeStudentCurrentRoutine(
   studentUid: string,
-  weekId: string = 'week-1',
+  weekId: string = 'weekData',
   onUpdate: (data: StudentCurrentRoutineDoc | null) => void,
   options?: {
     currentDayOfWeek?: DayOfWeek;
     studentTimezone?: string;
+    weeklyCycle?: number;
   }
 ): () => void {
   const cleanStudentUid = normalizeStudentIdForPath(studentUid);
@@ -294,182 +261,74 @@ export function subscribeStudentCurrentRoutine(
     onUpdate(null);
     return () => {};
   }
-  const safeWeekId = weekId || 'week-1';
-  const targetDay = options?.currentDayOfWeek;
+  const safeWeekId = weekId || 'weekData';
+  let disposed = false;
 
-  // Composite state to merge latest active document
-  let weekDataState: StudentCurrentRoutineDoc | null = null;
-  let cycleDataState: StudentCurrentRoutineDoc | null = null;
-  let week5DataState: StudentCurrentRoutineDoc | null = null;
-  let dayDataState: any = null;
-
-  const emitMerged = () => {
-    // Pick the most relevant track
-    const candidateTrack =
-      weekDataState?.currentSpotifyTrack ||
-      dayDataState?.currentSpotifyTrack ||
-      cycleDataState?.currentSpotifyTrack ||
-      week5DataState?.currentSpotifyTrack ||
-      null;
-
-    const candidateDoc =
-      weekDataState ||
-      cycleDataState ||
-      week5DataState ||
-      (dayDataState ? {
-        studentUid: cleanStudentUid,
-        weekId: safeWeekId,
-        currentSpotifyTrack: dayDataState.currentSpotifyTrack,
-        updatedAt: dayDataState.updatedAt,
-      } as StudentCurrentRoutineDoc : null);
-
-    if (candidateDoc) {
-      const merged: StudentCurrentRoutineDoc = {
-        ...candidateDoc,
-        currentSpotifyTrack: candidateTrack,
-        teacherFeedback: {
-          ...(week5DataState?.teacherFeedback || {}),
-          ...(cycleDataState?.teacherFeedback || {}),
-          ...(weekDataState?.teacherFeedback || {}),
-          ...(dayDataState?.teacherFeedback || {}),
-        },
-      };
-      onUpdate(merged);
-    } else {
-      onUpdate(null);
+  const fetchRoutine = async () => {
+    if (disposed) return;
+    const token = await getAuthTokenForSync();
+    if (!token || disposed) {
+      if (!disposed && !token) onUpdate(null);
+      return;
     }
-  };
-
-  // Immediate REST Hydration to prevent any initial lag
-  fetch(`/api/routines/current-routine?studentUid=${encodeURIComponent(cleanStudentUid)}&weekId=${encodeURIComponent(safeWeekId)}`)
-    .then((r) => r.json())
-    .then((res) => {
-      if (res?.routine) {
-        if (!weekDataState && !cycleDataState) {
-          cycleDataState = res.routine;
-          emitMerged();
-        }
-      }
-    })
-    .catch(() => {});
-
-  const firestoreUnsubs: (() => void)[] = [];
-
-  const cleanupFirestore = () => {
-    while (firestoreUnsubs.length > 0) {
-      try {
-        firestoreUnsubs.pop()?.();
-      } catch {}
-    }
-  };
-
-  const attachFirestoreListeners = () => {
-    cleanupFirestore();
-    if (!auth.currentUser) return;
 
     try {
-      const db = getDb();
-
-      // 1. Listen to users/{studentUID}/currentRoutine/weekData (Primary)
-      const weekDataRef = doc(db, 'users', cleanStudentUid, 'currentRoutine', 'weekData');
-      const unsubWeekData = onSnapshot(
-        weekDataRef,
-        (snap) => {
-          if (snap.exists()) {
-            weekDataState = snap.data() as StudentCurrentRoutineDoc;
-          } else {
-            weekDataState = null;
-          }
-          emitMerged();
-        },
-        (err) => {
-          handleFirestoreError(err, OperationType.GET, `users/${cleanStudentUid}/currentRoutine/weekData`);
-        }
-      );
-      firestoreUnsubs.push(unsubWeekData);
-
-      // 2. Listen to users/{studentUID}/currentRoutine/{weekId}
-      const cycleRef = doc(db, 'users', cleanStudentUid, 'currentRoutine', safeWeekId);
-      const unsubCycle = onSnapshot(
-        cycleRef,
-        (snap) => {
-          if (snap.exists()) {
-            cycleDataState = snap.data() as StudentCurrentRoutineDoc;
-          } else {
-            cycleDataState = null;
-          }
-          emitMerged();
-        },
-        (err) => {
-          handleFirestoreError(err, OperationType.GET, `users/${cleanStudentUid}/currentRoutine/${safeWeekId}`);
-        }
-      );
-      firestoreUnsubs.push(unsubCycle);
-
-      // If safeWeekId is week-1, also check week-5 where active cycle data lives
-      if (safeWeekId !== 'week-5') {
-        const week5Ref = doc(db, 'users', cleanStudentUid, 'currentRoutine', 'week-5');
-        const unsubWeek5 = onSnapshot(
-          week5Ref,
-          (snap) => {
-            if (snap.exists()) {
-              week5DataState = snap.data() as StudentCurrentRoutineDoc;
-              emitMerged();
-            }
-          },
-          () => {}
-        );
-        firestoreUnsubs.push(unsubWeek5);
+      const params = new URLSearchParams({
+        studentUid: cleanStudentUid,
+        weekId: safeWeekId,
+      });
+      if (options?.weeklyCycle !== undefined) {
+        params.set('weeklyCycle', String(options.weeklyCycle));
       }
-
-      // 3. Listen to users/{studentUID}/routines/{currentDayOfWeek}
-      if (targetDay) {
-        const dayRef = doc(db, 'users', cleanStudentUid, 'routines', targetDay);
-        const unsubDay = onSnapshot(
-          dayRef,
-          (snap) => {
-            if (snap.exists()) {
-              dayDataState = snap.data();
-              emitMerged();
-            }
-          },
-          () => {}
-        );
-        firestoreUnsubs.push(unsubDay);
+      const res = await fetch(`/api/routines/current-routine?${params.toString()}`, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/json',
+        },
+      });
+      if (!res.ok) {
+        return;
+      }
+      const data = await res.json().catch(() => null);
+      if (!disposed) {
+        onUpdate(data?.routine || null);
       }
     } catch (error) {
       handleFirestoreError(error, OperationType.GET, `users/${cleanStudentUid}/currentRoutine/weekData`);
     }
   };
 
-  // Only attach Firestore listeners if already authenticated
-  if (auth.currentUser) {
-    attachFirestoreListeners();
-  }
+  fetchRoutine();
 
-  // Subscribe to auth transitions: attach listeners on sign-in, cleanup on sign-out/visitor
-  const unsubAuth = onAuthStateChanged(auth, (user) => {
-    if (user) {
-      attachFirestoreListeners();
-    } else {
-      cleanupFirestore();
-    }
-  });
+  const pollId = setInterval(fetchRoutine, 15000);
+  const unsubAuth = auth
+    ? onAuthStateChanged(auth, (user) => {
+        if (disposed) return;
+        if (user) {
+          fetchRoutine();
+        } else {
+          onUpdate(null);
+        }
+      })
+    : () => {};
 
   return () => {
-    unsubAuth();
-    cleanupFirestore();
+    disposed = true;
+    clearInterval(pollId);
+    try {
+      unsubAuth();
+    } catch {}
   };
 }
 
 /**
  * Saves a comment or recommendation from the Native Friend / Teacher
- * strictly linked to the student and the song/day they listened to.
- * Persists to both weekData and specific weekId.
+ * via authenticated backend API.
  */
 export async function saveNativeFriendTrackFeedback(
   studentUid: string,
-  weekId: string = 'week-1',
+  weekId: string = 'weekData',
   feedback: {
     teacherUid: string;
     teacherName?: string;
@@ -478,64 +337,51 @@ export async function saveNativeFriendTrackFeedback(
     trackId: string;
     comment: string;
     recommendation?: string;
+    weeklyCycle?: number;
   }
 ): Promise<boolean> {
   const cleanStudentUid = normalizeStudentIdForPath(studentUid);
   if (!cleanStudentUid) return false;
-  const safeWeekId = weekId || 'week-1';
+  const safeWeekId = weekId || 'weekData';
+
+  const token = await getAuthTokenForSync();
+  if (!token) {
+    return false;
+  }
 
   const feedbackEntry: StudentTrackFeedback = {
-    ...feedback,
+    teacherUid: feedback.teacherUid,
+    teacherName: feedback.teacherName,
+    teacherEmail: feedback.teacherEmail,
+    dayOfWeek: feedback.dayOfWeek,
+    trackId: feedback.trackId,
+    comment: feedback.comment,
+    recommendation: feedback.recommendation,
     studentUid: cleanStudentUid,
     createdAt: new Date().toISOString(),
   };
 
-  const payload = {
-    updatedAt: new Date().toISOString(),
-    nativeFriendUid: feedback.teacherUid,
-    ...(feedback.teacherEmail ? { nativeFriendEmail: feedback.teacherEmail } : {}),
-    teacherFeedback: {
-      [feedback.dayOfWeek]: feedbackEntry,
-    },
-  };
-
-  // 1. Mirror to server backend REST endpoint
-  fetch('/api/routines/current-routine/feedback', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      studentUid: cleanStudentUid,
-      weekId: safeWeekId,
-      feedback: feedbackEntry,
-    }),
-  }).catch(() => {});
-
-  if (!auth.currentUser && typeof (auth as any)?.authStateReady === 'function') {
-    try {
-      await (auth as any).authStateReady();
-    } catch {}
-  }
-
-  if (!auth.currentUser) {
-    return true;
-  }
-
   try {
-    const db = getDb();
+    const res = await fetch('/api/routines/current-routine/feedback', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        studentUid: cleanStudentUid,
+        weekId: safeWeekId,
+        ...(feedback.weeklyCycle !== undefined ? { weeklyCycle: feedback.weeklyCycle } : {}),
+        feedback: feedbackEntry,
+      }),
+    });
 
-    // 1. Save to users/{studentUID}/currentRoutine/weekData
-    const weekDataRef = doc(db, 'users', cleanStudentUid, 'currentRoutine', 'weekData');
-    await setDoc(weekDataRef, payload, { merge: true });
+    if (!res.ok) {
+      return false;
+    }
 
-    // 2. Save to users/{studentUID}/currentRoutine/{weekId}
-    const routineDocRef = doc(db, 'users', cleanStudentUid, 'currentRoutine', safeWeekId);
-    await setDoc(routineDocRef, payload, { merge: true });
-
-    // 3. Save to users/{studentUID}/routines/{dayOfWeek}
-    const dayDocRef = doc(db, 'users', cleanStudentUid, 'routines', feedback.dayOfWeek);
-    await setDoc(dayDocRef, { teacherFeedback: payload.teacherFeedback }, { merge: true });
-
-    return true;
+    const data = await res.json().catch(() => null);
+    return Boolean(data?.success);
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, `users/${cleanStudentUid}/currentRoutine/weekData`);
     return false;
@@ -544,16 +390,21 @@ export async function saveNativeFriendTrackFeedback(
 
 /**
  * Saves a Spotify track recommendation / override from the Native Friend teacher
- * for a specific day of the student's routine.
- * Persists to Firestore at users/{studentUID}/routines/{dayOfWeek}.
+ * via authenticated backend API.
  */
 export async function saveTeacherSpotifyOverrideToFirestore(
   studentUid: string,
   dayOfWeek: DayOfWeek,
-  overrideTrack: TeacherOverrideTrack
+  overrideTrack: TeacherOverrideTrack,
+  weeklyCycle?: number
 ): Promise<boolean> {
   const cleanStudentUid = normalizeStudentIdForPath(studentUid);
   if (!cleanStudentUid || !dayOfWeek) return false;
+
+  const token = await getAuthTokenForSync();
+  if (!token) {
+    return false;
+  }
 
   const sanitizedTrack: TeacherOverrideTrack = {
     id: overrideTrack.id || overrideTrack.trackId || 'override-track',
@@ -572,55 +423,27 @@ export async function saveTeacherSpotifyOverrideToFirestore(
     updatedAt: new Date().toISOString(),
   };
 
-  // 1. Mirror to server REST notification
-  fetch('/api/routines/override-track', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      studentUid: cleanStudentUid,
-      dayOfWeek,
-      teacherOverrideTrack: sanitizedTrack,
-    }),
-  }).catch(() => {});
-
-  if (!auth.currentUser && typeof (auth as any)?.authStateReady === 'function') {
-    try {
-      await (auth as any).authStateReady();
-    } catch {}
-  }
-
-  if (!auth.currentUser) {
-    return true;
-  }
-
   try {
-    const db = getDb();
-    // 1. Write to users/{studentUID}/routines/{dayOfWeek}
-    const dayRef = doc(db, 'users', cleanStudentUid, 'routines', dayOfWeek);
-    await setDoc(
-      dayRef,
-      {
-        teacherOverrideTrack: sanitizedTrack,
+    const res = await fetch('/api/routines/override-track', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        studentUid: cleanStudentUid,
         dayOfWeek,
-        updatedAt: sanitizedTrack.updatedAt,
-      },
-      { merge: true }
-    );
+        ...(weeklyCycle !== undefined ? { weeklyCycle } : {}),
+        teacherOverrideTrack: sanitizedTrack,
+      }),
+    });
 
-    // 2. Also write to users/{studentUID}/currentRoutine/weekData
-    const weekDataRef = doc(db, 'users', cleanStudentUid, 'currentRoutine', 'weekData');
-    await setDoc(
-      weekDataRef,
-      {
-        teacherOverrides: {
-          [dayOfWeek]: sanitizedTrack,
-        },
-        updatedAt: sanitizedTrack.updatedAt,
-      },
-      { merge: true }
-    );
+    if (!res.ok) {
+      return false;
+    }
 
-    return true;
+    const data = await res.json().catch(() => null);
+    return Boolean(data?.success);
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, `users/${cleanStudentUid}/routines/${dayOfWeek}`);
     return false;
@@ -628,65 +451,43 @@ export async function saveTeacherSpotifyOverrideToFirestore(
 }
 
 /**
- * Removes a Spotify track recommendation / override from the Native Friend teacher
- * for a specific day of the student's routine, restoring the curriculum track.
+ * Removes a Spotify track recommendation / override via authenticated backend API,
+ * restoring the curriculum track.
  */
 export async function removeTeacherSpotifyOverrideFromFirestore(
   studentUid: string,
-  dayOfWeek: DayOfWeek
+  dayOfWeek: DayOfWeek,
+  weeklyCycle?: number
 ): Promise<boolean> {
   const cleanStudentUid = normalizeStudentIdForPath(studentUid);
   if (!cleanStudentUid || !dayOfWeek) return false;
 
-  const now = new Date().toISOString();
-
-  // 1. Mirror to server REST notification
-  fetch('/api/routines/override-track', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      studentUid: cleanStudentUid,
-      dayOfWeek,
-      teacherOverrideTrack: null,
-    }),
-  }).catch(() => {});
-
-  if (!auth.currentUser && typeof (auth as any)?.authStateReady === 'function') {
-    try {
-      await (auth as any).authStateReady();
-    } catch {}
-  }
-
-  if (!auth.currentUser) {
-    return true;
+  const token = await getAuthTokenForSync();
+  if (!token) {
+    return false;
   }
 
   try {
-    const db = getDb();
-
-    const dayRef = doc(db, 'users', cleanStudentUid, 'routines', dayOfWeek);
-    await setDoc(
-      dayRef,
-      {
+    const res = await fetch('/api/routines/override-track', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        studentUid: cleanStudentUid,
+        dayOfWeek,
+        ...(weeklyCycle !== undefined ? { weeklyCycle } : {}),
         teacherOverrideTrack: null,
-        updatedAt: now,
-      },
-      { merge: true }
-    );
+      }),
+    });
 
-    const weekDataRef = doc(db, 'users', cleanStudentUid, 'currentRoutine', 'weekData');
-    await setDoc(
-      weekDataRef,
-      {
-        teacherOverrides: {
-          [dayOfWeek]: null,
-        },
-        updatedAt: now,
-      },
-      { merge: true }
-    );
+    if (!res.ok) {
+      return false;
+    }
 
-    return true;
+    const data = await res.json().catch(() => null);
+    return Boolean(data?.success);
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, `users/${cleanStudentUid}/routines/${dayOfWeek}`);
     return false;

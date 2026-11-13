@@ -48,7 +48,6 @@ import {
   addVideoToWatchedHistoryInFirestore,
   addTrackToListenedHistoryInFirestore,
   initializeCleanStudentRoutinesInFirestore,
-  fetchAllRoutineVideosFromFirestore,
 } from './hooks/useRoutine';
 import { recordConsumedVideo, recordConsumedTrack } from './hooks/useStudentHistory';
 import { extractYouTubeVideoId, getYouTubeWatchUrl } from './utils/youtube';
@@ -111,10 +110,6 @@ import {
   cacheVocabularyLocally,
   saveStudentJournalEntryToFirestore,
   fetchStudentJournalFromFirestore,
-  saveLiveLessonToFirestore,
-  deleteLiveLessonFromFirestore,
-  fetchStudentLessonsFromFirestore,
-  subscribeToStudentLessons,
   saveStudentNativeFriendToFirestore,
   saveStudentProfileToFirestore,
   fetchStudentProfileFromFirestore,
@@ -126,7 +121,6 @@ import {
   cacheWeeklyChecksLocally,
   subscribeToStudentDailyJournal,
   subscribeToStudentDailyRoutines,
-  fetchStudentDailyRoutinesFromFirestore,
   deleteStudentVocabularyFromFirestore,
   fetchExcludedDictionaryWords,
   addExcludedDictionaryWord,
@@ -1541,36 +1535,19 @@ export default function App() {
     activeStudentUidRef.current = role === 'student' ? uid : '';
     const queryParams = `email=${encodeURIComponent(email)}&role=${encodeURIComponent(role)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`;
 
-    const isTeacherRole = role === 'teacher' || role === 'admin';
     let isCancelled = false;
 
-    // 1. Fetch user-isolated lessons directly from Firestore + API atomically (Firestore is authoritative)
-    Promise.all([
-      fetchStudentLessonsFromFirestore(uid, email, isTeacherRole).catch(() => []),
-      apiClient.get<LiveLesson[]>('/api/lessons'),
-    ])
-      .then(([fsLessons, apiLessons]) => {
+    // 1. Fetch user-isolated canonical lessons strictly from backend API /api/lessons (Firestore lessons/{lessonId})
+    apiClient.get<LiveLesson[]>('/api/lessons')
+      .then((apiLessons) => {
         if (isCancelled) return;
         const map = new Map<string, LiveLesson>();
-        // Put API data first
         (Array.isArray(apiLessons) ? apiLessons : []).forEach((l: LiveLesson) => {
           if (l?.id) map.set(l.id, l);
         });
-        // Put fsLessons over API data (Firestore takes absolute priority!)
-        (Array.isArray(fsLessons) ? fsLessons : []).forEach((l: LiveLesson) => {
-          if (!l?.id) return;
-          const existing = map.get(l.id);
-          if (existing && (existing.status === 'cancelled' || existing.cancelledAt) && l.status !== 'cancelled' && !l.cancelledAt) {
-            // Keep cancelled
-          } else if (existing && (existing.status === 'completed' || existing.completedAt) && l.status !== 'completed' && !l.completedAt) {
-            // Keep completed
-          } else {
-            map.set(l.id, { ...existing, ...l });
-          }
-        });
         // Strict invariant: any cancelled lesson is permanently marked cancelled, any completed lesson is permanently completed
         map.forEach((l, id) => {
-          if (l.status === 'cancelled' || l.cancelledAt) {
+          if (l.status === 'cancelled' || (l.status as string) === 'canceled' || l.cancelledAt) {
             map.set(id, {
               ...l,
               status: 'cancelled',
@@ -1628,14 +1605,6 @@ export default function App() {
             ...prev,
           ]);
         }
-        // Fallback to direct Firestore lessons so UI remains functional
-        fetchStudentLessonsFromFirestore(uid, email, isTeacherRole)
-          .then((fsLessons) => {
-            if (!isCancelled && Array.isArray(fsLessons) && fsLessons.length > 0) {
-              setLessons(fsLessons);
-            }
-          })
-          .catch(() => {});
       });
 
     // Real-time synchronization for lessons is handled by useLessonsRevalidation hook
@@ -1814,119 +1783,31 @@ export default function App() {
             setUserProfile(loadedProfile);
           }
 
-          // Fetch student-specific routines
-          const routinesRes = await fetch(`/api/student-routines?studentEmail=${encodeURIComponent(email)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`).catch(() => null);
+          // Fetch canonical student-specific routines exclusively via authenticated backend endpoint
+          const routineAuthToken =
+            (await getAccessToken().catch(() => null)) ||
+            (await auth?.currentUser?.getIdToken().catch(() => null)) ||
+            null;
+          const routinesRes = await fetch(
+            `/api/student-routines?studentEmail=${encodeURIComponent(email)}&uid=${encodeURIComponent(effectiveStudentUid)}`,
+            {
+              headers: routineAuthToken ? { Authorization: `Bearer ${routineAuthToken}` } : undefined,
+            }
+          ).catch(() => null);
           let baseRoutines = createCleanStudentRoutines(loadedProfile?.routineVideoTime);
           if (routinesRes && routinesRes.ok) {
             const routines = await routinesRes.json();
             if (routines && typeof routines === 'object' && Object.keys(routines).length > 0) {
               baseRoutines = routines;
             }
-          }
-
-          // Hydrate daily routines directly from Firestore first (source of truth per student UID)
-          try {
-            const cloudVideos = await fetchAllRoutineVideosFromFirestore(effectiveStudentUid);
-            if (cloudVideos && Object.keys(cloudVideos).length > 0) {
-              (Object.keys(cloudVideos) as DayOfWeek[]).forEach((day) => {
-                const v = cloudVideos[day];
-                const cleanVidId = v && v.videoId ? v.videoId.trim() : '';
-                if (cleanVidId && v) {
-                  const dayList = baseRoutines[day] || defaultRoutinesByDay[day] || [];
-                  baseRoutines[day] = dayList.map((item, idx) => {
-                    if (
-                      idx === 0 ||
-                      item.id.endsWith('1') ||
-                      item.activityName?.toLowerCase().includes('video') ||
-                      item.activityName?.toLowerCase().includes('vídeo') ||
-                      (item.teacherVideos && item.teacherVideos.length > 0)
-                    ) {
-                      return {
-                        ...item,
-                        activityName: v.playlistTitle || v.title || v.videoTitle || item.activityName,
-                        playlistId: v.playlistId || '',
-                        playlistTitle: v.playlistTitle || '',
-                        teacherVideos: [{
-                          id: cleanVidId,
-                          videoId: cleanVidId,
-                          title: v.title || v.videoTitle || 'Daily Video Practice',
-                          url: v.url || `https://www.youtube.com/watch?v=${cleanVidId}`,
-                          playlistId: v.playlistId || '',
-                          playlistTitle: v.playlistTitle || '',
-                          isRepeatVideo: Boolean(v.isRepeatVideo),
-                          isCustomSuggestion: Boolean(v.isCustomSuggestion || v.playlistId === 'custom_suggestion' || v.title === 'Your Suggestion' || v.playlistTitle === 'Your Suggestion'),
-                          instructions: v.instructions || '',
-                          duration: v.duration || '5-10 min',
-                        }],
-                        completedToday: v.completedToday !== undefined ? v.completedToday : item.completedToday,
-                      };
-                    }
-                    return item;
-                  });
-                } else if (v && v.videoId === '' && v.playlistId === '') {
-                  const dayList = baseRoutines[day] || defaultRoutinesByDay[day] || [];
-                  baseRoutines[day] = dayList.map((item, idx) => {
-                    if (idx === 0 || item.id.endsWith('1') || item.activityName?.toLowerCase().includes('video') || item.activityName?.toLowerCase().includes('vídeo')) {
-                      return {
-                        ...item,
-                        activityName: 'Video of the Day',
-                        playlistId: '',
-                        playlistTitle: '',
-                        teacherVideos: [],
-                        completedToday: v.completedToday !== undefined ? v.completedToday : item.completedToday,
-                      };
-                    }
-                    return item;
-                  });
-                }
-              });
-            }
-          } catch (e) {
-            console.warn('Notice hydrating routines from Firestore on login:', e);
-          }
-
-          // CORREÇÃO A: Hydrate student daily routines (including 5 learned words) directly from Firestore
-          try {
-            const routinesFs = await fetchStudentDailyRoutinesFromFirestore(effectiveStudentUid);
-            if (routinesFs && routinesFs.success && routinesFs.routines) {
-              (Object.keys(routinesFs.routines) as DayOfWeek[]).forEach((day) => {
-                const dayData = routinesFs.routines[day];
-                if (dayData && Array.isArray(dayData.learnedWords) && dayData.learnedWords.length > 0) {
-                  const dayList = baseRoutines[day] || defaultRoutinesByDay[day] || [];
-                  baseRoutines[day] = dayList.map((item, idx) => {
-                    if (
-                      idx === 0 ||
-                      item.id.endsWith('1') ||
-                      item.activityName?.toLowerCase().includes('video') ||
-                      item.activityName?.toLowerCase().includes('vídeo') ||
-                      (item.teacherVideos && item.teacherVideos.length > 0)
-                    ) {
-                      return {
-                        ...item,
-                        learnedWords: dayData.learnedWords,
-                      };
-                    }
-                    return item;
-                  });
-                }
-              });
-
-              if (activeRoutinesHydrationUidRef.current === uid) {
-                const hasWords = Object.values(baseRoutines).some((dayList) =>
-                  (dayList || []).some((item) => Array.isArray(item.learnedWords) && item.learnedWords.length > 0)
-                );
-                setRoutinesHydrationStatus(hasWords ? 'loaded_with_words' : 'loaded_empty');
-              }
-            } else if (routinesFs && routinesFs.error) {
-              if (activeRoutinesHydrationUidRef.current === uid) {
-                setRoutinesHydrationStatus('error');
-              }
-            }
-          } catch (routinesErr) {
-            console.warn('Notice loading routines from Firestore in loadStudentData:', routinesErr);
             if (activeRoutinesHydrationUidRef.current === uid) {
-              setRoutinesHydrationStatus('error');
+              const hasWords = Object.values(baseRoutines).some((dayList) =>
+                (dayList || []).some((item) => Array.isArray(item.learnedWords) && item.learnedWords.length > 0)
+              );
+              setRoutinesHydrationStatus(hasWords ? 'loaded_with_words' : 'loaded_empty');
             }
+          } else if (activeRoutinesHydrationUidRef.current === uid) {
+            setRoutinesHydrationStatus('error');
           }
 
           // Apply this specific student's registered routine times
@@ -3980,38 +3861,35 @@ export default function App() {
     }
 
     const activeEmail = currentAccount?.email || userProfile?.email;
-    const effectiveStudentUid = userProfile?.id || (userProfile as any)?.uid || currentAccount?.uid;
+    const effectiveStudentUid = auth?.currentUser?.uid || userProfile?.id || (userProfile as any)?.uid || currentAccount?.uid;
+    const activeCycle = parseWeekCycleNumber(userProfile?.weeklyCycle) ?? 1;
 
     try {
-      await fetch('/api/routines/words', {
+      const token =
+        (await getAccessToken().catch(() => null)) ||
+        (await auth?.currentUser?.getIdToken().catch(() => null)) ||
+        null;
+      const res = await fetch('/api/routines/words', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: JSON.stringify({
           day: selectedDay,
           activityId,
           words,
           studentEmail: activeEmail,
           studentUid: effectiveStudentUid,
+          weeklyCycle: activeCycle,
         }),
       });
-    } catch {
-      // local fallback
-    }
-
-    // Direct Cloud Firestore users/{cleanUid}/routines/{day} persistence
-    try {
-      const cleanUid = (effectiveStudentUid && isValidCanonicalUid(effectiveStudentUid) ? effectiveStudentUid : '') ||
-        (auth?.currentUser?.uid && isValidCanonicalUid(auth.currentUser.uid) ? auth.currentUser.uid : '');
-      const firestoreDb = getDb();
-      if (firestoreDb && cleanUid && selectedDay) {
-        const rRef = doc(firestoreDb, 'users', cleanUid, 'routines', selectedDay);
-        setDoc(rRef, {
-          dayOfWeek: selectedDay,
-          learnedWords: words,
-          updatedAt: new Date().toISOString(),
-        }, { merge: true }).catch(() => {});
+      if (!res.ok) {
+        console.warn('[App] Failed to persist learned words to backend:', res.status);
       }
-    } catch {}
+    } catch (err) {
+      console.warn('[App] Error saving learned words to backend:', err);
+    }
   };
 
   // Unified single source of truth for 100% automatic behavioral activity completion
@@ -4154,26 +4032,6 @@ export default function App() {
               }));
             }
           });
-
-          // Routines subcollection update for daily routine tracking with separate video and audio flags
-          const db = getDb();
-          if (db && uid) {
-            const routineData: Record<string, any> = {
-              updatedAt: new Date().toISOString(),
-            };
-            if (params.type === 'video') {
-              routineData.completedVideoToday = true;
-              routineData.completedToday = true;
-              routineData.completed = true;
-            } else if (params.type === 'audio') {
-              routineData.completedAudioToday = true;
-            }
-            setDoc(
-              doc(db, 'users', uid, 'routines', targetDay),
-              routineData,
-              { merge: true }
-            ).catch(() => {});
-          }
         }
       }
 
@@ -4304,17 +4162,29 @@ export default function App() {
         }
       }
 
-      // 4. Backend synchronization mirror
+      // 4. Canonical backend routine toggle persistence (single source of truth)
       try {
-        fetch('/api/routines/toggle', {
+        const token =
+          (await getAccessToken().catch(() => null)) ||
+          (await auth?.currentUser?.getIdToken().catch(() => null)) ||
+          null;
+        await fetch('/api/routines/toggle', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
           body: JSON.stringify({
             day: targetDay,
             activityId: params.activityId || (params.type === 'video' ? 'act-1' : 'act-2'),
+            activityType: params.type === 'audio' ? 'audio' : 'video',
+            completed: true,
+            completedToday: true,
             studentEmail: email,
             studentUid: uid,
             videoId: params.video?.videoId || null,
+            videoTitle: params.video?.videoTitle || null,
+            weeklyCycle: activeCycle,
           }),
         }).catch(() => {});
       } catch {}
@@ -4655,40 +4525,46 @@ export default function App() {
       handleUpdateSPathCheck('audio_day', selectedDay, nowCompleted);
     }
 
-    // Direct atomic write to Firestore routines subcollection with dedicated flags
-    const db = getDb();
-    if (db && studentUid) {
-      const routineUpdates: Record<string, any> = {
-        updatedAt: new Date().toISOString(),
-      };
-      if (isVideoActivity) {
-        routineUpdates.completedVideoToday = nowCompleted;
-        routineUpdates.completedToday = nowCompleted;
-      }
-      if (isAudioActivity) {
-        routineUpdates.completedAudioToday = nowCompleted;
-      }
-      setDoc(
-        doc(db, 'users', studentUid, 'routines', selectedDay),
-        routineUpdates,
-        { merge: true }
-      ).catch(() => {});
-    }
-
     try {
-      await fetch('/api/routines/toggle', {
+      const token =
+        (await getAccessToken().catch(() => null)) ||
+        (await auth?.currentUser?.getIdToken().catch(() => null)) ||
+        null;
+      const res = await fetch('/api/routines/toggle', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: JSON.stringify({
           day: selectedDay,
           activityId,
+          activityType: isAudioActivity ? 'audio' : 'video',
+          completed: nowCompleted,
+          completedToday: nowCompleted,
           studentEmail,
           studentUid,
           videoId: videoIdToArchive,
+          weeklyCycle: parseWeekCycleNumber(userProfile?.weeklyCycle) ?? 1,
         }),
       });
+      if (!res.ok) {
+        setRoutinesByDay((prev) => {
+          const updated = { ...prev };
+          updated[selectedDay] = (updated[selectedDay] || []).map((item) =>
+            item.id === activityId ? { ...item, completedToday: !nowCompleted } : item
+          );
+          return updated;
+        });
+      }
     } catch {
-      // local fallback
+      setRoutinesByDay((prev) => {
+        const updated = { ...prev };
+        updated[selectedDay] = (updated[selectedDay] || []).map((item) =>
+          item.id === activityId ? { ...item, completedToday: !nowCompleted } : item
+        );
+        return updated;
+      });
     }
   };
 
@@ -4826,7 +4702,8 @@ export default function App() {
     spotify?: TeacherAssignedSpotify | null,
     targetStudentEmail?: string,
     targetStudentUid?: string,
-    activityName?: string
+    activityName?: string,
+    options?: { skipVideoApi?: boolean }
   ) => {
     const daysToUpdate: DayOfWeek[] = replicateToAllDays
       ? ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
@@ -4886,27 +4763,40 @@ export default function App() {
     });
 
     try {
-      await fetch('/api/routines/teacher-video', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          studentEmail: studentEmailToUse,
-          studentUid: studentUidToUse,
-          teacherUid: currentAccount?.uid,
-          teacherEmail: currentAccount?.email,
-          activityId,
-          activityName: resolvedTopic,
-          playlistTitle: resolvedTopic,
-          videos,
-          teacherNotes,
-          days: daysToUpdate,
-        }),
-      });
+      const token =
+        (await getAccessToken().catch(() => null)) ||
+        (await auth?.currentUser?.getIdToken().catch(() => null)) ||
+        null;
 
-      if (spotify !== undefined) {
-        await fetch('/api/routines/teacher-spotify', {
+      if (!options?.skipVideoApi) {
+        await fetch('/api/routines/teacher-video', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({
+            studentEmail: studentEmailToUse,
+            studentUid: studentUidToUse,
+            teacherUid: currentAccount?.uid,
+            teacherEmail: currentAccount?.email,
+            activityId,
+            activityName: resolvedTopic,
+            playlistTitle: resolvedTopic,
+            videos,
+            teacherNotes,
+            days: daysToUpdate,
+          }),
+        });
+      }
+
+      if (spotify !== undefined && !options?.skipVideoApi) {
+        const spotRes = await fetch('/api/routines/teacher-spotify', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
           body: JSON.stringify({
             studentEmail: studentEmailToUse,
             studentUid: studentUidToUse,
@@ -4918,6 +4808,9 @@ export default function App() {
             days: daysToUpdate,
           }),
         });
+        if (!spotRes.ok) {
+          console.warn(`[App] Failed to persist teacher-spotify: HTTP ${spotRes.status}`);
+        }
       }
     } catch {
       // local fallback
@@ -4939,8 +4832,18 @@ export default function App() {
   };
 
   // Handler: Assign video from playlist topic to activity
-  const handleAssignVideoToActivity = (activityId: string, video: TeacherAssignedVideo, day: DayOfWeek) => {
-    const playlistTopic = (video as any).playlistTitle;
+  const handleAssignVideoToActivity = async (
+    activityId: string,
+    video: TeacherAssignedVideo,
+    day: DayOfWeek,
+    playlistTopicOrOptions?: string | { playlistTopic?: string; skipApiPersist?: boolean }
+  ) => {
+    const playlistTopic =
+      typeof playlistTopicOrOptions === 'string'
+        ? playlistTopicOrOptions
+        : playlistTopicOrOptions?.playlistTopic || (video as any).playlistTitle;
+    const skipApiPersist =
+      typeof playlistTopicOrOptions === 'object' && Boolean(playlistTopicOrOptions?.skipApiPersist);
     const cleanVidId = extractYouTubeVideoId(video.videoId || video.url || '') || video.videoId;
     setRoutinesByDay((prev) => {
       const updated = { ...prev };
@@ -4960,51 +4863,44 @@ export default function App() {
       return updated;
     });
 
+    if (skipApiPersist) return;
+
     const activeEmail = currentAccount?.email || userProfile?.email;
     const activeUid = auth?.currentUser?.uid || currentAccount?.uid || (currentAccount as any)?.id || userProfile?.id;
     const activeCycle = parseWeekCycleNumber(userProfile?.weeklyCycle) || 1;
     if (activeEmail || activeUid) {
-      // 1. Direct daily-video persistence endpoint (backed by Firestore users/{uid}/routines/{day})
-      fetch('/api/routines/daily-video', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          studentUid: activeUid,
-          studentEmail: activeEmail,
-          day,
-          dayOfWeek: day,
-          videoId: cleanVidId,
-          title: video.title,
-          videoTitle: video.title,
-          url: video.url,
-          playlistId: (video as any).playlistId || '',
-          playlistTitle: playlistTopic || (video as any).playlistTitle || '',
-          isRepeatVideo: Boolean((video as any).isRepeatVideo),
-          activityId,
-          instructions: video.instructions,
-          duration: video.duration,
-          weeklyCycle: activeCycle,
-        }),
-      }).catch(() => {});
-
-      // 2. Legacy teacher-video routine endpoint
-      fetch('/api/routines/teacher-video', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          activityId,
-          activityName: playlistTopic || (video as any).playlistTitle || 'Video of the Day',
-          playlistTitle: playlistTopic || (video as any).playlistTitle || '',
-          playlistId: (video as any).playlistId || '',
-          videos: [video],
-          teacherNotes: video.instructions,
-          days: [day],
-          day,
-          studentEmail: activeEmail,
-          studentUid: activeUid,
-          weeklyCycle: activeCycle,
-        }),
-      }).catch(() => {});
+      try {
+        const token =
+          (await getAccessToken().catch(() => null)) ||
+          (await auth?.currentUser?.getIdToken().catch(() => null)) ||
+          null;
+        await fetch('/api/routines/daily-video', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({
+            studentUid: activeUid,
+            studentEmail: activeEmail,
+            day,
+            dayOfWeek: day,
+            videoId: cleanVidId,
+            title: video.title,
+            videoTitle: video.title,
+            url: video.url,
+            playlistId: (video as any).playlistId || '',
+            playlistTitle: playlistTopic || (video as any).playlistTitle || '',
+            isRepeatVideo: Boolean((video as any).isRepeatVideo),
+            activityId,
+            instructions: video.instructions,
+            duration: video.duration,
+            weeklyCycle: activeCycle,
+          }),
+        });
+      } catch (err) {
+        console.warn('[App] Error persisting assigned routine video:', err);
+      }
     }
   };
 
@@ -5271,7 +5167,6 @@ export default function App() {
       const res = await apiClient.post<{
         success: boolean;
         lesson?: LiveLesson;
-        liveLessons?: LiveLesson[];
         error?: string;
       }>(`/api/lessons/${encodeURIComponent(lessonId)}/complete`, {});
 
@@ -5280,10 +5175,7 @@ export default function App() {
       }
 
       const nowIso = new Date().toISOString();
-      const confirmedLesson =
-        res.lesson ||
-        (Array.isArray(res.liveLessons) ? res.liveLessons.find((l) => l.id === lessonId) : undefined) ||
-        targetLessonBefore;
+      const confirmedLesson = res.lesson || targetLessonBefore;
 
       const completedAt = confirmedLesson?.completedAt || nowIso;
 
@@ -6059,10 +5951,24 @@ export default function App() {
     });
 
     try {
+      const token =
+        (await getAccessToken().catch(() => null)) ||
+        (await auth?.currentUser?.getIdToken().catch(() => null)) ||
+        null;
+      const targetStudentObj = studentsList.find(
+        (s) => s.email && studentEmail && s.email.toLowerCase().trim() === studentEmail.toLowerCase().trim()
+      );
       await fetch('/api/routines/words', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ words: newWords, studentEmail }),
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({
+          words: newWords,
+          studentEmail,
+          studentUid: targetStudentObj?.uid || targetStudentObj?.id || undefined,
+        }),
       });
     } catch {
       // local fallback
@@ -6789,7 +6695,7 @@ export default function App() {
   };
 
   // Punctual time update for any activity in the timeline
-  const handleUpdateActivityTime = (activityId: string, newTime: string, dayToUpdate?: DayOfWeek) => {
+  const handleUpdateActivityTime = async (activityId: string, newTime: string, dayToUpdate?: DayOfWeek) => {
     const targetDay = dayToUpdate || selectedDay;
     setRoutinesByDay((prev) => {
       const updated = { ...prev };
@@ -6800,17 +6706,31 @@ export default function App() {
     });
 
     const activeEmail = currentAccount?.email || userProfile?.email;
-    if (activeEmail) {
-      fetch('/api/routines/update-time', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          studentEmail: activeEmail,
-          day: targetDay,
-          activityId,
-          time: newTime,
-        }),
-      }).catch(() => {});
+    const activeUid = auth?.currentUser?.uid || currentAccount?.uid || userProfile?.id;
+    if (activeEmail || activeUid) {
+      try {
+        const token =
+          (await getAccessToken().catch(() => null)) ||
+          (await auth?.currentUser?.getIdToken().catch(() => null)) ||
+          null;
+        await fetch('/api/routines/update-time', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({
+            studentUid: activeUid,
+            studentEmail: activeEmail,
+            day: targetDay,
+            activityId,
+            time: newTime,
+            weeklyCycle: parseWeekCycleNumber(userProfile?.weeklyCycle) ?? 1,
+          }),
+        });
+      } catch (err) {
+        console.warn('[App] Error updating activity time:', err);
+      }
     }
   };
 

@@ -65,8 +65,7 @@ import {
   getCachedPlaylistTracks,
   SpotifyDailyTrack,
 } from '../utils/spotify';
-import { auth, getDb } from '../firebase';
-import { doc, getDoc } from 'firebase/firestore';
+import { auth } from '../firebase';
 import { getAccessToken } from '../utils/auth';
 import { isValidCanonicalUid } from '../utils/tutorConsolidation';
 import { useStudentSpotifySync } from '../hooks/useStudentSpotifySync';
@@ -115,7 +114,12 @@ interface StudentRoutineGuideSectionProps {
   onTest30MinReminder?: () => void;
   currentLanguage: Language;
   t: Translations;
-  onAssignVideoToActivity?: (activityId: string, video: TeacherAssignedVideo, day: DayOfWeek, playlistTopic?: string) => void;
+  onAssignVideoToActivity?: (
+    activityId: string,
+    video: TeacherAssignedVideo,
+    day: DayOfWeek,
+    playlistTopic?: string | { playlistTopic?: string; skipApiPersist?: boolean }
+  ) => void;
   onStartNewWeek?: (studyDaysTarget?: number, selectedDays?: DayOfWeek[]) => Promise<boolean | void> | void;
   weeklyCycle?: number;
   isStarting?: boolean;
@@ -791,23 +795,25 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     let isMounted = true;
     const resolveLevelAsync = async () => {
       try {
-        const db = getDb();
-        if (db && currentUid) {
-          const snap = await getDoc(doc(db, 'users', currentUid));
-          if (snap.exists() && isMounted) {
-            const data = snap.data();
-            const found = resolveCanonicalStudentLevel(
-              data?.englishLevel,
-              data?.userLevel,
-              data?.studentLevel,
-              data?.cefrLevel,
-              data?.level
-            );
-            if (found) {
-              setFirestoreLevel(found);
-              setIsLevelResolving(false);
-              return;
-            }
+        const token = await getAccessToken().catch(() => null);
+        const query = currentUid
+          ? `uid=${encodeURIComponent(currentUid)}`
+          : `email=${encodeURIComponent(currentEmail || '')}`;
+        const res = await fetch(`/api/user-profile?${query}`, {
+          headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+        });
+        if (res.ok && isMounted) {
+          const payload = await res.json();
+          const data = payload?.profile || payload?.user || payload;
+          const found = resolveCanonicalStudentLevel(
+            data?.englishLevel,
+            data?.userLevel,
+            data?.studentLevel,
+            data?.cefrLevel,
+            data?.level
+          );
+          if (found) {
+            setFirestoreLevel(found);
           }
         }
       } catch (err) {
@@ -1361,49 +1367,33 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
             activityId,
             day: selectedDay,
             videoUrl: prevVideo?.url,
+            weeklyCycle: userProfile?.weeklyCycle || weeklyCycle || 1,
           }),
         });
 
-        const data = await res.json();
-        const candidatePrev = prevVideo;
-        const finalVideo: TeacherAssignedVideo = data.video || candidatePrev || {
-          id: `vid-${selectedDay}-repeat-${Date.now()}`,
-          url: 'https://www.youtube.com/watch?v=V1bFr2KGq1g',
-          videoId: 'V1bFr2KGq1g',
-          title: 'Daily English Video Practice',
-          duration: '5-10 min',
-          instructions: isEn ? 'Repeated previous video' : 'Vídeo anterior repetido',
-          addedAt: new Date().toISOString(),
-        };
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.success || !data.video) {
+          setPlaylistFeedback({
+            activityId,
+            type: 'error',
+            message: data.message || data.error || (isEn ? 'Failed to persist repeated video.' : 'Falha ao salvar vídeo repetido.'),
+          });
+          return;
+        }
 
         const repeatedWithMeta: TeacherAssignedVideo = {
-          ...finalVideo,
+          ...data.video,
           playlistId: 'repeat_previous_video',
           playlistTitle: isEn ? 'Repeat Previous Video' : 'Repetir Vídeo Anterior',
         } as any;
 
         if (onAssignVideoToActivity) {
-          onAssignVideoToActivity(activityId, repeatedWithMeta, selectedDay);
-        }
-
-        if (effectiveStudentUid && repeatedWithMeta) {
-          const saveOk = await saveVideoForDay(selectedDay, {
-            videoId: repeatedWithMeta.videoId,
-            videoTitle: repeatedWithMeta.title,
-            title: repeatedWithMeta.title,
-            url: repeatedWithMeta.url,
-            playlistId: 'repeat_previous_video',
-            playlistTitle: repeatedWithMeta.playlistTitle || (isEn ? 'Repeat Previous Video' : 'Repetir Vídeo Anterior'),
-            activityId,
-            isRepeatVideo: true,
-            instructions: repeatedWithMeta.instructions,
-            duration: repeatedWithMeta.duration,
-            weeklyCycle: userProfile?.weeklyCycle || weeklyCycle || 1,
+          onAssignVideoToActivity(activityId, repeatedWithMeta, selectedDay, {
+            playlistTopic: repeatedWithMeta.playlistTitle,
+            skipApiPersist: true,
           });
-          if (!saveOk) {
-            console.warn('[StudentRoutineGuideSection] Failed to persist repeated video to Firestore');
-          }
         }
+        await refreshRoutines().catch(() => {});
 
         setPlaylistFeedback({
           activityId,
@@ -1416,40 +1406,11 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
         onSelectActivity(activityId);
       } catch (err) {
         console.warn('Error repeating previous video:', err);
-        if (prevVideo && onAssignVideoToActivity) {
-          const repeatedWithMeta: TeacherAssignedVideo = {
-            ...prevVideo,
-            playlistId: 'repeat_previous_video',
-            playlistTitle: isEn ? 'Repeat Previous Video' : 'Repetir Vídeo Anterior',
-          } as any;
-          onAssignVideoToActivity(activityId, repeatedWithMeta, selectedDay);
-
-          if (effectiveStudentUid) {
-            const saveOk = await saveVideoForDay(selectedDay, {
-              videoId: repeatedWithMeta.videoId,
-              videoTitle: repeatedWithMeta.title,
-              title: repeatedWithMeta.title,
-              url: repeatedWithMeta.url,
-              playlistId: 'repeat_previous_video',
-              playlistTitle: repeatedWithMeta.playlistTitle || (isEn ? 'Repeat Previous Video' : 'Repetir Vídeo Anterior'),
-              activityId,
-              isRepeatVideo: true,
-              instructions: repeatedWithMeta.instructions,
-              duration: repeatedWithMeta.duration,
-            });
-            if (!saveOk) {
-              console.warn('[StudentRoutineGuideSection] Failed to persist repeated fallback video');
-            }
-          }
-
-          setPlaylistFeedback({
-            activityId,
-            type: 'success',
-            message: isEn ? '🔁 Previous video repeated!' : '🔁 Vídeo anterior repetido com sucesso!',
-          });
-          setTimeout(() => setPlaylistFeedback(null), 4000);
-          onSelectActivity(activityId);
-        }
+        setPlaylistFeedback({
+          activityId,
+          type: 'error',
+          message: isEn ? 'Connection error repeating previous video.' : 'Erro de conexão ao repetir vídeo anterior.',
+        });
       } finally {
         setLoadingPlaylistAssignId(null);
       }
@@ -1486,14 +1447,14 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
         }),
       });
 
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (data.allConsumed) {
         setPlaylistFeedback({
           activityId,
           type: 'warning',
           message: data.message || (isEn ? 'All videos in this playlist were already assigned.' : 'Todos os vídeos desta playlist já foram assistidos.'),
         });
-      } else if (data.success && data.video) {
+      } else if (res.ok && data.success && data.video) {
         setPlaylistFeedback({
           activityId,
           type: 'success',
@@ -1502,36 +1463,19 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
         setTimeout(() => setPlaylistFeedback(null), 4500);
 
         if (onAssignVideoToActivity) {
-          onAssignVideoToActivity(activityId, data.video, selectedDay, (data.playlistTitle || data.video.playlistTitle || playlistId) as any);
-        }
-
-        // Immediately save to Firestore users/{studentUID}/routines/{dayOfWeek}
-        if (effectiveStudentUid) {
-          const saveOk = await saveVideoForDay(selectedDay, {
-            videoId: data.video.videoId,
-            videoTitle: data.video.title,
-            title: data.video.title,
-            url: data.video.url,
-            playlistId,
-            playlistTitle: data.playlistTitle || data.video.playlistTitle,
-            activityId,
-            isRepeatVideo: false,
-            instructions: data.video.instructions,
-            duration: data.video.duration,
-            weeklyCycle: userProfile?.weeklyCycle || weeklyCycle || 1,
+          onAssignVideoToActivity(activityId, data.video, selectedDay, {
+            playlistTopic: data.playlistTitle || data.video.playlistTitle || playlistId,
+            skipApiPersist: true,
           });
-
-          if (!saveOk) {
-            console.warn('[StudentRoutineGuideSection] Failed to persist assigned playlist video to Firestore');
-          }
         }
+        await refreshRoutines().catch(() => {});
 
         onSelectActivity(activityId);
       } else {
         setPlaylistFeedback({
           activityId,
           type: 'error',
-          message: data.error || (isEn ? 'Error assigning video.' : 'Erro ao injetar vídeo.'),
+          message: data.message || data.error || (isEn ? 'Error assigning video.' : 'Erro ao injetar vídeo.'),
         });
       }
     } catch (err) {
@@ -1566,12 +1510,6 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
   const handleUncheckRepeatPreviousVideo = async (activityId: string) => {
     setLoadingPlaylistAssignId(activityId);
     setPlaylistFeedback(null);
-    setSelectedTopicByDay((prev) => ({ ...prev, [selectedDay]: '' }));
-
-    const normLevel = normalizeStudentLevel(userProfile?.level || 'beginner');
-    const defaultDailyVid = getDailyYouTubeVideoForStudent(normLevel, selectedDay);
-    const studentEmail = userProfile?.email || 'aluno@itssimple.com';
-    const studentUid = userProfile?.id || (userProfile as any)?.uid;
 
     const resetVideo: TeacherAssignedVideo = {
       id: `vid-${selectedDay}-reset-${Date.now()}`,
@@ -1585,58 +1523,62 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
       playlistTitle: isEn ? 'Video of the Day' : 'Vídeo do Dia',
     } as any;
 
-    if (onAssignVideoToActivity) {
-      onAssignVideoToActivity(activityId, resetVideo, selectedDay);
-    }
-
-    if (effectiveStudentUid) {
-      saveVideoForDay(selectedDay, {
-        videoId: resetVideo.videoId,
-        videoTitle: resetVideo.title,
-        title: resetVideo.title,
-        url: resetVideo.url,
-        playlistId: '',
-        playlistTitle: resetVideo.playlistTitle,
-        activityId,
-        isRepeatVideo: false,
-      }).catch(() => {});
-    }
-
-    setCustomSuggestionActivities((prev) => ({ ...prev, [activityId]: false }));
-    setSuggestingUrlActivityId(null);
-
     try {
-      await fetch('/api/routines/teacher-video', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      const saveOk = effectiveStudentUid
+        ? await saveVideoForDay(selectedDay, {
+            videoId: '',
+            videoTitle: resetVideo.title,
+            title: resetVideo.title,
+            url: '',
+            playlistId: '',
+            playlistTitle: '',
+            activityId,
+            isRepeatVideo: false,
+            instructions: resetVideo.instructions,
+            duration: resetVideo.duration,
+            weeklyCycle: userProfile?.weeklyCycle || weeklyCycle || 1,
+          })
+        : false;
+
+      if (!saveOk) {
+        setPlaylistFeedback({
           activityId,
-          activityName: isEn ? 'Video of the Day' : 'Vídeo do Dia',
-          playlistTitle: isEn ? 'Video of the Day' : 'Vídeo do Dia',
-          playlistId: '',
-          videos: [resetVideo],
-          teacherNotes: resetVideo.instructions,
-          days: [selectedDay],
-          day: selectedDay,
-          studentEmail,
-          studentUid,
-        }),
+          type: 'error',
+          message: isEn ? 'Failed to reset video on server.' : 'Falha ao redefinir vídeo no servidor.',
+        });
+        return;
+      }
+
+      setSelectedTopicByDay((prev) => ({ ...prev, [selectedDay]: '' }));
+      setCustomSuggestionActivities((prev) => ({ ...prev, [activityId]: false }));
+      setSuggestingUrlActivityId(null);
+
+      if (onAssignVideoToActivity) {
+        onAssignVideoToActivity(activityId, resetVideo, selectedDay, {
+          playlistTopic: resetVideo.playlistTitle,
+          skipApiPersist: true,
+        });
+      }
+
+      setPlaylistFeedback({
+        activityId,
+        type: 'info',
+        message: isEn
+          ? 'Topic selector re-enabled. Choose a topic or your suggestion.'
+          : 'Seletor de tópicos reabilitado. Escolha um tema ou sua sugestão.',
       });
+      setTimeout(() => setPlaylistFeedback(null), 3500);
+      onSelectActivity(activityId);
     } catch (err) {
       console.warn('Error syncing uncheck repeat video:', err);
+      setPlaylistFeedback({
+        activityId,
+        type: 'error',
+        message: isEn ? 'Connection error resetting video.' : 'Erro de conexão ao redefinir vídeo.',
+      });
     } finally {
       setLoadingPlaylistAssignId(null);
     }
-
-    setPlaylistFeedback({
-      activityId,
-      type: 'info',
-      message: isEn
-        ? 'Topic selector re-enabled. Choose a topic or your suggestion.'
-        : 'Seletor de tópicos reabilitado. Escolha um tema ou sua sugestão.',
-    });
-    setTimeout(() => setPlaylistFeedback(null), 3500);
-    onSelectActivity(activityId);
   };
 
   // Handler: Save / Confirm custom YouTube video URL suggested by student
@@ -1681,28 +1623,36 @@ export const StudentRoutineGuideSection: React.FC<StudentRoutineGuideSectionProp
     };
 
     try {
-      if (onAssignVideoToActivity) {
-        onAssignVideoToActivity(activityId, customVideo, selectedDay, 'Your Suggestion' as any);
+      const saveOk = effectiveStudentUid
+        ? await saveVideoForDay(selectedDay, {
+            videoId: customVideo.videoId,
+            videoTitle: customVideo.title,
+            title: customVideo.title,
+            url: customVideo.url,
+            playlistId: 'custom_suggestion',
+            playlistTitle: customVideo.playlistTitle,
+            activityId,
+            isRepeatVideo: false,
+            instructions: customVideo.instructions,
+            duration: customVideo.duration,
+            weeklyCycle: userProfile?.weeklyCycle || weeklyCycle || 1,
+          })
+        : false;
+
+      if (!saveOk) {
+        setPlaylistFeedback({
+          activityId,
+          type: 'error',
+          message: isEn ? 'Error saving video suggestion to server.' : 'Erro ao salvar sugestão de vídeo no servidor.',
+        });
+        return;
       }
 
-      if (effectiveStudentUid && customVideo) {
-        const saveOk = await saveVideoForDay(selectedDay, {
-          videoId: customVideo.videoId,
-          videoTitle: customVideo.title,
-          title: customVideo.title,
-          url: customVideo.url,
-          playlistId: 'custom_suggestion',
-          playlistTitle: customVideo.playlistTitle,
-          activityId,
-          isRepeatVideo: false,
-          instructions: customVideo.instructions,
-          duration: customVideo.duration,
-          weeklyCycle: userProfile?.weeklyCycle || weeklyCycle || 1,
+      if (onAssignVideoToActivity) {
+        onAssignVideoToActivity(activityId, customVideo, selectedDay, {
+          playlistTopic: 'Your Suggestion',
+          skipApiPersist: true,
         });
-
-        if (!saveOk) {
-          console.warn('[StudentRoutineGuideSection] Failed to persist custom video suggestion to Firestore');
-        }
       }
 
       setSelectedTopicByDay((prev) => ({ ...prev, [selectedDay]: 'custom_suggestion' }));

@@ -143,6 +143,16 @@ import {
   fetchStudentCycleStatusFromServerFirestore,
   saveLastCycleResultToFirestore,
   fetchUsersFromFirestoreCanonical,
+  fetchStudentProfileFromFirestoreServer,
+  fetchCanonicalRoutineContextServer,
+  saveStudentRoutineDayFieldsServer,
+  saveStudentAssignmentsCanonicalServer,
+  addWatchedVideoCanonicalServer,
+  addListenedTrackCanonicalServer,
+  fetchStudentCurrentRoutineServer,
+  saveStudentCurrentRoutineServer,
+  saveCurrentRoutineFeedbackServer,
+  saveTeacherSpotifyOverrideServer,
 } from './src/serverFirestore';
 import { normalizeDictionaryWord } from './src/utils/studentDictionaryLibrary';
 import { buildWeeklyLearningInsights } from './src/utils/weeklyLearningInsights';
@@ -172,6 +182,7 @@ import {
   distributeWeeklySpotifyForStudentEngine,
   selectNextTrackFromPlaylist,
   getOrCreateStudentCycleState,
+  cloneOrInitSpotifyCycleState,
   getSpotifyConfigStatus,
   getSpotifyAccessToken,
   clearSpotifyPlaylistCache,
@@ -719,9 +730,16 @@ function sanitizeSpotifyRecord(obj: any, dayHint?: string): any {
 }
 
 function mergeDbWithDefaults(parsed: any): AppDb {
+  const {
+    liveLessons: _ignoredParsedLiveLessons,
+    lessons: _ignoredParsedLessons,
+    scheduledLessons: _ignoredParsedScheduledLessons,
+    ...safeParsed
+  } = parsed || {};
+
   const merged: AppDb = {
     ...DEFAULT_DB,
-    ...(parsed || {}),
+    ...safeParsed,
     routinesByDay:
       parsed && parsed.routinesByDay && Object.keys(parsed.routinesByDay).length > 0
         ? parsed.routinesByDay
@@ -1191,7 +1209,12 @@ export async function initCloudPersistence() {
         ...(cloudState.studentListenedTracks || {}),
       };
 
-      const { liveLessons: _ignoredCloudLiveLessons, ...cloudStateWithoutLegacyLessons } = cloudState;
+      const {
+        liveLessons: _ignoredCloudLiveLessons,
+        lessons: _ignoredCloudLessons,
+        scheduledLessons: _ignoredCloudScheduledLessons,
+        ...cloudStateWithoutLegacyLessons
+      } = cloudState;
       inMemoryDb = mergeDbWithDefaults({
         ...inMemoryDb,
         ...cloudStateWithoutLegacyLessons,
@@ -6754,171 +6777,429 @@ function extractServerYouTubeId(urlOrId: string | null | undefined): string | nu
   return match && match[1] && match[1].length === 11 ? match[1] : null;
 }
 
-app.get('/api/student-routines', async (req, res) => {
-  const db = readDb();
-  const studentEmail = ((req.query.studentEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
-  const uid = ((req.query.uid as string) || (req.query.studentUid as string) || '').trim();
-  const resolved = resolveStudentIdentifiers(db, studentEmail, uid);
-
-  const emailRoutines = (resolved.email && db.studentRoutinesMap?.[resolved.email]) || (studentEmail && db.studentRoutinesMap?.[studentEmail]);
-  const uidRoutines = resolved.uid && db.studentRoutinesMap?.[resolved.uid];
-
-  const countContent = (r: any) => {
-    if (!r || typeof r !== 'object') return 0;
-    let score = 0;
-    Object.values(r).forEach((dayList: any) => {
-      if (Array.isArray(dayList)) {
-        dayList.forEach((act: any) => {
-          if (act.teacherVideos && act.teacherVideos.length > 0) score += 10;
-          if (act.learnedWords && act.learnedWords.length > 0) score += act.learnedWords.length;
-        });
-      }
-    });
-    return score;
-  };
-
-  const emailScore = countContent(emailRoutines);
-  const uidScore = countContent(uidRoutines);
-  let routines = uidScore >= emailScore && uidScore > 0 ? uidRoutines : (emailScore > 0 ? emailRoutines : (uidRoutines || emailRoutines));
-
-  const targetKeys = Array.from(new Set([resolved.uid, resolved.email, studentEmail].filter(Boolean) as string[]));
-
-  // Sync back to both keys so they never diverge
-  if (routines) {
-    if (!db.studentRoutinesMap) db.studentRoutinesMap = {};
-    targetKeys.forEach((k) => {
-      db.studentRoutinesMap[k] = routines;
-    });
+// ARCH.2E.2A: Canonical Firestore-backed YouTube weekly distributor (zero reliance on inMemoryDb routine maps)
+async function distributeWeeklyYouTubeCanonical(params: {
+  uid: string;
+  email: string;
+  level?: string;
+  teacherUid?: string;
+  teacherEmail?: string;
+  days?: string[];
+  weeklyCycle?: number;
+  forceRedistribute?: boolean;
+  idempotencyKey?: string;
+  catalogPlaylists?: any[];
+}): Promise<{
+  success: boolean;
+  idempotentReplay?: boolean;
+  assignments: any[];
+  weeklyCycle: number;
+  error?: string;
+  code?: string;
+}> {
+  const ctx = await fetchCanonicalRoutineContextServer(params.uid, params.weeklyCycle);
+  if (!ctx) {
+    return {
+      success: false,
+      assignments: [],
+      weeklyCycle: params.weeklyCycle || 1,
+      error: 'Canonical Firestore (default) context unavailable.',
+      code: 'FIRESTORE_UNAVAILABLE',
+    };
   }
 
-  // Auto-distribute if video or spotify assignments are missing or have repeating duplicates
-  let videoAssigns: any[] = [];
-  let spotifyAssigns: any[] = [];
+  const requestedCycle = extractPositiveIntegerCycle(params.weeklyCycle);
+  if (requestedCycle !== null && requestedCycle < ctx.activeCycle) {
+    return {
+      success: false,
+      assignments: ctx.videoAssignments,
+      weeklyCycle: ctx.activeCycle,
+      error: `Stale cycle ${requestedCycle} rejected; active cycle is ${ctx.activeCycle}.`,
+      code: 'STALE_CYCLE',
+    };
+  }
 
-  for (const k of targetKeys) {
-    if (db.studentVideoAssignments?.[k] && Array.isArray(db.studentVideoAssignments[k])) {
-      videoAssigns = db.studentVideoAssignments[k];
-      if (videoAssigns.length > 0) break;
+  const activeCycle = requestedCycle !== null ? Math.max(ctx.activeCycle, requestedCycle) : ctx.activeCycle;
+  const studentLevelRaw = params.level || ctx.level || 'beginner';
+  const normLevel = normalizeStudentLevel(studentLevelRaw).key;
+  const levelPlaylist = YOUTUBE_LEVEL_PLAYLISTS[normLevel] || YOUTUBE_LEVEL_PLAYLISTS.beginner;
+
+  const daysToDistribute = (Array.isArray(params.days) && params.days.length > 0 ? params.days : ctx.studyDays)
+    .map((d) => String(d || '').toLowerCase().trim())
+    .filter((d) => DAYS_SEQUENCE.includes(d as any));
+  const targetDays = daysToDistribute.length > 0 ? daysToDistribute : DAYS_SEQUENCE;
+
+  // Idempotency check: if idempotencyKey matches or all target days already have unique non-empty assignments in activeCycle
+  const existingForDays = targetDays
+    .map((d) => ctx.videoAssignments.find((a: any) => (a.day || a.dayOfWeek) === d && Number(a.weeklyCycle || activeCycle) === activeCycle))
+    .filter(Boolean);
+  const existingIds = existingForDays
+    .map((a: any) => extractServerYouTubeId(a.videoId || a.videoUrl))
+    .filter(Boolean) as string[];
+  const hasUniqueExisting =
+    existingForDays.length === targetDays.length &&
+    existingIds.length === targetDays.length &&
+    (targetDays.length === 1 || new Set(existingIds).size > 1);
+  const matchingIdempotency =
+    Boolean(params.idempotencyKey) &&
+    existingForDays.some((a: any) => a.idempotencyKey === params.idempotencyKey);
+
+  if (!params.forceRedistribute && (matchingIdempotency || hasUniqueExisting)) {
+    return {
+      success: true,
+      idempotentReplay: true,
+      assignments: ctx.videoAssignments,
+      weeklyCycle: activeCycle,
+    };
+  }
+
+  const consumedVideoIds = new Set<string>();
+  ctx.watchedVideosHistory.forEach((id) => {
+    const cid = extractServerYouTubeId(id) || id;
+    if (cid) consumedVideoIds.add(cid);
+  });
+  ctx.studentJournal.forEach((entry: any) => {
+    if (entry && entry.type === 'video') {
+      const cid = extractServerYouTubeId(entry.id || entry.url);
+      if (cid) consumedVideoIds.add(cid);
     }
-  }
+  });
 
-  // If video assignments were missing but routines already has teacherVideos configured, extract them!
-  if (videoAssigns.length === 0 && routines) {
-    Object.keys(routines).forEach((d) => {
-      const dayList = routines[d];
-      if (Array.isArray(dayList)) {
-        dayList.forEach((act: any) => {
-          if (Array.isArray(act.teacherVideos) && act.teacherVideos.length > 0) {
-            const v = act.teacherVideos[0];
-            if (v && (v.videoId || v.url)) {
-              videoAssigns.push({ ...v, day: d, dayOfWeek: d });
-            }
-          }
+  const channelPlaylistCandidates: any[] = [];
+  if (Array.isArray(params.catalogPlaylists)) {
+    params.catalogPlaylists.forEach((pl: any) => {
+      if (Array.isArray(pl.videos)) {
+        pl.videos.forEach((v: any) => {
+          channelPlaylistCandidates.push({
+            ...v,
+            playlistId: pl.id,
+            playlistTitle: pl.title,
+            instructions: v.instructions || `Assista a esta aula sobre "${pl.title}".`,
+          });
         });
       }
     });
-    if (videoAssigns.length > 0) {
-      if (!db.studentVideoAssignments) db.studentVideoAssignments = {};
-      targetKeys.forEach((k) => {
-        db.studentVideoAssignments[k] = videoAssigns;
+  }
+
+  const allLevelCandidates: any[] = [
+    ...DAYS_SEQUENCE.map((d) => levelPlaylist.videos[d]),
+    ...(levelPlaylist.pool || []),
+    ...channelPlaylistCandidates,
+  ].filter(Boolean);
+
+  const assignedInWeekVideoIds = new Set<string>();
+  const assignedRecords: any[] = [];
+  const now = new Date().toISOString();
+
+  for (let idx = 0; idx < targetDays.length; idx++) {
+    const dayKey = targetDays[idx] as DayOfWeek;
+    const designatedVideo = levelPlaylist.videos[dayKey];
+    let chosenVideo: any = designatedVideo;
+    const designatedVidId = extractServerYouTubeId(designatedVideo?.videoId || designatedVideo?.url);
+
+    if (!designatedVidId || consumedVideoIds.has(designatedVidId) || assignedInWeekVideoIds.has(designatedVidId)) {
+      const unseenCandidate = allLevelCandidates.find((c) => {
+        const cid = extractServerYouTubeId(c.videoId || c.url);
+        return cid && !consumedVideoIds.has(cid) && !assignedInWeekVideoIds.has(cid);
       });
+      if (unseenCandidate) {
+        chosenVideo = unseenCandidate;
+      } else {
+        const unassignedThisWeek = allLevelCandidates.find((c) => {
+          const cid = extractServerYouTubeId(c.videoId || c.url);
+          return cid && !assignedInWeekVideoIds.has(cid);
+        });
+        chosenVideo = unassignedThisWeek || designatedVideo;
+      }
     }
-  }
-  for (const k of targetKeys) {
-    if (db.studentSpotifyAssignments?.[k] && Array.isArray(db.studentSpotifyAssignments[k])) {
-      spotifyAssigns = db.studentSpotifyAssignments[k];
-      if (spotifyAssigns.length > 0) break;
-    }
-  }
 
-  const uniqueVideoIds = new Set(
-    videoAssigns.map((a) => extractServerYouTubeId(a.videoId || a.videoUrl)).filter(Boolean)
-  );
-  const hasExplicitRepeatVideo = videoAssigns.some(
-    (a) => a.isRepeatVideo || a.playlistId === 'repeat_previous_video' || (a.playlistTitle && a.playlistTitle.toLowerCase().includes('repeat'))
-  );
-  // Never treat user-selected repeat videos or voluntary video assignments as a repeating bug
-  const hasRepeatingVideoBug =
-    videoAssigns.length > 1 &&
-    uniqueVideoIds.size === 1 &&
-    !hasExplicitRepeatVideo &&
-    !videoAssigns.some((a) => a.playlistId && a.playlistId !== 'curriculum-default');
+    const cleanVidId = extractServerYouTubeId(chosenVideo?.videoId || chosenVideo?.url) || `vid-${dayKey}`;
+    assignedInWeekVideoIds.add(cleanVidId);
+    consumedVideoIds.add(cleanVidId);
 
-  const uniqueTrackIds = new Set(
-    spotifyAssigns.map((a) => extractSpotifyTrackId(a.trackId || a.url || a.trackUrl)).filter(Boolean)
-  );
-  const hasRepeatingSpotifyBug = spotifyAssigns.length > 1 && uniqueTrackIds.size === 1;
+    const canonicalUrl = `https://www.youtube.com/watch?v=${cleanVidId}`;
+    const embedUrl = chosenVideo?.embedUrl || `https://www.youtube-nocookie.com/embed/${cleanVidId}?rel=0&modestbranding=1&enablejsapi=1`;
+    const instructions =
+      chosenVideo?.instructions ||
+      chosenVideo?.teacherTipPt ||
+      'Vídeo exclusivo do dia. Assista com atenção e anote novos vocabulários.';
+    const playlistIdVal = chosenVideo?.playlistId || levelPlaylist.playlistId;
+    const playlistTitleVal = chosenVideo?.playlistTitle || levelPlaylist.playlistTitle;
+    const titleVal = chosenVideo?.title || 'Daily Video Practice';
+    const durationVal = chosenVideo?.duration || '6-8 min';
 
-  let dbChanged = false;
-  let isAwaitingTopicSelection = false;
-  if (resolved.email || resolved.uid) {
-    const studentLevel = normalizeStudentLevel(resolveStudentLevel(db, resolved.email, resolved.uid)).key;
-    const studentPlanDays: string[] =
-      (resolved.email && db.weeklyStudyDays?.[resolved.email] && db.weeklyStudyDays[resolved.email].length > 0)
-        ? db.weeklyStudyDays[resolved.email]
-        : (resolved.uid && db.weeklyStudyDays?.[resolved.uid] && db.weeklyStudyDays[resolved.uid].length > 0)
-        ? db.weeklyStudyDays[resolved.uid]
-        : (resolved.email && db.userProfiles?.[resolved.email]?.weeklyStudyDays && db.userProfiles[resolved.email].weeklyStudyDays.length > 0)
-        ? db.userProfiles[resolved.email].weeklyStudyDays
-        : (resolved.email && db.userProfiles?.[resolved.email]?.selectedStudyDays && db.userProfiles[resolved.email].selectedStudyDays.length > 0)
-        ? db.userProfiles[resolved.email].selectedStudyDays
-        : DAYS_SEQUENCE;
-    const expectedDaysCount = Math.max(1, studentPlanDays.length);
+    const assignmentRecord: any = {
+      id: `assign-${dayKey}-${activeCycle}-${cleanVidId}`,
+      activityId: `act-${dayKey}-1`,
+      studentEmail: params.email,
+      studentUid: params.uid,
+      teacherUid: (params.teacherUid || '').trim(),
+      teacherEmail: (params.teacherEmail || '').trim(),
+      day: dayKey,
+      playlistId: playlistIdVal,
+      playlistTitle: playlistTitleVal,
+      videoId: cleanVidId,
+      videoTitle: titleVal,
+      videoUrl: canonicalUrl,
+      embedUrl,
+      assignedAt: now,
+      level: normLevel,
+      instructions,
+      duration: durationVal,
+      weeklyCycle: activeCycle,
+      ...(params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : {}),
+    };
 
-    const hasVoluntaryVideoAssignments = videoAssigns.length > 0;
-    isAwaitingTopicSelection = Boolean(
-      (resolved.email && db.studentAwaitingTopicSelection?.[resolved.email]) ||
-      (resolved.uid && db.studentAwaitingTopicSelection?.[resolved.uid]) ||
-      !hasVoluntaryVideoAssignments
+    assignedRecords.push(assignmentRecord);
+
+    const savedDay = await saveRoutineVideoSubcollection(
+      params.uid,
+      dayKey,
+      {
+        id: cleanVidId,
+        videoId: cleanVidId,
+        title: titleVal,
+        videoTitle: titleVal,
+        url: canonicalUrl,
+        playlistId: playlistIdVal,
+        playlistTitle: playlistTitleVal,
+        dayOfWeek: dayKey,
+        activityId: `act-${dayKey}-1`,
+        teacherUid: (params.teacherUid || '').trim(),
+        teacherEmail: (params.teacherEmail || '').trim(),
+        isRepeatVideo: false,
+        instructions,
+        duration: durationVal,
+        weeklyCycle: activeCycle,
+        updatedAt: now,
+      },
+      activeCycle
     );
 
-    const hasSpotifyLevelMismatch = spotifyAssigns.length > 0 && spotifyAssigns.some((a) => {
-      const aNorm = normalizeStudentLevel(a.level || a.playlistTitle).key;
-      return aNorm !== studentLevel || (a.playlistId && a.playlistId !== SPOTIFY_LEVEL_PLAYLISTS[studentLevel].playlistId);
+    if (!savedDay) {
+      return {
+        success: false,
+        assignments: [],
+        weeklyCycle: activeCycle,
+        error: `Failed to persist daily video for ${dayKey} in Firestore.`,
+        code: 'WRITE_FAILED',
+      };
+    }
+  }
+
+  const targetDaySet = new Set(targetDays);
+  const mergedAssignments = [
+    ...ctx.videoAssignments.filter((a: any) => !targetDaySet.has((a.day || a.dayOfWeek || '').toLowerCase())),
+    ...assignedRecords,
+  ];
+
+  const savedAssignments = await saveStudentAssignmentsCanonicalServer(params.uid, {
+    uid: params.uid,
+    email: params.email,
+    level: normLevel,
+    weeklyCycle: activeCycle,
+    videoAssignments: mergedAssignments,
+    awaitingTopicSelection: false,
+    updatedAt: now,
+  });
+
+  if (!savedAssignments) {
+    return {
+      success: false,
+      assignments: [],
+      weeklyCycle: activeCycle,
+      error: 'Failed to persist weekly video assignments in Firestore.',
+      code: 'WRITE_FAILED',
+    };
+  }
+
+  return {
+    success: true,
+    assignments: mergedAssignments,
+    weeklyCycle: activeCycle,
+  };
+}
+
+app.get('/api/student-routines', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeStudentRoutineAccess(req, res, { allowMissingTargetFallbackToCaller: true });
+  if (!authCtx) return;
+
+  const { canonicalStudentUid, canonicalStudentEmail } = authCtx;
+  const requestedCycle = req.query.weeklyCycle !== undefined ? String(req.query.weeklyCycle) : undefined;
+  const ctx = await fetchCanonicalRoutineContextServer(canonicalStudentUid, requestedCycle);
+
+  if (!ctx) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Could not read canonical student routines from Firestore (default).',
+    });
+  }
+
+  const vidTime = ctx.userProfile?.routineVideoTime;
+  const audTime = ctx.userProfile?.routineAudioTime;
+  const merged = createCleanStudentRoutines(vidTime);
+
+  const dayKeys = Object.keys(merged) as Array<keyof typeof merged>;
+  dayKeys.forEach((day) => {
+    const rawDay = ctx.routinesByDayRaw[day];
+    const dayAssignment = ctx.videoAssignments.find((a: any) => (a.day || a.dayOfWeek) === day);
+    const spotifyAssign = ctx.spotifyAssignments.find((s: any) => (s.day || s.dayOfWeek) === day);
+
+    const dayList = (merged[day] || []).map((item: any, idx: number, arr: any[]) => {
+      const nextItem = { ...item };
+
+      if (idx === 0 || item.id?.endsWith('1')) {
+        if (vidTime) nextItem.time = vidTime;
+
+        if (rawDay) {
+          if (Array.isArray(rawDay.learnedWords)) {
+            nextItem.learnedWords = rawDay.learnedWords;
+          }
+          if (rawDay.completedToday !== undefined) {
+            nextItem.completedToday = Boolean(rawDay.completedToday);
+            nextItem.completed = Boolean(rawDay.completed ?? rawDay.completedToday);
+          }
+          if (rawDay.completedVideoToday !== undefined) {
+            nextItem.completedVideoToday = Boolean(rawDay.completedVideoToday);
+          }
+          if (rawDay.time) {
+            nextItem.time = rawDay.time;
+          } else if (rawDay.activityTimes && nextItem.id && rawDay.activityTimes[nextItem.id]) {
+            nextItem.time = rawDay.activityTimes[nextItem.id];
+          }
+          if (rawDay.instructions || rawDay.teacherNotes) {
+            nextItem.teacherNotes = rawDay.teacherNotes || rawDay.instructions;
+          }
+
+          const rawVidId = rawDay.videoId ? (extractServerYouTubeId(rawDay.videoId || rawDay.url) || String(rawDay.videoId).trim()) : '';
+          if (rawVidId) {
+            const cleanUrl = rawDay.url || `https://www.youtube.com/watch?v=${rawVidId}`;
+            const title = rawDay.title || rawDay.videoTitle || 'Daily Video Practice';
+            const plTitle = rawDay.playlistTitle || '';
+            nextItem.activityName = plTitle || title || nextItem.activityName;
+            nextItem.playlistId = rawDay.playlistId || '';
+            nextItem.playlistTitle = plTitle;
+            nextItem.isRepeatVideo = Boolean(rawDay.isRepeatVideo);
+            nextItem.teacherVideos = [
+              {
+                id: rawVidId,
+                videoId: rawVidId,
+                title,
+                url: cleanUrl,
+                playlistId: rawDay.playlistId || '',
+                playlistTitle: plTitle,
+                isRepeatVideo: Boolean(rawDay.isRepeatVideo),
+                isCustomSuggestion: Boolean(rawDay.isCustomSuggestion || rawDay.playlistId === 'custom_suggestion'),
+                instructions: rawDay.instructions || '',
+                duration: rawDay.duration || '5-10 min',
+                addedAt: rawDay.updatedAt || new Date().toISOString(),
+              },
+            ];
+          } else if (rawDay.videoId === '' && rawDay.playlistId === '') {
+            nextItem.activityName = 'Video of the Day';
+            nextItem.playlistId = '';
+            nextItem.playlistTitle = '';
+            nextItem.teacherVideos = [];
+          } else if (dayAssignment && (dayAssignment.videoId || dayAssignment.videoUrl)) {
+            const aVidId = extractServerYouTubeId(dayAssignment.videoId || dayAssignment.videoUrl) || dayAssignment.videoId;
+            if (aVidId) {
+              nextItem.activityName = dayAssignment.playlistTitle || dayAssignment.videoTitle || nextItem.activityName;
+              nextItem.playlistId = dayAssignment.playlistId || '';
+              nextItem.playlistTitle = dayAssignment.playlistTitle || '';
+              nextItem.teacherVideos = [
+                {
+                  id: aVidId,
+                  videoId: aVidId,
+                  title: dayAssignment.videoTitle || dayAssignment.title || 'Daily Video Practice',
+                  url: dayAssignment.videoUrl || `https://www.youtube.com/watch?v=${aVidId}`,
+                  playlistId: dayAssignment.playlistId || '',
+                  playlistTitle: dayAssignment.playlistTitle || '',
+                  isRepeatVideo: Boolean(dayAssignment.isRepeatVideo),
+                  instructions: dayAssignment.instructions || '',
+                  duration: dayAssignment.duration || '5-10 min',
+                },
+              ];
+            }
+          }
+        } else if (dayAssignment && (dayAssignment.videoId || dayAssignment.videoUrl)) {
+          const aVidId = extractServerYouTubeId(dayAssignment.videoId || dayAssignment.videoUrl) || dayAssignment.videoId;
+          if (aVidId) {
+            nextItem.activityName = dayAssignment.playlistTitle || dayAssignment.videoTitle || nextItem.activityName;
+            nextItem.playlistId = dayAssignment.playlistId || '';
+            nextItem.playlistTitle = dayAssignment.playlistTitle || '';
+            nextItem.teacherVideos = [
+              {
+                id: aVidId,
+                videoId: aVidId,
+                title: dayAssignment.videoTitle || dayAssignment.title || 'Daily Video Practice',
+                url: dayAssignment.videoUrl || `https://www.youtube.com/watch?v=${aVidId}`,
+                playlistId: dayAssignment.playlistId || '',
+                playlistTitle: dayAssignment.playlistTitle || '',
+                isRepeatVideo: Boolean(dayAssignment.isRepeatVideo),
+                instructions: dayAssignment.instructions || '',
+                duration: dayAssignment.duration || '5-10 min',
+              },
+            ];
+          }
+        }
+      }
+
+      const isAudioTarget = arr.length === 1 ? idx === 0 : (idx === 1 || Boolean(item.id?.endsWith('2')));
+      if (isAudioTarget) {
+        if (audTime) {
+          if (idx === 1 || item.id?.endsWith('2')) {
+            nextItem.time = audTime;
+          } else {
+            nextItem.audioTime = audTime;
+          }
+        }
+        if (rawDay && rawDay.completedAudioToday !== undefined) {
+          nextItem.completedAudioToday = Boolean(rawDay.completedAudioToday);
+          if (idx === 1 || item.id?.endsWith('2')) {
+            nextItem.completedToday = Boolean(rawDay.completedAudioToday);
+            nextItem.completed = Boolean(rawDay.completedAudioToday);
+          }
+        }
+        if (rawDay && rawDay.teacherOverrideTrack !== undefined) {
+          nextItem.teacherOverrideTrack = rawDay.teacherOverrideTrack;
+        }
+        if (rawDay && rawDay.teacherFeedback !== undefined) {
+          nextItem.teacherFeedback = rawDay.teacherFeedback;
+        }
+        if (rawDay && (rawDay.teacherNotes || rawDay.instructions)) {
+          nextItem.teacherNotes = rawDay.teacherNotes || rawDay.instructions;
+        }
+        const daySpot =
+          rawDay?.teacherSpotify === null
+            ? null
+            : rawDay?.teacherSpotify && (rawDay.teacherSpotify.url || rawDay.teacherSpotify.trackUrl)
+            ? rawDay.teacherSpotify
+            : spotifyAssign;
+        if (daySpot && (daySpot.url || daySpot.trackUrl)) {
+          nextItem.teacherSpotify = {
+            id: daySpot.id || daySpot.trackId || `spot-${day}`,
+            ...(daySpot.trackId ? { trackId: daySpot.trackId } : {}),
+            url: daySpot.url || daySpot.trackUrl,
+            title: daySpot.title || daySpot.trackTitle || 'Daily Spotify Audio',
+            artistOrHost: daySpot.artistOrHost || daySpot.artist || 'Spotify',
+            instructions: daySpot.instructions || rawDay?.teacherNotes || '',
+            type: daySpot.type || 'music',
+          };
+        }
+      }
+
+      if (rawDay?.activityTimes && nextItem.id && rawDay.activityTimes[nextItem.id]) {
+        nextItem.time = rawDay.activityTimes[nextItem.id];
+      }
+
+      return nextItem;
     });
 
-    if (hasRepeatingVideoBug && !isAwaitingTopicSelection) {
-      distributeWeeklyYouTubeForStudent(db, resolved.email, resolved.uid, studentLevel, undefined, undefined, studentPlanDays);
-      dbChanged = true;
-    }
-    if (spotifyAssigns.length < expectedDaysCount || hasRepeatingSpotifyBug || hasSpotifyLevelMismatch) {
-      await distributeWeeklySpotifyForStudent(db, resolved.email, resolved.uid, studentLevel, undefined, undefined, studentPlanDays);
-      dbChanged = true;
-    }
-    if (dbChanged) {
-      writeDb(db);
-      routines = (resolved.uid && db.studentRoutinesMap?.[resolved.uid]) || (resolved.email && db.studentRoutinesMap?.[resolved.email]) || routines;
-    }
-  }
+    merged[day] = dayList;
+  });
 
-  if (routines && typeof routines === 'object' && Object.keys(routines).length > 0) {
-    const base = createCleanStudentRoutines();
-    const merged = { ...base, ...routines };
-    if (isAwaitingTopicSelection) {
-      Object.keys(merged).forEach((d) => {
-        if (Array.isArray(merged[d])) {
-          merged[d] = merged[d].map((act: any) => {
-            const isVideo =
-              act.id?.endsWith('1') ||
-              act.activityName?.toLowerCase().includes('vídeo') ||
-              act.activityName?.toLowerCase().includes('video');
-            if (isVideo && !act.teacherAssigned) {
-              return {
-                ...act,
-                activityName: 'Video of the Day',
-                playlistId: '',
-                playlistTitle: '',
-                teacherVideos: [],
-              };
-            }
-            return act;
-          });
-        }
-      });
-    }
-    return res.json(merged);
-  }
-  res.json(createCleanStudentRoutines());
+  // Read-only hydration complete: never overwrite Firestore videos with empty state or auto-distribute YouTube here.
+  return res.json(merged);
 });
 
 /**
@@ -7412,111 +7693,252 @@ app.get(['/api/student-routines/cycle-status', '/api/student-routines/start-new-
   });
 });
 
-// Real-time Current Routine & Spotify Track Mirroring Endpoints
-app.post('/api/routines/current-routine', (req, res) => {
-  const { studentUid, weekId, currentSpotifyTrack, studentEmail, nativeFriendUid, nativeFriendEmail } = req.body;
-  if (!studentUid) {
-    return res.status(400).json({ error: 'studentUid is required' });
-  }
+// Canonical Firestore (default) Current Routine, Spotify Track, Feedback, and Override Endpoints
+app.post('/api/routines/current-routine', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeStudentRoutineAccess(req, res, { allowMissingTargetFallbackToCaller: true });
+  if (!authCtx) return;
 
-  const db = readDb();
-  if (!(db as any).studentCurrentRoutines) {
-    (db as any).studentCurrentRoutines = {};
-  }
+  const { canonicalStudentUid, canonicalStudentEmail } = authCtx;
+  const {
+    weekId,
+    currentSpotifyTrack,
+    studentEmail,
+    nativeFriendUid,
+    nativeFriendEmail,
+    dayOfWeek,
+    weeklyCycle: bodyCycle,
+  } = req.body || {};
 
-  const cleanUid = String(studentUid).toLowerCase().trim();
-  const safeWeekId = weekId || 'week-1';
-  const key = `${cleanUid}:${safeWeekId}`;
-  const weekDataKey = `${cleanUid}:weekData`;
-
-  const existing = (db as any).studentCurrentRoutines[key] || {};
-  const updatedDoc = {
-    ...existing,
-    studentUid: cleanUid,
-    weekId: safeWeekId,
-    currentSpotifyTrack: currentSpotifyTrack !== undefined ? currentSpotifyTrack : existing.currentSpotifyTrack,
-    studentEmail: studentEmail || existing.studentEmail,
-    nativeFriendUid: nativeFriendUid || existing.nativeFriendUid,
-    nativeFriendEmail: nativeFriendEmail || existing.nativeFriendEmail,
-    updatedAt: new Date().toISOString(),
-  };
-
-  (db as any).studentCurrentRoutines[key] = updatedDoc;
-  (db as any).studentCurrentRoutines[weekDataKey] = {
-    ...((db as any).studentCurrentRoutines[weekDataKey] || {}),
-    ...updatedDoc,
-  };
-
-  writeDb(db);
-  res.json({ success: true, routine: updatedDoc });
-});
-
-app.get('/api/routines/current-routine', (req, res) => {
-  const studentUid = (req.query.studentUid as string || '').toLowerCase().trim();
-  const weekId = (req.query.weekId as string || 'week-1').trim();
-  if (!studentUid) {
-    return res.status(400).json({ error: 'studentUid is required' });
-  }
-
-  const db = readDb();
-  const routinesMap = (db as any).studentCurrentRoutines || {};
-
-  // Check weekData first, then requested weekId
-  let routine = routinesMap[`${studentUid}:weekData`] || routinesMap[`${studentUid}:${weekId}`] || null;
-
-  // Fallback: if routine is missing or track is null, search all cycles for this student
-  if (!routine || !routine.currentSpotifyTrack) {
-    const studentKeys = Object.keys(routinesMap).filter((k) => k.startsWith(`${studentUid}:`));
-    const matching = studentKeys
-      .map((k) => routinesMap[k])
-      .filter((r) => r && r.currentSpotifyTrack)
-      .sort((a, b) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime());
-    if (matching.length > 0) {
-      routine = matching[0];
+  let sanitizedTrack = currentSpotifyTrack;
+  if (currentSpotifyTrack && typeof currentSpotifyTrack === 'object' && typeof currentSpotifyTrack.url === 'string' && currentSpotifyTrack.url.trim() !== '') {
+    const parsed = parseSpotifyUrl(currentSpotifyTrack.url);
+    if (!parsed.isValid) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.errorMessage || 'Invalid Spotify URL in currentSpotifyTrack.',
+      });
     }
+    sanitizedTrack = {
+      ...currentSpotifyTrack,
+      url: parsed.canonicalUrl || currentSpotifyTrack.url,
+    };
   }
 
-  res.json({ success: true, routine });
+  const safeWeekId = typeof weekId === 'string' && weekId.trim() ? weekId.trim() : 'weekData';
+  const saveRes = await saveStudentCurrentRoutineServer(
+    canonicalStudentUid,
+    safeWeekId,
+    {
+      currentSpotifyTrack: sanitizedTrack,
+      studentEmail: canonicalStudentEmail || studentEmail,
+      nativeFriendUid,
+      nativeFriendEmail,
+      dayOfWeek: dayOfWeek || sanitizedTrack?.dayOfWeek,
+    },
+    bodyCycle
+  );
+
+  if (!saveRes.success) {
+    if (saveRes.code === 'STALE_CYCLE') {
+      return res.status(409).json({
+        success: false,
+        error: 'STALE_CYCLE',
+        message: saveRes.error,
+        activeCycle: saveRes.activeCycle,
+      });
+    }
+    if (saveRes.code === 'FIRESTORE_UNAVAILABLE') {
+      return res.status(503).json({
+        success: false,
+        error: 'FirestoreUnavailable',
+        message: saveRes.error || 'Canonical Firestore (default) unavailable.',
+      });
+    }
+    return res.status(500).json({
+      success: false,
+      error: 'FirestorePersistenceFailed',
+      message: saveRes.error || 'Failed to persist current routine in Firestore (default).',
+    });
+  }
+
+  return res.json({
+    success: true,
+    routine: saveRes.routine,
+    studentUid: canonicalStudentUid,
+    weeklyCycle: saveRes.activeCycle,
+  });
 });
 
-app.post('/api/routines/current-routine/feedback', (req, res) => {
-  const { studentUid, weekId, feedback } = req.body;
-  if (!studentUid || !feedback || !feedback.dayOfWeek) {
-    return res.status(400).json({ error: 'studentUid and feedback with dayOfWeek are required' });
+app.get('/api/routines/current-routine', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeStudentRoutineAccess(req, res, { allowMissingTargetFallbackToCaller: true });
+  if (!authCtx) return;
+
+  const { canonicalStudentUid } = authCtx;
+  const weekId = ((req.query.weekId as string) || '').trim();
+  const requestedCycle = req.query.weeklyCycle !== undefined ? String(req.query.weeklyCycle) : undefined;
+
+  const result = await fetchStudentCurrentRoutineServer(canonicalStudentUid, weekId || undefined, requestedCycle);
+  if (!result) {
+    return res.status(503).json({
+      success: false,
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) unavailable.',
+    });
   }
 
-  const db = readDb();
-  if (!(db as any).studentCurrentRoutines) {
-    (db as any).studentCurrentRoutines = {};
+  return res.json({
+    success: true,
+    routine: result.routine,
+    studentUid: canonicalStudentUid,
+    weeklyCycle: result.activeCycle,
+  });
+});
+
+app.post('/api/routines/current-routine/feedback', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeStudentRoutineAccess(req, res, {
+    allowMissingTargetFallbackToCaller: true,
+    requireApprovedTeacherIfTutor: true,
+  });
+  if (!authCtx) return;
+
+  const { callerUid, callerEmail, isCallerApprovedTeacher, canonicalStudentUid } = authCtx;
+  const { weekId, feedback, weeklyCycle: bodyCycle } = req.body || {};
+
+  if (!feedback || !feedback.dayOfWeek) {
+    return res.status(400).json({ error: 'feedback with dayOfWeek is required' });
+  }
+  const cleanDay = String(feedback.dayOfWeek).toLowerCase().trim();
+  if (!DAYS_SEQUENCE.includes(cleanDay as any)) {
+    return res.status(400).json({ error: `Invalid dayOfWeek: ${cleanDay}` });
   }
 
-  const cleanUid = String(studentUid).toLowerCase().trim();
-  const safeWeekId = weekId || 'week-1';
-  const key = `${cleanUid}:${safeWeekId}`;
-  const weekDataKey = `${cleanUid}:weekData`;
-
-  const existing = (db as any).studentCurrentRoutines[key] || {
-    studentUid: cleanUid,
-    weekId: safeWeekId,
+  const stampedFeedback = {
+    ...feedback,
+    dayOfWeek: cleanDay,
+    studentUid: canonicalStudentUid,
+    teacherUid: isCallerApprovedTeacher ? callerUid : (feedback.teacherUid || callerUid),
+    teacherEmail: isCallerApprovedTeacher ? callerEmail : (feedback.teacherEmail || callerEmail),
   };
 
-  if (!existing.teacherFeedback) existing.teacherFeedback = {};
-  existing.teacherFeedback[feedback.dayOfWeek] = feedback;
-  existing.updatedAt = new Date().toISOString();
+  const safeWeekId = typeof weekId === 'string' && weekId.trim() ? weekId.trim() : 'weekData';
+  const saveRes = await saveCurrentRoutineFeedbackServer(
+    canonicalStudentUid,
+    safeWeekId,
+    stampedFeedback,
+    bodyCycle
+  );
 
-  (db as any).studentCurrentRoutines[key] = existing;
+  if (!saveRes.success) {
+    if (saveRes.code === 'STALE_CYCLE') {
+      return res.status(409).json({
+        success: false,
+        error: 'STALE_CYCLE',
+        message: saveRes.error,
+        activeCycle: saveRes.activeCycle,
+      });
+    }
+    if (saveRes.code === 'FIRESTORE_UNAVAILABLE') {
+      return res.status(503).json({
+        success: false,
+        error: 'FirestoreUnavailable',
+        message: saveRes.error || 'Canonical Firestore (default) unavailable.',
+      });
+    }
+    return res.status(500).json({
+      success: false,
+      error: 'FirestorePersistenceFailed',
+      message: saveRes.error || 'Failed to persist track feedback in Firestore (default).',
+    });
+  }
 
-  const existingWeekData = (db as any).studentCurrentRoutines[weekDataKey] || {
-    studentUid: cleanUid,
-    weekId: safeWeekId,
-  };
-  if (!existingWeekData.teacherFeedback) existingWeekData.teacherFeedback = {};
-  existingWeekData.teacherFeedback[feedback.dayOfWeek] = feedback;
-  existingWeekData.updatedAt = new Date().toISOString();
-  (db as any).studentCurrentRoutines[weekDataKey] = existingWeekData;
+  return res.json({
+    success: true,
+    routine: saveRes.routine,
+    studentUid: canonicalStudentUid,
+    weeklyCycle: saveRes.activeCycle,
+  });
+});
 
-  writeDb(db);
-  res.json({ success: true, routine: existing });
+app.post('/api/routines/override-track', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeStudentRoutineAccess(req, res, {
+    allowMissingTargetFallbackToCaller: true,
+    requireApprovedTeacherIfTutor: true,
+  });
+  if (!authCtx) return;
+
+  const { callerUid, callerEmail, isCallerApprovedTeacher, canonicalStudentUid } = authCtx;
+  const { dayOfWeek, day, teacherOverrideTrack, weeklyCycle: bodyCycle } = req.body || {};
+
+  const targetDay = String(dayOfWeek || day || '').toLowerCase().trim();
+  if (!targetDay || !DAYS_SEQUENCE.includes(targetDay as any)) {
+    return res.status(400).json({ error: 'Valid dayOfWeek is required' });
+  }
+
+  let sanitizedOverride: Record<string, any> | null = null;
+  if (teacherOverrideTrack !== null && teacherOverrideTrack !== undefined) {
+    if (typeof teacherOverrideTrack !== 'object' || !teacherOverrideTrack.url) {
+      return res.status(400).json({ error: 'teacherOverrideTrack must include a valid Spotify url or be null' });
+    }
+    const parsed = parseSpotifyUrl(teacherOverrideTrack.url);
+    if (!parsed.isValid) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.errorMessage || 'Invalid Spotify URL in teacherOverrideTrack.',
+      });
+    }
+    const cleanTrackId =
+      teacherOverrideTrack.trackId ||
+      parsed.id ||
+      extractSpotifyTrackId(parsed.canonicalUrl || teacherOverrideTrack.url) ||
+      'override-track';
+    sanitizedOverride = {
+      ...teacherOverrideTrack,
+      id: teacherOverrideTrack.id || `override-${targetDay}-${cleanTrackId}`,
+      trackId: cleanTrackId,
+      url: parsed.canonicalUrl || teacherOverrideTrack.url,
+      embedUrl: parsed.embedUrl || teacherOverrideTrack.embedUrl,
+      teacherUid: isCallerApprovedTeacher ? callerUid : (teacherOverrideTrack.teacherUid || callerUid),
+      teacherEmail: isCallerApprovedTeacher ? callerEmail : (teacherOverrideTrack.teacherEmail || callerEmail),
+    };
+  }
+
+  const saveRes = await saveTeacherSpotifyOverrideServer(
+    canonicalStudentUid,
+    targetDay,
+    sanitizedOverride,
+    bodyCycle
+  );
+
+  if (!saveRes.success) {
+    if (saveRes.code === 'STALE_CYCLE') {
+      return res.status(409).json({
+        success: false,
+        error: 'STALE_CYCLE',
+        message: saveRes.error,
+        activeCycle: saveRes.activeCycle,
+      });
+    }
+    if (saveRes.code === 'FIRESTORE_UNAVAILABLE') {
+      return res.status(503).json({
+        success: false,
+        error: 'FirestoreUnavailable',
+        message: saveRes.error || 'Canonical Firestore (default) unavailable.',
+      });
+    }
+    return res.status(500).json({
+      success: false,
+      error: 'FirestorePersistenceFailed',
+      message: saveRes.error || 'Failed to persist Spotify override track in Firestore (default).',
+    });
+  }
+
+  return res.json({
+    success: true,
+    studentUid: canonicalStudentUid,
+    dayOfWeek: targetDay,
+    teacherOverrideTrack: sanitizedOverride,
+    weeklyCycle: saveRes.activeCycle,
+  });
 });
 
 // 5. Live Lessons Endpoints
@@ -7547,18 +7969,33 @@ async function verifyTeacherIdentityInFirestore(
   const cleanUid = uid.trim();
   const cleanEmail = (email || '').trim().toLowerCase();
 
-  const isApprovedTutorData = (data: any): boolean => {
-    if (!data) return false;
+  const isApprovedTutorData = (data: any, sourceCollection: 'users' | 'tutors'): boolean => {
+    if (!data || typeof data !== 'object') return false;
     const role = (data.role || '').toLowerCase().trim();
+    const approvalStatus = (data.approvalStatus || data.status || '').toLowerCase().trim();
+    if (
+      approvalStatus === 'pending' ||
+      approvalStatus === 'rejected' ||
+      data.isApproved === false ||
+      data.approved === false
+    ) {
+      return false;
+    }
+    const hasPositiveApproval =
+      approvalStatus === 'approved' ||
+      data.isApproved === true ||
+      data.approved === true;
+    if (!hasPositiveApproval) return false;
+
+    if (sourceCollection === 'tutors') {
+      return role !== 'student';
+    }
     const isTeacherRole =
       role === 'teacher' ||
       role === 'tutor' ||
       role === 'native_friend' ||
       data.isTeacher === true;
-    const isApproved =
-      data.approvalStatus === 'approved' &&
-      data.isApproved === true;
-    return Boolean(isTeacherRole && isApproved);
+    return Boolean(isTeacherRole);
   };
 
   try {
@@ -7566,7 +8003,7 @@ async function verifyTeacherIdentityInFirestore(
     const userDoc = await firestore.collection('users').doc(cleanUid).get().catch(() => null);
     if (userDoc && userDoc.exists) {
       const uData = userDoc.data();
-      if (isApprovedTutorData(uData)) {
+      if (isApprovedTutorData(uData, 'users')) {
         return {
           isTeacher: true,
           publicTutorId: uData.publicTutorId || uData.tutorId || uData.id || cleanUid,
@@ -7581,7 +8018,7 @@ async function verifyTeacherIdentityInFirestore(
     const tutorDoc = await firestore.collection('tutors').doc(cleanUid).get().catch(() => null);
     if (tutorDoc && tutorDoc.exists) {
       const tData = tutorDoc.data();
-      if (isApprovedTutorData(tData)) {
+      if (isApprovedTutorData(tData, 'tutors')) {
         return {
           isTeacher: true,
           publicTutorId: tData.publicTutorId || tutorDoc.id,
@@ -7597,7 +8034,7 @@ async function verifyTeacherIdentityInFirestore(
     if (qAuthUid && !qAuthUid.empty) {
       const doc = qAuthUid.docs[0];
       const tData = doc.data();
-      if (isApprovedTutorData(tData)) {
+      if (isApprovedTutorData(tData, 'tutors')) {
         return {
           isTeacher: true,
           publicTutorId: tData.publicTutorId || doc.id,
@@ -7613,7 +8050,7 @@ async function verifyTeacherIdentityInFirestore(
     if (qUid && !qUid.empty) {
       const doc = qUid.docs[0];
       const tData = doc.data();
-      if (isApprovedTutorData(tData)) {
+      if (isApprovedTutorData(tData, 'tutors')) {
         return {
           isTeacher: true,
           publicTutorId: tData.publicTutorId || doc.id,
@@ -7630,7 +8067,7 @@ async function verifyTeacherIdentityInFirestore(
       if (qEmail && !qEmail.empty) {
         const doc = qEmail.docs[0];
         const tData = doc.data();
-        if (isApprovedTutorData(tData)) {
+        if (isApprovedTutorData(tData, 'tutors')) {
           return {
             isTeacher: true,
             publicTutorId: tData.publicTutorId || doc.id,
@@ -7708,19 +8145,14 @@ app.get(
           });
         }
       } else if (isTeacher) {
-        // Teacher (Native Friend): execute strictly filtered canonical queries (no unrestricted scan)
+        // Teacher (Native Friend): execute strictly filtered canonical queries on lessons/{lessonId}
         const publicTutorId = teacherInfo.publicTutorId;
         const teacherAuthUid = (teacherInfo.authUid || '').trim();
         const teacherEmail = (teacherInfo.email || email).toLowerCase().trim();
 
-        // Query subcollections first so canonical root `lessons/{lessonId}` always takes precedence
-        const subcollectionPromises: Promise<any>[] = [];
         const rootQueryPromises: Promise<any>[] = [];
 
         if (publicTutorId) {
-          subcollectionPromises.push(
-            firestore.collection('tutors').doc(publicTutorId).collection('lessons').get().catch(() => ({ docs: [] }))
-          );
           rootQueryPromises.push(
             firestore.collection('lessons').where('teacherUid', '==', publicTutorId).get().catch(() => ({ docs: [] })),
             firestore.collection('lessons').where('tutorUid', '==', publicTutorId).get().catch(() => ({ docs: [] })),
@@ -7729,9 +8161,6 @@ app.get(
         }
 
         if (uid) {
-          subcollectionPromises.push(
-            firestore.collection('users').doc(uid).collection('lessons').get().catch(() => ({ docs: [] }))
-          );
           if (uid !== publicTutorId) {
             rootQueryPromises.push(
               firestore.collection('lessons').where('teacherUid', '==', uid).get().catch(() => ({ docs: [] })),
@@ -7746,9 +8175,6 @@ app.get(
         }
 
         if (teacherAuthUid && teacherAuthUid !== uid) {
-          subcollectionPromises.push(
-            firestore.collection('users').doc(teacherAuthUid).collection('lessons').get().catch(() => ({ docs: [] }))
-          );
           rootQueryPromises.push(
             firestore.collection('lessons').where('teacherUid', '==', teacherAuthUid).get().catch(() => ({ docs: [] })),
             firestore.collection('lessons').where('tutorUid', '==', teacherAuthUid).get().catch(() => ({ docs: [] })),
@@ -7763,21 +8189,7 @@ app.get(
           );
         }
 
-        const [subSnapshots, rootSnapshots] = await Promise.all([
-          Promise.all(subcollectionPromises),
-          Promise.all(rootQueryPromises),
-        ]);
-
-        for (const snap of subSnapshots) {
-          if (snap && snap.docs) {
-            for (const doc of snap.docs) {
-              lessonsById.set(doc.id, {
-                ...doc.data(),
-                id: doc.id,
-              });
-            }
-          }
-        }
+        const rootSnapshots = await Promise.all(rootQueryPromises);
 
         for (const snap of rootSnapshots) {
           if (snap && snap.docs) {
@@ -7790,10 +8202,7 @@ app.get(
           }
         }
       } else {
-        // Student: execute strictly filtered canonical queries (no unrestricted scan)
-        const subcollectionPromises: Promise<any>[] = [
-          firestore.collection('users').doc(uid).collection('lessons').get().catch(() => ({ docs: [] })),
-        ];
+        // Student: execute strictly filtered canonical queries on lessons/{lessonId}
         const rootQueryPromises: Promise<any>[] = [
           firestore.collection('lessons').where('studentUid', '==', uid).get().catch(() => ({ docs: [] })),
         ];
@@ -7804,21 +8213,7 @@ app.get(
           );
         }
 
-        const [subSnapshots, rootSnapshots] = await Promise.all([
-          Promise.all(subcollectionPromises),
-          Promise.all(rootQueryPromises),
-        ]);
-
-        for (const snap of subSnapshots) {
-          if (snap && snap.docs) {
-            for (const doc of snap.docs) {
-              lessonsById.set(doc.id, {
-                ...doc.data(),
-                id: doc.id,
-              });
-            }
-          }
-        }
+        const rootSnapshots = await Promise.all(rootQueryPromises);
 
         for (const snap of rootSnapshots) {
           if (snap && snap.docs) {
@@ -7963,7 +8358,8 @@ app.get(
 
           // By email
           if (target.includes('@')) {
-            const qEm = await firestore.collection('tutors').where('email', '==', target.toLowerCase().trim()).limit(1).get().catch(() => null);
+            const cleanTargetEmail = target.toLowerCase().trim();
+            const qEm = await firestore.collection('tutors').where('email', '==', cleanTargetEmail).limit(1).get().catch(() => null);
             if (qEm && !qEm.empty) {
               const tData = qEm.docs[0].data();
               if (tData) {
@@ -7973,13 +8369,33 @@ app.get(
                 break;
               }
             }
+            const qUserEm = await firestore.collection('users').where('email', '==', cleanTargetEmail).limit(1).get().catch(() => null);
+            if (qUserEm && !qUserEm.empty) {
+              const uData = qUserEm.docs[0].data();
+              if (uData && (uData.role === 'teacher' || uData.role === 'tutor' || uData.role === 'native_friend' || uData.isTeacher || uData.approved || uData.isApproved || uData.publicTutorId)) {
+                publicTutorId = uData.publicTutorId || publicTutorId;
+                teacherAuthUid = uData.authUid || uData.uid || qUserEm.docs[0].id;
+                teacherEmail = (uData.email || cleanTargetEmail).toLowerCase().trim();
+                break;
+              }
+            }
           } else {
             const userDoc = await firestore.collection('users').doc(target).get().catch(() => null);
             if (userDoc && userDoc.exists) {
               const uData = userDoc.data();
-              if (uData && (uData.role === 'teacher' || uData.isTeacher || uData.approved || uData.publicTutorId)) {
+              if (uData && (uData.role === 'teacher' || uData.role === 'tutor' || uData.role === 'native_friend' || uData.isTeacher || uData.approved || uData.isApproved || uData.publicTutorId)) {
                 publicTutorId = uData.publicTutorId || publicTutorId;
                 teacherAuthUid = uData.authUid || uData.uid || userDoc.id;
+                if (!teacherEmail && uData.email) teacherEmail = uData.email.toLowerCase().trim();
+                break;
+              }
+            }
+            const qUserPub = await firestore.collection('users').where('publicTutorId', '==', target).limit(1).get().catch(() => null);
+            if (qUserPub && !qUserPub.empty) {
+              const uData = qUserPub.docs[0].data();
+              if (uData && (uData.role === 'teacher' || uData.role === 'tutor' || uData.role === 'native_friend' || uData.isTeacher || uData.approved || uData.isApproved || uData.publicTutorId)) {
+                publicTutorId = uData.publicTutorId || target;
+                teacherAuthUid = uData.authUid || uData.uid || qUserPub.docs[0].id;
                 if (!teacherEmail && uData.email) teacherEmail = uData.email.toLowerCase().trim();
                 break;
               }
@@ -7988,39 +8404,16 @@ app.get(
         } catch {}
       }
 
-      // Fallback tutor metadata lookup in tutorsList only if not resolved from Firestore tutors/users
-      const db = readDb();
-      if (!publicTutorId && db.tutorsList) {
-        const found = db.tutorsList.find((t: any) => {
-          const tEmail = (t.email || '').toLowerCase().trim();
-          const tId = (t.publicTutorId || t.id || '').trim();
-          return (
-            (rawTarget && (tId === rawTarget || tEmail === rawTarget.toLowerCase())) ||
-            (queryEmail && tEmail === queryEmail) ||
-            (queryUid && (t.uid === queryUid || t.authUid === queryUid))
-          );
-        });
-        if (found) {
-          publicTutorId = found.publicTutorId || found.id || '';
-          teacherAuthUid = found.authUid || found.uid || teacherAuthUid || '';
-          if (!teacherEmail && found.email) teacherEmail = found.email.toLowerCase().trim();
-        }
-      }
-
       if (!publicTutorId && !rawTarget.includes('@') && rawTarget) {
         publicTutorId = rawTarget;
       }
 
       const activeLessonsMap = new Map<string, any>();
 
-      // Fetch active scheduled lessons strictly from canonical Firestore (default)
-      const subcollectionPromises: Promise<any>[] = [];
+      // ARCH.2D.2: Fetch active scheduled lessons strictly from canonical Firestore (default) lessons/{lessonId}
       const rootQueryPromises: Promise<any>[] = [];
 
       if (publicTutorId) {
-        subcollectionPromises.push(
-          firestore.collection('tutors').doc(publicTutorId).collection('lessons').get().catch(() => ({ docs: [] }))
-        );
         rootQueryPromises.push(
           firestore.collection('lessons').where('teacherUid', '==', publicTutorId).get().catch(() => ({ docs: [] })),
           firestore.collection('lessons').where('tutorUid', '==', publicTutorId).get().catch(() => ({ docs: [] })),
@@ -8028,9 +8421,6 @@ app.get(
         );
       }
       if (teacherAuthUid) {
-        subcollectionPromises.push(
-          firestore.collection('users').doc(teacherAuthUid).collection('lessons').get().catch(() => ({ docs: [] }))
-        );
         if (teacherAuthUid !== publicTutorId) {
           rootQueryPromises.push(
             firestore.collection('lessons').where('teacherUid', '==', teacherAuthUid).get().catch(() => ({ docs: [] })),
@@ -8050,18 +8440,8 @@ app.get(
         );
       }
 
-      const [subSnapshots, rootSnapshots] = await Promise.all([
-        Promise.all(subcollectionPromises),
-        Promise.all(rootQueryPromises),
-      ]);
+      const rootSnapshots = await Promise.all(rootQueryPromises);
 
-      for (const snap of subSnapshots) {
-        if (snap && snap.docs) {
-          for (const doc of snap.docs) {
-            activeLessonsMap.set(doc.id, doc.data());
-          }
-        }
-      }
       for (const snap of rootSnapshots) {
         if (snap && snap.docs) {
           for (const doc of snap.docs) {
@@ -8079,7 +8459,7 @@ app.get(
             Boolean(l.cancelledAt);
           return (
             !isCancelled &&
-            l.status === 'scheduled' &&
+            (l.status === 'scheduled' || l.status === 'confirmed') &&
             Boolean(l.startDateTime) &&
             Boolean(l.endDateTime)
           );
@@ -8613,7 +8993,7 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
     }
   }
 
-  // 6. Lesson check (canonical Firestore lessons/{lessonId} only — decoupled from db.liveLessons)
+  // 6. Lesson check (canonical Firestore lessons/{lessonId} only — decoupled from db.liveLessons and legacy subcollections)
   const lessonId = (explicitLessonId || req.body?.lessonId || (req.body?.id && !req.body.id.startsWith('session_') ? req.body.id : '')).trim();
   let lesson: any = null;
   if (lessonId) {
@@ -8623,11 +9003,6 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
         const lSnap = await fs.collection('lessons').doc(lessonId).get().catch(() => null);
         if (lSnap && lSnap.exists) {
           lesson = lSnap.data();
-        } else {
-          const userLessonSnap = await fs.collection('users').doc(studentUid).collection('lessons').doc(lessonId).get().catch(() => null);
-          if (userLessonSnap && userLessonSnap.exists) {
-            lesson = userLessonSnap.data();
-          }
         }
       }
     } catch {}
@@ -12890,11 +13265,51 @@ app.get('/api/students/verify-link', async (req, res) => {
     return res.json({ isLinked: true, reason: 'assigned_student' });
   }
 
-  // Check canonical Firestore lessons
+  // Check canonical Firestore (default) user profile & tutors + lessons
   let hasLesson = false;
   try {
     const fs = getFirestoreDb();
     if (fs) {
+      // 1. Check student profile in Firestore users collection
+      let fsStudentProfile: any = null;
+      if (studentUid && isValidCanonicalUid(studentUid)) {
+        const directUserSnap = await fs.collection('users').doc(studentUid).get().catch(() => null);
+        if (directUserSnap && directUserSnap.exists) {
+          fsStudentProfile = directUserSnap.data();
+        }
+      }
+      if (!fsStudentProfile && studentEmail) {
+        const qSnap = await fs.collection('users').where('email', '==', studentEmail).get().catch(() => null);
+        if (qSnap && !qSnap.empty) {
+          fsStudentProfile = qSnap.docs[0].data();
+        }
+      }
+
+      if (fsStudentProfile) {
+        const fsTeacherUid = (
+          fsStudentProfile.assignedNativeFriendUID ||
+          fsStudentProfile.nativeFriendUID ||
+          fsStudentProfile.teacherUid ||
+          fsStudentProfile.assignedTeacherId ||
+          ''
+        ).trim();
+        const fsTeacherEmail = (fsStudentProfile.teacherEmail || fsStudentProfile.assignedTeacherEmail || '').toLowerCase().trim();
+        const fsDirectMatch =
+          (teacherUid && fsTeacherUid && (teacherUid === fsTeacherUid || teacherUid === `tutor-${fsTeacherUid}` || fsTeacherUid === `tutor-${teacherUid}`)) ||
+          (teacherEmail && fsTeacherEmail && teacherEmail === fsTeacherEmail);
+        const fsConflict = Boolean(
+          (fsTeacherEmail && teacherEmail && fsTeacherEmail !== teacherEmail) ||
+          (fsTeacherUid && teacherUid && fsTeacherUid !== teacherUid && fsTeacherUid !== `tutor-${teacherUid}`)
+        );
+        if (fsDirectMatch && !fsConflict) {
+          return res.json({ isLinked: true, reason: 'assigned_student_firestore' });
+        }
+        if (fsConflict) {
+          return res.json({ isLinked: false, reason: 'unauthorized_uid_pair' });
+        }
+      }
+
+      // 2. Check canonical Firestore lessons
       const queries: Promise<any>[] = [];
       if (studentUid) {
         queries.push(fs.collection('lessons').where('studentUid', '==', studentUid).get().catch(() => ({ docs: [] })));
@@ -13016,105 +13431,233 @@ app.post('/api/routines', (req, res) => {
   res.json(db.routinesByDay);
 });
 
-app.post('/api/routines/words', async (req, res) => {
-  const db = readDb();
-  const { day, activityId, words, studentEmail, studentUid } = req.body;
-  const { email, uid } = resolveStudentIdentifiers(db, studentEmail, studentUid);
-  const targetKeys = Array.from(new Set([email, uid, studentEmail, studentUid].filter(Boolean) as string[]));
+app.post('/api/routines/words', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeStudentRoutineAccess(req, res, { allowMissingTargetFallbackToCaller: true });
+  if (!authCtx) return;
 
-  if (db.routinesByDay && db.routinesByDay[day]) {
-    db.routinesByDay[day] = db.routinesByDay[day].map((item: any, idx: number) =>
-      item.id === activityId || (!activityId && idx === 0) ? { ...item, learnedWords: words } : item
+  const { day, words, weeklyCycle: bodyCycle } = req.body || {};
+  if (!Array.isArray(words)) {
+    return res.status(400).json({ error: 'words array is required' });
+  }
+
+  const { canonicalStudentUid } = authCtx;
+  const ctx = await fetchCanonicalRoutineContextServer(canonicalStudentUid);
+  if (!ctx) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) context unavailable.',
+    });
+  }
+
+  const requestedCycle = extractPositiveIntegerCycle(bodyCycle);
+  if (requestedCycle !== null && requestedCycle < ctx.activeCycle) {
+    return res.status(409).json({
+      success: false,
+      error: 'STALE_CYCLE',
+      message: `Stale cycle ${requestedCycle} rejected; active cycle is ${ctx.activeCycle}.`,
+      activeCycle: ctx.activeCycle,
+    });
+  }
+
+  const cleanWords = Array.from(
+    new Set(
+      words
+        .map((w: any) => (typeof w === 'string' ? w.trim() : ''))
+        .filter(Boolean)
+    )
+  );
+
+  const targetDays = day
+    ? [String(day).toLowerCase().trim()]
+    : (ctx.studyDays.length > 0 ? ctx.studyDays : DAYS_SEQUENCE);
+
+  const invalidDay = targetDays.find((d) => !DAYS_SEQUENCE.includes(d as any));
+  if (invalidDay) {
+    return res.status(400).json({ error: `Invalid day of week: ${invalidDay}` });
+  }
+
+  for (const targetDay of targetDays) {
+    const existingWords = Array.isArray(ctx.routinesByDayRaw[targetDay]?.learnedWords)
+      ? ctx.routinesByDayRaw[targetDay].learnedWords
+      : [];
+    const wordsToSave = day ? cleanWords : Array.from(new Set([...existingWords, ...cleanWords]));
+    const saveRes = await saveStudentRoutineDayFieldsServer(
+      canonicalStudentUid,
+      targetDay,
+      { learnedWords: wordsToSave },
+      bodyCycle
     );
-  }
-
-  if (targetKeys.length > 0) {
-    if (!db.studentRoutinesMap) db.studentRoutinesMap = {};
-    targetKeys.forEach((k) => {
-      if (!db.studentRoutinesMap[k]) {
-        db.studentRoutinesMap[k] = JSON.parse(JSON.stringify(db.routinesByDay || defaultRoutinesByDay));
+    if (!saveRes.success) {
+      if (saveRes.code === 'STALE_CYCLE') {
+        return res.status(409).json({
+          success: false,
+          error: 'STALE_CYCLE',
+          message: saveRes.error,
+          activeCycle: saveRes.activeCycle,
+        });
       }
-      if (db.studentRoutinesMap[k][day]) {
-        db.studentRoutinesMap[k][day] = db.studentRoutinesMap[k][day].map((item: any, idx: number) =>
-          item.id === activityId || (!activityId && idx === 0) ? { ...item, learnedWords: words } : item
-        );
-      }
-    });
-  }
-
-  writeDb(db);
-
-  // Direct persistence to Cloud Firestore users/{effectiveUid}/routines/{day}
-  try {
-    const fs = getFirestoreDb();
-    const effectiveUid = uid || studentUid;
-    if (fs && effectiveUid && day) {
-      const routineDocRef = fs.collection('users').doc(effectiveUid).collection('routines').doc(day);
-      await routineDocRef.set(
-        {
-          dayOfWeek: day,
-          learnedWords: Array.isArray(words) ? words : [],
-          updatedAt: new Date().toISOString(),
-        },
-        { merge: true }
-      );
-    }
-  } catch (err) {
-    console.warn('[serverApp] Error saving learnedWords to Firestore:', err);
-  }
-
-  res.json({ success: true, learnedWords: words });
-});
-
-app.post('/api/routines/toggle', (req, res) => {
-  const db = readDb();
-  const { day, activityId, studentEmail, studentUid, videoId } = req.body;
-  const { email, uid } = resolveStudentIdentifiers(db, studentEmail, studentUid);
-  const targetKeys = Array.from(new Set([email, uid].filter(Boolean) as string[]));
-
-  let becameCompleted = false;
-
-  if (db.routinesByDay && db.routinesByDay[day]) {
-    db.routinesByDay[day] = db.routinesByDay[day].map((item: any) => {
-      if (item.id === activityId) {
-        const nextState = !item.completedToday;
-        if (nextState) becameCompleted = true;
-        return { ...item, completedToday: nextState, completed: nextState };
-      }
-      return item;
-    });
-  }
-
-  targetKeys.forEach((k) => {
-    if (db.studentRoutinesMap?.[k]?.[day]) {
-      db.studentRoutinesMap[k][day] = db.studentRoutinesMap[k][day].map((item: any) => {
-        if (item.id === activityId) {
-          const nextState = !item.completedToday;
-          if (nextState) becameCompleted = true;
-          return { ...item, completedToday: nextState, completed: nextState };
-        }
-        return item;
+      return res.status(500).json({
+        success: false,
+        error: 'FirestorePersistenceFailed',
+        message: saveRes.error || 'Failed to persist learnedWords in Firestore (default).',
       });
     }
+  }
 
-    if (becameCompleted && videoId) {
-      const cleanVid = extractServerYouTubeId(videoId);
-      if (cleanVid) {
-        if (!db.studentWatchedVideos) db.studentWatchedVideos = {};
-        if (!db.studentWatchedVideos[k]) db.studentWatchedVideos[k] = [];
-        if (!db.studentWatchedVideos[k].includes(cleanVid)) {
-          db.studentWatchedVideos[k].push(cleanVid);
-        }
-      }
-    }
-  });
-
-  writeDb(db);
-  res.json({ success: true });
+  return res.json({ success: true, learnedWords: cleanWords, studentUid: canonicalStudentUid, updatedDays: targetDays });
 });
 
-app.post('/api/routines/teacher-video', (req, res) => {
-  const db = readDb();
+app.post('/api/routines/toggle', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeStudentRoutineAccess(req, res, { allowMissingTargetFallbackToCaller: true });
+  if (!authCtx) return;
+
+  const { day, activityId, videoId, videoTitle, completed, completedToday, activityType, weeklyCycle: bodyCycle } = req.body || {};
+  const targetDay = String(day || '').toLowerCase().trim();
+  if (!targetDay || !DAYS_SEQUENCE.includes(targetDay as any)) {
+    return res.status(400).json({ error: 'Valid day of week is required' });
+  }
+
+  const { canonicalStudentUid } = authCtx;
+  const ctx = await fetchCanonicalRoutineContextServer(canonicalStudentUid);
+  if (!ctx) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) context unavailable.',
+    });
+  }
+
+  const requestedCycle = extractPositiveIntegerCycle(bodyCycle);
+  if (requestedCycle !== null && requestedCycle < ctx.activeCycle) {
+    return res.status(409).json({
+      success: false,
+      error: 'STALE_CYCLE',
+      message: `Stale cycle ${requestedCycle} rejected; active cycle is ${ctx.activeCycle}.`,
+      activeCycle: ctx.activeCycle,
+    });
+  }
+
+  const existingDay = ctx.routinesByDayRaw[targetDay] || {};
+  const inferredType =
+    activityType ||
+    (typeof activityId === 'string' && activityId.endsWith('2') ? 'audio' : 'video');
+
+  const explicitNext =
+    typeof completedToday === 'boolean'
+      ? completedToday
+      : typeof completed === 'boolean'
+      ? completed
+      : null;
+
+  const currentVal =
+    inferredType === 'audio'
+      ? Boolean(existingDay.completedAudioToday ?? existingDay.completedToday)
+      : Boolean(existingDay.completedVideoToday ?? existingDay.completedToday);
+  const nextState = explicitNext !== null ? explicitNext : !currentVal;
+
+  const fieldsToSave: Record<string, any> = {};
+  if (inferredType === 'audio') {
+    fieldsToSave.completedAudioToday = nextState;
+  } else {
+    fieldsToSave.completedVideoToday = nextState;
+    fieldsToSave.completedToday = nextState;
+    fieldsToSave.completed = nextState;
+  }
+
+  const saveRes = await saveStudentRoutineDayFieldsServer(
+    canonicalStudentUid,
+    targetDay,
+    fieldsToSave,
+    bodyCycle
+  );
+
+  if (!saveRes.success) {
+    if (saveRes.code === 'STALE_CYCLE') {
+      return res.status(409).json({
+        success: false,
+        error: 'STALE_CYCLE',
+        message: saveRes.error,
+        activeCycle: saveRes.activeCycle,
+      });
+    }
+    return res.status(500).json({
+      success: false,
+      error: 'FirestorePersistenceFailed',
+      message: saveRes.error || 'Failed to persist completion toggle in Firestore (default).',
+    });
+  }
+
+  const effectiveVideoId = videoId || existingDay.videoId;
+  if (nextState && inferredType === 'video' && effectiveVideoId) {
+    const cleanVid = extractServerYouTubeId(effectiveVideoId);
+    if (cleanVid) {
+      const watchRes = await addWatchedVideoCanonicalServer(
+        canonicalStudentUid,
+        cleanVid,
+        videoTitle || existingDay.videoTitle || existingDay.title
+      );
+      if (!watchRes.success) {
+        return res.status(500).json({
+          success: false,
+          error: 'FirestorePersistenceFailed',
+          message: watchRes.error || 'Failed to persist watched video history in Firestore (default).',
+        });
+      }
+    }
+  }
+
+  const effectiveTrackIdRaw =
+    req.body?.trackId ||
+    req.body?.trackUrl ||
+    existingDay.teacherSpotify?.trackId ||
+    existingDay.teacherSpotify?.url ||
+    existingDay.teacherOverrideTrack?.trackId ||
+    existingDay.teacherOverrideTrack?.url ||
+    '';
+  if (nextState && inferredType === 'audio' && effectiveTrackIdRaw) {
+    const rawStr = String(effectiveTrackIdRaw).trim();
+    const cleanTrackId =
+      extractSpotifyTrackId(rawStr) ||
+      (/^[a-zA-Z0-9_-]{3,80}$/.test(rawStr) ? rawStr : null);
+    if (cleanTrackId) {
+      const listenRes = await addListenedTrackCanonicalServer(
+        canonicalStudentUid,
+        cleanTrackId,
+        req.body?.trackTitle || req.body?.title || existingDay.teacherSpotify?.title,
+        req.body?.artist || req.body?.artistOrHost || existingDay.teacherSpotify?.artistOrHost
+      );
+      if (!listenRes.success) {
+        return res.status(500).json({
+          success: false,
+          error: 'FirestorePersistenceFailed',
+          message: listenRes.error || 'Failed to persist listened track history in Firestore (default).',
+        });
+      }
+    }
+  }
+
+  return res.json({
+    success: true,
+    studentUid: canonicalStudentUid,
+    day: targetDay,
+    completed: nextState,
+    completedToday: nextState,
+    weeklyCycle: saveRes.activeCycle,
+  });
+});
+
+app.post('/api/routines/teacher-video', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeStudentRoutineAccess(req, res, { allowMissingTargetFallbackToCaller: true });
+  if (!authCtx) return;
+
+  const {
+    callerUid,
+    callerEmail,
+    isAdmin,
+    isCallerApprovedTeacher,
+    canonicalStudentUid,
+    canonicalStudentEmail,
+  } = authCtx;
+
   const {
     activityId,
     activityName,
@@ -13124,159 +13667,178 @@ app.post('/api/routines/teacher-video', (req, res) => {
     teacherNotes,
     days,
     day,
-    studentEmail,
-    studentUid,
-    teacherUid,
-    teacherEmail,
-  } = req.body;
+    weeklyCycle: bodyWeeklyCycle,
+    teacherUid: bodyTeacherUid,
+    teacherEmail: bodyTeacherEmail,
+  } = req.body || {};
 
-  const targetDays: string[] = Array.isArray(days) && days.length > 0
+  const ctx = await fetchCanonicalRoutineContextServer(canonicalStudentUid);
+  if (!ctx) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) context unavailable.',
+    });
+  }
+
+  const passedCycle = extractPositiveIntegerCycle(bodyWeeklyCycle);
+  if (passedCycle !== null && passedCycle < ctx.activeCycle) {
+    return res.status(409).json({
+      success: false,
+      error: 'STALE_CYCLE',
+      message: `Stale cycle ${passedCycle} rejected; active cycle is ${ctx.activeCycle}.`,
+      activeCycle: ctx.activeCycle,
+    });
+  }
+  const activeCycle = passedCycle !== null ? Math.max(ctx.activeCycle, passedCycle) : ctx.activeCycle;
+
+  const rawDays: string[] = Array.isArray(days) && days.length > 0
     ? days
     : day
     ? [day]
-    : Object.keys(db.routinesByDay || {});
+    : DAYS_SEQUENCE;
+  const targetDays = rawDays
+    .map((d) => String(d || '').toLowerCase().trim())
+    .filter((d) => DAYS_SEQUENCE.includes(d as any));
 
-  const { email, uid } = resolveStudentIdentifiers(db, studentEmail, studentUid);
-  const resolvedTopicTitle = activityName || playlistTitle || videos?.[0]?.playlistTitle;
+  if (targetDays.length === 0) {
+    return res.status(400).json({ error: 'Valid day or days array is required' });
+  }
 
-  // 1. Update global db.routinesByDay for fallback
-  targetDays.forEach((d: string) => {
-    if (db.routinesByDay && db.routinesByDay[d]) {
-      db.routinesByDay[d] = db.routinesByDay[d].map((item: any) =>
-        item.id === activityId || item.activityName?.toLowerCase().includes('video') || item.activityName?.toLowerCase().includes('vídeo')
-          ? {
-              ...item,
-              activityName: resolvedTopicTitle || item.activityName,
-              teacherVideos: videos,
-              teacherNotes: teacherNotes || item.teacherNotes,
-            }
-          : item
-      );
-    }
-  });
+  const effectiveTeacherUid = isCallerApprovedTeacher
+    ? callerUid
+    : isAdmin
+    ? (bodyTeacherUid || '').trim()
+    : (ctx.userProfile?.assignedNativeFriendUID || ctx.userProfile?.teacherUid || '').trim();
+  const effectiveTeacherEmail = isCallerApprovedTeacher
+    ? callerEmail
+    : isAdmin
+    ? (bodyTeacherEmail || '').toLowerCase().trim()
+    : (ctx.userProfile?.teacherEmail || '').toLowerCase().trim();
 
-  // 2. If student is identified, persist to studentRoutinesMap and studentVideoAssignments
-  if (email || uid) {
-    if (!db.studentRoutinesMap) db.studentRoutinesMap = {};
-    if (!db.studentVideoAssignments) db.studentVideoAssignments = {};
+  const videoInput = Array.isArray(videos) && videos.length > 0 ? videos[0] : null;
+  const rawVideoId = videoInput ? (videoInput.videoId || videoInput.url || videoInput.id || '') : '';
+  const cleanVidId = videoInput
+    ? (rawVideoId === '' ? '' : (extractServerYouTubeId(rawVideoId) || String(rawVideoId).trim()))
+    : '';
+  const cleanUrl = videoInput?.url || (cleanVidId ? `https://www.youtube.com/watch?v=${cleanVidId}` : '');
+  const resolvedPlaylistId = playlistId ?? videoInput?.playlistId ?? '';
+  const resolvedTopicTitle = activityName || playlistTitle || videoInput?.playlistTitle || videoInput?.title || '';
+  const now = new Date().toISOString();
 
-    let existingRoutines =
-      (email && db.studentRoutinesMap[email]) ||
-      (uid && db.studentRoutinesMap[uid]) ||
-      null;
+  let updatedAssignments = [...ctx.videoAssignments];
 
-    if (!existingRoutines || typeof existingRoutines !== 'object' || Object.keys(existingRoutines).length === 0) {
-      existingRoutines = JSON.parse(JSON.stringify(db.routinesByDay || {}));
-    } else {
-      const defaultDays = Object.keys(db.routinesByDay || {});
-      defaultDays.forEach((d) => {
-        if (!existingRoutines[d] || !Array.isArray(existingRoutines[d]) || existingRoutines[d].length === 0) {
-          existingRoutines[d] = JSON.parse(JSON.stringify(db.routinesByDay[d] || []));
-        }
+  for (const targetDay of targetDays) {
+    const dayPayload = {
+      id: cleanVidId || `vid-${targetDay}`,
+      videoId: cleanVidId,
+      title: videoInput?.title || resolvedTopicTitle || (cleanVidId ? 'Teacher Assigned Video' : 'Video of the Day'),
+      videoTitle: videoInput?.title || resolvedTopicTitle || (cleanVidId ? 'Teacher Assigned Video' : 'Video of the Day'),
+      url: cleanUrl,
+      playlistId: resolvedPlaylistId,
+      playlistTitle: playlistTitle || videoInput?.playlistTitle || resolvedTopicTitle || '',
+      dayOfWeek: targetDay,
+      activityId: activityId || 'act-1',
+      teacherUid: effectiveTeacherUid,
+      teacherEmail: effectiveTeacherEmail,
+      isRepeatVideo: Boolean(videoInput?.isRepeatVideo || resolvedPlaylistId === 'repeat_previous_video'),
+      isCustomSuggestion: Boolean(videoInput?.isCustomSuggestion || resolvedPlaylistId === 'custom_suggestion'),
+      instructions: teacherNotes || videoInput?.instructions || '',
+      duration: videoInput?.duration || '5-10 min',
+      weeklyCycle: activeCycle,
+      updatedAt: now,
+    };
+
+    const daySaved = await saveRoutineVideoSubcollection(canonicalStudentUid, targetDay, dayPayload, activeCycle);
+    if (!daySaved) {
+      return res.status(500).json({
+        success: false,
+        error: 'FirestorePersistenceFailed',
+        message: `Failed to persist routine video for ${targetDay} in Firestore (default).`,
       });
     }
 
-    targetDays.forEach((d: string) => {
-      if (existingRoutines && existingRoutines[d]) {
-        let matched = false;
-        existingRoutines[d] = existingRoutines[d].map((item: any) => {
-          const match = activityId
-            ? item.id === activityId
-            : item.id?.endsWith('1') || item.activityName?.toLowerCase().includes('video') || item.activityName?.toLowerCase().includes('vídeo');
-          if (match) {
-            matched = true;
-            return {
-              ...item,
-              activityName: resolvedTopicTitle || item.activityName,
-              teacherVideos: videos,
-              teacherNotes: teacherNotes || item.teacherNotes,
-            };
-          }
-          return item;
-        });
-        if (!matched && existingRoutines[d].length > 0) {
-          existingRoutines[d][0] = {
-            ...existingRoutines[d][0],
-            activityName: resolvedTopicTitle || existingRoutines[d][0].activityName,
-            teacherVideos: videos,
-            teacherNotes: teacherNotes || existingRoutines[d][0].teacherNotes,
-          };
-        }
-      }
-
-      // Record in studentVideoAssignments for anti-repetition history
-      const keysToUpdate = [email, uid].filter(Boolean) as string[];
-      keysToUpdate.forEach((key) => {
-        if (!db.studentVideoAssignments[key]) db.studentVideoAssignments[key] = [];
-        db.studentVideoAssignments[key] = db.studentVideoAssignments[key].filter(
-          (a: any) => a.day !== d
-        );
-
-        if (Array.isArray(videos) && videos.length > 0 && videos[0]?.url) {
-          const validVidId = extractServerYouTubeId(videos[0].videoId || videos[0].url) || '';
-          const newAssignment = {
-            id: `assign-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
-            activityId: activityId || 'act-1',
-            studentEmail: email,
-            studentUid: uid,
-            teacherUid: (teacherUid || '').trim(),
-            teacherEmail: (teacherEmail || '').trim(),
-            day: d,
-            playlistId: videos[0].playlistId || 'custom-teacher-url',
-            playlistTitle: videos[0].playlistTitle || 'Teacher Assigned Custom Video',
-            videoId: validVidId,
-            videoTitle: videos[0].title || 'Teacher Assigned Video',
-            videoUrl: videos[0].url,
-            assignedAt: new Date().toISOString(),
-          };
-          db.studentVideoAssignments[key].push(newAssignment);
-        }
+    updatedAssignments = updatedAssignments.filter((a: any) => (a.day || a.dayOfWeek) !== targetDay);
+    if (cleanVidId || cleanUrl) {
+      updatedAssignments.push({
+        id: `assign-${targetDay}-${activeCycle}-${cleanVidId || 'custom'}`,
+        activityId: activityId || 'act-1',
+        studentEmail: canonicalStudentEmail,
+        studentUid: canonicalStudentUid,
+        teacherUid: effectiveTeacherUid,
+        teacherEmail: effectiveTeacherEmail,
+        day: targetDay,
+        playlistId: resolvedPlaylistId || 'custom-teacher-url',
+        playlistTitle: dayPayload.playlistTitle || 'Teacher Assigned Custom Video',
+        videoId: cleanVidId,
+        videoTitle: dayPayload.videoTitle,
+        videoUrl: cleanUrl,
+        isRepeatVideo: dayPayload.isRepeatVideo,
+        instructions: dayPayload.instructions,
+        duration: dayPayload.duration,
+        weeklyCycle: activeCycle,
+        assignedAt: now,
       });
-    });
-
-    if (email) db.studentRoutinesMap[email] = existingRoutines;
-    if (uid) db.studentRoutinesMap[uid] = existingRoutines;
-
-    const targetUid = uid || (email ? email.toLowerCase().trim().replace(/[^a-zA-Z0-9_-]/g, '_') : '');
-    if (targetUid) {
-      const explicitCycle = req.body.weeklyCycle || undefined;
-      targetDays.forEach((d: string) => {
-        const dayActs = existingRoutines[d] || [];
-        const videoAct = dayActs.find((a: any) => a.teacherVideos && a.teacherVideos.length > 0) || dayActs[0];
-        if (videoAct) {
-          saveRoutineVideoSubcollection(targetUid, d, videoAct, explicitCycle).catch(() => {});
-        }
-      });
-      saveStudentAssignmentsByUid(targetUid, {
-        uid: targetUid,
-        email,
-        videoAssignments: (email && db.studentVideoAssignments[email]) || (uid && db.studentVideoAssignments[uid]) || [],
-        spotifyAssignments: (email && db.studentSpotifyAssignments[email]) || (uid && db.studentSpotifyAssignments[uid]) || [],
-        updatedAt: new Date().toISOString(),
-      }).catch(() => {});
     }
   }
 
-  writeDb(db);
-  res.json({ success: true, updatedDays: targetDays, studentEmail: email, studentUid: uid });
+  const hasAnyVideo = updatedAssignments.some((a: any) => Boolean(a.videoId || a.videoUrl));
+  const assignmentsSaved = await saveStudentAssignmentsCanonicalServer(canonicalStudentUid, {
+    uid: canonicalStudentUid,
+    email: canonicalStudentEmail,
+    level: normalizeStudentLevel(ctx.level).key,
+    weeklyCycle: activeCycle,
+    videoAssignments: updatedAssignments,
+    awaitingTopicSelection: !hasAnyVideo,
+    updatedAt: now,
+  });
+
+  if (!assignmentsSaved) {
+    return res.status(500).json({
+      success: false,
+      error: 'FirestorePersistenceFailed',
+      message: 'Failed to persist student_assignments document in Firestore (default).',
+    });
+  }
+
+  return res.json({
+    success: true,
+    updatedDays: targetDays,
+    studentEmail: canonicalStudentEmail,
+    studentUid: canonicalStudentUid,
+    weeklyCycle: activeCycle,
+  });
 });
 
-app.post('/api/routines/teacher-spotify', (req, res) => {
-  const db = readDb();
+app.post('/api/routines/teacher-spotify', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeStudentRoutineAccess(req, res, {
+    allowMissingTargetFallbackToCaller: true,
+    requireApprovedTeacherIfTutor: true,
+  });
+  if (!authCtx) return;
+
+  const {
+    callerUid,
+    callerEmail,
+    isAdmin,
+    isCallerApprovedTeacher,
+    canonicalStudentUid,
+    canonicalStudentEmail,
+  } = authCtx;
+
   const {
     activityId,
     spotify,
     teacherNotes,
     days,
     day,
-    studentEmail,
-    studentUid,
-    teacherUid,
-    teacherEmail,
-  } = req.body;
+    weeklyCycle: bodyWeeklyCycle,
+    teacherUid: bodyTeacherUid,
+    teacherEmail: bodyTeacherEmail,
+  } = req.body || {};
 
-  // Strict validation and sanitization of Spotify URL
-  if (spotify && spotify.url) {
+  // Strict validation and sanitization of Spotify URL if provided
+  let normalizedSpotify: Record<string, any> | null = null;
+  if (spotify && typeof spotify === 'object' && spotify.url) {
     const spotifyValidation = parseSpotifyUrl(spotify.url);
     if (!spotifyValidation.isValid) {
       return res.status(400).json({
@@ -13284,120 +13846,155 @@ app.post('/api/routines/teacher-spotify', (req, res) => {
         error: spotifyValidation.errorMessage || 'URL do Spotify inválida ou incompleta. Utilize um link válido de /track/, /episode/ ou /show/.',
       });
     }
-    spotify.url = spotifyValidation.canonicalUrl;
-    spotify.type = spotifyValidation.contentType;
+    const cleanTrackId =
+      spotifyValidation.id ||
+      spotify.trackId ||
+      extractSpotifyTrackId(spotifyValidation.canonicalUrl || spotify.url) ||
+      `spot-${Date.now()}`;
+    normalizedSpotify = {
+      ...spotify,
+      id: spotify.id || `spot-${cleanTrackId}`,
+      trackId: cleanTrackId,
+      url: spotifyValidation.canonicalUrl || spotify.url,
+      embedUrl: spotifyValidation.embedUrl || spotify.embedUrl,
+      type: spotifyValidation.contentType || spotify.type || 'music',
+      title: spotify.title || 'Teacher Recommended Audio',
+      artistOrHost: spotify.artistOrHost || spotify.artist || 'Spotify',
+      instructions: spotify.instructions || teacherNotes || '',
+    };
   }
 
-  const targetDays: string[] = Array.isArray(days) && days.length > 0
+  const ctx = await fetchCanonicalRoutineContextServer(canonicalStudentUid);
+  if (!ctx) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) context unavailable.',
+    });
+  }
+
+  const passedCycle = extractPositiveIntegerCycle(bodyWeeklyCycle);
+  if (passedCycle !== null && passedCycle < ctx.activeCycle) {
+    return res.status(409).json({
+      success: false,
+      error: 'STALE_CYCLE',
+      message: `Stale cycle ${passedCycle} rejected; active cycle is ${ctx.activeCycle}.`,
+      activeCycle: ctx.activeCycle,
+    });
+  }
+  const activeCycle = passedCycle !== null ? Math.max(ctx.activeCycle, passedCycle) : ctx.activeCycle;
+
+  const rawDays: string[] = Array.isArray(days) && days.length > 0
     ? days
     : day
     ? [day]
-    : Object.keys(db.routinesByDay || {});
+    : DAYS_SEQUENCE;
+  const targetDays = rawDays
+    .map((d) => String(d || '').toLowerCase().trim())
+    .filter((d) => DAYS_SEQUENCE.includes(d as any));
 
-  const { email, uid } = resolveStudentIdentifiers(db, studentEmail, studentUid);
+  if (targetDays.length === 0) {
+    return res.status(400).json({ error: 'Valid day or days array is required' });
+  }
 
-  targetDays.forEach((d: string) => {
-    if (db.routinesByDay && db.routinesByDay[d]) {
-      db.routinesByDay[d] = db.routinesByDay[d].map((item: any) =>
-        item.id === activityId || item.activityName?.toLowerCase().includes('podcast') || item.activityName?.toLowerCase().includes('áudio')
-          ? { ...item, teacherSpotify: spotify, teacherNotes: teacherNotes || item.teacherNotes }
-          : item
-      );
-    }
-  });
+  const effectiveTeacherUid = isCallerApprovedTeacher
+    ? callerUid
+    : isAdmin
+    ? (bodyTeacherUid || '').trim()
+    : (ctx.userProfile?.assignedNativeFriendUID || ctx.userProfile?.teacherUid || '').trim();
+  const effectiveTeacherEmail = isCallerApprovedTeacher
+    ? callerEmail
+    : isAdmin
+    ? (bodyTeacherEmail || '').toLowerCase().trim()
+    : (ctx.userProfile?.teacherEmail || '').toLowerCase().trim();
 
-  if (email || uid) {
-    if (!db.studentRoutinesMap) db.studentRoutinesMap = {};
-    if (!db.studentSpotifyAssignments) db.studentSpotifyAssignments = {};
+  const now = new Date().toISOString();
+  let updatedSpotifyAssignments = [...ctx.spotifyAssignments];
 
-    let existingRoutines =
-      (email && db.studentRoutinesMap[email]) ||
-      (uid && db.studentRoutinesMap[uid]) ||
-      null;
-
-    if (!existingRoutines || typeof existingRoutines !== 'object' || Object.keys(existingRoutines).length === 0) {
-      existingRoutines = JSON.parse(JSON.stringify(db.routinesByDay || {}));
-    } else {
-      const defaultDays = Object.keys(db.routinesByDay || {});
-      defaultDays.forEach((d) => {
-        if (!existingRoutines[d] || !Array.isArray(existingRoutines[d]) || existingRoutines[d].length === 0) {
-          existingRoutines[d] = JSON.parse(JSON.stringify(db.routinesByDay[d] || []));
-        }
-      });
-    }
-
-    targetDays.forEach((d: string) => {
-      if (existingRoutines && existingRoutines[d]) {
-        let matched = false;
-        existingRoutines[d] = existingRoutines[d].map((item: any) => {
-          const match = activityId
-            ? item.id === activityId
-            : item.id?.endsWith('2') || item.activityName?.toLowerCase().includes('podcast') || item.activityName?.toLowerCase().includes('áudio');
-          if (match) {
-            matched = true;
-            return {
-              ...item,
-              teacherSpotify: spotify,
-              teacherNotes: teacherNotes || item.teacherNotes,
-            };
+  for (const targetDay of targetDays) {
+    const dayFields: Record<string, any> = {
+      activityId: activityId || 'act-2',
+      teacherSpotify: normalizedSpotify
+        ? {
+            ...normalizedSpotify,
+            teacherUid: effectiveTeacherUid,
+            teacherEmail: effectiveTeacherEmail,
+            weeklyCycle: activeCycle,
+            addedAt: normalizedSpotify.addedAt || now,
           }
-          return item;
+        : null,
+      ...(teacherNotes !== undefined ? { teacherNotes } : {}),
+      ...(effectiveTeacherUid ? { teacherUid: effectiveTeacherUid } : {}),
+      ...(effectiveTeacherEmail ? { teacherEmail: effectiveTeacherEmail } : {}),
+    };
+
+    const dayRes = await saveStudentRoutineDayFieldsServer(canonicalStudentUid, targetDay, dayFields, activeCycle);
+    if (!dayRes.success) {
+      if (dayRes.code === 'STALE_CYCLE') {
+        return res.status(409).json({
+          success: false,
+          error: 'STALE_CYCLE',
+          message: dayRes.error,
+          activeCycle: dayRes.activeCycle,
         });
-        if (!matched && existingRoutines[d].length > 0) {
-          existingRoutines[d][0] = {
-            ...existingRoutines[d][0],
-            teacherSpotify: spotify,
-            teacherNotes: teacherNotes || existingRoutines[d][0].teacherNotes,
-          };
-        }
       }
-
-      // Record in studentSpotifyAssignments for strict UID/email persistence and auditing
-      const keysToUpdate = [email, uid].filter(Boolean) as string[];
-      keysToUpdate.forEach((key) => {
-        if (!db.studentSpotifyAssignments![key]) db.studentSpotifyAssignments![key] = [];
-        db.studentSpotifyAssignments![key] = db.studentSpotifyAssignments![key].filter(
-          (a: any) => a.day !== d
-        );
-
-        if (spotify && spotify.url) {
-          const newAssignment = {
-            id: spotify.id || `spot-assign-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
-            activityId: activityId || 'act-2',
-            studentEmail: email,
-            studentUid: uid,
-            teacherUid: (teacherUid || '').trim(),
-            teacherEmail: (teacherEmail || '').trim(),
-            day: d,
-            url: spotify.url,
-            title: spotify.title || 'Teacher Recommended Audio',
-            artistOrHost: spotify.artistOrHost,
-            type: spotify.type || 'music',
-            instructions: spotify.instructions || teacherNotes,
-            assignedAt: spotify.addedAt || new Date().toISOString(),
-          };
-          db.studentSpotifyAssignments![key].push(newAssignment);
-        }
+      return res.status(500).json({
+        success: false,
+        error: 'FirestorePersistenceFailed',
+        message: dayRes.error || `Failed to persist routine Spotify for ${targetDay} in Firestore (default).`,
       });
-    });
+    }
 
-    if (email) db.studentRoutinesMap[email] = existingRoutines;
-    if (uid) db.studentRoutinesMap[uid] = existingRoutines;
-
-    const targetUid = uid || (email ? email.toLowerCase().trim().replace(/[^a-zA-Z0-9_-]/g, '_') : '');
-    if (targetUid) {
-      saveStudentAssignmentsByUid(targetUid, {
-        uid: targetUid,
-        email,
-        videoAssignments: (email && db.studentVideoAssignments[email]) || (uid && db.studentVideoAssignments[uid]) || [],
-        spotifyAssignments: (email && db.studentSpotifyAssignments[email]) || (uid && db.studentSpotifyAssignments[uid]) || [],
-        updatedAt: new Date().toISOString(),
-      }).catch(() => {});
+    updatedSpotifyAssignments = updatedSpotifyAssignments.filter(
+      (a: any) => (a.day || a.dayOfWeek) !== targetDay
+    );
+    if (normalizedSpotify && normalizedSpotify.url) {
+      updatedSpotifyAssignments.push({
+        id: normalizedSpotify.id || `spot-assign-${targetDay}-${activeCycle}`,
+        activityId: activityId || 'act-2',
+        studentEmail: canonicalStudentEmail,
+        studentUid: canonicalStudentUid,
+        teacherUid: effectiveTeacherUid,
+        teacherEmail: effectiveTeacherEmail,
+        day: targetDay,
+        trackId: normalizedSpotify.trackId,
+        trackTitle: normalizedSpotify.title,
+        trackUrl: normalizedSpotify.url,
+        url: normalizedSpotify.url,
+        embedUrl: normalizedSpotify.embedUrl || '',
+        title: normalizedSpotify.title,
+        artistOrHost: normalizedSpotify.artistOrHost,
+        type: normalizedSpotify.type || 'music',
+        instructions: normalizedSpotify.instructions || teacherNotes || '',
+        weeklyCycle: activeCycle,
+        assignedAt: normalizedSpotify.addedAt || now,
+      });
     }
   }
 
-  writeDb(db);
-  res.json({ success: true, updatedDays: targetDays, studentEmail: email, studentUid: uid });
+  const assignmentsSaved = await saveStudentAssignmentsCanonicalServer(canonicalStudentUid, {
+    uid: canonicalStudentUid,
+    email: canonicalStudentEmail,
+    level: normalizeStudentLevel(ctx.level).key,
+    weeklyCycle: activeCycle,
+    spotifyAssignments: updatedSpotifyAssignments,
+    updatedAt: now,
+  });
+
+  if (!assignmentsSaved) {
+    return res.status(500).json({
+      success: false,
+      error: 'FirestorePersistenceFailed',
+      message: 'Failed to persist student_assignments document in Firestore (default).',
+    });
+  }
+
+  return res.json({
+    success: true,
+    updatedDays: targetDays,
+    studentEmail: canonicalStudentEmail,
+    studentUid: canonicalStudentUid,
+    weeklyCycle: activeCycle,
+  });
 });
 
 // Endpoint to validate Spotify link format and return canonical metadata (supports GET & POST)
@@ -13413,54 +14010,72 @@ const handleSpotifyValidate = (req: express.Request, res: express.Response) => {
 app.get('/api/spotify/validate-link', handleSpotifyValidate);
 app.post('/api/spotify/validate-link', handleSpotifyValidate);
 
-// Endpoint to retrieve individual student Spotify assignments by UID or email with auto-distribution and listened history
-app.get('/api/student-spotify-assignments', async (req, res) => {
-  const db = readDb();
-  const studentEmail = ((req.query.studentEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
-  const uid = ((req.query.uid as string) || (req.query.studentUid as string) || '').trim();
-  const { email, uid: resolvedUid } = resolveStudentIdentifiers(db, studentEmail, uid);
+// Read-only canonical Spotify assignments retrieval (NO auto-distribution on empty state)
+app.get('/api/student-spotify-assignments', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeStudentRoutineAccess(req, res, { allowMissingTargetFallbackToCaller: true });
+  if (!authCtx) return;
 
-  const studentLevel = normalizeStudentLevel(resolveStudentLevel(db, email, resolvedUid)).key;
-  const keysToLookup = [resolvedUid, email].filter(Boolean) as string[];
+  const { canonicalStudentUid, canonicalStudentEmail } = authCtx;
+  const requestedCycle = req.query.weeklyCycle !== undefined ? String(req.query.weeklyCycle) : undefined;
+  const ctx = await fetchCanonicalRoutineContextServer(canonicalStudentUid, requestedCycle);
 
-  let assignments: any[] = [];
-  for (const k of keysToLookup) {
-    if (db.studentSpotifyAssignments?.[k] && Array.isArray(db.studentSpotifyAssignments[k])) {
-      assignments = db.studentSpotifyAssignments[k];
-      if (assignments.length > 0) break;
-    }
+  if (!ctx) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) context unavailable.',
+    });
   }
 
-  // Preserve existing assignments after F5 or new login (Rule 7)
-  // Only distribute if student has NO assignments yet
-  if (assignments.length === 0) {
-    if (email || resolvedUid) {
-      assignments = await distributeWeeklySpotifyForStudent(db, email, resolvedUid, studentLevel);
-      writeDb(db);
-    }
-  }
-
-  const listenedKey = resolvedUid && db.studentListenedTracks?.[resolvedUid] ? resolvedUid : email;
-  const listened = (listenedKey && db.studentListenedTracks?.[listenedKey]) || [];
-
-  res.json({
+  const studentLevel = normalizeStudentLevel(ctx.level).key;
+  return res.json({
     success: true,
-    assignments,
-    listened,
-    studentEmail: email,
-    studentUid: resolvedUid,
+    assignments: ctx.spotifyAssignments,
+    listened: ctx.listenedTracks,
+    studentEmail: ctx.studentEmail || canonicalStudentEmail,
+    studentUid: canonicalStudentUid,
     studentLevel,
+    weeklyCycle: ctx.activeCycle,
   });
 });
 
-// Endpoint for Spotify anti-repetition exclusive track assignment (Parity with YouTube video assignment engine)
-app.post('/api/student-spotify-assignments/assign', async (req, res) => {
-  const db = readDb();
+// Canonical Spotify exclusive track assignment for a specific day
+app.post('/api/student-spotify-assignments/assign', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeStudentRoutineAccess(req, res, {
+    allowMissingTargetFallbackToCaller: true,
+    requireApprovedTeacherIfTutor: true,
+  });
+  if (!authCtx) return;
+
   const {
-    studentEmail,
-    studentUid,
-    teacherUid,
-    teacherEmail,
+    callerUid,
+    callerEmail,
+    isAdmin,
+    isCallerApprovedTeacher,
+    canonicalStudentUid,
+    canonicalStudentEmail,
+  } = authCtx;
+
+  const db = readDb(); // Catalog cache fallback only (db.spotifyPlaylists)
+  const ctx = await fetchCanonicalRoutineContextServer(canonicalStudentUid);
+  if (!ctx) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) context unavailable.',
+    });
+  }
+
+  const passedCycle = extractPositiveIntegerCycle(req.body?.weeklyCycle);
+  if (passedCycle !== null && passedCycle < ctx.activeCycle) {
+    return res.status(409).json({
+      success: false,
+      error: 'STALE_CYCLE',
+      message: `Stale cycle ${passedCycle} rejected; active cycle is ${ctx.activeCycle}.`,
+      activeCycle: ctx.activeCycle,
+    });
+  }
+  const activeCycle = passedCycle !== null ? Math.max(ctx.activeCycle, passedCycle) : ctx.activeCycle;
+
+  const {
     day,
     level,
     trackUrl,
@@ -13469,47 +14084,99 @@ app.post('/api/student-spotify-assignments/assign', async (req, res) => {
     teacherNotes,
     trackType,
     activityId,
-  } = req.body;
+    teacherUid: bodyTeacherUid,
+    teacherEmail: bodyTeacherEmail,
+  } = req.body || {};
 
-  const { email: cleanEmail, uid } = resolveStudentIdentifiers(db, studentEmail, studentUid);
-
-  if (!cleanEmail && !uid) {
-    return res.status(400).json({ error: 'studentEmail or studentUid is required to assign Spotify track' });
+  const targetDay = String(day || 'monday').toLowerCase().trim() as DayOfWeek;
+  if (!DAYS_SEQUENCE.includes(targetDay)) {
+    return res.status(400).json({ error: `Invalid day of week: ${targetDay}` });
   }
 
-  const studentLevel = normalizeStudentLevel(level || resolveStudentLevel(db, cleanEmail, uid)).key;
+  const studentLevel = normalizeStudentLevel(level || ctx.level).key as SpotifyLevel;
   const officialMeta = OFFICIAL_SPOTIFY_PLAYLISTS[studentLevel];
-  const targetDay = (day && DAYS_SEQUENCE.includes(day.toLowerCase()) ? day.toLowerCase() : 'monday') as any;
+  const cleanEmail = ctx.studentEmail || canonicalStudentEmail;
 
-  if (!db.studentSpotifyAssignments) db.studentSpotifyAssignments = {};
-  if (!db.studentListenedTracks) db.studentListenedTracks = {};
-  if (!db.studentRoutinesMap) db.studentRoutinesMap = {};
+  const forceNew = Boolean(req.body?.forceNewTrack || req.body?.reassign);
+  const idempotencyKey = typeof req.body?.idempotencyKey === 'string' ? req.body.idempotencyKey.trim() : '';
+  const customUrl = (trackUrl || '').trim();
+  const parsedCustom = customUrl ? parseSpotifyUrl(customUrl) : null;
+  if (customUrl && (!parsedCustom || !parsedCustom.isValid)) {
+    return res.status(400).json({
+      error: parsedCustom?.errorMessage || 'Link do Spotify inválido. Utilize um link válido do open.spotify.com.',
+    });
+  }
 
-  const canonicalKey = uid || cleanEmail;
-  const cycleState = getOrCreateStudentCycleState(db, canonicalKey, studentLevel);
-
-  let chosenTrack: any = null;
-  let customUrl = (trackUrl || '').trim();
-
-  if (customUrl) {
-    const parsed = parseSpotifyUrl(customUrl);
-    if (!parsed.isValid) {
-      return res.status(400).json({
-        error: parsed.errorMessage || 'Link do Spotify inválido. Utilize um link válido do open.spotify.com.',
+  // Idempotency check for identical repeated requests on (day, weeklyCycle)
+  const existingAssignment = ctx.spotifyAssignments.find(
+    (a: any) => (a.day || a.dayOfWeek) === targetDay && Number(a.weeklyCycle || activeCycle) === activeCycle
+  );
+  if (!forceNew && existingAssignment && (existingAssignment.trackUrl || existingAssignment.url)) {
+    const existingTrackId = extractSpotifyTrackId(existingAssignment.trackId || existingAssignment.trackUrl || existingAssignment.url);
+    const sameIdempotencyKey = Boolean(idempotencyKey && existingAssignment.idempotencyKey === idempotencyKey);
+    const sameCustomUrl = Boolean(
+      customUrl &&
+      parsedCustom?.canonicalUrl &&
+      (existingAssignment.trackUrl === parsedCustom.canonicalUrl || existingAssignment.url === parsedCustom.canonicalUrl)
+    );
+    const sameSequentialParams = Boolean(!customUrl && existingAssignment.level === studentLevel);
+    if (sameIdempotencyKey || sameCustomUrl || (!idempotencyKey && sameSequentialParams)) {
+      const replayTrack = {
+        id: existingAssignment.id || `sp-${targetDay}-${existingTrackId || 'replay'}`,
+        url: existingAssignment.trackUrl || existingAssignment.url,
+        trackId: existingTrackId || existingAssignment.trackId,
+        title: existingAssignment.title || existingAssignment.trackTitle || 'Daily Spotify Audio',
+        artistOrHost: existingAssignment.artistOrHost || 'Spotify',
+        duration: existingAssignment.duration || '3-4 min',
+        instructions: existingAssignment.instructions || '',
+        type: existingAssignment.type || 'music',
+        addedAt: existingAssignment.assignedAt || new Date().toISOString(),
+        level: existingAssignment.level || studentLevel,
+        playlistId: existingAssignment.playlistId || officialMeta.id,
+        playlistTitle: existingAssignment.playlistTitle || officialMeta.title,
+        cycle: existingAssignment.cycle || 1,
+      };
+      return res.json({
+        success: true,
+        idempotentReplay: true,
+        track: replayTrack,
+        assignment: existingAssignment,
+        playlistTitle: replayTrack.playlistTitle,
+        studentEmail: cleanEmail,
+        studentUid: canonicalStudentUid,
+        weeklyCycle: activeCycle,
+        message: `Faixa "${replayTrack.title}" já atribuída para ${targetDay}.`,
       });
     }
-    const trackId = parsed.id || `custom-${Date.now()}`;
+  }
+
+  const effectiveTeacherUid = isCallerApprovedTeacher
+    ? callerUid
+    : isAdmin
+    ? (bodyTeacherUid || '').trim()
+    : (ctx.userProfile?.assignedNativeFriendUID || ctx.userProfile?.teacherUid || '').trim();
+  const effectiveTeacherEmail = isCallerApprovedTeacher
+    ? callerEmail
+    : isAdmin
+    ? (bodyTeacherEmail || '').toLowerCase().trim()
+    : (ctx.userProfile?.teacherEmail || '').toLowerCase().trim();
+
+  const updatedSpotifyCycles = { ...(ctx.spotifyCycles || {}) };
+  const cycleState = cloneOrInitSpotifyCycleState(updatedSpotifyCycles, studentLevel);
+
+  let chosenTrack: any = null;
+  if (customUrl && parsedCustom) {
+    const trackId = parsedCustom.id || `custom-${Date.now()}`;
     chosenTrack = {
       trackId,
       title: title || 'Faixa Selecionada pelo Professor',
       artist: artistOrHost || 'Artista / Podcast',
-      url: parsed.canonicalUrl || customUrl,
-      embedUrl: parsed.embedUrl,
+      url: parsedCustom.canonicalUrl || customUrl,
+      embedUrl: parsedCustom.embedUrl,
       playlistId: officialMeta.id,
       playlistTitle: officialMeta.title,
     };
   } else {
-    // Dynamic sequential selection from official playlist
     let playlistTracks: SpotifyTrack[] = [];
     try {
       playlistTracks = await fetchOfficialPlaylistTracks(studentLevel);
@@ -13518,24 +14185,25 @@ app.post('/api/student-spotify-assignments/assign', async (req, res) => {
         playlistTracks = db.spotifyPlaylists[studentLevel].tracks;
       }
     }
-
     if (playlistTracks.length === 0) {
       return res.status(503).json({
         error: 'SPOTIFY_PLAYLIST_UNAVAILABLE',
         message: 'Could not retrieve tracks from official Spotify playlist.',
       });
     }
-
     const { track } = selectNextTrackFromPlaylist(playlistTracks, cycleState, targetDay);
     chosenTrack = track;
   }
 
+  updatedSpotifyCycles[studentLevel] = cycleState;
+
   const chosenId = chosenTrack.trackId || extractSpotifyTrackId(chosenTrack.url) || `sp-${Date.now()}`;
   const canonicalUrl = chosenTrack.url || `https://open.spotify.com/track/${chosenId}`;
   const embedUrl = chosenTrack.embedUrl || `https://open.spotify.com/embed/track/${chosenId}?utm_source=generator&theme=0`;
+  const now = new Date().toISOString();
 
   const assignedTrackObj = {
-    id: `sp-${targetDay}-${Date.now()}`,
+    id: `sp-${targetDay}-${activeCycle}-${chosenId}`,
     url: canonicalUrl,
     trackId: chosenId,
     title: title || chosenTrack.title,
@@ -13545,178 +14213,388 @@ app.post('/api/student-spotify-assignments/assign', async (req, res) => {
       teacherNotes ||
       `Sugestão diária do Teacher: Prática auditiva com "${chosenTrack.title}" (${chosenTrack.artist}).`,
     type: trackType || 'music',
-    addedAt: new Date().toISOString(),
+    addedAt: now,
     level: studentLevel,
     playlistId: chosenTrack.playlistId || officialMeta.id,
     playlistTitle: chosenTrack.playlistTitle || officialMeta.title,
     cycle: cycleState.cycle,
+    weeklyCycle: activeCycle,
   };
 
-  const newAssignment = {
-    id: `spot-assign-${targetDay}-${Date.now()}`,
+  const newAssignment: Record<string, any> = {
+    id: `spot-assign-${targetDay}-${activeCycle}-${chosenId}`,
     activityId: activityId || `act-${targetDay}-2`,
     studentEmail: cleanEmail,
-    studentUid: uid,
-    teacherUid: (teacherUid || '').trim(),
-    teacherEmail: (teacherEmail || '').trim(),
+    studentUid: canonicalStudentUid,
+    teacherUid: effectiveTeacherUid,
+    teacherEmail: effectiveTeacherEmail,
     day: targetDay,
     trackId: chosenId,
     trackTitle: assignedTrackObj.title,
     trackUrl: canonicalUrl,
+    url: canonicalUrl,
     embedUrl,
     title: assignedTrackObj.title,
     artistOrHost: assignedTrackObj.artistOrHost,
     type: assignedTrackObj.type,
     instructions: assignedTrackObj.instructions,
-    assignedAt: new Date().toISOString(),
+    assignedAt: now,
     level: studentLevel,
     playlistId: assignedTrackObj.playlistId,
     playlistTitle: assignedTrackObj.playlistTitle,
     cycle: cycleState.cycle,
+    weeklyCycle: activeCycle,
   };
-
-  const targetKeys = Array.from(new Set([cleanEmail, uid].filter(Boolean) as string[]));
-  targetKeys.forEach((k) => {
-    if (!db.studentSpotifyAssignments![k]) db.studentSpotifyAssignments![k] = [];
-    db.studentSpotifyAssignments![k] = db.studentSpotifyAssignments![k].filter(
-      (a: any) => a.day !== targetDay
-    );
-    db.studentSpotifyAssignments![k].push(newAssignment);
-    if (!db.studentSpotifyCycles![k]) db.studentSpotifyCycles![k] = {};
-    db.studentSpotifyCycles![k][studentLevel] = cycleState;
-  });
-
-  // Update routine activity #2
-  targetKeys.forEach((k) => {
-    let studentRoutine = db.studentRoutinesMap?.[k];
-    if (!studentRoutine) {
-      studentRoutine = JSON.parse(JSON.stringify(db.routinesByDay || defaultRoutinesByDay));
-    }
-    if (studentRoutine && studentRoutine[targetDay]) {
-      let matched = false;
-      studentRoutine[targetDay] = studentRoutine[targetDay].map((item: any) => {
-        const isTarget =
-          item.id?.endsWith('2') ||
-          item.activityName?.toLowerCase().includes('podcast') ||
-          item.activityName?.toLowerCase().includes('áudio') ||
-          item.activityName?.toLowerCase().includes('audio');
-        if (isTarget) {
-          matched = true;
-          return {
-            ...item,
-            teacherSpotify: assignedTrackObj,
-            teacherNotes: teacherNotes || item.teacherNotes,
-          };
-        }
-        return item;
-      });
-      if (!matched && studentRoutine[targetDay].length > 0) {
-        studentRoutine[targetDay][0] = {
-          ...studentRoutine[targetDay][0],
-          teacherSpotify: assignedTrackObj,
-          teacherNotes: teacherNotes || studentRoutine[targetDay][0].teacherNotes,
-        };
-      }
-    }
-    db.studentRoutinesMap![k] = studentRoutine;
-  });
-
-  writeDb(db);
-
-  if (uid) {
-    saveStudentAssignmentsByUid(uid, {
-      uid,
-      email: cleanEmail,
-      level: studentLevel,
-      spotifyAssignments: db.studentSpotifyAssignments?.[uid] || db.studentSpotifyAssignments?.[cleanEmail] || [],
-      videoAssignments: db.studentVideoAssignments?.[uid] || db.studentVideoAssignments?.[cleanEmail] || [],
-      routines: db.studentRoutinesMap?.[uid] || db.studentRoutinesMap?.[cleanEmail],
-      updatedAt: new Date().toISOString(),
-    }).catch((err) => console.warn('Firestore saveStudentAssignmentsByUid (Spotify assign) notice:', err));
+  if (idempotencyKey) {
+    newAssignment.idempotencyKey = idempotencyKey;
   }
 
-  res.json({
+  const dayRes = await saveStudentRoutineDayFieldsServer(
+    canonicalStudentUid,
+    targetDay,
+    {
+      activityId: newAssignment.activityId,
+      teacherSpotify: assignedTrackObj,
+      ...(teacherNotes !== undefined ? { teacherNotes } : {}),
+      ...(effectiveTeacherUid ? { teacherUid: effectiveTeacherUid } : {}),
+      ...(effectiveTeacherEmail ? { teacherEmail: effectiveTeacherEmail } : {}),
+    },
+    activeCycle
+  );
+
+  if (!dayRes.success) {
+    if (dayRes.code === 'STALE_CYCLE') {
+      return res.status(409).json({
+        success: false,
+        error: 'STALE_CYCLE',
+        message: dayRes.error,
+        activeCycle: dayRes.activeCycle,
+      });
+    }
+    return res.status(500).json({
+      success: false,
+      error: 'FirestorePersistenceFailed',
+      message: dayRes.error || `Failed to persist routine Spotify for ${targetDay} in Firestore (default).`,
+    });
+  }
+
+  const updatedSpotifyAssignments = [
+    ...ctx.spotifyAssignments.filter((a: any) => (a.day || a.dayOfWeek) !== targetDay),
+    newAssignment,
+  ];
+
+  const assignmentsSaved = await saveStudentAssignmentsCanonicalServer(canonicalStudentUid, {
+    uid: canonicalStudentUid,
+    email: cleanEmail,
+    level: studentLevel,
+    weeklyCycle: activeCycle,
+    spotifyAssignments: updatedSpotifyAssignments,
+    spotifyCycles: updatedSpotifyCycles,
+    updatedAt: now,
+  });
+
+  if (!assignmentsSaved) {
+    return res.status(500).json({
+      success: false,
+      error: 'FirestorePersistenceFailed',
+      message: 'Failed to persist student_assignments document in Firestore (default).',
+    });
+  }
+
+  return res.json({
     success: true,
+    idempotentReplay: false,
     track: assignedTrackObj,
     assignment: newAssignment,
     playlistTitle: officialMeta.title,
     studentEmail: cleanEmail,
-    studentUid: uid,
+    studentUid: canonicalStudentUid,
+    weeklyCycle: activeCycle,
     message: `Faixa "${assignedTrackObj.title}" atribuída com sucesso para ${targetDay}.`,
   });
 });
 
-// Endpoint to distribute exclusive sequential tracks for student active days
-app.post('/api/student-spotify-assignments/distribute-week', async (req, res) => {
-  const db = readDb();
-  const { studentEmail, studentUid, teacherUid, teacherEmail, level, days } = req.body;
-  const { email: cleanEmail, uid } = resolveStudentIdentifiers(db, studentEmail, studentUid);
+// Canonical weekly Spotify sequential distribution (idempotent, cycle-isolated, awaited persistence)
+app.post('/api/student-spotify-assignments/distribute-week', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeStudentRoutineAccess(req, res, {
+    allowMissingTargetFallbackToCaller: true,
+    requireApprovedTeacherIfTutor: true,
+  });
+  if (!authCtx) return;
 
-  if (!cleanEmail && !uid) {
-    return res.status(400).json({ error: 'studentEmail or studentUid is required' });
+  const {
+    callerUid,
+    callerEmail,
+    isAdmin,
+    isCallerApprovedTeacher,
+    canonicalStudentUid,
+    canonicalStudentEmail,
+  } = authCtx;
+
+  const db = readDb(); // Catalog cache fallback only (db.spotifyPlaylists)
+  const ctx = await fetchCanonicalRoutineContextServer(canonicalStudentUid);
+  if (!ctx) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) context unavailable.',
+    });
   }
 
-  const studentLevel = normalizeStudentLevel(level || resolveStudentLevel(db, cleanEmail, uid)).key;
+  const { level, days, weeklyCycle: bodyCycle, teacherUid: bodyTeacherUid, teacherEmail: bodyTeacherEmail } = req.body || {};
+  const passedCycle = extractPositiveIntegerCycle(bodyCycle);
+  if (passedCycle !== null && passedCycle < ctx.activeCycle) {
+    return res.status(409).json({
+      success: false,
+      error: 'STALE_CYCLE',
+      message: `Stale cycle ${passedCycle} rejected; active cycle is ${ctx.activeCycle}.`,
+      activeCycle: ctx.activeCycle,
+    });
+  }
+  const activeCycle = passedCycle !== null ? Math.max(ctx.activeCycle, passedCycle) : ctx.activeCycle;
 
-  const assignments = await distributeWeeklySpotifyForStudent(
-    db,
-    cleanEmail,
-    uid,
-    studentLevel,
-    teacherUid,
-    teacherEmail,
-    Array.isArray(days) ? days : undefined
-  );
+  const studentLevel = normalizeStudentLevel(level || ctx.level).key as SpotifyLevel;
+  const cleanEmail = ctx.studentEmail || canonicalStudentEmail;
+  const officialMeta = OFFICIAL_SPOTIFY_PLAYLISTS[studentLevel];
 
-  writeDb(db);
+  const default5Days: DayOfWeek[] = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday'];
+  const requestedDays = Array.isArray(days) && days.length > 0
+    ? days.map((d: any) => String(d || '').toLowerCase().trim()).filter((d: string) => DAYS_SEQUENCE.includes(d as any)) as DayOfWeek[]
+    : [];
+  const daysToAssign: DayOfWeek[] =
+    requestedDays.length > 0
+      ? requestedDays
+      : ctx.studyDays.length > 0
+      ? (ctx.studyDays as DayOfWeek[])
+      : default5Days;
 
-  res.json({
-    success: true,
-    assignments,
+  const forceRedistribute = Boolean(req.body?.forceRedistribute || req.body?.reassign);
+  const idempotencyKey = typeof req.body?.idempotencyKey === 'string' ? req.body.idempotencyKey.trim() : '';
+
+  if (!forceRedistribute) {
+    const existingForDays = daysToAssign
+      .map((d) =>
+        ctx.spotifyAssignments.find(
+          (a: any) => (a.day || a.dayOfWeek) === d && Number(a.weeklyCycle || activeCycle) === activeCycle
+        )
+      )
+      .filter(Boolean);
+
+    const sameIdempotencyKey = Boolean(
+      idempotencyKey &&
+      ctx.lastSpotifyDistributionAttempt?.idempotencyKey === idempotencyKey &&
+      Number(ctx.lastSpotifyDistributionAttempt?.weeklyCycle || activeCycle) === activeCycle &&
+      existingForDays.length > 0
+    );
+
+    const allDaysAlreadyAssignedForLevel =
+      existingForDays.length === daysToAssign.length &&
+      existingForDays.every((a: any) => Boolean(a.trackUrl || a.url) && (!level || a.level === studentLevel));
+
+    if (sameIdempotencyKey || allDaysAlreadyAssignedForLevel) {
+      return res.json({
+        success: true,
+        idempotentReplay: true,
+        assignments: existingForDays,
+        studentEmail: cleanEmail,
+        studentUid: canonicalStudentUid,
+        weeklyCycle: activeCycle,
+        message: `Semana de ${existingForDays.length} faixas exclusivas do Spotify já distribuída.`,
+      });
+    }
+  }
+
+  let playlistTracks: SpotifyTrack[] = [];
+  try {
+    playlistTracks = await fetchOfficialPlaylistTracks(studentLevel);
+  } catch {
+    if (db.spotifyPlaylists?.[studentLevel]?.tracks) {
+      playlistTracks = db.spotifyPlaylists[studentLevel].tracks;
+    }
+  }
+
+  if (playlistTracks.length === 0) {
+    return res.status(503).json({
+      error: 'SPOTIFY_PLAYLIST_UNAVAILABLE',
+      message: 'Could not retrieve tracks from official Spotify playlist.',
+    });
+  }
+
+  const effectiveTeacherUid = isCallerApprovedTeacher
+    ? callerUid
+    : isAdmin
+    ? (bodyTeacherUid || '').trim()
+    : (ctx.userProfile?.assignedNativeFriendUID || ctx.userProfile?.teacherUid || '').trim();
+  const effectiveTeacherEmail = isCallerApprovedTeacher
+    ? callerEmail
+    : isAdmin
+    ? (bodyTeacherEmail || '').toLowerCase().trim()
+    : (ctx.userProfile?.teacherEmail || '').toLowerCase().trim();
+
+  const updatedSpotifyCycles = { ...(ctx.spotifyCycles || {}) };
+  updatedSpotifyCycles[studentLevel] = cloneOrInitSpotifyCycleState(updatedSpotifyCycles, studentLevel);
+
+  const transientEngineDb: Record<string, any> = {
+    studentSpotifyCycles: {
+      [canonicalStudentUid]: updatedSpotifyCycles,
+    },
+    studentSpotifyAssignments: {},
+    studentRoutinesMap: {},
+    weeklyStudyDays: {
+      [canonicalStudentUid]: daysToAssign,
+    },
+  };
+
+  const distributedAssignments = distributeWeeklySpotifyForStudentEngine({
+    db: transientEngineDb,
     studentEmail: cleanEmail,
-    studentUid: uid,
-    message: `Semana de ${assignments.length} faixas exclusivas do Spotify distribuída com sucesso!`,
+    studentUid: canonicalStudentUid,
+    level: studentLevel,
+    playlistTracks,
+    activeDays: daysToAssign,
+    teacherUid: effectiveTeacherUid,
+    teacherEmail: effectiveTeacherEmail,
+    weeklyCycle: activeCycle,
+  });
+
+  if (transientEngineDb.studentSpotifyCycles?.[canonicalStudentUid]?.[studentLevel]) {
+    updatedSpotifyCycles[studentLevel] = transientEngineDb.studentSpotifyCycles[canonicalStudentUid][studentLevel];
+  }
+  const now = new Date().toISOString();
+
+  let updatedSpotifyAssignments = [...ctx.spotifyAssignments];
+  for (const assign of distributedAssignments) {
+    const targetDay = assign.day;
+    const routineSpotifyObj = {
+      id: `sp-${targetDay}-${activeCycle}-${assign.trackId}`,
+      url: assign.trackUrl,
+      trackId: assign.trackId,
+      title: assign.trackTitle,
+      artistOrHost: assign.artistOrHost,
+      duration: '3-4 min',
+      instructions: assign.instructions,
+      type: assign.type || 'music',
+      addedAt: assign.assignedAt || now,
+      level: studentLevel,
+      playlistId: assign.playlistId || officialMeta.id,
+      playlistTitle: assign.playlistTitle || officialMeta.title,
+      cycle: assign.cycle,
+      weeklyCycle: activeCycle,
+    };
+
+    const dayRes = await saveStudentRoutineDayFieldsServer(
+      canonicalStudentUid,
+      targetDay,
+      {
+        activityId: assign.activityId || `act-${targetDay}-2`,
+        teacherSpotify: routineSpotifyObj,
+        ...(effectiveTeacherUid ? { teacherUid: effectiveTeacherUid } : {}),
+        ...(effectiveTeacherEmail ? { teacherEmail: effectiveTeacherEmail } : {}),
+      },
+      activeCycle
+    );
+
+    if (!dayRes.success) {
+      if (dayRes.code === 'STALE_CYCLE') {
+        return res.status(409).json({
+          success: false,
+          error: 'STALE_CYCLE',
+          message: dayRes.error,
+          activeCycle: dayRes.activeCycle,
+        });
+      }
+      return res.status(500).json({
+        success: false,
+        error: 'FirestorePersistenceFailed',
+        message: dayRes.error || `Failed to persist distributed audio for ${targetDay} in Firestore (default).`,
+      });
+    }
+
+    updatedSpotifyAssignments = updatedSpotifyAssignments.filter(
+      (a: any) => (a.day || a.dayOfWeek) !== targetDay
+    );
+    updatedSpotifyAssignments.push({
+      ...assign,
+      url: assign.trackUrl,
+      title: assign.trackTitle,
+      weeklyCycle: activeCycle,
+    });
+  }
+
+  const assignmentsSaved = await saveStudentAssignmentsCanonicalServer(canonicalStudentUid, {
+    uid: canonicalStudentUid,
+    email: cleanEmail,
+    level: studentLevel,
+    weeklyCycle: activeCycle,
+    spotifyAssignments: updatedSpotifyAssignments,
+    spotifyCycles: updatedSpotifyCycles,
+    lastSpotifyDistributionAttempt: {
+      at: now,
+      level: studentLevel,
+      weeklyCycle: activeCycle,
+      days: daysToAssign,
+      ...(idempotencyKey ? { idempotencyKey } : {}),
+    },
+    updatedAt: now,
+  });
+
+  if (!assignmentsSaved) {
+    return res.status(500).json({
+      success: false,
+      error: 'FirestorePersistenceFailed',
+      message: 'Failed to persist distributed Spotify assignments in Firestore (default).',
+    });
+  }
+
+  return res.json({
+    success: true,
+    idempotentReplay: false,
+    assignments: distributedAssignments,
+    studentEmail: cleanEmail,
+    studentUid: canonicalStudentUid,
+    weeklyCycle: activeCycle,
+    message: `Semana de ${distributedAssignments.length} faixas exclusivas do Spotify distribuída com sucesso!`,
   });
 });
 
-// Endpoint to record a track as listened by a student (parallel to studentWatchedVideos)
-app.post('/api/student-spotify-assignments/listen', (req, res) => {
-  const db = readDb();
-  const { studentEmail, studentUid, trackId, trackUrl } = req.body;
-  const { email: cleanEmail, uid } = resolveStudentIdentifiers(db, studentEmail, studentUid);
+// Canonical idempotent endpoint to record a listened Spotify track in Firestore (default)
+app.post('/api/student-spotify-assignments/listen', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeStudentRoutineAccess(req, res, { allowMissingTargetFallbackToCaller: true });
+  if (!authCtx) return;
 
-  const cleanTrackId = extractSpotifyTrackId(trackId || trackUrl);
+  const { canonicalStudentUid, canonicalStudentEmail } = authCtx;
+  const { trackId, trackUrl, trackTitle, title, artist, artistOrHost } = req.body || {};
+
+  const rawInput = typeof trackId === 'string' && trackId.trim() ? trackId.trim() : typeof trackUrl === 'string' ? trackUrl.trim() : '';
+  const extracted = extractSpotifyTrackId(trackUrl || trackId);
+  const cleanTrackId =
+    extracted ||
+    (rawInput && /^[a-zA-Z0-9_-]{3,80}$/.test(rawInput) ? rawInput : null);
+
   if (!cleanTrackId) {
-    return res.status(400).json({ error: 'trackId or trackUrl is required' });
+    return res.status(400).json({ error: 'Valid trackId or trackUrl is required' });
   }
 
-  if (!db.studentListenedTracks) db.studentListenedTracks = {};
+  const listenRes = await addListenedTrackCanonicalServer(
+    canonicalStudentUid,
+    cleanTrackId,
+    trackTitle || title,
+    artist || artistOrHost
+  );
 
-  const targetKeys = Array.from(new Set([cleanEmail, uid].filter(Boolean) as string[]));
-  targetKeys.forEach((key) => {
-    if (!db.studentListenedTracks![key]) db.studentListenedTracks![key] = [];
-    if (!db.studentListenedTracks![key].includes(cleanTrackId)) {
-      db.studentListenedTracks![key].push(cleanTrackId);
-    }
-  });
-
-  writeDb(db);
-
-  if (uid) {
-    saveStudentAssignmentsByUid(uid, {
-      uid,
-      email: cleanEmail,
-      listenedTracks: db.studentListenedTracks[uid] || [],
-      updatedAt: new Date().toISOString(),
-    }).catch((err) => console.warn('Firestore saveStudentAssignmentsByUid (listen) notice:', err));
+  if (!listenRes.success) {
+    return res.status(500).json({
+      success: false,
+      error: 'FirestorePersistenceFailed',
+      message: listenRes.error || 'Failed to persist listened track history in Firestore (default).',
+    });
   }
 
-  const activeListened = (uid && db.studentListenedTracks[uid]) || (cleanEmail && db.studentListenedTracks[cleanEmail]) || [];
-  res.json({
+  return res.json({
     success: true,
-    listened: activeListened,
-    studentEmail: cleanEmail,
-    studentUid: uid,
+    alreadyRecorded: listenRes.alreadyRecorded,
+    listened: listenRes.listenedTracks,
+    studentEmail: canonicalStudentEmail,
+    studentUid: canonicalStudentUid,
   });
 });
 
@@ -14441,72 +15319,38 @@ app.post('/api/spotify-playlists/sync', async (req, res) => {
   }
 });
 
-app.get('/api/student-video-assignments', (req, res) => {
-  const db = readDb();
-  const studentEmail = ((req.query.studentEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
-  const uid = ((req.query.uid as string) || (req.query.studentUid as string) || '').trim();
-  const { email, uid: resolvedUid } = resolveStudentIdentifiers(db, studentEmail, uid);
+app.get('/api/student-video-assignments', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeStudentRoutineAccess(req, res, { allowMissingTargetFallbackToCaller: true });
+  if (!authCtx) return;
 
-  const studentLevel = normalizeStudentLevel(resolveStudentLevel(db, email, resolvedUid)).key;
-  const keysToLookup = [resolvedUid, email].filter(Boolean) as string[];
+  const { canonicalStudentUid, canonicalStudentEmail } = authCtx;
+  const requestedCycle = req.query.weeklyCycle !== undefined ? String(req.query.weeklyCycle) : undefined;
+  const ctx = await fetchCanonicalRoutineContextServer(canonicalStudentUid, requestedCycle);
 
-  let assignments: any[] = [];
-  for (const k of keysToLookup) {
-    if (db.studentVideoAssignments?.[k] && Array.isArray(db.studentVideoAssignments[k])) {
-      assignments = db.studentVideoAssignments[k];
-      if (assignments.length > 0) break;
-    }
+  if (!ctx) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) context unavailable.',
+    });
   }
 
-  // Check if assignments are missing or corrupted with duplicate video IDs across days
-  const uniqueVideoIds = new Set(
-    assignments.map((a) => extractServerYouTubeId(a.videoId || a.videoUrl)).filter(Boolean)
-  );
-  const hasRepeatingBug = assignments.length > 1 && uniqueVideoIds.size === 1;
+  const studentLevel = normalizeStudentLevel(ctx.level).key;
 
-  const studentPlanDays: string[] =
-    (email && db.weeklyStudyDays?.[email] && db.weeklyStudyDays[email].length > 0)
-      ? db.weeklyStudyDays[email]
-      : (resolvedUid && db.weeklyStudyDays?.[resolvedUid] && db.weeklyStudyDays[resolvedUid].length > 0)
-      ? db.weeklyStudyDays[resolvedUid]
-      : (email && db.userProfiles?.[email]?.weeklyStudyDays && db.userProfiles[email].weeklyStudyDays.length > 0)
-      ? db.userProfiles[email].weeklyStudyDays
-      : (email && db.userProfiles?.[email]?.selectedStudyDays && db.userProfiles[email].selectedStudyDays.length > 0)
-      ? db.userProfiles[email].selectedStudyDays
-      : DAYS_SEQUENCE;
-  const expectedDaysCount = Math.max(1, studentPlanDays.length);
-
-  const hasVoluntaryVideoAssignments = assignments.length > 0;
-  const isAwaitingTopicSelection = Boolean(
-    (email && db.studentAwaitingTopicSelection?.[email]) ||
-    (resolvedUid && db.studentAwaitingTopicSelection?.[resolvedUid]) ||
-    !hasVoluntaryVideoAssignments
-  );
-
-  if ((assignments.length < expectedDaysCount || hasRepeatingBug) && !isAwaitingTopicSelection && hasVoluntaryVideoAssignments) {
-    if (email || resolvedUid) {
-      assignments = distributeWeeklyYouTubeForStudent(db, email, resolvedUid, studentLevel, undefined, undefined, studentPlanDays);
-      writeDb(db);
-    }
-  }
-
-  const watchedKey = resolvedUid && db.studentWatchedVideos?.[resolvedUid] ? resolvedUid : email;
-  const watched = (watchedKey && db.studentWatchedVideos?.[watchedKey]) || [];
-
-  res.json({
+  return res.json({
     success: true,
-    assignments,
-    watched,
-    studentEmail: email,
-    studentUid: resolvedUid,
+    assignments: ctx.videoAssignments,
+    watched: ctx.watchedVideosHistory,
+    studentEmail: ctx.studentEmail || canonicalStudentEmail,
+    studentUid: canonicalStudentUid,
     studentLevel,
+    weeklyCycle: ctx.activeCycle,
   });
 });
 
 /**
- * Hardening Fase 2B: Authoritatively verifies if an authenticated caller is an approved Native Friend (Teacher).
+ * Hardening Fase 2B + ARCH.2E.2A: Authoritatively verifies if an authenticated caller is an approved Native Friend (Teacher).
  * Checks Firestore /tutors and /users collections, canonical identity resolver, and local DB authoritative tutors.
- * Validates active/approved status.
+ * Preserves approved teachers even when Firebase Auth token lacks a custom teacher claim.
  */
 async function verifyActiveApprovedTeacher(
   uid: string,
@@ -14559,11 +15403,14 @@ async function verifyActiveApprovedTeacher(
     });
     if (found) {
       const role = (found.role || '').toLowerCase().trim();
+      const status = (found.approvalStatus || found.status || '').toLowerCase().trim();
+      const isDeniedOrPending =
+        status === 'pending' || status === 'rejected' || found.isApproved === false || found.approved === false;
       const isTeacherRole = role === 'teacher' || role === 'tutor' || role === 'native_friend' || !role;
       const isApproved = Boolean(
         isTeacherRole &&
-        found.approvalStatus === 'approved' &&
-        found.isApproved === true
+        !isDeniedOrPending &&
+        (status === 'approved' || found.isApproved === true || found.approved === true)
       );
       if (isApproved) {
         return {
@@ -14579,22 +15426,94 @@ async function verifyActiveApprovedTeacher(
   return { isTeacher: false };
 }
 
-app.post('/api/student-video-assignments/assign', firebaseAuthMiddleware, async (req, res) => {
-  const db = readDb();
+async function isExplicitlyUnapprovedTeacherInFirestore(
+  firestore: any,
+  uid: string,
+  email?: string
+): Promise<boolean> {
+  if (!firestore || !uid) return false;
+  const cleanUid = uid.trim();
+  const cleanEmail = (email || '').toLowerCase().trim();
+  const hasNegativeApproval = (data: any): boolean => {
+    if (!data || typeof data !== 'object') return false;
+    const status = (data.approvalStatus || data.status || '').toLowerCase().trim();
+    return Boolean(
+      status === 'pending' ||
+      status === 'rejected' ||
+      data.isApproved === false ||
+      data.approved === false
+    );
+  };
+  try {
+    const [uDoc, tDoc] = await Promise.all([
+      firestore.collection('users').doc(cleanUid).get().catch(() => null),
+      firestore.collection('tutors').doc(cleanUid).get().catch(() => null),
+    ]);
+    if (uDoc?.exists) {
+      const ud = uDoc.data() || {};
+      const role = (ud.role || '').toLowerCase().trim();
+      if ((role === 'teacher' || role === 'tutor' || role === 'native_friend' || ud.isTeacher === true) && hasNegativeApproval(ud)) {
+        return true;
+      }
+    }
+    if (tDoc?.exists && hasNegativeApproval(tDoc.data())) {
+      return true;
+    }
+    if (cleanEmail) {
+      const qT = await firestore.collection('tutors').where('email', '==', cleanEmail).limit(1).get().catch(() => null);
+      if (qT && !qT.empty && hasNegativeApproval(qT.docs[0].data())) {
+        return true;
+      }
+    }
+  } catch {}
+  return false;
+}
+
+async function authorizeStudentRoutineAccess(
+  req: express.Request,
+  res: express.Response,
+  options?: { allowMissingTargetFallbackToCaller?: boolean; requireApprovedTeacherIfTutor?: boolean }
+): Promise<{
+  callerUid: string;
+  callerEmail: string;
+  isAdmin: boolean;
+  isCallerApprovedTeacher: boolean;
+  effectiveRole: 'admin' | 'teacher' | 'student';
+  canonicalStudentUid: string;
+  canonicalStudentEmail: string;
+  firestore: any;
+} | null> {
   const caller = req.user;
   if (!caller || !caller.uid) {
-    return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required: verified user token missing.' });
+    res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Authentication required: verified user token missing.',
+    });
+    return null;
   }
 
+  const firestore = getFirestoreDb();
+  if (!firestore) {
+    res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
+    return null;
+  }
+
+  const db = readDb();
   const cleanCallerUid = caller.uid.trim();
   const cleanCallerEmail = (caller.email || '').toLowerCase().trim();
   const isAdmin = caller.role === 'admin';
 
-  // Validate Native Friend identity and active/approved status if caller is a teacher or has teacher records
-  const teacherStatus = await verifyActiveApprovedTeacher(cleanCallerUid, cleanCallerEmail, caller.email_verified, db);
+  const teacherStatus = await verifyActiveApprovedTeacher(
+    cleanCallerUid,
+    cleanCallerEmail,
+    caller.email_verified,
+    db
+  );
   const isCallerApprovedTeacher = teacherStatus.isTeacher;
 
-  // Check if caller is registered as tutor but not approved/active
   const allTutors = [...(db.teachers || []), ...(db.tutorsList || [])];
   const matchedTutorRecord = allTutors.find((t: any) => {
     const cleanTutorEmail = (t.email || '').toLowerCase().trim();
@@ -14605,53 +15524,132 @@ app.post('/api/student-video-assignments/assign', firebaseAuthMiddleware, async 
       (cleanCallerEmail && cleanTutorEmail === cleanCallerEmail)
     );
   });
-  if (matchedTutorRecord && !isCallerApprovedTeacher && !isAdmin) {
-    return res.status(403).json({
-      error: 'Forbidden',
-      message: 'Native Friend is not approved or active.',
-    });
+  const unapprovedInFirestore =
+    !isCallerApprovedTeacher && !isAdmin
+      ? await isExplicitlyUnapprovedTeacherInFirestore(firestore, cleanCallerUid, cleanCallerEmail)
+      : false;
+
+  const rawUid = ((req.body?.studentUid as string) || (req.body?.uid as string) || (req.query?.studentUid as string) || (req.query?.uid as string) || '').trim();
+  const rawEmail = ((req.body?.studentEmail as string) || (req.body?.email as string) || (req.query?.studentEmail as string) || (req.query?.email as string) || '').toLowerCase().trim();
+
+  if ((matchedTutorRecord || unapprovedInFirestore) && !isCallerApprovedTeacher && !isAdmin) {
+    const targetingOther = Boolean(
+      (rawUid && rawUid !== cleanCallerUid) ||
+      (rawEmail && cleanCallerEmail && rawEmail !== cleanCallerEmail) ||
+      (!rawUid && rawEmail)
+    );
+    if (options?.requireApprovedTeacherIfTutor || targetingOther) {
+      res.status(403).json({
+        error: 'Forbidden',
+        message: 'Native Friend is not approved or active.',
+      });
+      return null;
+    }
   }
 
-  const effectiveRole = isAdmin ? 'admin' : (isCallerApprovedTeacher ? 'teacher' : 'student');
+  const effectiveRole: 'admin' | 'teacher' | 'student' = isAdmin
+    ? 'admin'
+    : isCallerApprovedTeacher
+    ? 'teacher'
+    : 'student';
 
-  // Validate canonical student identity and pedagogical link
+  let candidateUid = rawUid;
+  let candidateEmail = rawEmail;
+
+  if (!candidateUid && !candidateEmail && options?.allowMissingTargetFallbackToCaller) {
+    candidateUid = cleanCallerUid;
+    candidateEmail = cleanCallerEmail;
+  }
+
+  if (!candidateUid && candidateEmail) {
+    const fsProf = await fetchStudentProfileFromFirestoreServer('', candidateEmail);
+    if (fsProf.uid && isValidCanonicalUid(fsProf.uid)) {
+      candidateUid = fsProf.uid;
+    }
+  }
+
   const studentResolution = await resolveCanonicalStudentIdentity({
     caller: {
       uid: cleanCallerUid,
       email: cleanCallerEmail,
       role: effectiveRole,
     },
-    studentEmail: req.body.studentEmail,
-    studentUid: req.body.studentUid || req.body.uid,
+    studentEmail: candidateEmail || undefined,
+    studentUid: candidateUid || undefined,
   });
 
   if (!studentResolution.authorized) {
-    return res.status(studentResolution.statusCode || 403).json({
-      error: studentResolution.statusCode === 401 ? 'Unauthorized' : 'Forbidden',
+    res.status(studentResolution.statusCode || 403).json({
+      error: studentResolution.statusCode === 401 ? 'Unauthorized' : studentResolution.statusCode === 422 ? 'Unprocessable Entity' : 'Forbidden',
       message: studentResolution.error || 'Access denied.',
     });
+    return null;
   }
 
   const canonicalStudentUid = studentResolution.canonicalStudentUid;
-  const canonicalStudentEmail = (studentResolution.studentEmail || '').toLowerCase().trim();
-
   if (!isValidCanonicalUid(canonicalStudentUid)) {
-    return res.status(422).json({
+    res.status(422).json({
       error: 'Unprocessable Entity',
       message: 'Invalid or non-canonical student UID.',
     });
+    return null;
   }
 
-  // Derive teacher authorization strictly:
+  return {
+    callerUid: cleanCallerUid,
+    callerEmail: cleanCallerEmail,
+    isAdmin,
+    isCallerApprovedTeacher,
+    effectiveRole,
+    canonicalStudentUid,
+    canonicalStudentEmail: (studentResolution.studentEmail || candidateEmail || '').toLowerCase().trim(),
+    firestore,
+  };
+}
+
+app.post('/api/student-video-assignments/assign', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeStudentRoutineAccess(req, res, {
+    allowMissingTargetFallbackToCaller: true,
+    requireApprovedTeacherIfTutor: true,
+  });
+  if (!authCtx) return;
+
+  const {
+    callerUid,
+    callerEmail,
+    isAdmin,
+    isCallerApprovedTeacher,
+    canonicalStudentUid,
+    canonicalStudentEmail,
+  } = authCtx;
+
+  const db = readDb(); // Catalog playlists only (db.youtubePlaylists)
+  const ctx = await fetchCanonicalRoutineContextServer(canonicalStudentUid);
+  if (!ctx) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) context unavailable.',
+    });
+  }
+
+  const passedCycle = extractPositiveIntegerCycle(req.body.weeklyCycle);
+  if (passedCycle !== null && passedCycle < ctx.activeCycle) {
+    return res.status(409).json({
+      success: false,
+      error: 'STALE_CYCLE',
+      message: `Stale cycle ${passedCycle} rejected; active cycle is ${ctx.activeCycle}.`,
+      activeCycle: ctx.activeCycle,
+    });
+  }
+  const activeCycle = passedCycle !== null ? Math.max(ctx.activeCycle, passedCycle) : ctx.activeCycle;
+
   let effectiveTeacherUid = '';
   let effectiveTeacherEmail = '';
 
   if (isCallerApprovedTeacher) {
-    // Authenticated teacher UID only
-    effectiveTeacherUid = cleanCallerUid;
-    effectiveTeacherEmail = cleanCallerEmail;
+    effectiveTeacherUid = callerUid;
+    effectiveTeacherEmail = callerEmail;
   } else if (isAdmin) {
-    // Admin can specify teacher, validate if provided
     if (req.body.teacherUid || req.body.teacherEmail) {
       const teacherRes = await resolveTeacherCanonicalIdentity({
         teacherUid: req.body.teacherUid,
@@ -14664,99 +15662,103 @@ app.post('/api/student-video-assignments/assign', firebaseAuthMiddleware, async 
       }
     }
   } else {
-    // Student: CANNOT arbitrarily assign another teacher
-    const studentProfile = db.userProfiles?.[canonicalStudentUid] || db.userProfiles?.[canonicalStudentEmail];
-    const registeredStudent = (db.students || []).find((s: any) =>
-      (canonicalStudentUid && (s.uid === canonicalStudentUid || s.id === canonicalStudentUid)) ||
-      (canonicalStudentEmail && (s.email || '').toLowerCase().trim() === canonicalStudentEmail)
-    );
     effectiveTeacherUid = (
-      studentProfile?.assignedNativeFriendUID ||
-      studentProfile?.teacherUid ||
-      registeredStudent?.assignedTeacherId ||
-      registeredStudent?.teacherUid ||
+      ctx.userProfile?.assignedNativeFriendUID ||
+      ctx.userProfile?.teacherUid ||
       ''
     ).trim();
-    effectiveTeacherEmail = (
-      studentProfile?.teacherEmail ||
-      registeredStudent?.teacherEmail ||
-      ''
-    ).trim();
+    effectiveTeacherEmail = (ctx.userProfile?.teacherEmail || '').trim();
   }
 
-  const cleanEmail = canonicalStudentEmail;
   const uid = canonicalStudentUid;
-
+  const cleanEmail = ctx.studentEmail || canonicalStudentEmail;
   const { playlistId, activityId, day, teacherNotes, videoUrl } = req.body;
+  const targetDay: DayOfWeek = ((String(day || 'monday').toLowerCase().trim() as DayOfWeek));
+  if (!DAYS_SEQUENCE.includes(targetDay)) {
+    return res.status(400).json({ error: `Invalid day of week: ${targetDay}` });
+  }
 
-  const studentLevel = normalizeStudentLevel(resolveStudentLevel(db, cleanEmail, uid)).key;
+  const studentLevel = normalizeStudentLevel(ctx.level).key;
   const levelCurriculum = YOUTUBE_LEVEL_PLAYLISTS[studentLevel] || YOUTUBE_LEVEL_PLAYLISTS.beginner;
-
   const playlists = db.youtubePlaylists || [];
   const playlist = playlists.find((p: any) => p.id === playlistId) || playlists[0];
 
-  if (!db.studentVideoAssignments) db.studentVideoAssignments = {};
-  if (!db.studentWatchedVideos) db.studentWatchedVideos = {};
+  const forceNew = Boolean(req.body.forceNewVideo || req.body.reassign);
+  const idempotencyKey = typeof req.body.idempotencyKey === 'string' ? req.body.idempotencyKey.trim() : '';
+  const requestedManualVidId = videoUrl ? extractServerYouTubeId(videoUrl) : null;
 
-  const targetKeys = [cleanEmail, uid].filter(Boolean) as string[];
-
-  let userAssignments: any[] = [];
-  for (const k of targetKeys) {
-    if (db.studentVideoAssignments[k] && Array.isArray(db.studentVideoAssignments[k])) {
-      userAssignments = db.studentVideoAssignments[k];
-      if (userAssignments.length > 0) break;
+  // Idempotency check for identical repeated requests on the same (day, playlistId, cycle)
+  const existingAssignment = ctx.videoAssignments.find(
+    (a: any) => (a.day || a.dayOfWeek) === targetDay && Number(a.weeklyCycle || activeCycle) === activeCycle
+  );
+  if (!forceNew && existingAssignment && (existingAssignment.videoId || existingAssignment.videoUrl)) {
+    const existingVidId = extractServerYouTubeId(existingAssignment.videoId || existingAssignment.videoUrl);
+    const sameIdempotencyKey = Boolean(idempotencyKey && existingAssignment.idempotencyKey === idempotencyKey);
+    const sameRequestParams = Boolean(
+      playlistId &&
+      existingAssignment.playlistId === playlistId &&
+      (!requestedManualVidId || requestedManualVidId === existingVidId)
+    );
+    if (sameIdempotencyKey || sameRequestParams) {
+      const consumedSet = new Set<string>(ctx.watchedVideosHistory.map((id) => extractServerYouTubeId(id) || id));
+      ctx.videoAssignments.forEach((a: any) => {
+        const cid = extractServerYouTubeId(a.videoId || a.videoUrl);
+        if (cid) consumedSet.add(cid);
+      });
+      const remainingUnseen = (playlist?.videos || []).filter((v: any) => {
+        const vid = extractServerYouTubeId(v.videoId || v.url || v.id);
+        return vid && !consumedSet.has(vid);
+      }).length;
+      const replayVideo = {
+        id: existingAssignment.id || `vid-${targetDay}-${existingVidId}`,
+        url: existingAssignment.videoUrl || `https://www.youtube.com/watch?v=${existingVidId}`,
+        videoId: existingVidId || existingAssignment.videoId,
+        title: existingAssignment.videoTitle || 'Daily Video Practice',
+        duration: existingAssignment.duration || '5-10 min',
+        instructions: existingAssignment.instructions || '',
+        addedAt: existingAssignment.assignedAt || new Date().toISOString(),
+        playlistId: existingAssignment.playlistId,
+        playlistTitle: existingAssignment.playlistTitle,
+      };
+      return res.json({
+        success: true,
+        idempotentReplay: true,
+        video: replayVideo,
+        playlistTitle: replayVideo.playlistTitle,
+        playlistId: replayVideo.playlistId,
+        remainingUnseen,
+        totalVideos: playlist?.videos?.length || 7,
+        studentEmail: cleanEmail,
+        studentUid: uid,
+        weeklyCycle: activeCycle,
+        message: `Vídeo exclusivo "${replayVideo.title}" já atribuído para este dia.`,
+      });
     }
   }
 
-  let userWatched: string[] = [];
-  for (const k of targetKeys) {
-    if (db.studentWatchedVideos[k] && Array.isArray(db.studentWatchedVideos[k])) {
-      userWatched = db.studentWatchedVideos[k];
-      if (userWatched.length > 0) break;
-    }
-  }
-
-  const targetDay: DayOfWeek = ((day as DayOfWeek) || 'monday');
-
-  // Consumed video IDs: already watched OR already assigned to other days of the week for this student OR recorded in studentJournal
   const consumedVideoIds = new Set<string>();
-  userWatched.forEach((id: string) => {
+  ctx.watchedVideosHistory.forEach((id: string) => {
     const cid = extractServerYouTubeId(id);
     if (cid) consumedVideoIds.add(cid);
   });
-
   const clientWatchedHistory: string[] = Array.isArray(req.body.watchedVideosHistory)
     ? req.body.watchedVideosHistory
     : [];
   clientWatchedHistory.forEach((id: string) => {
     const cid = extractServerYouTubeId(id);
-    if (cid) {
-      consumedVideoIds.add(cid);
-    }
+    if (cid) consumedVideoIds.add(cid);
   });
 
-  // Query studentJournal from request body, in-memory DB, and profile to enforce 100% video exclusivity
   const reqJournal: any[] = Array.isArray(req.body.studentJournal) ? req.body.studentJournal : [];
-  const dbJournalEntries = [
-    ...reqJournal,
-    ...((cleanEmail && db.studentActivityJournal?.[cleanEmail]) || []),
-    ...((uid && db.studentActivityJournal?.[uid]) || []),
-    ...((cleanEmail && db.userProfiles?.[cleanEmail]?.studentJournal) || []),
-    ...((uid && db.userProfiles?.[uid]?.studentJournal) || []),
-  ];
-  dbJournalEntries.forEach((entry: any) => {
-    if (entry && entry.type === 'video' && entry.id) {
-      const cid = extractServerYouTubeId(entry.id);
+  [...reqJournal, ...ctx.studentJournal].forEach((entry: any) => {
+    if (entry && entry.type === 'video') {
+      const cid = extractServerYouTubeId(entry.id || entry.url);
       if (cid) consumedVideoIds.add(cid);
-      if (entry.url) {
-        const uCid = extractServerYouTubeId(entry.url);
-        if (uCid) consumedVideoIds.add(uCid);
-      }
     }
   });
 
-  userAssignments.forEach((assign: any) => {
-    if (assign.day !== targetDay) {
+  ctx.videoAssignments.forEach((assign: any) => {
+    if ((assign.day || assign.dayOfWeek) !== targetDay) {
       const cid = extractServerYouTubeId(assign.videoId || assign.videoUrl);
       if (cid) consumedVideoIds.add(cid);
     }
@@ -14764,18 +15766,9 @@ app.post('/api/student-video-assignments/assign', firebaseAuthMiddleware, async 
 
   let chosenVideo: any = null;
 
-  // If requesting to repeat previous video
   if (playlistId === 'repeat_previous_video') {
     const calendarDays: DayOfWeek[] = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
-    const studentPlanDays: string[] =
-      (cleanEmail && db.weeklyStudyDays?.[cleanEmail] && db.weeklyStudyDays[cleanEmail].length > 0)
-        ? db.weeklyStudyDays[cleanEmail]
-        : (uid && db.weeklyStudyDays?.[uid] && db.weeklyStudyDays[uid].length > 0)
-        ? db.weeklyStudyDays[uid]
-        : (cleanEmail && db.userProfiles?.[cleanEmail]?.weeklyStudyDays && db.userProfiles[cleanEmail].weeklyStudyDays.length > 0)
-        ? db.userProfiles[cleanEmail].weeklyStudyDays
-        : calendarDays;
-
+    const studentPlanDays = ctx.studyDays.length > 0 ? ctx.studyDays : calendarDays;
     const activeDaysInOrder = calendarDays.filter((d) => studentPlanDays.includes(d));
     const effectiveActiveDays = activeDaysInOrder.length > 0 ? activeDaysInOrder : calendarDays;
     const currentActiveIdx = effectiveActiveDays.indexOf(targetDay);
@@ -14791,8 +15784,7 @@ app.post('/api/student-video-assignments/assign', firebaseAuthMiddleware, async 
       targetPrevDay = (preceding.length > 0 ? preceding[preceding.length - 1] : (effectiveActiveDays[effectiveActiveDays.length - 1] || 'monday')) as DayOfWeek;
     }
 
-    // 1. Search designated target previous active study day in assignments
-    const prevAssign = userAssignments.find((a: any) => a.day === targetPrevDay && (a.videoId || a.videoUrl));
+    const prevAssign = ctx.videoAssignments.find((a: any) => (a.day || a.dayOfWeek) === targetPrevDay && (a.videoId || a.videoUrl));
     if (prevAssign) {
       const pVidId = extractServerYouTubeId(prevAssign.videoId || prevAssign.videoUrl);
       chosenVideo = {
@@ -14804,35 +15796,26 @@ app.post('/api/student-video-assignments/assign', firebaseAuthMiddleware, async 
       };
     }
 
-    // 2. Search designated target previous active study day in routines
     if (!chosenVideo) {
-      const routineObj =
-        (cleanEmail && db.studentRoutinesMap?.[cleanEmail]) ||
-        (uid && db.studentRoutinesMap?.[uid]) ||
-        db.routinesByDay ||
-        defaultRoutinesByDay;
-      const dayActs = routineObj[targetPrevDay] || [];
-      for (const act of dayActs) {
-        const v = act.teacherVideos?.[0];
-        if (v && (v.videoId || v.url)) {
-          const pVidId = extractServerYouTubeId(v.videoId || v.url);
+      const prevRaw = ctx.routinesByDayRaw[targetPrevDay];
+      if (prevRaw && (prevRaw.videoId || prevRaw.url)) {
+        const pVidId = extractServerYouTubeId(prevRaw.videoId || prevRaw.url);
+        if (pVidId) {
           chosenVideo = {
             videoId: pVidId,
-            url: v.url || `https://www.youtube.com/watch?v=${pVidId}`,
-            title: v.title || `Repeated Video (${targetPrevDay})`,
-            duration: v.duration || '5-10 min',
+            url: prevRaw.url || `https://www.youtube.com/watch?v=${pVidId}`,
+            title: prevRaw.videoTitle || prevRaw.title || `Repeated Video (${targetPrevDay})`,
+            duration: prevRaw.duration || '5-10 min',
             instructions: `Repeated from ${targetPrevDay}`,
           };
-          break;
         }
       }
     }
 
-    // 3. Fallback search across any remaining active days in reverse order
     if (!chosenVideo) {
       const otherActiveDays = [...effectiveActiveDays].filter((d) => d !== targetDay && d !== targetPrevDay).reverse();
       for (const d of otherActiveDays) {
-        const assign = userAssignments.find((a: any) => a.day === d && (a.videoId || a.videoUrl));
+        const assign = ctx.videoAssignments.find((a: any) => (a.day || a.dayOfWeek) === d && (a.videoId || a.videoUrl));
         if (assign) {
           const pVidId = extractServerYouTubeId(assign.videoId || assign.videoUrl);
           chosenVideo = {
@@ -14847,9 +15830,8 @@ app.post('/api/student-video-assignments/assign', firebaseAuthMiddleware, async 
       }
     }
 
-    // 4. Fallback to userWatched last entry
-    if (!chosenVideo && userWatched.length > 0) {
-      const lastWatchedId = userWatched[userWatched.length - 1];
+    if (!chosenVideo && ctx.watchedVideosHistory.length > 0) {
+      const lastWatchedId = ctx.watchedVideosHistory[ctx.watchedVideosHistory.length - 1];
       chosenVideo = {
         videoId: lastWatchedId,
         url: `https://www.youtube.com/watch?v=${lastWatchedId}`,
@@ -14859,7 +15841,6 @@ app.post('/api/student-video-assignments/assign', firebaseAuthMiddleware, async 
       };
     }
 
-    // 5. Fallback to curriculum of target previous active day
     if (!chosenVideo) {
       const fallbackVid = levelCurriculum.videos[targetPrevDay] || levelCurriculum.videos.monday;
       if (fallbackVid) {
@@ -14874,7 +15855,6 @@ app.post('/api/student-video-assignments/assign', firebaseAuthMiddleware, async 
     }
   }
 
-  // If a custom videoUrl was provided explicitly
   if (videoUrl) {
     const manualId = extractServerYouTubeId(videoUrl);
     if (manualId) {
@@ -14887,7 +15867,6 @@ app.post('/api/student-video-assignments/assign', firebaseAuthMiddleware, async 
     }
   }
 
-  // Next: find next unseen video from the requested playlist
   if (!chosenVideo && playlist && playlist.videos && playlist.videos.length > 0) {
     chosenVideo = playlist.videos.find((v: any) => {
       const vid = extractServerYouTubeId(v.videoId || v.url || v.id);
@@ -14895,7 +15874,6 @@ app.post('/api/student-video-assignments/assign', firebaseAuthMiddleware, async 
     });
   }
 
-  // Fallback: search in level curriculum
   if (!chosenVideo) {
     const pool = [
       ...DAYS_SEQUENCE.map((d) => levelCurriculum.videos[d]),
@@ -14908,7 +15886,6 @@ app.post('/api/student-video-assignments/assign', firebaseAuthMiddleware, async 
     });
   }
 
-  // Ultimate fallback: recycle designated day video
   if (!chosenVideo) {
     chosenVideo = levelCurriculum.videos[targetDay] || {
       videoId: 'V1bFr2KGq1g',
@@ -14920,28 +15897,40 @@ app.post('/api/student-video-assignments/assign', firebaseAuthMiddleware, async 
 
   const validVidId = extractServerYouTubeId(chosenVideo.videoId || chosenVideo.url || chosenVideo.id)!;
   const cleanVideoUrl = `https://www.youtube.com/watch?v=${validVidId}`;
+  const now = new Date().toISOString();
+
+  const resolvedPlaylistId =
+    playlistId === 'repeat_previous_video'
+      ? 'repeat_previous_video'
+      : (playlist?.id || levelCurriculum.playlistId);
+  const resolvedPlaylistTitle =
+    playlistId === 'repeat_previous_video'
+      ? 'Repeat Previous Video'
+      : (playlist?.title || levelCurriculum.playlistTitle);
+  const resolvedInstructions =
+    teacherNotes ||
+    chosenVideo.instructions ||
+    chosenVideo.teacherTipPt ||
+    'Vídeo exclusivo do dia. Assista com atenção e anote 5 novas palavras.';
+  const resolvedDuration = chosenVideo.duration || '5-10 min';
 
   const assignedVideoObj = {
-    id: `vid-${targetDay}-${Date.now()}`,
+    id: `vid-${targetDay}-${activeCycle}-${validVidId}`,
     url: cleanVideoUrl,
     videoId: validVidId,
     title: chosenVideo.title,
-    duration: chosenVideo.duration || '5-10 min',
-    instructions:
-      teacherNotes ||
-      chosenVideo.instructions ||
-      chosenVideo.teacherTipPt ||
-      `Vídeo exclusivo do dia. Assista com atenção e anote 5 novas palavras.`,
-    addedAt: new Date().toISOString(),
-    playlistId: playlistId === 'repeat_previous_video' ? 'repeat_previous_video' : (playlist?.id || levelCurriculum.playlistId),
-    playlistTitle: playlistId === 'repeat_previous_video' ? 'Repeat Previous Video' : (playlist?.title || levelCurriculum.playlistTitle),
+    duration: resolvedDuration,
+    instructions: resolvedInstructions,
+    addedAt: now,
+    playlistId: resolvedPlaylistId,
+    playlistTitle: resolvedPlaylistTitle,
   };
 
-  const assignmentRecord = {
-    id: `assign-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+  const assignmentRecord: any = {
+    id: `assign-${targetDay}-${activeCycle}-${validVidId}`,
     activityId: activityId || 'act-1',
     studentEmail: cleanEmail,
-    studentUid: uid || '',
+    studentUid: uid,
     teacherUid: effectiveTeacherUid,
     teacherEmail: effectiveTeacherEmail,
     day: targetDay,
@@ -14950,115 +15939,75 @@ app.post('/api/student-video-assignments/assign', firebaseAuthMiddleware, async 
     videoId: validVidId,
     videoTitle: chosenVideo.title,
     videoUrl: cleanVideoUrl,
-    assignedAt: new Date().toISOString(),
+    isRepeatVideo: playlistId === 'repeat_previous_video',
+    instructions: resolvedInstructions,
+    duration: resolvedDuration,
+    weeklyCycle: activeCycle,
+    assignedAt: now,
+    ...(idempotencyKey ? { idempotencyKey } : {}),
   };
 
-  targetKeys.forEach((key) => {
-    if (!db.studentVideoAssignments[key]) {
-      db.studentVideoAssignments[key] = [];
-    }
-    db.studentVideoAssignments[key] = db.studentVideoAssignments[key].filter(
-      (a: any) => a.day !== targetDay
-    );
-    db.studentVideoAssignments[key].push(assignmentRecord);
-  });
+  const updatedAssignments = [
+    ...ctx.videoAssignments.filter((a: any) => (a.day || a.dayOfWeek) !== targetDay),
+    assignmentRecord,
+  ];
 
-  if (!db.studentRoutinesMap) db.studentRoutinesMap = {};
-  let studentRoutineObj =
-    (cleanEmail && db.studentRoutinesMap[cleanEmail]) ||
-    (uid && db.studentRoutinesMap[uid]) ||
-    null;
+  const subcollectionSaved = await saveRoutineVideoSubcollection(
+    uid,
+    targetDay,
+    {
+      id: validVidId,
+      videoId: validVidId,
+      videoTitle: assignedVideoObj.title,
+      title: assignedVideoObj.title,
+      url: cleanVideoUrl,
+      playlistId: assignedVideoObj.playlistId,
+      playlistTitle: assignedVideoObj.playlistTitle,
+      dayOfWeek: targetDay,
+      activityId: activityId || 'act-1',
+      teacherUid: effectiveTeacherUid,
+      teacherEmail: effectiveTeacherEmail,
+      isRepeatVideo: playlistId === 'repeat_previous_video',
+      instructions: resolvedInstructions,
+      duration: resolvedDuration,
+      weeklyCycle: activeCycle,
+      updatedAt: now,
+    },
+    activeCycle
+  );
 
-  if (!studentRoutineObj || typeof studentRoutineObj !== 'object' || Object.keys(studentRoutineObj).length === 0) {
-    studentRoutineObj = JSON.parse(JSON.stringify(db.routinesByDay || defaultRoutinesByDay));
-  } else {
-    DAYS_SEQUENCE.forEach((d) => {
-      if (!studentRoutineObj[d] || !Array.isArray(studentRoutineObj[d]) || studentRoutineObj[d].length === 0) {
-        studentRoutineObj[d] = JSON.parse(JSON.stringify(db.routinesByDay?.[d] || defaultRoutinesByDay[d] || []));
-      }
+  if (!subcollectionSaved) {
+    return res.status(500).json({
+      success: false,
+      error: 'FirestorePersistenceFailed',
+      message: 'Failed to persist assigned video to users/{uid}/routines in Firestore (default).',
     });
   }
 
-  if (studentRoutineObj?.[targetDay]) {
-    let matched = false;
-    studentRoutineObj[targetDay] = studentRoutineObj[targetDay].map((act: any) => {
-      const match = activityId
-        ? act.id === activityId
-        : act.id.endsWith('1') ||
-          act.activityName?.toLowerCase().includes('vídeo') ||
-          act.activityName?.toLowerCase().includes('video') ||
-          (db.youtubePlaylists || []).some((pl: any) => pl.title?.toLowerCase() === act.activityName?.toLowerCase());
-      if (match) {
-        matched = true;
-        return {
-          ...act,
-          activityName: assignedVideoObj.playlistTitle,
-          teacherVideos: [assignedVideoObj],
-          teacherNotes: assignedVideoObj.instructions,
-        };
-      }
-      return act;
-    });
-    if (!matched && studentRoutineObj[targetDay].length > 0) {
-      studentRoutineObj[targetDay][0] = {
-        ...studentRoutineObj[targetDay][0],
-        activityName: assignedVideoObj.playlistTitle,
-        teacherVideos: [assignedVideoObj],
-        teacherNotes: assignedVideoObj.instructions,
-      };
-    }
-  }
-
-  targetKeys.forEach((key) => {
-    db.studentRoutinesMap[key] = studentRoutineObj;
-    const assigns = db.studentVideoAssignments?.[key] || [];
-    if (assigns.length >= 7 && db.studentAwaitingTopicSelection) {
-      db.studentAwaitingTopicSelection[key] = false;
-    }
+  const assignDocSaved = await saveStudentAssignmentsCanonicalServer(uid, {
+    uid,
+    email: cleanEmail,
+    level: studentLevel,
+    weeklyCycle: activeCycle,
+    videoAssignments: updatedAssignments,
+    awaitingTopicSelection: false,
+    updatedAt: now,
   });
 
-  writeDb(db);
-
-  if (uid) {
-    try {
-      const cycleToUse = req.body.weeklyCycle || (uid && db.userProfiles?.[uid]?.weeklyCycle) || 1;
-      await saveRoutineVideoSubcollection(uid, targetDay, {
-        videoId: validVidId,
-        videoTitle: assignedVideoObj.title,
-        title: assignedVideoObj.title,
-        url: cleanVideoUrl,
-        playlistId: assignedVideoObj.playlistId,
-        playlistTitle: assignedVideoObj.playlistTitle,
-        dayOfWeek: targetDay,
-        activityId: activityId || 'act-1',
-        isRepeatVideo: playlistId === 'repeat_previous_video',
-        instructions: assignedVideoObj.instructions || '',
-        duration: assignedVideoObj.duration || '5-10 min',
-        weeklyCycle: cycleToUse,
-        updatedAt: new Date().toISOString(),
-      }, cycleToUse);
-
-      await saveStudentAssignmentsByUid(uid, {
-        uid,
-        email: cleanEmail,
-        level: studentLevel,
-        videoAssignments: db.studentVideoAssignments?.[uid] || db.studentVideoAssignments?.[cleanEmail] || [],
-        spotifyAssignments: db.studentSpotifyAssignments?.[uid] || db.studentSpotifyAssignments?.[cleanEmail] || [],
-        routines: studentRoutineObj,
-        updatedAt: new Date().toISOString(),
-      });
-    } catch (fsErr) {
-      console.warn('[serverApp] Firestore saveStudentAssignments notice:', fsErr);
-    }
+  if (!assignDocSaved) {
+    return res.status(500).json({
+      success: false,
+      error: 'FirestorePersistenceFailed',
+      message: 'Failed to persist student_assignments/{uid} in Firestore (default).',
+    });
   }
 
-  // Count remaining unseen videos in this playlist for this student
-  const remainingUnseen = playlist.videos.filter((v: any) => {
+  const remainingUnseen = (playlist?.videos || []).filter((v: any) => {
     const vid = extractServerYouTubeId(v.videoId || v.url || v.id);
     return vid && !consumedVideoIds.has(vid) && vid !== validVidId;
   }).length;
 
-  res.json({
+  return res.json({
     success: true,
     video: assignedVideoObj,
     playlistTitle: assignedVideoObj.playlistTitle,
@@ -15067,18 +16016,27 @@ app.post('/api/student-video-assignments/assign', firebaseAuthMiddleware, async 
     totalVideos: playlist?.videos?.length || 7,
     studentEmail: cleanEmail,
     studentUid: uid,
+    weeklyCycle: activeCycle,
     message: `Vídeo exclusivo "${chosenVideo.title}" atribuído com sucesso!`,
   });
 });
 
 // Endpoint to distribute exclusive sequential YouTube videos for student active days (or Monday to Sunday)
 app.post('/api/student-video-assignments/distribute-week', firebaseAuthMiddleware, async (req, res) => {
-  const db = readDb();
   const caller = req.user;
   if (!caller || !caller.uid) {
     return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required: verified user token missing.' });
   }
 
+  const firestore = getFirestoreDb();
+  if (!firestore) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
+  }
+
+  const db = readDb();
   const cleanCallerUid = caller.uid.trim();
   const cleanCallerEmail = (caller.email || '').toLowerCase().trim();
   const isAdmin = caller.role === 'admin';
@@ -15086,7 +16044,6 @@ app.post('/api/student-video-assignments/distribute-week', firebaseAuthMiddlewar
   const teacherStatus = await verifyActiveApprovedTeacher(cleanCallerUid, cleanCallerEmail, caller.email_verified, db);
   const isCallerApprovedTeacher = teacherStatus.isTeacher;
 
-  // Check if caller is registered as tutor but not approved/active
   const allTutors = [...(db.teachers || []), ...(db.tutorsList || [])];
   const matchedTutorRecord = allTutors.find((t: any) => {
     const cleanTutorEmail = (t.email || '').toLowerCase().trim();
@@ -15097,7 +16054,11 @@ app.post('/api/student-video-assignments/distribute-week', firebaseAuthMiddlewar
       (cleanCallerEmail && cleanTutorEmail === cleanCallerEmail)
     );
   });
-  if (matchedTutorRecord && !isCallerApprovedTeacher && !isAdmin) {
+  const unapprovedInFirestore =
+    !isCallerApprovedTeacher && !isAdmin
+      ? await isExplicitlyUnapprovedTeacherInFirestore(firestore, cleanCallerUid, cleanCallerEmail)
+      : false;
+  if ((matchedTutorRecord || unapprovedInFirestore) && !isCallerApprovedTeacher && !isAdmin) {
     return res.status(403).json({
       error: 'Forbidden',
       message: 'Native Friend is not approved or active.',
@@ -15105,6 +16066,8 @@ app.post('/api/student-video-assignments/distribute-week', firebaseAuthMiddlewar
   }
 
   const effectiveRole = isAdmin ? 'admin' : (isCallerApprovedTeacher ? 'teacher' : 'student');
+  const forceRedistribute = Boolean(req.body.forceRedistribute);
+  const idempotencyKey = typeof req.body.idempotencyKey === 'string' ? req.body.idempotencyKey.trim() : '';
 
   // Handle Batch Distribution
   if (Array.isArray(req.body.students)) {
@@ -15120,17 +16083,22 @@ app.post('/api/student-video-assignments/distribute-week', firebaseAuthMiddlewar
       return res.status(400).json({ error: 'students array is empty' });
     }
 
-    // Phase 1: Validate authorization for EVERY student in the batch before any writes
-    const validatedStudents: { canonicalUid: string; canonicalEmail: string; level?: string; days?: string[] }[] = [];
+    const validatedStudents: { canonicalUid: string; canonicalEmail: string; level?: string; days?: string[]; weeklyCycle?: number }[] = [];
     for (const item of batchStudents) {
+      const sEmail = (item.studentEmail || item.email || '').toLowerCase().trim();
+      let sUid = (item.studentUid || item.uid || '').trim();
+      if (!sUid && sEmail) {
+        const fsProf = await fetchStudentProfileFromFirestoreServer('', sEmail);
+        if (fsProf.uid && isValidCanonicalUid(fsProf.uid)) sUid = fsProf.uid;
+      }
       const sRes = await resolveCanonicalStudentIdentity({
         caller: {
           uid: cleanCallerUid,
           email: cleanCallerEmail,
           role: effectiveRole,
         },
-        studentEmail: item.studentEmail || item.email,
-        studentUid: item.studentUid || item.uid,
+        studentEmail: sEmail || undefined,
+        studentUid: sUid || undefined,
       });
 
       if (!sRes.authorized || !isValidCanonicalUid(sRes.canonicalStudentUid)) {
@@ -15142,34 +16110,54 @@ app.post('/api/student-video-assignments/distribute-week', firebaseAuthMiddlewar
 
       validatedStudents.push({
         canonicalUid: sRes.canonicalStudentUid,
-        canonicalEmail: (sRes.studentEmail || '').toLowerCase().trim(),
+        canonicalEmail: (sRes.studentEmail || sEmail || '').toLowerCase().trim(),
         level: item.level || req.body.level,
         days: item.days || req.body.days,
+        weeklyCycle: item.weeklyCycle ?? req.body.weeklyCycle,
       });
     }
 
-    // Phase 2: All verified, perform distributions using validated canonical IDs
     const batchResults: any[] = [];
     for (const vStudent of validatedStudents) {
       const teacherUidToUse = isCallerApprovedTeacher ? cleanCallerUid : (req.body.teacherUid || '');
       const teacherEmailToUse = isCallerApprovedTeacher ? cleanCallerEmail : (req.body.teacherEmail || '');
-      const assignments = distributeWeeklyYouTubeForStudent(
-        db,
-        vStudent.canonicalEmail,
-        vStudent.canonicalUid,
-        vStudent.level,
-        teacherUidToUse,
-        teacherEmailToUse,
-        Array.isArray(vStudent.days) ? vStudent.days : undefined
-      );
+      const distRes = await distributeWeeklyYouTubeCanonical({
+        uid: vStudent.canonicalUid,
+        email: vStudent.canonicalEmail,
+        level: vStudent.level,
+        teacherUid: teacherUidToUse,
+        teacherEmail: teacherEmailToUse,
+        days: Array.isArray(vStudent.days) ? vStudent.days : undefined,
+        weeklyCycle: vStudent.weeklyCycle,
+        forceRedistribute,
+        idempotencyKey,
+        catalogPlaylists: db.youtubePlaylists,
+      });
+
+      if (!distRes.success) {
+        if (distRes.code === 'STALE_CYCLE') {
+          return res.status(409).json({
+            success: false,
+            error: 'STALE_CYCLE',
+            message: distRes.error,
+            activeCycle: distRes.weeklyCycle,
+          });
+        }
+        return res.status(500).json({
+          success: false,
+          error: 'FirestorePersistenceFailed',
+          message: distRes.error || 'Failed to persist batch weekly video distribution.',
+        });
+      }
+
       batchResults.push({
         studentUid: vStudent.canonicalUid,
         studentEmail: vStudent.canonicalEmail,
-        count: assignments.length,
+        count: distRes.assignments.length,
+        idempotentReplay: Boolean(distRes.idempotentReplay),
       });
     }
 
-    writeDb(db);
     return res.json({
       success: true,
       batch: true,
@@ -15179,33 +16167,14 @@ app.post('/api/student-video-assignments/distribute-week', firebaseAuthMiddlewar
   }
 
   // Handle Single Student Distribution
-  const { studentEmail, studentUid, level, days } = req.body;
-  const studentResolution = await resolveCanonicalStudentIdentity({
-    caller: {
-      uid: cleanCallerUid,
-      email: cleanCallerEmail,
-      role: effectiveRole,
-    },
-    studentEmail,
-    studentUid: studentUid || req.body.uid,
+  const authCtx = await authorizeStudentRoutineAccess(req, res, {
+    allowMissingTargetFallbackToCaller: true,
+    requireApprovedTeacherIfTutor: true,
   });
+  if (!authCtx) return;
 
-  if (!studentResolution.authorized) {
-    return res.status(studentResolution.statusCode || 403).json({
-      error: studentResolution.statusCode === 401 ? 'Unauthorized' : 'Forbidden',
-      message: studentResolution.error || 'Access denied.',
-    });
-  }
-
-  const canonicalStudentUid = studentResolution.canonicalStudentUid;
-  const canonicalStudentEmail = (studentResolution.studentEmail || '').toLowerCase().trim();
-
-  if (!isValidCanonicalUid(canonicalStudentUid)) {
-    return res.status(422).json({
-      error: 'Unprocessable Entity',
-      message: 'Invalid or non-canonical student UID.',
-    });
-  }
+  const { canonicalStudentUid, canonicalStudentEmail } = authCtx;
+  const { level, days, weeklyCycle: bodyCycle } = req.body;
 
   let effectiveTeacherUid = '';
   let effectiveTeacherEmail = '';
@@ -15215,156 +16184,150 @@ app.post('/api/student-video-assignments/distribute-week', firebaseAuthMiddlewar
   } else if (isAdmin) {
     effectiveTeacherUid = (req.body.teacherUid || '').trim();
     effectiveTeacherEmail = (req.body.teacherEmail || '').trim();
-  } else {
-    // Student: preserve existing teacher, cannot inject arbitrary teacher
-    const studentProfile = db.userProfiles?.[canonicalStudentUid] || db.userProfiles?.[canonicalStudentEmail];
-    effectiveTeacherUid = (studentProfile?.assignedNativeFriendUID || studentProfile?.teacherUid || '').trim();
-    effectiveTeacherEmail = (studentProfile?.teacherEmail || '').trim();
   }
 
-  const assignments = distributeWeeklyYouTubeForStudent(
-    db,
-    canonicalStudentEmail,
-    canonicalStudentUid,
+  const distRes = await distributeWeeklyYouTubeCanonical({
+    uid: canonicalStudentUid,
+    email: canonicalStudentEmail,
     level,
-    effectiveTeacherUid,
-    effectiveTeacherEmail,
-    Array.isArray(days) ? days : undefined
-  );
-
-  writeDb(db);
-
-  return res.json({
-    success: true,
-    assignments,
-    studentEmail: canonicalStudentEmail,
-    studentUid: canonicalStudentUid,
-    message: `Semana de ${assignments.length} vídeos exclusivos do YouTube atribuída com sucesso!`,
+    teacherUid: effectiveTeacherUid,
+    teacherEmail: effectiveTeacherEmail,
+    days: Array.isArray(days) ? days : undefined,
+    weeklyCycle: bodyCycle,
+    forceRedistribute,
+    idempotencyKey,
+    catalogPlaylists: db.youtubePlaylists,
   });
-});
 
-app.post('/api/student-video-assignments/watch', (req, res) => {
-  const db = readDb();
-  const { studentEmail, studentUid, videoId } = req.body;
-  const { email: cleanEmail, uid } = resolveStudentIdentifiers(db, studentEmail, studentUid);
-  const cleanVidId = extractServerYouTubeId(videoId);
-
-  if ((!cleanEmail && !uid) || !cleanVidId) {
-    return res.status(400).json({ error: 'studentEmail/studentUid and valid videoId are required' });
-  }
-
-  if (!db.studentWatchedVideos) db.studentWatchedVideos = {};
-
-  const keysToUpdate = [cleanEmail, uid].filter(Boolean) as string[];
-  keysToUpdate.forEach((key) => {
-    if (!db.studentWatchedVideos[key]) db.studentWatchedVideos[key] = [];
-    if (!db.studentWatchedVideos[key].includes(cleanVidId)) {
-      db.studentWatchedVideos[key].push(cleanVidId);
+  if (!distRes.success) {
+    if (distRes.code === 'STALE_CYCLE') {
+      return res.status(409).json({
+        success: false,
+        error: 'STALE_CYCLE',
+        message: distRes.error,
+        activeCycle: distRes.weeklyCycle,
+      });
     }
-  });
-
-  writeDb(db);
-
-  const watchedList = (cleanEmail && db.studentWatchedVideos[cleanEmail]) || (uid && db.studentWatchedVideos[uid]) || [];
-  if (uid && cleanVidId) {
-    addWatchedVideoToUserDoc(uid, cleanVidId, (req.body.videoTitle || req.body.title)).catch(() => {});
-  }
-
-  res.json({
-    success: true,
-    watchedCount: watchedList.length,
-    watchedVideos: watchedList,
-    studentEmail: cleanEmail,
-    studentUid: uid,
-  });
-});
-
-app.get('/api/routines/daily-video', async (req, res) => {
-  const db = readDb();
-  let callerUid = '';
-  const authHeader = req.headers.authorization || '';
-  if (authHeader.startsWith('Bearer ')) {
-    const token = authHeader.substring(7).trim();
-    try {
-      const adminAuth = getFirebaseAdminAuth();
-      const decoded = await adminAuth.verifyIdToken(token);
-      if (decoded?.uid) callerUid = decoded.uid;
-    } catch {}
-  }
-
-  const queryUid = ((req.query.studentUid as string) || (req.query.uid as string) || '').trim();
-  const queryEmail = ((req.query.studentEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
-  const targetUid = queryUid || callerUid;
-
-  const resolved = resolveStudentIdentifiers(db, queryEmail, targetUid);
-  const effectiveUid = queryUid || callerUid || resolved.uid || targetUid;
-
-  if (!effectiveUid && !resolved.email) {
-    return res.status(400).json({ error: 'studentUid or studentEmail is required' });
-  }
-
-  const requestedCycle = req.query.weeklyCycle !== undefined ? (req.query.weeklyCycle as string) : undefined;
-  const firestoreData = effectiveUid
-    ? await fetchRoutineVideosFromFirestoreServer(effectiveUid, requestedCycle)
-    : { routinesByDay: {}, weeklyCycle: 1, watchedVideosHistory: [] };
-
-  const inMemoryAssignments =
-    (effectiveUid && db.studentVideoAssignments?.[effectiveUid]) ||
-    (resolved.email && db.studentVideoAssignments?.[resolved.email]) ||
-    [];
-
-  const mergedRoutines: Record<string, any> = { ...firestoreData.routinesByDay };
-  if (Array.isArray(inMemoryAssignments) && inMemoryAssignments.length > 0) {
-    inMemoryAssignments.forEach((assign: any) => {
-      const d = assign.day || assign.dayOfWeek;
-      const assignCycle = assign.weeklyCycle !== undefined ? Number(assign.weeklyCycle) : firestoreData.weeklyCycle;
-      if (d && !mergedRoutines[d] && assign.videoId && assignCycle === firestoreData.weeklyCycle) {
-        mergedRoutines[d] = {
-          videoId: assign.videoId,
-          title: assign.videoTitle || assign.title || 'Daily Video Practice',
-          videoTitle: assign.videoTitle || assign.title || 'Daily Video Practice',
-          url: assign.url || assign.videoUrl || `https://www.youtube.com/watch?v=${assign.videoId}`,
-          playlistId: assign.playlistId || '',
-          playlistTitle: assign.playlistTitle || '',
-          dayOfWeek: d,
-          isRepeatVideo: Boolean(assign.isRepeatVideo),
-          activityId: assign.activityId || 'act-1',
-          duration: assign.duration || '5-10 min',
-          instructions: assign.instructions || '',
-          updatedAt: assign.assignedAt || new Date().toISOString(),
-        };
-      }
+    return res.status(500).json({
+      success: false,
+      error: 'FirestorePersistenceFailed',
+      message: distRes.error || 'Failed to persist weekly video distribution in Firestore (default).',
     });
   }
 
-  const currentDay = (req.query.day || req.query.dayOfWeek) as string | undefined;
-
-  res.json({
+  return res.json({
     success: true,
-    studentUid: effectiveUid,
-    weeklyCycle: firestoreData.weeklyCycle,
-    routinesByDay: mergedRoutines,
-    watchedVideosHistory: firestoreData.watchedVideosHistory,
-    currentDayRoutine: currentDay ? mergedRoutines[currentDay] || null : undefined,
+    idempotentReplay: Boolean(distRes.idempotentReplay),
+    assignments: distRes.assignments,
+    studentEmail: canonicalStudentEmail,
+    studentUid: canonicalStudentUid,
+    weeklyCycle: distRes.weeklyCycle,
+    message: `Semana de ${distRes.assignments.length} vídeos exclusivos do YouTube atribuída com sucesso!`,
   });
 });
 
-app.post('/api/routines/daily-video', async (req, res) => {
-  const db = readDb();
-  let callerUid = '';
-  const authHeader = req.headers.authorization || '';
-  if (authHeader.startsWith('Bearer ')) {
-    const token = authHeader.substring(7).trim();
-    try {
-      const adminAuth = getFirebaseAdminAuth();
-      const decoded = await adminAuth.verifyIdToken(token);
-      if (decoded?.uid) callerUid = decoded.uid;
-    } catch {}
+app.post('/api/student-video-assignments/watch', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeStudentRoutineAccess(req, res, { allowMissingTargetFallbackToCaller: true });
+  if (!authCtx) return;
+
+  const { canonicalStudentUid, canonicalStudentEmail } = authCtx;
+  const { videoId, videoTitle, title } = req.body || {};
+  const cleanVidId = extractServerYouTubeId(videoId);
+
+  if (!cleanVidId) {
+    return res.status(400).json({ error: 'Valid videoId is required' });
   }
 
+  const watchRes = await addWatchedVideoCanonicalServer(
+    canonicalStudentUid,
+    cleanVidId,
+    videoTitle || title
+  );
+
+  if (!watchRes.success) {
+    return res.status(500).json({
+      success: false,
+      error: 'FirestorePersistenceFailed',
+      message: watchRes.error || 'Failed to persist watched video history in Firestore (default).',
+    });
+  }
+
+  return res.json({
+    success: true,
+    watchedCount: watchRes.watchedVideos.length,
+    watchedVideos: watchRes.watchedVideos,
+    studentEmail: canonicalStudentEmail,
+    studentUid: canonicalStudentUid,
+  });
+});
+
+app.get('/api/routines/daily-video', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeStudentRoutineAccess(req, res, { allowMissingTargetFallbackToCaller: true });
+  if (!authCtx) return;
+
+  const { canonicalStudentUid } = authCtx;
+  const requestedCycle = req.query.weeklyCycle !== undefined ? (req.query.weeklyCycle as string) : undefined;
+  const ctx = await fetchCanonicalRoutineContextServer(canonicalStudentUid, requestedCycle);
+
+  if (!ctx) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) context unavailable.',
+    });
+  }
+
+  const routinesByDay: Record<string, any> = {};
+  Object.entries(ctx.routinesByDayRaw).forEach(([d, rawDay]: [string, any]) => {
+    if (rawDay && typeof rawDay === 'object') {
+      routinesByDay[d] = {
+        ...rawDay,
+        dayOfWeek: d,
+        weeklyCycle: ctx.activeCycle,
+      };
+    }
+  });
+
+  // Also include active-cycle videoAssignments not yet present on routinesByDay subcollection
+  ctx.videoAssignments.forEach((assign: any) => {
+    const d = (assign.day || assign.dayOfWeek || '').toLowerCase().trim();
+    const assignCycle = extractPositiveIntegerCycle(assign.weeklyCycle) ?? ctx.activeCycle;
+    if (d && !routinesByDay[d] && assign.videoId && assignCycle === ctx.activeCycle) {
+      routinesByDay[d] = {
+        videoId: assign.videoId,
+        title: assign.videoTitle || assign.title || 'Daily Video Practice',
+        videoTitle: assign.videoTitle || assign.title || 'Daily Video Practice',
+        url: assign.url || assign.videoUrl || `https://www.youtube.com/watch?v=${assign.videoId}`,
+        playlistId: assign.playlistId || '',
+        playlistTitle: assign.playlistTitle || '',
+        dayOfWeek: d,
+        isRepeatVideo: Boolean(assign.isRepeatVideo),
+        activityId: assign.activityId || 'act-1',
+        duration: assign.duration || '5-10 min',
+        instructions: assign.instructions || '',
+        weeklyCycle: ctx.activeCycle,
+        updatedAt: assign.assignedAt || new Date().toISOString(),
+      };
+    }
+  });
+
+  const currentDay = ((req.query.day || req.query.dayOfWeek || '') as string).toLowerCase().trim() || undefined;
+
+  return res.json({
+    success: true,
+    studentUid: canonicalStudentUid,
+    weeklyCycle: ctx.activeCycle,
+    routinesByDay,
+    watchedVideosHistory: ctx.watchedVideosHistory,
+    currentDayRoutine: currentDay ? routinesByDay[currentDay] || null : undefined,
+  });
+});
+
+app.post('/api/routines/daily-video', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeStudentRoutineAccess(req, res, { allowMissingTargetFallbackToCaller: true });
+  if (!authCtx) return;
+
+  const { canonicalStudentUid, canonicalStudentEmail } = authCtx;
   const {
-    studentUid,
-    studentEmail,
     day,
     dayOfWeek,
     videoId,
@@ -15374,56 +16337,45 @@ app.post('/api/routines/daily-video', async (req, res) => {
     playlistId,
     playlistTitle,
     isRepeatVideo,
+    isCustomSuggestion,
     activityId,
     instructions,
     duration,
     weeklyCycle: bodyWeeklyCycle,
   } = req.body || {};
 
-  const targetDay = dayOfWeek || day;
-  if ((!studentUid && !studentEmail && !callerUid) || !targetDay) {
-    return res.status(400).json({ error: 'studentUid/studentEmail and day are required' });
+  const targetDay = String(dayOfWeek || day || '').toLowerCase().trim();
+  if (!targetDay || !DAYS_SEQUENCE.includes(targetDay as any)) {
+    return res.status(400).json({ error: 'Valid day of week is required' });
   }
 
-  const resolved = resolveStudentIdentifiers(db, studentEmail, studentUid || callerUid);
-  const effectiveUid = studentUid || callerUid || resolved.uid;
-  const targetKeys = Array.from(new Set([resolved.email, effectiveUid, studentUid, studentEmail].filter(Boolean) as string[]));
+  const ctx = await fetchCanonicalRoutineContextServer(canonicalStudentUid);
+  if (!ctx) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) context unavailable.',
+    });
+  }
 
-  const cleanVidId = extractServerYouTubeId(videoId || url);
+  const passedCycle = extractPositiveIntegerCycle(bodyWeeklyCycle);
+  if (passedCycle !== null && passedCycle < ctx.activeCycle) {
+    return res.status(409).json({
+      success: false,
+      error: 'STALE_CYCLE',
+      message: `Stale cycle ${passedCycle} rejected; active cycle is ${ctx.activeCycle}.`,
+      activeCycle: ctx.activeCycle,
+    });
+  }
+  const currentCycle = passedCycle !== null ? Math.max(ctx.activeCycle, passedCycle) : ctx.activeCycle;
+
+  const cleanVidId = videoId === '' ? '' : (extractServerYouTubeId(videoId || url) || (typeof videoId === 'string' ? videoId.trim() : ''));
   const cleanTitle = title || videoTitle || (cleanVidId ? 'Daily Video Practice' : 'Video of the Day');
-  const cleanUrl = url || (cleanVidId ? `https://www.youtube.com/watch?v=${cleanVidId}` : '');
-
-  let currentCycle = typeof bodyWeeklyCycle === 'number' && bodyWeeklyCycle > 0
-    ? bodyWeeklyCycle
-    : (typeof bodyWeeklyCycle === 'string' ? parseInt(bodyWeeklyCycle.replace(/\D/g, ''), 10) : undefined);
-  if ((!currentCycle || isNaN(currentCycle)) && effectiveUid) {
-    const fs = getFirestoreDb();
-    if (fs) {
-      try {
-        const uDoc = await fs.collection('users').doc(effectiveUid).get();
-        if (uDoc.exists) {
-          const uData = uDoc.data();
-          const uCycle = typeof uData?.weeklyCycle === 'number' ? uData.weeklyCycle : (typeof uData?.weeklyCycle === 'string' ? parseInt(uData.weeklyCycle.replace(/\D/g, ''), 10) : NaN);
-          if (!isNaN(uCycle) && uCycle > 0) {
-            currentCycle = uCycle;
-          }
-        }
-      } catch {}
-    }
-  }
-  if (!currentCycle || isNaN(currentCycle)) {
-    const rawCycle = (effectiveUid && db.userProfiles?.[effectiveUid]?.weeklyCycle) ||
-      (resolved.email && db.userProfiles?.[resolved.email]?.weeklyCycle) ||
-      1;
-    currentCycle = typeof rawCycle === 'number' ? rawCycle : (typeof rawCycle === 'string' ? parseInt(rawCycle.replace(/\D/g, ''), 10) : 1);
-  }
-  if (!currentCycle || isNaN(currentCycle) || currentCycle < 1) {
-    currentCycle = 1;
-  }
+  const cleanUrl = url !== undefined ? String(url || '') : (cleanVidId ? `https://www.youtube.com/watch?v=${cleanVidId}` : '');
+  const now = new Date().toISOString();
 
   const videoObj = {
-    id: cleanVidId || videoId || `vid-${targetDay}-${Date.now()}`,
-    videoId: cleanVidId || videoId || '',
+    id: cleanVidId || `vid-${targetDay}`,
+    videoId: cleanVidId,
     title: cleanTitle,
     videoTitle: cleanTitle,
     url: cleanUrl,
@@ -15431,108 +16383,169 @@ app.post('/api/routines/daily-video', async (req, res) => {
     playlistTitle: playlistTitle || '',
     dayOfWeek: targetDay,
     activityId: activityId || 'act-1',
-    isRepeatVideo: Boolean(isRepeatVideo),
+    isRepeatVideo: Boolean(isRepeatVideo || playlistId === 'repeat_previous_video'),
+    isCustomSuggestion: Boolean(isCustomSuggestion || playlistId === 'custom_suggestion'),
     instructions: instructions || '',
     duration: duration || '5-10 min',
     weeklyCycle: currentCycle,
-    updatedAt: new Date().toISOString(),
+    updatedAt: now,
   };
 
-  // 1. Persist to Firestore default database via Firebase Admin SDK and confirm
-  let firestoreSaved = false;
-  if (effectiveUid) {
-    try {
-      firestoreSaved = await saveRoutineVideoSubcollection(effectiveUid, targetDay, videoObj, currentCycle);
-    } catch (fsErr) {
-      console.warn('[serverApp] Error saving routine video to Firestore:', fsErr);
-    }
-  }
-
-  // Phase 3B: Do not return success or treat in-memory write as definitive if Firestore write failed (unless cloud writes are restricted)
-  if (!effectiveUid || (!firestoreSaved && !getIsCloudWriteDisabled())) {
+  const firestoreSaved = await saveRoutineVideoSubcollection(canonicalStudentUid, targetDay, videoObj, currentCycle);
+  if (!firestoreSaved) {
     return res.status(500).json({
       success: false,
       error: 'FirestorePersistenceFailed',
       message: 'Falha ao confirmar persistência do vídeo diário no Firestore.',
-      studentUid: effectiveUid || null,
+      studentUid: canonicalStudentUid,
       day: targetDay,
     });
   }
 
-  // 2. Update local in-memory DB strictly after confirmed Firestore persistence
-  targetKeys.forEach((k) => {
-    if (!db.studentVideoAssignments) db.studentVideoAssignments = {};
-    if (!Array.isArray(db.studentVideoAssignments[k])) db.studentVideoAssignments[k] = [];
-    const existingIdx = db.studentVideoAssignments[k].findIndex((v: any) => (v.day || v.dayOfWeek) === targetDay);
-    if (existingIdx >= 0) {
-      db.studentVideoAssignments[k][existingIdx] = { ...db.studentVideoAssignments[k][existingIdx], ...videoObj, day: targetDay };
-    } else {
-      db.studentVideoAssignments[k].push({ ...videoObj, day: targetDay });
-    }
+  const filteredAssignments = ctx.videoAssignments.filter((a: any) => (a.day || a.dayOfWeek) !== targetDay);
+  if (cleanVidId || cleanUrl) {
+    filteredAssignments.push({
+      id: `assign-${targetDay}-${currentCycle}-${cleanVidId || 'custom'}`,
+      activityId: videoObj.activityId,
+      studentEmail: ctx.studentEmail || canonicalStudentEmail,
+      studentUid: canonicalStudentUid,
+      day: targetDay,
+      playlistId: videoObj.playlistId,
+      playlistTitle: videoObj.playlistTitle,
+      videoId: cleanVidId,
+      videoTitle: cleanTitle,
+      videoUrl: cleanUrl,
+      isRepeatVideo: videoObj.isRepeatVideo,
+      instructions: videoObj.instructions,
+      duration: videoObj.duration,
+      weeklyCycle: currentCycle,
+      assignedAt: now,
+    });
+  }
 
-    if (db.studentAwaitingTopicSelection) {
-      db.studentAwaitingTopicSelection[k] = false;
-    }
-
-    if (!db.studentRoutinesMap) db.studentRoutinesMap = {};
-    if (!db.studentRoutinesMap[k]) {
-      db.studentRoutinesMap[k] = JSON.parse(JSON.stringify(db.routinesByDay || defaultRoutinesByDay));
-    }
-    if (db.studentRoutinesMap[k][targetDay]) {
-      db.studentRoutinesMap[k][targetDay] = db.studentRoutinesMap[k][targetDay].map((item: any, idx: number) => {
-        if (idx === 0 || item.id?.endsWith('1') || item.activityName?.toLowerCase().includes('vídeo') || item.activityName?.toLowerCase().includes('video')) {
-          return {
-            ...item,
-            teacherVideos: [videoObj],
-            playlistId: playlistId || '',
-            playlistTitle: playlistTitle || '',
-            isRepeatVideo: Boolean(isRepeatVideo),
-          };
-        }
-        return item;
-      });
-    }
+  const assignSaved = await saveStudentAssignmentsCanonicalServer(canonicalStudentUid, {
+    uid: canonicalStudentUid,
+    email: ctx.studentEmail || canonicalStudentEmail,
+    level: normalizeStudentLevel(ctx.level).key,
+    weeklyCycle: currentCycle,
+    videoAssignments: filteredAssignments,
+    awaitingTopicSelection: filteredAssignments.length === 0,
+    updatedAt: now,
   });
 
-  writeDb(db);
+  if (!assignSaved) {
+    return res.status(500).json({
+      success: false,
+      error: 'FirestorePersistenceFailed',
+      message: 'Falha ao atualizar student_assignments no Firestore.',
+      studentUid: canonicalStudentUid,
+      day: targetDay,
+    });
+  }
 
-  res.json({
+  return res.json({
     success: true,
     savedRoutine: videoObj,
     firestoreConfirmed: true,
-    studentUid: effectiveUid,
+    studentUid: canonicalStudentUid,
     day: targetDay,
+    weeklyCycle: currentCycle,
   });
 });
 
-app.post('/api/routines/update-time', (req, res) => {
-  const db = readDb();
-  const { day, activityId, time, studentEmail } = req.body;
-  if (!day || !activityId || !time) {
-    return res.status(400).json({ error: 'day, activityId, and time are required' });
+app.post('/api/routines/update-time', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeStudentRoutineAccess(req, res, { allowMissingTargetFallbackToCaller: true });
+  if (!authCtx) return;
+
+  const { day, activityId, time, weeklyCycle: bodyCycle } = req.body || {};
+  const targetDay = String(day || '').toLowerCase().trim();
+  if (!targetDay || !DAYS_SEQUENCE.includes(targetDay as any) || !activityId || !time) {
+    return res.status(400).json({ error: 'Valid day, activityId, and time are required' });
   }
 
-  if (db.routinesByDay && db.routinesByDay[day]) {
-    db.routinesByDay[day] = db.routinesByDay[day].map((item: any) =>
-      item.id === activityId ? { ...item, time } : item
-    );
+  const { canonicalStudentUid, firestore } = authCtx;
+  const ctx = await fetchCanonicalRoutineContextServer(canonicalStudentUid);
+  if (!ctx) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) context unavailable.',
+    });
   }
 
-  const cleanEmail = (studentEmail || '').toLowerCase().trim();
-  if (cleanEmail) {
-    if (!db.studentRoutinesMap) db.studentRoutinesMap = {};
-    if (!db.studentRoutinesMap[cleanEmail]) {
-      db.studentRoutinesMap[cleanEmail] = JSON.parse(JSON.stringify(db.routinesByDay || {}));
+  const passedCycle = extractPositiveIntegerCycle(bodyCycle);
+  if (passedCycle !== null && passedCycle < ctx.activeCycle) {
+    return res.status(409).json({
+      success: false,
+      error: 'STALE_CYCLE',
+      message: `Stale cycle ${passedCycle} rejected; active cycle is ${ctx.activeCycle}.`,
+      activeCycle: ctx.activeCycle,
+    });
+  }
+
+  const existingDay = ctx.routinesByDayRaw[targetDay] || {};
+  const existingTimes = (existingDay.activityTimes && typeof existingDay.activityTimes === 'object')
+    ? existingDay.activityTimes
+    : {};
+  const isVideoSlot = String(activityId).endsWith('1') || activityId === 'act-1';
+  const cleanTime = String(time).trim();
+
+  const dayFields: Record<string, any> = {
+    activityTimes: {
+      ...existingTimes,
+      [String(activityId)]: cleanTime,
+    },
+  };
+  if (isVideoSlot) {
+    dayFields.time = cleanTime;
+  }
+
+  const saveRes = await saveStudentRoutineDayFieldsServer(
+    canonicalStudentUid,
+    targetDay,
+    dayFields,
+    bodyCycle
+  );
+
+  if (!saveRes.success) {
+    if (saveRes.code === 'STALE_CYCLE') {
+      return res.status(409).json({
+        success: false,
+        error: 'STALE_CYCLE',
+        message: saveRes.error,
+        activeCycle: saveRes.activeCycle,
+      });
     }
-    if (db.studentRoutinesMap[cleanEmail]?.[day]) {
-      db.studentRoutinesMap[cleanEmail][day] = db.studentRoutinesMap[cleanEmail][day].map((item: any) =>
-        item.id === activityId ? { ...item, time } : item
+    return res.status(500).json({
+      success: false,
+      error: 'FirestorePersistenceFailed',
+      message: saveRes.error || 'Failed to persist activity time in Firestore (default).',
+    });
+  }
+
+  // Also sync routineAudioTime / routineVideoTime if updating audio or video slot on user profile
+  if (String(activityId).endsWith('2') || activityId === 'act-2') {
+    try {
+      await firestore.collection('users').doc(canonicalStudentUid).set(
+        { routineAudioTime: cleanTime, updatedAt: new Date().toISOString() },
+        { merge: true }
       );
+    } catch {
+      return res.status(500).json({
+        success: false,
+        error: 'FirestorePersistenceFailed',
+        message: 'Failed to persist routineAudioTime on user profile.',
+      });
     }
   }
 
-  writeDb(db);
-  res.json({ success: true, day, activityId, time });
+  return res.json({
+    success: true,
+    studentUid: canonicalStudentUid,
+    day: targetDay,
+    activityId,
+    time: cleanTime,
+    weeklyCycle: saveRes.activeCycle,
+  });
 });
 
 // Helper to strictly validate positive-integer week cycles (e.g. 1, "1", "week-1")

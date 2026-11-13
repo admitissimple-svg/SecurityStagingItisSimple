@@ -64,6 +64,7 @@ export interface SpotifyAssignment {
   playlistTitle: string;
   trackIndex: number;
   cycle: number;
+  weeklyCycle?: number;
 }
 
 /**
@@ -349,6 +350,33 @@ export function getOrCreateStudentCycleState(
 }
 
 /**
+ * Pure helper to clone or initialize a student's Spotify cycle state from a Firestore map
+ * without mutating any in-memory database global.
+ */
+export function cloneOrInitSpotifyCycleState(
+  spotifyCyclesMap: Record<string, any> | undefined | null,
+  level: SpotifyLevel
+): StudentSpotifyCycleState {
+  const existing = spotifyCyclesMap && typeof spotifyCyclesMap === 'object' ? spotifyCyclesMap[level] : null;
+  if (existing && typeof existing === 'object') {
+    return {
+      cycle: typeof existing.cycle === 'number' && existing.cycle > 0 ? existing.cycle : 1,
+      assignedInCycleTrackIds: Array.isArray(existing.assignedInCycleTrackIds)
+        ? [...existing.assignedInCycleTrackIds]
+        : [],
+      lastAssignedTrackId: typeof existing.lastAssignedTrackId === 'string' ? existing.lastAssignedTrackId : null,
+      history: Array.isArray(existing.history) ? existing.history.map((h: any) => ({ ...h })) : [],
+    };
+  }
+  return {
+    cycle: 1,
+    assignedInCycleTrackIds: [],
+    lastAssignedTrackId: null,
+    history: [],
+  };
+}
+
+/**
  * Selects the next sequential track from the playlist for a student in accordance with Rule 3:
  * 1. Follows the exact current order of the playlist.
  * 2. Does not repeat songs while there are unassigned songs in the current cycle.
@@ -418,8 +446,9 @@ export function distributeWeeklySpotifyForStudentEngine(params: {
   teacherUid?: string;
   teacherEmail?: string;
   weekId?: string;
+  weeklyCycle?: number;
 }): SpotifyAssignment[] {
-  const { db, studentEmail, studentUid, level, playlistTracks, activeDays, teacherUid, teacherEmail, weekId } = params;
+  const { db, studentEmail, studentUid, level, playlistTracks, activeDays, teacherUid, teacherEmail, weekId, weeklyCycle } = params;
   const normLevel = normalizeStudentLevel(level);
 
   const cleanEmail = (studentEmail || '').trim().toLowerCase();
@@ -473,6 +502,7 @@ export function distributeWeeklySpotifyForStudentEngine(params: {
       playlistTitle: track.playlistTitle,
       trackIndex: idx + 1,
       cycle: cycleState.cycle,
+      ...(typeof weeklyCycle === 'number' && weeklyCycle > 0 ? { weeklyCycle } : {}),
     };
 
     assignments.push(assignment);

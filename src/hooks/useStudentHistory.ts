@@ -87,86 +87,18 @@ export async function verifyStudentNativeFriendLink(
 
   const emailToSearch = (studentEmail || (cleanStudent.includes('@') ? cleanStudent : '')).toLowerCase().trim();
 
-  // 3. Client Firestore verification (if authorized in rules)
+  // 3. Authoritative backend verification (Firestore default + lessons + tutor approval)
   try {
-    const db = getDb();
-    if (cleanStudent && !cleanStudent.includes('@')) {
-      const studentDocRef = doc(db, 'users', cleanStudent);
-      let snap = await getDoc(studentDocRef);
-      let targetRef = studentDocRef;
-
-      // Check by email if document not directly found
-      if (!snap.exists() && emailToSearch) {
-        const q = query(collection(db, 'users'), where('email', '==', emailToSearch));
-        const qSnap = await getDocs(q);
-        if (!qSnap.empty) {
-          snap = qSnap.docs[0];
-          targetRef = snap.ref;
-        }
+    let token: string | null = null;
+    try {
+      if (auth?.currentUser) {
+        token = await auth.currentUser.getIdToken();
       }
-
-      if (snap.exists()) {
-        const data = snap.data();
-        const assignedUid = (data.assignedNativeFriendUID || data.nativeFriendUID || '').trim();
-        const sTeacherEmail = (data.teacherEmail || data.assignedTeacherEmail || '').toLowerCase().trim();
-        const sTeacherUid = (data.teacherUid || '').trim();
-
-        // If directly assigned to this teacher UID
-        if (assignedUid && assignedUid === cleanTeacher) {
-          return true;
-        }
-
-        // If assigned to a DIFFERENT teacher UID, reject to prevent cross-profile leakage
-        if (assignedUid && assignedUid !== cleanTeacher) {
-          if (sTeacherEmail && (cleanTeacher.toLowerCase().includes(sTeacherEmail) || currentEmail === sTeacherEmail)) {
-            return true;
-          }
-          return false;
-        }
-
-        // If no assignedUid yet, check if student matches by teacherUid or teacherEmail
-        const teacherMatches =
-          (sTeacherUid && sTeacherUid === cleanTeacher) ||
-          (sTeacherEmail && (cleanTeacher.toLowerCase().includes(sTeacherEmail) || currentEmail === sTeacherEmail));
-
-        if (teacherMatches) {
-          await setDoc(
-            targetRef,
-            {
-              assignedNativeFriendUID: cleanTeacher,
-              nativeFriendUID: cleanTeacher,
-              updatedAt: new Date().toISOString(),
-            },
-            { merge: true }
-          );
-          return true;
-        }
-      }
-
-      // Secondary check: query users collection where assignedNativeFriendUID == cleanTeacher and uid == cleanStudent
-      const q = query(
-        collection(db, 'users'),
-        where('assignedNativeFriendUID', '==', cleanTeacher)
-      );
-      const querySnap = await getDocs(q);
-      let matched = false;
-      querySnap.forEach((d) => {
-        if (d.id === cleanStudent || d.data().uid === cleanStudent || (emailToSearch && d.data().email === emailToSearch)) {
-          matched = true;
-        }
-      });
-
-      if (matched) return true;
-    }
-  } catch (fsErr) {
-    // Client SDK might be restricted by firestore.rules; proceed to authoritative backend verification
-  }
-
-  // 4. Authoritative backend verification fallback
-  try {
+    } catch {}
     const studentUidParam = cleanStudent && !cleanStudent.includes('@') && cleanStudent !== cleanTeacher ? cleanStudent : '';
     const resp = await fetch(
-      `/api/students/verify-link?studentUid=${encodeURIComponent(studentUidParam)}&studentEmail=${encodeURIComponent(emailToSearch)}&teacherUid=${encodeURIComponent(cleanTeacher)}&teacherEmail=${encodeURIComponent(currentEmail)}`
+      `/api/students/verify-link?studentUid=${encodeURIComponent(studentUidParam)}&studentEmail=${encodeURIComponent(emailToSearch)}&teacherUid=${encodeURIComponent(cleanTeacher)}&teacherEmail=${encodeURIComponent(currentEmail)}`,
+      token ? { headers: { Authorization: `Bearer ${token}` } } : undefined
     );
     if (resp.ok) {
       const json = await resp.json();

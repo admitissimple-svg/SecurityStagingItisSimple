@@ -1,6 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { doc, getDoc, setDoc } from 'firebase/firestore';
-import { auth, db } from '../firebase';
+import { auth } from '../firebase';
 import { DayOfWeek, TeacherOverrideTrack } from '../types';
 import { normalizeStudentIdForPath } from '../utils/routineSync';
 import { extractYouTubeVideoId } from '../utils/youtube';
@@ -304,8 +303,8 @@ export async function addMultipleVideosToWatchedHistoryInFirestore(
 }
 
 /**
- * Appends a Spotify track record to the student's listened tracks history directly in Firestore.
- * Avoids deprecated API endpoints and ensures real persistence and verification.
+ * Appends a Spotify track record to the student's listened tracks history via authenticated backend.
+ * Preserves customDb branch for isolated unit testing.
  */
 export async function addTrackToListenedHistoryInFirestore(
   studentUid: string,
@@ -321,7 +320,6 @@ export async function addTrackToListenedHistoryInFirestore(
   const cleanArtist = (artist || 'Spotify Artist').trim();
 
   try {
-    const targetDb = customDb || db;
     if (customDb && typeof customDb.doc === 'function') {
       const docRef = customDb.doc(`users/${cleanUid}`);
       const snap = await docRef.get().catch(() => null);
@@ -355,39 +353,26 @@ export async function addTrackToListenedHistoryInFirestore(
       return true;
     }
 
-    const userRef = doc(targetDb, 'users', cleanUid);
-    const snap = await getDoc(userRef).catch(() => null);
-    const existingData = snap?.exists() ? snap.data() : null;
-    const currentListened = Array.isArray(existingData?.listenedTracksHistory)
-      ? existingData.listenedTracksHistory
-      : [];
-
-    const exists = currentListened.some((t: any) =>
-      typeof t === 'string' ? t === cleanTrackId : t?.trackId === cleanTrackId || t?.id === cleanTrackId
-    );
-
-    if (!exists) {
-      const entry: ListenedTrackEntry = {
+    const headers = await getAuthHeaders();
+    const res = await fetch('/api/student-spotify-assignments/listen', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        studentUid: cleanUid,
         trackId: cleanTrackId,
         trackTitle: cleanTitle,
         artist: cleanArtist,
-        listenedAt: new Date().toISOString(),
-      };
-      await setDoc(
-        userRef,
-        {
-          listenedTracksHistory: [
-            ...currentListened,
-            { ...entry, id: cleanTrackId, title: cleanTitle },
-          ],
-          updatedAt: new Date().toISOString(),
-        },
-        { merge: true }
-      );
+      }),
+    });
+
+    if (!res.ok) {
+      return false;
     }
-    return true;
+
+    const data = await res.json().catch(() => null);
+    return Boolean(data?.success);
   } catch (error) {
-    console.warn('[useRoutine] Error recording listened track to Firestore:', error);
+    console.warn('[useRoutine] Error recording listened track to backend:', error);
     return false;
   }
 }
@@ -510,10 +495,10 @@ export function selectNextUnwatchedVideo<T extends { videoId?: string; id?: stri
 export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeWeeklyCycle?: number) {
   const authUid = auth?.currentUser?.uid || '';
   const effectiveUid =
+    (studentUid && isValidCanonicalUid(studentUid) ? studentUid : '') ||
     (isValidCanonicalUid(authUid) ? authUid : '') ||
     (studentUid ? normalizeStudentIdForPath(studentUid) : '') ||
-    authUid ||
-    (studentUid && isValidCanonicalUid(studentUid) ? studentUid : '');
+    authUid;
 
   /**
    * Constructs a pristine clean 7-day routine object with zero selected videos or topics.
@@ -652,7 +637,7 @@ export function useRoutine(studentUid?: string, selectedDay?: DayOfWeek, activeW
             const item = data.routinesByDay[d];
             if (item && typeof item === 'object') {
               const itemCycle = item.weeklyCycle !== undefined ? Number(item.weeklyCycle) : resolvedCycle;
-              if (itemCycle === resolvedCycle && item.videoId && item.videoId.trim() !== '') {
+              if (itemCycle === resolvedCycle && ((item.videoId && item.videoId.trim() !== '') || item.isRepeatVideo || item.playlistId)) {
                 filtered[d] = {
                   ...item,
                   weeklyCycle: resolvedCycle,

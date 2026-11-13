@@ -50,7 +50,6 @@ import {
 import { Translations, getActivityDisplayName } from '../utils/i18n';
 import { defaultRoutinesByDay } from '../data/defaultRoutines';
 import { NativeFriendSpotifyTable, SHOW_SPOTIFY_AUDIO_ASSIGNMENT } from './NativeFriendSpotifyTable';
-import { fetchWatchedVideosHistoryFromFirestore } from '../hooks/useRoutine';
 import { getAccessToken } from '../utils/auth';
 import { isValidCanonicalUid, normalizeWeekId, parseWeekCycleNumber } from '../utils/studentPersistence';
 
@@ -70,7 +69,8 @@ interface TeacherMediaAssignmentPanelProps {
     spotify?: TeacherAssignedSpotify | null,
     targetStudentEmail?: string,
     targetStudentUid?: string,
-    activityName?: string
+    activityName?: string,
+    options?: { skipVideoApi?: boolean }
   ) => void;
   currentLanguage: Language;
   t: Translations;
@@ -140,7 +140,9 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
   // Immediately clear state when active student changes to prevent any cross-contamination
   React.useEffect(() => {
     setStudentWatched([]);
+    setStudentListenedTracks([]);
     setStudentAssignments([]);
+    setStudentSpotifyAssignments([]);
     setStudentRoutines(null);
     setDayPlaylistIds({});
     setYoutubeUrls({
@@ -301,6 +303,7 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
         if (spotAssignRes && spotAssignRes.ok) {
           const spotData = await spotAssignRes.json();
           spotifyAssignList = spotData?.assignments || [];
+          setStudentListenedTracks(Array.isArray(spotData?.listened) ? spotData.listened : []);
         }
         if (profileRes && profileRes.ok) {
           const profData = await profileRes.json();
@@ -351,17 +354,6 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
             weeklyStudyDays: selectedStudent.weeklyStudyDays,
             weeklyStudyDaysTarget: selectedStudent.weeklyStudyDaysTarget || selectedStudent.weeklyStudyDays.length,
           };
-        }
-      }
-
-      if (activeStudentUid) {
-        try {
-          const firestoreWatched = await fetchWatchedVideosHistoryFromFirestore(activeStudentUid);
-          if (firestoreWatched && firestoreWatched.length > 0) {
-            watchedList = Array.from(new Set([...watchedList, ...firestoreWatched]));
-          }
-        } catch (e) {
-          console.warn('Notice loading Firestore watched videos for student:', e);
         }
       }
 
@@ -672,7 +664,7 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
   };
 
   // Handler: Change playlist topic for a specific day from teacher view
-  const handleDayPlaylistChange = (dayId: DayOfWeek, newPlId: string) => {
+  const handleDayPlaylistChange = async (dayId: DayOfWeek, newPlId: string) => {
     setDayPlaylistIds((prev) => ({ ...prev, [dayId]: newPlId }));
 
     if (newPlId === 'custom_suggestion') {
@@ -703,23 +695,30 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
         });
 
         if (activeStudentEmail || activeStudentUid) {
-          fetch('/api/routines/teacher-video', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              studentEmail: activeStudentEmail,
-              studentUid: activeStudentUid,
-              teacherUid: currentAccount?.uid,
-              teacherEmail: currentAccount?.email,
-              activityId: targetActivity.id,
-              activityName: topicTitle,
-              playlistTitle: topicTitle,
-              playlistId: 'custom_suggestion',
-              videos: targetActivity.teacherVideos || [],
-              days: [dayId],
-              day: dayId,
-            }),
-          }).catch(() => {});
+          getAccessToken()
+            .then((token) =>
+              fetch('/api/routines/teacher-video', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  ...(token ? { Authorization: `Bearer ${token}` } : {}),
+                },
+                body: JSON.stringify({
+                  studentEmail: activeStudentEmail,
+                  studentUid: activeStudentUid,
+                  teacherUid: currentAccount?.uid,
+                  teacherEmail: currentAccount?.email,
+                  activityId: targetActivity.id,
+                  activityName: topicTitle,
+                  playlistTitle: topicTitle,
+                  playlistId: 'custom_suggestion',
+                  videos: targetActivity.teacherVideos || [],
+                  days: [dayId],
+                  day: dayId,
+                }),
+              })
+            )
+            .catch(() => {});
         }
       }
       return;
@@ -731,10 +730,6 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
       const prevVidId = extractYouTubeVideoId(prevUrl);
       const topicTitle = isEn ? 'Repeat Previous Video' : 'Repetir Vídeo Anterior';
       const prevDayLabel = WEEK_DAYS.find((w) => w.id === prevActiveDay)?.name || prevActiveDay;
-
-      if (prevUrl) {
-        setYoutubeUrls((prev) => ({ ...prev, [dayId]: prevUrl }));
-      }
 
       const dayItems = (studentRoutines && studentRoutines[dayId]) || (routinesByDay && routinesByDay[dayId]) || [];
       const targetActivity =
@@ -749,77 +744,84 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
         ) ||
         dayItems[0];
 
-      if (targetActivity) {
-        const repeatedVideo: TeacherAssignedVideo = {
-          id: `vid-${dayId}-repeat-${Date.now()}`,
-          url: prevUrl || 'https://www.youtube.com/watch?v=V1bFr2KGq1g',
-          videoId: prevVidId || 'V1bFr2KGq1g',
-          title: `Repeated Video (${prevDayLabel})`,
-          duration: '5-10 min',
-          instructions: `Repeated from ${prevDayLabel}`,
-          addedAt: new Date().toISOString(),
-          playlistId: 'repeat_previous_video',
-          playlistTitle: topicTitle,
-        } as any;
+      if (targetActivity && (activeStudentEmail || activeStudentUid)) {
+        try {
+          const token = await getAccessToken();
+          const res = await fetch('/api/student-video-assignments/assign', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            },
+            body: JSON.stringify({
+              studentEmail: activeStudentEmail,
+              studentUid: activeStudentUid,
+              teacherUid: currentAccount?.uid,
+              teacherEmail: currentAccount?.email,
+              playlistId: 'repeat_previous_video',
+              activityId: targetActivity.id,
+              day: dayId,
+              videoUrl: prevUrl,
+            }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || !data.success || !data.video) {
+            setAssignFeedback({
+              type: 'error',
+              message: data.message || data.error || 'Error repeating previous video on server.',
+            });
+            return;
+          }
 
-        setStudentRoutines((prev) => {
-          if (!prev) return prev;
-          const updated = { ...prev };
-          if (updated[dayId]) {
-            updated[dayId] = updated[dayId].map((item) =>
-              item.id === targetActivity.id
-                ? {
-                    ...item,
-                    activityName: topicTitle,
-                    teacherVideos: [repeatedVideo],
-                    teacherNotes: `Repeated from ${prevDayLabel}`,
-                  }
-                : item
+          const persistedVideo: TeacherAssignedVideo = {
+            ...data.video,
+            playlistId: 'repeat_previous_video',
+            playlistTitle: topicTitle,
+          };
+          setYoutubeUrls((prev) => ({ ...prev, [dayId]: persistedVideo.url || prevUrl }));
+          setStudentRoutines((prev) => {
+            if (!prev) return prev;
+            const updated = { ...prev };
+            if (updated[dayId]) {
+              updated[dayId] = updated[dayId].map((item) =>
+                item.id === targetActivity.id
+                  ? {
+                      ...item,
+                      activityName: topicTitle,
+                      teacherVideos: [persistedVideo],
+                      teacherNotes: persistedVideo.instructions || `Repeated from ${prevDayLabel}`,
+                    }
+                  : item
+              );
+            }
+            return updated;
+          });
+
+          if (onTeacherSaveVideos) {
+            onTeacherSaveVideos(
+              targetActivity.id,
+              [persistedVideo],
+              persistedVideo.instructions || `Repeated from ${prevDayLabel}`,
+              false,
+              [dayId],
+              undefined,
+              activeStudentEmail,
+              activeStudentUid,
+              topicTitle,
+              { skipVideoApi: true }
             );
           }
-          return updated;
-        });
 
-        if (activeStudentEmail || activeStudentUid) {
-          getAccessToken().then((token) => {
-            fetch('/api/student-video-assignments/assign', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                ...(token ? { Authorization: `Bearer ${token}` } : {}),
-              },
-              body: JSON.stringify({
-                studentEmail: activeStudentEmail,
-                studentUid: activeStudentUid,
-                teacherUid: currentAccount?.uid,
-                teacherEmail: currentAccount?.email,
-                playlistId: 'repeat_previous_video',
-                activityId: targetActivity.id,
-                day: dayId,
-                videoUrl: prevUrl,
-              }),
-            }).catch(() => {});
-          }).catch(() => {});
+          setAssignFeedback({
+            type: 'success',
+            message: `🔁 ${isEn ? `Previous video from ${prevDayLabel} assigned for ${dayId.toUpperCase()}` : `Vídeo anterior de ${prevDayLabel} atribuído para ${dayId.toUpperCase()}`}`,
+          });
+        } catch {
+          setAssignFeedback({
+            type: 'error',
+            message: 'Connection error while assigning repeated video.',
+          });
         }
-
-        if (onTeacherSaveVideos) {
-          onTeacherSaveVideos(
-            targetActivity.id,
-            [repeatedVideo],
-            `Repeated from ${prevDayLabel}`,
-            false,
-            [dayId],
-            undefined,
-            activeStudentEmail,
-            activeStudentUid,
-            topicTitle
-          );
-        }
-
-        setAssignFeedback({
-          type: 'success',
-          message: `🔁 ${isEn ? `Previous video from ${prevDayLabel} assigned for ${dayId.toUpperCase()}` : `Vídeo anterior de ${prevDayLabel} atribuído para ${dayId.toUpperCase()}`}`,
-        });
       }
       return;
     }
@@ -853,23 +855,30 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
       });
 
       if (activeStudentEmail || activeStudentUid) {
-        fetch('/api/routines/teacher-video', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            studentEmail: activeStudentEmail,
-            studentUid: activeStudentUid,
-            teacherUid: currentAccount?.uid,
-            teacherEmail: currentAccount?.email,
-            activityId: targetActivity.id,
-            activityName: pl.title,
-            playlistTitle: pl.title,
-            playlistId: pl.id,
-            videos: targetActivity.teacherVideos || [],
-            days: [dayId],
-            day: dayId,
-          }),
-        }).catch(() => {});
+        getAccessToken()
+          .then((token) =>
+            fetch('/api/routines/teacher-video', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                ...(token ? { Authorization: `Bearer ${token}` } : {}),
+              },
+              body: JSON.stringify({
+                studentEmail: activeStudentEmail,
+                studentUid: activeStudentUid,
+                teacherUid: currentAccount?.uid,
+                teacherEmail: currentAccount?.email,
+                activityId: targetActivity.id,
+                activityName: pl.title,
+                playlistTitle: pl.title,
+                playlistId: pl.id,
+                videos: targetActivity.teacherVideos || [],
+                days: [dayId],
+                day: dayId,
+              }),
+            })
+          )
+          .catch(() => {});
       }
 
       if (onTeacherSaveVideos) {
@@ -882,7 +891,8 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
           undefined,
           activeStudentEmail,
           activeStudentUid,
-          pl.title
+          pl.title,
+          { skipVideoApi: true }
         );
       }
     }
@@ -930,20 +940,21 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
           playlistId: playlistIdToUse,
           activityId: targetActivity.id,
           day: dayId,
+          forceNewVideo: true,
         }),
       });
 
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (data.allConsumed) {
         setAssignFeedback({
           type: 'warning',
           message: data.message || `All videos from the selected playlist have already been assigned or watched by this student.`,
         });
-      } else if (data.success && data.video) {
+      } else if (res.ok && data.success && data.video) {
         setYoutubeUrls((prev) => ({ ...prev, [dayId]: data.video.url }));
         const assignedTopicTitle = data.playlistTitle || data.video.playlistTitle;
 
-        // Optimistically update studentRoutines with unified activityName
+        // Update studentRoutines ONLY after confirmed persistence
         setStudentRoutines((prev) => {
           if (!prev) return prev;
           const updated = { ...prev };
@@ -972,7 +983,8 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
             undefined,
             activeStudentEmail,
             activeStudentUid,
-            assignedTopicTitle
+            assignedTopicTitle,
+            { skipVideoApi: true }
           );
         }
         setAssignFeedback({
@@ -983,7 +995,7 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
       } else {
         setAssignFeedback({
           type: 'error',
-          message: data.error || 'Error assigning exclusive video.',
+          message: data.message || data.error || 'Error assigning exclusive video.',
         });
       }
     } catch {
@@ -1078,9 +1090,13 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
     }
 
     try {
-      await fetch('/api/routines/teacher-video', {
+      const token = await getAccessToken();
+      const res = await fetch('/api/routines/teacher-video', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: JSON.stringify({
           studentEmail: activeStudentEmail,
           studentUid: activeStudentUid,
@@ -1096,6 +1112,37 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
         }),
       });
 
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        throw new Error(data.message || data.error || 'Error saving video to server.');
+      }
+
+      setStudentRoutines((prev) => {
+        if (!prev) return prev;
+        const updated = { ...prev };
+        if (updated[dayId]) {
+          updated[dayId] = updated[dayId].map((item) =>
+            item.id === targetActivity.id ? { ...item, activityName: topicTitle, teacherVideos: finalVideos } : item
+          );
+        }
+        return updated;
+      });
+
+      if (onTeacherSaveVideos) {
+        onTeacherSaveVideos(
+          targetActivity.id,
+          finalVideos,
+          undefined,
+          false,
+          [dayId],
+          undefined,
+          activeStudentEmail,
+          activeStudentUid,
+          topicTitle,
+          { skipVideoApi: true }
+        );
+      }
+
       setSavedDayFeedback((prev) => ({ ...prev, [`yt-${dayId}`]: true }));
       setTimeout(() => {
         setSavedDayFeedback((prev) => ({ ...prev, [`yt-${dayId}`]: false }));
@@ -1106,39 +1153,14 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
         message: `✓ Video URL for ${dayId.toUpperCase()} saved and synchronized with student page!`,
       });
       setTimeout(() => setAssignFeedback(null), 4000);
-    } catch (err) {
+    } catch (err: any) {
       console.warn('Error saving teacher video:', err);
       setAssignFeedback({
         type: 'error',
-        message: 'Error saving video to server.',
+        message: err?.message || 'Error saving video to server.',
       });
     } finally {
       setSavingYtDay(null);
-    }
-
-    setStudentRoutines((prev) => {
-      if (!prev) return prev;
-      const updated = { ...prev };
-      if (updated[dayId]) {
-        updated[dayId] = updated[dayId].map((item) =>
-          item.id === targetActivity.id ? { ...item, activityName: topicTitle, teacherVideos: finalVideos } : item
-        );
-      }
-      return updated;
-    });
-
-    if (onTeacherSaveVideos) {
-      onTeacherSaveVideos(
-        targetActivity.id,
-        finalVideos,
-        undefined,
-        false,
-        [dayId],
-        undefined,
-        activeStudentEmail,
-        activeStudentUid,
-        topicTitle
-      );
     }
   };
 
@@ -1246,9 +1268,13 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
     }
 
     try {
+      const token = await getAccessToken();
       const res = await fetch('/api/routines/teacher-spotify', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: JSON.stringify({
           studentEmail: activeStudentEmail,
           studentUid: activeStudentUid,
@@ -1263,7 +1289,33 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
 
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.error || 'Error saving audio on server.');
+        throw new Error(errData.error || errData.message || 'Error saving audio on server.');
+      }
+
+      setStudentRoutines((prev) => {
+        if (!prev) return prev;
+        const updated = { ...prev };
+        if (updated[dayId]) {
+          updated[dayId] = updated[dayId].map((item) =>
+            item.id === targetActivity.id ? { ...item, teacherSpotify: finalSpotify || undefined } : item
+          );
+        }
+        return updated;
+      });
+
+      if (onTeacherSaveVideos) {
+        onTeacherSaveVideos(
+          targetActivity.id,
+          targetActivity.teacherVideos || [],
+          undefined,
+          false,
+          [dayId],
+          finalSpotify,
+          activeStudentEmail,
+          activeStudentUid,
+          undefined,
+          { skipVideoApi: true }
+        );
       }
 
       setSavedDayFeedback((prev) => ({ ...prev, [`spot-${dayId}`]: true }));
@@ -1285,30 +1337,6 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
     } finally {
       setSavingSpotDay(null);
     }
-
-    setStudentRoutines((prev) => {
-      if (!prev) return prev;
-      const updated = { ...prev };
-      if (updated[dayId]) {
-        updated[dayId] = updated[dayId].map((item) =>
-          item.id === targetActivity.id ? { ...item, teacherSpotify: finalSpotify || undefined } : item
-        );
-      }
-      return updated;
-    });
-
-    if (onTeacherSaveVideos) {
-      onTeacherSaveVideos(
-        targetActivity.id,
-        targetActivity.teacherVideos || [],
-        undefined,
-        false,
-        [dayId],
-        finalSpotify,
-        activeStudentEmail,
-        activeStudentUid
-      );
-    }
   };
 
   // Handler: Assign strict exclusive unseen Spotify track from level curriculum
@@ -1322,20 +1350,25 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
     setAssignFeedback(null);
 
     try {
+      const token = await getAccessToken();
       const res = await fetch('/api/student-spotify-assignments/assign', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: JSON.stringify({
           studentEmail: activeStudentEmail,
           studentUid: activeStudentUid,
           teacherUid: currentAccount?.uid,
           teacherEmail: currentAccount?.email,
+          level: currentNormalizedLevel,
           day: dayId,
         }),
       });
 
-      const data = await res.json();
-      if (data.success && data.track) {
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success && data.track) {
         setSpotifyUrls((prev) => ({ ...prev, [dayId]: data.track.url }));
         setSpotifyTypes((prev) => ({ ...prev, [dayId]: data.track.type || 'music' }));
         setAssignFeedback({
@@ -1346,7 +1379,7 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
       } else {
         setAssignFeedback({
           type: 'error',
-          message: data.error || 'Error assigning exclusive Spotify track.',
+          message: data.error || data.message || 'Error assigning exclusive Spotify track.',
         });
       }
     } catch {
@@ -1413,9 +1446,13 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
     setIsDistributingSpotWeek(true);
     setAssignFeedback(null);
     try {
+      const token = await getAccessToken();
       const res = await fetch('/api/student-spotify-assignments/distribute-week', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: JSON.stringify({
           studentEmail: activeStudentEmail,
           studentUid: activeStudentUid,
@@ -1425,8 +1462,8 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
           days: activeWeekDays.map((d) => d.id),
         }),
       });
-      const data = await res.json();
-      if (data.success) {
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
         setAssignFeedback({
           type: 'success',
           message: `✨ Week of ${activeWeekDays.length} exclusive Spotify ${activeWeekDays.length === 1 ? 'track' : 'tracks'} distributed successfully!`,
@@ -1435,7 +1472,7 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
       } else {
         setAssignFeedback({
           type: 'error',
-          message: data.error || 'Error distributing weekly tracks.',
+          message: data.error || data.message || 'Error distributing weekly tracks.',
         });
       }
     } catch {

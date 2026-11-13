@@ -1400,11 +1400,18 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
         teachers: confirmedStateTeachers,
       };
 
-      const sanitizedLessonsDoc = lessons ? { ...lessons } : {};
+      const sanitizedMainData: Record<string, any> = { ...hydratedMainData };
+      delete sanitizedMainData.liveLessons;
+      delete sanitizedMainData.lessons;
+      delete sanitizedMainData.scheduledLessons;
+
+      const sanitizedLessonsDoc: Record<string, any> = lessons ? { ...lessons } : {};
       delete sanitizedLessonsDoc.liveLessons;
+      delete sanitizedLessonsDoc.lessons;
+      delete sanitizedLessonsDoc.scheduledLessons;
 
       return {
-        ...hydratedMainData,
+        ...sanitizedMainData,
         ...(routines || {}),
         ...mergedTutorsDoc,
         ...(assignments || {}),
@@ -1627,6 +1634,8 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
     delete mainData.weeklyStudyDays;
     delete mainData.weeklyStudyDaysTargets;
     delete mainData.liveLessons;
+    delete mainData.lessons;
+    delete mainData.scheduledLessons;
     delete mainData.contractedLessons;
     delete mainData.weeklyHomework;
     delete mainData.studentHomeworkMap;
@@ -2205,9 +2214,38 @@ function extractYouTubeIdInternal(urlOrId: string | null | undefined): string | 
   return match && match[1] && match[1].length === 11 ? match[1] : null;
 }
 
+function parsePositiveCycleInternal(raw: any): number | null {
+  if (raw === undefined || raw === null || raw === '') return null;
+  if (typeof raw === 'number') {
+    return Number.isFinite(raw) && Number.isSafeInteger(raw) && raw > 0 ? raw : null;
+  }
+  if (typeof raw === 'string') {
+    const clean = raw.trim().toLowerCase().replace(/^week-/, '');
+    if (!/^\d+$/.test(clean)) return null;
+    const parsed = Number(clean);
+    return Number.isFinite(parsed) && Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+  }
+  return null;
+}
+
+function extractSpotifyTrackIdInternal(urlOrId: string | null | undefined): string | null {
+  if (!urlOrId || typeof urlOrId !== 'string') return null;
+  const clean = urlOrId.trim();
+  if (!clean) return null;
+  if (/^[a-zA-Z0-9]{15,35}$/.test(clean)) return clean;
+  const webMatch = clean.match(
+    /^(?:https?:\/\/)?(?:[a-zA-Z0-9-]+\.)*spotify\.com(?::\d+)?\/(?:intl-[a-z]{2,3}(?:-[a-z]{2,4})?\/)?(?:embed\/)?(?:track|episode|show|playlist|album)\/([a-zA-Z0-9]{15,35})(?:[?#].*)?$/i
+  );
+  if (webMatch && webMatch[1]) return webMatch[1];
+  const uriMatch = clean.match(/^spotify:(?:track|episode|show|playlist|album):([a-zA-Z0-9]{15,35})$/i);
+  if (uriMatch && uriMatch[1]) return uriMatch[1];
+  if (/^[a-zA-Z0-9_-]{3,80}$/.test(clean) && !clean.includes('http')) return clean;
+  return null;
+}
+
 /**
  * Persists daily routine video selection to users/{uid}/routines/{dayOfWeek}
- * and mirrors to users/{uid}.routinesByDay with weekly cycle binding
+ * and mirrors to users/{uid}.routinesByDay with strict active weekly cycle protection.
  */
 export async function saveRoutineVideoSubcollection(
   uid: string,
@@ -2218,77 +2256,88 @@ export async function saveRoutineVideoSubcollection(
   if (isCloudWriteDisabled) return false;
   const db = getFirestoreDb();
   if (!db || !uid || !dayOfWeek) return false;
+  const cleanDay = dayOfWeek.toLowerCase().trim();
+
   try {
     const userRef = db.collection('users').doc(uid);
 
-    let targetCycle = 1;
-    const cycleCandidates = [weeklyCycle, data?.weeklyCycle];
-    for (const cand of cycleCandidates) {
-      const n = typeof cand === 'number' ? cand : typeof cand === 'string' ? parseInt(cand.replace(/\D/g, ''), 10) : NaN;
-      if (!isNaN(n) && n > 0) {
-        targetCycle = n;
-        break;
-      }
+    const passedCycle =
+      parsePositiveCycleInternal(weeklyCycle) ??
+      parsePositiveCycleInternal(data?.weeklyCycle);
+
+    let canonicalUserCycle: number | null = null;
+    const uSnap = await withTimeout(userRef.get(), 3500);
+    if (uSnap && uSnap.exists) {
+      const uData = uSnap.data();
+      canonicalUserCycle = parsePositiveCycleInternal(uData?.weeklyCycle);
     }
-    try {
-      const uSnap = await withTimeout(userRef.get(), 2500);
-      if (uSnap && uSnap.exists) {
-        const uData = uSnap.data();
-        const uCycle = typeof uData?.weeklyCycle === 'number' ? uData.weeklyCycle : typeof uData?.weeklyCycle === 'string' ? parseInt(uData.weeklyCycle.replace(/\D/g, ''), 10) : NaN;
-        if (!isNaN(uCycle) && uCycle > 0) {
-          targetCycle = Math.max(targetCycle, uCycle);
-        }
-      }
-    } catch {}
 
-    const firstVideo = (Array.isArray(data.teacherVideos) && data.teacherVideos.length > 0) ? data.teacherVideos[0] : null;
-    const rawVidId = data.videoId || firstVideo?.videoId || firstVideo?.id || data.url || firstVideo?.url || '';
-    const cleanVidId = (extractYouTubeIdInternal(rawVidId) || (typeof rawVidId === 'string' && !rawVidId.startsWith('vid-') && !rawVidId.startsWith('act-') ? rawVidId : '')).trim();
-    const cleanTitle = (data.title || data.videoTitle || firstVideo?.title || firstVideo?.videoTitle || (cleanVidId ? 'Daily Video Practice' : 'Video of the Day')).trim();
-    const cleanUrl = data.url || firstVideo?.url || (cleanVidId ? `https://www.youtube.com/watch?v=${cleanVidId}` : '');
-    const cleanPlaylistId = data.playlistId || firstVideo?.playlistId || '';
-    const cleanPlaylistTitle = data.playlistTitle || firstVideo?.playlistTitle || (cleanPlaylistId === 'custom_suggestion' ? 'Your Suggestion' : '');
-    const isRepeat = Boolean(data.isRepeatVideo || firstVideo?.isRepeatVideo || cleanPlaylistId === 'repeat_previous_video');
-    const isCustom = Boolean(data.isCustomSuggestion || firstVideo?.isCustomSuggestion || cleanPlaylistId === 'custom_suggestion' || cleanPlaylistTitle === 'Your Suggestion' || cleanPlaylistTitle === 'Sua Sugestão');
+    // ARCH.2E.2A Stale-Cycle Guard: never allow an older weekly cycle payload to overwrite the active cycle
+    if (passedCycle !== null && canonicalUserCycle !== null && passedCycle < canonicalUserCycle) {
+      console.warn(
+        `[serverFirestore] Stale cycle write blocked for users/${uid}/routines/${cleanDay}: passed weeklyCycle=${passedCycle} < active weeklyCycle=${canonicalUserCycle}`
+      );
+      return false;
+    }
 
-    const sanitized = JSON.parse(JSON.stringify({
-      ...data,
-      id: data.id || (cleanVidId ? `vid-${cleanVidId}` : `vid-${dayOfWeek}`),
+    const targetCycle =
+      canonicalUserCycle !== null
+        ? Math.max(canonicalUserCycle, passedCycle ?? canonicalUserCycle)
+        : (passedCycle ?? 1);
+
+    const firstVideo = (Array.isArray(data?.teacherVideos) && data.teacherVideos.length > 0) ? data.teacherVideos[0] : null;
+    const rawVidId = data?.videoId ?? firstVideo?.videoId ?? firstVideo?.id ?? data?.url ?? firstVideo?.url ?? '';
+    const cleanVidId = data?.videoId === ''
+      ? ''
+      : (extractYouTubeIdInternal(rawVidId) || (typeof rawVidId === 'string' && !rawVidId.startsWith('vid-') && !rawVidId.startsWith('act-') ? rawVidId : '')).trim();
+    const cleanTitle = (data?.title || data?.videoTitle || firstVideo?.title || firstVideo?.videoTitle || (cleanVidId ? 'Daily Video Practice' : 'Video of the Day')).trim();
+    const cleanUrl = data?.url !== undefined
+      ? String(data.url || '')
+      : (firstVideo?.url || (cleanVidId ? `https://www.youtube.com/watch?v=${cleanVidId}` : ''));
+    const cleanPlaylistId = data?.playlistId ?? firstVideo?.playlistId ?? '';
+    const cleanPlaylistTitle = data?.playlistTitle ?? firstVideo?.playlistTitle ?? (cleanPlaylistId === 'custom_suggestion' ? 'Your Suggestion' : '');
+    const isRepeat = Boolean(data?.isRepeatVideo || firstVideo?.isRepeatVideo || cleanPlaylistId === 'repeat_previous_video');
+    const isCustom = Boolean(data?.isCustomSuggestion || firstVideo?.isCustomSuggestion || cleanPlaylistId === 'custom_suggestion' || cleanPlaylistTitle === 'Your Suggestion' || cleanPlaylistTitle === 'Sua Sugestão');
+
+    const sanitized = removeUndefinedFields({
+      ...(data && typeof data === 'object' ? data : {}),
+      id: data?.id || (cleanVidId ? `vid-${cleanVidId}` : `vid-${cleanDay}`),
       videoId: cleanVidId,
       title: cleanTitle,
       videoTitle: cleanTitle,
       url: cleanUrl,
       playlistId: cleanPlaylistId,
       playlistTitle: cleanPlaylistTitle,
-      dayOfWeek,
-      activityId: data.activityId || 'act-1',
+      dayOfWeek: cleanDay,
+      activityId: data?.activityId || 'act-1',
       isRepeatVideo: isRepeat,
       isCustomSuggestion: isCustom,
-      instructions: data.instructions || firstVideo?.instructions || '',
-      duration: data.duration || firstVideo?.duration || '5-10 min',
+      instructions: data?.instructions ?? firstVideo?.instructions ?? '',
+      duration: data?.duration ?? firstVideo?.duration ?? '5-10 min',
       weeklyCycle: targetCycle,
-      updatedAt: data.updatedAt || new Date().toISOString(),
-    }));
+      updatedAt: data?.updatedAt || new Date().toISOString(),
+    });
 
-    const savePromise = userRef.collection('routines').doc(dayOfWeek).set(sanitized, { merge: true }).then(() => true);
+    const savePromise = userRef.collection('routines').doc(cleanDay).set(sanitized, { merge: true }).then(() => true);
     const saveResult = await withTimeout(savePromise, 4500);
+    if (!saveResult) return false;
 
     // Also mirror to user doc routinesByDay for instant multi-device hydration
-    await withTimeout(
-      userRef.set(
+    const rootSavePromise = userRef
+      .set(
         {
           routinesByDay: {
-            [dayOfWeek]: sanitized,
+            [cleanDay]: sanitized,
           },
           weeklyCycle: targetCycle,
-          updatedAt: new Date().toISOString(),
+          updatedAt: sanitized.updatedAt,
         },
         { merge: true }
-      ),
-      3500
-    );
+      )
+      .then(() => true);
+    const rootResult = await withTimeout(rootSavePromise, 4500);
 
-    return !!saveResult;
+    return Boolean(saveResult && rootResult);
   } catch (err: any) {
     if (isPermissionError(err)) {
       isCloudWriteDisabled = true;
@@ -2297,6 +2346,1046 @@ export async function saveRoutineVideoSubcollection(
       console.warn('Firestore saveRoutineVideoSubcollection error:', err);
     }
     return false;
+  }
+}
+
+export interface CanonicalRoutineContext {
+  uid: string;
+  studentEmail: string;
+  userProfile: Record<string, any> | null;
+  activeCycle: number;
+  level: string;
+  studyDays: string[];
+  routinesByDayRaw: Record<string, any>;
+  videoAssignments: any[];
+  spotifyAssignments: any[];
+  spotifyCycles: Record<string, any>;
+  listenedTracks: string[];
+  listenedTracksHistory: any[];
+  lastSpotifyDistributionAttempt: any | null;
+  watchedVideosHistory: string[];
+  awaitingTopicSelection: boolean;
+  studentJournal: any[];
+}
+
+/**
+ * ARCH.2E.2A: Resolves a student profile directly from Firestore (default) users/{uid} or users email query.
+ */
+export async function fetchStudentProfileFromFirestoreServer(
+  uid?: string,
+  email?: string
+): Promise<{ uid: string; email: string; profile: Record<string, any> | null }> {
+  const db = getFirestoreDb();
+  const cleanUid = (uid || '').trim();
+  const cleanEmail = (email || '').toLowerCase().trim();
+  if (!db) return { uid: cleanUid, email: cleanEmail, profile: null };
+
+  try {
+    if (cleanUid && isValidCanonicalUid(cleanUid)) {
+      const snap = await withTimeout(db.collection('users').doc(cleanUid).get(), 3500);
+      if (snap && snap.exists) {
+        const data = snap.data() || {};
+        return {
+          uid: cleanUid,
+          email: (data.email || cleanEmail || '').toLowerCase().trim(),
+          profile: { ...data, uid: cleanUid },
+        };
+      }
+    }
+
+    if (cleanEmail) {
+      const qSnap = await withTimeout(db.collection('users').where('email', '==', cleanEmail).limit(1).get(), 3500);
+      if (qSnap && !qSnap.empty) {
+        const docSnap = qSnap.docs[0];
+        const data = docSnap.data() || {};
+        const resolvedUid = (data.uid && isValidCanonicalUid(data.uid) ? data.uid : (isValidCanonicalUid(docSnap.id) ? docSnap.id : cleanUid));
+        return {
+          uid: resolvedUid,
+          email: cleanEmail,
+          profile: { ...data, uid: resolvedUid },
+        };
+      }
+    }
+  } catch (err) {
+    if (!isPermissionError(err)) {
+      console.warn('[serverFirestore] fetchStudentProfileFromFirestoreServer error:', err);
+    }
+  }
+
+  return { uid: cleanUid, email: cleanEmail, profile: null };
+}
+
+/**
+ * ARCH.2E.2A: Canonical Firestore (default) reader for student routines, video assignments,
+ * active weekly cycle, and watched video history. Never reads inMemoryDb or app_state caches.
+ */
+export async function fetchCanonicalRoutineContextServer(
+  uid: string,
+  requestedCycle?: number | string
+): Promise<CanonicalRoutineContext | null> {
+  const db = getFirestoreDb();
+  if (!db || !uid) return null;
+
+  const parsedRequestedCycle = parsePositiveCycleInternal(requestedCycle);
+  const ALL_DAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+
+  try {
+    const userRef = db.collection('users').doc(uid);
+    const assignRef = db.collection('student_assignments').doc(uid);
+
+    const [userSnap, routinesSnap, assignSnap] = await Promise.all([
+      withTimeout(userRef.get(), 4500),
+      withTimeout(userRef.collection('routines').get(), 4500),
+      withTimeout(assignRef.get(), 4500),
+    ]);
+
+    const uData = (userSnap && userSnap.exists ? userSnap.data() : null) || {};
+    const aData = (assignSnap && assignSnap.exists ? assignSnap.data() : null) || {};
+
+    const uCycle = parsePositiveCycleInternal(uData.weeklyCycle);
+    const aCycle = parsePositiveCycleInternal(aData.weeklyCycle);
+
+    let activeCycle = 1;
+    if (uCycle !== null) {
+      activeCycle = parsedRequestedCycle !== null ? Math.max(uCycle, parsedRequestedCycle) : uCycle;
+    } else if (aCycle !== null) {
+      activeCycle = parsedRequestedCycle !== null ? Math.max(aCycle, parsedRequestedCycle) : aCycle;
+    } else if (parsedRequestedCycle !== null) {
+      activeCycle = parsedRequestedCycle;
+    }
+
+    const routinesByDayRaw: Record<string, any> = {};
+    if (uData.routinesByDay && typeof uData.routinesByDay === 'object') {
+      for (const [day, item] of Object.entries(uData.routinesByDay)) {
+        if (!item || typeof item !== 'object') continue;
+        const rawItemCycle = parsePositiveCycleInternal((item as any).weeklyCycle);
+        const itemCycle = rawItemCycle ?? activeCycle;
+        if (itemCycle === activeCycle) {
+          routinesByDayRaw[day] = { ...(item as any), dayOfWeek: day, weeklyCycle: activeCycle };
+        }
+      }
+    }
+
+    if (routinesSnap && !routinesSnap.empty) {
+      routinesSnap.forEach((docSnap: any) => {
+        const data = docSnap.data();
+        if (!data) return;
+        const day = docSnap.id;
+        const rawDocCycle = parsePositiveCycleInternal(data.weeklyCycle);
+        const docCycle = rawDocCycle ?? activeCycle;
+        if (docCycle === activeCycle) {
+          routinesByDayRaw[day] = {
+            ...(routinesByDayRaw[day] || {}),
+            ...data,
+            dayOfWeek: day,
+            weeklyCycle: activeCycle,
+          };
+        }
+      });
+    }
+
+    const rawVideoAssigns: any[] = Array.isArray(aData.videoAssignments) ? aData.videoAssignments : [];
+    const activeVideoAssigns = rawVideoAssigns.filter((a: any) => {
+      if (!a || typeof a !== 'object') return false;
+      const c = parsePositiveCycleInternal(a.weeklyCycle);
+      return c === null || c === activeCycle;
+    });
+
+    // Reconcile per-day video data from subcollection into videoAssignments view if missing in student_assignments
+    const assignByDay = new Map<string, any>();
+    for (const a of activeVideoAssigns) {
+      const d = (a.day || a.dayOfWeek || '').toLowerCase().trim();
+      if (d) assignByDay.set(d, { ...a, day: d, weeklyCycle: parsePositiveCycleInternal(a.weeklyCycle) ?? activeCycle });
+    }
+    for (const d of ALL_DAYS) {
+      const rDoc = routinesByDayRaw[d];
+      const existingA = assignByDay.get(d);
+      const rVid = rDoc?.videoId ? extractYouTubeIdInternal(rDoc.videoId || rDoc.url) || rDoc.videoId : '';
+      if (rVid && (!existingA || (!existingA.videoId && !existingA.videoUrl))) {
+        assignByDay.set(d, {
+          id: existingA?.id || rDoc.id || `assign-${d}-${activeCycle}`,
+          activityId: rDoc.activityId || 'act-1',
+          studentEmail: (uData.email || aData.email || '').toLowerCase().trim(),
+          studentUid: uid,
+          teacherUid: rDoc.teacherUid || existingA?.teacherUid || '',
+          teacherEmail: rDoc.teacherEmail || existingA?.teacherEmail || '',
+          day: d,
+          playlistId: rDoc.playlistId || '',
+          playlistTitle: rDoc.playlistTitle || '',
+          videoId: rVid,
+          videoTitle: rDoc.videoTitle || rDoc.title || 'Daily Video Practice',
+          videoUrl: rDoc.url || `https://www.youtube.com/watch?v=${rVid}`,
+          isRepeatVideo: Boolean(rDoc.isRepeatVideo),
+          instructions: rDoc.instructions || '',
+          duration: rDoc.duration || '5-10 min',
+          weeklyCycle: activeCycle,
+          assignedAt: rDoc.updatedAt || new Date().toISOString(),
+        });
+      }
+    }
+
+    const watchedSet = new Set<string>();
+    const addWatchedId = (raw: any) => {
+      const rawStr = typeof raw === 'string' ? raw : (raw?.videoId || raw?.id || raw?.url || '');
+      const clean = extractYouTubeIdInternal(rawStr) || (typeof rawStr === 'string' ? rawStr.trim() : '');
+      if (clean) watchedSet.add(clean);
+    };
+    (Array.isArray(uData.watchedVideosHistory) ? uData.watchedVideosHistory : []).forEach(addWatchedId);
+    (Array.isArray(uData.watchedVideos) ? uData.watchedVideos : []).forEach(addWatchedId);
+    (Array.isArray(aData.watchedVideos) ? aData.watchedVideos : []).forEach(addWatchedId);
+
+    const journal = Array.isArray(uData.studentJournal) ? uData.studentJournal : [];
+    journal.forEach((entry: any) => {
+      if (entry && entry.type === 'video') {
+        addWatchedId(entry.id);
+        if (entry.url) addWatchedId(entry.url);
+      }
+    });
+
+    const rawSpotifyAssigns: any[] = Array.isArray(aData.spotifyAssignments) ? aData.spotifyAssignments : [];
+    const activeSpotifyAssigns = rawSpotifyAssigns.filter((a: any) => {
+      if (!a || typeof a !== 'object') return false;
+      const c = parsePositiveCycleInternal(a.weeklyCycle);
+      return c === null || c === activeCycle;
+    });
+
+    const spotifyByDay = new Map<string, any>();
+    for (const a of activeSpotifyAssigns) {
+      const d = (a.day || a.dayOfWeek || '').toLowerCase().trim();
+      if (d) {
+        spotifyByDay.set(d, {
+          ...a,
+          day: d,
+          weeklyCycle: parsePositiveCycleInternal(a.weeklyCycle) ?? activeCycle,
+        });
+      }
+    }
+    for (const d of ALL_DAYS) {
+      const rDoc = routinesByDayRaw[d];
+      const spot = rDoc?.teacherSpotify;
+      const existingS = spotifyByDay.get(d);
+      if (spot && typeof spot === 'object' && spot.url && (!existingS || (!existingS.url && !existingS.trackUrl))) {
+        const sTrackId = extractSpotifyTrackIdInternal(spot.trackId || spot.url || spot.id) || spot.trackId || spot.id || '';
+        spotifyByDay.set(d, {
+          id: existingS?.id || spot.id || `spot-assign-${d}-${activeCycle}`,
+          activityId: rDoc.activityId || 'act-2',
+          studentEmail: (uData.email || aData.email || '').toLowerCase().trim(),
+          studentUid: uid,
+          teacherUid: spot.teacherUid || rDoc.teacherUid || existingS?.teacherUid || '',
+          teacherEmail: spot.teacherEmail || rDoc.teacherEmail || existingS?.teacherEmail || '',
+          day: d,
+          trackId: sTrackId,
+          trackTitle: spot.title || 'Teacher Recommended Audio',
+          trackUrl: spot.url,
+          url: spot.url,
+          embedUrl: spot.embedUrl || '',
+          title: spot.title || 'Teacher Recommended Audio',
+          artistOrHost: spot.artistOrHost || spot.artist || 'Spotify',
+          type: spot.type || 'music',
+          instructions: spot.instructions || rDoc.teacherNotes || '',
+          level: spot.level || '',
+          playlistId: spot.playlistId || '',
+          playlistTitle: spot.playlistTitle || '',
+          weeklyCycle: activeCycle,
+          assignedAt: spot.addedAt || rDoc.updatedAt || new Date().toISOString(),
+        });
+      }
+    }
+
+    const listenedSet = new Set<string>();
+    const listenedHistoryItems: any[] = [];
+    const seenListenedLower = new Set<string>();
+    const addListenedEntry = (raw: any) => {
+      const rawStr = typeof raw === 'string' ? raw : (raw?.trackId || raw?.id || raw?.trackUrl || raw?.url || '');
+      const cleanId = extractSpotifyTrackIdInternal(rawStr);
+      if (cleanId) {
+        listenedSet.add(cleanId);
+        const lower = cleanId.toLowerCase();
+        if (!seenListenedLower.has(lower)) {
+          seenListenedLower.add(lower);
+          if (raw && typeof raw === 'object') {
+            listenedHistoryItems.push({ ...raw, trackId: cleanId, id: cleanId });
+          } else {
+            listenedHistoryItems.push({
+              trackId: cleanId,
+              id: cleanId,
+              trackTitle: 'Daily Spotify Listening',
+              artist: 'Spotify Artist',
+              listenedAt: '',
+            });
+          }
+        }
+      }
+    };
+    (Array.isArray(uData.listenedTracksHistory) ? uData.listenedTracksHistory : []).forEach(addListenedEntry);
+    (Array.isArray(uData.listenedTracks) ? uData.listenedTracks : []).forEach(addListenedEntry);
+    (Array.isArray(aData.listenedTracks) ? aData.listenedTracks : []).forEach(addListenedEntry);
+    journal.forEach((entry: any) => {
+      if (entry && entry.type === 'audio') {
+        addListenedEntry(entry);
+      }
+    });
+
+    const studyDaysSource =
+      (Array.isArray(uData.weeklyStudyDays) && uData.weeklyStudyDays.length > 0 && uData.weeklyStudyDays) ||
+      (Array.isArray(uData.selectedStudyDays) && uData.selectedStudyDays.length > 0 && uData.selectedStudyDays) ||
+      (Array.isArray(aData.weeklyStudyDays) && aData.weeklyStudyDays.length > 0 && aData.weeklyStudyDays) ||
+      ALL_DAYS;
+
+    const studentEmail = (uData.email || aData.email || '').toLowerCase().trim();
+    const level = (uData.englishLevel || uData.level || uData.userLevel || aData.level || 'beginner').toString();
+
+    return {
+      uid,
+      studentEmail,
+      userProfile: Object.keys(uData).length > 0 ? { ...uData, uid } : null,
+      activeCycle,
+      level,
+      studyDays: ALL_DAYS.filter((d) => studyDaysSource.includes(d)),
+      routinesByDayRaw,
+      videoAssignments: Array.from(assignByDay.values()),
+      spotifyAssignments: Array.from(spotifyByDay.values()),
+      spotifyCycles: (aData.spotifyCycles && typeof aData.spotifyCycles === 'object') ? aData.spotifyCycles : {},
+      listenedTracks: Array.from(listenedSet),
+      listenedTracksHistory: listenedHistoryItems,
+      lastSpotifyDistributionAttempt: aData.lastSpotifyDistributionAttempt || null,
+      watchedVideosHistory: Array.from(watchedSet),
+      awaitingTopicSelection: Boolean(aData.awaitingTopicSelection ?? uData.awaitingTopicSelection ?? (assignByDay.size === 0)),
+      studentJournal: journal,
+    };
+  } catch (err: any) {
+    if (!isPermissionError(err)) {
+      console.warn('[serverFirestore] Error in fetchCanonicalRoutineContextServer:', err);
+    }
+    return null;
+  }
+}
+
+/**
+ * ARCH.2E.2A: Canonical Firestore merge write for daily routine fields (words, toggle, time)
+ * directly to users/{uid}/routines/{dayOfWeek} and mirrored to users/{uid}.routinesByDay.{dayOfWeek}.
+ */
+export async function saveStudentRoutineDayFieldsServer(
+  uid: string,
+  dayOfWeek: string,
+  fields: Record<string, any>,
+  expectedCycle?: number | string
+): Promise<{ success: boolean; activeCycle: number; error?: string; code?: string }> {
+  if (isCloudWriteDisabled) {
+    return { success: false, activeCycle: 1, error: 'Firestore writes disabled by IAM', code: 'CLOUD_WRITE_DISABLED' };
+  }
+  const db = getFirestoreDb();
+  if (!db || !uid || !dayOfWeek) {
+    return { success: false, activeCycle: 1, error: 'Firestore or target document invalid', code: 'FIRESTORE_UNAVAILABLE' };
+  }
+  const cleanDay = dayOfWeek.toLowerCase().trim();
+
+  try {
+    const userRef = db.collection('users').doc(uid);
+    const dayRef = userRef.collection('routines').doc(cleanDay);
+
+    const [uSnap, dSnap] = await Promise.all([
+      withTimeout(userRef.get(), 3500),
+      withTimeout(dayRef.get(), 3500),
+    ]);
+
+    const uData = (uSnap && uSnap.exists ? uSnap.data() : null) || {};
+    const dData = (dSnap && dSnap.exists ? dSnap.data() : null) || {};
+
+    const canonicalUserCycle = parsePositiveCycleInternal(uData.weeklyCycle);
+    const passedCycle = parsePositiveCycleInternal(expectedCycle);
+
+    if (passedCycle !== null && canonicalUserCycle !== null && passedCycle < canonicalUserCycle) {
+      return {
+        success: false,
+        activeCycle: canonicalUserCycle,
+        error: `Stale cycle ${passedCycle} rejected; active cycle is ${canonicalUserCycle}.`,
+        code: 'STALE_CYCLE',
+      };
+    }
+
+    const activeCycle = canonicalUserCycle ?? passedCycle ?? 1;
+    const now = new Date().toISOString();
+
+    const sanitizedFields = removeUndefinedFields({
+      dayOfWeek: cleanDay,
+      weeklyCycle: parsePositiveCycleInternal(dData.weeklyCycle) === activeCycle ? activeCycle : activeCycle,
+      ...fields,
+      updatedAt: now,
+    });
+
+    const daySaved = await withTimeout(dayRef.set(sanitizedFields, { merge: true }).then(() => true), 4500);
+    if (!daySaved) {
+      return { success: false, activeCycle, error: 'Timeout saving daily routine document', code: 'WRITE_FAILED' };
+    }
+
+    const rootSaved = await withTimeout(
+      userRef
+        .set(
+          {
+            routinesByDay: {
+              [cleanDay]: sanitizedFields,
+            },
+            updatedAt: now,
+          },
+          { merge: true }
+        )
+        .then(() => true),
+      4500
+    );
+
+    if (!rootSaved) {
+      return { success: false, activeCycle, error: 'Timeout mirroring routine to user document', code: 'WRITE_FAILED' };
+    }
+
+    return { success: true, activeCycle };
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+    } else {
+      console.warn('[serverFirestore] saveStudentRoutineDayFieldsServer error:', err);
+    }
+    return { success: false, activeCycle: 1, error: err?.message || 'Firestore write failed', code: 'WRITE_FAILED' };
+  }
+}
+
+/**
+ * ARCH.2E.2A: Canonical server write to student_assignments/{uid} awaiting completion.
+ */
+export async function saveStudentAssignmentsCanonicalServer(
+  uid: string,
+  data: Record<string, any>
+): Promise<boolean> {
+  if (isCloudWriteDisabled) return false;
+  const db = getFirestoreDb();
+  if (!db || !uid) return false;
+  try {
+    const sanitized = removeUndefinedFields({
+      ...data,
+      uid,
+      updatedAt: data.updatedAt || new Date().toISOString(),
+    });
+    const savePromise = db.collection('student_assignments').doc(uid).set(sanitized, { merge: true }).then(() => true);
+    const result = await withTimeout(savePromise, 4500);
+    return Boolean(result);
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+      console.info('[serverFirestore] Remote student assignments write restricted by IAM.');
+    } else {
+      console.warn('[serverFirestore] saveStudentAssignmentsCanonicalServer error:', err);
+    }
+    return false;
+  }
+}
+
+/**
+ * ARCH.2E.2A: Canonical awaited append to users/{uid}.watchedVideosHistory and student_assignments/{uid}.watchedVideos.
+ */
+export async function addWatchedVideoCanonicalServer(
+  uid: string,
+  videoId: string,
+  videoTitle?: string
+): Promise<{ success: boolean; watchedVideos: string[]; error?: string }> {
+  if (isCloudWriteDisabled) {
+    return { success: false, watchedVideos: [], error: 'Firestore writes disabled by IAM' };
+  }
+  const db = getFirestoreDb();
+  const cleanVid = (extractYouTubeIdInternal(videoId) || videoId || '').trim();
+  if (!db || !uid || !cleanVid) {
+    return { success: false, watchedVideos: [], error: 'Firestore unavailable or invalid uid/videoId' };
+  }
+
+  try {
+    const userRef = db.collection('users').doc(uid);
+    const assignRef = db.collection('student_assignments').doc(uid);
+
+    const [userSnap, assignSnap] = await Promise.all([
+      withTimeout(userRef.get(), 4000),
+      withTimeout(assignRef.get(), 4000),
+    ]);
+
+    const uData = (userSnap && userSnap.exists ? userSnap.data() : null) || {};
+    const aData = (assignSnap && assignSnap.exists ? assignSnap.data() : null) || {};
+
+    const existingHistory = Array.isArray(uData.watchedVideosHistory)
+      ? [...uData.watchedVideosHistory]
+      : (Array.isArray(uData.watchedVideos) ? [...uData.watchedVideos] : []);
+
+    const cleanTitle = (videoTitle || 'Daily Video Practice').trim();
+    const alreadyInHistory = existingHistory.some((item: any) => {
+      const id = typeof item === 'string' ? item : (item?.videoId || item?.id || '');
+      return id.toLowerCase() === cleanVid.toLowerCase();
+    });
+
+    const now = new Date().toISOString();
+    if (!alreadyInHistory) {
+      existingHistory.push({
+        videoId: cleanVid,
+        videoTitle: cleanTitle,
+        watchedAt: now,
+      });
+    }
+
+    const existingAssignWatched = Array.isArray(aData.watchedVideos) ? [...aData.watchedVideos] : [];
+    const watchedIdSet = new Set<string>(
+      existingAssignWatched
+        .map((item: any) => (typeof item === 'string' ? item : (item?.videoId || item?.id || '')).trim())
+        .filter(Boolean)
+    );
+    existingHistory.forEach((item: any) => {
+      const id = (typeof item === 'string' ? item : (item?.videoId || item?.id || '')).trim();
+      if (id) watchedIdSet.add(id);
+    });
+    watchedIdSet.add(cleanVid);
+    const mergedWatchedIds = Array.from(watchedIdSet);
+
+    const [userOk, assignOk] = await Promise.all([
+      withTimeout(
+        userRef.set({ watchedVideosHistory: existingHistory, updatedAt: now }, { merge: true }).then(() => true),
+        4500
+      ),
+      withTimeout(
+        assignRef.set({ uid, watchedVideos: mergedWatchedIds, updatedAt: now }, { merge: true }).then(() => true),
+        4500
+      ),
+    ]);
+
+    if (!userOk || !assignOk) {
+      return { success: false, watchedVideos: [], error: 'Failed to confirm watched video persistence in Firestore' };
+    }
+
+    return { success: true, watchedVideos: mergedWatchedIds };
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+    } else {
+      console.warn('[serverFirestore] addWatchedVideoCanonicalServer error:', err);
+    }
+    return { success: false, watchedVideos: [], error: err?.message || 'Firestore write failed' };
+  }
+}
+
+/**
+ * ARCH.2E.2B: Canonical awaited append to users/{uid}.listenedTracksHistory and student_assignments/{uid}.listenedTracks.
+ * Guarantees idempotency (no duplicate entries) and strict error propagation.
+ */
+export async function addListenedTrackCanonicalServer(
+  uid: string,
+  trackId: string,
+  trackTitle?: string,
+  artist?: string
+): Promise<{ success: boolean; listenedTracks: string[]; alreadyRecorded?: boolean; error?: string }> {
+  if (isCloudWriteDisabled) {
+    return { success: false, listenedTracks: [], error: 'Firestore writes disabled by IAM' };
+  }
+  const db = getFirestoreDb();
+  const cleanTrackId = (extractSpotifyTrackIdInternal(trackId) || trackId || '').trim();
+  if (!db || !uid || !cleanTrackId) {
+    return { success: false, listenedTracks: [], error: 'Firestore unavailable or invalid uid/trackId' };
+  }
+
+  try {
+    const userRef = db.collection('users').doc(uid);
+    const assignRef = db.collection('student_assignments').doc(uid);
+
+    const [userSnap, assignSnap] = await Promise.all([
+      withTimeout(userRef.get(), 4000),
+      withTimeout(assignRef.get(), 4000),
+    ]);
+
+    const uData = (userSnap && userSnap.exists ? userSnap.data() : null) || {};
+    const aData = (assignSnap && assignSnap.exists ? assignSnap.data() : null) || {};
+
+    const existingHistory = Array.isArray(uData.listenedTracksHistory)
+      ? [...uData.listenedTracksHistory]
+      : (Array.isArray(uData.listenedTracks) ? [...uData.listenedTracks] : []);
+
+    const cleanTitle = (trackTitle || 'Daily Spotify Listening').trim();
+    const cleanArtist = (artist || 'Spotify Artist').trim();
+    const alreadyInHistory = existingHistory.some((item: any) => {
+      const id = typeof item === 'string' ? item : (item?.trackId || item?.id || '');
+      return id.toLowerCase() === cleanTrackId.toLowerCase();
+    });
+
+    const now = new Date().toISOString();
+    if (!alreadyInHistory) {
+      existingHistory.push({
+        trackId: cleanTrackId,
+        id: cleanTrackId,
+        trackTitle: cleanTitle,
+        title: cleanTitle,
+        artist: cleanArtist,
+        listenedAt: now,
+      });
+    }
+
+    const existingAssignListened = Array.isArray(aData.listenedTracks) ? [...aData.listenedTracks] : [];
+    const alreadyInAssign = existingAssignListened.some((item: any) => {
+      const id = (typeof item === 'string' ? item : (item?.trackId || item?.id || '')).trim();
+      return id.toLowerCase() === cleanTrackId.toLowerCase();
+    });
+    const listenedIdSet = new Set<string>(
+      existingAssignListened
+        .map((item: any) => (typeof item === 'string' ? item : (item?.trackId || item?.id || '')).trim())
+        .filter(Boolean)
+    );
+    existingHistory.forEach((item: any) => {
+      const id = (typeof item === 'string' ? item : (item?.trackId || item?.id || '')).trim();
+      if (id) listenedIdSet.add(id);
+    });
+    listenedIdSet.add(cleanTrackId);
+    const mergedListenedIds = Array.from(listenedIdSet);
+
+    if (alreadyInHistory && alreadyInAssign) {
+      return { success: true, listenedTracks: mergedListenedIds, alreadyRecorded: true };
+    }
+
+    const [userOk, assignOk] = await Promise.all([
+      withTimeout(
+        userRef.set({ listenedTracksHistory: existingHistory, updatedAt: now }, { merge: true }).then(() => true),
+        4500
+      ),
+      withTimeout(
+        assignRef.set({ uid, listenedTracks: mergedListenedIds, updatedAt: now }, { merge: true }).then(() => true),
+        4500
+      ),
+    ]);
+
+    if (!userOk || !assignOk) {
+      return { success: false, listenedTracks: [], error: 'Failed to confirm listened track persistence in Firestore' };
+    }
+
+    return {
+      success: true,
+      listenedTracks: mergedListenedIds,
+      alreadyRecorded: alreadyInHistory && alreadyInAssign,
+    };
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+    } else {
+      console.warn('[serverFirestore] addListenedTrackCanonicalServer error:', err);
+    }
+    return { success: false, listenedTracks: [], error: err?.message || 'Firestore write failed' };
+  }
+}
+
+/**
+ * ARCH.2E.2B: Canonical Firestore (default) reader for users/{uid}/currentRoutine/weekData,
+ * users/{uid}/currentRoutine/{weekId}, and users/{uid}/routines/* feedback/overrides.
+ */
+export async function fetchStudentCurrentRoutineServer(
+  uid: string,
+  weekId?: string,
+  requestedCycle?: number | string
+): Promise<{ routine: Record<string, any> | null; activeCycle: number } | null> {
+  const db = getFirestoreDb();
+  if (!db || !uid) return null;
+
+  const safeWeekId = (weekId || '').trim();
+  const parsedRequestedCycle = parsePositiveCycleInternal(requestedCycle);
+
+  try {
+    const userRef = db.collection('users').doc(uid);
+    const currentRoutineCol = userRef.collection('currentRoutine');
+
+    const [userSnap, weekDataSnap, weekDocSnap, routinesSnap] = await Promise.all([
+      withTimeout(userRef.get(), 4000),
+      withTimeout(currentRoutineCol.doc('weekData').get(), 4000),
+      safeWeekId && safeWeekId !== 'weekData'
+        ? withTimeout(currentRoutineCol.doc(safeWeekId).get(), 4000)
+        : Promise.resolve(null),
+      withTimeout(userRef.collection('routines').get(), 4000),
+    ]);
+
+    const uData = (userSnap && userSnap.exists ? userSnap.data() : null) || {};
+    const uCycle = parsePositiveCycleInternal(uData.weeklyCycle);
+    const activeCycle = uCycle !== null
+      ? (parsedRequestedCycle !== null ? Math.max(uCycle, parsedRequestedCycle) : uCycle)
+      : (parsedRequestedCycle ?? 1);
+
+    const rawWeekData = weekDataSnap && weekDataSnap.exists ? weekDataSnap.data() : null;
+    const rawWeekDoc = weekDocSnap && weekDocSnap.exists ? weekDocSnap.data() : null;
+
+    const filterCycleData = (d: any): any | null => {
+      if (!d || typeof d !== 'object') return null;
+      const docCycle = parsePositiveCycleInternal(d.weeklyCycle);
+      if (docCycle !== null && docCycle < activeCycle) return null;
+      return d;
+    };
+
+    const weekData = filterCycleData(rawWeekData);
+    const weekDoc = filterCycleData(rawWeekDoc);
+
+    const routinesTeacherFeedback: Record<string, any> = {};
+    const routinesTeacherOverrides: Record<string, any> = {};
+    let routinesCurrentTrack: any = null;
+    let routinesTrackUpdatedAt = 0;
+
+    if (routinesSnap && !routinesSnap.empty) {
+      routinesSnap.forEach((docSnap: any) => {
+        const dData = docSnap.data();
+        if (!dData || typeof dData !== 'object') return;
+        const docCycle = parsePositiveCycleInternal(dData.weeklyCycle);
+        if (docCycle !== null && docCycle < activeCycle) return;
+        const dayKey = docSnap.id;
+
+        if (dData.teacherFeedback && typeof dData.teacherFeedback === 'object') {
+          Object.entries(dData.teacherFeedback).forEach(([fbDay, fbVal]) => {
+            if (fbVal) routinesTeacherFeedback[fbDay] = fbVal;
+          });
+        }
+        if (dData.teacherOverrideTrack !== undefined) {
+          routinesTeacherOverrides[dayKey] = dData.teacherOverrideTrack;
+        }
+        if (dData.currentSpotifyTrack && typeof dData.currentSpotifyTrack === 'object') {
+          const ts = new Date(dData.updatedAt || 0).getTime() || 0;
+          if (!routinesCurrentTrack || ts >= routinesTrackUpdatedAt) {
+            routinesCurrentTrack = dData.currentSpotifyTrack;
+            routinesTrackUpdatedAt = ts;
+          }
+        }
+      });
+    }
+
+    const mergedFeedback = {
+      ...(weekDoc?.teacherFeedback || {}),
+      ...(weekData?.teacherFeedback || {}),
+      ...routinesTeacherFeedback,
+    };
+    const mergedOverrides = {
+      ...(weekDoc?.teacherOverrides || {}),
+      ...(weekData?.teacherOverrides || {}),
+      ...routinesTeacherOverrides,
+    };
+
+    const currentSpotifyTrack =
+      (weekData && weekData.currentSpotifyTrack !== undefined ? weekData.currentSpotifyTrack : undefined) ??
+      (weekDoc && weekDoc.currentSpotifyTrack !== undefined ? weekDoc.currentSpotifyTrack : undefined) ??
+      routinesCurrentTrack ??
+      null;
+
+    const hasAnyData = Boolean(
+      weekData ||
+      weekDoc ||
+      currentSpotifyTrack ||
+      Object.keys(mergedFeedback).length > 0 ||
+      Object.keys(mergedOverrides).length > 0
+    );
+
+    if (!hasAnyData) {
+      return { routine: null, activeCycle };
+    }
+
+    const baseDoc = weekData || weekDoc || {};
+    const routine: Record<string, any> = {
+      ...baseDoc,
+      studentUid: uid,
+      weekId: safeWeekId || baseDoc.weekId || `week-${activeCycle}`,
+      weeklyCycle: activeCycle,
+      currentSpotifyTrack,
+      teacherFeedback: mergedFeedback,
+      teacherOverrides: mergedOverrides,
+      updatedAt: baseDoc.updatedAt || new Date().toISOString(),
+    };
+
+    return { routine, activeCycle };
+  } catch (err: any) {
+    if (!isPermissionError(err)) {
+      console.warn('[serverFirestore] fetchStudentCurrentRoutineServer error:', err);
+    }
+    return null;
+  }
+}
+
+/**
+ * ARCH.2E.2B: Canonical awaited write for users/{uid}/currentRoutine/weekData, {weekId}, and daily routines/{dayOfWeek}.
+ */
+export async function saveStudentCurrentRoutineServer(
+  uid: string,
+  weekId: string,
+  data: {
+    currentSpotifyTrack?: any;
+    studentEmail?: string;
+    nativeFriendUid?: string;
+    nativeFriendEmail?: string;
+    dayOfWeek?: string;
+  },
+  expectedCycle?: number | string
+): Promise<{ success: boolean; routine?: Record<string, any>; activeCycle: number; error?: string; code?: string }> {
+  if (isCloudWriteDisabled) {
+    return { success: false, activeCycle: 1, error: 'Firestore writes disabled by IAM', code: 'CLOUD_WRITE_DISABLED' };
+  }
+  const db = getFirestoreDb();
+  if (!db || !uid) {
+    return { success: false, activeCycle: 1, error: 'Firestore or target document invalid', code: 'FIRESTORE_UNAVAILABLE' };
+  }
+
+  try {
+    const userRef = db.collection('users').doc(uid);
+    const uSnap = await withTimeout(userRef.get(), 3500);
+    const uData = (uSnap && uSnap.exists ? uSnap.data() : null) || {};
+    const canonicalUserCycle = parsePositiveCycleInternal(uData.weeklyCycle);
+    const passedCycle = parsePositiveCycleInternal(expectedCycle) ?? parsePositiveCycleInternal(weekId);
+
+    if (passedCycle !== null && canonicalUserCycle !== null && passedCycle < canonicalUserCycle) {
+      return {
+        success: false,
+        activeCycle: canonicalUserCycle,
+        error: `Stale cycle ${passedCycle} rejected; active cycle is ${canonicalUserCycle}.`,
+        code: 'STALE_CYCLE',
+      };
+    }
+
+    const activeCycle = canonicalUserCycle !== null
+      ? Math.max(canonicalUserCycle, passedCycle ?? canonicalUserCycle)
+      : (passedCycle ?? 1);
+
+    const safeWeekId = (weekId || `week-${activeCycle}`).trim();
+    const now = new Date().toISOString();
+    const cleanDay = (data.dayOfWeek || data.currentSpotifyTrack?.dayOfWeek || '').toLowerCase().trim();
+
+    const payload = removeUndefinedFields({
+      studentUid: uid,
+      weekId: safeWeekId,
+      weeklyCycle: activeCycle,
+      ...(data.currentSpotifyTrack !== undefined ? { currentSpotifyTrack: data.currentSpotifyTrack } : {}),
+      ...(data.studentEmail ? { studentEmail: data.studentEmail.toLowerCase().trim() } : {}),
+      ...(data.nativeFriendUid ? { nativeFriendUid: data.nativeFriendUid.trim() } : {}),
+      ...(data.nativeFriendEmail ? { nativeFriendEmail: data.nativeFriendEmail.toLowerCase().trim() } : {}),
+      updatedAt: now,
+    });
+
+    const currentRoutineCol = userRef.collection('currentRoutine');
+    const writes: Promise<boolean | null>[] = [
+      withTimeout(currentRoutineCol.doc('weekData').set(payload, { merge: true }).then(() => true), 4500),
+    ];
+    if (safeWeekId && safeWeekId !== 'weekData') {
+      writes.push(withTimeout(currentRoutineCol.doc(safeWeekId).set(payload, { merge: true }).then(() => true), 4500));
+    }
+    if (cleanDay && data.currentSpotifyTrack !== undefined) {
+      writes.push(
+        withTimeout(
+          userRef
+            .collection('routines')
+            .doc(cleanDay)
+            .set(
+              removeUndefinedFields({
+                currentSpotifyTrack: data.currentSpotifyTrack,
+                dayOfWeek: cleanDay,
+                weeklyCycle: activeCycle,
+                updatedAt: now,
+              }),
+              { merge: true }
+            )
+            .then(() => true),
+          4500
+        )
+      );
+    }
+
+    const results = await Promise.all(writes);
+    if (results.some((r) => !r)) {
+      return { success: false, activeCycle, error: 'Failed to confirm current routine write in Firestore', code: 'WRITE_FAILED' };
+    }
+
+    return { success: true, routine: payload, activeCycle };
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+    } else {
+      console.warn('[serverFirestore] saveStudentCurrentRoutineServer error:', err);
+    }
+    return { success: false, activeCycle: 1, error: err?.message || 'Firestore write failed', code: 'WRITE_FAILED' };
+  }
+}
+
+/**
+ * ARCH.2E.2B: Canonical awaited write for teacher audio feedback across weekData, {weekId}, and routines/{dayOfWeek}.
+ */
+export async function saveCurrentRoutineFeedbackServer(
+  uid: string,
+  weekId: string,
+  feedback: Record<string, any>,
+  expectedCycle?: number | string
+): Promise<{ success: boolean; routine?: Record<string, any>; activeCycle: number; error?: string; code?: string }> {
+  if (isCloudWriteDisabled) {
+    return { success: false, activeCycle: 1, error: 'Firestore writes disabled by IAM', code: 'CLOUD_WRITE_DISABLED' };
+  }
+  const db = getFirestoreDb();
+  const cleanDay = String(feedback?.dayOfWeek || '').toLowerCase().trim();
+  if (!db || !uid || !cleanDay) {
+    return { success: false, activeCycle: 1, error: 'Firestore or target document invalid', code: 'FIRESTORE_UNAVAILABLE' };
+  }
+
+  try {
+    const userRef = db.collection('users').doc(uid);
+    const uSnap = await withTimeout(userRef.get(), 3500);
+    const uData = (uSnap && uSnap.exists ? uSnap.data() : null) || {};
+    const canonicalUserCycle = parsePositiveCycleInternal(uData.weeklyCycle);
+    const passedCycle = parsePositiveCycleInternal(expectedCycle) ?? parsePositiveCycleInternal(weekId);
+
+    if (passedCycle !== null && canonicalUserCycle !== null && passedCycle < canonicalUserCycle) {
+      return {
+        success: false,
+        activeCycle: canonicalUserCycle,
+        error: `Stale cycle ${passedCycle} rejected; active cycle is ${canonicalUserCycle}.`,
+        code: 'STALE_CYCLE',
+      };
+    }
+
+    const activeCycle = canonicalUserCycle !== null
+      ? Math.max(canonicalUserCycle, passedCycle ?? canonicalUserCycle)
+      : (passedCycle ?? 1);
+
+    const safeWeekId = (weekId || `week-${activeCycle}`).trim();
+    const now = new Date().toISOString();
+
+    const sanitizedFeedback: Record<string, any> = removeUndefinedFields({
+      ...feedback,
+      studentUid: uid,
+      dayOfWeek: cleanDay,
+      createdAt: feedback.createdAt || now,
+      updatedAt: now,
+    });
+
+    const payload = removeUndefinedFields({
+      studentUid: uid,
+      weekId: safeWeekId,
+      weeklyCycle: activeCycle,
+      ...(sanitizedFeedback.teacherUid ? { nativeFriendUid: sanitizedFeedback.teacherUid } : {}),
+      ...(sanitizedFeedback.teacherEmail ? { nativeFriendEmail: sanitizedFeedback.teacherEmail } : {}),
+      teacherFeedback: {
+        [cleanDay]: sanitizedFeedback,
+      },
+      updatedAt: now,
+    });
+
+    const currentRoutineCol = userRef.collection('currentRoutine');
+    const writes: Promise<boolean | null>[] = [
+      withTimeout(currentRoutineCol.doc('weekData').set(payload, { merge: true }).then(() => true), 4500),
+      withTimeout(
+        userRef
+          .collection('routines')
+          .doc(cleanDay)
+          .set(
+            {
+              teacherFeedback: { [cleanDay]: sanitizedFeedback },
+              dayOfWeek: cleanDay,
+              weeklyCycle: activeCycle,
+              updatedAt: now,
+            },
+            { merge: true }
+          )
+          .then(() => true),
+        4500
+      ),
+    ];
+
+    if (safeWeekId && safeWeekId !== 'weekData') {
+      writes.push(withTimeout(currentRoutineCol.doc(safeWeekId).set(payload, { merge: true }).then(() => true), 4500));
+    }
+
+    const results = await Promise.all(writes);
+    if (results.some((r) => !r)) {
+      return { success: false, activeCycle, error: 'Failed to confirm feedback write in Firestore', code: 'WRITE_FAILED' };
+    }
+
+    return { success: true, routine: payload, activeCycle };
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+    } else {
+      console.warn('[serverFirestore] saveCurrentRoutineFeedbackServer error:', err);
+    }
+    return { success: false, activeCycle: 1, error: err?.message || 'Firestore write failed', code: 'WRITE_FAILED' };
+  }
+}
+
+/**
+ * ARCH.2E.2B: Canonical awaited write for teacher Spotify override track across routines/{dayOfWeek},
+ * users/{uid}.routinesByDay.{dayOfWeek}, and currentRoutine/weekData.
+ */
+export async function saveTeacherSpotifyOverrideServer(
+  uid: string,
+  dayOfWeek: string,
+  overrideTrack: Record<string, any> | null,
+  expectedCycle?: number | string
+): Promise<{ success: boolean; activeCycle: number; error?: string; code?: string }> {
+  if (isCloudWriteDisabled) {
+    return { success: false, activeCycle: 1, error: 'Firestore writes disabled by IAM', code: 'CLOUD_WRITE_DISABLED' };
+  }
+  const db = getFirestoreDb();
+  const cleanDay = String(dayOfWeek || '').toLowerCase().trim();
+  if (!db || !uid || !cleanDay) {
+    return { success: false, activeCycle: 1, error: 'Firestore or target document invalid', code: 'FIRESTORE_UNAVAILABLE' };
+  }
+
+  try {
+    const userRef = db.collection('users').doc(uid);
+    const uSnap = await withTimeout(userRef.get(), 3500);
+    const uData = (uSnap && uSnap.exists ? uSnap.data() : null) || {};
+    const canonicalUserCycle = parsePositiveCycleInternal(uData.weeklyCycle);
+    const passedCycle = parsePositiveCycleInternal(expectedCycle);
+
+    if (passedCycle !== null && canonicalUserCycle !== null && passedCycle < canonicalUserCycle) {
+      return {
+        success: false,
+        activeCycle: canonicalUserCycle,
+        error: `Stale cycle ${passedCycle} rejected; active cycle is ${canonicalUserCycle}.`,
+        code: 'STALE_CYCLE',
+      };
+    }
+
+    const activeCycle = canonicalUserCycle ?? passedCycle ?? 1;
+    const now = new Date().toISOString();
+    const sanitizedOverride = overrideTrack === null ? null : removeUndefinedFields({ ...overrideTrack, updatedAt: now });
+
+    const dayRes = await saveStudentRoutineDayFieldsServer(
+      uid,
+      cleanDay,
+      {
+        teacherOverrideTrack: sanitizedOverride,
+      },
+      activeCycle
+    );
+
+    if (!dayRes.success) {
+      return dayRes;
+    }
+
+    const weekDataOk = await withTimeout(
+      userRef
+        .collection('currentRoutine')
+        .doc('weekData')
+        .set(
+          {
+            studentUid: uid,
+            weeklyCycle: activeCycle,
+            teacherOverrides: {
+              [cleanDay]: sanitizedOverride,
+            },
+            updatedAt: now,
+          },
+          { merge: true }
+        )
+        .then(() => true),
+      4500
+    );
+
+    if (!weekDataOk) {
+      return { success: false, activeCycle, error: 'Failed to confirm override write on currentRoutine/weekData', code: 'WRITE_FAILED' };
+    }
+
+    return { success: true, activeCycle };
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+    } else {
+      console.warn('[serverFirestore] saveTeacherSpotifyOverrideServer error:', err);
+    }
+    return { success: false, activeCycle: 1, error: err?.message || 'Firestore write failed', code: 'WRITE_FAILED' };
   }
 }
 
@@ -2753,8 +3842,46 @@ export async function resolveCanonicalStudentIdentity(
   // Authoritative DB access
   const dbLocal = getAuthoritativeDb();
 
-  // Determine effective caller role with in-memory tutor validation fallback
+  const db = getFirestoreDb();
+
+  // Determine effective caller role with Firestore + in-memory tutor validation fallback
   let callerRole = caller.role;
+  if (callerRole === 'student' && db) {
+    try {
+      const uCallerSnap = await withTimeout(db.collection('users').doc(callerUid).get(), 2500);
+      if (uCallerSnap && uCallerSnap.exists) {
+        const uData = uCallerSnap.data() || {};
+        const uRole = String(uData.role || '').toLowerCase().trim();
+        const isExplicitlyApproved =
+          uData.approvalStatus !== 'pending' &&
+          uData.approvalStatus !== 'rejected' &&
+          uData.status !== 'pending' &&
+          uData.status !== 'rejected' &&
+          uData.isApproved !== false &&
+          (uData.approvalStatus === 'approved' || uData.status === 'approved' || uData.isApproved === true || uData.approved === true);
+        if ((uRole === 'teacher' || uRole === 'tutor' || uRole === 'native_friend' || uData.isTeacher === true) && isExplicitlyApproved) {
+          callerRole = 'teacher';
+        }
+      }
+      if (callerRole === 'student') {
+        const tCallerSnap = await withTimeout(db.collection('tutors').doc(callerUid).get(), 2500);
+        const tData = tCallerSnap && tCallerSnap.exists ? tCallerSnap.data() : null;
+        if (
+          tData &&
+          tData.role !== 'student' &&
+          tData.approvalStatus !== 'pending' &&
+          tData.approvalStatus !== 'rejected' &&
+          tData.status !== 'pending' &&
+          tData.status !== 'rejected' &&
+          tData.isApproved !== false &&
+          (tData.approvalStatus === 'approved' || tData.status === 'approved' || tData.isApproved === true || tData.approved === true)
+        ) {
+          callerRole = 'teacher';
+        }
+      }
+    } catch {}
+  }
+
   if (callerRole === 'student' && dbLocal) {
     const isTutor =
       (dbLocal.tutorsList || []).some((t: any) => (t.uid && t.uid === callerUid) || (t.id && (t.id === callerUid || t.id === `tutor-${callerUid}`)) || (t.authUid && t.authUid === callerUid) || (callerEmail && t.email && t.email.toLowerCase().trim() === callerEmail)) ||
@@ -2771,7 +3898,7 @@ export async function resolveCanonicalStudentIdentity(
         authorized: false,
         canonicalStudentUid: '',
         studentEmail: '',
-        error: 'Cross-student access prohibited. Students may only access their own dictionary.',
+        error: 'Cross-student access prohibited. Students may only access their own routines.',
         statusCode: 403,
       };
     }
@@ -2780,7 +3907,7 @@ export async function resolveCanonicalStudentIdentity(
         authorized: false,
         canonicalStudentUid: '',
         studentEmail: '',
-        error: 'Cross-student access prohibited. Students may only access their own dictionary.',
+        error: 'Cross-student access prohibited. Students may only access their own routines.',
         statusCode: 403,
       };
     }
@@ -2790,8 +3917,6 @@ export async function resolveCanonicalStudentIdentity(
       studentEmail: callerEmail || cleanReqEmail,
     };
   }
-
-  const db = getFirestoreDb();
   let adminAuth: any = null;
   try {
     const { getFirebaseAdminAuth } = await import('./serverFirebaseAdmin');
@@ -2872,27 +3997,37 @@ export async function resolveCanonicalStudentIdentity(
         }
       } catch {}
 
-      // Query user profile for assigned native friend relationship
+      // Query user profile directly by UID doc AND by email/uid query for assigned native friend relationship
       if (!hasAuthorizedLink) {
         try {
-          const profileQuery = authorizedEmail
-            ? db.collection('users').where('email', '==', authorizedEmail)
-            : db.collection('users').where('uid', '==', candidateUid);
-          const pSnap = await profileQuery.get();
-          if (!pSnap.empty) {
-            for (const pDoc of pSnap.docs) {
-              const pData = pDoc.data();
-              const assignedUid = pData.assignedNativeFriendUID || pData.teacherUid;
-              const assignedEmail = (pData.teacherEmail || '').toLowerCase().trim();
-              if ((assignedUid && (assignedUid === caller.uid || assignedUid === `tutor-${caller.uid}`)) || (assignedEmail && assignedEmail === callerEmail)) {
-                hasAuthorizedLink = true;
-                if (!authorizedEmail && pData.email) authorizedEmail = pData.email.toLowerCase().trim();
-                const resolvedDocUid = (pData.uid && isValidCanonicalUid(pData.uid) ? pData.uid : (isValidCanonicalUid(pDoc.id) ? pDoc.id : ''));
-                if ((!candidateUid || candidateUid.includes('@') || !isValidCanonicalUid(candidateUid) || candidateUid.startsWith('usr-')) && resolvedDocUid && resolvedDocUid !== caller.uid) {
-                  candidateUid = resolvedDocUid;
-                }
-                break;
+          const docsToInspect: any[] = [];
+          if (candidateUid && isValidCanonicalUid(candidateUid)) {
+            const directSnap = await db.collection('users').doc(candidateUid).get().catch(() => null);
+            if (directSnap && directSnap.exists) {
+              docsToInspect.push(directSnap);
+            }
+          }
+          if (docsToInspect.length === 0 && (authorizedEmail || candidateUid)) {
+            const profileQuery = authorizedEmail
+              ? db.collection('users').where('email', '==', authorizedEmail)
+              : db.collection('users').where('uid', '==', candidateUid);
+            const pSnap = await profileQuery.get();
+            if (pSnap && !pSnap.empty) {
+              docsToInspect.push(...pSnap.docs);
+            }
+          }
+          for (const pDoc of docsToInspect) {
+            const pData = pDoc.data();
+            const assignedUid = pData?.assignedNativeFriendUID || pData?.teacherUid || pData?.assignedTeacherId;
+            const assignedEmail = (pData?.teacherEmail || '').toLowerCase().trim();
+            if ((assignedUid && (assignedUid === caller.uid || assignedUid === `tutor-${caller.uid}`)) || (assignedEmail && callerEmail && assignedEmail === callerEmail)) {
+              hasAuthorizedLink = true;
+              if (!authorizedEmail && pData.email) authorizedEmail = pData.email.toLowerCase().trim();
+              const resolvedDocUid = (pData.uid && isValidCanonicalUid(pData.uid) ? pData.uid : (isValidCanonicalUid(pDoc.id) ? pDoc.id : ''));
+              if ((!candidateUid || candidateUid.includes('@') || !isValidCanonicalUid(candidateUid) || candidateUid.startsWith('usr-')) && resolvedDocUid && resolvedDocUid !== caller.uid) {
+                candidateUid = resolvedDocUid;
               }
+              break;
             }
           }
         } catch {}
@@ -3056,7 +4191,7 @@ export async function resolveCanonicalStudentIdentity(
     let targetEmail = cleanReqEmail;
 
     if (candidateUid && isValidCanonicalUid(candidateUid)) {
-      if (adminAuth) {
+      if (adminAuth && typeof adminAuth.getUser === 'function') {
         try {
           const userRec = await adminAuth.getUser(candidateUid);
           if (userRec && userRec.uid) {
@@ -3067,7 +4202,21 @@ export async function resolveCanonicalStudentIdentity(
             };
           }
         } catch {}
-      } else {
+      }
+      if (db) {
+        try {
+          const uDoc = await db.collection('users').doc(candidateUid).get();
+          if (uDoc && uDoc.exists) {
+            const uData = uDoc.data() || {};
+            return {
+              authorized: true,
+              canonicalStudentUid: uDoc.id,
+              studentEmail: (uData.email || targetEmail || '').toLowerCase().trim(),
+            };
+          }
+        } catch {}
+      }
+      if (!adminAuth) {
         return {
           authorized: true,
           canonicalStudentUid: candidateUid,

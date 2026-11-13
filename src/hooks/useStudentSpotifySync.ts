@@ -28,7 +28,7 @@ export function useStudentSpotifySync(params: {
     studentEmail,
     nativeFriendUid,
     nativeFriendEmail,
-    weekId = 'week-1',
+    weekId = 'weekData',
     currentTrack,
   } = params;
 
@@ -141,7 +141,7 @@ export function useTeacherStudentRoutineSync(params: {
     teacherUid,
     teacherName,
     teacherEmail,
-    weekId = 'week-1',
+    weekId = 'weekData',
   } = params;
 
   const effectiveUid = normalizeStudentIdForPath(studentUid || studentEmail || '');

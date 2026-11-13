@@ -17,8 +17,7 @@ import {
   AlertCircle,
   Loader2
 } from 'lucide-react';
-import { doc, onSnapshot, collection } from 'firebase/firestore';
-import { getDb } from '../firebase';
+import { auth } from '../firebase';
 import { DayOfWeek, EnglishLevel, Language, TeacherOverrideTrack } from '../types';
 import {
   selectCurrentDaySpotifyTrack,
@@ -200,42 +199,42 @@ export const NativeFriendSpotifyTable: React.FC<NativeFriendSpotifyTableProps> =
       return;
     }
 
+    let cancelled = false;
     setIsLoadingSync(true);
-    const db = getDb();
-    let unsub = () => {};
 
-    try {
-      const routinesCol = collection(db, 'users', cleanStudentUid, 'routines');
-      unsub = onSnapshot(
-        routinesCol,
-        (snapshot) => {
+    const loadOverrides = async () => {
+      try {
+        const token = await auth?.currentUser?.getIdToken().catch(() => null);
+        if (!token || cancelled) {
+          if (!cancelled) setIsLoadingSync(false);
+          return;
+        }
+        const res = await fetch(
+          `/api/routines/current-routine?studentUid=${encodeURIComponent(cleanStudentUid)}&weeklyCycle=${encodeURIComponent(String(weeklyCycle || 1))}`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (res.ok && !cancelled) {
+          const data = await res.json().catch(() => null);
+          const overridesMap = data?.routine?.teacherOverrides || {};
           const updated: Partial<Record<DayOfWeek, TeacherOverrideTrack | null>> = {};
           ALL_DAYS.forEach((d) => {
-            updated[d] = null;
-          });
-          snapshot.forEach((docSnap) => {
-            const day = docSnap.id as DayOfWeek;
-            const data = docSnap.data();
-            const override = data?.teacherOverrideTrack as TeacherOverrideTrack | undefined;
-            updated[day] = override || null;
+            updated[d] = (overridesMap[d] as TeacherOverrideTrack | null) || null;
           });
           setDayOverrides((prev) => ({ ...prev, ...updated }));
-          setIsLoadingSync(false);
-        },
-        (err) => {
-          console.warn('NativeFriendSpotifyTable routines listener notice:', err);
-          setIsLoadingSync(false);
         }
-      );
-    } catch (err) {
-      console.warn('Error setting up onSnapshot for routines:', err);
-      setIsLoadingSync(false);
-    }
+      } catch (err) {
+        console.warn('NativeFriendSpotifyTable routines fetch notice:', err);
+      } finally {
+        if (!cancelled) setIsLoadingSync(false);
+      }
+    };
+
+    loadOverrides();
 
     return () => {
-      unsub();
+      cancelled = true;
     };
-  }, [cleanStudentUid]);
+  }, [cleanStudentUid, weeklyCycle]);
 
   // Selected track for compact inline preview
   const [previewTrackUrl, setPreviewTrackUrl] = useState<string | null>(null);
