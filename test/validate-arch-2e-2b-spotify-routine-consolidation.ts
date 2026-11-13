@@ -239,8 +239,52 @@ async function runTests() {
   console.log(" IT'S SIMPLE — ARCH.2E.2B: CONSOLIDAÇÃO CANÔNICA DE SPOTIFY E ROTINAS DE ÁUDIO");
   console.log('================================================================================\n');
 
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const trackedIntervals = new Set<ReturnType<typeof setInterval>>();
+  const trackedTimeouts = new Set<ReturnType<typeof setTimeout>>();
+
+  globalThis.setInterval = ((handler: any, timeout?: any, ...args: any[]) => {
+    const handle = originalSetInterval(handler, timeout, ...args);
+    trackedIntervals.add(handle);
+    return handle;
+  }) as typeof setInterval;
+
+  globalThis.clearInterval = ((handle?: ReturnType<typeof setInterval>) => {
+    if (handle !== undefined) trackedIntervals.delete(handle);
+    return originalClearInterval(handle as any);
+  }) as typeof clearInterval;
+
+  globalThis.setTimeout = ((handler: any, timeout?: any, ...args: any[]) => {
+    if (typeof handler === 'function') {
+      let handle: ReturnType<typeof setTimeout>;
+      handle = originalSetTimeout(
+        (...cbArgs: any[]) => {
+          trackedTimeouts.delete(handle);
+          return handler(...cbArgs);
+        },
+        timeout,
+        ...args
+      );
+      trackedTimeouts.add(handle);
+      return handle;
+    }
+    const handle = originalSetTimeout(handler, timeout, ...args);
+    trackedTimeouts.add(handle);
+    return handle;
+  }) as typeof setTimeout;
+
+  globalThis.clearTimeout = ((handle?: ReturnType<typeof setTimeout>) => {
+    if (handle !== undefined) trackedTimeouts.delete(handle);
+    return originalClearTimeout(handle as any);
+  }) as typeof clearTimeout;
+
   const mockDb = new MockFirestoreDb();
-  setFirebaseAdminFirestoreForTesting(mockDb as any);
+
+  try {
+    setFirebaseAdminFirestoreForTesting(mockDb as any);
 
   const STUDENT_A_UID = 'StuA_SpotUid12345678901234';
   const STUDENT_A_EMAIL = 'student.a.arch2e2b@gmail.com';
@@ -1082,6 +1126,26 @@ async function runTests() {
   console.log('\n================================================================================');
   console.log(` RESULTADO ARCH.2E.2B: ${passed} PASSOU | ${failed} FALHOU`);
   console.log('================================================================================');
+  } finally {
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+
+    for (const handle of trackedIntervals) {
+      originalClearInterval(handle);
+    }
+    trackedIntervals.clear();
+
+    for (const handle of trackedTimeouts) {
+      originalClearTimeout(handle);
+    }
+    trackedTimeouts.clear();
+
+    mockDb.failWriteMatcher = null;
+    setFirebaseAdminAuthForTesting(null);
+    setFirebaseAdminFirestoreForTesting(null);
+  }
 
   if (failed > 0) {
     process.exit(1);

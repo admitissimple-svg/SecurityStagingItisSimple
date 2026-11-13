@@ -109,6 +109,10 @@ import {
   saveWeeklyChecksToFirestore,
   fetchHomeworkFromFirestore,
   saveHomeworkToFirestore,
+  fetchCanonicalUserWeeklyCycleServer,
+  fetchCanonicalWeeklyChecksServer,
+  saveCanonicalWeeklyChecksServer,
+  saveCanonicalHomeworkServer,
   mergeHomeworkRecords,
   isPermissionError,
   getIsCloudWriteDisabled,
@@ -16614,37 +16618,18 @@ function validateStudentIdentity(studentUid?: any, studentEmail?: any): {
 async function resolveStudentWeeklyCycle(studentUid?: string, studentEmail?: string): Promise<number | null> {
   const cleanUid = (studentUid || '').trim();
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
-  const db = readDb();
 
-  // 1. Check in-memory user profiles
-  if (cleanUid && db.userProfiles?.[cleanUid]?.weeklyCycle) {
-    const cycle = extractPositiveIntegerCycle(db.userProfiles[cleanUid].weeklyCycle);
-    if (cycle !== null) return cycle;
-  }
-  if (cleanEmail && db.userProfiles?.[cleanEmail]?.weeklyCycle) {
-    const cycle = extractPositiveIntegerCycle(db.userProfiles[cleanEmail].weeklyCycle);
-    if (cycle !== null) return cycle;
+  // ARCH.2E.2C: Canonical Firestore (default) users/{uid}.weeklyCycle is the sole authoritative source.
+  if (cleanUid) {
+    const res = await fetchCanonicalUserWeeklyCycleServer(cleanUid);
+    if (res.activeCycle !== null) return res.activeCycle;
   }
 
-  // 2. Check in-memory students list
-  const foundStudent = (db.students || []).find((s: any) =>
-    (cleanUid && (s.uid === cleanUid || s.studentUid === cleanUid || s.id === cleanUid)) ||
-    (cleanEmail && (s.email === cleanEmail || s.studentEmail === cleanEmail))
-  );
-  if (foundStudent?.weeklyCycle) {
-    const cycle = extractPositiveIntegerCycle(foundStudent.weeklyCycle);
-    if (cycle !== null) return cycle;
-  }
-
-  // 3. Check Firestore user document
-  const docIds = [cleanUid, cleanEmail].filter(Boolean);
-  for (const docId of docIds) {
+  if (cleanEmail) {
     try {
-      const uData = await fetchUserDocumentFromFirestore(docId);
-      if (uData) {
-        const cycle = extractPositiveIntegerCycle(uData?.weeklyCycle);
-        if (cycle !== null) return cycle;
-      }
+      const prof = await fetchStudentProfileFromFirestoreServer('', cleanEmail);
+      const cycle = extractPositiveIntegerCycle(prof?.profile?.weeklyCycle);
+      if (cycle !== null) return cycle;
     } catch {}
   }
 
@@ -17361,22 +17346,69 @@ export async function authorizeStudentAccess(
   };
 }
 
-// 7.1 Student Weekly S-Path Progress Endpoints (Week-aware & strictly isolated)
-app.get('/api/routines/weekly-checks', async (req, res) => {
-  if (!req.user) {
-    await getVerifiedUserFromRequest(req);
+async function authorizeHomeworkChecksAccess(
+  req: express.Request,
+  res: express.Response,
+  action: 'read' | 'write'
+) {
+  const nested = (req.body && (req.body.weeklyHomework || req.body.homework)) || null;
+  const topUid = ((req.body?.studentUid as string) || (req.body?.uid as string) || (req.query?.studentUid as string) || (req.query?.uid as string) || '').trim();
+  const topEmail = ((req.body?.studentEmail as string) || (req.body?.email as string) || (req.query?.studentEmail as string) || (req.query?.email as string) || '').toLowerCase().trim();
+  const nestedUid = ((nested?.studentUid as string) || (nested?.uid as string) || '').trim();
+  const nestedEmail = ((nested?.studentEmail as string) || (nested?.email as string) || '').toLowerCase().trim();
+
+  if (topUid && nestedUid && topUid !== nestedUid) {
+    res.status(403).json({
+      error: 'Forbidden',
+      message: 'Conflicting studentUid between request payload and nested homework object.',
+    });
+    return null;
   }
-  const authContext = await authorizeStudentAccess(req, 'read');
-  let cleanUid = authContext.cleanUid;
-  let cleanEmail = authContext.cleanEmail;
-  if (!authContext.authorized) {
-    cleanUid = (req.query.studentUid || req.query.uid || '').toString().trim();
-    cleanEmail = (req.query.studentEmail || req.query.email || '').toString().toLowerCase().trim();
-    if (!cleanUid && !cleanEmail) {
-      return res.status(authContext.status).json({ error: authContext.error });
-    }
+  if (topEmail && nestedEmail && topEmail !== nestedEmail) {
+    res.status(403).json({
+      error: 'Forbidden',
+      message: 'Conflicting studentEmail between request payload and nested homework object.',
+    });
+    return null;
   }
 
+  let effectiveReq: express.Request = req;
+  if ((!topUid && nestedUid) || (!topEmail && nestedEmail)) {
+    effectiveReq = Object.create(req, {
+      body: {
+        value: {
+          ...(req.body || {}),
+          ...(topUid ? {} : nestedUid ? { studentUid: nestedUid } : {}),
+          ...(topEmail ? {} : nestedEmail ? { studentEmail: nestedEmail } : {}),
+        },
+        configurable: true,
+      },
+    });
+  }
+
+  const authCtx = await authorizeStudentRoutineAccess(effectiveReq, res, {
+    allowMissingTargetFallbackToCaller: true,
+    requireApprovedTeacherIfTutor: true,
+  });
+  if (!authCtx) return null;
+
+  if (action === 'write' && authCtx.effectiveRole === 'teacher') {
+    res.status(403).json({
+      error: 'Forbidden',
+      message: 'Teachers are not authorized to modify student homework or weekly routine checks.',
+    });
+    return null;
+  }
+
+  return authCtx;
+}
+
+// 7.1 Student Weekly S-Path Progress Endpoints (ARCH.2E.2C Canonical Firestore-only)
+app.get('/api/routines/weekly-checks', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeHomeworkChecksAccess(req, res, 'read');
+  if (!authCtx) return;
+
+  const { canonicalStudentUid } = authCtx;
   const rawWeek = req.query.weekId || req.query.week || req.query.weeklyCycle;
   if (!rawWeek) {
     return res.status(400).json({
@@ -17386,7 +17418,7 @@ app.get('/api/routines/weekly-checks', async (req, res) => {
 
   let cycle: number | null = null;
   if (typeof rawWeek === 'string' && rawWeek.trim().toLowerCase() === 'current_week') {
-    cycle = await resolveStudentWeeklyCycle(cleanUid, cleanEmail);
+    cycle = await resolveStudentWeeklyCycle(canonicalStudentUid, authCtx.canonicalStudentEmail);
     if (cycle === null) {
       return res.status(400).json({
         error: 'Cannot resolve "current_week" alias: student has no valid persisted weeklyCycle. Explicit week identifier required.',
@@ -17402,70 +17434,34 @@ app.get('/api/routines/weekly-checks', async (req, res) => {
   }
 
   const canonicalWeekId = `week-${cycle}`;
-  const studentKey = cleanUid || cleanEmail;
-  const weekScopedKey = `${studentKey}::${canonicalWeekId}`;
-  const emailScopedKey = cleanEmail ? `${cleanEmail}::${canonicalWeekId}` : '';
-
-  const db = readDb();
-  let checks: Record<string, boolean> | null =
-    (db.studentWeeklyChecks && (db.studentWeeklyChecks[weekScopedKey] || (emailScopedKey ? db.studentWeeklyChecks[emailScopedKey] : undefined))) || null;
-
-  // If not found in-memory, query Firestore week subcollection
-  if (!checks) {
-    const docIds = [cleanUid, cleanEmail].filter(Boolean);
-    const fsChecks = await fetchWeeklyChecksFromFirestore(docIds, canonicalWeekId, cycle);
-    if (fsChecks) {
-      checks = fsChecks;
-      if (!db.studentWeeklyChecks) db.studentWeeklyChecks = {};
-      db.studentWeeklyChecks[weekScopedKey] = checks;
-    }
+  const fsCtx = await fetchCanonicalWeeklyChecksServer(canonicalStudentUid, canonicalWeekId, cycle);
+  if (!fsCtx) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
   }
 
-  // For Week 2+, NEVER fall back to legacy root document or unscoped checks!
-  const finalChecks = checks || {};
-
-  const userProf = (db.userProfiles && (db.userProfiles[studentKey] || (cleanEmail ? db.userProfiles[cleanEmail] : undefined))) || {};
-  const weeklyNativeLessonsTarget =
-    (db.weeklyNativeTargets && (db.weeklyNativeTargets[studentKey] || (cleanEmail ? db.weeklyNativeTargets[cleanEmail] : undefined))) ||
-    userProf.weeklyNativeLessonsTarget ||
-    1;
-  const weeklyStudyDaysTarget =
-    (db.weeklyStudyDaysTargets && (db.weeklyStudyDaysTargets[studentKey] || (cleanEmail ? db.weeklyStudyDaysTargets[cleanEmail] : undefined))) ||
-    userProf.weeklyStudyDaysTarget ||
-    7;
-  const weeklyStudyDays =
-    (db.weeklyStudyDays && (db.weeklyStudyDays[studentKey] || (cleanEmail ? db.weeklyStudyDays[cleanEmail] : undefined))) ||
-    userProf.weeklyStudyDays ||
-    ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
-
-  res.json({
+  return res.json({
     success: true,
+    studentUid: canonicalStudentUid,
     weekId: canonicalWeekId,
     weeklyCycle: cycle,
-    checks: finalChecks,
-    weeklyNativeLessonsTarget,
-    weeklyStudyDaysTarget,
-    weeklyStudyDays,
+    checks: fsCtx.checks,
+    weeklyNativeLessonsTarget: fsCtx.weeklyNativeLessonsTarget,
+    weeklyStudyDaysTarget: fsCtx.weeklyStudyDaysTarget,
+    weeklyStudyDays: fsCtx.weeklyStudyDays,
   });
 });
 
-app.post('/api/routines/weekly-checks', async (req, res) => {
-  if (!req.user) {
-    await getVerifiedUserFromRequest(req);
-  }
-  const authContext = await authorizeStudentAccess(req, 'write');
-  let cleanUid = authContext.cleanUid;
-  let cleanEmail = authContext.cleanEmail;
-  if (!authContext.authorized) {
-    cleanUid = (req.body?.studentUid || req.body?.uid || req.query?.studentUid || req.query?.uid || '').toString().trim();
-    cleanEmail = (req.body?.studentEmail || req.body?.email || req.query?.studentEmail || req.query?.email || '').toString().toLowerCase().trim();
-    if (!cleanUid && !cleanEmail) {
-      return res.status(authContext.status).json({ error: authContext.error });
-    }
-  }
-  const { checks, merge, weeklyNativeLessonsTarget, weeklyStudyDaysTarget, weeklyStudyDays } = req.body;
+app.post('/api/routines/weekly-checks', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeHomeworkChecksAccess(req, res, 'write');
+  if (!authCtx) return;
 
-  const rawWeek = req.body.weekId || req.body.week || req.body.weeklyCycle || req.query.weekId || req.query.week || req.query.weeklyCycle;
+  const { canonicalStudentUid, canonicalStudentEmail } = authCtx;
+  const { checks, weeklyNativeLessonsTarget, weeklyStudyDaysTarget, weeklyStudyDays } = req.body || {};
+
+  const rawWeek = req.body?.weekId || req.body?.week || req.body?.weeklyCycle || req.query?.weekId || req.query?.week || req.query?.weeklyCycle;
   if (!rawWeek) {
     return res.status(400).json({
       error: 'Missing week identifier. A valid positive integer cycle (e.g. 1, "week-1") or resolvable "current_week" alias is required.',
@@ -17474,7 +17470,7 @@ app.post('/api/routines/weekly-checks', async (req, res) => {
 
   let cycle: number | null = null;
   if (typeof rawWeek === 'string' && rawWeek.trim().toLowerCase() === 'current_week') {
-    cycle = await resolveStudentWeeklyCycle(cleanUid, cleanEmail);
+    cycle = await resolveStudentWeeklyCycle(canonicalStudentUid, canonicalStudentEmail);
     if (cycle === null) {
       return res.status(400).json({
         error: 'Cannot resolve "current_week" alias: student has no valid persisted weeklyCycle. Explicit week identifier required.',
@@ -17490,136 +17486,55 @@ app.post('/api/routines/weekly-checks', async (req, res) => {
   }
 
   const canonicalWeekId = `week-${cycle}`;
-  const studentKey = cleanUid || cleanEmail;
-  const weekScopedKey = `${studentKey}::${canonicalWeekId}`;
+  const saveResult = await saveCanonicalWeeklyChecksServer({
+    studentUid: canonicalStudentUid,
+    studentEmail: canonicalStudentEmail || undefined,
+    canonicalWeekId,
+    cycle,
+    checks: checks && typeof checks === 'object' ? checks : undefined,
+    reset: req.body?.reset === true,
+    weeklyNativeLessonsTarget: typeof weeklyNativeLessonsTarget === 'number' ? weeklyNativeLessonsTarget : undefined,
+    weeklyStudyDaysTarget: typeof weeklyStudyDaysTarget === 'number' ? weeklyStudyDaysTarget : undefined,
+    weeklyStudyDays: Array.isArray(weeklyStudyDays) ? weeklyStudyDays : undefined,
+  });
 
-  const db = readDb();
-  if (!db.studentWeeklyChecks) {
-    db.studentWeeklyChecks = {};
-  }
-
-  if (checks && typeof checks === 'object') {
-    const isReset = req.body.reset === true;
-    const existing = db.studentWeeklyChecks[weekScopedKey] || {};
-    db.studentWeeklyChecks[weekScopedKey] = isReset
-      ? (checks || {})
-      : {
-          ...existing,
-          ...checks,
-        };
-
-    if (cleanEmail && cleanEmail !== studentKey) {
-      db.studentWeeklyChecks[`${cleanEmail}::${canonicalWeekId}`] = db.studentWeeklyChecks[weekScopedKey];
+  if (!saveResult.ok) {
+    if (saveResult.statusCode === 409) {
+      return res.status(409).json({
+        success: false,
+        error: 'STALE_CYCLE',
+        code: 'STALE_CYCLE',
+        activeCycle: saveResult.activeCycle,
+        requestedCycle: cycle,
+        message: saveResult.error || `Stale cycle ${cycle} rejected; active cycle is ${saveResult.activeCycle}.`,
+      });
     }
-
-    // Keep active cycle checks accessible on studentKey and cleanEmail
-    db.studentWeeklyChecks[studentKey] = db.studentWeeklyChecks[weekScopedKey];
-    if (cleanEmail) {
-      db.studentWeeklyChecks[cleanEmail] = db.studentWeeklyChecks[weekScopedKey];
-    }
-  }
-
-  if (typeof weeklyNativeLessonsTarget === 'number' && weeklyNativeLessonsTarget > 0) {
-    if (!db.weeklyNativeTargets) db.weeklyNativeTargets = {};
-    db.weeklyNativeTargets[studentKey] = weeklyNativeLessonsTarget;
-    if (cleanEmail && db.userProfiles && db.userProfiles[cleanEmail]) {
-      db.userProfiles[cleanEmail].weeklyNativeLessonsTarget = weeklyNativeLessonsTarget;
-    }
-  }
-
-  if (typeof weeklyStudyDaysTarget === 'number' && weeklyStudyDaysTarget >= 1 && weeklyStudyDaysTarget <= 7) {
-    if (!db.weeklyStudyDaysTargets) db.weeklyStudyDaysTargets = {};
-    db.weeklyStudyDaysTargets[studentKey] = weeklyStudyDaysTarget;
-    if (cleanEmail && db.userProfiles && db.userProfiles[cleanEmail]) {
-      db.userProfiles[cleanEmail].weeklyStudyDaysTarget = weeklyStudyDaysTarget;
-    }
-  }
-
-  if (Array.isArray(weeklyStudyDays)) {
-    if (!db.weeklyStudyDays) db.weeklyStudyDays = {};
-    db.weeklyStudyDays[studentKey] = weeklyStudyDays;
-    if (cleanEmail && db.userProfiles && db.userProfiles[cleanEmail]) {
-      db.userProfiles[cleanEmail].weeklyStudyDays = weeklyStudyDays;
-    }
-  }
-
-  // Phase 3B: Explicitly await Firestore persistence before in-memory commit and success confirmation
-  const docId = cleanUid || cleanEmail;
-  if (!docId) {
-    return res.status(400).json({
-      success: false,
-      error: 'MissingStudentIdentity',
-      message: 'Identificador canônico do aluno ausente para gravação dos checks semanais.',
-    });
-  }
-
-  // 1. Write week-specific document: users/{docId}/weeklyChecks/week-${cycle}
-  const weekDocPayload: Record<string, any> = {
-    id: canonicalWeekId,
-    weekId: canonicalWeekId,
-    weeklyCycle: cycle,
-    checks: db.studentWeeklyChecks[weekScopedKey] || {},
-    weeklyChecks: db.studentWeeklyChecks[weekScopedKey] || {},
-    sPathChecks: db.studentWeeklyChecks[weekScopedKey] || {},
-    updatedAt: new Date().toISOString(),
-    studentUid: cleanUid || null,
-    studentEmail: cleanEmail || null,
-  };
-  if (typeof weeklyNativeLessonsTarget === 'number') {
-    weekDocPayload.weeklyNativeLessonsTarget = weeklyNativeLessonsTarget;
-  }
-  if (typeof weeklyStudyDaysTarget === 'number') {
-    weekDocPayload.weeklyStudyDaysTarget = weeklyStudyDaysTarget;
-  }
-
-  // 2. Root document users/{docId}: targets and current week checks
-  const fsRootPayload: Record<string, any> = {
-    updatedAt: new Date().toISOString(),
-    weeklyChecks: db.studentWeeklyChecks[weekScopedKey] || {},
-    sPathChecks: db.studentWeeklyChecks[weekScopedKey] || {},
-  };
-  if (typeof weeklyNativeLessonsTarget === 'number') {
-    fsRootPayload.weeklyNativeLessonsTarget = weeklyNativeLessonsTarget;
-  }
-  if (typeof weeklyStudyDaysTarget === 'number') {
-    fsRootPayload.weeklyStudyDaysTarget = weeklyStudyDaysTarget;
-  }
-  if (Array.isArray(weeklyStudyDays)) {
-    fsRootPayload.weeklyStudyDays = weeklyStudyDays;
-  }
-
-  const fsOk = await saveWeeklyChecksToFirestore(docId, canonicalWeekId, weekDocPayload, fsRootPayload);
-  if (!fsOk && !getIsCloudWriteDisabled()) {
-    return res.status(500).json({
+    return res.status(saveResult.statusCode || 500).json({
       success: false,
       error: 'FirestorePersistenceFailed',
       message: 'Falha ao confirmar persistência dos checks semanais no Firestore.',
     });
   }
 
-  await writeDbSync(db);
-
-  const savedChecks = db.studentWeeklyChecks[weekScopedKey] || {};
-  res.json({
+  return res.json({
     success: true,
     firestoreConfirmed: true,
+    studentUid: canonicalStudentUid,
     weekId: canonicalWeekId,
     weeklyCycle: cycle,
-    checks: savedChecks,
-    weeklyNativeLessonsTarget: typeof weeklyNativeLessonsTarget === 'number' ? weeklyNativeLessonsTarget : 1,
-    weeklyStudyDaysTarget: typeof weeklyStudyDaysTarget === 'number' ? weeklyStudyDaysTarget : 7,
-    weeklyStudyDays: Array.isArray(weeklyStudyDays) ? weeklyStudyDays : [],
+    checks: saveResult.checks || {},
+    weeklyNativeLessonsTarget: saveResult.weeklyNativeLessonsTarget ?? 1,
+    weeklyStudyDaysTarget: saveResult.weeklyStudyDaysTarget ?? 7,
+    weeklyStudyDays: saveResult.weeklyStudyDays || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'],
   });
 });
 
-// 8. Homework Endpoints with per-student and per-week isolation
+// 8. Homework Endpoints with per-student and per-week isolation (ARCH.2E.2C Canonical Firestore-only)
 app.get('/api/homework', firebaseAuthMiddleware, async (req, res) => {
-  const authContext = await authorizeStudentAccess(req, 'read');
-  if (!authContext.authorized) {
-    return res.status(authContext.status).json({ error: authContext.error });
-  }
-  const { cleanUid, cleanEmail } = authContext;
+  const authCtx = await authorizeHomeworkChecksAccess(req, res, 'read');
+  if (!authCtx) return;
 
+  const { canonicalStudentUid, canonicalStudentEmail } = authCtx;
   const rawWeek = req.query.weekId || req.query.week || req.query.weeklyCycle;
   if (!rawWeek) {
     return res.status(400).json({
@@ -17629,7 +17544,7 @@ app.get('/api/homework', firebaseAuthMiddleware, async (req, res) => {
 
   let cycle: number | null = null;
   if (typeof rawWeek === 'string' && rawWeek.trim().toLowerCase() === 'current_week') {
-    cycle = await resolveStudentWeeklyCycle(cleanUid, cleanEmail);
+    cycle = await resolveStudentWeeklyCycle(canonicalStudentUid, canonicalStudentEmail);
     if (cycle === null) {
       return res.status(400).json({
         error: 'Cannot resolve "current_week" alias: student has no valid persisted weeklyCycle. Explicit week identifier required.',
@@ -17645,36 +17560,8 @@ app.get('/api/homework', firebaseAuthMiddleware, async (req, res) => {
   }
 
   const canonicalWeekId = `week-${cycle}`;
-  const studentKey = cleanUid || cleanEmail;
-  const hwScopedKey = `${studentKey}::${canonicalWeekId}`;
-  const emailScopedKey = cleanEmail ? `${cleanEmail}::${canonicalWeekId}` : '';
+  const hwData = await fetchHomeworkFromFirestore([canonicalStudentUid], canonicalWeekId, cycle);
 
-  const db = readDb();
-  let hwData =
-    (db.studentHomeworkMap && (db.studentHomeworkMap[hwScopedKey] || (emailScopedKey ? db.studentHomeworkMap[emailScopedKey] : undefined))) || null;
-
-  // Check if in-memory data has complete answers and evaluation
-  const hasCompleteData = Boolean(
-    hwData?.studentAnswers &&
-    (Object.keys(hwData.studentAnswers.matching || {}).length > 0 ||
-     Object.keys(hwData.studentAnswers.fillInBlanks || {}).length > 0 ||
-     Object.keys(hwData.studentAnswers.sentences || {}).length > 0 ||
-     Object.keys(hwData.studentAnswers.quizAnswers || {}).length > 0) &&
-    hwData?.aiEvaluation
-  );
-
-  // If not found in-memory or in-memory data lacks answers/evaluation, query Firestore
-  if (!hwData || !hasCompleteData) {
-    const docIds = [cleanUid, cleanEmail].filter(Boolean);
-    const fsHw = await fetchHomeworkFromFirestore(docIds, canonicalWeekId, cycle);
-    if (fsHw) {
-      hwData = hwData ? mergeHomeworkRecords(hwData, fsHw) : fsHw;
-      if (!db.studentHomeworkMap) db.studentHomeworkMap = {};
-      db.studentHomeworkMap[hwScopedKey] = hwData;
-    }
-  }
-
-  // For Week 2+, NEVER return legacy root homework or global db.weeklyHomework!
   if (hwData) {
     if (hwData.aiEvaluation) {
       if (isSyntheticHomeworkEvaluation(hwData.aiEvaluation) || !isValidHomeworkEvaluation(hwData.aiEvaluation)) {
@@ -17685,36 +17572,44 @@ app.get('/api/homework', firebaseAuthMiddleware, async (req, res) => {
         }
       }
     }
-    return res.json(hwData);
+    return res.json({
+      ...hwData,
+      id: canonicalWeekId,
+      weekId: canonicalWeekId,
+      weeklyCycle: cycle,
+      studentUid: canonicalStudentUid,
+      ...(canonicalStudentEmail ? { studentEmail: canonicalStudentEmail } : {}),
+    });
   }
 
-  res.json({
+  return res.json({
     id: canonicalWeekId,
     weekId: canonicalWeekId,
     weeklyCycle: cycle,
-    studentUid: cleanUid || undefined,
-    studentEmail: cleanEmail || undefined,
+    studentUid: canonicalStudentUid,
+    studentEmail: canonicalStudentEmail || undefined,
     completedPartsByDay: {},
     studentAnswers: { matching: {}, fillInBlanks: {}, sentences: {}, quizAnswers: {} },
   });
 });
 
 app.post(['/api/homework', '/api/homework/submit'], firebaseAuthMiddleware, async (req, res) => {
-  const authContext = await authorizeStudentAccess(req, 'write');
-  if (!authContext.authorized) {
-    return res.status(authContext.status).json({ error: authContext.error });
-  }
-  const { cleanUid, cleanEmail } = authContext;
-  const weeklyHomework = req.body.weeklyHomework || req.body;
+  const authCtx = await authorizeHomeworkChecksAccess(req, res, 'write');
+  if (!authCtx) return;
 
-  let rawWeek = req.body.weekId || req.body.week || req.body.weeklyCycle || weeklyHomework?.weekId || weeklyHomework?.weeklyCycle || weeklyHomework?.id;
+  const { canonicalStudentUid, canonicalStudentEmail } = authCtx;
+  const weeklyHomework = req.body?.weeklyHomework || req.body || {};
+  const isSubmit = req.path === '/api/homework/submit' || Boolean(req.body?.submit);
+
+  const idCycleCandidate = extractPositiveIntegerCycle(weeklyHomework?.id) !== null ? weeklyHomework?.id : undefined;
+  let rawWeek = req.body?.weekId || req.body?.week || req.body?.weeklyCycle || weeklyHomework?.weekId || weeklyHomework?.weeklyCycle || idCycleCandidate;
   if (!rawWeek) {
     rawWeek = 'current_week';
   }
 
   let cycle: number | null = null;
   if (typeof rawWeek === 'string' && rawWeek.trim().toLowerCase() === 'current_week') {
-    cycle = await resolveStudentWeeklyCycle(cleanUid, cleanEmail);
+    cycle = await resolveStudentWeeklyCycle(canonicalStudentUid, canonicalStudentEmail);
     if (cycle === null) {
       return res.status(400).json({
         error: 'Cannot resolve "current_week" alias: student has no valid persisted weeklyCycle. Explicit week identifier required.',
@@ -17730,21 +17625,15 @@ app.post(['/api/homework', '/api/homework/submit'], firebaseAuthMiddleware, asyn
   }
 
   const canonicalWeekId = `week-${cycle}`;
-  const studentKey = cleanUid || cleanEmail;
-  const hwScopedKey = `${studentKey}::${canonicalWeekId}`;
-
-  const db = readDb();
-  db.studentHomeworkMap = db.studentHomeworkMap || {};
-
-  const hwPayload = {
+  const hwPayload: Record<string, any> = {
     ...weeklyHomework,
     id: canonicalWeekId,
     weekId: canonicalWeekId,
     weeklyCycle: cycle,
-    uid: cleanUid || undefined,
-    studentUid: cleanUid || undefined,
-    email: cleanEmail || undefined,
-    studentEmail: cleanEmail || undefined,
+    uid: canonicalStudentUid,
+    studentUid: canonicalStudentUid,
+    email: canonicalStudentEmail || undefined,
+    studentEmail: canonicalStudentEmail || undefined,
     updatedAt: new Date().toISOString(),
   };
 
@@ -17758,39 +17647,41 @@ app.post(['/api/homework', '/api/homework/submit'], firebaseAuthMiddleware, asyn
     }
   }
 
-  db.studentHomeworkMap[hwScopedKey] = hwPayload;
-  if (cleanEmail && cleanEmail !== studentKey) {
-    db.studentHomeworkMap[`${cleanEmail}::${canonicalWeekId}`] = hwPayload;
-  }
+  const saveResult = await saveCanonicalHomeworkServer({
+    studentUid: canonicalStudentUid,
+    studentEmail: canonicalStudentEmail || undefined,
+    canonicalWeekId,
+    cycle,
+    homeworkPayload: hwPayload,
+    isSubmit,
+    enforceStaleCycle: true,
+  });
 
-  // Preserve Week 1 legacy compatibility only where explicitly required
-  if (cycle === 1) {
-    db.studentHomeworkMap[studentKey] = hwPayload;
-    if (cleanEmail) db.studentHomeworkMap[cleanEmail] = hwPayload;
-    db.weeklyHomework = hwPayload;
-  }
-  // For cycle >= 2: NEVER write to global db.weeklyHomework or unscoped db.studentHomeworkMap[studentKey]!
-
-  writeDb(db);
-
-  // Firestore persistence: await confirmed persistence in canonical Firestore '(default)'
-  const docId = cleanUid || cleanEmail;
-  if (docId) {
-    const fsOk = await saveHomeworkToFirestore(docId, canonicalWeekId, cycle, hwPayload);
-    if (!fsOk && !getIsCloudWriteDisabled()) {
-      return res.status(500).json({
+  if (!saveResult.ok) {
+    if (saveResult.statusCode === 409) {
+      return res.status(409).json({
         success: false,
-        error: 'FirestorePersistenceFailed',
-        message: 'Falha ao confirmar persistência do homework no Firestore.',
+        error: 'STALE_CYCLE',
+        code: 'STALE_CYCLE',
+        activeCycle: saveResult.activeCycle,
+        requestedCycle: cycle,
+        message: saveResult.error || `Stale cycle ${cycle} rejected; active cycle is ${saveResult.activeCycle}.`,
       });
     }
+    return res.status(saveResult.statusCode || 500).json({
+      success: false,
+      error: 'FirestorePersistenceFailed',
+      message: 'Falha ao confirmar persistência do homework no Firestore.',
+    });
   }
 
-  res.json({
+  return res.json({
     success: true,
+    firestoreConfirmed: true,
+    studentUid: canonicalStudentUid,
     weekId: canonicalWeekId,
     weeklyCycle: cycle,
-    weeklyHomework: hwPayload,
+    weeklyHomework: saveResult.weeklyHomework,
   });
 });
 
@@ -20026,16 +19917,15 @@ export function resetResidualCachesForTesting(): void {
 // 13. Comprehensive AI Homework Evaluator (All 4 Interactive Stages)
 app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
   try {
-    const caller = req.user!;
-    const callerUid = caller.uid;
-    const callerEmail = (caller.email || '').toLowerCase().trim();
+    const authCtx = await authorizeHomeworkChecksAccess(req, res, 'write');
+    if (!authCtx) return;
+
+    const { canonicalStudentUid, canonicalStudentEmail, effectiveRole } = authCtx;
     const {
       homework,
       studentAnswers = {},
       studentLevel = 'iniciante',
       studentName = 'Student',
-      studentUid = '',
-      studentEmail = '',
       currentLanguage = 'pt',
     } = req.body || {};
 
@@ -20046,41 +19936,39 @@ app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
     let effectiveLevel = studentLevel || homework.studentLevel;
     let effectiveName = studentName || homework.studentName;
 
-    if (caller.role === 'student') {
-      if (studentUid && studentUid !== callerUid) {
-        return res.status(403).json({
-          error: 'Forbidden',
-          message: 'Unauthorized access: cannot evaluate homework for another student.',
-        });
-      }
-      if (studentEmail && studentEmail.toLowerCase().trim() !== callerEmail) {
-        return res.status(403).json({
-          error: 'Forbidden',
-          message: 'Unauthorized access: cannot evaluate homework for another student.',
-        });
-      }
-      if (homework.studentUid && homework.studentUid !== callerUid) {
-        return res.status(403).json({
-          error: 'Forbidden',
-          message: 'Unauthorized access: cannot evaluate homework for another student.',
-        });
-      }
-      if (homework.studentEmail && homework.studentEmail.toLowerCase().trim() !== callerEmail) {
-        return res.status(403).json({
-          error: 'Forbidden',
-          message: 'Unauthorized access: cannot evaluate homework for another student.',
-        });
-      }
-
-      const db = readDb();
-      const registeredStudent = (db.students || []).find((s: any) =>
-        (s.uid === callerUid || s.id === callerUid) ||
-        (callerEmail && (s.email || '').toLowerCase().trim() === callerEmail)
-      );
-      const profile = db.userProfiles?.[callerUid] || (callerEmail && db.userProfiles?.[callerEmail]);
-      effectiveLevel = profile?.level || profile?.englishLevel || registeredStudent?.level || registeredStudent?.englishLevel || effectiveLevel;
-      effectiveName = profile?.name || registeredStudent?.name || effectiveName;
+    const userCycleInfo = await fetchCanonicalUserWeeklyCycleServer(canonicalStudentUid);
+    if (userCycleInfo.userData) {
+      effectiveLevel =
+        userCycleInfo.userData.level ||
+        userCycleInfo.userData.englishLevel ||
+        effectiveLevel;
+      effectiveName = userCycleInfo.userData.name || effectiveName;
     }
+
+    const explicitCycle =
+      extractPositiveIntegerCycle(req.body?.weeklyCycle) ??
+      extractPositiveIntegerCycle(req.body?.weekId) ??
+      extractPositiveIntegerCycle(homework?.weeklyCycle) ??
+      extractPositiveIntegerCycle(homework?.weekId) ??
+      extractPositiveIntegerCycle(homework?.id);
+
+    if (
+      explicitCycle !== null &&
+      userCycleInfo.activeCycle !== null &&
+      explicitCycle < userCycleInfo.activeCycle
+    ) {
+      return res.status(409).json({
+        success: false,
+        error: 'STALE_CYCLE',
+        code: 'STALE_CYCLE',
+        activeCycle: userCycleInfo.activeCycle,
+        requestedCycle: explicitCycle,
+        message: `Stale cycle ${explicitCycle} rejected; active cycle is ${userCycleInfo.activeCycle}.`,
+      });
+    }
+
+    const cycle = explicitCycle ?? userCycleInfo.activeCycle ?? 1;
+    const canonicalWeekId = `week-${cycle}`;
 
     const levelMeta = normalizeStudentLevel(effectiveLevel);
     const { matching = {}, fillInBlanks = {}, sentences = {}, quizAnswers = {} } = studentAnswers;
@@ -20088,7 +19976,7 @@ app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
     // Check in-memory cache to preserve previously evaluated content and prevent duplicate costs
     const evaluatedContent = JSON.stringify({ sentences: sentences || {}, quizAnswers: quizAnswers || {} });
     const contentHash = crypto.createHash('sha256').update(evaluatedContent).digest('hex').slice(0, 16);
-    const evalCacheKey = `${callerUid}_${homework.id || 'hw'}_${contentHash}`;
+    const evalCacheKey = `${canonicalStudentUid}_${canonicalWeekId}_${homework.id || 'hw'}_${contentHash}`;
     const cachedEval = homeworkEvalCache.get(evalCacheKey);
     if (cachedEval && Date.now() < cachedEval.expiry) {
       if (isValidHomeworkEvaluation(cachedEval.data) && !isSyntheticHomeworkEvaluation(cachedEval.data)) {
@@ -20097,11 +19985,7 @@ app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
     }
 
     // Check if student already has a valid persisted evaluation in Firestore for this exact week, sentences, and quiz answers
-    const rawWeek = homework.weekId || homework.id || 'week-1';
-    const cycle = extractPositiveIntegerCycle(rawWeek) || 1;
-    const canonicalWeekId = `week-${cycle}`;
-    const docIds = [callerUid, callerEmail].filter(Boolean);
-    const existingHw = await fetchHomeworkFromFirestore(docIds, canonicalWeekId, cycle).catch(() => null);
+    const existingHw = await fetchHomeworkFromFirestore([canonicalStudentUid], canonicalWeekId, cycle).catch(() => null);
     if (
       existingHw &&
       existingHw.aiEvaluation &&
@@ -20133,7 +20017,7 @@ app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
     }
 
     // Security Hotfix (Etapa 2 & Residuals): Rate limiting check per authenticated UID
-    const rateCheck = await checkAndConsumeRateLimit(callerUid, 'homework_evaluate');
+    const rateCheck = await checkAndConsumeRateLimit(canonicalStudentUid, 'homework_evaluate');
     if (!rateCheck.allowed) {
       if (rateCheck.unavailable) {
         return sendGeminiCostControlUnavailable(res, 5);
@@ -20141,7 +20025,7 @@ app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
       logGeminiAudited({
         feature: 'homework_evaluate',
         status: 'RATE_LIMITED',
-        callerRole: caller.role,
+        callerRole: effectiveRole,
         detail: `Rate limit hit, retry after ${rateCheck.retryAfterSeconds}s`,
       });
       return res.status(429).json({
@@ -20153,7 +20037,7 @@ app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
     }
 
     // Security Hotfix (Etapa 2 & Residuals): Multi-instance Single-Flight Lock with key bound to user and content
-    const flightKey = `homework_evaluate:${callerUid}:${homework.id || 'hw'}:${contentHash}`;
+    const flightKey = `homework_evaluate:${canonicalStudentUid}:${canonicalWeekId}:${homework.id || 'hw'}:${contentHash}`;
     const flightLock = await acquireSingleFlightLock(flightKey);
     if (!flightLock.acquired) {
       if (flightLock.unavailable) {
@@ -20162,7 +20046,7 @@ app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
       logGeminiAudited({
         feature: 'homework_evaluate',
         status: 'INFLIGHT_LOCKED',
-        callerRole: caller.role,
+        callerRole: effectiveRole,
         detail: 'Concurrent homework evaluation in progress',
       });
       return res.status(429).json({
@@ -20272,8 +20156,8 @@ app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
       id: canonicalWeekId,
       weekId: canonicalWeekId,
       weeklyCycle: cycle,
-      studentUid: callerUid,
-      studentEmail: callerEmail || homework.studentEmail,
+      studentUid: canonicalStudentUid,
+      studentEmail: canonicalStudentEmail || homework.studentEmail,
       studentAnswers: {
         matching: mergedMatching,
         fillInBlanks: mergedFill,
@@ -20286,22 +20170,36 @@ app.post('/api/homework/evaluate', firebaseAuthMiddleware, async (req, res) => {
       updatedAt: new Date().toISOString(),
     };
 
-    let initialPersistOk = false;
-    try {
-      initialPersistOk = await saveHomeworkToFirestore(callerUid, canonicalWeekId, cycle, unvalidatedHwState);
-    } catch (errPersist) {
-      console.warn('[homework/evaluate] Erro ao gravar respostas iniciais no Firestore:', errPersist);
-      initialPersistOk = false;
-    }
+    const initSave = await saveCanonicalHomeworkServer({
+      studentUid: canonicalStudentUid,
+      studentEmail: canonicalStudentEmail || homework.studentEmail,
+      canonicalWeekId,
+      cycle,
+      homeworkPayload: unvalidatedHwState,
+      isSubmit: false,
+      enforceStaleCycle: true,
+    });
 
-    if (!initialPersistOk && !getIsCloudWriteDisabled()) {
+    if (!initSave.ok) {
       await flightLock.release();
-      return res.status(500).json({
-        success: false,
-        persisted: false,
-        error: 'FirestorePersistenceFailed',
-        message: 'Falha ao salvar as respostas no banco de dados Firestore. Tente novamente.',
-      });
+      if (initSave.statusCode === 409) {
+        return res.status(409).json({
+          success: false,
+          error: 'STALE_CYCLE',
+          code: 'STALE_CYCLE',
+          activeCycle: initSave.activeCycle,
+          requestedCycle: cycle,
+          message: initSave.error || `Stale cycle ${cycle} rejected; active cycle is ${initSave.activeCycle}.`,
+        });
+      }
+      if (!getIsCloudWriteDisabled()) {
+        return res.status(initSave.statusCode || 500).json({
+          success: false,
+          persisted: false,
+          error: 'FirestorePersistenceFailed',
+          message: 'Falha ao salvar as respostas no banco de dados Firestore. Tente novamente.',
+        });
+      }
     }
 
     // AI evaluation of sentences with Gemini 3-model contingency (Frase do Dia robust pattern)
@@ -20380,7 +20278,7 @@ Output STRICT JSON matching this schema:
           feature: 'homework_evaluate',
           systemInstruction: 'You are a warm, inspiring Native English teacher at "It\'s Simple". Evaluate student written sentences providing accurate, rigorous feedback strictly in valid JSON format.',
           untrustedUserDataPrompt: prompt,
-          callerRole: caller.role,
+          callerRole: effectiveRole,
           apiKey,
           temperature: 0.1,
           validator: (json) => validateHomeworkAiEvaluationResponse(
@@ -20522,17 +20420,17 @@ Output STRICT JSON matching this schema:
       readingFeedback: finalReadingFeedback,
     };
 
-    // Persist genuine validated evaluation directly to Firestore '(default)'
+    // Persist genuine validated evaluation directly to canonical Firestore '(default)'
     const updatedHwForStorage = {
       ...homework,
       id: canonicalWeekId,
       weekId: canonicalWeekId,
       weeklyCycle: cycle,
-      studentUid: callerUid,
-      studentEmail: callerEmail || homework.studentEmail,
+      studentUid: canonicalStudentUid,
+      studentEmail: canonicalStudentEmail || homework.studentEmail,
       isCompleted: true,
       score: overallScore,
-      submittedAt: new Date().toISOString(),
+      submittedAt: existingHw?.submittedAt || homework.submittedAt || new Date().toISOString(),
       studentAnswers: {
         matching: mergedMatching,
         fillInBlanks: mergedFill,
@@ -20543,20 +20441,22 @@ Output STRICT JSON matching this schema:
       updatedAt: new Date().toISOString(),
     };
 
-    let evalPersistOk = false;
-    try {
-      evalPersistOk = await saveHomeworkToFirestore(callerUid, canonicalWeekId, cycle, updatedHwForStorage);
-    } catch (errPersistEval) {
-      console.warn('[homework/evaluate] Erro ao gravar resultado da avaliação no Firestore:', errPersistEval);
-      evalPersistOk = false;
-    }
+    const evalSave = await saveCanonicalHomeworkServer({
+      studentUid: canonicalStudentUid,
+      studentEmail: canonicalStudentEmail || homework.studentEmail,
+      canonicalWeekId,
+      cycle,
+      homeworkPayload: updatedHwForStorage,
+      isSubmit: true,
+      enforceStaleCycle: true,
+    });
 
-    if (!evalPersistOk) {
-      return res.status(500).json({
+    if (!evalSave.ok) {
+      return res.status(evalSave.statusCode === 409 ? 409 : 500).json({
         success: false,
         persisted: true,
         evaluationStatus: 'evaluation_persist_failed',
-        error: 'EvaluationPersistenceFailed',
+        error: evalSave.statusCode === 409 ? 'STALE_CYCLE' : 'EvaluationPersistenceFailed',
         message: 'Suas respostas foram salvas, mas ocorreu uma falha ao registrar a avaliação definitiva no banco de dados. Tente novamente.',
       });
     }
@@ -20565,21 +20465,6 @@ Output STRICT JSON matching this schema:
     if (isValidHomeworkEvaluation(evaluationResponse)) {
       homeworkEvalCache.set(evalCacheKey, { data: evaluationResponse, expiry: Date.now() + 600000 });
     }
-
-    const studentKey = callerUid || callerEmail;
-    const hwScopedKey = `${studentKey}::${canonicalWeekId}`;
-    const db = readDb();
-    if (!db.studentHomeworkMap) db.studentHomeworkMap = {};
-    db.studentHomeworkMap[hwScopedKey] = updatedHwForStorage;
-    if (callerEmail) {
-      db.studentHomeworkMap[`${callerEmail}::${canonicalWeekId}`] = updatedHwForStorage;
-    }
-    if (cycle === 1) {
-      db.studentHomeworkMap[studentKey] = updatedHwForStorage;
-      if (callerEmail) db.studentHomeworkMap[callerEmail] = updatedHwForStorage;
-      db.weeklyHomework = updatedHwForStorage;
-    }
-    writeDb(db);
 
     return res.json({
       success: true,

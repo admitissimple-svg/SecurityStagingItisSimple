@@ -10,6 +10,7 @@ import {
   onSnapshot,
   runTransaction,
 } from 'firebase/firestore';
+import { onAuthStateChanged } from 'firebase/auth';
 import { getDb, auth } from '../firebase';
 import {
   StudentDictionaryEntry,
@@ -2329,200 +2330,114 @@ export function subscribeToStudentWeeklyChecks(
   }) => void,
   week?: string | number | null
 ): () => void {
-  const db = getDb();
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
   const cleanUid = normalizeUid(studentUid, cleanEmail);
-  if (!db || !cleanUid) return () => {};
+  if (!cleanUid && !cleanEmail) return () => {};
 
-  const explicitWeekId = normalizeWeekId(week);
-  const explicitCycle = parseWeekCycleNumber(week);
+  const isCurrentWeekAlias = week === undefined || week === null || (typeof week === 'string' && (week.trim() === '' || week.trim().toLowerCase() === 'current_week'));
+  const explicitWeekId = isCurrentWeekAlias ? 'current_week' : normalizeWeekId(week);
+  const explicitCycle = isCurrentWeekAlias ? null : parseWeekCycleNumber(week);
 
-  let activeWeekUnsub: (() => void) | null = null;
-  let profileUnsub: (() => void) | null = null;
-  let currentSubscribedWeekId: string | null = null;
+  if (!isCurrentWeekAlias && (!explicitWeekId || !explicitCycle)) {
+    return () => {};
+  }
 
-  const subscribeToSpecificWeek = (targetWeekId: string, cycleNumber: number, fallbackToLegacyRoot: boolean = false) => {
-    if (currentSubscribedWeekId === targetWeekId && activeWeekUnsub) {
-      return;
-    }
-    if (activeWeekUnsub) {
-      activeWeekUnsub();
-      activeWeekUnsub = null;
-    }
-    currentSubscribedWeekId = targetWeekId;
+  let isCancelled = false;
 
-    const weekDocRef = doc(db, 'users', cleanUid, 'weeklyChecks', targetWeekId);
-    activeWeekUnsub = onSnapshot(
-      weekDocRef,
-      async (weekSnap) => {
-        if (weekSnap.exists()) {
-          const wData = weekSnap.data();
-          const docChecks: Record<string, boolean> = {
-            ...(wData?.checks || {}),
-            ...(wData?.weeklyChecks || {}),
-            ...(wData?.sPathChecks || {}),
-          };
-          cacheWeeklyChecksLocally(cleanUid, cleanEmail, docChecks, targetWeekId);
-          callback({
-            checks: docChecks,
-            weeklyNativeLessonsTarget: wData?.weeklyNativeLessonsTarget,
-            weeklyStudyDaysTarget: wData?.weeklyStudyDaysTarget,
-            weekId: targetWeekId,
-            weeklyCycle: cycleNumber,
-          });
-        } else if (fallbackToLegacyRoot && cycleNumber === 1) {
-          // Backward compatibility for Week 1 only when no week-1 document exists yet
-          try {
-            const userRef = doc(db, 'users', cleanUid);
-            const userSnap = await withFirestoreTimeout(getDoc(userRef), 2000, null);
-            if (userSnap && userSnap.exists()) {
-              const uData = userSnap.data();
-              const baseChecks: Record<string, boolean> = {
-                ...(uData?.weeklyChecks || {}),
-                ...(uData?.sPathChecks || {}),
-              };
-              if (uData?.weeklyHomework?.completedPartsByDay && typeof uData.weeklyHomework.completedPartsByDay === 'object') {
-                Object.entries(uData.weeklyHomework.completedPartsByDay).forEach(([day, isDone]) => {
-                  if (isDone) baseChecks[`memorization_${day}`] = true;
-                });
-              }
-              try {
-                const memoCol = collection(db, 'users', cleanUid, 'memorization');
-                const memoSnaps = await withFirestoreTimeout(getDocs(memoCol), 1500, null);
-                if (memoSnaps && !memoSnaps.empty) {
-                  memoSnaps.forEach((d) => {
-                    if (d.data()?.completed) {
-                      baseChecks[`memorization_${d.id}`] = true;
-                    }
-                  });
-                }
-              } catch {}
-              try {
-                const hwDoc = doc(db, 'users', cleanUid, 'homework', 'current_week');
-                const hwSnap = await withFirestoreTimeout(getDoc(hwDoc), 1500, null);
-                if (hwSnap && hwSnap.exists()) {
-                  const hwData = hwSnap.data();
-                  if (hwData?.completedPartsByDay && typeof hwData.completedPartsByDay === 'object') {
-                    Object.entries(hwData.completedPartsByDay).forEach(([day, isDone]) => {
-                      if (isDone) baseChecks[`memorization_${day}`] = true;
-                    });
-                  }
-                }
-              } catch {}
+  const fetchLatest = async () => {
+    if (isCancelled) return;
+    try {
+      const token = await getAccessToken().catch(() => null);
+      if (isCancelled) return;
+      if (typeof window !== 'undefined' && !token) return;
 
-              cacheWeeklyChecksLocally(cleanUid, cleanEmail, baseChecks, targetWeekId);
-              callback({
-                checks: baseChecks,
-                weeklyNativeLessonsTarget: uData?.weeklyNativeLessonsTarget,
-                weeklyStudyDaysTarget: uData?.weeklyStudyDaysTarget,
-                weekId: targetWeekId,
-                weeklyCycle: 1,
-              });
-              return;
-            }
-          } catch {}
-          // Check backend server API for persisted checks before assuming empty
-          try {
-            const qParams = new URLSearchParams();
-            if (cleanUid) qParams.append('studentUid', cleanUid);
-            if (cleanEmail) qParams.append('studentEmail', cleanEmail);
-            qParams.append('weeklyCycle', String(1));
-            qParams.append('weekId', targetWeekId);
-            const res = await fetch(`/api/routines/weekly-checks?${qParams.toString()}`);
-            if (res.ok) {
-              const sData = await res.json();
-              if (sData?.checks && Object.keys(sData.checks).length > 0) {
-                cacheWeeklyChecksLocally(cleanUid, cleanEmail, sData.checks, targetWeekId);
-                callback({
-                  checks: sData.checks,
-                  weeklyNativeLessonsTarget: sData.weeklyNativeLessonsTarget,
-                  weeklyStudyDaysTarget: sData.weeklyStudyDaysTarget,
-                  weekId: targetWeekId,
-                  weeklyCycle: 1,
-                });
-                return;
-              }
-            }
-          } catch {}
-          cacheWeeklyChecksLocally(cleanUid, cleanEmail, {}, targetWeekId);
-          callback({ checks: {}, weekId: targetWeekId, weeklyCycle: 1 });
-        } else {
-          // Week 2 onward: check backend server API before falling back to empty checks
-          try {
-            const qParams = new URLSearchParams();
-            if (cleanUid) qParams.append('studentUid', cleanUid);
-            if (cleanEmail) qParams.append('studentEmail', cleanEmail);
-            qParams.append('weeklyCycle', String(cycleNumber));
-            qParams.append('weekId', targetWeekId);
-            const res = await fetch(`/api/routines/weekly-checks?${qParams.toString()}`);
-            if (res.ok) {
-              const sData = await res.json();
-              if (sData?.checks && Object.keys(sData.checks).length > 0) {
-                cacheWeeklyChecksLocally(cleanUid, cleanEmail, sData.checks, targetWeekId);
-                callback({
-                  checks: sData.checks,
-                  weeklyNativeLessonsTarget: sData.weeklyNativeLessonsTarget,
-                  weeklyStudyDaysTarget: sData.weeklyStudyDaysTarget,
-                  weekId: targetWeekId,
-                  weeklyCycle: cycleNumber,
-                });
-                return;
-              }
-            }
-          } catch {}
-          cacheWeeklyChecksLocally(cleanUid, cleanEmail, {}, targetWeekId);
-          callback({
-            checks: {},
-            weekId: targetWeekId,
-            weeklyCycle: cycleNumber,
-          });
-        }
-      },
-      (err) => {
-        console.warn(`Real-time weeklyChecks notice for ${cleanUid}/${targetWeekId}:`, err);
+      const canonicalUid = auth?.currentUser?.uid || (isValidCanonicalUid(cleanUid) ? cleanUid : '');
+      const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
+      const safeStudentEmail = (cleanEmail && cleanEmail.includes('@') && (!currentAuthEmail || currentAuthEmail === cleanEmail)) ? cleanEmail : '';
+
+      const qParams = new URLSearchParams();
+      if (canonicalUid) qParams.append('studentUid', canonicalUid);
+      if (safeStudentEmail) qParams.append('studentEmail', safeStudentEmail);
+      if (explicitWeekId === 'current_week') {
+        qParams.append('weekId', 'current_week');
+      } else {
+        qParams.append('weeklyCycle', String(explicitCycle));
+        qParams.append('weekId', explicitWeekId!);
       }
-    );
+
+      const headers: Record<string, string> = {};
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+
+      const res = await fetch(`/api/routines/weekly-checks?${qParams.toString()}`, { headers });
+      if (isCancelled || !res.ok) return;
+
+      const sData = await res.json().catch(() => null);
+      if (isCancelled || !sData || !sData.success) return;
+
+      const resolvedWeekId = sData.weekId || (explicitWeekId !== 'current_week' ? explicitWeekId : 'week-1');
+      const resolvedCycle = sData.weeklyCycle || explicitCycle || 1;
+      const docChecks: Record<string, boolean> = sData.checks || {};
+
+      cacheWeeklyChecksLocally(canonicalUid || cleanUid, cleanEmail, docChecks, resolvedWeekId);
+      callback({
+        checks: docChecks,
+        weeklyNativeLessonsTarget: sData.weeklyNativeLessonsTarget,
+        weeklyStudyDaysTarget: sData.weeklyStudyDaysTarget,
+        weekId: resolvedWeekId,
+        weeklyCycle: resolvedCycle,
+      });
+    } catch (err) {
+      console.warn(`WeeklyChecks API sync notice for ${cleanUid}:`, err);
+    }
   };
 
-  if (explicitWeekId && explicitCycle) {
-    subscribeToSpecificWeek(explicitWeekId, explicitCycle, explicitCycle === 1);
-  } else {
-    // Week identity not explicitly passed: observe user profile to resolve active cycle
-    // CRITICAL: If weeklyCycle cannot be determined, do NOT silently default to Week 1!
-    const userRef = doc(db, 'users', cleanUid);
-    profileUnsub = onSnapshot(
-      userRef,
-      (uSnap) => {
-        if (uSnap.exists()) {
-          const uData = uSnap.data();
-          const resolvedCycle = typeof uData?.weeklyCycle === 'number' && uData.weeklyCycle > 0 ? uData.weeklyCycle : 1;
-          const resolvedWeekId = `week-${resolvedCycle}`;
-          subscribeToSpecificWeek(resolvedWeekId, resolvedCycle, resolvedCycle === 1);
-        } else {
-          subscribeToSpecificWeek('week-1', 1, true);
+  fetchLatest();
+
+  let unsubAuth: (() => void) | null = null;
+  if (typeof window !== 'undefined' && auth) {
+    try {
+      unsubAuth = onAuthStateChanged(auth, (user) => {
+        if (user && !isCancelled) {
+          fetchLatest();
         }
-      },
-      (err) => {
-        console.warn(`Real-time notice for profile user ${cleanUid}:`, err);
-        subscribeToSpecificWeek('week-1', 1, true);
-      }
-    );
+      });
+    } catch {}
+  }
+
+  const handleUpdatedEvent = (ev: Event) => {
+    if (isCancelled) return;
+    const detail = (ev as CustomEvent)?.detail;
+    if (!detail) return;
+    const detailUid = detail.studentUid || '';
+    if (detailUid && cleanUid && detailUid !== cleanUid && detailUid !== auth?.currentUser?.uid) return;
+    if (!isCurrentWeekAlias && detail.weeklyCycle && explicitCycle && detail.weeklyCycle !== explicitCycle) return;
+    if (detail.checks && typeof detail.checks === 'object') {
+      callback({
+        checks: detail.checks,
+        weeklyNativeLessonsTarget: detail.weeklyNativeLessonsTarget,
+        weeklyStudyDaysTarget: detail.weeklyStudyDaysTarget,
+        weekId: detail.weekId,
+        weeklyCycle: detail.weeklyCycle,
+      });
+    }
+  };
+
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('its-simple:weekly-checks-updated', handleUpdatedEvent);
   }
 
   return () => {
-    if (activeWeekUnsub) activeWeekUnsub();
-    if (profileUnsub) profileUnsub();
+    isCancelled = true;
+    if (unsubAuth) unsubAuth();
+    if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      window.removeEventListener('its-simple:weekly-checks-updated', handleUpdatedEvent);
+    }
   };
 }
 
 /**
- * Persist student S-Path (Gráfico S) weekly checks to Firestore under users/{studentUID}/weeklyChecks/week-${cycle}.
- * Requirements:
- * - Scoped to the requested week (users/{uid}/weeklyChecks/week-${cycle}).
- * - Prevents checks from previous weeks from being merged into the current week.
- * - Week 1: preserves backward compatibility by reading root doc if week-1 doc does not exist yet.
- * - Week 2+: never falls back to legacy root-level checks or merges previous weeks.
- * - Refuses to silently default to Week 1 when week identity is unknown.
+ * Persist student S-Path (Gráfico S) weekly checks via authenticated /api/routines/weekly-checks endpoint.
+ * Writes exclusively to canonical Firestore users/{uid}/weeklyChecks/week-{cycle} (and goals on users/{uid}).
  */
 export async function saveStudentWeeklyChecksToFirestore(
   studentUid: string,
@@ -2542,21 +2457,29 @@ export async function saveStudentWeeklyChecksToFirestore(
     const sanitizedChecks: Record<string, boolean> = JSON.parse(JSON.stringify(checks || {}));
 
     const isChecksEmpty = Object.keys(sanitizedChecks).length === 0;
-    if (isChecksEmpty && !isNewWeekReset) {
+    const hasGoals =
+      (typeof weeklyNativeLessonsTarget === 'number' && weeklyNativeLessonsTarget > 0) ||
+      (typeof weeklyStudyDaysTarget === 'number' && weeklyStudyDaysTarget >= 1 && weeklyStudyDaysTarget <= 7);
+    if (isChecksEmpty && !isNewWeekReset && !hasGoals) {
       // Guard against race conditions and empty overwrites: do not wipe persisted checks without explicit new week reset
       return true;
     }
 
-    let targetWeekId = normalizeWeekId(week);
-    let targetCycle = parseWeekCycleNumber(week);
+    const isCurrentWeekAlias =
+      week === undefined ||
+      week === null ||
+      (typeof week === 'string' && (week.trim() === '' || week.trim().toLowerCase() === 'current_week'));
 
-    if (!targetWeekId || !targetCycle) {
-      targetCycle = 1;
-      targetWeekId = 'week-1';
+    let targetWeekId = isCurrentWeekAlias ? 'current_week' : normalizeWeekId(week);
+    let targetCycle = isCurrentWeekAlias ? null : parseWeekCycleNumber(week);
+
+    if (!isCurrentWeekAlias && (!targetWeekId || !targetCycle)) {
+      console.warn(`[studentPersistence] saveStudentWeeklyChecksToFirestore: Invalid week identifier '${week}'.`);
+      return false;
     }
 
-    // In-memory cache fallback as baseline
-    const localCached = getCachedWeeklyChecks(cleanUid, cleanEmail, targetWeekId);
+    // In-memory cache fallback as baseline when weekId is explicit
+    const localCached = targetWeekId !== 'current_week' ? getCachedWeeklyChecks(cleanUid, cleanEmail, targetWeekId!) : {};
     const mergedChecks: Record<string, boolean> = isNewWeekReset
       ? sanitizedChecks
       : {
@@ -2564,21 +2487,28 @@ export async function saveStudentWeeklyChecksToFirestore(
           ...sanitizedChecks,
         };
 
-    // Phase 3B: Use authenticated Express endpoint as primary persistence path with Firebase ID Token
     const token = await getAccessToken().catch(() => null);
+    if (typeof window !== 'undefined' && !token) {
+      console.warn('[studentPersistence] saveStudentWeeklyChecksToFirestore: missing Firebase ID token.');
+      return false;
+    }
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (token) {
       headers['Authorization'] = `Bearer ${token}`;
     }
 
-    const payload = {
-      studentUid: cleanUid,
-      studentEmail: cleanEmail || undefined,
+    const canonicalUid = auth?.currentUser?.uid || cleanUid;
+    const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
+    const safeStudentEmail = (cleanEmail && cleanEmail.includes('@') && (!currentAuthEmail || currentAuthEmail === cleanEmail)) ? cleanEmail : undefined;
+
+    const payload: Record<string, any> = {
+      studentUid: canonicalUid,
+      ...(safeStudentEmail ? { studentEmail: safeStudentEmail } : {}),
       checks: mergedChecks,
       merge: !isNewWeekReset,
       reset: isNewWeekReset,
       weekId: targetWeekId,
-      weeklyCycle: targetCycle,
+      ...(targetCycle ? { weeklyCycle: targetCycle } : {}),
       weeklyNativeLessonsTarget,
       weeklyStudyDaysTarget,
     };
@@ -2600,9 +2530,25 @@ export async function saveStudentWeeklyChecksToFirestore(
       return false;
     }
 
-    // Success confirmed by backend: update local in-memory cache
+    const confirmedWeekId = resData.weekId || (targetWeekId !== 'current_week' ? targetWeekId : 'week-1');
     const confirmedChecks = resData.checks || mergedChecks;
-    cacheWeeklyChecksLocally(cleanUid, cleanEmail, confirmedChecks, targetWeekId);
+    cacheWeeklyChecksLocally(canonicalUid, cleanEmail, confirmedChecks, confirmedWeekId);
+
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(
+        new CustomEvent('its-simple:weekly-checks-updated', {
+          detail: {
+            studentUid: canonicalUid,
+            weekId: confirmedWeekId,
+            weeklyCycle: resData.weeklyCycle || targetCycle,
+            checks: confirmedChecks,
+            weeklyNativeLessonsTarget: resData.weeklyNativeLessonsTarget,
+            weeklyStudyDaysTarget: resData.weeklyStudyDaysTarget,
+          },
+        })
+      );
+    }
+
     return true;
   } catch (error) {
     console.error(`[studentPersistence] saveStudentWeeklyChecksToFirestore error for ${cleanUid}:`, error);
@@ -2637,34 +2583,28 @@ export async function saveMemorizationCompletionToFirestore(
 
   // 1. Resolve canonical week BEFORE performing any related persistence operation.
   const isCurrentWeekAlias = !weekId || weekId === 'current_week' || (typeof weekId === 'string' && weekId.trim() === '');
-  let targetCycle: number | null = null;
-  let targetWeekId: string | null = null;
+  let targetCycle: number | null = parseWeekCycleNumber(isCurrentWeekAlias ? homeworkData?.weeklyCycle : weekId);
+  let targetWeekId: string | null = targetCycle !== null ? `week-${targetCycle}` : (isCurrentWeekAlias ? 'current_week' : null);
 
-  if (isCurrentWeekAlias) {
-    targetCycle = parseWeekCycleNumber(homeworkData?.weeklyCycle) || 1;
-  } else {
-    targetCycle = parseWeekCycleNumber(weekId);
-  }
-
-  if (targetCycle !== null) {
-    targetWeekId = `week-${targetCycle}`;
-  }
-
-  if (!targetCycle || !targetWeekId) {
+  if (!targetWeekId) {
     console.warn(
       `[studentPersistence] saveMemorizationCompletionToFirestore: Failed to resolve canonical week for student ${cleanUid} (weekId: '${weekId}'). Aborting safely.`
     );
     return false;
   }
 
-  // 2. Perform persistence via authenticated Express endpoints (Phase 3B: primary path)
   try {
     const token = await getAccessToken().catch(() => null);
+    if (typeof window !== 'undefined' && !token) {
+      console.warn('[studentPersistence] saveMemorizationCompletionToFirestore: missing Firebase ID token.');
+      return false;
+    }
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (token) {
       headers['Authorization'] = `Bearer ${token}`;
     }
 
+    const canonicalUid = auth?.currentUser?.uid || cleanUid;
     const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
     const safeStudentEmail = (cleanEmail && cleanEmail.includes('@') && (!currentAuthEmail || currentAuthEmail === cleanEmail)) ? cleanEmail : undefined;
 
@@ -2673,12 +2613,12 @@ export async function saveMemorizationCompletionToFirestore(
       method: 'POST',
       headers,
       body: JSON.stringify({
-        studentUid: cleanUid,
+        studentUid: canonicalUid,
         ...(safeStudentEmail ? { studentEmail: safeStudentEmail } : {}),
         checks: { [checkKey]: isCompleted },
         merge: true,
         weekId: targetWeekId,
-        weeklyCycle: targetCycle,
+        ...(targetCycle !== null ? { weeklyCycle: targetCycle } : {}),
       }),
     });
 
@@ -2693,16 +2633,19 @@ export async function saveMemorizationCompletionToFirestore(
       return false;
     }
 
+    const resolvedCycle = checksData.weeklyCycle || targetCycle || 1;
+    const resolvedWeekId = checksData.weekId || (targetWeekId !== 'current_week' ? targetWeekId : `week-${resolvedCycle}`);
+
     // 2b. Homework completion endpoint
     const hwRes = await fetch('/api/homework', {
       method: 'POST',
       headers,
       body: JSON.stringify({
-        uid: cleanUid,
-        studentUid: cleanUid,
+        uid: canonicalUid,
+        studentUid: canonicalUid,
         ...(safeStudentEmail ? { studentEmail: safeStudentEmail } : {}),
-        weekId: targetWeekId,
-        weeklyCycle: targetCycle,
+        weekId: resolvedWeekId,
+        weeklyCycle: resolvedCycle,
         weeklyHomework: {
           completedPartsByDay: { [day]: isCompleted },
           isDayPartCompleted: isCompleted,
@@ -2722,17 +2665,17 @@ export async function saveMemorizationCompletionToFirestore(
     }
 
     // 2c. Multi-device studentJournal activity log
-    const journalEntryId = `memorization_${day}_${targetCycle}`;
+    const journalEntryId = `memorization_${day}_${resolvedCycle}`;
     const journalEntry: StudentJournalEntry = {
       id: journalEntryId,
       type: 'memorization',
       date: getDateForDayInCurrentWeek(day),
       dayOfWeek: day,
-      week: targetCycle,
+      week: resolvedCycle,
       timestamp: Date.now(),
       title: 'Weekly Memorization Activity',
       details: `Completed Memorization for ${day}`,
-      studentUid: cleanUid,
+      studentUid: canonicalUid,
       studentEmail: cleanEmail,
     };
 
@@ -2740,23 +2683,41 @@ export async function saveMemorizationCompletionToFirestore(
       method: 'POST',
       headers,
       body: JSON.stringify({
-        studentUid: cleanUid,
+        studentUid: canonicalUid,
         ...(safeStudentEmail ? { studentEmail: safeStudentEmail } : {}),
         entry: journalEntry,
       }),
     }).catch(() => {});
 
-    // Update in-memory session cache scoped to targetWeekId upon confirmed persistence
-    const currentCached = getCachedWeeklyChecks(cleanUid, cleanEmail, targetWeekId);
-    cacheWeeklyChecksLocally(
-      cleanUid,
-      cleanEmail,
-      {
-        ...currentCached,
-        [checkKey]: isCompleted,
-      },
-      targetWeekId
-    );
+    // Update in-memory session cache scoped to resolvedWeekId upon confirmed persistence
+    const currentCached = getCachedWeeklyChecks(canonicalUid, cleanEmail, resolvedWeekId);
+    const updatedChecks = checksData.checks || { ...currentCached, [checkKey]: isCompleted };
+    cacheWeeklyChecksLocally(canonicalUid, cleanEmail, updatedChecks, resolvedWeekId);
+
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(
+        new CustomEvent('its-simple:weekly-checks-updated', {
+          detail: {
+            studentUid: canonicalUid,
+            weekId: resolvedWeekId,
+            weeklyCycle: resolvedCycle,
+            checks: updatedChecks,
+          },
+        })
+      );
+      if (hwData.weeklyHomework) {
+        window.dispatchEvent(
+          new CustomEvent('its-simple:homework-updated', {
+            detail: {
+              studentUid: canonicalUid,
+              weekId: resolvedWeekId,
+              weeklyCycle: resolvedCycle,
+              homework: hwData.weeklyHomework,
+            },
+          })
+        );
+      }
+    }
 
     return true;
   } catch (err) {
@@ -2784,244 +2745,77 @@ export async function fetchStudentWeeklyChecksFromFirestore(
   weekId?: string;
   weeklyCycle?: number;
 }> {
-  const db = getDb();
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
   const cleanUid = normalizeUid(studentUid, cleanEmail);
 
-  let targetWeekId = normalizeWeekId(week);
-  let targetCycle = parseWeekCycleNumber(week);
+  const isCurrentWeekAlias =
+    week === undefined ||
+    week === null ||
+    (typeof week === 'string' && (week.trim() === '' || week.trim().toLowerCase() === 'current_week'));
 
-  // If week was not provided by caller, attempt to resolve from user profile
-  if (!targetWeekId && db && cleanUid) {
-    try {
-      const userRef = doc(db, 'users', cleanUid);
-      const userSnap = await withFirestoreTimeout(getDoc(userRef), 2000, null);
-      if (userSnap && userSnap.exists()) {
-        const uData = userSnap.data();
-        if (typeof uData?.weeklyCycle === 'number' && uData.weeklyCycle > 0) {
-          targetCycle = uData.weeklyCycle;
-          targetWeekId = `week-${targetCycle}`;
-        }
-      }
-    } catch {}
-  }
+  const targetWeekId = isCurrentWeekAlias ? 'current_week' : normalizeWeekId(week);
+  const targetCycle = isCurrentWeekAlias ? null : parseWeekCycleNumber(week);
 
-  // CRITICAL: If week identity is unknown, refuse to silently default to Week 1!
-  if (!targetWeekId || !targetCycle) {
+  if (!isCurrentWeekAlias && (!targetWeekId || !targetCycle)) {
     console.warn(
-      `[studentPersistence] fetchStudentWeeklyChecksFromFirestore: Week identity is unknown for ${cleanUid}. Explicit week parameter required (Phase 02-B dependency). Refusing to default to Week 1.`
+      `[studentPersistence] fetchStudentWeeklyChecksFromFirestore: Invalid week parameter '${week}' for ${cleanUid}. Refusing to default to Week 1.`
     );
     return { checks: {} };
   }
 
-  // Check in-memory session cache for this specific week
-  const localCached = getCachedWeeklyChecks(cleanUid, cleanEmail, targetWeekId);
-  let combinedChecks: Record<string, boolean> = { ...localCached };
-  let resolvedNativeTarget: number | undefined;
-  let resolvedStudyTarget: number | undefined;
-
-  // 1. Phase 3B: Query authenticated backend endpoint as primary path
-  if (cleanUid || cleanEmail) {
-    try {
-      const qParams = new URLSearchParams();
-      if (cleanUid) qParams.append('studentUid', cleanUid);
-      if (cleanEmail) qParams.append('studentEmail', cleanEmail);
-      if (targetCycle) qParams.append('weeklyCycle', String(targetCycle));
-      if (targetWeekId) qParams.append('weekId', targetWeekId);
-
-      const headers: Record<string, string> = {};
-      const token = await getAccessToken().catch(() => null);
-      if (token) headers['Authorization'] = `Bearer ${token}`;
-
-      const serverRes = await fetch(`/api/routines/weekly-checks?${qParams.toString()}`, { headers });
-      if (serverRes.ok) {
-        const sData = await serverRes.json();
-        if (sData && sData.success) {
-          const sChecks = sData.checks || {};
-          combinedChecks = { ...combinedChecks, ...sChecks };
-          if (typeof sData.weeklyNativeLessonsTarget === 'number' && sData.weeklyNativeLessonsTarget > 0) {
-            resolvedNativeTarget = sData.weeklyNativeLessonsTarget;
-          }
-          if (typeof sData.weeklyStudyDaysTarget === 'number' && sData.weeklyStudyDaysTarget > 0) {
-            resolvedStudyTarget = sData.weeklyStudyDaysTarget;
-          }
-          cacheWeeklyChecksLocally(cleanUid, cleanEmail, combinedChecks, targetWeekId);
-          return {
-            checks: combinedChecks,
-            weeklyNativeLessonsTarget: resolvedNativeTarget,
-            weeklyStudyDaysTarget: resolvedStudyTarget,
-            weekId: targetWeekId,
-            weeklyCycle: targetCycle,
-          };
-        }
-      }
-    } catch (serverErr) {
-      console.warn('[studentPersistence] Notice fetching weeklyChecks from server API:', serverErr);
-    }
+  if (!cleanUid && !cleanEmail) {
+    return { checks: {} };
   }
 
-  // 2. Read week-specific document users/{cleanUid}/weeklyChecks/{targetWeekId} (Fallback)
-  if (db && cleanUid) {
-    try {
-      const weekDocRef = doc(db, 'users', cleanUid, 'weeklyChecks', targetWeekId);
-      const weekSnap = await withFirestoreTimeout(getDoc(weekDocRef), 2500, null);
-      if (weekSnap && weekSnap.exists()) {
-        const wData = weekSnap.data();
-        const docChecks: Record<string, boolean> = {
-          ...(wData?.checks || {}),
-          ...(wData?.weeklyChecks || {}),
-          ...(wData?.sPathChecks || {}),
+  const localCached = targetWeekId !== 'current_week' ? getCachedWeeklyChecks(cleanUid, cleanEmail, targetWeekId!) : {};
+
+  try {
+    const token = await getAccessToken().catch(() => null);
+    if (typeof window !== 'undefined' && !token) {
+      return { checks: localCached };
+    }
+
+    const canonicalUid = auth?.currentUser?.uid || cleanUid;
+    const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
+    const safeStudentEmail = (cleanEmail && cleanEmail.includes('@') && (!currentAuthEmail || currentAuthEmail === cleanEmail)) ? cleanEmail : '';
+
+    const qParams = new URLSearchParams();
+    if (canonicalUid) qParams.append('studentUid', canonicalUid);
+    if (safeStudentEmail) qParams.append('studentEmail', safeStudentEmail);
+    if (targetCycle) qParams.append('weeklyCycle', String(targetCycle));
+    if (targetWeekId) qParams.append('weekId', targetWeekId);
+
+    const headers: Record<string, string> = {};
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const serverRes = await fetch(`/api/routines/weekly-checks?${qParams.toString()}`, { headers });
+    if (serverRes.ok) {
+      const sData = await serverRes.json().catch(() => null);
+      if (sData && sData.success) {
+        const resolvedWeekId = sData.weekId || (targetWeekId !== 'current_week' ? targetWeekId : undefined);
+        const resolvedCycle = sData.weeklyCycle || targetCycle || undefined;
+        const sChecks = sData.checks || {};
+        const combinedChecks = { ...localCached, ...sChecks };
+        if (resolvedWeekId) {
+          cacheWeeklyChecksLocally(canonicalUid || cleanUid, cleanEmail, combinedChecks, resolvedWeekId);
+        }
+        return {
+          checks: combinedChecks,
+          weeklyNativeLessonsTarget: typeof sData.weeklyNativeLessonsTarget === 'number' && sData.weeklyNativeLessonsTarget > 0 ? sData.weeklyNativeLessonsTarget : undefined,
+          weeklyStudyDaysTarget: typeof sData.weeklyStudyDaysTarget === 'number' && sData.weeklyStudyDaysTarget > 0 ? sData.weeklyStudyDaysTarget : undefined,
+          weekId: resolvedWeekId,
+          weeklyCycle: resolvedCycle,
         };
-        combinedChecks = {
-          ...combinedChecks,
-          ...docChecks,
-        };
-        if (typeof wData?.weeklyNativeLessonsTarget === 'number' && wData.weeklyNativeLessonsTarget > 0) {
-          resolvedNativeTarget = wData.weeklyNativeLessonsTarget;
-        }
-        if (typeof wData?.weeklyStudyDaysTarget === 'number' && wData.weeklyStudyDaysTarget > 0) {
-          resolvedStudyTarget = wData.weeklyStudyDaysTarget;
-        }
       }
-
-      // Backward compatibility for Week 1 only: check root document
-      if (targetCycle === 1) {
-        const userRef = doc(db, 'users', cleanUid);
-        const userSnap = await withFirestoreTimeout(getDoc(userRef), 2500, null);
-        if (userSnap && userSnap.exists()) {
-          const data = userSnap.data();
-          validateFirestoreDocument('users', data, { path: `users/${cleanUid}` });
-          const rootChecks: Record<string, boolean> = {
-            ...(data?.weeklyChecks || {}),
-            ...(data?.sPathChecks || {}),
-          };
-          combinedChecks = {
-            ...combinedChecks,
-            ...rootChecks,
-          };
-
-          if (data?.weeklyHomework?.completedPartsByDay && typeof data.weeklyHomework.completedPartsByDay === 'object') {
-            Object.entries(data.weeklyHomework.completedPartsByDay).forEach(([day, isDone]) => {
-              if (isDone) combinedChecks[`memorization_${day}`] = true;
-            });
-          }
-
-          try {
-            const memoCol = collection(db, 'users', cleanUid, 'memorization');
-            const memoSnaps = await withFirestoreTimeout(getDocs(memoCol), 1500, null);
-            if (memoSnaps && !memoSnaps.empty) {
-              memoSnaps.forEach((d) => {
-                if (d.data()?.completed) {
-                  combinedChecks[`memorization_${d.id}`] = true;
-                }
-              });
-            }
-          } catch {}
-
-          try {
-            const hwSubDoc = doc(db, 'users', cleanUid, 'homework', 'current_week');
-            const hwSubSnap = await withFirestoreTimeout(getDoc(hwSubDoc), 1500, null);
-            if (hwSubSnap && hwSubSnap.exists()) {
-              const hwData = hwSubSnap.data();
-              if (hwData?.completedPartsByDay && typeof hwData.completedPartsByDay === 'object') {
-                Object.entries(hwData.completedPartsByDay).forEach(([day, isDone]) => {
-                  if (isDone) combinedChecks[`memorization_${day}`] = true;
-                });
-              }
-            }
-          } catch {}
-
-          if (resolvedNativeTarget === undefined && typeof data?.weeklyNativeLessonsTarget === 'number' && data.weeklyNativeLessonsTarget > 0) {
-            resolvedNativeTarget = data.weeklyNativeLessonsTarget;
-          }
-          if (resolvedStudyTarget === undefined && typeof data?.weeklyStudyDaysTarget === 'number' && data.weeklyStudyDaysTarget > 0) {
-            resolvedStudyTarget = data.weeklyStudyDaysTarget;
-          }
-        }
-      }
-    } catch (err) {
-      console.warn(`Notice fetching weeklyChecks from Firestore for ${targetWeekId}:`, err);
     }
+  } catch (serverErr) {
+    console.warn('[studentPersistence] Notice fetching weeklyChecks from server API:', serverErr);
   }
-
-  // 2. Week 1 legacy email doc check (strictly for cycle === 1)
-  if (targetCycle === 1 && db && cleanEmail) {
-    const legacyDocId = `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
-    if (legacyDocId !== cleanUid) {
-      try {
-        const altRef = doc(db, 'users', legacyDocId);
-        const altSnap = await withFirestoreTimeout(getDoc(altRef), 2000, null);
-        if (altSnap && altSnap.exists()) {
-          const altData = altSnap.data();
-          const altChecks: Record<string, boolean> = {
-            ...(altData?.weeklyChecks || {}),
-            ...(altData?.sPathChecks || {}),
-          };
-          if (altData?.weeklyHomework?.completedPartsByDay) {
-            Object.entries(altData.weeklyHomework.completedPartsByDay).forEach(([day, isDone]) => {
-              if (isDone) altChecks[`memorization_${day}`] = true;
-            });
-          }
-          combinedChecks = {
-            ...combinedChecks,
-            ...altChecks,
-          };
-          if (resolvedNativeTarget === undefined && typeof altData?.weeklyNativeLessonsTarget === 'number' && altData.weeklyNativeLessonsTarget > 0) {
-            resolvedNativeTarget = altData.weeklyNativeLessonsTarget;
-          }
-          if (resolvedStudyTarget === undefined && typeof altData?.weeklyStudyDaysTarget === 'number' && altData.weeklyStudyDaysTarget > 0) {
-            resolvedStudyTarget = altData.weeklyStudyDaysTarget;
-          }
-        }
-      } catch {}
-    }
-  }
-
-  // 3. Server API sync / fallback (hydrated from authoritative Cloud Firestore)
-  // ALWAYS query backend server API to ensure all checks persisted in Firestore are loaded and merged
-  if (cleanUid || cleanEmail) {
-    try {
-      const qParams = new URLSearchParams();
-      if (cleanUid) qParams.append('studentUid', cleanUid);
-      if (cleanEmail) qParams.append('studentEmail', cleanEmail);
-      if (targetCycle) qParams.append('weeklyCycle', String(targetCycle));
-      if (targetWeekId) qParams.append('weekId', targetWeekId);
-
-      const headers: Record<string, string> = {};
-      try {
-        const token = await getAccessToken().catch(() => null);
-        if (token) headers['Authorization'] = `Bearer ${token}`;
-      } catch {}
-
-      const serverRes = await fetch(`/api/routines/weekly-checks?${qParams.toString()}`, { headers });
-      if (serverRes.ok) {
-        const sData = await serverRes.json();
-        if (sData && sData.checks && typeof sData.checks === 'object') {
-          combinedChecks = {
-            ...combinedChecks,
-            ...sData.checks,
-          };
-          if (resolvedNativeTarget === undefined && typeof sData.weeklyNativeLessonsTarget === 'number' && sData.weeklyNativeLessonsTarget > 0) {
-            resolvedNativeTarget = sData.weeklyNativeLessonsTarget;
-          }
-          if (resolvedStudyTarget === undefined && typeof sData.weeklyStudyDaysTarget === 'number' && sData.weeklyStudyDaysTarget > 0) {
-            resolvedStudyTarget = sData.weeklyStudyDaysTarget;
-          }
-        }
-      }
-    } catch (serverErr) {
-      console.warn('Notice fetching weeklyChecks from server API:', serverErr);
-    }
-  }
-
-  cacheWeeklyChecksLocally(cleanUid, cleanEmail, combinedChecks, targetWeekId);
 
   return {
-    checks: combinedChecks,
-    weeklyNativeLessonsTarget: resolvedNativeTarget,
-    weeklyStudyDaysTarget: resolvedStudyTarget,
-    weekId: targetWeekId,
-    weeklyCycle: targetCycle,
+    checks: localCached,
+    weekId: targetWeekId !== 'current_week' ? targetWeekId! : undefined,
+    weeklyCycle: targetCycle ?? undefined,
   };
 }
 
@@ -3974,49 +3768,23 @@ export async function saveStudentHomeworkProgressToFirestore(
   studentUid: string,
   studentEmail: string | undefined,
   homework: WeeklyHomeworkData,
-  weekId: string = 'current_week'
+  weekId: string = 'current_week',
+  options?: { submit?: boolean }
 ): Promise<boolean> {
-  const db = getDb();
   const cleanUid = normalizeUid(studentUid, studentEmail);
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
 
-  if (!homework) return false;
+  if (!homework || (!cleanUid && !cleanEmail)) return false;
 
-  // Resolve canonical week cycle.
-  // Treat "current_week" (or omitted/empty) as an alias requiring resolution from persisted weeklyCycle.
   const isCurrentWeekAlias = !weekId || weekId === 'current_week' || (typeof weekId === 'string' && weekId.trim() === '');
-  let targetCycle: number | null = null;
-  let targetWeekId: string | null = null;
-  let existingHomework: any = {};
-  let existingUserDoc: any = {};
+  let targetCycle: number | null = isCurrentWeekAlias
+    ? parseWeekCycleNumber(homework?.weeklyCycle)
+    : parseWeekCycleNumber(weekId);
+  let targetWeekId: string | null = targetCycle !== null ? `week-${targetCycle}` : (isCurrentWeekAlias ? 'current_week' : null);
 
-  if (db && cleanUid) {
-    try {
-      const userRef = doc(db, 'users', cleanUid);
-      const uSnap = await withFirestoreTimeout(getDoc(userRef), 2000, null);
-      if (uSnap && uSnap.exists()) {
-        existingUserDoc = uSnap.data() || {};
-        existingHomework = existingUserDoc?.weeklyHomework || {};
-      }
-    } catch {}
-  }
-
-  if (isCurrentWeekAlias) {
-    targetCycle =
-      parseWeekCycleNumber(homework?.weeklyCycle) ||
-      parseWeekCycleNumber(existingUserDoc?.weeklyCycle) ||
-      parseWeekCycleNumber(existingHomework?.weeklyCycle);
-  } else {
-    targetCycle = parseWeekCycleNumber(weekId);
-  }
-
-  if (targetCycle !== null) {
-    targetWeekId = `week-${targetCycle}`;
-  }
-
-  if (!targetCycle || !targetWeekId) {
+  if (!targetWeekId) {
     console.warn(
-      `[studentPersistence] saveStudentHomeworkProgressToFirestore: Failed to resolve canonical week for student ${cleanUid} (weekId: '${weekId}'). Aborting safely without partially updating homework. Refusing to default to Week 1.`
+      `[studentPersistence] saveStudentHomeworkProgressToFirestore: Failed to resolve canonical week for student ${cleanUid} (weekId: '${weekId}'). Aborting safely.`
     );
     return false;
   }
@@ -4035,134 +3803,22 @@ export async function saveStudentHomeworkProgressToFirestore(
       }
     }
 
-    // For existing homework, check week-specific doc
-    if (db && cleanUid) {
-      try {
-        const hwSnap = await withFirestoreTimeout(getDoc(doc(db, 'users', cleanUid, 'homework', targetWeekId)), 1500, null);
-        if (hwSnap && hwSnap.exists()) {
-          existingHomework = hwSnap.data() || existingHomework;
-        }
-      } catch {}
-
-      // Also check student_homework collection (HOTFIX 2.3.2)
-      try {
-        const topSnap = await withFirestoreTimeout(getDoc(doc(db, 'student_homework', cleanUid)), 1500, null);
-        if (topSnap && topSnap.exists()) {
-          const topData = topSnap.data();
-          if (topData) {
-            const topCycle =
-              topData.weeklyCycle !== undefined
-                ? Number(topData.weeklyCycle)
-                : typeof topData.weekId === 'string'
-                ? parseInt(topData.weekId.replace(/\D/g, ''), 10)
-                : targetCycle === 1
-                ? 1
-                : null;
-            if (topCycle === targetCycle || (targetCycle === 1 && !topCycle)) {
-              existingHomework = mergeHomeworkRecords(topData, existingHomework);
-            }
-          }
-        }
-      } catch {}
-    }
-
-    if (existingHomework?.aiEvaluation) {
-      if (isSyntheticHomeworkEvaluation(existingHomework.aiEvaluation) || !isValidHomeworkEvaluation(existingHomework.aiEvaluation)) {
-        delete existingHomework.aiEvaluation;
-        if (existingHomework.isCompleted) {
-          existingHomework.isCompleted = false;
-          delete existingHomework.score;
-        }
-      }
-    }
-
-    const mergedCompletedParts = {
-      ...(existingHomework?.completedPartsByDay || {}),
-      ...(sanitizedHomework?.completedPartsByDay || {}),
-    };
-
-    const mergedStudentAnswers = {
-      matching: { ...(existingHomework?.studentAnswers?.matching || {}), ...(sanitizedHomework?.studentAnswers?.matching || {}) },
-      fillInBlanks: { ...(existingHomework?.studentAnswers?.fillInBlanks || {}), ...(sanitizedHomework?.studentAnswers?.fillInBlanks || {}) },
-      sentences: { ...(existingHomework?.studentAnswers?.sentences || {}), ...(sanitizedHomework?.studentAnswers?.sentences || {}) },
-      quizAnswers: { ...(existingHomework?.studentAnswers?.quizAnswers || {}), ...(sanitizedHomework?.studentAnswers?.quizAnswers || {}) },
-    };
-
-    // HOTFIX 2.3.1: Strictly protect genuine aiEvaluation, score, and isCompleted against empty or autosave state
-    const finalAiEvaluation = (
-      sanitizedHomework.aiEvaluation && isValidHomeworkEvaluation(sanitizedHomework.aiEvaluation) && !isSyntheticHomeworkEvaluation(sanitizedHomework.aiEvaluation)
-    ) ? sanitizedHomework.aiEvaluation : (
-      existingHomework?.aiEvaluation && isValidHomeworkEvaluation(existingHomework.aiEvaluation) && !isSyntheticHomeworkEvaluation(existingHomework.aiEvaluation)
-    ) ? existingHomework.aiEvaluation : undefined;
-
-    const finalScore = (typeof sanitizedHomework.score === 'number' && sanitizedHomework.score > 0)
-      ? sanitizedHomework.score
-      : (typeof existingHomework?.score === 'number' && existingHomework.score > 0)
-      ? existingHomework.score
-      : (typeof sanitizedHomework.score === 'number')
-      ? sanitizedHomework.score
-      : (typeof existingHomework?.score === 'number')
-      ? existingHomework.score
-      : 0;
-
-    const finalIsCompleted = Boolean(
-      sanitizedHomework.isCompleted ||
-      existingHomework?.isCompleted ||
-      (finalAiEvaluation && finalScore > 0)
-    );
-
-    const finalMatchingPairs = (Array.isArray(sanitizedHomework.matchingPairs) && sanitizedHomework.matchingPairs.length > 0)
-      ? sanitizedHomework.matchingPairs
-      : (Array.isArray(existingHomework?.matchingPairs) && existingHomework.matchingPairs.length > 0)
-      ? existingHomework.matchingPairs
-      : [];
-
-    const finalFillInBlanks = (Array.isArray(sanitizedHomework.fillInBlanks) && sanitizedHomework.fillInBlanks.length > 0)
-      ? sanitizedHomework.fillInBlanks
-      : (Array.isArray(existingHomework?.fillInBlanks) && existingHomework.fillInBlanks.length > 0)
-      ? existingHomework.fillInBlanks
-      : [];
-
-    const finalPrompts = (Array.isArray(sanitizedHomework.sentenceWritingPrompts) && sanitizedHomework.sentenceWritingPrompts.length > 0)
-      ? sanitizedHomework.sentenceWritingPrompts
-      : (Array.isArray(existingHomework?.sentenceWritingPrompts) && existingHomework.sentenceWritingPrompts.length > 0)
-      ? existingHomework.sentenceWritingPrompts
-      : [];
-
-    const finalReadingPassage = (sanitizedHomework.readingPassage?.text)
-      ? sanitizedHomework.readingPassage
-      : (existingHomework?.readingPassage?.text)
-      ? existingHomework.readingPassage
-      : sanitizedHomework.readingPassage;
-
-    const mergedDailyActivities = mergeDailyActivities(
-      existingHomework?.dailyActivities,
-      sanitizedHomework?.dailyActivities
-    );
-
+    const canonicalUid = auth?.currentUser?.uid || cleanUid;
     const payload = stampSchemaVersion({
-      ...existingHomework,
       ...sanitizedHomework,
-      id: targetWeekId,
-      weekId: targetWeekId,
-      weeklyCycle: targetCycle,
-      studentUid: cleanUid,
+      ...(targetWeekId !== 'current_week' ? { id: targetWeekId, weekId: targetWeekId } : {}),
+      ...(targetCycle ? { weeklyCycle: targetCycle } : {}),
+      studentUid: canonicalUid,
       studentEmail: cleanEmail,
-      matchingPairs: finalMatchingPairs,
-      fillInBlanks: finalFillInBlanks,
-      sentenceWritingPrompts: finalPrompts,
-      readingPassage: finalReadingPassage,
-      completedPartsByDay: mergedCompletedParts,
-      dailyActivities: mergedDailyActivities,
-      studentAnswers: mergedStudentAnswers,
-      aiEvaluation: finalAiEvaluation,
-      score: finalScore,
-      isCompleted: finalIsCompleted,
       updatedAt: new Date().toISOString(),
     });
 
-    // Phase 3B: Use authenticated Express endpoint as primary persistence path with Firebase ID Token
     const token = await getAccessToken().catch(() => null);
+    if (typeof window !== 'undefined' && !token) {
+      console.warn('[studentPersistence] saveStudentHomeworkProgressToFirestore: missing Firebase ID token.');
+      return false;
+    }
+
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (token) {
       headers['Authorization'] = `Bearer ${token}`;
@@ -4171,15 +3827,16 @@ export async function saveStudentHomeworkProgressToFirestore(
     const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
     const safeStudentEmail = (cleanEmail && cleanEmail.includes('@') && (!currentAuthEmail || currentAuthEmail === cleanEmail)) ? cleanEmail : undefined;
 
-    const res = await fetch('/api/homework', {
+    const endpoint = options?.submit ? '/api/homework/submit' : '/api/homework';
+    const res = await fetch(endpoint, {
       method: 'POST',
       headers,
       body: JSON.stringify({
-        uid: cleanUid,
-        studentUid: cleanUid,
+        uid: canonicalUid,
+        studentUid: canonicalUid,
         ...(safeStudentEmail ? { studentEmail: safeStudentEmail } : {}),
         weekId: targetWeekId,
-        weeklyCycle: targetCycle,
+        ...(targetCycle ? { weeklyCycle: targetCycle } : {}),
         weeklyHomework: payload,
       }),
     });
@@ -4195,6 +3852,19 @@ export async function saveStudentHomeworkProgressToFirestore(
       return false;
     }
 
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(
+        new CustomEvent('its-simple:homework-updated', {
+          detail: {
+            studentUid: canonicalUid,
+            weekId: resData.weekId || targetWeekId,
+            weeklyCycle: resData.weeklyCycle || targetCycle,
+            homework: resData.weeklyHomework || payload,
+          },
+        })
+      );
+    }
+
     return true;
   } catch (error) {
     console.error(`[studentPersistence] Failed to save homework for ${cleanUid}:`, error);
@@ -4203,229 +3873,86 @@ export async function saveStudentHomeworkProgressToFirestore(
 }
 
 /**
- * Fetch student weekly homework and activity progress directly from Cloud Firestore.
- * Prioritizes Firestore users/{cleanUid}/homework/week-${cycle}.
- * - Week 1: Falls back to users/{cleanUid}.weeklyHomework, current_week, and student_homework/{cleanUid} for backward compatibility.
- * - Week 2+: Strictly reads from users/{cleanUid}/homework/week-${cycle}. Never falls back to Week 1 or legacy root homework.
- * - Refuses to silently default to Week 1 when week identity cannot be determined.
+ * Fetch student weekly homework and activity progress exclusively via authenticated /api/homework endpoint.
  */
 export async function fetchStudentHomeworkProgressFromFirestore(
   studentUid: string,
   studentEmail?: string,
   weekId: string = 'current_week'
 ): Promise<WeeklyHomeworkData | null> {
-  const db = getDb();
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
   const cleanUid = normalizeUid(studentUid, cleanEmail);
 
-  if (!db || !cleanUid) return null;
+  if (!cleanUid && !cleanEmail) return null;
 
-  // Resolve canonical week identifier
   const isCurrentWeekAlias = !weekId || weekId === 'current_week' || (typeof weekId === 'string' && weekId.trim() === '');
-  let targetCycle: number | null = null;
-  let targetWeekId: string | null = null;
+  const targetCycle: number | null = isCurrentWeekAlias ? null : parseWeekCycleNumber(weekId);
+  const targetWeekId: string | null = isCurrentWeekAlias
+    ? 'current_week'
+    : (targetCycle !== null ? `week-${targetCycle}` : null);
 
-  if (isCurrentWeekAlias) {
-    try {
-      const userRef = doc(db, 'users', cleanUid);
-      const userSnap = await withFirestoreTimeout(getDoc(userRef), 2000, null);
-      if (userSnap && userSnap.exists()) {
-        const uData = userSnap.data();
-        targetCycle = parseWeekCycleNumber(uData?.weeklyCycle);
-      }
-    } catch {}
-  } else {
-    targetCycle = parseWeekCycleNumber(weekId);
-  }
-
-  if (targetCycle !== null) {
-    targetWeekId = `week-${targetCycle}`;
-  }
-
-  if (!targetCycle || !targetWeekId) {
+  if (!targetWeekId) {
     console.warn(
-      `[studentPersistence] fetchStudentHomeworkProgressFromFirestore: Week identity is unknown for ${cleanUid} (weekId: '${weekId}'). Explicit week parameter required. Refusing to default to Week 1.`
+      `[studentPersistence] fetchStudentHomeworkProgressFromFirestore: Invalid week identifier '${weekId}' for ${cleanUid}.`
     );
     return null;
   }
 
-  // 1. Phase 3B: Query authenticated backend endpoint as primary path
-  if (cleanEmail || cleanUid) {
-    try {
-      const token = await getAccessToken().catch(() => null);
-      if (token) {
-        const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
-        const safeStudentEmail = (cleanEmail && cleanEmail.includes('@') && (!currentAuthEmail || currentAuthEmail === cleanEmail)) ? cleanEmail : '';
-
-        const params = new URLSearchParams();
-        if (cleanUid) {
-          params.append('uid', cleanUid);
-          params.append('studentUid', cleanUid);
-        }
-        if (safeStudentEmail) {
-          params.append('studentEmail', safeStudentEmail);
-        }
-        params.append('weekId', targetWeekId);
-        params.append('weeklyCycle', String(targetCycle));
-
-        const res = await fetch(`/api/homework?${params.toString()}`, {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        });
-        if (res.ok) {
-          const apiData = await res.json();
-          if (apiData && (apiData.completedPartsByDay || apiData.studentAnswers || apiData.dailyActivities)) {
-            if (targetCycle >= 2) {
-              const apiCycle =
-                parseWeekCycleNumber(apiData.weeklyCycle) ||
-                parseWeekCycleNumber(apiData.weekId) ||
-                parseWeekCycleNumber(apiData.id);
-              if (apiCycle && apiCycle !== targetCycle) {
-                // Discard mismatching week data
-                return null;
-              }
-            }
-            return sanitizeLoadedHomeworkData(apiData as WeeklyHomeworkData);
-          }
-        }
-      }
-    } catch (apiErr) {
-      console.warn('[studentPersistence] Notice fetching homework from backend API:', apiErr);
-    }
-  }
-
   try {
-    // 2. Fallback: Fetch from canonical subcollection users/{cleanUid}/homework/week-${cycle}
-    let combinedData: any = null;
-    const hwDocRef = doc(db, 'users', cleanUid, 'homework', targetWeekId);
-    const hwSnap = await withFirestoreTimeout(getDoc(hwDocRef), 2500, null);
-    if (hwSnap && hwSnap.exists()) {
-      combinedData = hwSnap.data();
+    const token = await getAccessToken().catch(() => null);
+    if (typeof window !== 'undefined' && !token) {
+      return null;
     }
 
-    // 2. Authoritative check on student_homework (HOTFIX 2.3.2 & HOTFIX 2.3.3)
-    // Ensures genuine evaluation, score, and student answers recorded in student_homework are always restored without cycle mixing
-    try {
-      const weekSpecificRef = doc(db, 'student_homework', `${cleanUid}_${targetWeekId}`);
-      const weekSpecificSnap = await withFirestoreTimeout(getDoc(weekSpecificRef), 2000, null);
-      if (weekSpecificSnap && weekSpecificSnap.exists()) {
-        combinedData = mergeHomeworkRecords(weekSpecificSnap.data(), combinedData);
-      }
+    const canonicalUid = auth?.currentUser?.uid || cleanUid;
+    const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
+    const safeStudentEmail = (cleanEmail && cleanEmail.includes('@') && (!currentAuthEmail || currentAuthEmail === cleanEmail)) ? cleanEmail : '';
 
-      const topRef = doc(db, 'student_homework', cleanUid);
-      const topSnap = await withFirestoreTimeout(getDoc(topRef), 2500, null);
-      if (topSnap && topSnap.exists()) {
-        const topData = topSnap.data();
-        if (topData) {
-          if (topData.cycles && topData.cycles[targetWeekId]) {
-            combinedData = mergeHomeworkRecords(topData.cycles[targetWeekId], combinedData);
-          }
-          const topCycle =
-            topData.weeklyCycle !== undefined
-              ? Number(topData.weeklyCycle)
-              : typeof topData.weekId === 'string'
-              ? parseInt(topData.weekId.replace(/\D/g, ''), 10)
-              : targetCycle === 1
-              ? 1
-              : null;
-          if (topCycle === targetCycle || (targetCycle === 1 && !topCycle)) {
-            combinedData = mergeHomeworkRecords(topData, combinedData);
-          }
-        }
-      }
-    } catch {}
+    const params = new URLSearchParams();
+    if (canonicalUid) {
+      params.append('uid', canonicalUid);
+      params.append('studentUid', canonicalUid);
+    }
+    if (safeStudentEmail) {
+      params.append('studentEmail', safeStudentEmail);
+    }
+    params.append('weekId', targetWeekId);
+    if (targetCycle) {
+      params.append('weeklyCycle', String(targetCycle));
+    }
 
-    // 3. Week 1 backward compatibility only (consulted when answers/evaluation are not yet complete):
-    if (targetCycle === 1) {
-      const hasAnswersOrEval = Boolean(
-        combinedData?.aiEvaluation ||
-        (combinedData?.studentAnswers &&
-          (Object.keys(combinedData.studentAnswers.matching || {}).length > 0 ||
-           Object.keys(combinedData.studentAnswers.fillInBlanks || {}).length > 0 ||
-           Object.keys(combinedData.studentAnswers.sentences || {}).length > 0 ||
-           Object.keys(combinedData.studentAnswers.quizAnswers || {}).length > 0))
-      );
+    const headers: Record<string, string> = {};
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
 
-      if (!hasAnswersOrEval) {
-        // Check legacy subcollection document 'current_week'
-        try {
-          const legacyHwRef = doc(db, 'users', cleanUid, 'homework', 'current_week');
-          const legacySnap = await withFirestoreTimeout(getDoc(legacyHwRef), 2000, null);
-          if (legacySnap && legacySnap.exists()) {
-            combinedData = mergeHomeworkRecords(legacySnap.data(), combinedData);
-          }
-        } catch {}
+    const res = await fetch(`/api/homework?${params.toString()}`, { headers });
+    if (!res.ok) return null;
 
-        // Check users/{cleanUid} document
-        try {
-          const userRef = doc(db, 'users', cleanUid);
-          const userSnap = await withFirestoreTimeout(getDoc(userRef), 2500, null);
-          if (userSnap && userSnap.exists()) {
-            const data = userSnap.data();
-            if (data?.weeklyHomework) {
-              combinedData = mergeHomeworkRecords(data.weeklyHomework, combinedData);
-            }
-          }
-        } catch {}
+    const apiData = await res.json().catch(() => null);
+    if (!apiData) return null;
+
+    const hasSubstantiveFields = Boolean(
+      apiData.completedPartsByDay ||
+      apiData.studentAnswers ||
+      apiData.dailyActivities ||
+      (Array.isArray(apiData.matchingPairs) && apiData.matchingPairs.length > 0)
+    );
+    if (!hasSubstantiveFields) return null;
+
+    if (targetCycle && targetCycle >= 2) {
+      const apiCycle =
+        parseWeekCycleNumber(apiData.weeklyCycle) ||
+        parseWeekCycleNumber(apiData.weekId) ||
+        parseWeekCycleNumber(apiData.id);
+      if (apiCycle && apiCycle !== targetCycle) {
+        return null;
       }
     }
 
-    if (combinedData) {
-      return sanitizeLoadedHomeworkData(combinedData as WeeklyHomeworkData);
-    }
-
-    // 3. Server API fallback: strictly request targetWeekId & targetCycle
-    if (cleanEmail || cleanUid) {
-      try {
-        const token = await getAccessToken();
-        if (!token) {
-          // Authentication initializing or unavailable: do not execute unauthenticated fallback
-          return null;
-        }
-
-        const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
-        const safeStudentEmail = (cleanEmail && cleanEmail.includes('@') && (!currentAuthEmail || currentAuthEmail === cleanEmail)) ? cleanEmail : '';
-
-        const params = new URLSearchParams();
-        if (cleanUid) {
-          params.append('uid', cleanUid);
-          params.append('studentUid', cleanUid);
-        }
-        if (safeStudentEmail) {
-          params.append('studentEmail', safeStudentEmail);
-        }
-        params.append('weekId', targetWeekId);
-        params.append('weeklyCycle', String(targetCycle));
-
-        const res = await fetch(`/api/homework?${params.toString()}`, {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        });
-        if (res.ok) {
-          const apiData = await res.json();
-          // Requirement 9: Prevent an unscoped legacy server response from being treated as valid Week 2+ completion data!
-          if (apiData && (apiData.completedPartsByDay || apiData.studentAnswers)) {
-            if (targetCycle >= 2) {
-              const apiCycle =
-                parseWeekCycleNumber(apiData.weeklyCycle) ||
-                parseWeekCycleNumber(apiData.weekId) ||
-                parseWeekCycleNumber(apiData.id);
-              if (apiCycle !== targetCycle) {
-                // Discard legacy unscoped data or mismatching week data
-                return null;
-              }
-            }
-            return sanitizeLoadedHomeworkData(apiData as WeeklyHomeworkData);
-          }
-        }
-      } catch {}
-    }
-
-    return null;
-  } catch (error) {
-    handleFirestoreError(error, OperationType.GET, `users/${cleanUid}/homework/${targetWeekId}`);
+    return sanitizeLoadedHomeworkData(apiData as WeeklyHomeworkData);
+  } catch (apiErr) {
+    console.warn('[studentPersistence] Notice fetching homework from backend API:', apiErr);
     return null;
   }
 }
@@ -4584,183 +4111,158 @@ export function subscribeToStudentHomeworkProgress(
   callback: (homework: WeeklyHomeworkData) => void,
   weekId: string = 'current_week'
 ): () => void {
-  const db = getDb();
-  const cleanUid = normalizeUid(studentUid, studentEmail);
-  if (!db || !cleanUid) {
+  const cleanEmail = (studentEmail || '').toLowerCase().trim();
+  const cleanUid = normalizeUid(studentUid, cleanEmail);
+  if (!cleanUid && !cleanEmail) {
     return () => {};
   }
 
-  const unsubs: (() => void)[] = [];
-  let activeHwUnsub: (() => void) | null = null;
+  const isCurrentWeekAlias = !weekId || weekId === 'current_week' || (typeof weekId === 'string' && weekId.trim() === '');
+  const explicitCycle = isCurrentWeekAlias ? null : parseWeekCycleNumber(weekId);
+  if (!isCurrentWeekAlias && explicitCycle === null) {
+    console.warn(
+      `[studentPersistence] subscribeToStudentHomeworkProgress: Rejecting malformed explicit week identifier '${weekId}' for ${cleanUid}.`
+    );
+    return () => {};
+  }
 
-  const attachWeekListener = (cycle: number, initialUserData?: any) => {
-    if (activeHwUnsub) {
-      activeHwUnsub();
-      activeHwUnsub = null;
+  let isCancelled = false;
+
+  const hydrateNormalizedHomework = (data: Partial<WeeklyHomeworkData>, cycle: number): WeeklyHomeworkData => {
+    const canonicalWeekId = `week-${cycle}`;
+    const hasCompletedParts = data.completedPartsByDay && Object.keys(data.completedPartsByDay).length > 0;
+    const hasAnswers = data.studentAnswers && (
+      (data.studentAnswers.matching && Object.keys(data.studentAnswers.matching).length > 0) ||
+      (data.studentAnswers.fillInBlanks && Object.keys(data.studentAnswers.fillInBlanks).length > 0) ||
+      (data.studentAnswers.sentences && Object.keys(data.studentAnswers.sentences).length > 0) ||
+      (data.studentAnswers.quizAnswers && Object.keys(data.studentAnswers.quizAnswers).length > 0)
+    );
+    const isCompleted = !!data.isCompleted || !!data.isDayPartCompleted;
+    const hasExercises = Boolean(
+      (Array.isArray(data.matchingPairs) && data.matchingPairs.length > 0) ||
+      (Array.isArray(data.fillInBlanks) && data.fillInBlanks.length > 0) ||
+      (Array.isArray(data.sentenceWritingPrompts) && data.sentenceWritingPrompts.length > 0) ||
+      (data.dailyActivities && Object.values(data.dailyActivities).some((act: any) =>
+        (Array.isArray(act?.matchingPairs) && act.matchingPairs.length > 0) ||
+        (Array.isArray(act?.fillInBlanks) && act.fillInBlanks.length > 0) ||
+        (Array.isArray(act?.sentenceWritingPrompts) && act.sentenceWritingPrompts.length > 0) ||
+        (Array.isArray(act?.selectedWords) && act.selectedWords.length > 0)
+      ))
+    );
+
+    if ((!hasCompletedParts && !hasAnswers && !isCompleted && !hasExercises) || (data.isEmpty && !hasExercises)) {
+      return createCleanInitializedHomework(cleanUid, studentEmail, cycle, data);
     }
 
-    const canonicalWeekId = `week-${cycle}`;
-    try {
-      const hwDocRef = doc(db, 'users', cleanUid, 'homework', canonicalWeekId);
-      activeHwUnsub = onSnapshot(
-        hwDocRef,
-        (snap) => {
-          if (snap.exists()) {
-            // Canonical document EXISTS:
-            const data = (snap.data() || {}) as Partial<WeeklyHomeworkData>;
-            const hasCompletedParts = data.completedPartsByDay && Object.keys(data.completedPartsByDay).length > 0;
-            const hasAnswers = data.studentAnswers && (
-              (data.studentAnswers.matching && Object.keys(data.studentAnswers.matching).length > 0) ||
-              (data.studentAnswers.fillInBlanks && Object.keys(data.studentAnswers.fillInBlanks).length > 0) ||
-              (data.studentAnswers.sentences && Object.keys(data.studentAnswers.sentences).length > 0) ||
-              (data.studentAnswers.quizAnswers && Object.keys(data.studentAnswers.quizAnswers).length > 0)
-            );
-            const isCompleted = !!data.isCompleted || !!data.isDayPartCompleted;
+    const cleanBase = createCleanInitializedHomework(cleanUid, studentEmail, cycle, data);
+    const mergedDaily = data.dailyActivities
+      ? mergeDailyActivities(cleanBase.dailyActivities, data.dailyActivities)
+      : cleanBase.dailyActivities;
 
-            const hasExercises = Boolean(
-              (Array.isArray(data.matchingPairs) && data.matchingPairs.length > 0) ||
-              (Array.isArray(data.fillInBlanks) && data.fillInBlanks.length > 0) ||
-              (Array.isArray(data.sentenceWritingPrompts) && data.sentenceWritingPrompts.length > 0) ||
-              (data.dailyActivities && Object.values(data.dailyActivities).some((act: any) =>
-                (Array.isArray(act?.matchingPairs) && act.matchingPairs.length > 0) ||
-                (Array.isArray(act?.fillInBlanks) && act.fillInBlanks.length > 0) ||
-                (Array.isArray(act?.sentenceWritingPrompts) && act.sentenceWritingPrompts.length > 0) ||
-                (Array.isArray(act?.selectedWords) && act.selectedWords.length > 0)
-              ))
-            );
-
-            // Truly empty document without answers, completion, or exercises: notify subscriber with clean initialized state
-            if ((!hasCompletedParts && !hasAnswers && !isCompleted && !hasExercises) || (data.isEmpty && !hasExercises)) {
-              callback(createCleanInitializedHomework(cleanUid, studentEmail, cycle, data));
-            } else {
-              const cleanBase = createCleanInitializedHomework(cleanUid, studentEmail, cycle, data);
-              const mergedDaily = data.dailyActivities
-                ? mergeDailyActivities(cleanBase.dailyActivities, data.dailyActivities)
-                : cleanBase.dailyActivities;
-
-              const sanitizedResult = sanitizeLoadedHomeworkData({
-                ...cleanBase,
-                ...data,
-                dailyActivities: mergedDaily,
-                matchingPairs: Array.isArray(data.matchingPairs) && data.matchingPairs.length > 0 ? data.matchingPairs : cleanBase.matchingPairs,
-                fillInBlanks: Array.isArray(data.fillInBlanks) && data.fillInBlanks.length > 0 ? data.fillInBlanks : cleanBase.fillInBlanks,
-                sentenceWritingPrompts: Array.isArray(data.sentenceWritingPrompts) && data.sentenceWritingPrompts.length > 0 ? data.sentenceWritingPrompts : cleanBase.sentenceWritingPrompts,
-                vocabularyList: Array.isArray(data.vocabularyList) && data.vocabularyList.length > 0 ? data.vocabularyList : cleanBase.vocabularyList,
-                allRoutineWords: Array.isArray(data.allRoutineWords) && data.allRoutineWords.length > 0 ? data.allRoutineWords : cleanBase.allRoutineWords,
-                studentLevel: data.studentLevel || cleanBase.studentLevel,
-                readingPassage: data.readingPassage
-                  ? {
-                      ...cleanBase.readingPassage,
-                      ...data.readingPassage,
-                      questions: Array.isArray(data.readingPassage.questions)
-                        ? data.readingPassage.questions.map((q: any, qIdx: number) => ({
-                            ...q,
-                            id: q?.id || `q-${qIdx + 1}`,
-                            options: Array.isArray(q?.options) ? q.options : [],
-                          }))
-                        : (cleanBase.readingPassage?.questions || []),
-                    }
-                  : cleanBase.readingPassage,
-                weekId: canonicalWeekId,
-                weeklyCycle: cycle,
-              } as WeeklyHomeworkData);
-
-              callback(sanitizedResult);
-            }
-          } else {
-            // Canonical document DOES NOT EXIST (deleted, missing, or not yet created)
-            if (cycle === 1) {
-              // Consult legacy Week 1 storage ONLY when canonical week-1 document does not exist
-              let usedLegacy = false;
-              if (
-                initialUserData?.weeklyHomework &&
-                (initialUserData.weeklyHomework.completedPartsByDay || initialUserData.weeklyHomework.studentAnswers)
-              ) {
-                callback(initialUserData.weeklyHomework as WeeklyHomeworkData);
-                usedLegacy = true;
-              }
-
-              if (!usedLegacy) {
-                // Check users/{cleanUid}/homework/current_week fallback
-                getDoc(doc(db, 'users', cleanUid, 'homework', 'current_week'))
-                  .then((legacySnap) => {
-                    if (legacySnap.exists()) {
-                      const lData = legacySnap.data() as WeeklyHomeworkData;
-                      if (lData && (lData.completedPartsByDay || lData.studentAnswers || lData.matchingPairs)) {
-                        callback(lData);
-                        return;
-                      }
-                    }
-                    callback(createCleanInitializedHomework(cleanUid, studentEmail, 1));
-                  })
-                  .catch(() => {
-                    callback(createCleanInitializedHomework(cleanUid, studentEmail, 1));
-                  });
-              }
-            } else {
-              // Week 2 or later: NEVER consult legacy Week 1 storage!
-              // Notify subscriber with clean initialized homework state
-              callback(createCleanInitializedHomework(cleanUid, studentEmail, cycle));
-            }
+    return sanitizeLoadedHomeworkData({
+      ...cleanBase,
+      ...data,
+      dailyActivities: mergedDaily,
+      matchingPairs: Array.isArray(data.matchingPairs) && data.matchingPairs.length > 0 ? data.matchingPairs : cleanBase.matchingPairs,
+      fillInBlanks: Array.isArray(data.fillInBlanks) && data.fillInBlanks.length > 0 ? data.fillInBlanks : cleanBase.fillInBlanks,
+      sentenceWritingPrompts: Array.isArray(data.sentenceWritingPrompts) && data.sentenceWritingPrompts.length > 0 ? data.sentenceWritingPrompts : cleanBase.sentenceWritingPrompts,
+      vocabularyList: Array.isArray(data.vocabularyList) && data.vocabularyList.length > 0 ? data.vocabularyList : cleanBase.vocabularyList,
+      allRoutineWords: Array.isArray(data.allRoutineWords) && data.allRoutineWords.length > 0 ? data.allRoutineWords : cleanBase.allRoutineWords,
+      studentLevel: data.studentLevel || cleanBase.studentLevel,
+      readingPassage: data.readingPassage
+        ? {
+            ...cleanBase.readingPassage,
+            ...data.readingPassage,
+            questions: Array.isArray(data.readingPassage.questions)
+              ? data.readingPassage.questions.map((q: any, qIdx: number) => ({
+                  ...q,
+                  id: q?.id || `q-${qIdx + 1}`,
+                  options: Array.isArray(q?.options) ? q.options : [],
+                }))
+              : (cleanBase.readingPassage?.questions || []),
           }
-        },
-        (err) => {
-          console.warn('Real-time notice for student homework subcollection listener:', err);
-        }
-      );
-    } catch {}
+        : cleanBase.readingPassage,
+      weekId: canonicalWeekId,
+      weeklyCycle: cycle,
+    } as WeeklyHomeworkData);
   };
 
-  const isCurrentWeekAlias = weekId === 'current_week';
-  if (!isCurrentWeekAlias) {
-    const explicitCycle = parseWeekCycleNumber(weekId);
-    if (explicitCycle === null) {
-      // Requirement 1: Reject malformed explicit week identifiers.
-      // Do not silently interpret an invalid week as Week 1, and do not fall back to dynamic alias.
-      console.warn(
-        `[studentPersistence] subscribeToStudentHomeworkProgress: Rejecting malformed explicit week identifier '${weekId}' for ${cleanUid}. Refusing to default to Week 1.`
-      );
-      return () => {};
-    }
-    // Explicit valid week cycle confirmed
-    attachWeekListener(explicitCycle);
-  } else {
-    // Dynamic alias 'current_week': resolve dynamically from student profile
+  const fetchLatest = async () => {
+    if (isCancelled) return;
     try {
-      const userRef = doc(db, 'users', cleanUid);
-      let currentResolvedCycle: number | null = null;
-      unsubs.push(
-        onSnapshot(
-          userRef,
-          (snap) => {
-            if (snap.exists()) {
-              const uData = snap.data();
-              const newCycle = parseWeekCycleNumber(uData?.weeklyCycle);
-              if (newCycle === null) {
-                // Requirement 1: Do not silently interpret an invalid or missing weeklyCycle as Week 1
-                if (activeHwUnsub) {
-                  activeHwUnsub();
-                  activeHwUnsub = null;
-                }
-                currentResolvedCycle = null;
-                return;
-              }
-              // Preserve valid Week 1 behavior when the cycle is explicitly confirmed
-              if (newCycle !== currentResolvedCycle) {
-                currentResolvedCycle = newCycle;
-                attachWeekListener(newCycle, uData);
-              }
-            }
-          },
-          () => {}
-        )
-      );
+      const token = await getAccessToken().catch(() => null);
+      if (isCancelled) return;
+      if (typeof window !== 'undefined' && !token) return;
+
+      const canonicalUid = auth?.currentUser?.uid || (isValidCanonicalUid(cleanUid) ? cleanUid : '');
+      const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
+      const safeStudentEmail = (cleanEmail && cleanEmail.includes('@') && (!currentAuthEmail || currentAuthEmail === cleanEmail)) ? cleanEmail : '';
+
+      const params = new URLSearchParams();
+      if (canonicalUid) {
+        params.append('uid', canonicalUid);
+        params.append('studentUid', canonicalUid);
+      }
+      if (safeStudentEmail) {
+        params.append('studentEmail', safeStudentEmail);
+      }
+      if (isCurrentWeekAlias) {
+        params.append('weekId', 'current_week');
+      } else {
+        params.append('weekId', `week-${explicitCycle}`);
+        params.append('weeklyCycle', String(explicitCycle));
+      }
+
+      const headers: Record<string, string> = {};
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+
+      const res = await fetch(`/api/homework?${params.toString()}`, { headers });
+      if (isCancelled || !res.ok) return;
+
+      const data = await res.json().catch(() => null);
+      if (isCancelled || !data) return;
+
+      const resolvedCycle = parseWeekCycleNumber(data.weeklyCycle) || parseWeekCycleNumber(data.weekId) || explicitCycle || 1;
+      callback(hydrateNormalizedHomework(data, resolvedCycle));
+    } catch (err) {
+      console.warn('Homework API sync notice:', err);
+    }
+  };
+
+  fetchLatest();
+
+  let unsubAuth: (() => void) | null = null;
+  if (typeof window !== 'undefined' && auth) {
+    try {
+      unsubAuth = onAuthStateChanged(auth, (user) => {
+        if (user && !isCancelled) {
+          fetchLatest();
+        }
+      });
     } catch {}
   }
 
+  const handleUpdatedEvent = (ev: Event) => {
+    if (isCancelled) return;
+    const detail = (ev as CustomEvent)?.detail;
+    if (!detail?.homework) return;
+    const detailUid = detail.studentUid || '';
+    if (detailUid && cleanUid && detailUid !== cleanUid && detailUid !== auth?.currentUser?.uid) return;
+    const detailCycle = parseWeekCycleNumber(detail.weeklyCycle) || parseWeekCycleNumber(detail.weekId) || explicitCycle || 1;
+    if (!isCurrentWeekAlias && explicitCycle && detailCycle !== explicitCycle) return;
+    callback(hydrateNormalizedHomework(detail.homework, detailCycle));
+  };
+
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('its-simple:homework-updated', handleUpdatedEvent);
+  }
+
   return () => {
-    if (activeHwUnsub) activeHwUnsub();
-    unsubs.forEach((u) => u());
+    isCancelled = true;
+    if (unsubAuth) unsubAuth();
+    if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      window.removeEventListener('its-simple:homework-updated', handleUpdatedEvent);
+    }
   };
 }
 

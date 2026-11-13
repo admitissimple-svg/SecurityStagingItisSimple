@@ -1572,7 +1572,6 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
       studentRoutinesMap: sanitized.studentRoutinesMap || {},
       studentCurrentRoutines: sanitized.studentCurrentRoutines || {},
       routinesByDay: sanitized.routinesByDay || {},
-      studentWeeklyChecks: sanitized.studentWeeklyChecks || {},
       weeklyNativeTargets: sanitized.weeklyNativeTargets || {},
       updatedAt: new Date().toISOString(),
     };
@@ -1611,8 +1610,6 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
 
     const lessonsData = {
       contractedLessons: sanitized.contractedLessons || {},
-      weeklyHomework: sanitized.weeklyHomework || {},
-      studentHomeworkMap: sanitized.studentHomeworkMap || {},
       updatedAt: new Date().toISOString(),
     };
 
@@ -6153,10 +6150,20 @@ export async function saveWeeklyChecksToFirestore(
   try {
     const userRef = db.collection('users').doc(docId);
     const subRef = userRef.collection('weeklyChecks').doc(canonicalWeekId);
-    await Promise.all([
+    const cleanRootPayload: Record<string, any> = fsRootPayload && typeof fsRootPayload === 'object'
+      ? JSON.parse(JSON.stringify(fsRootPayload))
+      : {};
+    // ARCH.2E.2C: Eliminate redundant check mirrors on root users/{uid}
+    delete cleanRootPayload.weeklyChecks;
+    delete cleanRootPayload.sPathChecks;
+
+    const writes: Promise<any>[] = [
       subRef.set(JSON.parse(JSON.stringify(weekDocPayload)), { merge: true }),
-      userRef.set(JSON.parse(JSON.stringify(fsRootPayload)), { merge: true }),
-    ]);
+    ];
+    if (Object.keys(cleanRootPayload).length > 0) {
+      writes.push(userRef.set(cleanRootPayload, { merge: true }));
+    }
+    await Promise.all(writes);
     return true;
   } catch (err: any) {
     if (isPermissionError(err)) {
@@ -6171,7 +6178,7 @@ export async function saveWeeklyChecksToFirestore(
 
 /**
  * Merges two homework objects ensuring student answers, genuine evaluations,
- * scores, per-part progress, and question lists are never wiped by empty fields or autosaves.
+ * scores, per-part progress, daily activities, and question lists are never wiped by empty fields or autosaves.
  */
 export function mergeHomeworkRecords(primary: any, fallback: any): any {
   if (!primary && !fallback) return null;
@@ -6216,6 +6223,33 @@ export function mergeHomeworkRecords(primary: any, fallback: any): any {
     reading: mergePart('reading', 4),
   };
 
+  // Merge dailyActivities per day without wiping existing days
+  const mergedDailyActivities: Record<string, any> = {
+    ...(fallback.dailyActivities && typeof fallback.dailyActivities === 'object' ? fallback.dailyActivities : {}),
+  };
+  if (primary.dailyActivities && typeof primary.dailyActivities === 'object') {
+    for (const [dayKey, pDay] of Object.entries(primary.dailyActivities)) {
+      if (!pDay) continue;
+      const fDay = mergedDailyActivities[dayKey];
+      if (!fDay) {
+        mergedDailyActivities[dayKey] = pDay;
+      } else {
+        mergedDailyActivities[dayKey] = {
+          ...fDay,
+          ...(pDay as any),
+          studentAnswers: {
+            matching: { ...(fDay.studentAnswers?.matching || {}), ...((pDay as any).studentAnswers?.matching || {}) },
+            fillInBlanks: { ...(fDay.studentAnswers?.fillInBlanks || {}), ...((pDay as any).studentAnswers?.fillInBlanks || {}) },
+            sentences: { ...(fDay.studentAnswers?.sentences || {}), ...((pDay as any).studentAnswers?.sentences || {}) },
+            quizAnswers: { ...(fDay.studentAnswers?.quizAnswers || {}), ...((pDay as any).studentAnswers?.quizAnswers || {}) },
+          },
+          isCompleted: Boolean((pDay as any).isCompleted || fDay.isCompleted),
+          isStarted: Boolean((pDay as any).isStarted || fDay.isStarted),
+        };
+      }
+    }
+  }
+
   const finalAiEvaluation = primary.aiEvaluation || fallback.aiEvaluation;
   const finalScore =
     typeof primary.score === 'number' && primary.score > 0
@@ -6255,6 +6289,7 @@ export function mergeHomeworkRecords(primary: any, fallback: any): any {
       : fallback.readingPassage?.text
       ? fallback.readingPassage
       : primary.readingPassage,
+    dailyActivities: Object.keys(mergedDailyActivities).length > 0 ? mergedDailyActivities : primary.dailyActivities,
     completedPartsByDay: {
       ...(fallback.completedPartsByDay || {}),
       ...(primary.completedPartsByDay || {}),
@@ -6264,11 +6299,32 @@ export function mergeHomeworkRecords(primary: any, fallback: any): any {
     aiEvaluation: finalAiEvaluation,
     score: finalScore,
     isCompleted: finalIsCompleted,
+    submittedAt: primary.submittedAt || fallback.submittedAt,
+    status: primary.status || fallback.status,
   };
 }
 
+function hasHomeworkSubstantiveContent(hw: any): boolean {
+  if (!hw || typeof hw !== 'object') return false;
+  if (hw.aiEvaluation) return true;
+  if (hw.isCompleted || hw.isDayPartCompleted) return true;
+  if (hw.completedPartsByDay && Object.values(hw.completedPartsByDay).some(Boolean)) return true;
+  if (hw.studentAnswers) {
+    if (
+      Object.keys(hw.studentAnswers.matching || {}).length > 0 ||
+      Object.keys(hw.studentAnswers.fillInBlanks || {}).length > 0 ||
+      Object.keys(hw.studentAnswers.sentences || {}).length > 0 ||
+      Object.keys(hw.studentAnswers.quizAnswers || {}).length > 0
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
- * Subcollection-scoped persistence for homework with student_homework collection support
+ * Canonical-first homework fetch with strictly read-only legacy fallback when absent in canonical path.
+ * Never overwrites existing canonical data with legacy data.
  */
 export async function fetchHomeworkFromFirestore(
   docIds: string | string[],
@@ -6276,34 +6332,45 @@ export async function fetchHomeworkFromFirestore(
   cycle: number = 1
 ): Promise<any | null> {
   const db = getFirestoreDb();
-  const idList = Array.isArray(docIds) ? docIds : [docIds];
+  const idList = (Array.isArray(docIds) ? docIds : [docIds]).filter(Boolean);
   if (!db || !idList.length) return null;
 
-  let mergedResult: any = null;
+  let canonicalResult: any = null;
 
-  for (const dId of idList.filter(Boolean)) {
-    // 1. Check canonical subcollection users/{dId}/homework/{canonicalWeekId}
+  // 1. Authoritative canonical path: users/{uid}/homework/week-{cycle}
+  for (const dId of idList) {
     try {
       const hwSnap = await db.collection('users').doc(dId).collection('homework').doc(canonicalWeekId).get();
       if (hwSnap.exists) {
-        mergedResult = mergeHomeworkRecords(hwSnap.data(), mergedResult);
+        canonicalResult = mergeHomeworkRecords(canonicalResult, hwSnap.data());
       }
     } catch {}
+  }
 
-    // 2. Authoritative check on student_homework (HOTFIX 2.3.2 & HOTFIX 2.3.3)
+  // If canonical exists and already contains intentional reset or real answers/evaluation/progress,
+  // return immediately without consulting legacy collections.
+  if (
+    canonicalResult &&
+    (canonicalResult.isReset || canonicalResult.resetAt || hasHomeworkSubstantiveContent(canonicalResult))
+  ) {
+    return canonicalResult;
+  }
+
+  // 2. Read-only legacy fallback ONLY when substantive data is absent in canonical path
+  let legacyResult: any = null;
+  for (const dId of idList) {
     try {
-      // Check week-specific document first
       const weekSpecificSnap = await db.collection('student_homework').doc(`${dId}_${canonicalWeekId}`).get().catch(() => null);
       if (weekSpecificSnap && weekSpecificSnap.exists) {
-        mergedResult = mergeHomeworkRecords(weekSpecificSnap.data(), mergedResult);
+        legacyResult = mergeHomeworkRecords(legacyResult, weekSpecificSnap.data());
       }
 
-      const topSnap = await db.collection('student_homework').doc(dId).get();
-      if (topSnap.exists) {
+      const topSnap = await db.collection('student_homework').doc(dId).get().catch(() => null);
+      if (topSnap && topSnap.exists) {
         const topData = topSnap.data();
         if (topData) {
           if (topData.cycles && topData.cycles[canonicalWeekId]) {
-            mergedResult = mergeHomeworkRecords(topData.cycles[canonicalWeekId], mergedResult);
+            legacyResult = mergeHomeworkRecords(legacyResult, topData.cycles[canonicalWeekId]);
           }
           const topCycle =
             topData.weeklyCycle !== undefined
@@ -6314,7 +6381,7 @@ export async function fetchHomeworkFromFirestore(
               ? 1
               : null;
           if (topCycle === cycle || (cycle === 1 && !topCycle)) {
-            mergedResult = mergeHomeworkRecords(topData, mergedResult);
+            legacyResult = mergeHomeworkRecords(legacyResult, topData);
           }
         }
       }
@@ -6323,27 +6390,31 @@ export async function fetchHomeworkFromFirestore(
 
   // Week 1 legacy backward compatibility only
   if (cycle === 1) {
-    for (const dId of idList.filter(Boolean)) {
+    for (const dId of idList) {
       try {
-        const hwSubSnap = await db.collection('users').doc(dId).collection('homework').doc('current_week').get();
-        if (hwSubSnap.exists) {
-          mergedResult = mergeHomeworkRecords(hwSubSnap.data(), mergedResult);
+        const hwSubSnap = await db.collection('users').doc(dId).collection('homework').doc('current_week').get().catch(() => null);
+        if (hwSubSnap && hwSubSnap.exists) {
+          legacyResult = mergeHomeworkRecords(legacyResult, hwSubSnap.data());
         }
-        const userSnap = await db.collection('users').doc(dId).get();
-        if (userSnap.exists && userSnap.data()?.weeklyHomework) {
-          mergedResult = mergeHomeworkRecords(userSnap.data()?.weeklyHomework, mergedResult);
+        const userSnap = await db.collection('users').doc(dId).get().catch(() => null);
+        if (userSnap && userSnap.exists && userSnap.data()?.weeklyHomework) {
+          legacyResult = mergeHomeworkRecords(legacyResult, userSnap.data()?.weeklyHomework);
         }
       } catch {}
     }
   }
 
-  return mergedResult;
+  if (canonicalResult && legacyResult) {
+    // Canonical ALWAYS stays primary and is never overwritten by legacy values
+    return mergeHomeworkRecords(canonicalResult, legacyResult);
+  }
+  return canonicalResult || legacyResult;
 }
 
 export async function saveHomeworkToFirestore(
   docId: string,
   canonicalWeekId: string,
-  cycle: number,
+  _cycle: number,
   hwPayload: any
 ): Promise<boolean> {
   if (isCloudWriteDisabled) return false;
@@ -6351,56 +6422,13 @@ export async function saveHomeworkToFirestore(
   if (!db || !docId) return false;
   try {
     const sanitized = JSON.parse(JSON.stringify(hwPayload));
-    const userRef = db.collection('users').doc(docId);
-    const promises: Promise<any>[] = [
-      userRef.collection('homework').doc(canonicalWeekId).set(sanitized, { merge: true }),
-      db.collection('student_homework').doc(`${docId}_${canonicalWeekId}`).set(sanitized, { merge: true }),
-    ];
-
-    // Safely update student_homework/{docId} with per-cycle isolation map
-    try {
-      const topDocRef = db.collection('student_homework').doc(docId);
-      const topDocSnap = await topDocRef.get().catch(() => null);
-      const topData = topDocSnap && topDocSnap.exists ? topDocSnap.data() : null;
-      const topCycle = topData?.weeklyCycle !== undefined ? Number(topData.weeklyCycle) : (cycle === 1 ? 1 : null);
-
-      if (!topData || topCycle === cycle) {
-        promises.push(
-          topDocRef.set({
-            ...sanitized,
-            cycles: {
-              ...(topData?.cycles || {}),
-              [canonicalWeekId]: sanitized,
-            },
-          }, { merge: true })
-        );
-      } else {
-        promises.push(
-          topDocRef.set({
-            cycles: {
-              ...(topData?.cycles || {}),
-              [canonicalWeekId]: sanitized,
-            },
-          }, { merge: true })
-        );
-      }
-    } catch {}
-
-    if (cycle === 1) {
-      promises.push(
-        userRef.set(
-          {
-            weeklyHomework: sanitized,
-            updatedAt: new Date().toISOString(),
-          },
-          { merge: true }
-        )
-      );
-      promises.push(
-        userRef.collection('homework').doc('current_week').set(sanitized, { merge: true })
-      );
-    }
-    await Promise.all(promises);
+    // ARCH.2E.2C: Write exclusively to canonical users/{docId}/homework/week-{cycle}
+    await db
+      .collection('users')
+      .doc(docId)
+      .collection('homework')
+      .doc(canonicalWeekId)
+      .set(sanitized, { merge: true });
     return true;
   } catch (err: any) {
     if (isPermissionError(err)) {
@@ -6410,6 +6438,370 @@ export async function saveHomeworkToFirestore(
       console.warn('Firestore saveHomework error:', err);
     }
     return false;
+  }
+}
+
+export interface CanonicalWeeklyChecksContextResult {
+  checks: Record<string, boolean>;
+  weeklyNativeLessonsTarget: number;
+  weeklyStudyDaysTarget: number;
+  weeklyStudyDays: string[];
+  activeCycle: number | null;
+  source: 'canonical' | 'legacy_fallback' | 'empty';
+}
+
+const DEFAULT_STUDY_DAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+
+function parsePositiveCycleFromFirestore(val: any): number | null {
+  if (typeof val === 'number' && Number.isInteger(val) && val > 0) return val;
+  if (typeof val === 'string') {
+    const trimmed = val.trim();
+    const match = trimmed.match(/^(?:week-)?([1-9]\d*)$/i);
+    if (match) {
+      const n = Number(match[1]);
+      if (Number.isInteger(n) && n > 0) return n;
+    }
+  }
+  return null;
+}
+
+export async function fetchCanonicalUserWeeklyCycleServer(studentUid: string): Promise<{
+  activeCycle: number | null;
+  userData: Record<string, any> | null;
+}> {
+  const db = getFirestoreDb();
+  if (!db || !studentUid) return { activeCycle: null, userData: null };
+  try {
+    const userSnap = await db.collection('users').doc(studentUid).get();
+    if (!userSnap || !userSnap.exists) return { activeCycle: null, userData: null };
+    const uData = userSnap.data() || {};
+    return {
+      activeCycle: parsePositiveCycleFromFirestore(uData.weeklyCycle),
+      userData: uData,
+    };
+  } catch {
+    return { activeCycle: null, userData: null };
+  }
+}
+
+export async function fetchCanonicalWeeklyChecksServer(
+  studentUid: string,
+  canonicalWeekId: string,
+  cycle: number
+): Promise<CanonicalWeeklyChecksContextResult | null> {
+  const db = getFirestoreDb();
+  if (!db || !studentUid) return null;
+
+  const userRef = db.collection('users').doc(studentUid);
+  const weekRef = userRef.collection('weeklyChecks').doc(canonicalWeekId);
+
+  const [userSnap, weekSnap] = await Promise.all([
+    userRef.get().catch(() => null),
+    weekRef.get().catch(() => null),
+  ]);
+
+  const uData = userSnap && userSnap.exists ? (userSnap.data() || {}) : {};
+  const wData = weekSnap && weekSnap.exists ? (weekSnap.data() || {}) : null;
+
+  const activeCycle = parsePositiveCycleFromFirestore(uData.weeklyCycle);
+
+  const weeklyNativeLessonsTarget =
+    typeof uData.weeklyNativeLessonsTarget === 'number' && uData.weeklyNativeLessonsTarget > 0
+      ? uData.weeklyNativeLessonsTarget
+      : typeof wData?.weeklyNativeLessonsTarget === 'number' && wData.weeklyNativeLessonsTarget > 0
+      ? wData.weeklyNativeLessonsTarget
+      : 1;
+
+  const weeklyStudyDaysTarget =
+    typeof uData.weeklyStudyDaysTarget === 'number' && uData.weeklyStudyDaysTarget >= 1 && uData.weeklyStudyDaysTarget <= 7
+      ? uData.weeklyStudyDaysTarget
+      : typeof wData?.weeklyStudyDaysTarget === 'number' && wData.weeklyStudyDaysTarget >= 1 && wData.weeklyStudyDaysTarget <= 7
+      ? wData.weeklyStudyDaysTarget
+      : 7;
+
+  const weeklyStudyDays =
+    Array.isArray(uData.weeklyStudyDays) && uData.weeklyStudyDays.length > 0
+      ? uData.weeklyStudyDays
+      : DEFAULT_STUDY_DAYS;
+
+  if (wData) {
+    const canonicalChecks: Record<string, boolean> = {
+      ...(wData.weeklyChecks || {}),
+      ...(wData.sPathChecks || {}),
+      ...(wData.checks || {}),
+    };
+    return {
+      checks: canonicalChecks,
+      weeklyNativeLessonsTarget,
+      weeklyStudyDaysTarget,
+      weeklyStudyDays,
+      activeCycle,
+      source: 'canonical',
+    };
+  }
+
+  // Read-only legacy fallback strictly for cycle === 1 when canonical doc does not exist
+  if (cycle === 1 && (uData.weeklyChecks || uData.sPathChecks)) {
+    const legacyChecks: Record<string, boolean> = {
+      ...(uData.weeklyChecks || {}),
+      ...(uData.sPathChecks || {}),
+    };
+    return {
+      checks: legacyChecks,
+      weeklyNativeLessonsTarget,
+      weeklyStudyDaysTarget,
+      weeklyStudyDays,
+      activeCycle,
+      source: 'legacy_fallback',
+    };
+  }
+
+  return {
+    checks: {},
+    weeklyNativeLessonsTarget,
+    weeklyStudyDaysTarget,
+    weeklyStudyDays,
+    activeCycle,
+    source: 'empty',
+  };
+}
+
+export async function saveCanonicalWeeklyChecksServer(params: {
+  studentUid: string;
+  studentEmail?: string;
+  canonicalWeekId: string;
+  cycle: number;
+  checks?: Record<string, boolean>;
+  reset?: boolean;
+  weeklyNativeLessonsTarget?: number;
+  weeklyStudyDaysTarget?: number;
+  weeklyStudyDays?: string[];
+}): Promise<{
+  ok: boolean;
+  statusCode?: number;
+  errorCode?: string;
+  error?: string;
+  activeCycle?: number | null;
+  checks?: Record<string, boolean>;
+  weeklyNativeLessonsTarget?: number;
+  weeklyStudyDaysTarget?: number;
+  weeklyStudyDays?: string[];
+}> {
+  if (isCloudWriteDisabled) {
+    return { ok: false, statusCode: 500, errorCode: 'CLOUD_WRITE_DISABLED', error: 'Firestore cloud writes are disabled.' };
+  }
+  const db = getFirestoreDb();
+  if (!db || !params.studentUid) {
+    return { ok: false, statusCode: 503, errorCode: 'FIRESTORE_UNAVAILABLE', error: 'Canonical Firestore database unavailable.' };
+  }
+
+  const userRef = db.collection('users').doc(params.studentUid);
+  const weekRef = userRef.collection('weeklyChecks').doc(params.canonicalWeekId);
+
+  try {
+    const [userSnap, weekSnap] = await Promise.all([
+      userRef.get().catch(() => null),
+      weekRef.get().catch(() => null),
+    ]);
+
+    const uData = userSnap && userSnap.exists ? (userSnap.data() || {}) : {};
+    const activeCycle = parsePositiveCycleFromFirestore(uData.weeklyCycle);
+
+    if (activeCycle !== null && params.cycle < activeCycle) {
+      return {
+        ok: false,
+        statusCode: 409,
+        errorCode: 'STALE_CYCLE',
+        error: `Stale cycle ${params.cycle} rejected; active cycle is ${activeCycle}.`,
+        activeCycle,
+      };
+    }
+
+    const wData = weekSnap && weekSnap.exists ? (weekSnap.data() || {}) : null;
+    const existingChecks: Record<string, boolean> = wData
+      ? {
+          ...(wData.weeklyChecks || {}),
+          ...(wData.sPathChecks || {}),
+          ...(wData.checks || {}),
+        }
+      : {};
+
+    const sanitizedIncoming: Record<string, boolean> = {};
+    if (params.checks && typeof params.checks === 'object') {
+      for (const [k, v] of Object.entries(params.checks)) {
+        if (typeof v === 'boolean') {
+          sanitizedIncoming[k] = v;
+        }
+      }
+    }
+
+    const finalChecks: Record<string, boolean> =
+      params.reset === true
+        ? sanitizedIncoming
+        : {
+            ...existingChecks,
+            ...sanitizedIncoming,
+          };
+
+    const nowIso = new Date().toISOString();
+    const weekDocPayload: Record<string, any> = {
+      id: params.canonicalWeekId,
+      weekId: params.canonicalWeekId,
+      weeklyCycle: params.cycle,
+      checks: finalChecks,
+      studentUid: params.studentUid,
+      ...(params.studentEmail ? { studentEmail: params.studentEmail } : {}),
+      updatedAt: nowIso,
+    };
+
+    const writes: Promise<any>[] = [
+      weekRef.set(JSON.parse(JSON.stringify(weekDocPayload)), { merge: params.reset !== true }),
+    ];
+
+    // Write S-Path goal configurations exclusively to users/{uid} (never mirror checks on root users/{uid})
+    const rootGoalsUpdate: Record<string, any> = {};
+    if (typeof params.weeklyNativeLessonsTarget === 'number' && params.weeklyNativeLessonsTarget > 0) {
+      rootGoalsUpdate.weeklyNativeLessonsTarget = params.weeklyNativeLessonsTarget;
+    }
+    if (typeof params.weeklyStudyDaysTarget === 'number' && params.weeklyStudyDaysTarget >= 1 && params.weeklyStudyDaysTarget <= 7) {
+      rootGoalsUpdate.weeklyStudyDaysTarget = params.weeklyStudyDaysTarget;
+    }
+    if (Array.isArray(params.weeklyStudyDays) && params.weeklyStudyDays.length > 0) {
+      rootGoalsUpdate.weeklyStudyDays = params.weeklyStudyDays;
+    }
+    if (Object.keys(rootGoalsUpdate).length > 0) {
+      rootGoalsUpdate.updatedAt = nowIso;
+      writes.push(userRef.set(JSON.parse(JSON.stringify(rootGoalsUpdate)), { merge: true }));
+    }
+
+    await Promise.all(writes);
+
+    return {
+      ok: true,
+      checks: finalChecks,
+      weeklyNativeLessonsTarget:
+        rootGoalsUpdate.weeklyNativeLessonsTarget ??
+        (typeof uData.weeklyNativeLessonsTarget === 'number' && uData.weeklyNativeLessonsTarget > 0
+          ? uData.weeklyNativeLessonsTarget
+          : 1),
+      weeklyStudyDaysTarget:
+        rootGoalsUpdate.weeklyStudyDaysTarget ??
+        (typeof uData.weeklyStudyDaysTarget === 'number' && uData.weeklyStudyDaysTarget >= 1 && uData.weeklyStudyDaysTarget <= 7
+          ? uData.weeklyStudyDaysTarget
+          : 7),
+      weeklyStudyDays:
+        rootGoalsUpdate.weeklyStudyDays ??
+        (Array.isArray(uData.weeklyStudyDays) && uData.weeklyStudyDays.length > 0
+          ? uData.weeklyStudyDays
+          : DEFAULT_STUDY_DAYS),
+    };
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+    }
+    console.warn('[serverFirestore] saveCanonicalWeeklyChecksServer error:', err);
+    return {
+      ok: false,
+      statusCode: 500,
+      errorCode: 'WRITE_FAILED',
+      error: err?.message || 'Firestore write failed.',
+    };
+  }
+}
+
+export async function saveCanonicalHomeworkServer(params: {
+  studentUid: string;
+  studentEmail?: string;
+  canonicalWeekId: string;
+  cycle: number;
+  homeworkPayload: any;
+  isSubmit?: boolean;
+  enforceStaleCycle?: boolean;
+}): Promise<{
+  ok: boolean;
+  statusCode?: number;
+  errorCode?: string;
+  error?: string;
+  activeCycle?: number | null;
+  weeklyHomework?: any;
+}> {
+  if (isCloudWriteDisabled) {
+    return { ok: false, statusCode: 500, errorCode: 'CLOUD_WRITE_DISABLED', error: 'Firestore cloud writes are disabled.' };
+  }
+  const db = getFirestoreDb();
+  if (!db || !params.studentUid) {
+    return { ok: false, statusCode: 503, errorCode: 'FIRESTORE_UNAVAILABLE', error: 'Canonical Firestore database unavailable.' };
+  }
+
+  const userRef = db.collection('users').doc(params.studentUid);
+  const hwRef = userRef.collection('homework').doc(params.canonicalWeekId);
+
+  try {
+    const [userSnap, existingHwSnap] = await Promise.all([
+      userRef.get().catch(() => null),
+      hwRef.get().catch(() => null),
+    ]);
+
+    const uData = userSnap && userSnap.exists ? (userSnap.data() || {}) : {};
+    const activeCycle = parsePositiveCycleFromFirestore(uData.weeklyCycle);
+
+    if (params.enforceStaleCycle !== false && activeCycle !== null && params.cycle < activeCycle) {
+      return {
+        ok: false,
+        statusCode: 409,
+        errorCode: 'STALE_CYCLE',
+        error: `Stale cycle ${params.cycle} rejected; active cycle is ${activeCycle}.`,
+        activeCycle,
+      };
+    }
+
+    const existingCanonical = existingHwSnap && existingHwSnap.exists ? existingHwSnap.data() : null;
+    const incomingSanitized = JSON.parse(JSON.stringify(params.homeworkPayload || {}));
+    const merged = existingCanonical
+      ? mergeHomeworkRecords(incomingSanitized, existingCanonical)
+      : incomingSanitized;
+
+    const nowIso = new Date().toISOString();
+    const submittedAt =
+      existingCanonical?.submittedAt ||
+      incomingSanitized.submittedAt ||
+      (params.isSubmit ? nowIso : undefined);
+    const status =
+      incomingSanitized.status ||
+      existingCanonical?.status ||
+      (params.isSubmit ? (merged.aiEvaluation ? 'graded' : 'submitted') : undefined);
+
+    const finalPayload: Record<string, any> = {
+      ...merged,
+      id: params.canonicalWeekId,
+      weekId: params.canonicalWeekId,
+      weeklyCycle: params.cycle,
+      uid: params.studentUid,
+      studentUid: params.studentUid,
+      ...(params.studentEmail ? { studentEmail: params.studentEmail, email: params.studentEmail } : {}),
+      ...(submittedAt ? { submittedAt } : {}),
+      ...(status ? { status } : {}),
+      updatedAt: nowIso,
+    };
+
+    // ARCH.2E.2C: Write exclusively to canonical users/{uid}/homework/week-{cycle}
+    await hwRef.set(JSON.parse(JSON.stringify(finalPayload)), { merge: true });
+
+    return {
+      ok: true,
+      weeklyHomework: finalPayload,
+    };
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+    }
+    console.warn('[serverFirestore] saveCanonicalHomeworkServer error:', err);
+    return {
+      ok: false,
+      statusCode: 500,
+      errorCode: 'WRITE_FAILED',
+      error: err?.message || 'Firestore write failed.',
+    };
   }
 }
 

@@ -57,7 +57,7 @@ import { getAccessToken, getAdminAccessToken, waitForAuthUser, isAuthorizedAdmin
 import { isValidHomeworkEvaluation, isSyntheticHomeworkEvaluation } from './utils/writingChecker';
 import { useNativeFriends, isTutorApproved, isTeacherRole } from './hooks/useNativeFriends';
 import { onAuthStateChanged, signOut as firebaseSignOutAuth } from 'firebase/auth';
-import { doc, getDoc, collection, getDocs, onSnapshot, setDoc, deleteDoc, query, where } from 'firebase/firestore';
+import { doc, getDoc, collection, getDocs, onSnapshot, deleteDoc, query, where } from 'firebase/firestore';
 import { apiClient, ApiError } from './utils/apiClient';
 
 // Components
@@ -1920,87 +1920,6 @@ export default function App() {
             .catch((err) => {
               console.warn('Notice loading homework from Firestore:', err);
             });
-
-          if (loadedCycle !== null) {
-            getAccessToken().then((token) => {
-              if (isCancelled || !token) return;
-              const canonicalUid = auth.currentUser?.uid || (isValidCanonicalUid(uid) ? uid : '');
-              if (!canonicalUid && !email) return;
-
-              const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
-              const safeEmail = (email && (!currentAuthEmail || currentAuthEmail === email.toLowerCase().trim())) ? email : '';
-              const canonicalWeekId = normalizeWeekId(loadedCycle);
-              if (!canonicalWeekId) return;
-
-              const hwParams = new URLSearchParams();
-              if (canonicalUid) {
-                hwParams.append('uid', canonicalUid);
-                hwParams.append('studentUid', canonicalUid);
-              }
-              if (safeEmail) {
-                hwParams.append('studentEmail', safeEmail);
-              }
-              hwParams.append('weekId', canonicalWeekId);
-              hwParams.append('weeklyCycle', String(loadedCycle));
-
-              fetch(`/api/homework?${hwParams.toString()}`, {
-                headers: {
-                  Authorization: `Bearer ${token}`,
-                },
-              })
-                .then((res) => (res.ok ? res.json() : null))
-                .then((savedHw) => {
-                  if (isCancelled) return;
-                  if (savedHw && (savedHw.completedPartsByDay || savedHw.studentAnswers)) {
-                    const hwCycle = parseWeekCycleNumber(savedHw.weeklyCycle) || parseWeekCycleNumber(savedHw.weekId);
-                    if (hwCycle !== null && hwCycle !== loadedCycle) return;
-
-                    setWeeklyHomework((prev) => {
-                      const isSameWeek =
-                        prev &&
-                        ((prev.weeklyCycle && prev.weeklyCycle === loadedCycle) ||
-                          (prev.weekId && prev.weekId === canonicalWeekId));
-                      if (!isSameWeek) {
-                        return savedHw;
-                      }
-                      return {
-                        ...prev,
-                        ...savedHw,
-                        matchingPairs: (Array.isArray(savedHw.matchingPairs) && savedHw.matchingPairs.length > 0)
-                          ? savedHw.matchingPairs
-                          : prev.matchingPairs,
-                        fillInBlanks: (Array.isArray(savedHw.fillInBlanks) && savedHw.fillInBlanks.length > 0)
-                          ? savedHw.fillInBlanks
-                          : prev.fillInBlanks,
-                        sentenceWritingPrompts: (Array.isArray(savedHw.sentenceWritingPrompts) && savedHw.sentenceWritingPrompts.length > 0)
-                          ? savedHw.sentenceWritingPrompts
-                          : prev.sentenceWritingPrompts,
-                        readingPassage: savedHw.readingPassage?.text
-                          ? savedHw.readingPassage
-                          : prev.readingPassage,
-                        completedPartsByDay: {
-                          ...(prev.completedPartsByDay || {}),
-                          ...(savedHw.completedPartsByDay || {}),
-                        },
-                        studentAnswers: {
-                          matching: { ...(prev.studentAnswers?.matching || {}), ...(savedHw.studentAnswers?.matching || {}) },
-                          fillInBlanks: { ...(prev.studentAnswers?.fillInBlanks || {}), ...(savedHw.studentAnswers?.fillInBlanks || {}) },
-                          sentences: { ...(prev.studentAnswers?.sentences || {}), ...(savedHw.studentAnswers?.sentences || {}) },
-                          quizAnswers: { ...(prev.studentAnswers?.quizAnswers || {}), ...(savedHw.studentAnswers?.quizAnswers || {}) },
-                        },
-                        partsProgress: savedHw.partsProgress || prev.partsProgress,
-                        aiEvaluation: savedHw.aiEvaluation || prev.aiEvaluation,
-                        score: (typeof savedHw.score === 'number' && savedHw.score > 0)
-                          ? savedHw.score
-                          : typeof prev.score === 'number' ? prev.score : savedHw.score,
-                        isCompleted: Boolean(savedHw.isCompleted || prev.isCompleted || (savedHw.aiEvaluation && typeof savedHw.score === 'number' && savedHw.score > 0)),
-                      };
-                    });
-                  }
-                })
-                .catch(() => {});
-            }).catch(() => {});
-          }
         } catch (err) {
           console.warn('Could not fetch student data:', err);
         }
@@ -4344,7 +4263,7 @@ export default function App() {
         ).then((success) => {
           const curCycle = parseWeekCycleNumber(userProfile?.weeklyCycle);
           if (curCycle !== activeCycle) return;
-          if (!success && !isCompleted) {
+          if (!success) {
             setWeeklyChecks((prev) => ({
               ...prev,
               [checkKey]: previousChecked,
@@ -4352,27 +4271,13 @@ export default function App() {
           }
         }).catch(() => {
           const curCycle = parseWeekCycleNumber(userProfile?.weeklyCycle);
-          if (curCycle === activeCycle && !isCompleted) {
+          if (curCycle === activeCycle) {
             setWeeklyChecks((prev) => ({
               ...prev,
               [checkKey]: previousChecked,
             }));
           }
         });
-
-        // Direct atomic write to Firestore users/{uid} (matching GitHub original)
-        const db = getDb();
-        if (db && uid) {
-          setDoc(
-            doc(db, 'users', uid),
-            {
-              weeklyChecks: { [checkKey]: isCompleted },
-              sPathChecks: { [checkKey]: isCompleted },
-              updatedAt: new Date().toISOString(),
-            },
-            { merge: true }
-          ).catch(() => {});
-        }
       }
 
       // Feedback toast/notification for student
@@ -8186,7 +8091,7 @@ export default function App() {
           handleMarkDailyMemorizationPracticed(day, wordsUsed);
         }
       }}
-      onSubmitToTeacher={(updated) => {
+      onSubmitToTeacher={async (updated) => {
         const activeDay = updated.targetDay || homeworkTargetDay;
         const currentDaily = { ...(updated.dailyActivities || weeklyHomework?.dailyActivities || {}) };
         const resolvedUid = (currentAccount?.uid || userProfile?.id || (userProfile as any)?.uid || '').trim();
@@ -8227,6 +8132,7 @@ export default function App() {
         }
         const fullyUpdated: WeeklyHomeworkData = {
           ...updated,
+          submittedAt: updated.submittedAt || new Date().toISOString(),
           dailyActivities: currentDaily,
         };
         setWeeklyHomework(fullyUpdated);
@@ -8234,8 +8140,31 @@ export default function App() {
         const email = currentAccount?.email || userProfile?.email || '';
         const currentActiveCycle = parseWeekCycleNumber(userProfile?.weeklyCycle);
         const currentActiveWeekId = normalizeWeekId(currentActiveCycle);
+        let submittedOk = true;
         if (uid || email) {
-          saveStudentHomeworkProgressToFirestore(uid, email, fullyUpdated, currentActiveWeekId || undefined);
+          submittedOk = await saveStudentHomeworkProgressToFirestore(
+            uid,
+            email,
+            fullyUpdated,
+            currentActiveWeekId || undefined,
+            { submit: true }
+          );
+        }
+        if (!submittedOk) {
+          setNotifications((prev) => [
+            {
+              id: `hw-err-${Date.now()}`,
+              title: currentLanguage === 'en' ? 'Submission Failed' : 'Falha ao Enviar Homework',
+              message: currentLanguage === 'en'
+                ? 'Could not confirm homework submission on the server. Please try again.'
+                : 'Não foi possível confirmar o envio da homework no servidor. Tente novamente.',
+              type: 'info',
+              timestamp: new Date().toISOString(),
+              read: false,
+            },
+            ...prev,
+          ]);
+          return;
         }
         const wordsUsed = updated?.vocabularyList?.map((w) => w.word) || [];
         if (wordsUsed.length > 0) {

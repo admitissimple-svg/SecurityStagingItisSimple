@@ -28,8 +28,6 @@ import {
 import { Translations, getTranslations } from '../utils/i18n';
 import { DAYS_OF_WEEK, getTodayDayOfWeek } from '../utils/notifications';
 import { getDailyMemorizationSchedule } from '../utils/homeworkGenerator';
-import { onAuthStateChanged } from 'firebase/auth';
-import { auth } from '../firebase';
 import { getAccessToken } from '../utils/auth';
 import {
   saveStudentWeeklyChecksToFirestore,
@@ -44,7 +42,6 @@ import {
   getTodayIsoDate,
   mapStepIdToJournalType,
   deriveWeeklyChecksFromJournal,
-  isValidCanonicalUid,
   normalizeUid,
   normalizeWeekId,
   parseWeekCycleNumber,
@@ -317,14 +314,14 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
       }
     }
 
-    // Real-time Firestore subscription to guarantee instant checkmark reflection
+    // Real-time authenticated subscription to guarantee instant checkmark reflection without duplicate fetches
     let unsubWeekly: (() => void) | null = null;
     if ((studentUid || studentEmail) && activeWeekCycle !== null) {
       unsubWeekly = subscribeToStudentWeeklyChecks(
         studentUid,
         studentEmail,
         (data) => {
-          if (isMounted && data && data.checks !== undefined) {
+          if (isMounted && propWeeklyChecks === undefined && data && data.checks !== undefined) {
             setLocalWeeklyChecks(data.checks || {});
           }
           if (isMounted && typeof data?.weeklyNativeLessonsTarget === 'number' && data.weeklyNativeLessonsTarget > 0) {
@@ -335,61 +332,9 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
       );
     }
 
-    // Also fetch target from endpoint with protected Firebase Auth & explicit week
-    let unsubAuthSession: (() => void) | null = null;
-    if (activeWeekCycle !== null && activeWeekId) {
-      const executeProtectedFetch = async () => {
-        const token = await getAccessToken();
-        if (!isMounted || !token) return;
-
-        const canonicalUid = auth.currentUser?.uid || (isValidCanonicalUid(studentUid) ? studentUid : '');
-        if (!canonicalUid && !studentEmail) return;
-
-        const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
-        const safeStudentEmail = (studentEmail && (!currentAuthEmail || currentAuthEmail === studentEmail.toLowerCase().trim())) ? studentEmail : '';
-
-        const params = new URLSearchParams();
-        if (canonicalUid) params.append('studentUid', canonicalUid);
-        if (safeStudentEmail) params.append('studentEmail', safeStudentEmail);
-        params.append('weekId', activeWeekId);
-        params.append('weeklyCycle', String(activeWeekCycle));
-
-        fetch(`/api/routines/weekly-checks?${params.toString()}`, {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        })
-          .then((res) => (res.ok ? res.json() : null))
-          .then((data) => {
-            if (isMounted && data) {
-              if (propWeeklyChecks === undefined && data.checks !== undefined) {
-                setLocalWeeklyChecks(data.checks || {});
-              }
-              if (typeof data.weeklyNativeLessonsTarget === 'number' && data.weeklyNativeLessonsTarget > 0) {
-                setWeeklyNativeTarget(data.weeklyNativeLessonsTarget);
-              }
-            }
-          })
-          .catch((err) => {
-            console.warn('Error loading weekly checks from server:', err);
-          });
-      };
-
-      // Trigger fetch once auth resolution completes
-      executeProtectedFetch();
-
-      // Ensure immediate sync when user logs in
-      unsubAuthSession = onAuthStateChanged(auth, (user) => {
-        if (user && isMounted) {
-          executeProtectedFetch();
-        }
-      });
-    }
-
     return () => {
       isMounted = false;
       if (unsubWeekly) unsubWeekly();
-      if (unsubAuthSession) unsubAuthSession();
     };
   }, [studentEmail, studentUid, activeWeekCycle, activeWeekId, propWeeklyChecks]);
 

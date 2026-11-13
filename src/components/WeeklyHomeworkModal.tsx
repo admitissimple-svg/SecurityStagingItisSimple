@@ -54,7 +54,7 @@ interface WeeklyHomeworkModalProps {
   onClose: () => void;
   homework: WeeklyHomeworkData;
   onSaveProgress: (updatedHomework: WeeklyHomeworkData) => void;
-  onSubmitToTeacher: (homework: WeeklyHomeworkData) => void;
+  onSubmitToTeacher: (homework: WeeklyHomeworkData) => Promise<void> | void;
   currentLanguage: Language;
   onRegenerateWithAi?: () => Promise<void> | void;
   isGeneratingAi?: boolean;
@@ -1630,8 +1630,23 @@ export const WeeklyHomeworkModal: React.FC<WeeklyHomeworkModalProps> = ({
     }
   };
 
-  const handleSubmit = () => {
-    onSubmitToTeacher(homework);
+  const handleSubmit = async () => {
+    const activeEval = aiEvaluation || homework?.aiEvaluation;
+    const mergedSubmission: WeeklyHomeworkData = {
+      ...homework,
+      targetDay,
+      studentAnswers: {
+        matching: matchingAnswers,
+        fillInBlanks: fillAnswers,
+        sentences: sentenceAnswers,
+        quizAnswers,
+      },
+      partsProgress,
+      ...(activeEval ? { aiEvaluation: activeEval } : {}),
+      submittedAt: homework.submittedAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    await onSubmitToTeacher(mergedSubmission);
     setSubmittedFeedbackToast(memT.toastSubmitted);
     setTimeout(() => setSubmittedFeedbackToast(null), 4000);
   };
