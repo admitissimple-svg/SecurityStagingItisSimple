@@ -1,14 +1,12 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { LiveLesson, EnglishLevel } from '../types';
+import { LiveLesson, EnglishLevel, NoteApprovedVersion } from '../types';
 import { sanitizeTimeZone } from '../utils/timezone';
 import {
   extractNotesMarkings,
-  fetchPedagogicalTransformation,
   PedagogicalLessonTransformation,
   hasValidPedagogicalContent,
 } from '../utils/pedagogicalTransformer';
-import { getDb, auth } from '../firebase';
-import { collection, doc, getDoc, getDocs, setDoc, onSnapshot, query, where } from 'firebase/firestore';
+import { auth } from '../firebase';
 
 export interface SessionNoteSummary {
   key: string;
@@ -18,6 +16,8 @@ export interface SessionNoteSummary {
   teacherName: string;
   rawContent: string;
   timestamp: number;
+  lastApprovedVersion?: NoteApprovedVersion | null;
+  approvalStatus?: string;
 }
 
 export interface ReviewTabDef {
@@ -108,7 +108,6 @@ export function useNativeFriendsNotesReminder({
   lessonsRef.current = lessons || [];
 
   const [sessions, setSessions] = useState<SessionNoteSummary[]>([]);
-  const [latestTransformation, setLatestTransformation] = useState<PedagogicalLessonTransformation | null>(null);
   const [stepIndex, setStepIndex] = useState<number>(0);
   const [storedSessionKey, setStoredSessionKey] = useState<string>('');
   const [storedLastAssignedDate, setStoredLastAssignedDate] = useState<string>('');
@@ -172,79 +171,15 @@ export function useNativeFriendsNotesReminder({
                 teacherName: l.teacherName || (l as any)?.tutorName || 'Native Friend',
                 rawContent: raw,
                 timestamp,
+                lastApprovedVersion: (l as any)?.lastApprovedVersion || null,
+                approvalStatus: (l as any)?.approvalStatus || ((l as any)?.lastApprovedVersion ? 'approved' : 'unapproved'),
               });
             }
           }
         });
       }
 
-      // 1b. Firestore session_notes (root & users subcollection)
-      try {
-        const firestore = getDb();
-        if (firestore && resolvedUid) {
-          // Query root collection
-          try {
-            const rootQ = query(collection(firestore, 'session_notes'), where('studentUid', '==', resolvedUid));
-            const rootSnap = await getDocs(rootQ);
-            rootSnap.forEach((docSnap) => {
-              const data = docSnap.data();
-              if (data && data.content && data.content.trim() && data.studentUid === resolvedUid) {
-                const { timestamp, dateStr } = extractRealLessonDateAndTimestamp({
-                  sessionDate: data.sessionDate,
-                  startDateTime: data.startDateTime,
-                  id: docSnap.id,
-                  key: docSnap.id,
-                });
-                const key = docSnap.id;
-                if (!sessionsMap.has(key)) {
-                  sessionsMap.set(key, {
-                    key,
-                    lessonId: data.lessonId,
-                    dateStr: dateStr || 'Session',
-                    topic: data.topic || 'In-Session Coaching',
-                    teacherName: data.teacherName || 'Native Friend',
-                    rawContent: data.content,
-                    timestamp,
-                  });
-                }
-              }
-            });
-          } catch {}
-
-          // Query user subcollection
-          const userNotesCol = collection(firestore, 'users', resolvedUid, 'session_notes');
-          const snap = await getDocs(userNotesCol);
-          snap.forEach((docSnap) => {
-            if (docSnap.id === 'review_cycle') return; // Skip internal cycle document
-            const data = docSnap.data();
-            if (data && data.content && data.content.trim()) {
-              if (data.studentUid && data.studentUid !== resolvedUid) return;
-              const { timestamp, dateStr } = extractRealLessonDateAndTimestamp({
-                sessionDate: data.sessionDate,
-                startDateTime: data.startDateTime,
-                id: docSnap.id,
-                key: docSnap.id,
-              });
-              const key = docSnap.id;
-              if (!sessionsMap.has(key)) {
-                sessionsMap.set(key, {
-                  key,
-                  lessonId: data.lessonId,
-                  dateStr: dateStr || 'Session',
-                  topic: data.topic || 'In-Session Coaching',
-                  teacherName: data.teacherName || 'Native Friend',
-                  rawContent: data.content,
-                  timestamp,
-                });
-              }
-            }
-          });
-        }
-      } catch (fsErr) {
-        console.warn('useNativeFriendsNotesReminder: Firestore notice:', fsErr);
-      }
-
-      // 1c. Server API /api/session-notes
+      // 1b. Server API /api/session-notes (canonical Firestore source via backend)
       try {
         const queryParams = new URLSearchParams();
         if (resolvedUid) queryParams.set('studentUid', resolvedUid);
@@ -269,7 +204,19 @@ export function useNativeFriendsNotesReminder({
                     key: n.id,
                   });
                   const key = n.id || (dateStr ? `session_${dateStr}` : 'session');
-                  if (!sessionsMap.has(key)) {
+                  let existingKey: string | null = sessionsMap.has(key) ? key : null;
+                  if (!existingKey && n.lessonId) {
+                    const cleanNew = String(n.lessonId).replace(/^lesson_/, '');
+                    for (const [k, v] of sessionsMap.entries()) {
+                      if (v.lessonId && String(v.lessonId).replace(/^lesson_/, '') === cleanNew) {
+                        existingKey = k;
+                        break;
+                      }
+                    }
+                  }
+
+                  const serverApproved: NoteApprovedVersion | null = n.lastApprovedVersion || null;
+                  if (!existingKey) {
                     sessionsMap.set(key, {
                       key,
                       lessonId: n.lessonId,
@@ -278,6 +225,22 @@ export function useNativeFriendsNotesReminder({
                       teacherName: n.teacherName || 'Native Friend',
                       rawContent: n.content,
                       timestamp,
+                      lastApprovedVersion: serverApproved,
+                      approvalStatus: n.approvalStatus || (serverApproved ? 'approved' : 'unapproved'),
+                    });
+                  } else {
+                    const existing = sessionsMap.get(existingKey)!;
+                    const mergedApproved = serverApproved || existing.lastApprovedVersion || null;
+                    sessionsMap.set(existingKey, {
+                      ...existing,
+                      lessonId: existing.lessonId || n.lessonId,
+                      dateStr: (dateStr && /\d{4}-\d{2}-\d{2}/.test(dateStr)) ? dateStr : existing.dateStr,
+                      topic: n.topic || existing.topic,
+                      teacherName: n.teacherName || existing.teacherName,
+                      rawContent: (n.content?.length || 0) >= (existing.rawContent?.length || 0) ? n.content : existing.rawContent,
+                      timestamp: Math.max(existing.timestamp || 0, timestamp || 0),
+                      lastApprovedVersion: mergedApproved,
+                      approvalStatus: n.approvalStatus || (mergedApproved ? 'approved' : existing.approvalStatus || 'unapproved'),
                     });
                   }
                 }
@@ -307,7 +270,7 @@ export function useNativeFriendsNotesReminder({
     }
   }, [resolvedUid, resolvedEmail]);
 
-  // 2. Fetch stored progress from Firestore / Server (NO localStorage)
+  // 2. Fetch stored progress from Server API (canonical review_cycle in Firestore)
   const loadStoredProgress = useCallback(async () => {
     let loadedSessionKey = '';
     let loadedStepIndex = 0;
@@ -316,57 +279,32 @@ export function useNativeFriendsNotesReminder({
     let loadedReminderShownDate = '';
     let exists = false;
 
-    // 2a. Check Firestore /users/{studentUid}/session_notes/review_cycle
     try {
-      const firestore = getDb();
-      if (firestore && resolvedUid) {
-        const cycleDocRef = doc(firestore, 'users', resolvedUid, 'session_notes', 'review_cycle');
-        const snap = await getDoc(cycleDocRef);
-        if (snap.exists()) {
-          const data = snap.data();
-          if (data) {
+      const idToken = await auth?.currentUser?.getIdToken().catch(() => null);
+      if (idToken) {
+        const queryParams = new URLSearchParams();
+        if (resolvedUid) queryParams.set('studentUid', resolvedUid);
+        if (resolvedEmail) queryParams.set('studentEmail', resolvedEmail);
+
+        const res = await fetch(`/api/session-notes/progress?${queryParams.toString()}`, {
+          headers: {
+            Authorization: `Bearer ${idToken}`,
+          },
+        });
+        if (res.ok) {
+          const progressData = await res.json();
+          if (progressData) {
             exists = true;
-            loadedSessionKey = data.lastSessionKey || '';
-            loadedStepIndex = typeof data.stepIndex === 'number' ? data.stepIndex : 0;
-            loadedAssignedDate = data.lastAssignedDate || data.lastAssignedReviewDate || '';
-            loadedReviewedDate = data.lastReviewedDate || '';
-            loadedReminderShownDate = data.lastReminderShownDate || '';
+            loadedSessionKey = progressData.lastSessionKey || '';
+            loadedStepIndex = typeof progressData.stepIndex === 'number' ? progressData.stepIndex : 0;
+            loadedAssignedDate = progressData.lastAssignedDate || progressData.lastAssignedReviewDate || '';
+            loadedReviewedDate = progressData.lastReviewedDate || '';
+            loadedReminderShownDate = progressData.lastReminderShownDate || '';
           }
         }
       }
     } catch (err) {
-      console.warn('useNativeFriendsNotesReminder: Firestore progress read notice:', err);
-    }
-
-    // 2b. Check Server API fallback
-    if (!exists) {
-      try {
-        const idToken = await auth?.currentUser?.getIdToken().catch(() => null);
-        if (idToken) {
-          const queryParams = new URLSearchParams();
-          if (resolvedUid) queryParams.set('studentUid', resolvedUid);
-          if (resolvedEmail) queryParams.set('studentEmail', resolvedEmail);
-
-          const res = await fetch(`/api/session-notes/progress?${queryParams.toString()}`, {
-            headers: {
-              Authorization: `Bearer ${idToken}`,
-            },
-          });
-          if (res.ok) {
-            const progressData = await res.json();
-            if (progressData) {
-              exists = true;
-              loadedSessionKey = progressData.lastSessionKey || '';
-              loadedStepIndex = typeof progressData.stepIndex === 'number' ? progressData.stepIndex : 0;
-              loadedAssignedDate = progressData.lastAssignedDate || progressData.lastAssignedReviewDate || '';
-              loadedReviewedDate = progressData.lastReviewedDate || '';
-              loadedReminderShownDate = progressData.lastReminderShownDate || '';
-            }
-          }
-        }
-      } catch (err) {
-        console.warn('useNativeFriendsNotesReminder: Server progress read notice:', err);
-      }
+      console.warn('useNativeFriendsNotesReminder: Server progress read notice:', err);
     }
 
     setStoredSessionKey(loadedSessionKey);
@@ -383,85 +321,31 @@ export function useNativeFriendsNotesReminder({
     loadSessions();
     loadStoredProgress();
 
-    const firestore = getDb();
-    if (!firestore || !resolvedUid) return;
-
-    // Real-time synchronization of Native Friends Notes review cycle progress across mobile & desktop
-    const cycleDocRef = doc(firestore, 'users', resolvedUid, 'session_notes', 'review_cycle');
-    const unsubCycle = onSnapshot(
-      cycleDocRef,
-      (snap) => {
-        if (snap.exists()) {
-          const data = snap.data();
-          if (data) {
-            if (data.lastSessionKey) setStoredSessionKey(data.lastSessionKey);
-            if (typeof data.stepIndex === 'number') setStepIndex(data.stepIndex);
-            if (data.lastAssignedDate) setStoredLastAssignedDate(data.lastAssignedDate);
-            if (data.lastReviewedDate) setStoredLastReviewedDate(data.lastReviewedDate);
-            if (data.lastReminderShownDate) setStoredLastReminderShownDate(data.lastReminderShownDate);
-            setHasExistingProgress(true);
-            setIsProgressLoaded(true);
-            initialProgressLoadedRef.current = true;
-          }
-        }
-      },
-      (err) => console.warn('Real-time review_cycle snapshot notice:', err)
-    );
-
-    // Real-time listener for session notes subcollection
-    const userNotesCol = collection(firestore, 'users', resolvedUid, 'session_notes');
-    const unsubNotes = onSnapshot(
-      userNotesCol,
-      () => {
-        loadSessions();
-      },
-      (err) => console.warn('Real-time session_notes snapshot notice:', err)
-    );
+    const handleNotesUpdated = () => {
+      loadSessions();
+      loadStoredProgress();
+    };
+    window.addEventListener('native-notes-updated', handleNotesUpdated);
 
     return () => {
-      unsubCycle();
-      unsubNotes();
+      window.removeEventListener('native-notes-updated', handleNotesUpdated);
     };
   }, [resolvedUid, loadSessions, loadStoredProgress]);
 
-  // Update sessions when lessons count changes without resetting listeners
+  // Update sessions when lessons count changes
   useEffect(() => {
     loadSessions();
   }, [lessons?.length, loadSessions]);
 
-  // 3. Transform latest session notes
+  // 3. Derive latest transformation strictly from canonical lastApprovedVersion
   const latestSession = useMemo(() => sessions[0] || null, [sessions]);
 
-  useEffect(() => {
-    let isCancelled = false;
-    if (latestSession && latestSession.rawContent) {
-      fetchPedagogicalTransformation({
-        rawNotes: latestSession.rawContent,
-        topic: latestSession.topic,
-        sessionDate: latestSession.dateStr,
-        teacherName: latestSession.teacherName,
-        studentLevel,
-        studentUid: resolvedUid,
-        studentEmail: resolvedEmail,
-        lessonId: latestSession.lessonId,
-        sessionKey: latestSession.key,
-        language: currentLanguage,
-        forceRegenerate: false,
-        triggerAiIfMissing: false,
-      })
-        .then((trans) => {
-          if (!isCancelled) setLatestTransformation(trans);
-        })
-        .catch((err) => {
-          console.warn('useNativeFriendsNotesReminder: Failed to transform latest notes', err);
-        });
-    } else {
-      setLatestTransformation(null);
+  const latestTransformation = useMemo<PedagogicalLessonTransformation | null>(() => {
+    if (latestSession?.lastApprovedVersion?.status === 'approved' && latestSession.lastApprovedVersion.transformation) {
+      return latestSession.lastApprovedVersion.transformation;
     }
-    return () => {
-      isCancelled = true;
-    };
-  }, [latestSession, studentLevel, resolvedUid, resolvedEmail, currentLanguage]);
+    return null;
+  }, [latestSession]);
 
   // 4. Save review progress to Firestore and Server (NO localStorage)
   const persistProgress = useCallback(
@@ -495,23 +379,7 @@ export function useNativeFriendsNotesReminder({
         cyclePayload.lastReviewedTab = lastReviewedTab;
       }
 
-      // Save directly to Firestore /users/{studentUid}/session_notes/review_cycle and users/{studentUid}
-      try {
-        const firestore = getDb();
-        if (firestore && resolvedUid) {
-          const cycleDocRef = doc(firestore, 'users', resolvedUid, 'session_notes', 'review_cycle');
-          const userDocRef = doc(firestore, 'users', resolvedUid);
-
-          await Promise.all([
-            setDoc(cycleDocRef, cyclePayload, { merge: true }),
-            setDoc(userDocRef, { nativeNotesReview: cyclePayload, updatedAt: new Date().toISOString() }, { merge: true }),
-          ]);
-        }
-      } catch (err) {
-        console.warn('useNativeFriendsNotesReminder: Firestore progress save notice:', err);
-      }
-
-      // Save to Server API
+      // Save to Server API (writes strictly to canonical users/{uid}/session_notes/review_cycle)
       try {
         const idToken = await auth?.currentUser?.getIdToken().catch(() => null);
         if (idToken) {

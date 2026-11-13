@@ -4,6 +4,10 @@ import assert from 'assert';
 import http from 'http';
 import { app as serverApp } from '../serverApp';
 import { setFirebaseAdminAuthForTesting } from '../src/serverFirebaseAdmin';
+import {
+  setFirebaseAdminFirestoreForTesting,
+  resetFirebaseAdminFirestoreForTesting,
+} from '../src/serverFirestore';
 import { isValidCanonicalUid } from '../src/utils/studentPersistence';
 import { extractRealLessonDateAndTimestamp } from '../src/components/NativeFriendsNotesModal';
 import { parseNotesHtml } from '../src/utils/notesHtmlParser';
@@ -145,6 +149,88 @@ async function runTestSuite() {
     },
     setCustomUserClaims: async () => {},
   } as any);
+
+  // Isolated in-memory MockFirestoreDb for canonical (default) persistence
+  const firestoreStore = new Map<string, Record<string, any>>();
+  const makeDocRef = (docPath: string): any => {
+    const parts = docPath.split('/');
+    const id = parts[parts.length - 1];
+    return {
+      id,
+      path: docPath,
+      get: async () => {
+        const data = firestoreStore.get(docPath);
+        return {
+          exists: Boolean(data),
+          id,
+          ref: makeDocRef(docPath),
+          data: () => (data ? JSON.parse(JSON.stringify(data)) : undefined),
+        };
+      },
+      set: async (data: any, options?: { merge?: boolean }) => {
+        const existing = firestoreStore.get(docPath) || {};
+        const next = options?.merge ? { ...existing, ...JSON.parse(JSON.stringify(data)) } : JSON.parse(JSON.stringify(data));
+        firestoreStore.set(docPath, next);
+        return { writeTime: new Date() };
+      },
+      update: async (data: any) => {
+        const existing = firestoreStore.get(docPath);
+        if (!existing) throw new Error(`NOT_FOUND: ${docPath}`);
+        firestoreStore.set(docPath, { ...existing, ...JSON.parse(JSON.stringify(data)) });
+        return { writeTime: new Date() };
+      },
+      delete: async () => {
+        firestoreStore.delete(docPath);
+        return { writeTime: new Date() };
+      },
+      collection: (subName: string) => makeColRef(`${docPath}/${subName}`),
+    };
+  };
+  const makeQuery = (colPath: string, filters: Array<{ field: string; op: string; val: any }>): any => ({
+    where: (field: string, op: string, val: any) => makeQuery(colPath, [...filters, { field, op, val }]),
+    orderBy: () => makeQuery(colPath, filters),
+    limit: () => makeQuery(colPath, filters),
+    get: async () => {
+      const docs: any[] = [];
+      const prefix = `${colPath}/`;
+      for (const [k, v] of firestoreStore.entries()) {
+        if (!k.startsWith(prefix)) continue;
+        const rest = k.slice(prefix.length);
+        if (rest.includes('/')) continue;
+        const ok = filters.every((f) => {
+          const actual = v?.[f.field];
+          if (f.op === '==') return actual === f.val;
+          if (f.op === 'in' && Array.isArray(f.val)) return f.val.includes(actual);
+          return false;
+        });
+        if (ok) {
+          docs.push({ id: rest, exists: true, ref: makeDocRef(k), data: () => JSON.parse(JSON.stringify(v)) });
+        }
+      }
+      return { empty: docs.length === 0, size: docs.length, docs, forEach: (cb: (d: any) => void) => docs.forEach(cb) };
+    },
+  });
+  const makeColRef = (colPath: string): any => ({
+    doc: (id: string) => makeDocRef(`${colPath}/${id}`),
+    where: (field: string, op: string, val: any) => makeQuery(colPath, [{ field, op, val }]),
+    orderBy: () => makeQuery(colPath, []),
+    limit: () => makeQuery(colPath, []),
+    get: () => makeQuery(colPath, []).get(),
+  });
+  const mockFirestoreDb: any = {
+    store: firestoreStore,
+    collection: (name: string) => makeColRef(name),
+    runTransaction: async (fn: (tx: any) => Promise<any>) => {
+      const tx = {
+        get: async (ref: any) => ref.get(),
+        set: (ref: any, data: any, opts?: any) => ref.set(data, opts),
+        update: (ref: any, data: any) => ref.update(data),
+        delete: (ref: any) => ref.delete(),
+      };
+      return fn(tx);
+    },
+  };
+  setFirebaseAdminFirestoreForTesting(mockFirestoreDb);
 
   try {
     // ------------------------------------------------------------------------
@@ -400,30 +486,23 @@ async function runTestSuite() {
     // TESTE 6: Registros históricos incompletos não provocam associação indevida
     // ------------------------------------------------------------------------
     await test('6. Registros históricos incompletos não provocam associação indevida', async () => {
-      // Injeta diretamente um registro legado incompleto (sem studentUid, ou de outro aluno) no map interno do db
-      const { readDb, writeDbSync } = await import('../serverApp');
-      const db = readDb();
-      if (!db.sessionNotesMap) db.sessionNotesMap = {};
-
-      // Registro com e-mail similar ou genérico mas SEM studentUid
-      db.sessionNotesMap['legacy_incomplete_session_1'] = {
+      // Injeta diretamente um registro legado incompleto (sem studentUid, ou de outro aluno) no Firestore canônico
+      await mockFirestoreDb.collection('session_notes').doc('legacy_incomplete_session_1').set({
         id: 'legacy_incomplete_session_1',
         sessionDate: '2026-04-12',
         studentEmail: canonicalStudentEmail, // E-mail igual, mas studentUid ausente
         studentUid: undefined,
         content: 'Incomplete historical record without canonical UID',
-      };
+      });
 
       // Registro de outro aluno com studentUid explícito diferente
-      db.sessionNotesMap['other_student_session_1'] = {
+      await mockFirestoreDb.collection('session_notes').doc('other_student_session_1').set({
         id: 'other_student_session_1',
         sessionDate: '2026-11-05',
         studentEmail: 'other.student@example.com',
         studentUid: otherStudentUid,
         content: 'Confidential other student notes',
-      };
-
-      await writeDbSync(db);
+      });
 
       // Consulta de histórico pelo aluno canônico dofH3QR7IrPJyV7DL9UgGnGeLQF3
       const studentHistory = await makeRequest(
@@ -509,6 +588,7 @@ async function runTestSuite() {
     });
 
   } finally {
+    resetFirebaseAdminFirestoreForTesting();
     server.close();
   }
 

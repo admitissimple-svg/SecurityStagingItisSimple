@@ -87,10 +87,15 @@ import {
   addExcludedDictionaryWordsServer,
   removeExcludedDictionaryWordsServer,
   fetchExcludedDictionaryWordsServer,
+  markVocabularyWordsPracticedServer,
   resolveCanonicalStudentIdentity,
   saveSessionNotesToFirestoreServer,
   fetchSessionNotesFromFirestoreServer,
   fetchSessionNotesForStudentServer,
+  fetchAllSessionNotesServer,
+  fetchSessionNotesByTeacherServer,
+  findSessionNoteByDriveFileIdServer,
+  fetchAllPedagogicalTransformationsServer,
   saveYouTubePlaylistsToFirestore,
   fetchYouTubePlaylistsFromFirestore,
   fetchYouTubePlaylistsDocFromFirestore,
@@ -530,7 +535,7 @@ interface AppDb {
   weeklyNativeTargets: Record<string, number>;
   weeklyStudyDaysTargets: Record<string, number>;
   weeklyStudyDays: Record<string, string[]>;
-  studentDictionaryMap: Record<string, any[]>;
+  studentDictionaryMap?: Record<string, any[]>;
   studentJournalMap: Record<string, any[]>;
   studentActivityJournal: Record<string, any[]>;
   authUsers: Record<string, { uid?: string; email: string; name: string; role: string; createdAt?: string; updatedAt?: string }>;
@@ -608,7 +613,6 @@ const DEFAULT_DB: AppDb = {
   weeklyNativeTargets: {},
   weeklyStudyDaysTargets: {},
   weeklyStudyDays: {},
-  studentDictionaryMap: {},
   studentJournalMap: {},
   studentActivityJournal: {},
   transactions: [],
@@ -747,6 +751,10 @@ function mergeDbWithDefaults(parsed: any): AppDb {
     liveLessons: _ignoredParsedLiveLessons,
     lessons: _ignoredParsedLessons,
     scheduledLessons: _ignoredParsedScheduledLessons,
+    studentDictionaryMap: _ignoredParsedStudentDictionaryMap,
+    sessionNotesMap: _ignoredParsedSessionNotesMap,
+    sessionNotesProgressMap: _ignoredParsedSessionNotesProgressMap,
+    pedagogicalTransformationsMap: _ignoredParsedPedagogicalTransformationsMap,
     ...safeParsed
   } = parsed || {};
 
@@ -758,7 +766,6 @@ function mergeDbWithDefaults(parsed: any): AppDb {
         ? parsed.routinesByDay
         : defaultRoutinesByDay,
     studentWeeklyChecks: (parsed && parsed.studentWeeklyChecks) || {},
-    studentDictionaryMap: (parsed && parsed.studentDictionaryMap) || {},
     studentListenedTracks: (parsed && parsed.studentListenedTracks) || {},
     studentHomeworkMap: (parsed && parsed.studentHomeworkMap) || {},
     weeklyNativeTargets: (parsed && parsed.weeklyNativeTargets) || {},
@@ -772,9 +779,9 @@ function mergeDbWithDefaults(parsed: any): AppDb {
     studentSpotifyAssignments: (parsed && parsed.studentSpotifyAssignments) || {},
     studentAwaitingTopicSelection: (parsed && parsed.studentAwaitingTopicSelection) || {},
     spotifyPlaylists: (parsed && parsed.spotifyPlaylists) || {},
-    sessionNotesMap: (parsed && parsed.sessionNotesMap) || {},
-    sessionNotesProgressMap: (parsed && parsed.sessionNotesProgressMap) || {},
-    pedagogicalTransformationsMap: (parsed && parsed.pedagogicalTransformationsMap) || {},
+    sessionNotesMap: {},
+    sessionNotesProgressMap: {},
+    pedagogicalTransformationsMap: {},
     authUsers: (parsed && parsed.authUsers) || DEFAULT_DB.authUsers,
     teacherSettings: (parsed && parsed.teacherSettings) || {},
     meetSettings: (parsed && parsed.meetSettings) || {},
@@ -1204,15 +1211,6 @@ export async function initCloudPersistence() {
         if (isAllowedKey(k)) cleanStudentRoutines[k] = v;
       });
 
-      const rawStudentDictionary = {
-        ...(inMemoryDb.studentDictionaryMap || {}),
-        ...(cloudState.studentDictionaryMap || {}),
-      };
-      const cleanStudentDictionary: Record<string, any> = {};
-      Object.entries(rawStudentDictionary).forEach(([k, v]) => {
-        if (isAllowedKey(k)) cleanStudentDictionary[k] = v;
-      });
-
       const mergedWatchedVideos = {
         ...(inMemoryDb.studentWatchedVideos || {}),
         ...(cloudState.studentWatchedVideos || {}),
@@ -1226,6 +1224,10 @@ export async function initCloudPersistence() {
         liveLessons: _ignoredCloudLiveLessons,
         lessons: _ignoredCloudLessons,
         scheduledLessons: _ignoredCloudScheduledLessons,
+        studentDictionaryMap: _ignoredCloudStudentDictionaryMap,
+        sessionNotesMap: _ignoredCloudSessionNotesMap,
+        sessionNotesProgressMap: _ignoredCloudSessionNotesProgressMap,
+        pedagogicalTransformationsMap: _ignoredCloudPedagogicalTransformationsMap,
         ...cloudStateWithoutLegacyLessons
       } = cloudState;
       inMemoryDb = mergeDbWithDefaults({
@@ -1242,7 +1244,6 @@ export async function initCloudPersistence() {
         studentRoutinesMap: cleanStudentRoutines,
         studentWatchedVideos: mergedWatchedVideos,
         studentListenedTracks: mergedListenedTracks,
-        studentDictionaryMap: cleanStudentDictionary,
       });
       isCloudHydrated = true;
       await saveAppStateToFirestore(inMemoryDb);
@@ -9251,13 +9252,18 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
   const topic = req.body?.topic || lesson?.title || 'Live Coaching Session';
   const targetStudentEmail = (studentDoc?.email || req.body?.studentEmail || '').toLowerCase().trim();
 
-  // 8. Fetch existing document to preserve approved version, original notes, and version history (FASE NF-DOC.2A)
-  let existingDoc = db.sessionNotesMap?.[sessionKey];
-  if (!existingDoc) {
-    try {
-      existingDoc = await fetchSessionNotesFromFirestoreServer(sessionKey);
-    } catch {}
+  if (!getFirestoreDb()) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
   }
+
+  // 8. Fetch existing document from Firestore to preserve approved version, original notes, and version history (FASE NF-DOC.2A)
+  let existingDoc: any = null;
+  try {
+    existingDoc = await fetchSessionNotesFromFirestoreServer(sessionKey, { studentUid });
+  } catch {}
 
   const authorContext = {
     authorUid: teacherUid,
@@ -9286,31 +9292,26 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
       pronunciationNotes: req.body?.pronunciationNotes,
       grammarAndPhrasing: req.body?.grammarAndPhrasing,
       vocabularyNotes: req.body?.vocabularyNotes,
-      driveFileId: req.body?.driveFileId || '',
-      driveFileUrl: req.body?.driveFileUrl || '',
-      driveFolderName: req.body?.driveFolderName || GOOGLE_DRIVE_SESSION_FOLDER,
-      driveLastSyncedAt: req.body?.driveLastSyncedAt || '',
+      driveFileId: req.body?.driveFileId || existingDoc?.driveFileId || '',
+      driveFileUrl: req.body?.driveFileUrl || existingDoc?.driveFileUrl || '',
+      driveFolderName: req.body?.driveFolderName || existingDoc?.driveFolderName || GOOGLE_DRIVE_SESSION_FOLDER,
+      driveLastSyncedAt: req.body?.driveLastSyncedAt || existingDoc?.driveLastSyncedAt || '',
     },
     author: authorContext,
     changeSummary: req.body?.changeSummary,
   });
 
-  if (!db.sessionNotesMap) db.sessionNotesMap = {};
-  db.sessionNotesMap[sessionKey] = noteDoc;
-
-  // Invalidate cached pedagogical transformations
-  invalidatePedagogicalCache(db, {
-    canonicalSessionKey: sessionKey,
-    sessionKey,
-    lessonId,
-    id: sessionKey,
-  });
-
-  // 10. Persist canonically to Firestore (default) under session_notes/{sessionKey}, users/{studentUid}/session_notes, and lessons/{lessonId}
-  // ARCH.2D.2: Decoupled from db.liveLessons and writeDbSync (never triggers app_state/lessons write).
-  await saveSessionNotesToFirestoreServer(sessionKey, noteDoc).catch((err) => {
-    console.warn('Backend Firestore session notes save notice:', err);
-  });
+  // 10. Persist canonically to Firestore (default) under session_notes/{sessionKey} and lessons/{lessonId}
+  // ARCH.2F.2C: Zero db.sessionNotesMap and zero writeDbSync (never triggers app_state write).
+  const savedOk = await saveSessionNotesToFirestoreServer(sessionKey, noteDoc);
+  if (!savedOk) {
+    return res.status(500).json({
+      success: false,
+      error: 'FIRESTORE_SAVE_FAILED',
+      code: 'FIRESTORE_SAVE_FAILED',
+      message: 'Failed to persist session notes to Firestore.',
+    });
+  }
 
   return res.json({ success: true, sessionNote: noteDoc });
 }
@@ -9973,8 +9974,9 @@ async function resolveApprovedTeacherForSessionNotes(
 }
 
 async function resolveExistingSessionNoteWithKeyFallback(
-  db: any,
-  rawSessionKey: string
+  _db: any,
+  rawSessionKey: string,
+  studentUid?: string
 ): Promise<{ effectiveKey: string; existingDoc: any | null }> {
   const candidateKeys = [rawSessionKey];
   if (rawSessionKey.startsWith('lesson_')) {
@@ -9985,14 +9987,8 @@ async function resolveExistingSessionNoteWithKeyFallback(
   }
 
   for (const key of candidateKeys) {
-    if (db.sessionNotesMap?.[key]) {
-      return { effectiveKey: key, existingDoc: db.sessionNotesMap[key] };
-    }
-  }
-
-  for (const key of candidateKeys) {
     try {
-      const fsDoc = await fetchSessionNotesFromFirestoreServer(key);
+      const fsDoc = await fetchSessionNotesFromFirestoreServer(key, { studentUid });
       if (fsDoc) {
         return { effectiveKey: key, existingDoc: fsDoc };
       }
@@ -10120,10 +10116,22 @@ async function handleSessionNoteDraftInternal(req: any, res: any) {
     changeSummary: req.body?.changeSummary || 'Teacher updated draft AI transformation in progress',
   });
 
-  if (!db.sessionNotesMap) db.sessionNotesMap = {};
-  db.sessionNotesMap[targetSessionKey] = updatedDoc;
-  await writeDbSync(db);
-  await saveSessionNotesToFirestoreServer(targetSessionKey, updatedDoc).catch(() => null);
+  if (!getFirestoreDb()) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
+  }
+
+  const savedOk = await saveSessionNotesToFirestoreServer(targetSessionKey, updatedDoc);
+  if (!savedOk) {
+    return res.status(500).json({
+      success: false,
+      error: 'FIRESTORE_SAVE_FAILED',
+      code: 'FIRESTORE_SAVE_FAILED',
+      message: 'Failed to persist draft transformation to Firestore.',
+    });
+  }
 
   return res.json({ success: true, sessionNote: updatedDoc });
 }
@@ -10249,12 +10257,27 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
   const contentHash = computeNotesContentHash(rawNotes);
   const forceRegenerate = Boolean(req.body?.forceRegenerate);
   const language = (req.body?.language || req.body?.lang || 'pt').toLowerCase().trim();
+  let fsStudentProfile: any = null;
+  try {
+    const fs = getFirestoreDb();
+    if (fs && studentUid) {
+      const uSnap = await fs.collection('users').doc(studentUid).get().catch(() => null);
+      if (uSnap && uSnap.exists) fsStudentProfile = uSnap.data();
+    }
+  } catch {}
   const registeredStudent = (db.students || []).find((s: any) =>
     (studentUid && (s.uid === studentUid || s.id === studentUid)) ||
     (existingDoc.studentEmail && (s.email || '').toLowerCase().trim() === existingDoc.studentEmail.toLowerCase().trim())
   );
   const profile = (studentUid && db.userProfiles?.[studentUid]) || (existingDoc.studentEmail && db.userProfiles?.[existingDoc.studentEmail]);
-  const authoritativeLevel = profile?.level || profile?.englishLevel || registeredStudent?.level || registeredStudent?.englishLevel || 'intermediario';
+  const authoritativeLevel =
+    fsStudentProfile?.level ||
+    fsStudentProfile?.englishLevel ||
+    profile?.level ||
+    profile?.englishLevel ||
+    registeredStudent?.level ||
+    registeredStudent?.englishLevel ||
+    'intermediario';
   const cefr = resolveCefrLevel(authoritativeLevel).cefr;
   const compositeCacheKey = buildPedagogicalCacheKey({
     canonicalSessionKey: targetSessionKey,
@@ -10274,9 +10297,13 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
       existingDoc.lastApprovedVersion?.contentHash === contentHash
         ? existingDoc.lastApprovedVersion.transformation
         : null;
-    const memoryCachedTrans = db.pedagogicalTransformationsMap?.[compositeCacheKey] || null;
+    const fsCachedTrans = await fetchPedagogicalTransformationFromFirestoreServer(compositeCacheKey, {
+      language: 'en',
+      contentHash,
+      rawNotes,
+    });
 
-    const reusableTransformation = [existingDraftTrans, existingApprovedTrans, memoryCachedTrans].find(
+    const reusableTransformation = [existingDraftTrans, existingApprovedTrans, fsCachedTrans].find(
       (cand: any) =>
         cand &&
         cand.isAiGenerated &&
@@ -10328,10 +10355,15 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
         changeSummary: req.body?.changeSummary || 'Reused validated pedagogical transformation for unchanged notes',
       });
 
-      if (!db.sessionNotesMap) db.sessionNotesMap = {};
-      db.sessionNotesMap[targetSessionKey] = updatedDoc;
-      await writeDbSync(db);
-      await saveSessionNotesToFirestoreServer(targetSessionKey, updatedDoc).catch(() => null);
+      const savedOk = await saveSessionNotesToFirestoreServer(targetSessionKey, updatedDoc);
+      if (!savedOk) {
+        return res.status(500).json({
+          success: false,
+          error: 'FIRESTORE_SAVE_FAILED',
+          code: 'FIRESTORE_SAVE_FAILED',
+          message: 'Failed to persist reused draft transformation to Firestore.',
+        });
+      }
 
       return res.json({
         success: true,
@@ -10396,9 +10428,6 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
       });
     }
 
-    if (!db.pedagogicalTransformationsMap) db.pedagogicalTransformationsMap = {};
-    db.pedagogicalTransformationsMap[compositeCacheKey] = coreResult.transformation;
-
     const currentVersion = existingDoc.currentVersionNumber || 1;
     const nextDraftVersion = currentVersion + 1;
 
@@ -10435,10 +10464,16 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
       changeSummary: req.body?.changeSummary || 'Gemini generated pedagogical draft transformation',
     });
 
-    if (!db.sessionNotesMap) db.sessionNotesMap = {};
-    db.sessionNotesMap[targetSessionKey] = updatedDoc;
-    await writeDbSync(db);
-    await saveSessionNotesToFirestoreServer(targetSessionKey, updatedDoc).catch(() => null);
+    await savePedagogicalTransformationToFirestoreServer(compositeCacheKey, coreResult.transformation, { rawNotes }).catch(() => null);
+    const savedOk = await saveSessionNotesToFirestoreServer(targetSessionKey, updatedDoc);
+    if (!savedOk) {
+      return res.status(500).json({
+        success: false,
+        error: 'FIRESTORE_SAVE_FAILED',
+        code: 'FIRESTORE_SAVE_FAILED',
+        message: 'Failed to persist generated draft transformation to Firestore.',
+      });
+    }
 
     return res.json({
       success: true,
@@ -10679,10 +10714,22 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
     changeSummary: req.body?.changeSummary || `Version ${nextApprovedVersion} approved and published for student`,
   });
 
-  if (!db.sessionNotesMap) db.sessionNotesMap = {};
-  db.sessionNotesMap[targetSessionKey] = updatedDoc;
-  await writeDbSync(db);
-  await saveSessionNotesToFirestoreServer(targetSessionKey, updatedDoc).catch(() => null);
+  if (!getFirestoreDb()) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
+  }
+
+  const savedOk = await saveSessionNotesToFirestoreServer(targetSessionKey, updatedDoc);
+  if (!savedOk) {
+    return res.status(500).json({
+      success: false,
+      error: 'FIRESTORE_SAVE_FAILED',
+      code: 'FIRESTORE_SAVE_FAILED',
+      message: 'Failed to persist approved version to Firestore.',
+    });
+  }
 
   return res.json({
     success: true,
@@ -10712,12 +10759,11 @@ app.get('/api/session-notes/:id/versions', firebaseAuthMiddleware, async (req, r
   const targetSessionKey = decodeURIComponent(req.params.id).trim();
 
   const db = readDb();
-  let existingDoc = db.sessionNotesMap?.[targetSessionKey];
-  if (!existingDoc) {
-    try {
-      existingDoc = await fetchSessionNotesFromFirestoreServer(targetSessionKey);
-    } catch {}
-  }
+  const { existingDoc } = await resolveExistingSessionNoteWithKeyFallback(
+    db,
+    targetSessionKey,
+    !isCallerAdmin ? callerUid : undefined
+  );
 
   if (!existingDoc) {
     return res.status(404).json({ error: 'NOT_FOUND', message: 'Documento da anotação não encontrado.' });
@@ -10929,29 +10975,15 @@ async function authorizeAndFindDriveFile(
   const storedFile = getStoredDriveFile(fileId);
   const db = readDb();
 
-  let sessionDoc: any =
-    Object.values(db.sessionNotesMap || {}).find(
-      (s: any) => s && (s.driveFileId === fileId || s.id === fileId)
-    ) || null;
+  let sessionDoc: any = null;
   let lessonDoc: any = null;
 
-  if (!sessionDoc) {
-    try {
-      const directNote = await fetchSessionNotesFromFirestoreServer(fileId);
-      if (directNote) sessionDoc = directNote;
-    } catch {}
-  }
+  try {
+    sessionDoc = (await fetchSessionNotesFromFirestoreServer(fileId)) || (await findSessionNoteByDriveFileIdServer(fileId));
+  } catch {}
 
   const fs = getFirestoreDb();
   if (fs) {
-    if (!sessionDoc) {
-      try {
-        const snSnap = await fs.collection('session_notes').where('driveFileId', '==', fileId).limit(1).get();
-        if (snSnap && !snSnap.empty) {
-          sessionDoc = { id: snSnap.docs[0].id, ...snSnap.docs[0].data() };
-        }
-      } catch {}
-    }
     if (!lessonDoc) {
       try {
         const targetLessonId = sessionDoc?.lessonId || fileId;
@@ -11146,9 +11178,7 @@ app.post('/api/drive/sync-session-notes', firebaseAuthMiddleware, async (req, re
   // Check existing Drive file ownership if existingFileId is provided
   if (cleanExistingFileId && !isCallerAdmin) {
     const storedExisting = getStoredDriveFile(cleanExistingFileId);
-    const noteByFileId = Object.values(db.sessionNotesMap || {}).find(
-      (s: any) => s && (s.driveFileId === cleanExistingFileId || s.id === cleanExistingFileId)
-    ) as any;
+    const noteByFileId = await findSessionNoteByDriveFileIdServer(cleanExistingFileId);
 
     if (storedExisting) {
       if (storedExisting.teacherUid && storedExisting.teacherUid !== callerUid) {
@@ -11309,54 +11339,36 @@ app.post('/api/drive/sync-session-notes', firebaseAuthMiddleware, async (req, re
 
     const nowIso = driveRes.syncedAt || new Date().toISOString();
 
-    if (!db.sessionNotesMap) db.sessionNotesMap = {};
-    if (db.sessionNotesMap[effectiveKey]) {
-      db.sessionNotesMap[effectiveKey].driveFileId = driveRes.fileId;
-      db.sessionNotesMap[effectiveKey].driveFileUrl = driveRes.webViewLink;
-      db.sessionNotesMap[effectiveKey].driveFolderName = driveRes.folderName;
-      db.sessionNotesMap[effectiveKey].driveLastSyncedAt = nowIso;
-      if (!db.sessionNotesMap[effectiveKey].studentUid) db.sessionNotesMap[effectiveKey].studentUid = targetStudentUid;
-      if (!db.sessionNotesMap[effectiveKey].teacherUid) db.sessionNotesMap[effectiveKey].teacherUid = effectiveTeacherUid;
-      if (targetStudentEmail && !db.sessionNotesMap[effectiveKey].studentEmail) db.sessionNotesMap[effectiveKey].studentEmail = targetStudentEmail;
-      if (effectiveTeacherEmail && !db.sessionNotesMap[effectiveKey].teacherEmail) db.sessionNotesMap[effectiveKey].teacherEmail = effectiveTeacherEmail;
-      if (content) db.sessionNotesMap[effectiveKey].content = content;
-      if (topic) db.sessionNotesMap[effectiveKey].topic = topic;
-      db.sessionNotesMap[effectiveKey].updatedAt = nowIso;
-    } else {
-      db.sessionNotesMap[effectiveKey] = {
-        id: effectiveKey,
-        sessionKey: effectiveKey,
-        sessionDate: cleanDate,
-        lessonId: cleanLessonId || '',
-        studentUid: targetStudentUid,
-        studentEmail: targetStudentEmail,
-        teacherUid: effectiveTeacherUid,
-        teacherEmail: effectiveTeacherEmail,
-        teacherName: effectiveTeacherName,
-        topic: topic || '',
-        content: content || '',
-        rawContent: content || '',
-        driveFileId: driveRes.fileId,
-        driveFileUrl: driveRes.webViewLink,
-        driveFolderName: driveRes.folderName,
-        driveLastSyncedAt: nowIso,
-        updatedAt: nowIso,
-      };
-    }
-
-    // Invalidate cached pedagogical transformation for this session
-    invalidatePedagogicalCache(db, {
-      canonicalSessionKey: effectiveKey,
+    const updatedNote = {
+      ...(existingDoc || {}),
+      id: effectiveKey,
+      sessionId: effectiveKey,
       sessionKey: effectiveKey,
-      lessonId: cleanLessonId || undefined,
-    });
+      sessionDate: cleanDate || existingDoc?.sessionDate || '',
+      lessonId: cleanLessonId || existingDoc?.lessonId || '',
+      studentUid: targetStudentUid,
+      studentEmail: targetStudentEmail || existingDoc?.studentEmail || '',
+      teacherUid: effectiveTeacherUid || existingDoc?.teacherUid || callerUid,
+      teacherEmail: effectiveTeacherEmail || existingDoc?.teacherEmail || '',
+      teacherName: effectiveTeacherName || existingDoc?.teacherName || 'Native Friend',
+      topic: topic || existingDoc?.topic || '',
+      content: content || existingDoc?.content || '',
+      rawContent: content || existingDoc?.rawContent || existingDoc?.content || '',
+      driveFileId: driveRes.fileId,
+      driveFileUrl: driveRes.webViewLink,
+      driveFolderName: driveRes.folderName,
+      driveLastSyncedAt: nowIso,
+      updatedAt: nowIso,
+    };
 
-    await writeDbSync(db);
-    saveSessionNotesToFirestoreServer(effectiveKey, db.sessionNotesMap[effectiveKey]).catch(() => null);
+    const savedOk = await saveSessionNotesToFirestoreServer(effectiveKey, updatedNote);
+    if (!savedOk) {
+      return res.status(500).json({ error: 'Failed to persist synced Drive session notes to Firestore.' });
+    }
     if (cleanLessonId) {
       const firestore = getFirestoreDb();
       if (firestore) {
-        firestore
+        await firestore
           .collection('lessons')
           .doc(cleanLessonId)
           .set(
@@ -11556,31 +11568,30 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
     const targetKey = id || lessonId;
     const cleanId = targetKey.replace(/^lesson_/, '');
 
-    // First check Firestore canonical storage
+    // First check Firestore canonical storage (and read-only legacy fallback when targetStudentUid present)
     let firestoreNote: any = null;
     if (targetStudentUid) {
       try {
         const studentNotes = await fetchSessionNotesForStudentServer(targetStudentUid, targetKey);
         if (studentNotes && studentNotes.length > 0) {
           firestoreNote = studentNotes[0];
+        } else if (cleanId && cleanId !== targetKey) {
+          const cleanNotes = await fetchSessionNotesForStudentServer(targetStudentUid, cleanId);
+          if (cleanNotes && cleanNotes.length > 0) {
+            firestoreNote = cleanNotes[0];
+          }
         }
       } catch {}
     }
     if (!firestoreNote) {
       try {
-        firestoreNote = await fetchSessionNotesFromFirestoreServer(targetKey);
+        firestoreNote =
+          (await fetchSessionNotesFromFirestoreServer(targetKey)) ||
+          (cleanId && cleanId !== targetKey ? await fetchSessionNotesFromFirestoreServer(cleanId) : null);
       } catch {}
     }
 
     let foundDoc = firestoreNote;
-    if (!foundDoc) {
-      foundDoc = db.sessionNotesMap?.[targetKey] ||
-        db.sessionNotesMap?.[`lesson_${cleanId}`] ||
-        db.sessionNotesMap?.[cleanId] ||
-        Object.values(db.sessionNotesMap || {}).find(
-          (n: any) => n.id === targetKey || n.lessonId === targetKey || n.lessonId === cleanId || n.id === `lesson_${cleanId}`
-        );
-    }
 
     if (!foundDoc) {
       try {
@@ -11655,7 +11666,7 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
   if (targetStudentUid) {
     const map = new Map<string, any>();
 
-    // 3a. Retrieve from canonical Firestore
+    // 3a. Retrieve from canonical Firestore (session_notes + read-only legacy user subcollection fallback)
     try {
       const fsNotes = await fetchSessionNotesForStudentServer(targetStudentUid);
       if (Array.isArray(fsNotes)) {
@@ -11667,20 +11678,7 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
       }
     } catch {}
 
-    // 3b. Overlay in-memory sessionNotesMap matching targetStudentUid
-    const allNotes: any[] = Object.values(db.sessionNotesMap || {});
-    allNotes.forEach((n: any) => {
-      if (n.studentUid === targetStudentUid) {
-        const cleanLessonId = n.lessonId ? n.lessonId.replace(/^lesson_/, '') : '';
-        const mapKey = cleanLessonId ? `lesson_${cleanLessonId}` : (n.id || n.sessionDate);
-        if (mapKey && !map.has(mapKey)) {
-          const rawContent = n.rawContent || n.content || '';
-          map.set(mapKey, { ...n, rawContent, content: n.content || rawContent });
-        }
-      }
-    });
-
-    // 3c. Overlay canonical Firestore lessons/{lessonId} notes matching targetStudentUid
+    // 3b. Overlay canonical Firestore lessons/{lessonId} notes matching targetStudentUid
     try {
       const fs = getFirestoreDb();
       if (fs) {
@@ -11694,7 +11692,11 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
               const lDate = l.sessionDate || (l.startDateTime ? l.startDateTime.split('T')[0] : '');
               const cleanLessonId = lId ? String(lId).replace(/^lesson_/, '') : '';
               const mapKey = cleanLessonId ? `lesson_${cleanLessonId}` : (lId || `session_${lDate}_${targetStudentUid}`);
-              if (!map.has(mapKey)) {
+              const alreadyPresent =
+                map.has(mapKey) ||
+                map.has(lId) ||
+                Array.from(map.values()).some((ex: any) => ex.lessonId === lId || ex.id === lId || ex.id === mapKey);
+              if (!alreadyPresent) {
                 map.set(mapKey, {
                   id: mapKey,
                   sessionKey: mapKey,
@@ -11760,26 +11762,15 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
     return res.json(results);
   }
 
-  // 4. Admin listing all notes if no filter
+  // 4. Admin listing all notes from Firestore (default)
   if (isCallerAdmin) {
-    const all = Object.values(db.sessionNotesMap || {}).map((n: any) => ({
-      ...n,
-      rawContent: n.rawContent || n.content || '',
-      content: n.content || n.rawContent || '',
-    }));
+    const all = await fetchAllSessionNotesServer();
     return res.json(all);
   }
 
-  // Teacher listing notes for their lessons
+  // Teacher listing notes for their lessons from Firestore (default)
   if (isCallerTeacher) {
-    const callerEmail = (req.user?.email || '').toLowerCase();
-    const teacherNotes = Object.values(db.sessionNotesMap || {})
-      .filter((n: any) => n.teacherUid === callerUid || (callerEmail && n.teacherEmail?.toLowerCase() === callerEmail))
-      .map((n: any) => ({
-        ...n,
-        rawContent: n.rawContent || n.content || '',
-        content: n.content || n.rawContent || '',
-      }));
+    const teacherNotes = await fetchSessionNotesByTeacherServer(callerUid, req.user?.email);
     return res.json(teacherNotes);
   }
 
@@ -11913,18 +11904,14 @@ app.get('/api/session-notes/progress', firebaseAuthMiddleware, async (req, res) 
     }
   }
 
-  let progress = (db.sessionNotesProgressMap && db.sessionNotesProgressMap[targetStudentUid]) || null;
-  if (!progress || !progress.lastReminderShownDate) {
-    const fsProgress = await fetchSessionNotesProgressServer(targetStudentUid);
-    if (fsProgress) {
-      if (!db.sessionNotesProgressMap) db.sessionNotesProgressMap = {};
-      progress = {
-        ...(progress || {}),
-        ...fsProgress,
-      };
-      db.sessionNotesProgressMap[targetStudentUid] = progress;
-    }
+  if (!getFirestoreDb()) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
   }
+
+  const progress = await fetchSessionNotesProgressServer(targetStudentUid);
   return res.json(progress || null);
 });
 
@@ -12015,8 +12002,14 @@ app.post('/api/session-notes/progress', firebaseAuthMiddleware, async (req, res)
     targetStudentEmail = callerEmail;
   }
 
-  db.sessionNotesProgressMap = db.sessionNotesProgressMap || {};
-  const existingProg = db.sessionNotesProgressMap[targetStudentUid] || {};
+  if (!getFirestoreDb()) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
+  }
+
+  const existingProg = (await fetchSessionNotesProgressServer(targetStudentUid)) || {};
 
   const updatedProgress = {
     ...existingProg,
@@ -12031,10 +12024,15 @@ app.post('/api/session-notes/progress', firebaseAuthMiddleware, async (req, res)
     updatedAt: new Date().toISOString(),
   };
 
-  db.sessionNotesProgressMap[targetStudentUid] = updatedProgress;
-  await writeDbSync(db);
-
-  saveSessionNotesProgressToFirestore(targetStudentUid, updatedProgress).catch(() => {});
+  const savedOk = await saveSessionNotesProgressToFirestore(targetStudentUid, updatedProgress);
+  if (!savedOk) {
+    return res.status(500).json({
+      success: false,
+      error: 'FIRESTORE_SAVE_FAILED',
+      code: 'FIRESTORE_SAVE_FAILED',
+      message: 'Failed to persist session notes progress to Firestore.',
+    });
+  }
   return res.json({ success: true, progress: updatedProgress });
 });
 
@@ -12136,18 +12134,14 @@ app.post('/api/session-notes/reminder/claim', firebaseAuthMiddleware, async (req
       day: '2-digit',
     }).format(new Date());
 
-  const result = await recordDailyReminderShownServer(effectiveUid, todayInTz);
+  if (!getFirestoreDb()) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
+  }
 
-  if (!db.sessionNotesProgressMap) db.sessionNotesProgressMap = {};
-  const existingProg = db.sessionNotesProgressMap[effectiveUid] || {};
-  db.sessionNotesProgressMap[effectiveUid] = {
-    ...existingProg,
-    studentUid: effectiveUid,
-    studentEmail: effectiveEmail || existingProg.studentEmail || '',
-    lastReminderShownDate: result.lastReminderShownDate || todayInTz,
-    updatedAt: new Date().toISOString(),
-  };
-  await writeDbSync(db);
+  const result = await recordDailyReminderShownServer(effectiveUid, todayInTz);
 
   return res.json({
     success: true,
@@ -12244,27 +12238,15 @@ async function syncTransformationVocabToDictionary(
 ) {
   if (!transformation || !Array.isArray(transformation.vocabularyAndExpressions)) return;
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
-  const targetKey = studentUid || cleanEmail;
-  if (!targetKey) return;
+  const cleanUid = (studentUid || '').trim();
+  if (!cleanUid || !isValidCanonicalUid(cleanUid)) return;
 
-  const db = readDb();
-  if (!db.studentDictionaryMap) db.studentDictionaryMap = {};
-
-  let currentList: any[] =
-    (studentUid && db.studentDictionaryMap[studentUid]) ||
-    (cleanEmail && db.studentDictionaryMap[cleanEmail]) ||
-    [];
-
+  let currentList: any[] = [];
   let exclusions: string[] = [];
-  if (studentUid) {
-    try {
-      const fsList = await fetchStudentVocabularyFromFirestoreServer(studentUid, cleanEmail);
-      if (Array.isArray(fsList) && fsList.length > 0) {
-        currentList = fsList;
-      }
-      exclusions = await fetchExcludedDictionaryWordsServer(studentUid);
-    } catch {}
-  }
+  try {
+    currentList = await fetchStudentVocabularyFromFirestoreServer(cleanUid, cleanEmail);
+    exclusions = await fetchExcludedDictionaryWordsServer(cleanUid);
+  } catch {}
 
   const exSet = new Set(exclusions.map(normalizeDictionaryWord).filter(Boolean));
   const map = new Map<string, any>();
@@ -12276,6 +12258,8 @@ async function syncTransformationVocabToDictionary(
   const isDefinitiveAi = Boolean(
     transformation.isAiGenerated && !transformation.isProvisional && !transformation.isFallback
   );
+
+  const entriesToSave: any[] = [];
 
   transformation.vocabularyAndExpressions.forEach((v: any) => {
     const rawWord = (v.term || '').trim();
@@ -12379,7 +12363,7 @@ async function syncTransformationVocabToDictionary(
           ? `${transformation.sessionDate}T12:00:00.000Z`
           : new Date().toISOString()),
       studentEmail: cleanEmail || undefined,
-      studentUid: studentUid || undefined,
+      studentUid: cleanUid,
       notFound: false,
       origins: mergedOrigins.map(removeUndefinedFields),
       practiceCount: exCount,
@@ -12392,19 +12376,14 @@ async function syncTransformationVocabToDictionary(
     if (v.phoneticGuide || existing?.phonetic) dictEntry.phonetic = v.phoneticGuide || existing?.phonetic;
     if (existing?.lastPracticedAt) dictEntry.lastPracticedAt = existing.lastPracticedAt;
 
-    map.set(key, removeUndefinedFields(dictEntry));
+    const cleanEntry = removeUndefinedFields(dictEntry);
+    map.set(key, cleanEntry);
+    entriesToSave.push(cleanEntry);
   });
 
-  const updatedList = Array.from(map.values()).sort((a, b) =>
-    (a.word || '').localeCompare(b.word || '')
-  );
-  if (studentUid) db.studentDictionaryMap[studentUid] = updatedList;
-  if (cleanEmail) db.studentDictionaryMap[cleanEmail] = updatedList;
-  await writeDbSync(db);
-
-  if (isDefinitiveAi && studentUid) {
+  if (isDefinitiveAi && entriesToSave.length > 0) {
     try {
-      await saveStudentVocabularyToFirestoreServer(studentUid, updatedList, cleanEmail);
+      await saveStudentVocabularyToFirestoreServer(cleanUid, entriesToSave, cleanEmail);
     } catch (saveErr) {
       console.warn('Backend Firestore vocabulary save notice:', saveErr);
     }
@@ -12414,9 +12393,6 @@ async function syncTransformationVocabToDictionary(
 // Generate or retrieve Pedagogical Transformation using Gemini AI with fallback
 app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req, res) => {
   const db = readDb();
-  if (!db.pedagogicalTransformationsMap) {
-    db.pedagogicalTransformationsMap = {};
-  }
 
   const {
     rawNotes = '',
@@ -12512,18 +12488,32 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
   const effectiveTeacherUid = (caller.role === 'teacher' ? caller.uid : '') || foundLesson?.teacherUid || foundLesson?.tutorUid || '';
   const effectiveTeacherEmail = (caller.role === 'teacher' ? callerEmail : '') || foundLesson?.teacherEmail || foundLesson?.tutorEmail || '';
 
-  // Authoritative student CEFR level from registered user document (prevents client spoofing)
+  // Authoritative student CEFR level from registered user document in Firestore first (prevents client spoofing)
+  let fsUserDoc: any = null;
+  try {
+    const fs = getFirestoreDb();
+    if (fs && cleanUid) {
+      const uSnap = await fs.collection('users').doc(cleanUid).get().catch(() => null);
+      if (uSnap && uSnap.exists) fsUserDoc = uSnap.data();
+    }
+  } catch {}
   const registeredStudent = (db.students || []).find((s: any) =>
     (cleanUid && (s.uid === cleanUid || s.id === cleanUid)) ||
     (effectiveEmail && (s.email || '').toLowerCase().trim() === effectiveEmail)
   );
   const profile = (cleanUid && db.userProfiles?.[cleanUid]) || (effectiveEmail && db.userProfiles?.[effectiveEmail]);
-  const authoritativeLevel = profile?.level || profile?.englishLevel || registeredStudent?.level || registeredStudent?.englishLevel || studentLevel;
+  const authoritativeLevel =
+    fsUserDoc?.level ||
+    fsUserDoc?.englishLevel ||
+    profile?.level ||
+    profile?.englishLevel ||
+    registeredStudent?.level ||
+    registeredStudent?.englishLevel ||
+    studentLevel;
   const cefrMeta = resolveCefrLevel(authoritativeLevel);
   const cefr = cefrMeta.cefr;
 
-  // 2. CACHE LOOKUP:
-  // Build composite cache key partitioned by session, content hash, language, CEFR, and prompt version
+  // 2. FIRESTORE CACHE LOOKUP (zero RAM pedagogicalTransformationsMap):
   const compositeCacheKey = buildPedagogicalCacheKey({
     canonicalSessionKey,
     contentHash,
@@ -12531,46 +12521,30 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
     cefrLevel: cefr,
   });
 
-  let cached =
-    db.pedagogicalTransformationsMap[compositeCacheKey] ||
-    (language === 'pt' ? db.pedagogicalTransformationsMap[canonicalSessionKey] : undefined);
-
-  if (!cached || cached.isProvisional || isLegacyGenericTransformation(cached, rawNotes)) {
-    cached = null;
-    const candidates = [canonicalSessionKey, customSessionKey, lessonId].filter(Boolean);
-    for (const cand of candidates) {
-      if (db.pedagogicalTransformationsMap[cand] && db.pedagogicalTransformationsMap[cand].isAiGenerated && !db.pedagogicalTransformationsMap[cand].isProvisional && !isLegacyGenericTransformation(db.pedagogicalTransformationsMap[cand], rawNotes)) {
-        cached = db.pedagogicalTransformationsMap[cand];
-        break;
-      }
-      const prefixMatch = Object.entries(db.pedagogicalTransformationsMap || {}).find(([k, v]: [string, any]) => {
-        return (k.startsWith(`${cand}__`) || k === cand) && v?.isAiGenerated && !v?.isProvisional && !isLegacyGenericTransformation(v, rawNotes);
-      });
-      if (prefixMatch) {
-        cached = prefixMatch[1];
-        break;
-      }
-    }
-  }
-
-  if ((!cached || cached.isProvisional || isLegacyGenericTransformation(cached, rawNotes)) && (canonicalSessionKey || customSessionKey)) {
-    const sessionToSearch = canonicalSessionKey || customSessionKey;
+  let cached: any = null;
+  const lookupKeys = Array.from(new Set([compositeCacheKey, canonicalSessionKey, customSessionKey, lessonId].filter(Boolean)));
+  for (const lKey of lookupKeys) {
     try {
-      const fsCached = await fetchPedagogicalTransformationFromFirestoreServer(sessionToSearch, { language, rawNotes });
+      const fsCached = await fetchPedagogicalTransformationFromFirestoreServer(lKey, {
+        language,
+        contentHash,
+        rawNotes,
+      });
       if (fsCached && fsCached.isAiGenerated && !fsCached.isProvisional && !isLegacyGenericTransformation(fsCached, rawNotes)) {
         cached = fsCached;
-        db.pedagogicalTransformationsMap[compositeCacheKey] = cached;
+        break;
       }
     } catch {}
-    if ((!cached || cached.isProvisional || isLegacyGenericTransformation(cached, rawNotes)) && cleanUid) {
-      try {
-        const reconstructed = await reconstructTransformationFromJournalAndDictionaryServer(cleanUid, sessionToSearch);
-        if (reconstructed && !isLegacyGenericTransformation(reconstructed, rawNotes)) {
-          cached = reconstructed;
-          db.pedagogicalTransformationsMap[compositeCacheKey] = cached;
-        }
-      } catch {}
-    }
+  }
+
+  if ((!cached || cached.isProvisional || isLegacyGenericTransformation(cached, rawNotes)) && cleanUid && (canonicalSessionKey || customSessionKey)) {
+    const sessionToSearch = canonicalSessionKey || customSessionKey;
+    try {
+      const reconstructed = await reconstructTransformationFromJournalAndDictionaryServer(cleanUid, sessionToSearch);
+      if (reconstructed && !isLegacyGenericTransformation(reconstructed, rawNotes)) {
+        cached = reconstructed;
+      }
+    } catch {}
   }
 
   // FASE 4B.8 & 4B.9: If a valid, non-provisional AI-generated transformation exists for this session, REUSE IT,
@@ -12666,10 +12640,6 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
 
     if (coreResult.success && coreResult.transformation) {
       const transformation = coreResult.transformation;
-      db.pedagogicalTransformationsMap[compositeCacheKey] = transformation;
-      if (language === 'pt') {
-        db.pedagogicalTransformationsMap[canonicalSessionKey] = transformation;
-      }
       await savePedagogicalTransformationToFirestoreServer(compositeCacheKey, transformation, { rawNotes });
       await syncTransformationVocabToDictionary(transformation, cleanUid, effectiveEmail);
 
@@ -12688,8 +12658,6 @@ app.post('/api/pedagogical-notes/transform', firebaseAuthMiddleware, async (req,
       } catch (journalErr) {
         console.warn('Backend My Journal lesson review save notice:', journalErr);
       }
-
-      await writeDbSync(db);
 
       return res.json({
         success: true,
@@ -12900,40 +12868,27 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
       sessionKey ? sessionKey.replace(/^session_/, '').replace(/^lesson_/, '') : '',
     ].filter(Boolean)));
 
-    // 0. Inspect underlying session_notes or lessons ownership BEFORE looking up or reconstructing transformations
+    // 0. Inspect underlying session_notes or lessons ownership in Firestore BEFORE looking up or reconstructing transformations
     let underlyingOwner: { studentUid?: string; studentEmail?: string; teacherUid?: string } | undefined;
+    let foundSessionNote: any = null;
     for (const key of candidateKeys) {
-      const memNote = db.sessionNotesMap?.[key];
-      if (memNote) {
-        underlyingOwner = {
-          studentUid: memNote.studentUid,
-          studentEmail: memNote.studentEmail,
-          teacherUid: memNote.teacherUid,
-        };
-        if (!(await canCallerAccessRecord(memNote))) {
-          return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to student notes.' });
-        }
-        break;
-      }
-    }
-
-    if (!underlyingOwner) {
-      for (const key of candidateKeys) {
-        try {
-          const fsNote = await fetchSessionNotesFromFirestoreServer(key);
-          if (fsNote) {
-            underlyingOwner = {
-              studentUid: fsNote.studentUid,
-              studentEmail: fsNote.studentEmail,
-              teacherUid: fsNote.teacherUid,
-            };
-            if (!(await canCallerAccessRecord(fsNote))) {
-              return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to student notes.' });
-            }
-            break;
+      try {
+        const fsNote = await fetchSessionNotesFromFirestoreServer(key, {
+          studentUid: canonicalStudentContextUid || undefined,
+        });
+        if (fsNote) {
+          foundSessionNote = fsNote;
+          underlyingOwner = {
+            studentUid: fsNote.studentUid,
+            studentEmail: fsNote.studentEmail,
+            teacherUid: fsNote.teacherUid,
+          };
+          if (!(await canCallerAccessRecord(fsNote))) {
+            return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to student notes.' });
           }
-        } catch {}
-      }
+          break;
+        }
+      } catch {}
     }
 
     if (!underlyingOwner) {
@@ -12960,46 +12915,29 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
     }
 
     let transformation: any = null;
-    // 1. Check in-memory pedagogicalTransformationsMap across candidate keys
-    for (const key of candidateKeys) {
-      const directCand = db.pedagogicalTransformationsMap?.[key];
-      if (directCand) {
-        if (!(await canCallerAccessRecord(directCand, underlyingOwner))) {
+    // 1. Check approved version directly on canonical session_notes document if present
+    if (
+      foundSessionNote?.lastApprovedVersion?.status === 'approved' &&
+      foundSessionNote.lastApprovedVersion.transformation
+    ) {
+      const apprTrans = foundSessionNote.lastApprovedVersion.transformation;
+      const matchLang = !language || apprTrans.language === language;
+      const matchHash = !contentHash || apprTrans.contentHash === contentHash;
+      if (
+        matchLang &&
+        matchHash &&
+        apprTrans.isAiGenerated &&
+        !apprTrans.isProvisional &&
+        !isLegacyGenericTransformation(apprTrans, apprTrans.rawNotesSnippet)
+      ) {
+        if (!(await canCallerAccessRecord(apprTrans, underlyingOwner))) {
           return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to student notes.' });
         }
-        if (directCand.isAiGenerated && !directCand.isProvisional && !isLegacyGenericTransformation(directCand, directCand.rawNotesSnippet)) {
-          if ((!language || directCand.language === language) && (!contentHash || directCand.contentHash === contentHash)) {
-            transformation = directCand;
-            break;
-          }
-        }
+        transformation = apprTrans;
       }
-
-      const matchingEntries = Object.entries(db.pedagogicalTransformationsMap || {}).filter(
-        ([k]: [string, any]) => k === key || k.startsWith(`${key}__`)
-      );
-      for (const [, v] of matchingEntries) {
-        if (!v || typeof v !== 'object') continue;
-        if (!(await canCallerAccessRecord(v, underlyingOwner))) {
-          return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to student notes.' });
-        }
-        const matchLang = !language || (v as any).language === language;
-        const matchHash = !contentHash || (v as any).contentHash === contentHash;
-        if (
-          matchLang &&
-          matchHash &&
-          (v as any).isAiGenerated &&
-          !(v as any).isProvisional &&
-          !isLegacyGenericTransformation(v as any, (v as any).rawNotesSnippet)
-        ) {
-          transformation = v;
-          break;
-        }
-      }
-      if (transformation) break;
     }
 
-    // 2. Firestore fallback lookup if in-memory cache misses
+    // 2. Firestore pedagogical_cache lookup
     if (!transformation) {
       for (const key of candidateKeys) {
         try {
@@ -13009,10 +12947,6 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
               return res.status(403).json({ error: 'Forbidden', message: 'Unauthorized access to student notes.' });
             }
             transformation = fsMatch;
-            const ownerScope = fsMatch.studentUid ? `__uid_${fsMatch.studentUid}` : '';
-            const storeKey = fsMatch.cacheKey || `${sessionKey || queryLessonId}${ownerScope}__hash_${fsMatch.contentHash || 'any'}__lang_${fsMatch.language || language || 'pt'}`;
-            if (!db.pedagogicalTransformationsMap) db.pedagogicalTransformationsMap = {};
-            db.pedagogicalTransformationsMap[storeKey] = fsMatch;
             break;
           }
         } catch (fsErr) {
@@ -13032,9 +12966,6 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
               studentUid: callerUid,
               studentEmail: reconstructed.studentEmail || callerEmail,
             };
-            const storeKey = `${sessionKey || queryLessonId}__uid_${callerUid}__reconstructed__lang_${language || 'pt'}`;
-            if (!db.pedagogicalTransformationsMap) db.pedagogicalTransformationsMap = {};
-            db.pedagogicalTransformationsMap[storeKey] = transformation;
             break;
           }
         } catch (recErr) {
@@ -13054,24 +12985,28 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
     return res.json(null);
   }
 
-  // Listing endpoint when both sessionKey and lessonId are absent
+  // Listing endpoint when both sessionKey and lessonId are absent — strictly queried from Firestore (default)
   if (!isCallerAdmin && !isCallerTeacher) {
-    const list = Object.values(db.pedagogicalTransformationsMap || {}).filter((t: any) => {
-      if (!t || typeof t !== 'object') return false;
-      if (language && t.language !== language) return false;
-      const tUid = String(t.studentUid || '').trim();
-      const tEmail = String(t.studentEmail || '').toLowerCase().trim();
-      if (tUid) return tUid === callerUid;
-      return Boolean(callerEmail && tEmail && tEmail === callerEmail);
+    const studentItems = await fetchAllPedagogicalTransformationsServer({
+      studentUid: callerUid,
+      language: language || undefined,
     });
+    const list: any[] = [];
+    for (const t of studentItems) {
+      if (await canCallerAccessRecord(t)) {
+        list.push(t);
+      }
+    }
     return res.json(list);
   }
 
   if (isCallerTeacher && !isCallerAdmin) {
+    const allItems = await fetchAllPedagogicalTransformationsServer({
+      studentUid: resolvedTeacherTargetStudentUid || undefined,
+      language: language || undefined,
+    });
     const authorizedList: any[] = [];
-    for (const t of Object.values(db.pedagogicalTransformationsMap || {})) {
-      if (!t || typeof t !== 'object') continue;
-      if (language && (t as any).language !== language) continue;
+    for (const t of allItems) {
       if (resolvedTeacherTargetStudentUid && String((t as any).studentUid || '').trim() !== resolvedTeacherTargetStudentUid) {
         continue;
       }
@@ -13083,21 +13018,16 @@ app.get('/api/pedagogical-notes', firebaseAuthMiddleware, async (req, res) => {
   }
 
   // Admin caller
-  if (queryStudentUid || queryStudentEmail) {
-    const list = Object.values(db.pedagogicalTransformationsMap || {}).filter((t: any) => {
-      if (!t || typeof t !== 'object') return false;
-      if (language && t.language !== language) return false;
-      if (queryStudentUid && t.studentUid !== queryStudentUid) return false;
-      if (queryStudentEmail && String(t.studentEmail || '').toLowerCase().trim() !== queryStudentEmail) return false;
-      return true;
-    });
-    return res.json(list);
+  const adminItems = await fetchAllPedagogicalTransformationsServer({
+    studentUid: queryStudentUid || undefined,
+    language: language || undefined,
+  });
+  if (queryStudentEmail) {
+    return res.json(
+      adminItems.filter((t: any) => String(t.studentEmail || '').toLowerCase().trim() === queryStudentEmail)
+    );
   }
-
-  const adminList = Object.values(db.pedagogicalTransformationsMap || {}).filter(
-    (t: any) => !language || (t && t.language === language)
-  );
-  return res.json(adminList);
+  return res.json(adminItems);
 });
 
 // ============================================================================
@@ -13689,10 +13619,9 @@ STRICT CONSTRAINTS:
   }
 });
 
-// Student Personal Dictionary Endpoints (isolated by student UID and email with verified authorization)
+// Student Personal Dictionary Endpoints (ARCH.2F.2B: Canonical Cloud Firestore users/{uid}/vocabulary + excludedDictionaryWords)
 app.get('/api/student-dictionary', async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-  const db = readDb();
   const caller = await getVerifiedUserFromRequest(req);
 
   if (!caller) {
@@ -13702,13 +13631,19 @@ app.get('/api/student-dictionary', async (req, res) => {
     });
   }
 
+  if (!getFirestoreDb()) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
+  }
+
   const requestedEmail = ((req.query.studentEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
   const requestedUid = ((req.query.studentUid as string) || (req.query.uid as string) || '').trim();
   const requestedLessonId = ((req.query.lessonId as string) || '').trim();
 
-  // Admin access to all dictionaries (strictly requires verified admin token)
-  if (caller.role === 'admin' && !requestedEmail && !requestedUid) {
-    return res.json(db.studentDictionaryMap || {});
+  if (caller.role === 'admin' && !requestedEmail && !requestedUid && !requestedLessonId) {
+    return res.json({});
   }
 
   const identityRes = await resolveCanonicalStudentIdentity({
@@ -13720,7 +13655,7 @@ app.get('/api/student-dictionary', async (req, res) => {
 
   if (!identityRes.authorized) {
     return res.status(identityRes.statusCode || 403).json({
-      error: 'Forbidden',
+      error: identityRes.statusCode === 422 ? 'Unprocessable Entity' : 'Forbidden',
       message: identityRes.error || 'Access denied to student dictionary.',
     });
   }
@@ -13728,29 +13663,24 @@ app.get('/api/student-dictionary', async (req, res) => {
   const canonicalUid = identityRes.canonicalStudentUid;
   const canonicalEmail = identityRes.studentEmail;
 
-  // Fetch directly from canonical Firestore path
-  const firestoreWords = await fetchStudentVocabularyFromFirestoreServer(canonicalUid, canonicalEmail);
-  const canonicalExclusions = await fetchExcludedDictionaryWordsServer(canonicalUid);
-  const excludedSet = new Set(canonicalExclusions.map(normalizeDictionaryWord).filter(Boolean));
-
-  let activeWords = firestoreWords;
-  if (activeWords.length > 0) {
-    if (!db.studentDictionaryMap) db.studentDictionaryMap = {};
-    if (canonicalUid) db.studentDictionaryMap[canonicalUid] = activeWords;
-    if (canonicalEmail) db.studentDictionaryMap[canonicalEmail] = activeWords;
-  } else {
-    // Fallback to in-memory db if Firestore had no words, filtering out tombstones
-    const fromEmail: any[] = (canonicalEmail && db.studentDictionaryMap?.[canonicalEmail]) || [];
-    const fromUid: any[] = (canonicalUid && db.studentDictionaryMap?.[canonicalUid]) || [];
-    const map = new Map<string, any>();
-    [...fromEmail, ...fromUid].forEach((entry: any) => {
-      const w = normalizeDictionaryWord(entry.normalizedWord || entry.word);
-      if (w && !excludedSet.has(w)) map.set(w, entry);
+  if (!canonicalUid || !isValidCanonicalUid(canonicalUid)) {
+    return res.status(422).json({
+      error: 'Unprocessable Entity',
+      message: 'Canonical student UID could not be unequivocally determined.',
     });
-    activeWords = Array.from(map.values()).sort((a, b) => (a.word || '').localeCompare(b.word || ''));
   }
 
-  // Backwards compatibility: If legacy array format requested
+  if (caller.role === 'teacher' && canonicalUid === caller.uid) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Teacher UID cannot be used as student UID for dictionary access.',
+    });
+  }
+
+  // Fetch strictly from canonical Cloud Firestore path
+  const activeWords = await fetchStudentVocabularyFromFirestoreServer(canonicalUid, canonicalEmail);
+  const canonicalExclusions = await fetchExcludedDictionaryWordsServer(canonicalUid);
+
   if (req.query.format === 'legacy' || req.headers['x-legacy-format'] === 'true') {
     return res.json(activeWords);
   }
@@ -13768,13 +13698,19 @@ app.get('/api/student-dictionary', async (req, res) => {
 
 app.delete('/api/student-dictionary', async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-  const db = readDb();
   const caller = await getVerifiedUserFromRequest(req);
 
   if (!caller) {
     return res.status(401).json({
       error: 'Unauthorized',
       message: 'Authentication required: verified user token missing.',
+    });
+  }
+
+  if (!getFirestoreDb()) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
     });
   }
 
@@ -13791,59 +13727,38 @@ app.delete('/api/student-dictionary', async (req, res) => {
     });
   }
 
-  let canonicalStudentUid = '';
-  let studentEmail = '';
+  const requestedUid = ((req.body?.studentUid || req.query?.studentUid || req.body?.uid || req.query?.uid) as string || '').trim();
+  const requestedEmail = ((req.body?.studentEmail || req.query?.studentEmail || req.body?.email || req.query?.email) as string || '').toLowerCase().trim();
+  const requestedLessonId = ((req.body?.lessonId || req.query?.lessonId) as string || '').trim();
 
-  if (caller.role === 'student') {
-    // For student callers: identity is strictly determined by verified token UID
-    // Rejects any studentUid or studentEmail that does not match the caller's verified identity
-    const requestedUid = ((req.body?.studentUid || req.query?.studentUid || req.body?.uid || req.query?.uid) as string || '').trim();
-    const requestedEmail = ((req.body?.studentEmail || req.query?.studentEmail || req.body?.email || req.query?.email) as string || '').toLowerCase().trim();
+  const identityRes = await resolveCanonicalStudentIdentity({
+    caller,
+    studentEmail: requestedEmail,
+    studentUid: requestedUid,
+    lessonId: requestedLessonId || undefined,
+  });
 
-    if (requestedUid && requestedUid !== caller.uid) {
-      return res.status(403).json({
-        error: 'Forbidden',
-        message: 'Students cannot delete dictionary entries of other users.',
-      });
-    }
-
-    if (requestedEmail && caller.email && requestedEmail !== caller.email.toLowerCase().trim()) {
-      return res.status(403).json({
-        error: 'Forbidden',
-        message: 'Students cannot delete dictionary entries of other users.',
-      });
-    }
-
-    canonicalStudentUid = caller.uid;
-    studentEmail = caller.email?.toLowerCase().trim() || '';
-  } else {
-    // Admin or authorized Teacher
-    const requestedUid = ((req.body?.studentUid || req.query?.studentUid || req.body?.uid || req.query?.uid) as string || '').trim();
-    const requestedEmail = ((req.body?.studentEmail || req.query?.studentEmail || req.body?.email || req.query?.email) as string || '').toLowerCase().trim();
-    const requestedLessonId = ((req.body?.lessonId || req.query?.lessonId) as string || '').trim();
-
-    const identityRes = await resolveCanonicalStudentIdentity({
-      caller,
-      studentEmail: requestedEmail,
-      studentUid: requestedUid,
-      lessonId: requestedLessonId || undefined,
+  if (!identityRes.authorized) {
+    return res.status(identityRes.statusCode || 403).json({
+      error: identityRes.statusCode === 422 ? 'Unprocessable Entity' : 'Forbidden',
+      message: identityRes.error || 'Access denied to delete student dictionary entry.',
     });
-
-    if (!identityRes.authorized) {
-      return res.status(identityRes.statusCode || 403).json({
-        error: 'Forbidden',
-        message: identityRes.error || 'Access denied to delete student dictionary entry.',
-      });
-    }
-
-    canonicalStudentUid = identityRes.canonicalStudentUid;
-    studentEmail = identityRes.studentEmail || '';
   }
+
+  const canonicalStudentUid = identityRes.canonicalStudentUid;
+  const studentEmail = identityRes.studentEmail || '';
 
   if (!canonicalStudentUid || !isValidCanonicalUid(canonicalStudentUid)) {
     return res.status(422).json({
       error: 'Unprocessable Entity',
       message: 'Canonical student UID could not be unequivocally determined.',
+    });
+  }
+
+  if (caller.role === 'teacher' && canonicalStudentUid === caller.uid) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Teacher UID cannot be used as student UID for dictionary exclusion.',
     });
   }
 
@@ -13859,23 +13774,6 @@ app.delete('/api/student-dictionary', async (req, res) => {
     });
   }
 
-  // Filter in-memory db fallback as well
-  const excludedSet = new Set(updatedExclusions.map(normalizeDictionaryWord));
-  if (db.studentDictionaryMap) {
-    if (canonicalStudentUid && Array.isArray(db.studentDictionaryMap[canonicalStudentUid])) {
-      db.studentDictionaryMap[canonicalStudentUid] = db.studentDictionaryMap[canonicalStudentUid].filter(
-        (e: any) => !excludedSet.has(normalizeDictionaryWord(e.normalizedWord || e.word))
-      );
-    }
-    if (studentEmail && Array.isArray(db.studentDictionaryMap[studentEmail])) {
-      db.studentDictionaryMap[studentEmail] = db.studentDictionaryMap[studentEmail].filter(
-        (e: any) => !excludedSet.has(normalizeDictionaryWord(e.normalizedWord || e.word))
-      );
-    }
-    await writeDbSync(db);
-  }
-
-  // Authoritative active words after exclusions
   const activeWords = await fetchStudentVocabularyFromFirestoreServer(canonicalStudentUid, studentEmail);
 
   return res.json({
@@ -13890,7 +13788,6 @@ app.delete('/api/student-dictionary', async (req, res) => {
 });
 
 app.post('/api/student-dictionary', async (req, res) => {
-  const db = readDb();
   const caller = await getVerifiedUserFromRequest(req);
 
   if (!caller) {
@@ -13900,13 +13797,54 @@ app.post('/api/student-dictionary', async (req, res) => {
     });
   }
 
-  const { studentEmail, studentUid, lessonId, teacherEmail, teacherName, entries, entry } = req.body || {};
+  if (!getFirestoreDb()) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
+  }
 
-  // Resolve canonical student identity and verify teacher's authorized pedagogical link
+  const { studentEmail, studentUid, lessonId, entries, entry } = req.body || {};
+  const topUid = (studentUid || req.body?.uid || '').toString().trim();
+  const topEmail = (studentEmail || req.body?.email || '').toString().toLowerCase().trim();
+  const itemsToAdd = Array.isArray(entries) ? entries : (entry ? [entry] : []);
+
+  for (const item of itemsToAdd) {
+    if (!item || typeof item !== 'object') continue;
+    const itemUid = (item.studentUid || item.uid || '').toString().trim();
+    const itemEmail = (item.studentEmail || item.email || '').toString().toLowerCase().trim();
+    if (topUid && itemUid && topUid !== itemUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Conflicting studentUid between request payload and dictionary entry.',
+      });
+    }
+    if (topEmail && itemEmail && topEmail !== itemEmail) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Conflicting studentEmail between request payload and dictionary entry.',
+      });
+    }
+    if (caller.role !== 'admin') {
+      if (caller.role === 'student' && itemUid && itemUid !== caller.uid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Cross-student dictionary write rejected.',
+        });
+      }
+      if (caller.role === 'student' && itemEmail && caller.email && itemEmail !== caller.email.toLowerCase().trim()) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Cross-student dictionary write rejected.',
+        });
+      }
+    }
+  }
+
   const identityRes = await resolveCanonicalStudentIdentity({
     caller,
-    studentEmail,
-    studentUid,
+    studentEmail: topEmail || (itemsToAdd[0]?.studentEmail || '').toString().toLowerCase().trim(),
+    studentUid: topUid || (itemsToAdd[0]?.studentUid || '').toString().trim(),
     lessonId,
   });
 
@@ -13920,6 +13858,13 @@ app.post('/api/student-dictionary', async (req, res) => {
   const canonicalStudentUid = identityRes.canonicalStudentUid;
   const verifiedStudentEmail = identityRes.studentEmail;
 
+  if (!canonicalStudentUid || !isValidCanonicalUid(canonicalStudentUid)) {
+    return res.status(422).json({
+      error: 'Unprocessable Entity',
+      message: 'Canonical student UID could not be unequivocally determined.',
+    });
+  }
+
   // Strict invariant: Teacher UID can NEVER be the student UID
   if (caller.role === 'teacher' && canonicalStudentUid === caller.uid) {
     return res.status(403).json({
@@ -13928,14 +13873,32 @@ app.post('/api/student-dictionary', async (req, res) => {
     });
   }
 
-  const itemsToAdd = Array.isArray(entries) ? entries : (entry ? [entry] : []);
+  // Validate nested entries match resolved canonical student
+  for (const item of itemsToAdd) {
+    if (!item || typeof item !== 'object') continue;
+    const itemUid = (item.studentUid || item.uid || '').toString().trim();
+    const itemEmail = (item.studentEmail || item.email || '').toString().toLowerCase().trim();
+    if (itemUid && isValidCanonicalUid(itemUid) && itemUid !== canonicalStudentUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Conflicting nested studentUid in dictionary entry.',
+      });
+    }
+    if (itemEmail && verifiedStudentEmail && itemEmail !== verifiedStudentEmail) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Conflicting nested studentEmail in dictionary entry.',
+      });
+    }
+  }
+
   if (itemsToAdd.length === 0) {
     const existing = await fetchStudentVocabularyFromFirestoreServer(canonicalStudentUid, verifiedStudentEmail);
     const existingExclusions = await fetchExcludedDictionaryWordsServer(canonicalStudentUid);
     return res.json({ success: true, studentUid: canonicalStudentUid, dictionary: existing, excludedWords: existingExclusions });
   }
 
-  // ETAPA E: Distinguish automatic sync vs explicit intentional addition
+  // Distinguish automatic sync vs explicit intentional addition
   const isAutomaticSync = Boolean(
     req.body?.isAutomaticSync === true ||
     req.body?.syncType === 'routine_sync' ||
@@ -13947,28 +13910,23 @@ app.post('/api/student-dictionary', async (req, res) => {
   let finalItemsToAdd = itemsToAdd;
 
   if (isAutomaticSync) {
-    // Sincronizações automáticas não podem remover tombstones nem ressuscitar palavras excluídas
+    // Automatic syncs must never remove tombstones or resurrect excluded words
     const currentExclusions = await fetchExcludedDictionaryWordsServer(canonicalStudentUid);
     const exSet = new Set(currentExclusions.map(normalizeDictionaryWord).filter(Boolean));
     finalItemsToAdd = itemsToAdd.filter((e: any) => {
-      const norm = normalizeDictionaryWord(e.normalizedWord || e.word);
+      const norm = normalizeDictionaryWord(e?.normalizedWord || e?.word);
       return Boolean(norm && !exSet.has(norm));
     });
   } else {
-    // Explicit inclusion by student or teacher reintroduces words by removing tombstones atomically
+    // Explicit inclusion reintroduces words by removing tombstones atomically
     const wordsToReintroduce = itemsToAdd
-      .map((e: any) => normalizeDictionaryWord(e.normalizedWord || e.word))
+      .map((e: any) => normalizeDictionaryWord(e?.normalizedWord || e?.word))
       .filter(Boolean);
     if (wordsToReintroduce.length > 0) {
-      try {
-        await removeExcludedDictionaryWordsServer(canonicalStudentUid, wordsToReintroduce);
-      } catch (unexcludeErr) {
-        console.warn('Notice removing exclusion tombstones on explicit add:', unexcludeErr);
-      }
+      await removeExcludedDictionaryWordsServer(canonicalStudentUid, wordsToReintroduce);
     }
   }
 
-  // Persist directly and permanently to Cloud Firestore using Firebase Admin SDK
   if (finalItemsToAdd.length > 0) {
     try {
       const persisted = await saveStudentVocabularyToFirestoreServer(canonicalStudentUid, finalItemsToAdd, verifiedStudentEmail);
@@ -13988,15 +13946,8 @@ app.post('/api/student-dictionary', async (req, res) => {
     }
   }
 
-  // Retrieve authoritative consolidated list from canonical Firestore path
   const updatedList = await fetchStudentVocabularyFromFirestoreServer(canonicalStudentUid, verifiedStudentEmail);
   const remainingExclusions = await fetchExcludedDictionaryWordsServer(canonicalStudentUid);
-
-  // Sync memory cache
-  if (!db.studentDictionaryMap) db.studentDictionaryMap = {};
-  if (canonicalStudentUid) db.studentDictionaryMap[canonicalStudentUid] = updatedList;
-  if (verifiedStudentEmail) db.studentDictionaryMap[verifiedStudentEmail] = updatedList;
-  await writeDbSync(db);
 
   return res.json({
     success: true,
@@ -14005,6 +13956,174 @@ app.post('/api/student-dictionary', async (req, res) => {
     dictionary: updatedList,
     excludedWords: remainingExclusions,
   });
+});
+
+// Endpoint: Atomically increment practiceCount & append practiceHistory for practiced words
+app.post('/api/student-dictionary/practice', async (req, res) => {
+  const caller = await getVerifiedUserFromRequest(req);
+  if (!caller) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Authentication required: verified user token missing.',
+    });
+  }
+
+  if (!getFirestoreDb()) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
+  }
+
+  if (caller.role === 'teacher') {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Teachers cannot modify student dictionary practice metrics.',
+    });
+  }
+
+  const { studentEmail, studentUid, words, activityType } = req.body || {};
+  const cleanWords = Array.isArray(words)
+    ? words.map((w: any) => (typeof w === 'string' ? w.trim() : '')).filter(Boolean)
+    : [];
+
+  if (cleanWords.length === 0) {
+    return res.status(400).json({
+      error: 'Bad Request',
+      message: 'words array is required.',
+    });
+  }
+
+  const identityRes = await resolveCanonicalStudentIdentity({
+    caller,
+    studentEmail,
+    studentUid,
+  });
+
+  if (!identityRes.authorized) {
+    return res.status(identityRes.statusCode || 403).json({
+      error: identityRes.statusCode === 422 ? 'Unprocessable Entity' : 'Forbidden',
+      message: identityRes.error || 'Access denied: unauthorized dictionary practice update.',
+    });
+  }
+
+  const canonicalStudentUid = identityRes.canonicalStudentUid;
+  const verifiedStudentEmail = identityRes.studentEmail;
+
+  if (!canonicalStudentUid || !isValidCanonicalUid(canonicalStudentUid)) {
+    return res.status(422).json({
+      error: 'Unprocessable Entity',
+      message: 'Canonical student UID could not be unequivocally determined.',
+    });
+  }
+
+  if (caller.role !== 'admin' && canonicalStudentUid !== caller.uid) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Only the student or an admin can update dictionary practice metrics.',
+    });
+  }
+
+  try {
+    const result = await markVocabularyWordsPracticedServer(
+      canonicalStudentUid,
+      cleanWords,
+      typeof activityType === 'string' ? activityType : 'memorization',
+      verifiedStudentEmail
+    );
+    if (!result.ok) {
+      return res.status(500).json({
+        error: 'Internal Server Error',
+        message: 'Failed to persist practice metrics in canonical Firestore.',
+      });
+    }
+    return res.json({
+      success: true,
+      studentUid: canonicalStudentUid,
+      studentEmail: verifiedStudentEmail,
+      updatedCount: result.updatedCount,
+      dictionary: result.dictionary,
+    });
+  } catch (err: any) {
+    console.error('POST /api/student-dictionary/practice error:', err);
+    return res.status(500).json({
+      error: 'Internal Server Error',
+      message: 'Failed to record dictionary word practice.',
+    });
+  }
+});
+
+// Endpoint: Remove logical exclusions (tombstones) explicitly
+app.post('/api/student-dictionary/unexclude', async (req, res) => {
+  const caller = await getVerifiedUserFromRequest(req);
+  if (!caller) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Authentication required: verified user token missing.',
+    });
+  }
+
+  if (!getFirestoreDb()) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
+  }
+
+  const rawWord = req.body?.word;
+  const rawWords = req.body?.words || (rawWord ? [rawWord] : []);
+  const normalizedWords = Array.isArray(rawWords)
+    ? Array.from(new Set(rawWords.map((w: string) => normalizeDictionaryWord(w)).filter(Boolean)))
+    : [];
+
+  if (normalizedWords.length === 0) {
+    return res.status(400).json({
+      error: 'Bad Request',
+      message: 'word or words array is required.',
+    });
+  }
+
+  const identityRes = await resolveCanonicalStudentIdentity({
+    caller,
+    studentEmail: req.body?.studentEmail,
+    studentUid: req.body?.studentUid,
+  });
+
+  if (!identityRes.authorized) {
+    return res.status(identityRes.statusCode || 403).json({
+      error: identityRes.statusCode === 422 ? 'Unprocessable Entity' : 'Forbidden',
+      message: identityRes.error || 'Access denied.',
+    });
+  }
+
+  const canonicalStudentUid = identityRes.canonicalStudentUid;
+  if (!canonicalStudentUid || !isValidCanonicalUid(canonicalStudentUid)) {
+    return res.status(422).json({
+      error: 'Unprocessable Entity',
+      message: 'Canonical student UID could not be unequivocally determined.',
+    });
+  }
+  if (caller.role === 'teacher' && canonicalStudentUid === caller.uid) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Teacher UID cannot be used as student UID.',
+    });
+  }
+
+  try {
+    const excludedWords = await removeExcludedDictionaryWordsServer(canonicalStudentUid, normalizedWords);
+    return res.json({
+      success: true,
+      studentUid: canonicalStudentUid,
+      excludedWords,
+    });
+  } catch (err: any) {
+    console.error('POST /api/student-dictionary/unexclude error:', err);
+    return res.status(500).json({
+      error: 'Internal Server Error',
+      message: 'Failed to remove dictionary exclusions.',
+    });
+  }
 });
 
 // Endpoint: Enrich student vocabulary on demand exclusively via Gemini (used for Video routine words & new words)
@@ -14019,6 +14138,14 @@ app.post('/api/student-dictionary/enrich', async (req, res) => {
     });
   }
 
+  const fsDb = getFirestoreDb();
+  if (!fsDb) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
+  }
+
   const { studentEmail, studentUid, words, studentLevel } = req.body || {};
 
   const identityRes = await resolveCanonicalStudentIdentity({
@@ -14029,7 +14156,7 @@ app.post('/api/student-dictionary/enrich', async (req, res) => {
 
   if (!identityRes.authorized) {
     return res.status(identityRes.statusCode || 403).json({
-      error: 'Forbidden',
+      error: identityRes.statusCode === 422 ? 'Unprocessable Entity' : 'Forbidden',
       message: identityRes.error || 'Access denied: unauthorized student dictionary persistence.',
     });
   }
@@ -14037,12 +14164,26 @@ app.post('/api/student-dictionary/enrich', async (req, res) => {
   const canonicalStudentUid = identityRes.canonicalStudentUid;
   const verifiedStudentEmail = identityRes.studentEmail;
 
+  if (!canonicalStudentUid || !isValidCanonicalUid(canonicalStudentUid)) {
+    return res.status(422).json({
+      error: 'Unprocessable Entity',
+      message: 'Canonical student UID could not be unequivocally determined.',
+    });
+  }
+
+  if (caller.role === 'teacher' && canonicalStudentUid === caller.uid) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Teacher UID cannot be used as student UID for dictionary enrichment.',
+    });
+  }
+
   const rawWords: string[] = Array.isArray(words) ? words : [];
   if (rawWords.length === 0) {
     return res.json({ success: true, enrichedEntries: [] });
   }
 
-  // Fetch current vocabulary and exclusions
+  // Fetch current vocabulary and exclusions from canonical Firestore
   const currentVocab = await fetchStudentVocabularyFromFirestoreServer(canonicalStudentUid, verifiedStudentEmail);
   const exclusions = await fetchExcludedDictionaryWordsServer(canonicalStudentUid);
   const exSet = new Set(exclusions.map(normalizeDictionaryWord).filter(Boolean));
@@ -14066,20 +14207,31 @@ app.post('/api/student-dictionary/enrich', async (req, res) => {
   });
 
   // If zero words need enrichment (all already have definitions): zero Gemini calls!
-  // "Evitar chamadas Gemini por palavra já enriquecida e válida."
   if (wordsNeedingEnrichment.length === 0) {
     const matching = rawWords
-      .map((w) => existingMap.get(normalizeDictionaryWord(w)))
+      .map((w) => {
+        const norm = normalizeDictionaryWord(w);
+        return norm && !exSet.has(norm) ? existingMap.get(norm) : null;
+      })
       .filter(Boolean);
     return res.json({ success: true, enrichedEntries: matching, cached: true });
   }
+
+  let fsUserLevel: string | undefined;
+  try {
+    const uSnap = await fsDb.collection('users').doc(canonicalStudentUid).get();
+    if (uSnap && uSnap.exists) {
+      const uData = uSnap.data();
+      fsUserLevel = uData?.level || uData?.englishLevel;
+    }
+  } catch {}
 
   const registeredStudent = (db.students || []).find((s: any) =>
     (canonicalStudentUid && (s.uid === canonicalStudentUid || s.id === canonicalStudentUid)) ||
     (verifiedStudentEmail && (s.email || '').toLowerCase().trim() === verifiedStudentEmail)
   );
   const profile = (canonicalStudentUid && db.userProfiles?.[canonicalStudentUid]) || (verifiedStudentEmail && db.userProfiles?.[verifiedStudentEmail]);
-  const authoritativeLevel = profile?.level || profile?.englishLevel || registeredStudent?.level || registeredStudent?.englishLevel || studentLevel || 'intermediario';
+  const authoritativeLevel = fsUserLevel || profile?.level || profile?.englishLevel || registeredStudent?.level || registeredStudent?.englishLevel || studentLevel || 'intermediario';
   const cefrMeta = resolveCefrLevel(authoritativeLevel);
   const cefr = cefrMeta.cefr;
 
@@ -14127,7 +14279,7 @@ ${batchToEnrich.map((w, i) => `${i + 1}. ${w}`).join('\n')}`;
             singleAttempt.parsedJson.words.forEach((item: any) => {
               const w = (item.word || '').trim();
               const norm = normalizeDictionaryWord(w);
-              if (!norm) return;
+              if (!norm || exSet.has(norm)) return;
               const existing = existingMap.get(norm);
               const exCount = typeof existing?.practiceCount === 'number' ? existing.practiceCount : 0;
               const mergedOrigins = [...(existing?.origins || [])];
@@ -14176,17 +14328,22 @@ ${batchToEnrich.map((w, i) => `${i + 1}. ${w}`).join('\n')}`;
     }
   }
 
-  // Persist updated entries to Firestore and local memory
+  // Persist enriched entries strictly to canonical Firestore subcollection
   if (newlyEnriched.length > 0) {
     try {
-      const allEntries = Array.from(existingMap.values());
-      await saveStudentVocabularyToFirestoreServer(canonicalStudentUid, allEntries, verifiedStudentEmail);
-      if (!db.studentDictionaryMap) db.studentDictionaryMap = {};
-      if (canonicalStudentUid) db.studentDictionaryMap[canonicalStudentUid] = allEntries;
-      if (verifiedStudentEmail) db.studentDictionaryMap[verifiedStudentEmail] = allEntries;
-      await writeDbSync(db);
+      const persisted = await saveStudentVocabularyToFirestoreServer(canonicalStudentUid, newlyEnriched, verifiedStudentEmail);
+      if (!persisted) {
+        return res.status(500).json({
+          error: 'Internal Server Error',
+          message: 'Failed to persist enriched words to canonical Cloud Firestore.',
+        });
+      }
     } catch (saveErr) {
       console.warn('Failed to persist enriched words to Firestore:', saveErr);
+      return res.status(500).json({
+        error: 'Internal Server Error',
+        message: 'Failed to persist enriched words to canonical Cloud Firestore.',
+      });
     }
   }
 

@@ -31,7 +31,6 @@ import { formatDateInTimeZone } from '../utils/timezone';
 import { speakEnglish } from '../utils/audio';
 import {
   PedagogicalLessonTransformation,
-  fetchPedagogicalTransformation,
   resolveCefrLevel,
   extractNotesMarkings,
   computeNotesHash,
@@ -40,9 +39,8 @@ import {
   PEDAGOGICAL_PROMPT_VERSION,
 } from '../utils/pedagogicalTransformer';
 import { syncSessionVocabularyToStudentDictionary } from '../utils/sessionVocabularySync';
-import { getDb, auth } from '../firebase';
+import { auth } from '../firebase';
 import { isValidCanonicalUid } from '../utils/studentPersistence';
-import { collection, getDocs, query, where } from 'firebase/firestore';
 
 interface NativeFriendsNotesModalProps {
   isOpen: boolean;
@@ -389,134 +387,48 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
         });
       }
 
-      // 2. Fetch Firestore session_notes (root & user subcollection) and REST API /api/session-notes in parallel
-      const firestoreTask = (async (): Promise<SessionOption[]> => {
-        const firestore = getDb();
-        if (!firestore || !resolvedUid) return [];
-        const docs: SessionOption[] = [];
-
-        // 2a. Query root session_notes where studentUid == resolvedUid
-        try {
-          const rootCol = collection(firestore, 'session_notes');
-          const rootQ = query(rootCol, where('studentUid', '==', resolvedUid));
-          const rootSnap = await getDocs(rootQ);
-          rootSnap.forEach((docSnap) => {
-            const data = docSnap.data();
-            if (data && data.content && data.content.trim() && data.studentUid === resolvedUid) {
-              const { timestamp, dateStr } = extractRealLessonDateAndTimestamp({
-                sessionDate: data.sessionDate,
-                startDateTime: data.startDateTime,
-                id: docSnap.id,
-                key: docSnap.id,
-              });
-              docs.push({
-                key: docSnap.id,
-                lessonId: data.lessonId,
-                dateStr: dateStr || 'Session',
-                topic: data.topic || 'In-Session Coaching',
-                teacherName: data.teacherName || 'Native Friend',
-                rawContent: data.content,
-                timestamp,
-                lastApprovedVersion: data.lastApprovedVersion || null,
-                approvalStatus: data.approvalStatus || (data.lastApprovedVersion ? 'approved' : 'unapproved'),
-              });
-            }
+      // 2. Fetch canonical session notes from REST API /api/session-notes
+      try {
+        if (resolvedUid) {
+          const queryParams = new URLSearchParams();
+          queryParams.set('studentUid', resolvedUid);
+          const idToken = await auth?.currentUser?.getIdToken().catch(() => null);
+          const res = await fetch(`/api/session-notes?${queryParams.toString()}`, {
+            headers: {
+              ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+            },
           });
-        } catch {}
-
-        // 2b. Query subcollection users/{studentUid}/session_notes
-        try {
-          const userNotesCol = collection(firestore, 'users', resolvedUid, 'session_notes');
-          const snap = await getDocs(userNotesCol);
-          snap.forEach((docSnap) => {
-            if (docSnap.id === 'review_cycle') return;
-            const data = docSnap.data();
-            if (data && data.content && data.content.trim()) {
-              if (data.studentUid && data.studentUid !== resolvedUid) return;
-              const { timestamp, dateStr } = extractRealLessonDateAndTimestamp({
-                sessionDate: data.sessionDate,
-                startDateTime: data.startDateTime,
-                id: docSnap.id,
-                key: docSnap.id,
-              });
-              docs.push({
-                key: docSnap.id,
-                lessonId: data.lessonId,
-                dateStr: dateStr || 'Session',
-                topic: data.topic || 'In-Session Coaching',
-                teacherName: data.teacherName || 'Native Friend',
-                rawContent: data.content,
-                timestamp,
-                lastApprovedVersion: data.lastApprovedVersion || null,
-                approvalStatus: data.approvalStatus || (data.lastApprovedVersion ? 'approved' : 'unapproved'),
-              });
-            }
-          });
-        } catch {}
-
-        return docs;
-      })();
-
-      const apiTask = (async (): Promise<SessionOption[]> => {
-        if (!resolvedUid) return [];
-        const queryParams = new URLSearchParams();
-        queryParams.set('studentUid', resolvedUid);
-        const idToken = await auth?.currentUser?.getIdToken().catch(() => null);
-        const res = await fetch(`/api/session-notes?${queryParams.toString()}`, {
-          headers: {
-            ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
-          },
-        });
-        if (!res.ok) {
-          throw new Error(`Server returned HTTP ${res.status}`);
+          if (!res.ok) {
+            throw new Error(`Server returned HTTP ${res.status}`);
+          }
+          const serverNotes = await res.json();
+          if (Array.isArray(serverNotes)) {
+            serverNotes.forEach((n: any) => {
+              if (n && n.content && n.content.trim()) {
+                const { timestamp, dateStr } = extractRealLessonDateAndTimestamp({
+                  sessionDate: n.sessionDate,
+                  startDateTime: n.startDateTime,
+                  id: n.id,
+                  key: n.id,
+                });
+                const key = n.id || (dateStr ? `session_${dateStr}` : 'session');
+                mergeSessionOption(sessionsMap, {
+                  key,
+                  lessonId: n.lessonId,
+                  dateStr: dateStr || 'Session',
+                  topic: n.topic || 'In-Session Notes',
+                  teacherName: n.teacherName || 'Native Friend',
+                  rawContent: n.content,
+                  timestamp,
+                  lastApprovedVersion: n.lastApprovedVersion || null,
+                  approvalStatus: n.approvalStatus || (n.lastApprovedVersion ? 'approved' : 'unapproved'),
+                });
+              }
+            });
+          }
         }
-        const serverNotes = await res.json();
-        const docs: SessionOption[] = [];
-        if (Array.isArray(serverNotes)) {
-          serverNotes.forEach((n: any) => {
-            if (n && n.content && n.content.trim()) {
-              const { timestamp, dateStr } = extractRealLessonDateAndTimestamp({
-                sessionDate: n.sessionDate,
-                startDateTime: n.startDateTime,
-                id: n.id,
-                key: n.id,
-              });
-              const key = n.id || (dateStr ? `session_${dateStr}` : 'session');
-              docs.push({
-                key,
-                lessonId: n.lessonId,
-                dateStr: dateStr || 'Session',
-                topic: n.topic || 'In-Session Notes',
-                teacherName: n.teacherName || 'Native Friend',
-                rawContent: n.content,
-                timestamp,
-                lastApprovedVersion: n.lastApprovedVersion || null,
-                approvalStatus: n.approvalStatus || (n.lastApprovedVersion ? 'approved' : 'unapproved'),
-              });
-            }
-          });
-        }
-        return docs;
-      })();
-
-      const [firestoreResult, apiResult] = await Promise.allSettled([firestoreTask, apiTask]);
-
-      // Process Firestore results first (preserving priority/deduplication order)
-      if (firestoreResult.status === 'fulfilled') {
-        firestoreResult.value.forEach((item) => {
-          mergeSessionOption(sessionsMap, item);
-        });
-      } else {
-        console.warn('NativeFriendsNotes: Firestore /users query notice:', firestoreResult.reason);
-      }
-
-      // Process REST API results next
-      if (apiResult.status === 'fulfilled') {
-        apiResult.value.forEach((item) => {
-          mergeSessionOption(sessionsMap, item);
-        });
-      } else {
-        console.warn('NativeFriendsNotes: Server notes query notice:', apiResult.reason);
+      } catch (apiErr) {
+        console.warn('NativeFriendsNotes: Server notes query notice:', apiErr);
       }
 
       // 4. Convert to array and sort STRICTLY DESCENDING by real lesson timestamp (newest / most recent first with deterministic tie-breaker)

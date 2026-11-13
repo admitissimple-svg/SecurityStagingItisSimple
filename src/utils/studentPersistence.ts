@@ -304,11 +304,184 @@ export function clearAllLocalPersistenceCaches(): void {
   inMemoryExcludedVocabularyWords.clear();
 }
 
+const inFlightDictionaryRequests = new Map<
+  string,
+  Promise<{
+    dictionary: StudentDictionaryEntry[];
+    excludedWords: string[];
+    studentUid: string;
+    studentEmail: string;
+    ok: boolean;
+    error?: string;
+  }>
+>();
+
+export function dispatchStudentDictionaryUpdatedEvent(detail: {
+  studentUid?: string;
+  studentEmail?: string;
+  dictionary?: StudentDictionaryEntry[];
+  excludedWords?: string[];
+}): void {
+  if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
+    window.dispatchEvent(new CustomEvent('its-simple:student-dictionary-updated', { detail }));
+  }
+}
+
+async function resolveStudentAuthBearerToken(): Promise<string | null> {
+  try {
+    const token =
+      (await getAccessToken().catch(() => null)) ||
+      (await auth?.currentUser?.getIdToken().catch(() => null)) ||
+      null;
+    return token;
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchStudentDictionarySnapshotViaApi(
+  studentUid: string,
+  studentEmail?: string,
+  forceRefresh = false
+): Promise<{
+  dictionary: StudentDictionaryEntry[];
+  excludedWords: string[];
+  studentUid: string;
+  studentEmail: string;
+  ok: boolean;
+  error?: string;
+}> {
+  const cleanEmail = (studentEmail || '').toLowerCase().trim();
+  const cleanUid = normalizeUid(studentUid, cleanEmail);
+  const flightKey = `${cleanUid}::${cleanEmail}`;
+
+  if (!cleanUid && !cleanEmail) {
+    return { dictionary: [], excludedWords: [], studentUid: '', studentEmail: '', ok: false, error: 'Missing identity' };
+  }
+
+  if (!forceRefresh && inFlightDictionaryRequests.has(flightKey)) {
+    return inFlightDictionaryRequests.get(flightKey)!;
+  }
+
+  const runFetch = async () => {
+    if (typeof window === 'undefined') {
+      try {
+        const serverModule = '../' + 'serverFirestore';
+        const {
+          getFirestoreDb,
+          fetchStudentVocabularyFromFirestoreServer,
+          fetchExcludedDictionaryWordsServer,
+        } = await import(/* @vite-ignore */ serverModule);
+        const serverDb = getFirestoreDb();
+        if (serverDb && cleanUid) {
+          const [dictionary, excludedWords] = await Promise.all([
+            fetchStudentVocabularyFromFirestoreServer(cleanUid, cleanEmail),
+            fetchExcludedDictionaryWordsServer(cleanUid),
+          ]);
+          cacheExcludedWordsLocally(cleanUid, cleanEmail, excludedWords);
+          cacheVocabularyLocally(cleanUid, cleanEmail, dictionary);
+          return {
+            dictionary,
+            excludedWords,
+            studentUid: cleanUid,
+            studentEmail: cleanEmail,
+            ok: true,
+          };
+        }
+      } catch (err: any) {
+        return {
+          dictionary: getCachedLocalVocabulary(cleanUid, cleanEmail),
+          excludedWords: getCachedExcludedDictionaryWords(cleanUid, cleanEmail),
+          studentUid: cleanUid,
+          studentEmail: cleanEmail,
+          ok: false,
+          error: err?.message || 'Server dictionary read error',
+        };
+      }
+    }
+
+    const token = await resolveStudentAuthBearerToken();
+    if (!token) {
+      return {
+        dictionary: getCachedLocalVocabulary(cleanUid, cleanEmail),
+        excludedWords: getCachedExcludedDictionaryWords(cleanUid, cleanEmail),
+        studentUid: cleanUid,
+        studentEmail: cleanEmail,
+        ok: false,
+        error: 'Unauthenticated',
+      };
+    }
+
+    const qs = new URLSearchParams();
+    if (cleanEmail) qs.set('studentEmail', cleanEmail);
+    if (cleanUid) qs.set('uid', cleanUid);
+
+    const res = await fetch(`/api/student-dictionary?${qs.toString()}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    if (!res.ok) {
+      const errJson = await res.json().catch(() => ({}));
+      throw new Error(errJson.message || errJson.error || `HTTP ${res.status}: Failed to load dictionary.`);
+    }
+
+    const data = await res.json().catch(() => ({}));
+    const rawEntries: StudentDictionaryEntry[] = Array.isArray(data)
+      ? data
+      : Array.isArray(data?.dictionary)
+      ? data.dictionary
+      : [];
+    const excludedWords: string[] = Array.isArray(data?.excludedWords)
+      ? data.excludedWords.map((w: string) => normalizeDictionaryWord(w)).filter(Boolean)
+      : getCachedExcludedDictionaryWords(cleanUid, cleanEmail);
+
+    const excludedSet = new Set(excludedWords);
+    const activeEntries = rawEntries
+      .filter((item) => {
+        const norm = normalizeDictionaryWord(item?.normalizedWord || item?.word);
+        return Boolean(norm && !excludedSet.has(norm));
+      })
+      .sort((a, b) =>
+        (a.word || '').localeCompare(b.word || '', ['en', 'pt'], { sensitivity: 'base' })
+      );
+
+    const resolvedUid = data?.studentUid || cleanUid;
+    const resolvedEmail = data?.studentEmail || cleanEmail;
+    cacheExcludedWordsLocally(resolvedUid, resolvedEmail, excludedWords);
+    if (activeEntries.length > 0 || Array.isArray(data?.dictionary)) {
+      cacheVocabularyLocally(resolvedUid, resolvedEmail, activeEntries);
+    }
+
+    return {
+      dictionary: activeEntries,
+      excludedWords,
+      studentUid: resolvedUid,
+      studentEmail: resolvedEmail,
+      ok: true,
+    };
+  };
+
+  const promise = runFetch()
+    .catch((err: any) => ({
+      dictionary: getCachedLocalVocabulary(cleanUid, cleanEmail),
+      excludedWords: getCachedExcludedDictionaryWords(cleanUid, cleanEmail),
+      studentUid: cleanUid,
+      studentEmail: cleanEmail,
+      ok: false,
+      error: err?.message || 'Failed to fetch dictionary',
+    }))
+    .finally(() => {
+      inFlightDictionaryRequests.delete(flightKey);
+    });
+
+  inFlightDictionaryRequests.set(flightKey, promise);
+  return promise;
+}
+
 /**
- * Persist student vocabulary entries directly and permanently to Cloud Firestore.
- * CUMULATIVE: Loads existing words first and merges, ensuring words accumulate permanently over time
- * and are never overwritten or cleared.
- * Stores in both users/{studentUID} (consolidated vocabulary array) and subcollection users/{studentUID}/vocabulary/{wordId}.
+ * Persist student vocabulary entries permanently via authenticated backend API.
+ * ARCH.2F.2B: Canonical persistence strictly targets users/{studentUID}/vocabulary/{wordDocId} on the server.
+ * Eliminates blocked client Web SDK Firestore calls and legacy root array writes.
  */
 export async function saveStudentVocabularyToFirestore(
   studentUid: string,
@@ -316,179 +489,76 @@ export async function saveStudentVocabularyToFirestore(
   studentEmail?: string,
   lessonId?: string
 ): Promise<boolean> {
-  const db = getDb();
-  if (!db) return false;
   if (!entries || entries.length === 0) return true;
 
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
   const cleanUid = normalizeUid(studentUid, cleanEmail);
-  if (!cleanUid) return false;
+  if (!cleanUid && !cleanEmail) return false;
 
   try {
-    const sanitizedEntries: StudentDictionaryEntry[] = JSON.parse(JSON.stringify(entries || []));
-    const masterMap = new Map<string, StudentDictionaryEntry>();
-
-    // 1. Seed masterMap with local cache first to ensure zero data loss during network latency
-    const cached = getCachedLocalVocabulary(cleanUid, cleanEmail);
-    cached.forEach((item) => {
-      if (item?.word) {
-        const key = item.word.toLowerCase().trim();
-        masterMap.set(key, item);
-      }
-    });
-
-    // 2. Load existing words from Firestore users/{cleanUid} & subcollection (authoritative)
-    try {
-      const userRef = doc(db, 'users', cleanUid);
-      const userSnap = await withFirestoreTimeout(getDoc(userRef), 4000, null);
-      if (userSnap && userSnap.exists()) {
-        const data = userSnap.data();
-        if (Array.isArray(data?.vocabulary)) {
-          data.vocabulary.forEach((item: StudentDictionaryEntry) => {
-            if (item?.word) {
-              const key = item.word.toLowerCase().trim();
-              masterMap.set(key, { ...(masterMap.get(key) || {}), ...item });
-            }
-          });
-        }
-      }
-    } catch {}
-
-    try {
-      const subColRef = collection(db, 'users', cleanUid, 'vocabulary');
-      const subSnap = await withFirestoreTimeout(getDocs(subColRef), 4000, null);
-      if (subSnap && !subSnap.empty) {
-        subSnap.forEach((docItem) => {
-          const item = docItem.data() as StudentDictionaryEntry;
-          if (item && item.word) {
-            const key = item.word.toLowerCase().trim();
-            masterMap.set(key, { ...(masterMap.get(key) || {}), ...item });
-          }
-        });
-      }
-    } catch {}
-
-    // 3. Check legacy doc IDs if masterMap is still small or for accounts migrated from email (READ ONLY)
-    const allDocIds = getLegacyReadDocIds(cleanUid, cleanEmail);
-    for (const altId of allDocIds) {
-      if (altId === cleanUid) continue;
-      try {
-        const altRef = doc(db, 'users', altId);
-        const altSnap = await withFirestoreTimeout(getDoc(altRef), 2000, null);
-        if (altSnap && altSnap.exists()) {
-          const altData = altSnap.data();
-          if (Array.isArray(altData?.vocabulary)) {
-            altData.vocabulary.forEach((item: StudentDictionaryEntry) => {
-              if (item?.word) {
-                const key = item.word.toLowerCase().trim();
-                if (!masterMap.has(key)) {
-                  masterMap.set(key, item);
-                }
-              }
-            });
-          }
-        }
-      } catch {}
-    }
-
-    // 4. Merge new entries into masterMap using pedagogical consolidation engine
-    // Guarantees: multi-origin preservation, richer definition protection, non-zeroing practice count
-    const accumulatedList = consolidateDictionaryEntries(
-      Array.from(masterMap.values()),
-      sanitizedEntries
+    const sanitizedEntries: StudentDictionaryEntry[] = consolidateDictionaryEntries(
+      [],
+      JSON.parse(JSON.stringify(entries || []))
     );
+    if (sanitizedEntries.length === 0) return true;
 
-    // Cache accumulated list locally immediately
-    cacheVocabularyLocally(cleanUid, cleanEmail, accumulatedList);
-
-    // Write strictly to Cloud Firestore users/{cleanUid} with accumulatedList and schema validation
-    const userPayload = stampSchemaVersion({
-      vocabulary: accumulatedList,
-      updatedAt: new Date().toISOString(),
-    });
-    assertSafeFirestoreWrite(`users/${cleanUid}`, userPayload, undefined, true);
-
-    const userRef = doc(db, 'users', cleanUid);
-    const writePromises: Promise<any>[] = [
-      setDoc(userRef, userPayload, { merge: true }),
-    ];
-
-    // Write individual entries to subcollection users/{cleanUid}/vocabulary/{wordDocId}
-    accumulatedList.forEach((fullItem) => {
-      if (!fullItem || !fullItem.word || !fullItem.word.trim()) return;
-      const key = normalizeDictionaryWord(fullItem.normalizedWord || fullItem.word);
-      if (!key) return;
-      const wordDocId = key.replace(/[^a-zA-Z0-9_-]/g, '_');
-      const itemRef = doc(db, 'users', cleanUid, 'vocabulary', wordDocId);
-      const wordPayload = stampSchemaVersion({
-        ...fullItem,
-        studentUid: cleanUid,
-        studentEmail: cleanEmail,
-        updatedAt: new Date().toISOString(),
-      });
-      assertSafeFirestoreWrite(`users/${cleanUid}/vocabulary/${wordDocId}`, wordPayload, undefined, true);
-      writePromises.push(
-        setDoc(itemRef, wordPayload, { merge: true })
-      );
-    });
-
-    await withFirestoreTimeout(Promise.all(writePromises), 6000, null);
-
-    // Authoritative backend persistence with verified authorization & Firebase Admin SDK
-    if (cleanEmail || cleanUid) {
-      let token: string | null = null;
+    if (typeof window === 'undefined') {
       try {
-        token = await getAccessToken();
-      } catch {}
-
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (token) headers['Authorization'] = `Bearer ${token}`;
-
-      try {
-        const res = await fetch('/api/student-dictionary', {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({
-            studentEmail: cleanEmail,
-            studentUid: cleanUid,
-            lessonId,
-            entries: accumulatedList,
-          }),
-        });
-
-        if (!res.ok) {
-          const errJson = await res.json().catch(() => ({}));
-          throw new Error(errJson.message || errJson.error || `HTTP ${res.status}: Failed to persist dictionary.`);
-        }
-
-        const resData = await res.json().catch(() => ({}));
-        if (resData?.excludedWords && Array.isArray(resData.excludedWords)) {
-          cacheExcludedWordsLocally(resData.studentUid || cleanUid, resData.studentEmail || cleanEmail, resData.excludedWords);
-        }
-        if (resData?.dictionary && Array.isArray(resData.dictionary)) {
-          cacheVocabularyLocally(resData.studentUid || cleanUid, resData.studentEmail || cleanEmail, resData.dictionary);
+        const serverModule = '../' + 'serverFirestore';
+        const {
+          getFirestoreDb,
+          saveStudentVocabularyToFirestoreServer,
+          fetchStudentVocabularyFromFirestoreServer,
+        } = await import(/* @vite-ignore */ serverModule);
+        const serverDb = getFirestoreDb();
+        if (serverDb && cleanUid) {
+          await saveStudentVocabularyToFirestoreServer(cleanUid, sanitizedEntries, cleanEmail);
+          const updated = await fetchStudentVocabularyFromFirestoreServer(cleanUid, cleanEmail);
+          cacheVocabularyLocally(cleanUid, cleanEmail, updated);
           return true;
         }
-      } catch (fetchErr: any) {
-        // In Node/test/SSR environment where relative URL cannot be resolved:
-        if (typeof window === 'undefined') {
-          try {
-            const serverModule = '../' + 'serverFirestore';
-            const { getFirestoreDb, saveStudentVocabularyToFirestoreServer } = await import(/* @vite-ignore */ serverModule);
-            const serverDb = getFirestoreDb();
-            if (serverDb) {
-              await saveStudentVocabularyToFirestoreServer(cleanUid, accumulatedList, cleanEmail);
-              cacheVocabularyLocally(cleanUid, cleanEmail, accumulatedList);
-              return true;
-            }
-          } catch {}
-        }
-        throw fetchErr;
+      } catch (err) {
+        handleFirestoreError(err, OperationType.WRITE, `users/${cleanUid}/vocabulary`);
+        return false;
       }
+      return false;
     }
 
-    // Cache accumulated list locally only after confirmed persistence
-    cacheVocabularyLocally(cleanUid, cleanEmail, accumulatedList);
+    const token = await resolveStudentAuthBearerToken();
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const res = await fetch('/api/student-dictionary', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        studentEmail: cleanEmail,
+        studentUid: cleanUid,
+        lessonId,
+        entries: sanitizedEntries,
+      }),
+    });
+
+    if (!res.ok) {
+      const errJson = await res.json().catch(() => ({}));
+      throw new Error(errJson.message || errJson.error || `HTTP ${res.status}: Failed to persist dictionary.`);
+    }
+
+    const resData = await res.json().catch(() => ({}));
+    const resolvedUid = resData?.studentUid || cleanUid;
+    const resolvedEmail = resData?.studentEmail || cleanEmail;
+    if (Array.isArray(resData?.excludedWords)) {
+      cacheExcludedWordsLocally(resolvedUid, resolvedEmail, resData.excludedWords);
+    }
+    if (Array.isArray(resData?.dictionary)) {
+      cacheVocabularyLocally(resolvedUid, resolvedEmail, resData.dictionary);
+    }
+    dispatchStudentDictionaryUpdatedEvent({
+      studentUid: resolvedUid,
+      studentEmail: resolvedEmail,
+      dictionary: Array.isArray(resData?.dictionary) ? resData.dictionary : undefined,
+      excludedWords: Array.isArray(resData?.excludedWords) ? resData.excludedWords : undefined,
+    });
     return true;
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, `users/${cleanUid}/vocabulary`);
@@ -499,7 +569,7 @@ export async function saveStudentVocabularyToFirestore(
 /**
  * Persists vocabulary exclusively through the authenticated backend API /api/student-dictionary
  * with Firebase Bearer token and canonical server-side validation.
- * ZERO browser-side direct writes to Firestore (strictly compliant with Fase 4B.7A Rule 3 & Rule 4).
+ * ZERO browser-side direct writes to Firestore.
  */
 export async function persistStudentVocabularyViaBackendApi(params: {
   studentUid: string;
@@ -516,11 +586,7 @@ export async function persistStudentVocabularyViaBackendApi(params: {
   if (!entries || entries.length === 0) return [];
 
   if (typeof window !== 'undefined') {
-    let token: string | null = null;
-    try {
-      token = (await getAccessToken().catch(() => null)) || (await auth.currentUser?.getIdToken().catch(() => null)) || null;
-    } catch {}
-
+    const token = await resolveStudentAuthBearerToken();
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (token) headers['Authorization'] = `Bearer ${token}`;
 
@@ -545,13 +611,20 @@ export async function persistStudentVocabularyViaBackendApi(params: {
 
     const data = await res.json().catch(() => ({}));
     const updatedDict: StudentDictionaryEntry[] = Array.isArray(data?.dictionary) ? data.dictionary : entries;
-    if (data?.excludedWords && Array.isArray(data.excludedWords)) {
-      cacheExcludedWordsLocally(data.studentUid || cleanUid, data.studentEmail || cleanEmail, data.excludedWords);
+    const resolvedUid = data?.studentUid || cleanUid;
+    const resolvedEmail = data?.studentEmail || cleanEmail;
+    if (Array.isArray(data?.excludedWords)) {
+      cacheExcludedWordsLocally(resolvedUid, resolvedEmail, data.excludedWords);
     }
-    cacheVocabularyLocally(data?.studentUid || cleanUid, data?.studentEmail || cleanEmail, updatedDict);
+    cacheVocabularyLocally(resolvedUid, resolvedEmail, updatedDict);
+    dispatchStudentDictionaryUpdatedEvent({
+      studentUid: resolvedUid,
+      studentEmail: resolvedEmail,
+      dictionary: updatedDict,
+      excludedWords: Array.isArray(data?.excludedWords) ? data.excludedWords : undefined,
+    });
     return updatedDict;
   } else {
-    // Node.js test environment support
     try {
       const serverModule = '../' + 'serverFirestore';
       const {
@@ -584,14 +657,14 @@ export async function persistStudentVocabularyViaBackendApi(params: {
 }
 
 /**
- * Phase 1B: Mark vocabulary words practiced upon successful completion of Daily Memorization Activity.
- * Increments practiceCount (+1) and sets lastPracticedAt to current ISO timestamp for each word in the queue.
- * Persists through the existing vocabulary persistence architecture.
+ * Mark vocabulary words practiced via atomic backend endpoint POST /api/student-dictionary/practice.
+ * Increments practiceCount (+1), sets lastPracticedAt, and appends practiceHistory per practiced word.
  */
 export async function markVocabularyWordsPracticedInFirestore(
   studentUid: string,
   words: string[],
-  studentEmail?: string
+  studentEmail?: string,
+  activityType = 'memorization'
 ): Promise<StudentDictionaryEntry[]> {
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
   const cleanUid = normalizeUid(studentUid, cleanEmail);
@@ -599,144 +672,85 @@ export async function markVocabularyWordsPracticedInFirestore(
     return getCachedLocalVocabulary(cleanUid, cleanEmail);
   }
 
-  const currentVocab = await fetchStudentVocabularyFromFirestore(cleanUid, cleanEmail);
-  const nowIso = new Date().toISOString();
-  const targetWordsSet = new Set(words.map((w) => normalizeDictionaryWord(w)).filter(Boolean));
-
-  let modifiedCount = 0;
-  const updatedVocab = currentVocab.map((entry) => {
-    if (!entry || !entry.word) return entry;
-    const norm = normalizeDictionaryWord(entry.normalizedWord || entry.word);
-    if (targetWordsSet.has(norm)) {
-      modifiedCount++;
-      const currentCount = typeof entry.practiceCount === 'number' ? entry.practiceCount : 0;
-      const history = Array.isArray(entry.practiceHistory) ? [...entry.practiceHistory] : [];
-      history.push({
-        date: nowIso,
-        activityType: 'memorization',
-        correct: true,
-      });
-      return {
-        ...entry,
-        normalizedWord: entry.normalizedWord || norm,
-        practiceCount: currentCount + 1,
-        lastPracticedAt: nowIso,
-        practiceHistory: history,
-      };
+  if (typeof window === 'undefined') {
+    try {
+      const serverModule = '../' + 'serverFirestore';
+      const { getFirestoreDb, markVocabularyWordsPracticedServer } = await import(/* @vite-ignore */ serverModule);
+      const serverDb = getFirestoreDb();
+      if (serverDb) {
+        const result = await markVocabularyWordsPracticedServer(cleanUid, words, activityType, cleanEmail);
+        if (Array.isArray(result.dictionary)) {
+          cacheVocabularyLocally(cleanUid, cleanEmail, result.dictionary);
+          return result.dictionary;
+        }
+      }
+    } catch (err) {
+      console.warn('markVocabularyWordsPracticedInFirestore server fallback notice:', err);
     }
-    return entry;
-  });
-
-  if (modifiedCount > 0) {
-    await saveStudentVocabularyToFirestore(cleanUid, updatedVocab, cleanEmail);
+    return getCachedLocalVocabulary(cleanUid, cleanEmail);
   }
 
-  return updatedVocab;
+  try {
+    const token = await resolveStudentAuthBearerToken();
+    if (!token) {
+      return getCachedLocalVocabulary(cleanUid, cleanEmail);
+    }
+
+    const res = await fetch('/api/student-dictionary/practice', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        studentUid: cleanUid,
+        studentEmail: cleanEmail,
+        words,
+        activityType,
+      }),
+    });
+
+    if (!res.ok) {
+      const errJson = await res.json().catch(() => ({}));
+      throw new Error(errJson.message || errJson.error || `HTTP ${res.status}: Failed to update practice metrics.`);
+    }
+
+    const data = await res.json().catch(() => ({}));
+    const updatedDict: StudentDictionaryEntry[] = Array.isArray(data?.dictionary)
+      ? data.dictionary
+      : getCachedLocalVocabulary(cleanUid, cleanEmail);
+    const resolvedUid = data?.studentUid || cleanUid;
+    const resolvedEmail = data?.studentEmail || cleanEmail;
+    cacheVocabularyLocally(resolvedUid, resolvedEmail, updatedDict);
+    dispatchStudentDictionaryUpdatedEvent({
+      studentUid: resolvedUid,
+      studentEmail: resolvedEmail,
+      dictionary: updatedDict,
+    });
+    return updatedDict;
+  } catch (err) {
+    console.warn('markVocabularyWordsPracticedInFirestore API notice:', err);
+    return getCachedLocalVocabulary(cleanUid, cleanEmail);
+  }
 }
 
 /**
- * Fetch student vocabulary directly from Firestore.
- * Always returns accumulated words across document and subcollection,
- * pre-seeding with local cache so the dictionary never starts empty.
+ * Fetch student vocabulary strictly via authenticated backend API GET /api/student-dictionary.
+ * Eliminates blocked client Web SDK reads while preserving in-memory session cache fallback on transient errors.
  */
 export async function fetchStudentVocabularyFromFirestore(
   studentUid: string,
   studentEmail?: string
 ): Promise<StudentDictionaryEntry[]> {
-  const db = getDb();
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
   const cleanUid = normalizeUid(studentUid, cleanEmail);
 
-  if (!db || !cleanUid) {
+  if (!cleanUid && !cleanEmail) {
     return getCachedLocalVocabulary(cleanUid, cleanEmail);
   }
 
-  const entryMap = new Map<string, StudentDictionaryEntry>();
-
-  // A. Pre-populate from local cache so we never start empty
-  const localCache = getCachedLocalVocabulary(cleanUid, cleanEmail);
-  localCache.forEach((item) => {
-    if (item?.word) entryMap.set(item.word.toLowerCase().trim(), item);
-  });
-
-  try {
-    // 1. Fetch from users/{cleanUid} user profile document
-    try {
-      const userRef = doc(db, 'users', cleanUid);
-      const userSnap = await withFirestoreTimeout(getDoc(userRef), 4000, null);
-      if (userSnap && userSnap.exists()) {
-        const data = userSnap.data();
-        if (Array.isArray(data?.excludedDictionaryWords)) {
-          const list: string[] = data.excludedDictionaryWords
-            .map((w: string) => normalizeDictionaryWord(w))
-            .filter(Boolean);
-          cacheExcludedWordsLocally(cleanUid, cleanEmail, list);
-        }
-        if (Array.isArray(data?.vocabulary)) {
-          data.vocabulary.forEach((item: StudentDictionaryEntry) => {
-            if (item?.word) {
-              const key = item.word.toLowerCase().trim();
-              entryMap.set(key, { ...(entryMap.get(key) || {}), ...item });
-            }
-          });
-        }
-      }
-    } catch {}
-
-    // 2. Fetch from subcollection users/{cleanUid}/vocabulary
-    try {
-      const subColRef = collection(db, 'users', cleanUid, 'vocabulary');
-      const subSnap = await withFirestoreTimeout(getDocs(subColRef), 4000, null);
-      if (subSnap && !subSnap.empty) {
-        subSnap.forEach((docItem) => {
-          const item = docItem.data() as StudentDictionaryEntry;
-          if (item && item.word) {
-            const key = item.word.toLowerCase().trim();
-            entryMap.set(key, { ...(entryMap.get(key) || {}), ...item });
-          }
-        });
-      }
-    } catch {}
-
-    // 3. Fallback to legacy document IDs if cleanUid had no words (READ ONLY)
-    if (entryMap.size === 0) {
-      const allDocIds = getLegacyReadDocIds(cleanUid, cleanEmail);
-      for (const altId of allDocIds) {
-        if (altId === cleanUid) continue;
-        try {
-          const altRef = doc(db, 'users', altId);
-          const altSnap = await withFirestoreTimeout(getDoc(altRef), 2000, null);
-          if (altSnap && altSnap.exists()) {
-            const altData = altSnap.data();
-            if (Array.isArray(altData?.vocabulary) && altData.vocabulary.length > 0) {
-              altData.vocabulary.forEach((item: StudentDictionaryEntry) => {
-                if (item?.word) entryMap.set(item.word.toLowerCase().trim(), item);
-              });
-              // Etapa 4: Strictly read-only recovery - no automatic migration write in this phase
-              break;
-            }
-          }
-        } catch {}
-      }
-    }
-
-    const excluded = new Set(getCachedExcludedDictionaryWords(cleanUid, cleanEmail));
-    const result = Array.from(entryMap.values())
-      .filter((item) => !excluded.has(normalizeDictionaryWord(item.normalizedWord || item.word)))
-      .sort((a, b) =>
-        (a.word || '').localeCompare(b.word || '', ['en', 'pt'], { sensitivity: 'base' })
-      );
-
-    // CRITICAL: Only cache if we actually have words - NEVER wipe local cache with empty result!
-    if (result.length > 0) {
-      cacheVocabularyLocally(cleanUid, cleanEmail, result);
-    }
-
-    return result;
-  } catch (error) {
-    handleFirestoreError(error, OperationType.GET, `users/${cleanUid}/vocabulary`);
-    return getCachedLocalVocabulary(cleanUid, cleanEmail);
-  }
+  const snapshot = await fetchStudentDictionarySnapshotViaApi(cleanUid, cleanEmail);
+  return snapshot.dictionary;
 }
 
 /**
@@ -754,23 +768,21 @@ export async function deleteStudentVocabularyFromFirestore(
   const cleanUid = normalizeUid(studentUid, cleanEmail);
   if (!cleanUid) return false;
 
-  // 1. Update in-memory exclusions and filter local cache
-  const currentEx = new Set(getCachedExcludedDictionaryWords(cleanUid, cleanEmail));
+  const previousExcluded = getCachedExcludedDictionaryWords(cleanUid, cleanEmail);
+  const previousVocab = getCachedLocalVocabulary(cleanUid, cleanEmail);
+
+  // 1. Update in-memory exclusions and filter local cache optimistically
+  const currentEx = new Set(previousExcluded);
   currentEx.add(norm);
   const updatedExcluded = Array.from(currentEx);
   cacheExcludedWordsLocally(cleanUid, cleanEmail, updatedExcluded);
 
-  const localVocab = getCachedLocalVocabulary(cleanUid, cleanEmail);
-  const filteredVocab = localVocab.filter((e) => normalizeDictionaryWord(e.normalizedWord || e.word) !== norm);
+  const filteredVocab = previousVocab.filter((e) => normalizeDictionaryWord(e.normalizedWord || e.word) !== norm);
   cacheVocabularyLocally(cleanUid, cleanEmail, filteredVocab);
 
   // 2. Call authenticated backend DELETE endpoint
   try {
-    let token: string | null = null;
-    try {
-      token = await getAccessToken();
-    } catch {}
-
+    const token = await resolveStudentAuthBearerToken();
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (token) headers['Authorization'] = `Bearer ${token}`;
 
@@ -790,12 +802,22 @@ export async function deleteStudentVocabularyFromFirestore(
     }
 
     const resData = await res.json().catch(() => ({}));
+    const resolvedUid = resData?.studentUid || cleanUid;
+    const resolvedEmail = resData?.studentEmail || cleanEmail;
     if (Array.isArray(resData?.excludedWords)) {
-      cacheExcludedWordsLocally(cleanUid, cleanEmail, resData.excludedWords);
+      cacheExcludedWordsLocally(resolvedUid, resolvedEmail, resData.excludedWords);
     }
+    if (Array.isArray(resData?.dictionary)) {
+      cacheVocabularyLocally(resolvedUid, resolvedEmail, resData.dictionary);
+    }
+    dispatchStudentDictionaryUpdatedEvent({
+      studentUid: resolvedUid,
+      studentEmail: resolvedEmail,
+      dictionary: Array.isArray(resData?.dictionary) ? resData.dictionary : filteredVocab,
+      excludedWords: Array.isArray(resData?.excludedWords) ? resData.excludedWords : updatedExcluded,
+    });
     return true;
   } catch (fetchErr) {
-    // In Node / SSR / test environment without browser fetch to relative URL
     if (typeof window === 'undefined') {
       try {
         const serverModule = '../' + 'serverFirestore';
@@ -807,6 +829,9 @@ export async function deleteStudentVocabularyFromFirestore(
         }
       } catch {}
     }
+    // Rollback optimistic local caches on failure
+    cacheExcludedWordsLocally(cleanUid, cleanEmail, previousExcluded);
+    cacheVocabularyLocally(cleanUid, cleanEmail, previousVocab);
     throw fetchErr;
   }
 }
@@ -834,54 +859,20 @@ export function cacheExcludedWordsLocally(studentUid: string, studentEmail: stri
 }
 
 /**
- * Fetches excluded dictionary words from Firestore users/{cleanUid}.
+ * Fetches excluded dictionary words via authenticated backend API (coalesced with dictionary fetch).
  */
 export async function fetchExcludedDictionaryWords(
   studentUid: string,
   studentEmail?: string
 ): Promise<string[]> {
-  const db = getDb();
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
   const cleanUid = normalizeUid(studentUid, cleanEmail);
-  if (!cleanUid) {
+  if (!cleanUid && !cleanEmail) {
     return getCachedExcludedDictionaryWords(cleanUid, cleanEmail);
   }
 
-  if (typeof window === 'undefined') {
-    try {
-      const serverModule = '../' + 'serverFirestore';
-      const { getFirestoreDb, fetchExcludedDictionaryWordsServer } = await import(/* @vite-ignore */ serverModule);
-      const serverDb = getFirestoreDb();
-      if (serverDb) {
-        const serverWords = await fetchExcludedDictionaryWordsServer(cleanUid);
-        if (serverWords.length > 0) {
-          cacheExcludedWordsLocally(cleanUid, cleanEmail, serverWords);
-          return serverWords;
-        }
-      }
-    } catch {}
-  }
-
-  if (!db) {
-    return getCachedExcludedDictionaryWords(cleanUid, cleanEmail);
-  }
-
-  try {
-    const userRef = doc(db, 'users', cleanUid);
-    const snap = await withFirestoreTimeout(getDoc(userRef), 2500, null);
-    if (snap && snap.exists()) {
-      const data = snap.data();
-      if (Array.isArray(data?.excludedDictionaryWords)) {
-        const list: string[] = data.excludedDictionaryWords
-          .map((w: string) => normalizeDictionaryWord(w))
-          .filter(Boolean);
-        cacheExcludedWordsLocally(cleanUid, cleanEmail, list);
-        return list;
-      }
-    }
-  } catch {}
-
-  return getCachedExcludedDictionaryWords(cleanUid, cleanEmail);
+  const snapshot = await fetchStudentDictionarySnapshotViaApi(cleanUid, cleanEmail);
+  return snapshot.excludedWords;
 }
 
 /**
@@ -896,7 +887,7 @@ export async function addExcludedDictionaryWord(
 }
 
 /**
- * Removes a word from the excluded dictionary words list (e.g. when re-added manually).
+ * Removes a word from the excluded dictionary words list via authenticated backend endpoint.
  */
 export async function removeExcludedDictionaryWord(
   studentUid: string,
@@ -909,11 +900,11 @@ export async function removeExcludedDictionaryWord(
   const cleanUid = normalizeUid(studentUid, cleanEmail);
   if (!cleanUid) return false;
 
-  const current = new Set(getCachedExcludedDictionaryWords(cleanUid, cleanEmail));
+  const previousExcluded = getCachedExcludedDictionaryWords(cleanUid, cleanEmail);
+  const current = new Set(previousExcluded);
   if (current.has(norm)) {
     current.delete(norm);
-    const updatedList = Array.from(current);
-    cacheExcludedWordsLocally(cleanUid, cleanEmail, updatedList);
+    cacheExcludedWordsLocally(cleanUid, cleanEmail, Array.from(current));
   }
 
   if (typeof window === 'undefined') {
@@ -928,23 +919,41 @@ export async function removeExcludedDictionaryWord(
     } catch {}
   }
 
-  const db = getDb();
-  if (!db || !cleanUid) return true;
-
   try {
-    const userRef = doc(db, 'users', cleanUid);
-    const updatedList = Array.from(current);
-    await withFirestoreTimeout(
-      setDoc(userRef, { excludedDictionaryWords: updatedList, updatedAt: new Date().toISOString() }, { merge: true }),
-      3000,
-      null
-    );
+    const token = await resolveStudentAuthBearerToken();
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const res = await fetch('/api/student-dictionary/unexclude', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        word: norm,
+        studentUid: cleanUid,
+        studentEmail: cleanEmail,
+      }),
+    });
+
+    if (!res.ok) {
+      cacheExcludedWordsLocally(cleanUid, cleanEmail, previousExcluded);
+      return false;
+    }
+
+    const resData = await res.json().catch(() => ({}));
+    if (Array.isArray(resData?.excludedWords)) {
+      cacheExcludedWordsLocally(cleanUid, cleanEmail, resData.excludedWords);
+    }
+    dispatchStudentDictionaryUpdatedEvent({
+      studentUid: resData?.studentUid || cleanUid,
+      studentEmail: cleanEmail,
+      excludedWords: Array.isArray(resData?.excludedWords) ? resData.excludedWords : undefined,
+    });
     return true;
   } catch {
+    cacheExcludedWordsLocally(cleanUid, cleanEmail, previousExcluded);
     return false;
   }
 }
-
 
 export type StudentVocabularySubscriptionStatus =
   | 'loading'
@@ -961,214 +970,129 @@ export interface StudentVocabularySnapshotResult {
 }
 
 /**
- * Real-time subscription to student vocabulary on Firestore.
- * Immediately notifies when any word is added, updated, or removed by student, teacher, or routine across devices.
- * Firestore is the single authoritative source of truth.
- *
- * FASE 4B.3 (Estabilização da Leitura do My Dictionary):
- * - Differentiates explicitly: 'loading', 'loaded_with_words', 'loaded_empty', 'error'.
- * - First empty snapshot of subcollection is NEVER interpreted as consolidated empty while main doc read is pending.
- * - Read failures never display an empty dictionary.
- * - Strict isolation per canonical UID.
+ * Reactive subscription to student vocabulary backed strictly by authenticated backend API
+ * (/api/student-dictionary) + auth hydration + CustomEvent notifications (zero Web SDK onSnapshot).
  */
 export function subscribeToStudentVocabulary(
   studentUid: string,
   studentEmail: string | undefined,
   callback: (entries: StudentDictionaryEntry[], snapshotResult?: StudentVocabularySnapshotResult) => void
 ): () => void {
-  const db = getDb();
   const cleanEmail = (studentEmail || '').toLowerCase().trim();
   const cleanUid = normalizeUid(studentUid, cleanEmail);
 
-  if (!db || !cleanUid) {
+  if (!cleanUid && !cleanEmail) {
     return () => {};
   }
 
-  const vocabColRef = collection(db, 'users', cleanUid, 'vocabulary');
-  const userDocRef = doc(db, 'users', cleanUid);
-
   let isUnsubscribed = false;
-  let docReceived = false;
-  let colReceived = false;
-  let docError: any = null;
-  let colError: any = null;
 
-  let docVocab: StudentDictionaryEntry[] = [];
-  const colMap = new Map<string, StudentDictionaryEntry>();
-
-  const notify = () => {
+  const emitSnapshot = (
+    entries: StudentDictionaryEntry[],
+    excludedWords: string[],
+    status: StudentVocabularySubscriptionStatus,
+    error?: string | null
+  ) => {
     if (isUnsubscribed) return;
-
-    const isDocPending = !docReceived && docError === null;
-    const isColPending = !colReceived && colError === null;
-
-    // Both sources failed with read error:
-    if (docError !== null && colError !== null) {
-      const cached = getCachedLocalVocabulary(cleanUid, cleanEmail);
-      const excluded = new Set(getCachedExcludedDictionaryWords(cleanUid, cleanEmail));
-      const filteredCached = cached.filter((item) => !excluded.has(normalizeDictionaryWord(item.normalizedWord || item.word)));
-      callback(filteredCached, {
-        entries: filteredCached,
-        status: 'error',
-        studentUid: cleanUid,
-        error: docError?.message || colError?.message || 'Failed to read student vocabulary from Firestore',
-      });
-      return;
-    }
-
-    // While main doc is still pending:
-    // If subcollection is empty (colMap.size === 0), DO NOT emit as consolidated empty!
-    // We are still loading!
-    if (isDocPending && colMap.size === 0) {
-      const cached = getCachedLocalVocabulary(cleanUid, cleanEmail);
-      const excluded = new Set(getCachedExcludedDictionaryWords(cleanUid, cleanEmail));
-      const filteredCached = cached.filter((item) => !excluded.has(normalizeDictionaryWord(item.normalizedWord || item.word)));
-      if (filteredCached.length > 0) {
-        callback(filteredCached, {
-          entries: filteredCached,
-          status: 'loading',
-          studentUid: cleanUid,
-        });
-      }
-      return;
-    }
-
-    // While subcollection is pending:
-    // If docVocab is empty, we must also wait for subcollection before concluding empty!
-    if (isColPending && docVocab.length === 0) {
-      const cached = getCachedLocalVocabulary(cleanUid, cleanEmail);
-      const excluded = new Set(getCachedExcludedDictionaryWords(cleanUid, cleanEmail));
-      const filteredCached = cached.filter((item) => !excluded.has(normalizeDictionaryWord(item.normalizedWord || item.word)));
-      if (filteredCached.length > 0) {
-        callback(filteredCached, {
-          entries: filteredCached,
-          status: 'loading',
-          studentUid: cleanUid,
-        });
-      }
-      return;
-    }
-
-    // Authoritative consolidation
-    const mergedMap = new Map<string, StudentDictionaryEntry>();
-
-    // 1. Authoritative userDocRef vocabulary array
-    docVocab.forEach((item) => {
-      if (item && item.word && item.word.trim()) {
-        const norm = normalizeDictionaryWord(item.normalizedWord || item.word);
-        if (norm) mergedMap.set(norm, item);
-      }
-    });
-
-    // 2. Subcollection items
-    colMap.forEach((item, key) => {
-      if (!mergedMap.has(key)) {
-        mergedMap.set(key, item);
-      } else {
-        const existing = mergedMap.get(key)!;
-        const consolidated = consolidateDictionaryEntries([existing], [item]);
-        if (consolidated[0]) {
-          mergedMap.set(key, consolidated[0]);
-        }
-      }
-    });
-
-    const excluded = new Set(getCachedExcludedDictionaryWords(cleanUid, cleanEmail));
-    const list = Array.from(mergedMap.values())
-      .filter((item) => !excluded.has(normalizeDictionaryWord(item.normalizedWord || item.word)))
+    const exSet = new Set(excludedWords.map((w) => normalizeDictionaryWord(w)).filter(Boolean));
+    const filtered = (entries || [])
+      .filter((item) => {
+        const norm = normalizeDictionaryWord(item?.normalizedWord || item?.word);
+        return Boolean(norm && !exSet.has(norm));
+      })
       .sort((a, b) =>
         (a.word || '').localeCompare(b.word || '', ['en', 'pt'], { sensitivity: 'base' })
       );
 
-    const isInitialDone = (!isDocPending) && (!isColPending);
-
-    let status: StudentVocabularySubscriptionStatus = 'loading';
-    if (list.length > 0) {
-      status = 'loaded_with_words';
-      cacheVocabularyLocally(cleanUid, cleanEmail, list);
-    } else if (isInitialDone) {
-      if (docError !== null || colError !== null) {
-        status = 'error';
-      } else {
-        status = 'loaded_empty';
-      }
-    }
-
-    callback(list, {
-      entries: list,
+    callback(filtered, {
+      entries: filtered,
       status,
       studentUid: cleanUid,
-      error: (docError || colError)?.message || null,
-      excludedWords: Array.from(excluded),
+      error: error || null,
+      excludedWords: Array.from(exSet),
     });
   };
 
-  // Subcollection listener
-  const unsubCol = onSnapshot(
-    vocabColRef,
-    (snapshot) => {
-      if (isUnsubscribed) return;
-      colReceived = true;
-      colError = null;
-      colMap.clear();
-      snapshot.forEach((d) => {
-        const item = d.data() as StudentDictionaryEntry;
-        if (item && item.word && item.word.trim()) {
-          const norm = normalizeDictionaryWord(item.normalizedWord || item.word);
-          if (norm) {
-            colMap.set(norm, item);
-          }
+  const fetchLatest = async (forceRefresh = false) => {
+    if (isUnsubscribed) return;
+    const cached = getCachedLocalVocabulary(cleanUid, cleanEmail);
+    const cachedExcl = getCachedExcludedDictionaryWords(cleanUid, cleanEmail);
+
+    if (typeof window !== 'undefined' && !auth?.currentUser) {
+      if (cached.length > 0) {
+        emitSnapshot(cached, cachedExcl, 'loading');
+      }
+      return;
+    }
+
+    if (cached.length > 0) {
+      emitSnapshot(cached, cachedExcl, 'loading');
+    }
+
+    const res = await fetchStudentDictionarySnapshotViaApi(cleanUid, cleanEmail, forceRefresh);
+    if (isUnsubscribed) return;
+
+    if (!res.ok) {
+      if (res.error === 'Unauthenticated') {
+        return;
+      }
+      emitSnapshot(res.dictionary, res.excludedWords, 'error', res.error);
+      return;
+    }
+
+    emitSnapshot(
+      res.dictionary,
+      res.excludedWords,
+      res.dictionary.length > 0 ? 'loaded_with_words' : 'loaded_empty'
+    );
+  };
+
+  fetchLatest(false);
+
+  let unsubAuth: (() => void) | null = null;
+  if (typeof window !== 'undefined' && auth) {
+    try {
+      unsubAuth = onAuthStateChanged(auth, (user) => {
+        if (user && !isUnsubscribed) {
+          fetchLatest(false);
         }
       });
-      notify();
-    },
-    (err) => {
-      if (isUnsubscribed) return;
-      colReceived = true;
-      colError = err;
-      console.warn('Real-time vocabulary subcollection notice:', err);
-      notify();
-    }
-  );
+    } catch {}
+  }
 
-  // User document listener
-  const unsubDoc = onSnapshot(
-    userDocRef,
-    (snap) => {
-      if (isUnsubscribed) return;
-      docReceived = true;
-      docError = null;
-      if (snap.exists()) {
-        const data = snap.data();
-        if (Array.isArray(data?.excludedDictionaryWords)) {
-          const list: string[] = data.excludedDictionaryWords
-            .map((w: string) => normalizeDictionaryWord(w))
-            .filter(Boolean);
-          cacheExcludedWordsLocally(cleanUid, cleanEmail, list);
-        }
-        if (Array.isArray(data?.vocabulary)) {
-          docVocab = data.vocabulary;
-        } else {
-          docVocab = [];
-        }
-      } else {
-        docVocab = [];
-      }
-      notify();
-    },
-    (err) => {
-      if (isUnsubscribed) return;
-      docReceived = true;
-      docError = err;
-      console.warn('Real-time vocabulary user doc notice:', err);
-      notify();
+  const handleUpdatedEvent = (ev: Event) => {
+    if (isUnsubscribed) return;
+    const detail = (ev as CustomEvent)?.detail;
+    const detailUid = String(detail?.studentUid || '').trim();
+    const detailEmail = String(detail?.studentEmail || '').toLowerCase().trim();
+    if (detailUid && cleanUid && detailUid !== cleanUid && detailUid !== auth?.currentUser?.uid) return;
+    if (!detailUid && detailEmail && cleanEmail && detailEmail !== cleanEmail) return;
+
+    if (Array.isArray(detail?.dictionary)) {
+      const excluded = Array.isArray(detail?.excludedWords)
+        ? detail.excludedWords
+        : getCachedExcludedDictionaryWords(cleanUid, cleanEmail);
+      emitSnapshot(
+        detail.dictionary,
+        excluded,
+        detail.dictionary.length > 0 ? 'loaded_with_words' : 'loaded_empty'
+      );
+      return;
     }
-  );
+
+    fetchLatest(true);
+  };
+
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('its-simple:student-dictionary-updated', handleUpdatedEvent);
+  }
 
   return () => {
     isUnsubscribed = true;
-    unsubCol();
-    unsubDoc();
+    if (unsubAuth) unsubAuth();
+    if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      window.removeEventListener('its-simple:student-dictionary-updated', handleUpdatedEvent);
+    }
   };
 }
 

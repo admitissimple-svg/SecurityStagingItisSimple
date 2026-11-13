@@ -8,6 +8,7 @@ import {
 import {
   fetchStudentVocabularyFromFirestore,
   saveStudentVocabularyToFirestore,
+  markVocabularyWordsPracticedInFirestore,
   getCachedLocalVocabulary,
   getCachedExcludedDictionaryWords,
   normalizeUid,
@@ -439,14 +440,8 @@ export async function saveStudentDictionary(
   if (!cleanUid && !studentEmail) return false;
   if (!entries || entries.length === 0) return true;
 
-  // 1. Fetch existing entries
-  const existing = await getStudentDictionary(cleanUid, studentEmail);
-
-  // 2. Consolidate without data loss
-  const consolidated = consolidateDictionaryEntries(existing, entries);
-
-  // 3. Persist to Firestore authoritative store
-  return saveStudentVocabularyToFirestore(cleanUid, consolidated, studentEmail);
+  // Delegate directly to canonical backend-backed persistence (avoids redundant GET + full-dictionary re-POST)
+  return saveStudentVocabularyToFirestore(cleanUid, entries, studentEmail);
 }
 
 /**
@@ -463,38 +458,7 @@ export async function recordWordPractice(
     return getCachedLocalVocabulary(cleanUid, studentEmail);
   }
 
-  const normTargetSet = new Set(words.map((w) => normalizeDictionaryWord(w)).filter(Boolean));
-  const currentEntries = await getStudentDictionary(cleanUid, studentEmail);
-  const nowIso = new Date().toISOString();
-
-  let modifiedCount = 0;
-  const updatedEntries = currentEntries.map((entry) => {
-    const norm = normalizeDictionaryWord(entry.normalizedWord || entry.word);
-    if (normTargetSet.has(norm)) {
-      modifiedCount++;
-      const curCount = typeof entry.practiceCount === 'number' ? entry.practiceCount : 0;
-      const history = Array.isArray(entry.practiceHistory) ? [...entry.practiceHistory] : [];
-      history.push({
-        date: nowIso,
-        activityType,
-        correct: true,
-      });
-
-      return {
-        ...entry,
-        practiceCount: curCount + 1,
-        lastPracticedAt: nowIso,
-        practiceHistory: history,
-      };
-    }
-    return entry;
-  });
-
-  if (modifiedCount > 0) {
-    await saveStudentVocabularyToFirestore(cleanUid, updatedEntries, studentEmail);
-  }
-
-  return updatedEntries;
+  return markVocabularyWordsPracticedInFirestore(cleanUid, words, studentEmail, activityType);
 }
 
 /**

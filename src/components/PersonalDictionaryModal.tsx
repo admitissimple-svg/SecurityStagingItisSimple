@@ -21,6 +21,8 @@ import {
   consolidateDictionaryEntries,
   normalizeDictionaryWord,
 } from '../utils/studentDictionaryLibrary';
+import { dispatchStudentDictionaryUpdatedEvent } from '../utils/studentPersistence';
+import { getAccessToken } from '../utils/auth';
 import { auth } from '../firebase';
 
 interface PersonalDictionaryModalProps {
@@ -127,9 +129,14 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
 
     if (!targetUid && !targetEmail) return;
 
+    let isEffectCancelled = false;
+
     (async () => {
       try {
-        const token = await auth?.currentUser?.getIdToken().catch(() => null);
+        const token =
+          (await getAccessToken().catch(() => null)) ||
+          (await auth?.currentUser?.getIdToken().catch(() => null));
+        if (isEffectCancelled) return;
         const headers: Record<string, string> = { 'Content-Type': 'application/json' };
         if (token) {
           headers['Authorization'] = `Bearer ${token}`;
@@ -147,32 +154,39 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
         });
 
         const data = await res.json();
-        if (data.success && Array.isArray(data.enrichedEntries)) {
+        if (isEffectCancelled) return;
+        if (data.success && Array.isArray(data.enrichedEntries) && data.enrichedEntries.length > 0) {
+          const nextMap: Record<string, Partial<StudentDictionaryEntry>> = {};
           data.enrichedEntries.forEach((entry: StudentDictionaryEntry) => {
             const norm = normalizeDictionaryWord(entry.normalizedWord || entry.word);
             if (norm) {
-              setApiEnrichedEntries((prev) => ({
-                ...prev,
-                [norm]: {
-                  definitionEn: entry.definitionEn,
-                  exampleSentenceEn: entry.exampleSentenceEn,
-                  partOfSpeech: entry.partOfSpeech,
-                  phonetic: entry.phonetic,
-                  cefrLevel: entry.cefrLevel,
-                  translationPt: entry.translationPt,
-                },
-              }));
-              if (onSaveCustomEntry) {
-                onSaveCustomEntry(entry);
-              }
+              nextMap[norm] = {
+                definitionEn: entry.definitionEn,
+                exampleSentenceEn: entry.exampleSentenceEn,
+                partOfSpeech: entry.partOfSpeech,
+                phonetic: entry.phonetic,
+                cefrLevel: entry.cefrLevel,
+                translationPt: entry.translationPt,
+              };
             }
           });
+          if (Object.keys(nextMap).length > 0) {
+            setApiEnrichedEntries((prev) => ({ ...prev, ...nextMap }));
+            dispatchStudentDictionaryUpdatedEvent({
+              studentUid: targetUid,
+              studentEmail: targetEmail,
+            });
+          }
         }
       } catch (err) {
         console.warn('PersonalDictionaryModal: video words enrichment notice:', err);
       }
     })();
-  }, [isOpen, wordsFromRoutines, effectiveExcludedSet, customSavedEntries, apiEnrichedEntries, studentUid, studentEmail, studentLevel, onSaveCustomEntry]);
+
+    return () => {
+      isEffectCancelled = true;
+    };
+  }, [isOpen, wordsFromRoutines, effectiveExcludedSet, customSavedEntries, apiEnrichedEntries, studentUid, studentEmail, studentLevel]);
 
   // Convert routine words into canonical StudentDictionaryEntry items
   // Reusing existing My Dictionary definitions and omitting excluded words
@@ -373,7 +387,9 @@ export const PersonalDictionaryModal: React.FC<PersonalDictionaryModalProps> = (
     };
 
     if (onSaveCustomEntry) {
-      onSaveCustomEntry(newEntry);
+      Promise.resolve(onSaveCustomEntry(newEntry)).catch((err) => {
+        console.warn('PersonalDictionaryModal: save custom entry notice:', err);
+      });
     }
 
     setNewWord('');

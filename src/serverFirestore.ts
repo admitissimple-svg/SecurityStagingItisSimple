@@ -1405,6 +1405,9 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
       delete sanitizedMainData.liveLessons;
       delete sanitizedMainData.lessons;
       delete sanitizedMainData.scheduledLessons;
+      delete sanitizedMainData.sessionNotesMap;
+      delete sanitizedMainData.sessionNotesProgressMap;
+      delete sanitizedMainData.pedagogicalTransformationsMap;
 
       const sanitizedLessonsDoc: Record<string, any> = lessons ? { ...lessons } : {};
       delete sanitizedLessonsDoc.liveLessons;
@@ -1615,6 +1618,14 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
     };
 
     const mainData = { ...sanitized };
+    delete sanitized.studentDictionaryMap;
+    delete sanitized.sessionNotesMap;
+    delete sanitized.sessionNotesProgressMap;
+    delete sanitized.pedagogicalTransformationsMap;
+    delete mainData.studentDictionaryMap;
+    delete mainData.sessionNotesMap;
+    delete mainData.sessionNotesProgressMap;
+    delete mainData.pedagogicalTransformationsMap;
     delete mainData.studentRoutinesMap;
     delete mainData.studentCurrentRoutines;
     delete mainData.routinesByDay;
@@ -4435,13 +4446,23 @@ export function removeUndefinedFields<T = any>(val: T): T {
  * - Deduplicated deterministically by normalized word.
  * - Strips any undefined fields so Firestore Admin SDK never encounters undefined.
  */
+export function buildVocabularyDocId(rawWord: string): string {
+  const norm = normalizeDictionaryWord(rawWord) || (rawWord || '').toLowerCase().trim();
+  const sanitized = norm.replace(/[^a-zA-Z0-9_-]/g, '_');
+  if (sanitized && sanitized !== '.' && sanitized !== '..') {
+    return sanitized;
+  }
+  const hex = Buffer.from(norm || 'word', 'utf8').toString('hex').slice(0, 32);
+  return `word_${hex}`;
+}
+
 export function consolidateServerEntries(existingEntries: any[], newEntries: any[]): any[] {
   const masterMap = new Map<string, any>();
 
   (existingEntries || []).forEach((e) => {
     if (!e || !e.word) return;
     const rawWord = (e.word || '').trim();
-    const key = (e.normalizedWord || rawWord).toLowerCase().trim();
+    const key = normalizeDictionaryWord(e.normalizedWord || rawWord) || (e.normalizedWord || rawWord).toLowerCase().trim();
     if (!key) return;
     masterMap.set(key, removeUndefinedFields({ ...e, word: rawWord, normalizedWord: key }));
   });
@@ -4449,7 +4470,7 @@ export function consolidateServerEntries(existingEntries: any[], newEntries: any
   (newEntries || []).forEach((item) => {
     if (!item || !item.word) return;
     const rawWord = (item.word || '').trim();
-    const key = (item.normalizedWord || rawWord).toLowerCase().trim();
+    const key = normalizeDictionaryWord(item.normalizedWord || rawWord) || (item.normalizedWord || rawWord).toLowerCase().trim();
     if (!key) return;
 
     const existing = masterMap.get(key);
@@ -4510,9 +4531,11 @@ export function consolidateServerEntries(existingEntries: any[], newEntries: any
     const isNewGeneric = !newDef || isGenericPedagogicalDefinition(newDef);
     const isExistingGeneric = !existingDef || isGenericPedagogicalDefinition(existingDef);
 
-    // Rule: Legitimate definitions always replace generic placeholders; generic definitions never overwrite legitimate ones
+    // Rule: Legitimate definitions always replace generic placeholders; generic or significantly shorter/terse definitions never overwrite substantive ones
     let resolvedDef = '';
     if (!isExistingGeneric && isNewGeneric) {
+      resolvedDef = existingDef;
+    } else if (!isExistingGeneric && existingDef.length > 20 && newDef.length < 15) {
       resolvedDef = existingDef;
     } else if (!isNewGeneric) {
       resolvedDef = newDef;
@@ -4707,8 +4730,8 @@ export function hasVocabularyEntryChanged(existingDoc: any, targetDoc: any): boo
   const word2 = (targetDoc.word || '').trim();
   if (word1.toLowerCase() !== word2.toLowerCase()) return true;
 
-  const norm1 = (existingDoc.normalizedWord || word1).toLowerCase().trim();
-  const norm2 = (targetDoc.normalizedWord || word2).toLowerCase().trim();
+  const norm1 = normalizeDictionaryWord(existingDoc.normalizedWord || word1) || (existingDoc.normalizedWord || word1).toLowerCase().trim();
+  const norm2 = normalizeDictionaryWord(targetDoc.normalizedWord || word2) || (targetDoc.normalizedWord || word2).toLowerCase().trim();
   if (norm1 !== norm2) return true;
 
   const origWord1 = (existingDoc.originalWord || word1).trim();
@@ -4827,8 +4850,10 @@ export function hasVocabularyEntryChanged(existingDoc: any, targetDoc: any): boo
 /**
  * Server-side persistent storage of student vocabulary in Cloud Firestore.
  * Strictly requires a canonical student Firebase Auth UID (rejects synthetic usr-* / st-* or teacher UID).
- * Persists to canonical document users/{canonicalStudentUid} and subcollection users/{canonicalStudentUid}/vocabulary/{wordDocId}.
- * HOTFIX: Eliminates redundant writes to both root document and subcollection when documents are unchanged.
+ * ARCH.2F.2B: Canonical persistence strictly targets subcollection users/{canonicalStudentUid}/vocabulary/{wordDocId}.
+ * Eliminates new writes to users/{canonicalStudentUid}.vocabulary root array.
+ * Reads legacy users/{canonicalStudentUid}.vocabulary ONLY when the canonical subcollection is empty.
+ * Uses per-document transactions (when supported) for concurrency safety and skips unmodified documents.
  */
 export async function saveStudentVocabularyToFirestoreServer(
   studentUid: string,
@@ -4851,96 +4876,149 @@ export async function saveStudentVocabularyToFirestoreServer(
     const cleanEmail = (studentEmail || '').toLowerCase().trim();
     const sanitizedEntries = removeUndefinedFields(JSON.parse(JSON.stringify(entries || [])));
 
-    // 1. Fetch existing entries from canonical user document
-    let existingList: any[] = [];
-    let existingRootVocab: any[] = [];
-    let rootDocExists = false;
+    // 1. Read user document for excludedDictionaryWords (tombstones) only
+    let excludedSet = new Set<string>();
     let rootUserData: any = null;
-
     try {
       const userSnap = await db.collection('users').doc(cleanUid).get();
       if (userSnap.exists) {
-        rootDocExists = true;
         rootUserData = userSnap.data();
-        if (Array.isArray(rootUserData?.vocabulary)) {
-          existingRootVocab = rootUserData.vocabulary;
-          existingList = [...existingRootVocab];
+        if (Array.isArray(rootUserData?.excludedDictionaryWords)) {
+          excludedSet = new Set(
+            rootUserData.excludedDictionaryWords
+              .map((w: string) => normalizeDictionaryWord(w))
+              .filter(Boolean)
+          );
         }
       }
     } catch {}
 
-    // 2. Fetch existing entries from canonical subcollection
+    // 2. Read canonical subcollection users/{cleanUid}/vocabulary
+    const subColRef = db.collection('users').doc(cleanUid).collection('vocabulary');
     const existingSubcollectionByDocId = new Map<string, any>();
     const existingSubcollectionByNormWord = new Map<string, any>();
+    let isSubcollectionEmpty = true;
 
     try {
-      const subSnap = await db.collection('users').doc(cleanUid).collection('vocabulary').get();
-      if (!subSnap.empty) {
+      const subSnap = await subColRef.get();
+      if (subSnap && !subSnap.empty) {
+        isSubcollectionEmpty = false;
         subSnap.forEach((docItem) => {
           const item = docItem.data();
           if (item && item.word) {
             existingSubcollectionByDocId.set(docItem.id, item);
-            const norm = (item.normalizedWord || item.word).toLowerCase().trim();
+            const norm = normalizeDictionaryWord(item.normalizedWord || item.word);
             if (norm) {
               existingSubcollectionByNormWord.set(norm, item);
             }
-            existingList.push(item);
           }
         });
       }
     } catch {}
 
-    // 3. Consolidate entries cumulatively and recursively eliminate all undefined fields
-    const consolidated = removeUndefinedFields(consolidateServerEntries(existingList, sanitizedEntries));
-
-    // 4. Save to canonical root document users/{cleanUid} ONLY if vocabulary content has changed
-    let rootChanged = !rootDocExists || !Array.isArray(rootUserData?.vocabulary);
-    if (!rootChanged) {
-      if (existingRootVocab.length !== consolidated.length) {
-        rootChanged = true;
-      } else {
-        const rootMap = new Map<string, any>();
-        for (const item of existingRootVocab) {
-          if (item && item.word) {
-            const k = (item.normalizedWord || item.word).toLowerCase().trim();
-            rootMap.set(k, item);
-          }
+    // 3. Only if canonical subcollection is empty and legacy root array exists, preserve non-excluded legacy entries
+    //    into the canonical subcollection without ever writing back to users/{cleanUid}.vocabulary.
+    const legacySeedEntries: any[] = [];
+    if (isSubcollectionEmpty && Array.isArray(rootUserData?.vocabulary) && rootUserData.vocabulary.length > 0) {
+      rootUserData.vocabulary.forEach((item: any) => {
+        if (!item || !item.word) return;
+        const norm = normalizeDictionaryWord(item.normalizedWord || item.word);
+        if (norm && !excludedSet.has(norm)) {
+          legacySeedEntries.push(item);
         }
-        if (rootMap.size !== consolidated.length) {
-          rootChanged = true;
-        } else {
-          for (const item of consolidated) {
-            const k = (item.normalizedWord || item.word).toLowerCase().trim();
-            const existingRootItem = rootMap.get(k);
-            if (!existingRootItem || hasVocabularyEntryChanged(existingRootItem, item)) {
-              rootChanged = true;
-              break;
+      });
+    }
+
+    // Filter out tombstoned words from incoming payload (callers performing explicit re-addition remove tombstones first)
+    const activeIncomingEntries = (sanitizedEntries || []).filter((item: any) => {
+      if (!item || !item.word || !String(item.word).trim()) return false;
+      const norm = normalizeDictionaryWord(item.normalizedWord || item.word);
+      return Boolean(norm && !excludedSet.has(norm));
+    });
+
+    if (activeIncomingEntries.length === 0 && legacySeedEntries.length === 0) {
+      return true;
+    }
+
+    // Consolidate incoming batch (and legacy seed if subcollection was empty) locally first to dedupe duplicate words in the same batch
+    const batchEntries = removeUndefinedFields(
+      consolidateServerEntries(legacySeedEntries, activeIncomingEntries)
+    );
+
+    const hasRunTransaction = typeof (db as any).runTransaction === 'function';
+
+    for (const item of batchEntries) {
+      if (!item || !item.word) continue;
+      const normKey = normalizeDictionaryWord(item.normalizedWord || item.word);
+      if (!normKey || excludedSet.has(normKey)) continue;
+
+      const wordDocId = buildVocabularyDocId(normKey);
+      const docRef = subColRef.doc(wordDocId);
+
+      if (hasRunTransaction) {
+        await (db as any).runTransaction(async (tx: any) => {
+          const [txSnap, txUserSnap] = await Promise.all([
+            tx.get(docRef),
+            tx.get(db.collection('users').doc(cleanUid)).catch(() => null),
+          ]);
+
+          if (txUserSnap && txUserSnap.exists) {
+            const txUserData = txUserSnap.data();
+            if (Array.isArray(txUserData?.excludedDictionaryWords)) {
+              const txExcluded = txUserData.excludedDictionaryWords
+                .map((w: string) => normalizeDictionaryWord(w))
+                .filter(Boolean);
+              if (txExcluded.includes(normKey)) {
+                return;
+              }
             }
           }
-        }
-      }
-    }
 
-    if (rootChanged) {
-      const rootPayload = removeUndefinedFields({
-        vocabulary: consolidated,
-        updatedAt: new Date().toISOString(),
-      });
-      await db.collection('users').doc(cleanUid).set(rootPayload, { merge: true });
-    }
+          const existingSubDoc = txSnap && txSnap.exists
+            ? txSnap.data()
+            : (existingSubcollectionByDocId.get(wordDocId) || existingSubcollectionByNormWord.get(normKey));
 
-    // 5. Save individual entries to subcollection users/{cleanUid}/vocabulary/{wordDocId}
-    // HOTFIX: Only persist new or effectively modified documents to eliminate redundant Firestore writes!
-    for (const item of consolidated) {
-      if (item && item.word) {
-        const rawWord = (item.normalizedWord || item.word).toLowerCase().trim();
-        const wordDocId = rawWord.replace(/[^a-zA-Z0-9_-]/g, '_');
-        const existingSubDoc = existingSubcollectionByDocId.get(wordDocId) || existingSubcollectionByNormWord.get(rawWord);
+          const [consolidatedItem] = consolidateServerEntries(
+            existingSubDoc ? [existingSubDoc] : [],
+            [item]
+          );
+          if (!consolidatedItem) return;
+
+          const targetDocData = removeUndefinedFields({
+            ...consolidatedItem,
+            normalizedWord: normKey,
+            studentUid: cleanUid,
+            ...(cleanEmail || consolidatedItem.studentEmail ? { studentEmail: cleanEmail || consolidatedItem.studentEmail } : {}),
+          });
+
+          const isNewDoc = !existingSubDoc;
+          const isModified = isNewDoc || hasVocabularyEntryChanged(existingSubDoc, targetDocData);
+
+          if (isModified) {
+            const docPayload = removeUndefinedFields({
+              ...targetDocData,
+              updatedAt: new Date().toISOString(),
+            });
+            tx.set(docRef, docPayload, { merge: true });
+          }
+        });
+      } else {
+        const snap = await docRef.get().catch(() => null);
+        const existingSubDoc = (snap && snap.exists ? snap.data() : null)
+          || existingSubcollectionByDocId.get(wordDocId)
+          || existingSubcollectionByNormWord.get(normKey);
+
+        const [consolidatedItem] = consolidateServerEntries(
+          existingSubDoc ? [existingSubDoc] : [],
+          [item]
+        );
+        if (!consolidatedItem) continue;
 
         const targetDocData = removeUndefinedFields({
-          ...item,
+          ...consolidatedItem,
+          normalizedWord: normKey,
           studentUid: cleanUid,
-          ...(cleanEmail || item.studentEmail ? { studentEmail: cleanEmail || item.studentEmail } : {}),
+          ...(cleanEmail || consolidatedItem.studentEmail ? { studentEmail: cleanEmail || consolidatedItem.studentEmail } : {}),
         });
 
         const isNewDoc = !existingSubDoc;
@@ -4951,10 +5029,7 @@ export async function saveStudentVocabularyToFirestoreServer(
             ...targetDocData,
             updatedAt: new Date().toISOString(),
           });
-          await db.collection('users').doc(cleanUid).collection('vocabulary').doc(wordDocId).set(
-            docPayload,
-            { merge: true }
-          );
+          await docRef.set(docPayload, { merge: true });
         }
       }
     }
@@ -4973,10 +5048,10 @@ export async function saveStudentVocabularyToFirestoreServer(
 }
 
 /**
- * Server-side read of student personal dictionary directly from canonical Firestore path.
- * Implements Etapa 4: Safe, read-only recovery of legacy records when unequivocal identity link is proven.
- * CRITICAL: Strictly read-only! Never performs automatic migration writes (no setDoc).
- * CRITICAL: Canonical records are never overwritten by legacy records.
+ * Server-side read of student personal dictionary directly from canonical Firestore subcollection.
+ * ARCH.2F.2B: Canonical source is users/{canonicalStudentUid}/vocabulary/{wordDocId},
+ * combined with users/{canonicalStudentUid}.excludedDictionaryWords tombstones.
+ * Legacy users/{uid}.vocabulary and legacy usr-* doc IDs are ONLY read when canonical subcollection is empty (read-only).
  */
 export async function fetchStudentVocabularyFromFirestoreServer(
   canonicalStudentUid: string,
@@ -4988,7 +5063,24 @@ export async function fetchStudentVocabularyFromFirestoreServer(
   const entryMap = new Map<string, any>();
 
   try {
-    // 1. Fetch from canonical document users/{canonicalStudentUid}
+    // 1. Fetch canonical subcollection users/{canonicalStudentUid}/vocabulary FIRST
+    const subColRef = db.collection('users').doc(canonicalStudentUid).collection('vocabulary');
+    const subSnap = await subColRef.get();
+    const hasSubcollectionDocs = Boolean(subSnap && !subSnap.empty);
+    if (hasSubcollectionDocs) {
+      subSnap.forEach((docItem) => {
+        const item = docItem.data();
+        if (item && item.word) {
+          const key = normalizeDictionaryWord(item.normalizedWord || item.word) || (item.normalizedWord || item.word).toLowerCase().trim();
+          if (key) {
+            entryMap.set(key, { ...item, normalizedWord: key });
+          }
+        }
+      });
+    }
+
+    // 2. Fetch canonical user document ONLY for excludedDictionaryWords tombstones
+    //    (and legacy root vocabulary array ONLY if canonical subcollection is empty)
     const userDocRef = db.collection('users').doc(canonicalStudentUid);
     const userSnap = await userDocRef.get();
     let excludedWords: string[] = [];
@@ -4997,31 +5089,20 @@ export async function fetchStudentVocabularyFromFirestoreServer(
       if (Array.isArray(data?.excludedDictionaryWords)) {
         excludedWords = data.excludedDictionaryWords;
       }
-      if (Array.isArray(data?.vocabulary)) {
+      if (!hasSubcollectionDocs && entryMap.size === 0 && Array.isArray(data?.vocabulary)) {
         data.vocabulary.forEach((item: any) => {
           if (item && item.word) {
-            const key = (item.normalizedWord || item.word).toLowerCase().trim();
-            entryMap.set(key, item);
+            const key = normalizeDictionaryWord(item.normalizedWord || item.word) || (item.normalizedWord || item.word).toLowerCase().trim();
+            if (key && !entryMap.has(key)) {
+              entryMap.set(key, { ...item, normalizedWord: key });
+            }
           }
         });
       }
     }
 
-    // 2. Fetch from canonical subcollection users/{canonicalStudentUid}/vocabulary
-    const subColRef = db.collection('users').doc(canonicalStudentUid).collection('vocabulary');
-    const subSnap = await subColRef.get();
-    if (!subSnap.empty) {
-      subSnap.forEach((docItem) => {
-        const item = docItem.data();
-        if (item && item.word) {
-          const key = (item.normalizedWord || item.word).toLowerCase().trim();
-          entryMap.set(key, { ...(entryMap.get(key) || {}), ...item });
-        }
-      });
-    }
-
-    // 3. Etapa 4: Read-only check of legacy doc IDs if canonical doc has no vocabulary
-    if (studentEmail && entryMap.size === 0) {
+    // 3. Read-only check of legacy doc IDs ONLY if canonical subcollection and root doc have no vocabulary
+    if (!hasSubcollectionDocs && studentEmail && entryMap.size === 0) {
       const cleanEmail = studentEmail.toLowerCase().trim();
       const legacyDocIds = [
         `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`,
@@ -5039,9 +5120,9 @@ export async function fetchStudentVocabularyFromFirestoreServer(
             if (emailMatches && uidMatches && Array.isArray(legData?.vocabulary)) {
               legData.vocabulary.forEach((item: any) => {
                 if (item && item.word) {
-                  const key = (item.normalizedWord || item.word).toLowerCase().trim();
-                  if (!entryMap.has(key)) {
-                    entryMap.set(key, item);
+                  const key = normalizeDictionaryWord(item.normalizedWord || item.word) || (item.normalizedWord || item.word).toLowerCase().trim();
+                  if (key && !entryMap.has(key)) {
+                    entryMap.set(key, { ...item, normalizedWord: key });
                   }
                 }
               });
@@ -5268,6 +5349,141 @@ export async function removeExcludedDictionaryWordsServer(
   }
 }
 
+/**
+ * ARCH.2F.2B: Atomically increments practiceCount, updates lastPracticedAt, and appends practiceHistory
+ * strictly on canonical subcollection documents users/{canonicalStudentUid}/vocabulary/{wordDocId}.
+ * Respects excludedDictionaryWords tombstones and never writes to users/{uid}.vocabulary.
+ */
+export async function markVocabularyWordsPracticedServer(
+  canonicalStudentUid: string,
+  words: string[],
+  activityType = 'memorization',
+  studentEmail?: string
+): Promise<{ ok: boolean; updatedCount: number; dictionary: any[] }> {
+  const cleanUid = (canonicalStudentUid || '').trim();
+  if (!isValidCanonicalUid(cleanUid)) {
+    throw new Error(
+      `[markVocabularyWordsPracticedServer] Rejected non-canonical student UID: "${cleanUid}".`
+    );
+  }
+
+  const db = getFirestoreDb();
+  if (!db) {
+    return { ok: false, updatedCount: 0, dictionary: [] };
+  }
+
+  const cleanEmail = (studentEmail || '').toLowerCase().trim();
+  const cleanActivityType = (activityType || 'memorization').trim() || 'memorization';
+  const normalizedTargets = Array.from(
+    new Set((words || []).map((w) => normalizeDictionaryWord(w)).filter(Boolean))
+  );
+
+  if (normalizedTargets.length === 0) {
+    const dictionary = await fetchStudentVocabularyFromFirestoreServer(cleanUid, cleanEmail);
+    return { ok: true, updatedCount: 0, dictionary };
+  }
+
+  try {
+    const userDocRef = db.collection('users').doc(cleanUid);
+    const subColRef = userDocRef.collection('vocabulary');
+
+    const [userSnap, subSnap] = await Promise.all([
+      userDocRef.get().catch(() => null),
+      subColRef.get().catch(() => null),
+    ]);
+
+    const userData = userSnap && userSnap.exists ? userSnap.data() : null;
+    const excludedSet = new Set(
+      (Array.isArray(userData?.excludedDictionaryWords) ? userData.excludedDictionaryWords : [])
+        .map((w: string) => normalizeDictionaryWord(w))
+        .filter(Boolean)
+    );
+
+    const legacyMap = new Map<string, any>();
+    if ((!subSnap || subSnap.empty) && Array.isArray(userData?.vocabulary)) {
+      userData.vocabulary.forEach((item: any) => {
+        if (!item || !item.word) return;
+        const norm = normalizeDictionaryWord(item.normalizedWord || item.word);
+        if (norm && !excludedSet.has(norm)) {
+          legacyMap.set(norm, item);
+        }
+      });
+    }
+
+    const nowIso = new Date().toISOString();
+    let updatedCount = 0;
+    const hasRunTransaction = typeof (db as any).runTransaction === 'function';
+
+    for (const norm of normalizedTargets) {
+      if (excludedSet.has(norm)) continue;
+      const wordDocId = buildVocabularyDocId(norm);
+      const docRef = subColRef.doc(wordDocId);
+
+      const applyPracticeUpdate = (existing: any) => {
+        const base = existing || legacyMap.get(norm);
+        if (!base || !base.word) return null;
+        const curCount = typeof base.practiceCount === 'number' ? base.practiceCount : 0;
+        const history = Array.isArray(base.practiceHistory) ? [...base.practiceHistory] : [];
+        history.push({
+          date: nowIso,
+          activityType: cleanActivityType,
+          correct: true,
+        });
+        return removeUndefinedFields({
+          ...base,
+          normalizedWord: norm,
+          studentUid: cleanUid,
+          ...(cleanEmail || base.studentEmail ? { studentEmail: cleanEmail || base.studentEmail } : {}),
+          practiceCount: curCount + 1,
+          lastPracticedAt: nowIso,
+          practiceHistory: history,
+          updatedAt: nowIso,
+        });
+      };
+
+      if (hasRunTransaction) {
+        const changed = await (db as any).runTransaction(async (tx: any) => {
+          const [snap, txUserSnap] = await Promise.all([
+            tx.get(docRef),
+            tx.get(userDocRef).catch(() => null),
+          ]);
+          if (txUserSnap && txUserSnap.exists) {
+            const txExcluded = (Array.isArray(txUserSnap.data()?.excludedDictionaryWords)
+              ? txUserSnap.data().excludedDictionaryWords
+              : []
+            ).map((w: string) => normalizeDictionaryWord(w));
+            if (txExcluded.includes(norm)) return false;
+          }
+          const existing = snap && snap.exists ? snap.data() : null;
+          const payload = applyPracticeUpdate(existing);
+          if (!payload) return false;
+          tx.set(docRef, payload, { merge: true });
+          return true;
+        });
+        if (changed) updatedCount++;
+      } else {
+        const snap = await docRef.get().catch(() => null);
+        const existing = snap && snap.exists ? snap.data() : null;
+        const payload = applyPracticeUpdate(existing);
+        if (payload) {
+          await docRef.set(payload, { merge: true });
+          updatedCount++;
+        }
+      }
+    }
+
+    const dictionary = await fetchStudentVocabularyFromFirestoreServer(cleanUid, cleanEmail);
+    return { ok: true, updatedCount, dictionary };
+  } catch (err: any) {
+    if (isPermissionError(err)) {
+      isCloudWriteDisabled = true;
+      return { ok: false, updatedCount: 0, dictionary: [] };
+    }
+    console.warn('Firestore server markVocabularyWordsPracticedServer error:', err);
+    throw err;
+  }
+}
+
 
 /**
  * Server-side persistent storage of Native Friend In-Session Notes & Recommendations in Cloud Firestore.
@@ -5321,13 +5537,17 @@ export async function saveSessionNotesToFirestoreServer(
   try {
     const cleanKey = sessionKey.replace(/[^a-zA-Z0-9_-]/g, '_');
 
-    // Idempotency check: preserve original createdAt and lastApprovedVersion if doc exists
+    // Idempotency check: preserve original createdAt, versioning state, and Drive metadata if doc exists
     let existingCreatedAt = data.createdAt;
     let existingApprovedVersion = data.lastApprovedVersion;
     let existingOriginalNotes = data.originalTeacherNotes;
     let existingDraft = data.draftTransformation;
     let existingHistory = data.versionHistory;
     let existingApprovalStatus = data.approvalStatus;
+    let existingDriveFileId = data.driveFileId || '';
+    let existingDriveFileUrl = data.driveFileUrl || '';
+    let existingDriveFolderName = data.driveFolderName || '';
+    let existingDriveLastSyncedAt = data.driveLastSyncedAt || '';
 
     try {
       const existingDoc = await db.collection('session_notes').doc(cleanKey).get();
@@ -5349,6 +5569,18 @@ export async function saveSessionNotesToFirestoreServer(
         }
         if (!existingApprovalStatus && exData.approvalStatus) {
           existingApprovalStatus = exData.approvalStatus;
+        }
+        if (!existingDriveFileId && exData.driveFileId) {
+          existingDriveFileId = exData.driveFileId;
+        }
+        if (!existingDriveFileUrl && exData.driveFileUrl) {
+          existingDriveFileUrl = exData.driveFileUrl;
+        }
+        if (!existingDriveFolderName && exData.driveFolderName) {
+          existingDriveFolderName = exData.driveFolderName;
+        }
+        if (!existingDriveLastSyncedAt && exData.driveLastSyncedAt) {
+          existingDriveLastSyncedAt = exData.driveLastSyncedAt;
         }
       }
     } catch {}
@@ -5379,14 +5611,18 @@ export async function saveSessionNotesToFirestoreServer(
       approvalStatus: effectiveApprovalStatus,
       versionHistory: data.versionHistory || existingHistory || [],
       currentVersionNumber: data.currentVersionNumber || (Array.isArray(existingHistory) && existingHistory.length > 0 ? Math.max(...existingHistory.map((v: any) => v.versionNumber || 0)) : 1),
+      driveFileId: existingDriveFileId || '',
+      driveFileUrl: existingDriveFileUrl || '',
+      driveFolderName: existingDriveFolderName || '',
+      driveLastSyncedAt: existingDriveLastSyncedAt || '',
       createdAt: effectiveCreatedAt,
       updatedAt: data.updatedAt || nowIso,
       lastSavedByUid: teacherUid,
     }));
 
+    // ARCH.2F.2C: Canonical persistence in session_notes/{sessionKey} + link mirror on lessons/{lessonId} (no new users/{uid}/session_notes mirror writes)
     const savePromises: Promise<any>[] = [
       db.collection('session_notes').doc(cleanKey).set(sanitized, { merge: true }),
-      db.collection('users').doc(studentUid).collection('session_notes').doc(cleanKey).set(sanitized, { merge: true }),
     ];
 
     if (data.lessonId) {
@@ -5401,10 +5637,10 @@ export async function saveSessionNotesToFirestoreServer(
             updatedAt: sanitized.updatedAt,
             studentUid,
             teacherUid,
-            ...(data.driveFileId ? { driveFileId: data.driveFileId } : {}),
-            ...(data.driveFileUrl ? { driveFileUrl: data.driveFileUrl } : {}),
-            ...(data.driveFolderName ? { driveFolderName: data.driveFolderName } : {}),
-            ...(data.driveLastSyncedAt ? { driveLastSyncedAt: data.driveLastSyncedAt } : {}),
+            ...(existingDriveFileId ? { driveFileId: existingDriveFileId } : {}),
+            ...(existingDriveFileUrl ? { driveFileUrl: existingDriveFileUrl } : {}),
+            ...(existingDriveFolderName ? { driveFolderName: existingDriveFolderName } : {}),
+            ...(existingDriveLastSyncedAt ? { driveLastSyncedAt: existingDriveLastSyncedAt } : {}),
           },
           { merge: true }
         )
@@ -5416,7 +5652,7 @@ export async function saveSessionNotesToFirestoreServer(
   } catch (err: any) {
     if (isPermissionError(err)) {
       isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote session notes save restricted by IAM, continuing with local state.');
+      console.info('[serverFirestore] Remote session notes save restricted by IAM.');
     } else {
       console.warn('Firestore server session notes save notice:', err);
     }
@@ -5424,14 +5660,40 @@ export async function saveSessionNotesToFirestoreServer(
   }
 }
 
-export async function fetchSessionNotesFromFirestoreServer(sessionKey: string): Promise<any | null> {
+export async function fetchSessionNotesFromFirestoreServer(
+  sessionKey: string,
+  options?: { studentUid?: string }
+): Promise<any | null> {
   const db = getFirestoreDb();
   if (!db || !sessionKey) return null;
   try {
     const cleanKey = sessionKey.replace(/[^a-zA-Z0-9_-]/g, '_');
+    // 1. Canonical root collection session_notes/{sessionKey}
     const snap = await db.collection('session_notes').doc(cleanKey).get();
-    if (snap.exists) {
-      return snap.data();
+    if (snap && snap.exists) {
+      const d = snap.data();
+      if (d) {
+        return {
+          id: snap.id || cleanKey,
+          sessionKey: d.sessionKey || snap.id || cleanKey,
+          ...d,
+        };
+      }
+    }
+    // 2. Read-only legacy fallback in users/{studentUid}/session_notes/{sessionKey}
+    const studentUid = (options?.studentUid || '').trim();
+    if (studentUid && isValidCanonicalUid(studentUid) && cleanKey !== 'review_cycle') {
+      const legacySnap = await db.collection('users').doc(studentUid).collection('session_notes').doc(cleanKey).get();
+      if (legacySnap && legacySnap.exists) {
+        const ld = legacySnap.data();
+        if (ld && (!ld.studentUid || ld.studentUid === studentUid)) {
+          return {
+            id: legacySnap.id || cleanKey,
+            sessionKey: ld.sessionKey || legacySnap.id || cleanKey,
+            ...ld,
+          };
+        }
+      }
     }
     return null;
   } catch (err: any) {
@@ -5444,9 +5706,8 @@ export async function fetchSessionNotesFromFirestoreServer(sessionKey: string): 
 
 /**
  * Canonical retrieval of session notes for a verified student directly from Firestore (default).
- * FASE NF-NOTES.6: Queries root session_notes where studentUid == studentUid and
- * users/{studentUid}/session_notes, merging and deduplicating by session key.
- * Guarantees that rawContent is preserved regardless of AI status.
+ * ARCH.2F.2C: Prioritizes canonical session_notes/{sessionKey}, with read-only legacy fallback
+ * to users/{studentUid}/session_notes/{sessionKey} when absent from canonical collection.
  */
 export async function fetchSessionNotesForStudentServer(studentUid: string, sessionKey?: string): Promise<any[]> {
   const db = getFirestoreDb();
@@ -5456,20 +5717,7 @@ export async function fetchSessionNotesForStudentServer(studentUid: string, sess
 
     if (sessionKey) {
       const cleanKey = sessionKey.replace(/[^a-zA-Z0-9_-]/g, '_');
-      // 1. Check user subcollection
-      const snap = await db.collection('users').doc(studentUid).collection('session_notes').doc(cleanKey).get();
-      if (snap && snap.exists) {
-        const d = snap.data();
-        if (d && (d.studentUid === studentUid || !d.studentUid)) {
-          return [{
-            id: snap.id,
-            ...d,
-            rawContent: d.rawContent || d.content,
-            content: d.content || d.rawContent,
-          }];
-        }
-      }
-      // 2. Check root collection session_notes
+      // 1. Check canonical root collection session_notes first
       const globalSnap = await db.collection('session_notes').doc(cleanKey).get();
       if (globalSnap && globalSnap.exists) {
         const d = globalSnap.data();
@@ -5481,11 +5729,27 @@ export async function fetchSessionNotesForStudentServer(studentUid: string, sess
             content: d.content || d.rawContent,
           }];
         }
+        return [];
+      }
+      // 2. Read-only legacy fallback in user subcollection (when canonical doc does not exist)
+      if (cleanKey !== 'review_cycle') {
+        const snap = await db.collection('users').doc(studentUid).collection('session_notes').doc(cleanKey).get();
+        if (snap && snap.exists) {
+          const d = snap.data();
+          if (d && (d.studentUid === studentUid || !d.studentUid)) {
+            return [{
+              id: snap.id,
+              ...d,
+              rawContent: d.rawContent || d.content,
+              content: d.content || d.rawContent,
+            }];
+          }
+        }
       }
       return [];
     }
 
-    // 1. Query root session_notes collection by studentUid
+    // 1. Query canonical root session_notes collection by studentUid
     try {
       const rootSnap = await db.collection('session_notes').where('studentUid', '==', studentUid).get();
       if (rootSnap && !rootSnap.empty) {
@@ -5509,7 +5773,7 @@ export async function fetchSessionNotesForStudentServer(studentUid: string, sess
       }
     }
 
-    // 2. Query subcollection users/{studentUid}/session_notes
+    // 2. Read-only legacy fallback: query subcollection users/{studentUid}/session_notes
     try {
       const colSnap = await db.collection('users').doc(studentUid).collection('session_notes').get();
       if (colSnap && !colSnap.empty) {
@@ -5546,8 +5810,329 @@ export async function fetchSessionNotesForStudentServer(studentUid: string, sess
   }
 }
 
+function normalizeLessonFallbackNote(lId: string, l: any): any {
+  const noteContent = l?.sessionNotesDocument || l?.liveNotes || l?.recommendations || '';
+  const lDate = l?.sessionDate || (l?.startDateTime ? String(l.startDateTime).split('T')[0] : '');
+  const cleanLessonId = lId ? String(lId).replace(/^lesson_/, '') : '';
+  const mapKey = cleanLessonId ? `lesson_${cleanLessonId}` : (lId || `session_${lDate}_${l?.studentUid || 'unknown'}`);
+  return {
+    id: lId || mapKey,
+    sessionKey: lId || mapKey,
+    sessionDate: lDate,
+    lessonId: lId,
+    startDateTime: l?.startDateTime,
+    studentEmail: l?.studentEmail || '',
+    studentUid: l?.studentUid || '',
+    teacherEmail: l?.teacherEmail || l?.tutorEmail || '',
+    teacherName: l?.teacherName || l?.tutorName || 'Native Friend',
+    teacherUid: l?.teacherUid || l?.teacherAuthUid || '',
+    topic: l?.title || 'Conversation & Fluency',
+    content: noteContent,
+    rawContent: noteContent,
+    driveFileId: l?.driveFileId || '',
+    driveFileUrl: l?.driveFileUrl || '',
+    driveFolderName: l?.driveFolderName || '',
+    driveLastSyncedAt: l?.driveLastSyncedAt || '',
+    updatedAt: l?.updatedAt || l?.notesLastSavedAt || new Date().toISOString(),
+  };
+}
+
+function sortSessionNotesDescending(items: any[]): any[] {
+  const getTs = (item: any): number => {
+    if (item?.startDateTime && typeof item.startDateTime === 'string') {
+      const t = new Date(item.startDateTime).getTime();
+      if (!isNaN(t) && t > 0) return t;
+    }
+    const rawDate = item?.sessionDate || item?.lessonDate || '';
+    const match = typeof rawDate === 'string' ? rawDate.match(/\d{4}-\d{2}-\d{2}/) : null;
+    if (match) {
+      const t = new Date(match[0] + 'T00:00:00Z').getTime();
+      if (!isNaN(t) && t > 0) return t;
+    }
+    return 0;
+  };
+  return items.sort((a: any, b: any) => {
+    const tA = getTs(a);
+    const tB = getTs(b);
+    if (tB !== tA) return tB - tA;
+    const dateCmp = String(b.sessionDate || '').localeCompare(String(a.sessionDate || ''));
+    if (dateCmp !== 0) return dateCmp;
+    const updCmp = String(b.updatedAt || b.createdAt || '').localeCompare(String(a.updatedAt || a.createdAt || ''));
+    if (updCmp !== 0) return updCmp;
+    return String(b.id || b.sessionKey || '').localeCompare(String(a.id || a.sessionKey || ''));
+  });
+}
+
+/**
+ * Admin listing of all session notes directly from canonical Firestore (session_notes + lessons overlay).
+ */
+export async function fetchAllSessionNotesServer(): Promise<any[]> {
+  const db = getFirestoreDb();
+  if (!db) return [];
+  const map = new Map<string, any>();
+  const representedLessonIds = new Set<string>();
+
+  try {
+    const snap = await db.collection('session_notes').get();
+    if (snap && !snap.empty) {
+      snap.docs.forEach((docSnap: any) => {
+        const d = docSnap.data();
+        if (!d) return;
+        const rawContent = d.rawContent || d.content || '';
+        const key = docSnap.id;
+        map.set(key, {
+          id: key,
+          sessionKey: d.sessionKey || key,
+          ...d,
+          rawContent,
+          content: d.content || rawContent,
+        });
+        if (d.lessonId) representedLessonIds.add(String(d.lessonId));
+      });
+    }
+  } catch (err) {
+    if (!isPermissionError(err)) {
+      console.warn('[serverFirestore] fetchAllSessionNotesServer session_notes notice:', err);
+    }
+  }
+
+  try {
+    const lessonsSnap = await db.collection('lessons').get();
+    if (lessonsSnap && !lessonsSnap.empty) {
+      lessonsSnap.docs.forEach((docSnap: any) => {
+        const l = docSnap.data();
+        const lId = docSnap.id || l?.id;
+        const noteContent = l?.sessionNotesDocument || l?.liveNotes || l?.recommendations || '';
+        if (!lId || !noteContent || !String(noteContent).trim()) return;
+        const cleanLessonId = String(lId).replace(/^lesson_/, '');
+        const prefixedKey = `lesson_${cleanLessonId}`;
+        if (!map.has(lId) && !map.has(prefixedKey) && !representedLessonIds.has(lId)) {
+          map.set(prefixedKey, normalizeLessonFallbackNote(lId, l));
+        }
+      });
+    }
+  } catch (err) {
+    if (!isPermissionError(err)) {
+      console.warn('[serverFirestore] fetchAllSessionNotesServer lessons notice:', err);
+    }
+  }
+
+  return sortSessionNotesDescending(Array.from(map.values()));
+}
+
+/**
+ * Teacher-scoped listing of session notes directly from canonical Firestore.
+ */
+export async function fetchSessionNotesByTeacherServer(teacherUid: string, teacherEmail?: string): Promise<any[]> {
+  const db = getFirestoreDb();
+  const cleanTeacherUid = (teacherUid || '').trim();
+  const cleanTeacherEmail = (teacherEmail || '').toLowerCase().trim();
+  if (!db || !cleanTeacherUid) return [];
+
+  const map = new Map<string, any>();
+  const representedLessonIds = new Set<string>();
+
+  const addNoteIfAuthorized = (docId: string, d: any) => {
+    if (!d) return;
+    const docTeacherUid = String(d.teacherUid || '').trim();
+    const docTeacherEmail = String(d.teacherEmail || '').toLowerCase().trim();
+    const matchesTeacher =
+      docTeacherUid === cleanTeacherUid ||
+      (!docTeacherUid && cleanTeacherEmail && docTeacherEmail === cleanTeacherEmail);
+    if (!matchesTeacher) return;
+
+    const rawContent = d.rawContent || d.content || '';
+    map.set(docId, {
+      id: docId,
+      sessionKey: d.sessionKey || docId,
+      ...d,
+      rawContent,
+      content: d.content || rawContent,
+    });
+    if (d.lessonId) representedLessonIds.add(String(d.lessonId));
+  };
+
+  try {
+    const byUidSnap = await db.collection('session_notes').where('teacherUid', '==', cleanTeacherUid).get();
+    if (byUidSnap && !byUidSnap.empty) {
+      byUidSnap.docs.forEach((docSnap: any) => addNoteIfAuthorized(docSnap.id, docSnap.data()));
+    }
+  } catch (err) {
+    if (!isPermissionError(err)) {
+      console.warn('[serverFirestore] fetchSessionNotesByTeacherServer uid query notice:', err);
+    }
+  }
+
+  if (cleanTeacherEmail) {
+    try {
+      const byEmailSnap = await db.collection('session_notes').where('teacherEmail', '==', cleanTeacherEmail).get();
+      if (byEmailSnap && !byEmailSnap.empty) {
+        byEmailSnap.docs.forEach((docSnap: any) => {
+          if (!map.has(docSnap.id)) {
+            addNoteIfAuthorized(docSnap.id, docSnap.data());
+          }
+        });
+      }
+    } catch (err) {
+      if (!isPermissionError(err)) {
+        console.warn('[serverFirestore] fetchSessionNotesByTeacherServer email query notice:', err);
+      }
+    }
+  }
+
+  try {
+    const lessonsSnap = await db.collection('lessons').where('teacherUid', '==', cleanTeacherUid).get();
+    if (lessonsSnap && !lessonsSnap.empty) {
+      lessonsSnap.docs.forEach((docSnap: any) => {
+        const l = docSnap.data();
+        const lId = docSnap.id || l?.id;
+        const noteContent = l?.sessionNotesDocument || l?.liveNotes || l?.recommendations || '';
+        if (!lId || !noteContent || !String(noteContent).trim()) return;
+        const cleanLessonId = String(lId).replace(/^lesson_/, '');
+        const prefixedKey = `lesson_${cleanLessonId}`;
+        if (!map.has(lId) && !map.has(prefixedKey) && !representedLessonIds.has(lId)) {
+          map.set(prefixedKey, normalizeLessonFallbackNote(lId, l));
+        }
+      });
+    }
+  } catch (err) {
+    if (!isPermissionError(err)) {
+      console.warn('[serverFirestore] fetchSessionNotesByTeacherServer lessons notice:', err);
+    }
+  }
+
+  return sortSessionNotesDescending(Array.from(map.values()));
+}
+
+/**
+ * Find a canonical session note by Google Drive file ID or document ID.
+ */
+export async function findSessionNoteByDriveFileIdServer(fileId: string): Promise<any | null> {
+  const db = getFirestoreDb();
+  const cleanFileId = (fileId || '').trim();
+  if (!db || !cleanFileId) return null;
+  try {
+    const safeDocId = cleanFileId.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const directSnap = await db.collection('session_notes').doc(safeDocId).get();
+    if (directSnap && directSnap.exists) {
+      return { id: directSnap.id, ...directSnap.data() };
+    }
+    const querySnap = await db.collection('session_notes').where('driveFileId', '==', cleanFileId).limit(1).get();
+    if (querySnap && !querySnap.empty) {
+      const first = querySnap.docs[0];
+      return { id: first.id, ...first.data() };
+    }
+  } catch (err) {
+    if (!isPermissionError(err)) {
+      console.warn('[serverFirestore] findSessionNoteByDriveFileIdServer notice:', err);
+    }
+  }
+  return null;
+}
+
+/**
+ * List cached or approved pedagogical transformations directly from Firestore (session_notes/{sessionKey}/pedagogical_cache & approved versions).
+ */
+export async function fetchAllPedagogicalTransformationsServer(options?: {
+  studentUid?: string;
+  language?: string;
+}): Promise<any[]> {
+  const db = getFirestoreDb();
+  if (!db) return [];
+
+  const targetStudentUid = (options?.studentUid || '').trim();
+  const targetLang = (options?.language || '').toLowerCase().trim();
+  const results: any[] = [];
+  const seenKeys = new Set<string>();
+
+  const pushIfValid = (item: any, fallbackKey?: string) => {
+    if (!item || typeof item !== 'object') return;
+    if (!item.isAiGenerated || item.isProvisional) return;
+    if (isLegacyGenericTransformation(item, item.rawNotesSnippet)) return;
+    if (targetStudentUid && String(item.studentUid || '').trim() !== targetStudentUid) return;
+    if (targetLang && String(item.language || '').toLowerCase().trim() !== targetLang) return;
+
+    const dedupKey = `${item.cacheKey || fallbackKey || item.sessionKey || ''}__${item.studentUid || ''}__${item.language || ''}__${item.contentHash || ''}`;
+    if (seenKeys.has(dedupKey)) return;
+    seenKeys.add(dedupKey);
+    results.push(item);
+  };
+
+  try {
+    // 1. collectionGroup query when supported by Firestore Admin SDK
+    if (typeof (db as any).collectionGroup === 'function') {
+      let cgQuery: any = (db as any).collectionGroup('pedagogical_cache');
+      if (targetStudentUid) {
+        cgQuery = cgQuery.where('studentUid', '==', targetStudentUid);
+      }
+      const cgSnap = await cgQuery.get();
+      if (cgSnap && !cgSnap.empty) {
+        cgSnap.docs.forEach((d: any) => pushIfValid(d.data(), d.id));
+      }
+    } else if ((db as any).store instanceof Map) {
+      // Test MockFirestoreDb store fallback (supports subcollection entries without parent doc)
+      for (const [storePath, val] of ((db as any).store as Map<string, any>).entries()) {
+        if (/^session_notes\/[^/]+\/pedagogical_cache\/[^/]+$/.test(storePath)) {
+          pushIfValid(val, storePath.split('/').pop());
+        }
+      }
+    }
+
+    // 2. Also inspect canonical session_notes documents (lastApprovedVersion + pedagogical_cache subcollections)
+    const snQuery = targetStudentUid
+      ? db.collection('session_notes').where('studentUid', '==', targetStudentUid)
+      : db.collection('session_notes');
+    const snSnap = await snQuery.get();
+    if (snSnap && !snSnap.empty) {
+      for (const snDoc of snSnap.docs) {
+        const snData = snDoc.data();
+        if (snData?.lastApprovedVersion?.status === 'approved' && snData.lastApprovedVersion.transformation) {
+          pushIfValid(
+            {
+              studentUid: snData.studentUid,
+              studentEmail: snData.studentEmail,
+              teacherUid: snData.teacherUid,
+              sessionKey: snData.sessionKey || snDoc.id,
+              ...snData.lastApprovedVersion.transformation,
+            },
+            `${snDoc.id}__approved`
+          );
+        }
+        if (typeof (db as any).collectionGroup !== 'function' && !((db as any).store instanceof Map)) {
+          try {
+            const subSnap = await db.collection('session_notes').doc(snDoc.id).collection('pedagogical_cache').get();
+            if (subSnap && !subSnap.empty) {
+              subSnap.docs.forEach((d: any) => {
+                const subData = d.data();
+                if (subData) {
+                  pushIfValid(
+                    {
+                      studentUid: subData.studentUid || snData?.studentUid,
+                      studentEmail: subData.studentEmail || snData?.studentEmail,
+                      teacherUid: subData.teacherUid || snData?.teacherUid,
+                      ...subData,
+                    },
+                    d.id
+                  );
+                }
+              });
+            }
+          } catch {}
+        }
+      }
+    }
+  } catch (err) {
+    if (!isPermissionError(err)) {
+      console.warn('[serverFirestore] fetchAllPedagogicalTransformationsServer notice:', err);
+    }
+  }
+
+  return results;
+}
+
 /**
  * Direct persistence for Native Friend notes review progress
+ * ARCH.2F.2C: Canonical storage strictly in users/{uid}/session_notes/review_cycle (zero root user doc mirror).
  */
 export async function saveSessionNotesProgressToFirestore(key: string, cyclePayload: any): Promise<boolean> {
   if (isCloudWriteDisabled) return false;
@@ -5555,23 +6140,13 @@ export async function saveSessionNotesProgressToFirestore(key: string, cyclePayl
   if (!db || !key) return false;
   try {
     const sanitized = JSON.parse(JSON.stringify(cyclePayload));
-    const userRef = db.collection('users').doc(key);
-    const subRef = userRef.collection('session_notes').doc('review_cycle');
-    await Promise.all([
-      subRef.set(sanitized, { merge: true }),
-      userRef.set(
-        {
-          nativeNotesReview: sanitized,
-          updatedAt: sanitized.updatedAt || new Date().toISOString(),
-        },
-        { merge: true }
-      ),
-    ]);
+    const subRef = db.collection('users').doc(key).collection('session_notes').doc('review_cycle');
+    await subRef.set(sanitized, { merge: true });
     return true;
   } catch (err: any) {
     if (isPermissionError(err)) {
       isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote session notes progress save restricted by IAM, continuing with local state.');
+      console.info('[serverFirestore] Remote session notes progress save restricted by IAM.');
     } else {
       console.warn('Firestore saveSessionNotesProgress error:', err);
     }
@@ -5581,8 +6156,8 @@ export async function saveSessionNotesProgressToFirestore(key: string, cyclePayl
 
 /**
  * Atomic registration of daily reminder presentation.
- * Ensures the Native Friends Notes reminder is presented AT MOST ONCE per day per student UID,
- * immune to page reload, component remount, or switching devices.
+ * ARCH.2F.2C: Writes strictly to users/{uid}/session_notes/review_cycle while honoring
+ * read-only legacy fallback on users/{uid} if review_cycle does not yet exist.
  */
 export async function recordDailyReminderShownServer(
   studentUid: string,
@@ -5607,6 +6182,7 @@ export async function recordDailyReminderShownServer(
             const data = snap.data() || {};
             lastDate = data.lastReminderShownDate || '';
           } else {
+            // Read-only legacy fallback from root user doc
             const uSnap = await tx.get(userRef);
             if (uSnap && uSnap.exists) {
               const uData = uSnap.data() || {};
@@ -5618,22 +6194,13 @@ export async function recordDailyReminderShownServer(
             return { canShow: false, alreadyShown: true, lastReminderShownDate: lastDate };
           }
 
+          const nowIso = new Date().toISOString();
           tx.set(
             subRef,
             {
               lastReminderShownDate: todayInTz,
-              reminderShownAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString(),
-            },
-            { merge: true }
-          );
-
-          tx.set(
-            userRef,
-            {
-              lastReminderShownDate: todayInTz,
-              'nativeNotesReview.lastReminderShownDate': todayInTz,
-              updatedAt: new Date().toISOString(),
+              reminderShownAt: nowIso,
+              updatedAt: nowIso,
             },
             { merge: true }
           );
@@ -5644,13 +6211,22 @@ export async function recordDailyReminderShownServer(
       } else {
         // Mock / non-transactional fallback
         const snap = await subRef.get();
-        const data = snap && snap.exists ? snap.data() : null;
-        const lastDate = data?.lastReminderShownDate || '';
+        let lastDate = snap && snap.exists ? (snap.data()?.lastReminderShownDate || '') : '';
+        if (!lastDate && !(snap && snap.exists)) {
+          const uSnap = await userRef.get();
+          if (uSnap && uSnap.exists) {
+            const uData = uSnap.data() || {};
+            lastDate = uData.nativeNotesReview?.lastReminderShownDate || uData.lastReminderShownDate || '';
+          }
+        }
         if (lastDate === todayInTz) {
           return { canShow: false, alreadyShown: true, lastReminderShownDate: lastDate };
         }
-        await subRef.set({ lastReminderShownDate: todayInTz, updatedAt: new Date().toISOString() }, { merge: true });
-        await userRef.set({ lastReminderShownDate: todayInTz, 'nativeNotesReview.lastReminderShownDate': todayInTz }, { merge: true });
+        const nowIso = new Date().toISOString();
+        await subRef.set(
+          { lastReminderShownDate: todayInTz, reminderShownAt: nowIso, updatedAt: nowIso },
+          { merge: true }
+        );
         return { canShow: true, alreadyShown: false, lastReminderShownDate: todayInTz };
       }
     } catch (err) {
@@ -5663,6 +6239,7 @@ export async function recordDailyReminderShownServer(
 
 /**
  * Retrieve session notes progress from Firestore
+ * Reads canonical users/{uid}/session_notes/review_cycle first, with read-only legacy fallback on users/{uid}.
  */
 export async function fetchSessionNotesProgressServer(key: string): Promise<any> {
   const cleanKey = (key || '').trim();
@@ -5676,10 +6253,19 @@ export async function fetchSessionNotesProgressServer(key: string): Promise<any>
     if (snap && snap.exists) {
       return snap.data();
     }
+    // Read-only legacy fallback
     const uSnap = await userRef.get();
     if (uSnap && uSnap.exists) {
       const data = uSnap.data() || {};
-      return data.nativeNotesReview || null;
+      if (data.nativeNotesReview && typeof data.nativeNotesReview === 'object') {
+        return {
+          ...data.nativeNotesReview,
+          lastReminderShownDate: data.nativeNotesReview.lastReminderShownDate || data.lastReminderShownDate || '',
+        };
+      }
+      if (data.lastReminderShownDate) {
+        return { lastReminderShownDate: data.lastReminderShownDate };
+      }
     }
   } catch (err) {
     if (!isPermissionError(err)) {
@@ -9884,8 +10470,25 @@ export async function getStudentActivitiesBetweenLessonsServer(
           });
         }
 
+        const userDocDataForExcl = uSnap && uSnap.exists ? uSnap.data() : null;
+        const excludedWordSet = new Set<string>(
+          (Array.isArray(userDocDataForExcl?.excludedDictionaryWords)
+            ? userDocDataForExcl.excludedDictionaryWords
+            : []
+          )
+            .map((w: string) => normalizeDictionaryWord(w))
+            .filter(Boolean)
+        );
+
+        const hasSubcollectionVocab = Boolean(vocabSnap && !vocabSnap.empty);
         if (vocabSnap && !vocabSnap.empty) {
-          vocabSnap.forEach((docSnap: any) => rawWords.push(docSnap.data()));
+          vocabSnap.forEach((docSnap: any) => {
+            const item = docSnap.data();
+            const norm = normalizeDictionaryWord(item?.normalizedWord || item?.word);
+            if (norm && !excludedWordSet.has(norm)) {
+              rawWords.push(item);
+            }
+          });
         }
 
         if (uSnap && uSnap.exists) {
@@ -9904,9 +10507,15 @@ export async function getStudentActivitiesBetweenLessonsServer(
               }
             });
           }
-          if (Array.isArray(userDocData?.vocabulary)) {
+          if (!hasSubcollectionVocab && Array.isArray(userDocData?.vocabulary)) {
             userDocData.vocabulary.forEach((item: any) => {
-              if (item?.word && !rawWords.some((w) => (w.word || '').toLowerCase().trim() === (item.word || '').toLowerCase().trim())) {
+              const norm = normalizeDictionaryWord(item?.normalizedWord || item?.word);
+              if (
+                item?.word &&
+                norm &&
+                !excludedWordSet.has(norm) &&
+                !rawWords.some((w) => normalizeDictionaryWord(w?.normalizedWord || w?.word) === norm)
+              ) {
                 rawWords.push(item);
               }
             });

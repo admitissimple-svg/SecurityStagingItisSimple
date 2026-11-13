@@ -102,7 +102,6 @@ import { PersonalDictionaryModal } from './components/PersonalDictionaryModal';
 import { StudentJournalModal } from './components/StudentJournalModal';
 import { useLessonsRevalidation, DEFAULT_LESSONS_POLL_INTERVAL_MS } from './hooks/useLessonsRevalidation';
 import {
-  saveStudentVocabularyToFirestore,
   fetchStudentVocabularyFromFirestore,
   markVocabularyWordsPracticedInFirestore,
   subscribeToStudentVocabulary,
@@ -123,8 +122,8 @@ import {
   subscribeToStudentDailyRoutines,
   deleteStudentVocabularyFromFirestore,
   fetchExcludedDictionaryWords,
-  addExcludedDictionaryWord,
-  removeExcludedDictionaryWord,
+  fetchStudentDictionarySnapshotViaApi,
+  dispatchStudentDictionaryUpdatedEvent,
   getCachedExcludedDictionaryWords,
   cacheExcludedWordsLocally,
   deleteStudentJournalEntryFromFirestore,
@@ -2553,13 +2552,13 @@ export default function App() {
     };
   }, [selectedDay, selectedActivityId, currentAccount?.role, currentAccount?.uid, currentAccount?.email]);
 
-  // Hotfix A: Hydrate student dictionary from GET /api/student-dictionary upon login/startup (students only)
-  // as well as whenever PersonalDictionaryModal is opened.
+  // Refresh student dictionary authoritatively via single-flight backend API when PersonalDictionaryModal opens
   useEffect(() => {
     if (currentAccount?.role !== 'student') {
       setIsDictionaryHydrated(false);
       return;
     }
+    if (!isPersonalDictionaryOpen) return;
 
     const cleanEmail = (currentAccount?.email || auth.currentUser?.email || userProfile?.email || '').toLowerCase().trim();
     const rawUid = currentAccount?.uid || auth.currentUser?.uid || userProfile?.id || (userProfile as any)?.uid || '';
@@ -2569,32 +2568,24 @@ export default function App() {
     let isEffectCancelled = false;
     const reqId = ++dictionaryRequestIdRef.current;
 
-    auth.currentUser?.getIdToken().then((token) => {
-      const headers: Record<string, string> = {};
-      if (token) headers['Authorization'] = `Bearer ${token}`;
-      return fetch(`/api/student-dictionary?studentEmail=${encodeURIComponent(cleanEmail)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`, { headers });
-    }).catch(() => {
-      return fetch(`/api/student-dictionary?studentEmail=${encodeURIComponent(cleanEmail)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`);
-    })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
-        if (isEffectCancelled || !data) {
-          setDictionaryHydrationStatus('loaded_empty');
-          return;
-        }
+    fetchStudentDictionarySnapshotViaApi(uid, cleanEmail, true)
+      .then((snapshot) => {
+        if (isEffectCancelled) return;
         if (dictionaryRequestIdRef.current !== reqId) return;
         if (activeStudentUidRef.current !== uid) return;
+        if (!snapshot.ok) {
+          setDictionaryHydrationStatus('error');
+          return;
+        }
 
-        const entries = Array.isArray(data) ? data : (Array.isArray(data?.dictionary) ? data.dictionary : []);
-        const excluded = Array.isArray(data?.excludedWords)
-          ? data.excludedWords.map((w: string) => normalizeDictionaryWord(w)).filter(Boolean)
+        const entries = Array.isArray(snapshot.dictionary) ? snapshot.dictionary : [];
+        const excluded = Array.isArray(snapshot.excludedWords)
+          ? snapshot.excludedWords.map((w: string) => normalizeDictionaryWord(w)).filter(Boolean)
           : [];
 
-        if (excluded.length > 0) {
-          excludedDictionaryWordsRef.current = excluded;
-          setExcludedDictionaryWords(excluded);
-          cacheExcludedWordsLocally(uid, cleanEmail, excluded);
-        }
+        excludedDictionaryWordsRef.current = excluded;
+        setExcludedDictionaryWords(excluded);
+        cacheExcludedWordsLocally(uid, cleanEmail, excluded);
 
         const excludedSet = new Set(excluded);
         setStudentDictionaryEntries((prev) => {
@@ -5700,60 +5691,108 @@ export default function App() {
 
     const resData = await res.json();
     const updatedDictionary: StudentDictionaryEntry[] = resData.dictionary || [];
+    const updatedExcluded: string[] | undefined = Array.isArray(resData?.excludedWords)
+      ? resData.excludedWords.map((w: string) => normalizeDictionaryWord(w)).filter(Boolean)
+      : undefined;
 
     // CRITICAL (Etapa 5 - Isolamento de Sessão):
     // Only update studentDictionaryEntries React state if the currently logged-in account is the student!
     // NEVER mutate the teacher's React state!
     if (currentAccount?.role === 'student' && (!targetEmail || targetEmail === currentAccount?.email?.toLowerCase().trim())) {
-      setStudentDictionaryEntries(
-        updatedDictionary.length > 0 ? updatedDictionary : (prev) => consolidateDictionaryEntries(prev, entries)
-      );
+      const nextDict = updatedDictionary.length > 0 ? updatedDictionary : consolidateDictionaryEntries(studentDictionaryEntries, entries);
+      setStudentDictionaryEntries(nextDict);
+      cacheVocabularyLocally(resData?.studentUid || targetUid, resData?.studentEmail || targetEmail, nextDict);
+      if (updatedExcluded) {
+        excludedDictionaryWordsRef.current = updatedExcluded;
+        setExcludedDictionaryWords(updatedExcluded);
+        cacheExcludedWordsLocally(resData?.studentUid || targetUid, resData?.studentEmail || targetEmail, updatedExcluded);
+      }
     }
+
+    dispatchStudentDictionaryUpdatedEvent({
+      studentUid: resData?.studentUid || targetUid,
+      studentEmail: resData?.studentEmail || targetEmail,
+      dictionary: updatedDictionary.length > 0 ? updatedDictionary : undefined,
+      excludedWords: updatedExcluded,
+    });
 
     return { success: true, count: entries.length };
   };
 
-  // Handler: Save manual entry in Personal Dictionary
+  // Handler: Save manual entry in Personal Dictionary (single canonical POST with optimistic UI & rollback)
   const handleSaveCustomDictionaryEntry = async (entry: StudentDictionaryEntry) => {
     const norm = normalizeDictionaryWord(entry.normalizedWord || entry.word);
+    const rawUid = currentAccount?.uid || auth.currentUser?.uid || userProfile?.id || (userProfile as any)?.uid || '';
+    const targetEmail = (currentAccount?.email || auth.currentUser?.email || userProfile?.email || '').toLowerCase().trim();
+    const targetUid = normalizeUid(rawUid, targetEmail);
+
+    if (!targetUid && !targetEmail) {
+      throw new Error('Identidade do estudante não informada para salvar no dicionário.');
+    }
+
+    const previousEntries = [...studentDictionaryEntries];
+    const previousExcluded = [...excludedDictionaryWords];
+    const previousExcludedRef = [...excludedDictionaryWordsRef.current];
+
     if (norm) {
-      setExcludedDictionaryWords((prev) => prev.filter((w) => normalizeDictionaryWord(w) !== norm));
+      const nextExcluded = excludedDictionaryWordsRef.current.filter((w) => normalizeDictionaryWord(w) !== norm);
+      excludedDictionaryWordsRef.current = nextExcluded;
+      setExcludedDictionaryWords(nextExcluded);
     }
 
-    setStudentDictionaryEntries((prev) => {
-      return consolidateDictionaryEntries(prev, [entry]);
-    });
+    setStudentDictionaryEntries((prev) => consolidateDictionaryEntries(prev, [entry]));
 
-    const targetUid = currentAccount?.uid || auth.currentUser?.uid || userProfile?.id || (userProfile as any)?.uid || '';
-    const targetEmail = currentAccount?.email || auth.currentUser?.email || userProfile?.email || '';
+    try {
+      const token = (await getAccessToken().catch(() => null)) || (await auth.currentUser?.getIdToken().catch(() => null));
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (token) headers['Authorization'] = `Bearer ${token}`;
 
-    if (norm && (targetUid || targetEmail)) {
-      await removeExcludedDictionaryWord(targetUid, norm, targetEmail);
-    }
+      const res = await fetch('/api/student-dictionary', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          studentEmail: targetEmail,
+          studentUid: targetUid,
+          entry,
+          isAutomaticSync: false,
+          syncType: 'manual',
+        }),
+      });
 
-    // Direct Firestore persistence - cumulative and permanent!
-    if (targetUid || targetEmail) {
-      await saveStudentVocabularyToFirestore(targetUid, [entry], targetEmail);
-    }
-
-    if (currentAccount?.email || targetEmail) {
-      try {
-        const token = await auth.currentUser?.getIdToken().catch(() => null);
-        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-        if (token) headers['Authorization'] = `Bearer ${token}`;
-
-        await fetch('/api/student-dictionary', {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({
-            studentEmail: targetEmail || currentAccount?.email,
-            studentUid: targetUid,
-            entry,
-          }),
-        });
-      } catch (err) {
-        console.warn('Failed to save student dictionary entry:', err);
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(errJson.message || errJson.error || `HTTP ${res.status}: Erro ao salvar palavra no dicionário.`);
       }
+
+      const resData = await res.json().catch(() => ({}));
+      if (targetUid && activeStudentUidRef.current && activeStudentUidRef.current !== targetUid) {
+        return;
+      }
+
+      const authoritativeEntries: StudentDictionaryEntry[] = Array.isArray(resData?.dictionary)
+        ? resData.dictionary
+        : consolidateDictionaryEntries(previousEntries, [entry]);
+      const authoritativeExcluded: string[] = Array.isArray(resData?.excludedWords)
+        ? resData.excludedWords.map((w: string) => normalizeDictionaryWord(w)).filter(Boolean)
+        : excludedDictionaryWordsRef.current;
+
+      excludedDictionaryWordsRef.current = authoritativeExcluded;
+      setExcludedDictionaryWords(authoritativeExcluded);
+      setStudentDictionaryEntries(authoritativeEntries);
+      cacheExcludedWordsLocally(resData?.studentUid || targetUid, resData?.studentEmail || targetEmail, authoritativeExcluded);
+      cacheVocabularyLocally(resData?.studentUid || targetUid, resData?.studentEmail || targetEmail, authoritativeEntries);
+      dispatchStudentDictionaryUpdatedEvent({
+        studentUid: resData?.studentUid || targetUid,
+        studentEmail: resData?.studentEmail || targetEmail,
+        dictionary: authoritativeEntries,
+        excludedWords: authoritativeExcluded,
+      });
+    } catch (err) {
+      console.error('Failed to save student dictionary entry:', err);
+      setStudentDictionaryEntries(previousEntries);
+      setExcludedDictionaryWords(previousExcluded);
+      excludedDictionaryWordsRef.current = previousExcludedRef;
+      throw err;
     }
   };
 
@@ -5786,7 +5825,7 @@ export default function App() {
 
     try {
       // 3. Authenticated Backend DELETE with Firebase Bearer Token
-      const token = await auth.currentUser?.getIdToken().catch(() => null);
+      const token = (await getAccessToken().catch(() => null)) || (await auth.currentUser?.getIdToken().catch(() => null));
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (token) headers['Authorization'] = `Bearer ${token}`;
 
@@ -5819,11 +5858,20 @@ export default function App() {
 
       excludedDictionaryWordsRef.current = authoritativeExcluded;
       setExcludedDictionaryWords(authoritativeExcluded);
-      cacheExcludedWordsLocally(targetUid, targetEmail, authoritativeExcluded);
+      cacheExcludedWordsLocally(resData?.studentUid || targetUid, resData?.studentEmail || targetEmail, authoritativeExcluded);
 
       // Clean in-memory vocabulary caches for this word
-      const updatedList = previousEntries.filter((e) => normalizeDictionaryWord(e.normalizedWord || e.word) !== norm);
-      cacheVocabularyLocally(targetUid, targetEmail, updatedList);
+      const updatedList: StudentDictionaryEntry[] = Array.isArray(resData?.dictionary)
+        ? resData.dictionary
+        : previousEntries.filter((e) => normalizeDictionaryWord(e.normalizedWord || e.word) !== norm);
+      setStudentDictionaryEntries(updatedList);
+      cacheVocabularyLocally(resData?.studentUid || targetUid, resData?.studentEmail || targetEmail, updatedList);
+      dispatchStudentDictionaryUpdatedEvent({
+        studentUid: resData?.studentUid || targetUid,
+        studentEmail: resData?.studentEmail || targetEmail,
+        dictionary: updatedList,
+        excludedWords: authoritativeExcluded,
+      });
 
       return resData;
     } catch (err: any) {

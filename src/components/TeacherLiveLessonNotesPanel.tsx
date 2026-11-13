@@ -51,9 +51,7 @@ import {
 import { isValidCanonicalUid } from '../utils/studentPersistence';
 import { computeNotesContentHash } from '../utils/notesVersioning';
 import { formatDateInTimeZone, formatTimeInTimeZone } from '../utils/timezone';
-import { doc, setDoc } from 'firebase/firestore';
-import { getDb, auth } from '../firebase';
-import { assertSafeFirestoreWrite, stampSchemaVersion } from '../utils/firestoreSchemaValidator';
+import { auth } from '../firebase';
 import { useAuth } from '../context/AuthContext';
 import { getGoogleOAuthToken, setGoogleOAuthToken, requestGoogleDriveAuth } from '../utils/auth';
 import {
@@ -1081,30 +1079,13 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             driveLastSyncedAt: syncedIso,
           };
 
-          // 1. Update Firestore docs with Drive sync metadata
-          try {
-            const firestore = getDb();
-            if (firestore) {
-              setDoc(doc(firestore, 'session_notes', sessionKey), drivePayload, { merge: true }).catch(() => null);
-              const userDocId = studentResolution.uid;
-              if (userDocId) {
-                setDoc(doc(firestore, 'users', userDocId, 'session_notes', sessionKey), drivePayload, { merge: true }).catch(() => null);
-              }
-              if (targetLessonId) {
-                setDoc(doc(firestore, 'lessons', targetLessonId), drivePayload, { merge: true }).catch(() => null);
-              }
-            }
-          } catch (fsErr) {
-            console.warn('Firestore update drive notice:', fsErr);
-          }
-
-          // 2. Server API sync with Drive metadata (skipDriveSync prevents duplicate Google Drive operations)
+          // Server API sync with Drive metadata (skipDriveSync prevents duplicate Google Drive operations)
           try {
             const idToken = await auth.currentUser?.getIdToken().catch(() => null);
             const resolvedStudentUid = studentResolution.uid;
             const resolvedTeacherUid = (currentAccount?.uid || auth.currentUser?.uid || '').trim();
 
-            fetch('/api/session-notes', {
+            const syncApiRes = await fetch('/api/session-notes', {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
@@ -1125,7 +1106,10 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 skipDriveSync: true,
                 ...drivePayload,
               }),
-            }).catch(() => null);
+            });
+            if (syncApiRes.ok) {
+              window.dispatchEvent(new CustomEvent('native-notes-updated'));
+            }
           } catch {}
 
           // 3. Update lesson state in parent
@@ -1230,74 +1214,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         const nowIso = new Date().toISOString();
         const sName = resolveStudentName(activeStudent, activeLesson, selectedStudentEmail);
 
-        // 1. Client-Side Firestore Persistence
-        try {
-          const firestore = getDb();
-          const resolvedTeacherUid = (currentAccount?.uid || auth.currentUser?.uid || '').trim();
-
-          if (firestore && resolvedStudentUid) {
-            const documentPayload: SessionNotesDocument = {
-              id: sessionKey,
-              sessionDate: effectiveDate,
-              lessonId: targetLessonId || undefined,
-              studentEmail: cleanEmail,
-              studentUid: resolvedStudentUid,
-              teacherUid: resolvedTeacherUid || undefined,
-              teacherEmail: currentAccount?.email || '',
-              teacherName: currentAccount?.name || 'Native Friend',
-              topic: topicToSave,
-              content: contentToSave,
-              driveFileId: driveFileId || undefined,
-              driveFileUrl: driveFileUrl || undefined,
-              driveFolderName: GOOGLE_DRIVE_SESSION_FOLDER,
-              driveLastSyncedAt: driveLastSyncedAt || undefined,
-              updatedAt: nowIso,
-            };
-
-            const stampedPayload = stampSchemaVersion(documentPayload);
-            assertSafeFirestoreWrite(`session_notes/${sessionKey}`, stampedPayload, undefined, true);
-
-            setDoc(doc(firestore, 'session_notes', sessionKey), stampedPayload, {
-              merge: true,
-            }).catch((err) => console.warn('Firestore /session_notes notice:', err));
-
-            const userDocId = resolvedStudentUid;
-            if (userDocId) {
-              assertSafeFirestoreWrite(`users/${userDocId}/session_notes/${sessionKey}`, stampedPayload, undefined, true);
-              setDoc(
-                doc(firestore, 'users', userDocId, 'session_notes', sessionKey),
-                stampedPayload,
-                { merge: true }
-              ).catch((err) => console.warn('Firestore /users/.../session_notes notice:', err));
-            }
-
-            if (targetLessonId) {
-              setDoc(
-                doc(firestore, 'lessons', targetLessonId),
-                {
-                  sessionNotesDocument: contentToSave,
-                  liveNotes: contentToSave,
-                  recommendations: contentToSave,
-                  title: topicToSave,
-                  sessionDate: effectiveDate,
-                  notesLastSavedAt: nowIso,
-                  updatedAt: nowIso,
-                  studentUid: resolvedStudentUid,
-                  teacherUid: resolvedTeacherUid || undefined,
-                  ...(driveFileId ? { driveFileId } : {}),
-                  ...(driveFileUrl ? { driveFileUrl } : {}),
-                  ...(driveLastSyncedAt ? { driveLastSyncedAt } : {}),
-                  driveFolderName: GOOGLE_DRIVE_SESSION_FOLDER,
-                },
-                { merge: true }
-              ).catch((err) => console.warn('Firestore /lessons notice:', err));
-            }
-          }
-        } catch (err) {
-          console.warn('Direct Firestore save notice:', err);
-        }
-
-        // 2. Server API Persistence (ensures clean database and Firestore sync without touching Google Drive)
+        // Server API Persistence (canonical Firestore sync via backend without touching Google Drive)
         let serverSaveOk = true;
         try {
           const idToken = await auth.currentUser?.getIdToken().catch(() => null);
@@ -1335,6 +1252,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             setSaveError(errData.error || errData.message || 'Error saving notes to server.');
           } else {
             setSaveError(null);
+            window.dispatchEvent(new CustomEvent('native-notes-updated'));
           }
         } catch (err) {
           serverSaveOk = false;
@@ -1537,6 +1455,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         }
         setDraftTransformation(null);
         setAiSuccessMessage('Pedagogical report successfully approved and published for the student!');
+        window.dispatchEvent(new CustomEvent('native-notes-updated'));
       }
     } catch (err: any) {
       setAiError(err.message || 'Connection error while approving report.');
