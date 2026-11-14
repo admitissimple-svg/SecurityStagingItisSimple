@@ -217,12 +217,29 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   const [aiError, setAiError] = useState<string | null>(null);
   const [aiSuccessMessage, setAiSuccessMessage] = useState<string | null>(null);
 
+  const currentNotesHash = useMemo(() => computeNotesContentHash(notesContent), [notesContent]);
+
   // Stale draft check: compares draft contentHash with current notes content hash
   const isDraftStale = useMemo(() => {
     if (!draftTransformation) return false;
-    const currentHash = computeNotesContentHash(notesContent);
-    return Boolean(draftTransformation.contentHash && draftTransformation.contentHash !== currentHash);
-  }, [draftTransformation, notesContent]);
+    return Boolean(
+      (draftTransformation.contentHash && draftTransformation.contentHash !== currentNotesHash) ||
+      (draftTransformation.transformation?.contentHash && draftTransformation.transformation.contentHash !== currentNotesHash)
+    );
+  }, [draftTransformation, currentNotesHash]);
+
+  // Prevent Approve & Publish when there is no current draft and the approved transformation belongs to another contentHash
+  const isApprovedTransformationStale = useMemo(() => {
+    if (draftTransformation) return false;
+    const approvedHash =
+      lastApprovedVersion?.contentHash ||
+      lastApprovedVersion?.transformation?.contentHash ||
+      editableTransformation?.contentHash;
+    if (!approvedHash) return false;
+    return approvedHash !== currentNotesHash;
+  }, [draftTransformation, lastApprovedVersion, editableTransformation, currentNotesHash]);
+
+  const isTransformationOutdated = isDraftStale || isApprovedTransformationStale;
 
   // Pre-styled Inline Coaching Tag Constants (mirrors exact design system references)
   // Correct tag: Rounded rectangle (6px radius), light green bg (#ecfdf5), dark green border (#15803d), green checkmark (✓)
@@ -1421,8 +1438,12 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   const handleSaveDraft = useCallback(async () => {
     if (isSavingDraft || isApproving || !editableTransformation) return;
 
-    if (isDraftStale) {
-      setAiError('The pedagogical draft is outdated compared to the current session notes. Click Apply AI to refresh the draft first.');
+    if (isTransformationOutdated) {
+      setAiError(
+        isDraftStale
+          ? 'The pedagogical draft is outdated compared to the current session notes. Click Apply AI to refresh the draft first.'
+          : 'No active draft matches the current session notes, and the approved report belongs to another version. Click Apply AI to generate a new draft first.'
+      );
       return;
     }
 
@@ -1478,6 +1499,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     isApproving,
     editableTransformation,
     isDraftStale,
+    isTransformationOutdated,
     currentAccount,
     studentResolution,
     resolveCanonicalServerSessionKey,
@@ -1522,8 +1544,12 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   const handleApproveAndPublish = useCallback(async () => {
     if (isApproving || !editableTransformation) return;
 
-    if (isDraftStale) {
-      setAiError('The pedagogical draft is outdated compared to the current session notes. Modifications were made to notes after the draft. Generate or edit a new draft before approving.');
+    if (isTransformationOutdated) {
+      setAiError(
+        isDraftStale
+          ? 'The pedagogical draft is outdated compared to the current session notes. Modifications were made to notes after the draft. Generate or edit a new draft before approving.'
+          : 'No active draft matches the current session notes, and the approved report belongs to another version. Click Apply AI before approving.'
+      );
       return;
     }
 
@@ -1581,6 +1607,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     isApproving,
     editableTransformation,
     isDraftStale,
+    isTransformationOutdated,
     resolveCanonicalServerSessionKey,
     draftTransformation,
     studentResolution,
@@ -2548,14 +2575,14 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 <span>AI Draft (In Review)</span>
               </span>
             )}
-            {isDraftStale && (
+            {isTransformationOutdated && (
               <span
                 id="pedagogical-stale-badge"
                 className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-rose-50 text-rose-800 border border-rose-200 text-xs font-bold"
-                title="Original notes were modified after this draft was created"
+                title="Original notes were modified after this pedagogical report was created"
               >
                 <AlertCircle className="w-3.5 h-3.5 text-rose-600" />
-                <span>Outdated Draft</span>
+                <span>{isDraftStale ? 'Outdated Draft' : 'Outdated Report'}</span>
               </span>
             )}
             {editableTransformation && (draftTransformation || lastApprovedVersion) && (
@@ -2666,7 +2693,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           </div>
         )}
 
-        {isDraftStale && (
+        {isTransformationOutdated && (
           <div
             id="pedagogical-stale-alert"
             className="p-3.5 bg-amber-50 border border-amber-200 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-amber-900 text-xs font-medium shadow-2xs"
@@ -2674,7 +2701,15 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             <div className="flex items-center gap-2.5">
               <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
               <span>
-                Raw session notes were modified after this draft was generated. Click <strong>Apply AI</strong> to update the draft before approving.
+                {isDraftStale ? (
+                  <>
+                    Raw session notes were modified after this draft was generated. Click <strong>Apply AI</strong> to update the draft before approving.
+                  </>
+                ) : (
+                  <>
+                    Raw session notes were modified after the last approved report. Click <strong>Apply AI</strong> to generate a new draft before approving.
+                  </>
+                )}
               </span>
             </div>
             <button
@@ -3381,7 +3416,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             {/* Editorial Approval Footer */}
             <div className="pt-4 border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between gap-3">
               <div className="text-xs text-slate-500">
-                {isDraftStale ? (
+                {isTransformationOutdated ? (
                   <span className="text-rose-600 font-semibold flex items-center gap-1">
                     <AlertCircle className="w-3.5 h-3.5" />
                     <span>Notes modified after generation. Update via Apply AI to enable approval.</span>
@@ -3399,11 +3434,11 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               <div className="flex items-center gap-2 flex-wrap">
                 <button
                   type="button"
-                  disabled={isSavingDraft || isApproving || isDraftStale}
+                  disabled={isSavingDraft || isApproving || isTransformationOutdated}
                   onClick={handleSaveDraft}
                   id="btn-pedagogical-save-draft"
                   className={`px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-xs border ${
-                    isDraftStale
+                    isTransformationOutdated
                       ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
                       : 'bg-white hover:bg-slate-50 text-[#1C4C96] border-[#1C4C96]/40 cursor-pointer'
                   }`}
@@ -3419,17 +3454,17 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
                 <button
                   type="button"
-                  disabled={isApproving || isDraftStale}
+                  disabled={isApproving || isTransformationOutdated}
                   onClick={handleApproveAndPublish}
                   id="btn-pedagogical-approve-publish-editorial"
                   className={`px-5 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 shadow-xs border ${
-                    isDraftStale
+                    isTransformationOutdated
                       ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
                       : approvalStatus === 'approved'
                       ? 'bg-emerald-600 hover:bg-emerald-700 text-white border-emerald-700 cursor-pointer'
                       : 'bg-[#15803d] hover:bg-[#166534] text-white border-[#15803d] cursor-pointer active:scale-98'
                   }`}
-                  title={isDraftStale ? 'Notes modified. Re-apply AI before approving.' : 'Approve and Publish for Student'}
+                  title={isTransformationOutdated ? 'Notes modified. Re-apply AI before approving.' : 'Approve and Publish for Student'}
                 >
                   {isApproving ? (
                     <Loader2 className="w-4 h-4 animate-spin text-white" />
@@ -3439,7 +3474,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   <span>
                     {isApproving
                       ? 'Publishing...'
-                      : approvalStatus === 'approved'
+                      : !isTransformationOutdated && approvalStatus === 'approved'
                       ? 'Approved & Published ✓'
                       : 'Approve & Publish'}
                   </span>
@@ -3875,17 +3910,17 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   <button
                     type="button"
                     id="btn-approve-publish-top"
-                    disabled={isApproving || isDraftStale}
+                    disabled={isApproving || isTransformationOutdated}
                     onClick={handleApproveAndPublish}
                     className={`px-3 py-1.5 rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-2xs border ${
-                      isDraftStale
+                      isTransformationOutdated
                         ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
                         : approvalStatus === 'approved'
                         ? 'bg-emerald-50 text-emerald-700 border-emerald-300 cursor-pointer'
                         : 'bg-[#15803d] text-white hover:bg-[#166534] border-[#15803d] cursor-pointer'
                     }`}
                     title={
-                      isDraftStale
+                      isTransformationOutdated
                         ? 'Notes modified. Re-apply AI before approving.'
                         : 'Approve and publish pedagogical report for the student'
                     }
@@ -3899,7 +3934,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                     <span>
                       {isApproving
                         ? 'Publishing...'
-                        : approvalStatus === 'approved'
+                        : !isTransformationOutdated && approvalStatus === 'approved'
                         ? 'Published ✓'
                         : 'Approve & Publish'}
                     </span>
@@ -4226,9 +4261,9 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   <span>{aiError}</span>
                 </div>
               )}
-              {isDraftStale && (
+              {isTransformationOutdated && (
                 <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-amber-50 text-amber-800 text-xs font-semibold border border-amber-200">
-                  <span>⚠️ Draft outdated with original notes</span>
+                  <span>⚠️ {isDraftStale ? 'Draft' : 'Report'} outdated with original notes</span>
                 </div>
               )}
             </div>
@@ -4275,17 +4310,17 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 <button
                   type="button"
                   id="btn-approve-publish-bottom"
-                  disabled={isApproving || isDraftStale}
+                  disabled={isApproving || isTransformationOutdated}
                   onClick={handleApproveAndPublish}
                   className={`px-6 py-2.5 rounded-xl text-xs font-bold transition flex items-center gap-2 shadow-xs border active:scale-98 ${
-                    isDraftStale
+                    isTransformationOutdated
                       ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
                       : approvalStatus === 'approved'
                       ? 'bg-emerald-50 text-emerald-700 border-emerald-300 cursor-pointer'
                       : 'bg-[#15803d] text-white hover:bg-[#166534] border-[#15803d] cursor-pointer'
                   }`}
                   title={
-                    isDraftStale
+                    isTransformationOutdated
                       ? 'Notes modified. Re-apply AI before approving.'
                       : 'Approve and publish pedagogical report'
                   }
@@ -4299,7 +4334,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   <span>
                     {isApproving
                       ? 'Publishing...'
-                      : approvalStatus === 'approved'
+                      : !isTransformationOutdated && approvalStatus === 'approved'
                       ? 'Published ✓'
                       : 'Approve & Publish'}
                   </span>

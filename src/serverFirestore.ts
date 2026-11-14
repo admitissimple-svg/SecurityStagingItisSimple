@@ -6175,6 +6175,7 @@ export async function fetchPedagogicalTransformationFromFirestoreServer(
     const rawKey = compositeCacheKeyOrSessionKey.trim();
     const sessionKey = rawKey.split('__')[0];
     const sessionRef = db.collection('session_notes').doc(sessionKey);
+    const requestedHash = options?.contentHash ? String(options.contentHash).trim() : '';
 
     // 1. If exact compositeCacheKey doc exists, check it directly
     if (rawKey.includes('__')) {
@@ -6182,7 +6183,8 @@ export async function fetchPedagogicalTransformationFromFirestoreServer(
       if (snap && snap.exists) {
         const data = snap.data();
         const noteCtx = options?.rawNotes || data?.rawNotesSnippet;
-        if (data && data.isAiGenerated && !data.isProvisional && !isLegacyGenericTransformation(data, noteCtx)) {
+        const hashMatches = !requestedHash || data?.contentHash === requestedHash;
+        if (data && data.isAiGenerated && !data.isProvisional && hashMatches && !isLegacyGenericTransformation(data, noteCtx)) {
           return data;
         }
       }
@@ -6198,7 +6200,10 @@ export async function fetchPedagogicalTransformationFromFirestoreServer(
         const noteCtx = options?.rawNotes || data?.rawNotesSnippet;
         if (data && data.isAiGenerated && !data.isProvisional && !isLegacyGenericTransformation(data, noteCtx)) {
           const matchLang = !options?.language || data.language === options.language;
-          const matchHash = !options?.contentHash || data.contentHash === options.contentHash;
+          const matchHash = !requestedHash || data.contentHash === requestedHash;
+          if (requestedHash && !matchHash) {
+            continue;
+          }
           if (matchLang && matchHash) {
             return data;
           }

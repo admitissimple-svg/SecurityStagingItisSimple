@@ -10334,6 +10334,7 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
     const reusableTransformation = [existingDraftTrans, existingApprovedTrans, fsCachedTrans].find(
       (cand: any) =>
         cand &&
+        cand.contentHash === contentHash &&
         cand.isAiGenerated &&
         !cand.isFallback &&
         !cand.isProvisional &&
