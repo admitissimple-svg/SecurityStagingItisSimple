@@ -3605,6 +3605,13 @@ export function sanitizeLoadedHomeworkData(hw: any): WeeklyHomeworkData {
  * 3. top-level student_homework/{studentUID} for fast cross-device queries
  * 4. Mirrors to /api/homework with studentEmail and uid
  */
+const homeworkSaveSeqByStudent = new Map<string, number>();
+const homeworkSaveQueueByKey = new Map<string, Promise<void>>();
+
+export function getHomeworkSaveSequence(studentKey: string): number {
+  return homeworkSaveSeqByStudent.get(studentKey) || 0;
+}
+
 export async function saveStudentHomeworkProgressToFirestore(
   studentUid: string,
   studentEmail: string | undefined,
@@ -3630,87 +3637,104 @@ export async function saveStudentHomeworkProgressToFirestore(
     return false;
   }
 
-  try {
-    const sanitizedHomework = JSON.parse(JSON.stringify(homework));
+  const canonicalUid = auth?.currentUser?.uid || cleanUid;
+  const studentKey = canonicalUid || cleanEmail;
+  const queueKey = `${studentKey}::${targetWeekId}`;
+  const mySeq = (homeworkSaveSeqByStudent.get(studentKey) || 0) + 1;
+  homeworkSaveSeqByStudent.set(studentKey, mySeq);
 
-    // Strip synthetic or invalid evaluations before persisting (HOTFIX 2.2)
-    if (sanitizedHomework.aiEvaluation) {
-      if (isSyntheticHomeworkEvaluation(sanitizedHomework.aiEvaluation) || !isValidHomeworkEvaluation(sanitizedHomework.aiEvaluation)) {
-        delete sanitizedHomework.aiEvaluation;
-        if (sanitizedHomework.isCompleted) {
-          sanitizedHomework.isCompleted = false;
-          delete sanitizedHomework.score;
+  const prevQueue = homeworkSaveQueueByKey.get(queueKey) || Promise.resolve();
+  const runSave = async (): Promise<boolean> => {
+    try {
+      const sanitizedHomework = JSON.parse(JSON.stringify(homework));
+
+      // Strip synthetic or invalid evaluations before persisting (HOTFIX 2.2)
+      if (sanitizedHomework.aiEvaluation) {
+        if (isSyntheticHomeworkEvaluation(sanitizedHomework.aiEvaluation) || !isValidHomeworkEvaluation(sanitizedHomework.aiEvaluation)) {
+          delete sanitizedHomework.aiEvaluation;
+          if (sanitizedHomework.isCompleted) {
+            sanitizedHomework.isCompleted = false;
+            delete sanitizedHomework.score;
+          }
         }
       }
-    }
 
-    const canonicalUid = auth?.currentUser?.uid || cleanUid;
-    const payload = stampSchemaVersion({
-      ...sanitizedHomework,
-      ...(targetWeekId !== 'current_week' ? { id: targetWeekId, weekId: targetWeekId } : {}),
-      ...(targetCycle ? { weeklyCycle: targetCycle } : {}),
-      studentUid: canonicalUid,
-      studentEmail: cleanEmail,
-      updatedAt: new Date().toISOString(),
-    });
-
-    const token = await getAccessToken().catch(() => null);
-    if (typeof window !== 'undefined' && !token) {
-      console.warn('[studentPersistence] saveStudentHomeworkProgressToFirestore: missing Firebase ID token.');
-      return false;
-    }
-
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (token) {
-      headers['Authorization'] = `Bearer ${token}`;
-    }
-
-    const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
-    const safeStudentEmail = (cleanEmail && cleanEmail.includes('@') && (!currentAuthEmail || currentAuthEmail === cleanEmail)) ? cleanEmail : undefined;
-
-    const endpoint = options?.submit ? '/api/homework/submit' : '/api/homework';
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        uid: canonicalUid,
-        studentUid: canonicalUid,
-        ...(safeStudentEmail ? { studentEmail: safeStudentEmail } : {}),
-        weekId: targetWeekId,
+      const payload = stampSchemaVersion({
+        ...sanitizedHomework,
+        ...(targetWeekId !== 'current_week' ? { id: targetWeekId, weekId: targetWeekId } : {}),
         ...(targetCycle ? { weeklyCycle: targetCycle } : {}),
-        weeklyHomework: payload,
-      }),
-    });
+        studentUid: canonicalUid,
+        studentEmail: cleanEmail,
+        updatedAt: new Date().toISOString(),
+      });
 
-    if (!res.ok) {
-      console.error(`[studentPersistence] saveStudentHomeworkProgressToFirestore failed: HTTP ${res.status}`);
+      const token = await getAccessToken().catch(() => null);
+      if (typeof window !== 'undefined' && !token) {
+        console.warn('[studentPersistence] saveStudentHomeworkProgressToFirestore: missing Firebase ID token.');
+        return false;
+      }
+
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+
+      const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
+      const safeStudentEmail = (cleanEmail && cleanEmail.includes('@') && (!currentAuthEmail || currentAuthEmail === cleanEmail)) ? cleanEmail : undefined;
+
+      const endpoint = options?.submit ? '/api/homework/submit' : '/api/homework';
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          uid: canonicalUid,
+          studentUid: canonicalUid,
+          ...(safeStudentEmail ? { studentEmail: safeStudentEmail } : {}),
+          weekId: targetWeekId,
+          ...(targetCycle ? { weeklyCycle: targetCycle } : {}),
+          weeklyHomework: payload,
+        }),
+      });
+
+      if (!res.ok) {
+        console.error(`[studentPersistence] saveStudentHomeworkProgressToFirestore failed: HTTP ${res.status}`);
+        return false;
+      }
+
+      const resData = await res.json().catch(() => null);
+      if (!resData || resData.success === false) {
+        console.error('[studentPersistence] saveStudentHomeworkProgressToFirestore server rejected:', resData);
+        return false;
+      }
+
+      const isLatestSave = (homeworkSaveSeqByStudent.get(studentKey) || 0) === mySeq;
+      if (isLatestSave && typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+        window.dispatchEvent(
+          new CustomEvent('its-simple:homework-updated', {
+            detail: {
+              studentUid: canonicalUid,
+              weekId: resData.weekId || targetWeekId,
+              weeklyCycle: resData.weeklyCycle || targetCycle,
+              homework: resData.weeklyHomework || payload,
+              saveSeq: mySeq,
+            },
+          })
+        );
+      }
+
+      return true;
+    } catch (error) {
+      console.error(`[studentPersistence] Failed to save homework for ${cleanUid}:`, error);
       return false;
     }
+  };
 
-    const resData = await res.json().catch(() => null);
-    if (!resData || resData.success === false) {
-      console.error('[studentPersistence] saveStudentHomeworkProgressToFirestore server rejected:', resData);
-      return false;
-    }
-
-    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
-      window.dispatchEvent(
-        new CustomEvent('its-simple:homework-updated', {
-          detail: {
-            studentUid: canonicalUid,
-            weekId: resData.weekId || targetWeekId,
-            weeklyCycle: resData.weeklyCycle || targetCycle,
-            homework: resData.weeklyHomework || payload,
-          },
-        })
-      );
-    }
-
-    return true;
-  } catch (error) {
-    console.error(`[studentPersistence] Failed to save homework for ${cleanUid}:`, error);
-    return false;
-  }
+  const resultPromise = prevQueue.then(runSave, runSave);
+  homeworkSaveQueueByKey.set(
+    queueKey,
+    resultPromise.then(() => undefined, () => undefined)
+  );
+  return resultPromise;
 }
 
 /**
@@ -4030,6 +4054,8 @@ export function subscribeToStudentHomeworkProgress(
 
   const fetchLatest = async () => {
     if (isCancelled) return;
+    const studentKeyAtStart = auth?.currentUser?.uid || cleanUid || cleanEmail;
+    const seqAtStart = getHomeworkSaveSequence(studentKeyAtStart);
     try {
       const token = await getAccessToken().catch(() => null);
       if (isCancelled) return;
@@ -4038,6 +4064,7 @@ export function subscribeToStudentHomeworkProgress(
       const canonicalUid = auth?.currentUser?.uid || (isValidCanonicalUid(cleanUid) ? cleanUid : '');
       const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
       const safeStudentEmail = (cleanEmail && cleanEmail.includes('@') && (!currentAuthEmail || currentAuthEmail === cleanEmail)) ? cleanEmail : '';
+      const activeKey = canonicalUid || cleanUid || cleanEmail;
 
       const params = new URLSearchParams();
       if (canonicalUid) {
@@ -4062,6 +4089,14 @@ export function subscribeToStudentHomeworkProgress(
 
       const data = await res.json().catch(() => null);
       if (isCancelled || !data) return;
+
+      // Never let a stale initial/auth GET overwrite newer saves initiated while GET was in flight
+      if (
+        getHomeworkSaveSequence(studentKeyAtStart) !== seqAtStart ||
+        getHomeworkSaveSequence(activeKey) > seqAtStart
+      ) {
+        return;
+      }
 
       const resolvedCycle = parseWeekCycleNumber(data.weeklyCycle) || parseWeekCycleNumber(data.weekId) || explicitCycle || 1;
       callback(hydrateNormalizedHomework(data, resolvedCycle));
@@ -4089,6 +4124,10 @@ export function subscribeToStudentHomeworkProgress(
     if (!detail?.homework) return;
     const detailUid = detail.studentUid || '';
     if (detailUid && cleanUid && detailUid !== cleanUid && detailUid !== auth?.currentUser?.uid) return;
+    const eventKey = detailUid || cleanUid || cleanEmail;
+    if (typeof detail.saveSeq === 'number' && detail.saveSeq < getHomeworkSaveSequence(eventKey)) {
+      return;
+    }
     const detailCycle = parseWeekCycleNumber(detail.weeklyCycle) || parseWeekCycleNumber(detail.weekId) || explicitCycle || 1;
     if (!isCurrentWeekAlias && explicitCycle && detailCycle !== explicitCycle) return;
     callback(hydrateNormalizedHomework(detail.homework, detailCycle));
