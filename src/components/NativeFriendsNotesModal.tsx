@@ -73,9 +73,6 @@ interface SessionOption {
   approvalStatus?: 'unapproved' | 'draft_in_progress' | 'approved';
 }
 
-// Module-level in-memory cache for open/close modal transitions (Zero localStorage)
-const sessionNotesModalMemoryCache = new Map<string, PedagogicalLessonTransformation>();
-
 // In-flight synchronization promises to prevent duplicate simultaneous executions across remounts
 const inFlightVocabSyncPromises = new Map<string, Promise<StudentDictionaryEntry[]>>();
 
@@ -83,7 +80,6 @@ const inFlightVocabSyncPromises = new Map<string, Promise<StudentDictionaryEntry
 const completedVocabSyncKeys = new Set<string>();
 
 export function clearNativeFriendsNotesModalCache(): void {
-  sessionNotesModalMemoryCache.clear();
   inFlightVocabSyncPromises.clear();
   completedVocabSyncKeys.clear();
 }
@@ -139,17 +135,22 @@ function mergeSessionOption(
   newItem: SessionOption
 ) {
   let existingKey: string | null = null;
+  const cleanKey = (val?: string) => (val ? String(val).replace(/^lesson_+/, '').trim() : '');
+  const newLessonClean = cleanKey(newItem.lessonId);
+  const newKeyClean = cleanKey(newItem.key);
+
   if (map.has(newItem.key)) {
     existingKey = newItem.key;
-  } else if (newItem.lessonId) {
-    const cleanNew = newItem.lessonId.replace(/^lesson_/, '');
+  } else {
     for (const [k, v] of map.entries()) {
-      if (v.lessonId) {
-        const cleanExisting = v.lessonId.replace(/^lesson_/, '');
-        if (cleanNew === cleanExisting) {
-          existingKey = k;
-          break;
-        }
+      const vLessonClean = cleanKey(v.lessonId);
+      const vKeyClean = cleanKey(v.key);
+      if (
+        (newLessonClean && (vLessonClean === newLessonClean || vKeyClean === newLessonClean)) ||
+        (newKeyClean && (vLessonClean === newKeyClean || vKeyClean === newKeyClean))
+      ) {
+        existingKey = k;
+        break;
       }
     }
   }
@@ -268,11 +269,22 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
   const [sessionOptions, setSessionOptions] = useState<SessionOption[]>([]);
   const [selectedSessionKey, setSelectedSessionKey] = useState<string>('');
   const [isLoadingSessions, setIsLoadingSessions] = useState<boolean>(true);
+  const selectedSessionKeyRef = useRef<string>('');
+  const hasManualSelectionRef = useRef<boolean>(false);
   const isFreshOpenRef = useRef<boolean>(true);
+  const prevIsOpenRef = useRef<boolean>(false);
+  const prevResolvedUidRef = useRef<string>('');
+  const prevLoadedSessionKeyRef = useRef<string>('');
+  const isOpenRef = useRef<boolean>(isOpen);
+  const activeResolvedUidRef = useRef<string>(resolvedUid);
+  const fetchRequestSeqRef = useRef<number>(0);
   // Canonical key tracking to guarantee zero redundant calls on re-renders, StrictMode, or session list updates (AI-STD.1)
   const lastRequestedTransformKeyRef = useRef<string | null>(null);
   // Current active session key tracking to avoid stale async results overwriting new session (Requirement 7)
   const currentActiveSessionKeyRef = useRef<string>('');
+
+  isOpenRef.current = isOpen;
+  activeResolvedUidRef.current = resolvedUid;
 
   const [isSyncingVocab, setIsSyncingVocab] = useState<boolean>(false);
   const [vocabSyncError, setVocabSyncError] = useState<string | null>(null);
@@ -325,7 +337,9 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
   }, [activeTab, TABS_ORDER]);
 
   const handleClose = useCallback(() => {
+    hasManualSelectionRef.current = false;
     isFreshOpenRef.current = true;
+    prevLoadedSessionKeyRef.current = '';
     lastRequestedTransformKeyRef.current = null;
     onClose();
   }, [onClose]);
@@ -343,10 +357,17 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
     // FASE 4B.8.2: Await valid canonical authentication before querying protected sessions
     if (!hasValidAuth) {
       setSessionOptions([]);
+      setSelectedSessionKey('');
+      selectedSessionKeyRef.current = '';
+      currentActiveSessionKeyRef.current = '';
+      setTransformation(null);
+      setApprovedVersionMeta(null);
       setIsLoadingSessions(false);
       return;
     }
 
+    const requestSeq = ++fetchRequestSeqRef.current;
+    const requestUid = resolvedUid;
     setIsLoadingSessions(true);
     const sessionsMap = new Map<string, SessionOption>();
 
@@ -447,32 +468,97 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
         return (b.key || '').localeCompare(a.key || '');
       });
 
+      if (
+        !isMountedRef.current ||
+        !isOpenRef.current ||
+        requestSeq !== fetchRequestSeqRef.current ||
+        activeResolvedUidRef.current !== requestUid
+      ) {
+        return;
+      }
+
       setSessionOptions(list);
 
-      // Auto-select: When modal freshly opens, or no session is selected yet, or selected session is no longer in list:
-      // Select list[0].key (the newest available lesson)
+      // Auto-select: Only select list[0].key (newest lesson) when:
+      // 1) Modal freshly opened without a manual historical selection in this open cycle, OR
+      // 2) No session is selected yet, OR
+      // 3) The manually selected session is no longer present in the list.
+      // Preserves manual historical selection across data/lessons refreshes while the modal stays open.
+      const currentSelectedKey = selectedSessionKeyRef.current;
+      const selectionStillExists = Boolean(
+        currentSelectedKey && list.some((item) => item.key === currentSelectedKey)
+      );
+
       if (list.length > 0) {
-        if (isFreshOpenRef.current || !selectedSessionKey || !list.some((item) => item.key === selectedSessionKey)) {
+        if ((isFreshOpenRef.current && !hasManualSelectionRef.current) || !currentSelectedKey || !selectionStillExists) {
+          selectedSessionKeyRef.current = list[0].key;
           setSelectedSessionKey(list[0].key);
-          isFreshOpenRef.current = false;
         }
+        isFreshOpenRef.current = false;
       } else {
+        selectedSessionKeyRef.current = '';
         setSelectedSessionKey('');
       }
     } catch (err) {
       console.warn('NativeFriendsNotes: Error fetching student sessions', err);
     } finally {
-      setIsLoadingSessions(false);
+      if (isMountedRef.current && requestSeq === fetchRequestSeqRef.current) {
+        setIsLoadingSessions(false);
+      }
     }
-  }, [resolvedUid, resolvedEmail, lessons, hasValidAuth, selectedSessionKey]);
+  }, [resolvedUid, lessons, hasValidAuth]);
 
-  // Load sessions whenever modal opens or student identity changes
+  // Keep selectedSessionKeyRef synchronized
   useEffect(() => {
-    if (isOpen) {
+    selectedSessionKeyRef.current = selectedSessionKey;
+  }, [selectedSessionKey]);
+
+  // Load sessions on modal open and refresh without wiping manual historical selection
+  useEffect(() => {
+    const wasOpen = prevIsOpenRef.current;
+    const uidChanged = prevResolvedUidRef.current !== resolvedUid;
+    prevIsOpenRef.current = isOpen;
+    prevResolvedUidRef.current = resolvedUid;
+    isOpenRef.current = isOpen;
+    activeResolvedUidRef.current = resolvedUid;
+
+    if (!isOpen) {
+      fetchRequestSeqRef.current += 1;
+      hasManualSelectionRef.current = false;
       isFreshOpenRef.current = true;
-      fetchStudentSessions();
+      prevLoadedSessionKeyRef.current = '';
+      selectedSessionKeyRef.current = '';
+      currentActiveSessionKeyRef.current = '';
+      activeSessionRef.current = null;
+      setSessionOptions([]);
+      setSelectedSessionKey('');
+      setTransformation(null);
+      setApprovedVersionMeta(null);
+      setIsLoadingTransformation(false);
+      setVocabSyncError(null);
+      return;
     }
-  }, [isOpen, fetchStudentSessions]);
+
+    if (!wasOpen || uidChanged) {
+      hasManualSelectionRef.current = false;
+      isFreshOpenRef.current = true;
+      if (uidChanged) {
+        fetchRequestSeqRef.current += 1;
+        prevLoadedSessionKeyRef.current = '';
+        selectedSessionKeyRef.current = '';
+        currentActiveSessionKeyRef.current = '';
+        activeSessionRef.current = null;
+        setSessionOptions([]);
+        setSelectedSessionKey('');
+        setTransformation(null);
+        setApprovedVersionMeta(null);
+        setIsLoadingTransformation(false);
+        setVocabSyncError(null);
+      }
+    }
+
+    fetchStudentSessions();
+  }, [isOpen, resolvedUid, fetchStudentSessions]);
 
   // Active session object
   const activeSession = useMemo(() => {
@@ -533,6 +619,7 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
       setVocabSyncError(null);
 
       const isDefinitive = Boolean(
+        (session.lastApprovedVersion && session.lastApprovedVersion.status === 'approved') ||
         (approvedVersionMeta && approvedVersionMeta.status === 'approved') ||
         (currentResult.isAiGenerated && !currentResult.isProvisional && !currentResult.isFallback)
       );
@@ -590,12 +677,10 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
 
   useEffect(() => {
     activeSessionRef.current = activeSession;
-    if (activeSession?.key) {
-      currentActiveSessionKeyRef.current = activeSession.key;
-    }
+    currentActiveSessionKeyRef.current = activeSession?.key || '';
   }, [activeSession]);
 
-  // Load and validate approved pedagogical notes for active session (FASE NF-DOC.2D: Read-Only Approved Version)
+  // Load and validate approved pedagogical notes directly from canonical lastApprovedVersion (FASE NF-DOC.2D / NF.CACHE.2)
   const loadApprovedNotes = useCallback(
     async (targetSessionOverride?: SessionOption | null) => {
       const session = targetSessionOverride !== undefined ? targetSessionOverride : activeSessionRef.current;
@@ -607,49 +692,56 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
       }
 
       const targetSessionKey = session.key;
+      const requestUid = activeResolvedUidRef.current;
       let approved: NoteApprovedVersion | null = session.lastApprovedVersion || null;
 
-      // Fast-path: Check memory cache first
-      const cached = sessionNotesModalMemoryCache.get(targetSessionKey);
-      if (cached && approved && approved.transformation) {
-        if (isMountedRef.current && currentActiveSessionKeyRef.current === targetSessionKey) {
-          setApprovedVersionMeta(approved);
-          setTransformation(cached);
-          setIsLoadingTransformation(false);
-        }
-        performVocabularySync(cached, session, false);
-        return;
-      }
-
-      // If approved version is not yet attached in session object, query server details strictly for student
+      // If approved version is not yet attached in session object, query canonical Firestore (default) API strictly for student
       if (!approved) {
         setIsLoadingTransformation(true);
         try {
           const idToken = await auth?.currentUser?.getIdToken().catch(() => null);
-          const targetKey = session.lessonId || session.key;
-          const res = await fetch(`/api/session-notes?id=${encodeURIComponent(targetKey)}`, {
+          const queryParams = new URLSearchParams();
+          queryParams.set('id', session.key);
+          if (session.lessonId) {
+            queryParams.set('lessonId', session.lessonId);
+          }
+          const res = await fetch(`/api/session-notes?${queryParams.toString()}`, {
             headers: {
               ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
             },
           });
           if (res.ok) {
             const serverDoc = await res.json();
-            if (serverDoc?.lastApprovedVersion?.status === 'approved' && serverDoc.lastApprovedVersion.transformation) {
+            if (
+              isMountedRef.current &&
+              isOpenRef.current &&
+              activeResolvedUidRef.current === requestUid &&
+              serverDoc?.lastApprovedVersion?.status === 'approved' &&
+              serverDoc.lastApprovedVersion.transformation
+            ) {
               approved = serverDoc.lastApprovedVersion;
-              if (isMountedRef.current) {
-                setSessionOptions((prev) =>
-                  prev.map((s) =>
-                    s.key === targetSessionKey
-                      ? { ...s, lastApprovedVersion: approved, approvalStatus: 'approved' }
-                      : s
-                  )
-                );
-              }
+              setSessionOptions((prev) =>
+                prev.map((s) =>
+                  s.key === targetSessionKey
+                    ? { ...s, lastApprovedVersion: approved, approvalStatus: 'approved' }
+                    : s
+                )
+              );
             }
           }
         } catch (fetchErr) {
           console.warn('NativeFriendsNotes: session notes detail fetch notice:', fetchErr);
         }
+      }
+
+      // Guard against stale async completion after modal close, student switch, or session change
+      if (
+        !isMountedRef.current ||
+        !isOpenRef.current ||
+        activeResolvedUidRef.current !== requestUid ||
+        currentActiveSessionKeyRef.current !== targetSessionKey
+      ) {
+        return;
       }
 
       // Validate that approved version is genuine with all 4 canonical parts
@@ -663,35 +755,44 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
           typeof t.reviewSummary === 'object' &&
           !Array.isArray(t.reviewSummary)
         ) {
-          if (isMountedRef.current && currentActiveSessionKeyRef.current === targetSessionKey) {
-            setApprovedVersionMeta(approved);
-            setTransformation(t);
-            setIsLoadingTransformation(false);
-          }
-          sessionNotesModalMemoryCache.set(targetSessionKey, t);
-          performVocabularySync(t, session, false);
+          setApprovedVersionMeta(approved);
+          setTransformation(t);
+          setIsLoadingTransformation(false);
+          performVocabularySync(
+            t,
+            { ...session, lastApprovedVersion: approved, approvalStatus: 'approved' },
+            false
+          );
           return;
         }
       }
 
       // No approved version: student does NOT generate or use legacy unapproved transformations
-      if (isMountedRef.current && currentActiveSessionKeyRef.current === targetSessionKey) {
-        setApprovedVersionMeta(null);
-        setTransformation(null);
-        setIsLoadingTransformation(false);
-      }
+      setApprovedVersionMeta(null);
+      setTransformation(null);
+      setIsLoadingTransformation(false);
     },
     [performVocabularySync]
   );
 
   useEffect(() => {
-    if (!isOpen || !activeSession) return;
+    if (!isOpen) return;
+    if (!activeSession) {
+      prevLoadedSessionKeyRef.current = '';
+      currentActiveSessionKeyRef.current = '';
+      setTransformation(null);
+      setApprovedVersionMeta(null);
+      setIsLoadingTransformation(false);
+      return;
+    }
 
     // When active session changes, clear previous session's transformation immediately to avoid visual leakage
-    if (currentActiveSessionKeyRef.current !== activeSession.key) {
+    if (prevLoadedSessionKeyRef.current !== activeSession.key) {
+      prevLoadedSessionKeyRef.current = activeSession.key;
       currentActiveSessionKeyRef.current = activeSession.key;
       setTransformation(null);
       setApprovedVersionMeta(null);
+      setVocabSyncError(null);
     }
 
     loadApprovedNotes(activeSession);
@@ -817,8 +918,11 @@ export const NativeFriendsNotesModal: React.FC<NativeFriendsNotesModalProps> = (
                   id="session-date-selector"
                   value={selectedSessionKey}
                   onChange={(e) => {
-                    setSelectedSessionKey(e.target.value);
+                    const nextKey = e.target.value;
+                    hasManualSelectionRef.current = true;
                     isFreshOpenRef.current = false;
+                    selectedSessionKeyRef.current = nextKey;
+                    setSelectedSessionKey(nextKey);
                   }}
                   className="w-full bg-white border border-[#607EC9]/40 rounded-xl px-3 py-1.5 text-xs font-bold text-[#000035] pr-8 focus:outline-none focus:ring-2 focus:ring-[#1C4C96] cursor-pointer shadow-2xs"
                 >

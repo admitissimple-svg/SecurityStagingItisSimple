@@ -102,6 +102,58 @@ interface TeacherLiveLessonNotesPanelProps {
   timeZone?: string;
 }
 
+interface UnifiedTeacherSessionOption {
+  optionKey: string;
+  sessionKey: string;
+  lessonId: string;
+  sessionDate: string;
+  startDateTime?: string;
+  topic: string;
+  statusLabel: string;
+  approvalStatus: 'approved' | 'draft_in_progress' | 'unapproved';
+  approvedVersionNumber?: number;
+  rawContent: string;
+  noteDoc?: SessionNotesDocument | null;
+  lesson?: LiveLesson | null;
+  timestamp: number;
+  studentEmail?: string;
+  studentUid?: string;
+  updatedAt?: string;
+}
+
+function extractNoteDateAndTimestamp(item: {
+  sessionDate?: string;
+  startDateTime?: string;
+  id?: string;
+  sessionKey?: string;
+  updatedAt?: string;
+}): { dateStr: string; timestamp: number } {
+  if (item.startDateTime && typeof item.startDateTime === 'string') {
+    const t = new Date(item.startDateTime).getTime();
+    if (!isNaN(t) && t > 0) {
+      const datePart = item.startDateTime.includes('T') ? item.startDateTime.split('T')[0] : '';
+      return { dateStr: item.sessionDate || datePart, timestamp: t };
+    }
+  }
+  const candidate = item.sessionDate || '';
+  const match = typeof candidate === 'string' ? candidate.match(/\d{4}-\d{2}-\d{2}/) : null;
+  if (match) {
+    const t = new Date(`${match[0]}T00:00:00Z`).getTime();
+    if (!isNaN(t) && t > 0) return { dateStr: match[0], timestamp: t };
+  }
+  const keyCand = item.sessionKey || item.id || '';
+  const keyMatch = typeof keyCand === 'string' ? keyCand.match(/\d{4}-\d{2}-\d{2}/) : null;
+  if (keyMatch) {
+    const t = new Date(`${keyMatch[0]}T00:00:00Z`).getTime();
+    if (!isNaN(t) && t > 0) return { dateStr: keyMatch[0], timestamp: t };
+  }
+  if (item.updatedAt && typeof item.updatedAt === 'string') {
+    const t = new Date(item.updatedAt).getTime();
+    if (!isNaN(t) && t > 0) return { dateStr: '', timestamp: t };
+  }
+  return { dateStr: '', timestamp: 0 };
+}
+
 const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanelProps> = ({
   lessons = [],
   students = [],
@@ -175,7 +227,12 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
   // Selected session ID and student - Session date ALWAYS initialized to current date (=today)
   const [selectedLessonId, setSelectedLessonId] = useState<string>('');
+  const [selectedSessionNoteKey, setSelectedSessionNoteKey] = useState<string>('');
+  const [selectedOptionKey, setSelectedOptionKey] = useState<string>('');
   const [selectedStudentEmail, setSelectedStudentEmail] = useState<string>('');
+  const [fetchedStudentNotes, setFetchedStudentNotes] = useState<SessionNotesDocument[]>([]);
+  const [isLoadingStudentNotes, setIsLoadingStudentNotes] = useState<boolean>(false);
+  const studentNotesFetchSeqRef = useRef<number>(0);
   const [sessionDate, setSessionDate] = useState<string>(() => {
     try {
       const formatter = new Intl.DateTimeFormat('en-CA', {
@@ -376,6 +433,12 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       isInitialMountRef.current = false;
       prevStudentFilterRef.current = selectedStudentFilter;
 
+      // Immediately clear previous student's document state on student switch
+      setSelectedSessionNoteKey('');
+      setSelectedOptionKey('');
+      loadedSessionKeyRef.current = '';
+      isDirtyRef.current = false;
+
       const todayStr = getTodayDateStr();
 
       if (selectedStudentFilter && selectedStudentFilter !== 'all') {
@@ -399,10 +462,12 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         if (lessonToday && lessonToday.id) {
           // If a lesson is scheduled for today, select it
           setSelectedLessonId(lessonToday.id);
+          setSelectedOptionKey(`lesson_opt_${lessonToday.id}`);
           setSessionDate(todayStr);
         } else {
           // Always default to today's date for a new lesson (never automatically select old past dates!)
           setSelectedLessonId('');
+          setSelectedOptionKey('');
           setSessionDate(todayStr);
         }
       } else {
@@ -417,12 +482,14 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
         if (lessonToday && lessonToday.id) {
           setSelectedLessonId(lessonToday.id);
+          setSelectedOptionKey(`lesson_opt_${lessonToday.id}`);
           setSessionDate(todayStr);
           if (lessonToday.studentEmail) {
             setSelectedStudentEmail(lessonToday.studentEmail);
           }
         } else {
           setSelectedLessonId('');
+          setSelectedOptionKey('');
           setSessionDate(todayStr);
           if (safeStudents.length > 0 && !selectedStudentEmail) {
             const firstValidStudent = safeStudents.find((s) => s && s.email);
@@ -603,11 +670,231 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     return false;
   };
 
-  const currentSessionKey = selectedLessonId
+  // Fetch canonical session_notes/{sessionKey} documents for the active student (including standalone notes without lessonId)
+  const refreshStudentSessionNotes = useCallback(async () => {
+    const targetUid = studentResolution.uid;
+    if (!targetUid || studentResolution.error) {
+      setFetchedStudentNotes([]);
+      setIsLoadingStudentNotes(false);
+      return;
+    }
+
+    const seq = ++studentNotesFetchSeqRef.current;
+    setIsLoadingStudentNotes(true);
+    try {
+      const idToken = await auth.currentUser?.getIdToken().catch(() => null);
+      const res = await fetch(`/api/session-notes?studentUid=${encodeURIComponent(targetUid)}`, {
+        headers: {
+          ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+        },
+      });
+      if (!res.ok || seq !== studentNotesFetchSeqRef.current) {
+        return;
+      }
+      const data = await res.json().catch(() => null);
+      if (seq !== studentNotesFetchSeqRef.current) return;
+      if (Array.isArray(data)) {
+        const filtered = data.filter((d: any) => d && (!d.studentUid || d.studentUid === targetUid));
+        setFetchedStudentNotes(filtered);
+      } else {
+        setFetchedStudentNotes([]);
+      }
+    } catch {
+      if (seq === studentNotesFetchSeqRef.current) {
+        setFetchedStudentNotes([]);
+      }
+    } finally {
+      if (seq === studentNotesFetchSeqRef.current) {
+        setIsLoadingStudentNotes(false);
+      }
+    }
+  }, [studentResolution.uid, studentResolution.error]);
+
+  useEffect(() => {
+    setFetchedStudentNotes([]);
+    refreshStudentSessionNotes();
+  }, [refreshStudentSessionNotes]);
+
+  useEffect(() => {
+    const handler = () => {
+      refreshStudentSessionNotes();
+    };
+    window.addEventListener('native-notes-updated', handler);
+    return () => window.removeEventListener('native-notes-updated', handler);
+  }, [refreshStudentSessionNotes]);
+
+  const upsertFetchedStudentNote = useCallback((savedNote: any) => {
+    if (!savedNote || typeof savedNote !== 'object') return;
+    const savedId = String(savedNote.id || savedNote.sessionKey || '').trim();
+    if (!savedId) return;
+    setFetchedStudentNotes((prev) => {
+      const idx = prev.findIndex(
+        (item) =>
+          (item.id && item.id === savedId) ||
+          (item.sessionKey && item.sessionKey === savedId)
+      );
+      if (idx >= 0) {
+        const next = [...prev];
+        next[idx] = { ...next[idx], ...savedNote, id: savedId };
+        return next;
+      }
+      return [savedNote, ...prev];
+    });
+  }, []);
+
+  // Unified student sessions combining scheduled teacherLessons and Firestore session_notes/{sessionKey} (with or without lessonId)
+  const unifiedStudentSessions = useMemo<UnifiedTeacherSessionOption[]>(() => {
+    const activeEmailClean = (selectedStudentEmail || '').toLowerCase().trim();
+    const activeUidClean = (studentResolution.uid || '').trim();
+    const cleanStrip = (val?: string) => (val ? String(val).replace(/^lesson_+/, '').trim() : '');
+
+    // Index canonical fetched session_notes for fast matching
+    const notesList = fetchedStudentNotes.filter((n) => {
+      if (!n) return false;
+      if (activeUidClean && n.studentUid) return n.studentUid === activeUidClean;
+      if (activeEmailClean && n.studentEmail) {
+        return n.studentEmail.toLowerCase().trim() === activeEmailClean;
+      }
+      return true;
+    });
+
+    const consumedNoteIds = new Set<string>();
+    const options: UnifiedTeacherSessionOption[] = [];
+
+    const resolveApproval = (doc?: any): { status: 'approved' | 'draft_in_progress' | 'unapproved'; versionNumber?: number } => {
+      if (!doc) return { status: 'unapproved' };
+      if (doc.lastApprovedVersion?.status === 'approved') {
+        return {
+          status: 'approved',
+          versionNumber: doc.lastApprovedVersion.versionNumber,
+        };
+      }
+      if (doc.draftTransformation) {
+        return { status: 'draft_in_progress' };
+      }
+      if (doc.approvalStatus === 'approved' || doc.approvalStatus === 'draft_in_progress') {
+        return { status: doc.approvalStatus };
+      }
+      return { status: 'unapproved' };
+    };
+
+    const studentLessons = teacherLessons.filter((l) => {
+      if (!l) return false;
+      if (l.id === selectedLessonId) return true;
+      if (activeUidClean && l.studentUid) return l.studentUid === activeUidClean;
+      if (activeEmailClean) {
+        return (l.studentEmail || '').toLowerCase().trim() === activeEmailClean;
+      }
+      return true;
+    });
+
+    studentLessons.forEach((l) => {
+      const lessonCleanId = cleanStrip(l.id);
+      const matchedNote = notesList.find((n) => {
+        const nId = String(n.id || n.sessionKey || '').trim();
+        const nIdClean = cleanStrip(nId);
+        const nLessonClean = cleanStrip(n.lessonId);
+        return (
+          (lessonCleanId && nLessonClean === lessonCleanId) ||
+          (lessonCleanId && nIdClean === lessonCleanId) ||
+          nId === l.id
+        );
+      });
+
+      if (matchedNote?.id) {
+        consumedNoteIds.add(matchedNote.id);
+      }
+
+      const lessonRawContent =
+        l.sessionNotesDocument ||
+        l.liveNotes ||
+        l.recommendations ||
+        (Array.isArray(l.vocabularyNotes) && l.vocabularyNotes.length > 0
+          ? l.vocabularyNotes.map((v) => `• ${v.word}: ${v.notes || ''}`).join('\n')
+          : '');
+      const noteRawContent = matchedNote ? (matchedNote.rawContent || matchedNote.content || '') : '';
+      const rawContent = noteRawContent.trim() ? noteRawContent : lessonRawContent;
+      const { dateStr, timestamp } = extractNoteDateAndTimestamp({
+        sessionDate: matchedNote?.sessionDate || l.sessionDate,
+        startDateTime: l.startDateTime,
+        id: matchedNote?.id || l.id,
+        updatedAt: matchedNote?.updatedAt || l.updatedAt,
+      });
+      const appr = resolveApproval(matchedNote || (l as any));
+
+      options.push({
+        optionKey: `lesson_opt_${l.id}`,
+        sessionKey: matchedNote?.id || l.id,
+        lessonId: l.id,
+        sessionDate: dateStr,
+        startDateTime: l.startDateTime,
+        topic: matchedNote?.topic || l.title || 'Lesson',
+        statusLabel: l.status || 'scheduled',
+        approvalStatus: appr.status,
+        approvedVersionNumber: appr.versionNumber,
+        rawContent,
+        noteDoc: matchedNote || null,
+        lesson: l,
+        timestamp,
+        studentEmail: l.studentEmail || matchedNote?.studentEmail,
+        studentUid: l.studentUid || matchedNote?.studentUid,
+        updatedAt: matchedNote?.updatedAt || l.updatedAt,
+      });
+    });
+
+    // Include standalone session_notes/{sessionKey} docs (no lessonId or lesson not in teacherLessons)
+    notesList.forEach((n) => {
+      const noteId = String(n.id || n.sessionKey || '').trim();
+      if (!noteId || consumedNoteIds.has(noteId)) return;
+      consumedNoteIds.add(noteId);
+
+      const rawContent = n.rawContent || n.content || '';
+      const { dateStr, timestamp } = extractNoteDateAndTimestamp({
+        sessionDate: n.sessionDate,
+        startDateTime: (n as any).startDateTime,
+        id: noteId,
+        sessionKey: n.sessionKey,
+        updatedAt: n.updatedAt,
+      });
+      const appr = resolveApproval(n);
+
+      options.push({
+        optionKey: `note_opt_${noteId}`,
+        sessionKey: noteId,
+        lessonId: n.lessonId || '',
+        sessionDate: dateStr,
+        startDateTime: (n as any).startDateTime,
+        topic: n.topic || 'In-Session Notes',
+        statusLabel: n.lessonId ? 'lesson note' : 'standalone note',
+        approvalStatus: appr.status,
+        approvedVersionNumber: appr.versionNumber,
+        rawContent,
+        noteDoc: n,
+        lesson: null,
+        timestamp,
+        studentEmail: n.studentEmail,
+        studentUid: n.studentUid,
+        updatedAt: n.updatedAt,
+      });
+    });
+
+    return options.sort((a, b) => {
+      if (b.timestamp !== a.timestamp) return b.timestamp - a.timestamp;
+      const dateCmp = (b.sessionDate || '').localeCompare(a.sessionDate || '');
+      if (dateCmp !== 0) return dateCmp;
+      const updCmp = (b.updatedAt || '').localeCompare(a.updatedAt || '');
+      if (updCmp !== 0) return updCmp;
+      return b.optionKey.localeCompare(a.optionKey);
+    });
+  }, [teacherLessons, fetchedStudentNotes, selectedStudentEmail, studentResolution.uid, selectedLessonId]);
+
+  const currentSessionKey = selectedSessionNoteKey
+    ? `note_${selectedSessionNoteKey}`
+    : selectedLessonId
     ? `lesson_${selectedLessonId}`
     : `student_${(selectedStudentEmail || '').toLowerCase().trim()}_${sessionDate}`;
 
-  // When selected lesson or student changes, populate document cleanly without triggering save loops
+  // When selected lesson, standalone note, or student changes, populate document cleanly without triggering save loops
   useEffect(() => {
     if (!currentSessionKey) return;
     if (loadedSessionKeyRef.current === currentSessionKey) {
@@ -639,10 +926,54 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     let initialDriveSyncedAt: string | null = null;
     let initialSavedAt: string | null = null;
 
+    const cleanStrip = (val?: string) => (val ? String(val).replace(/^lesson_+/, '').trim() : '');
+    const matchedCachedNote = fetchedStudentNotes.find((n) => {
+      if (!n) return false;
+      if (selectedSessionNoteKey && (n.id === selectedSessionNoteKey || n.sessionKey === selectedSessionNoteKey)) {
+        return true;
+      }
+      if (selectedLessonId) {
+        const lClean = cleanStrip(selectedLessonId);
+        return cleanStrip(n.lessonId) === lClean || cleanStrip(n.id) === lClean;
+      }
+      return false;
+    });
+
     try {
       const currentLesson = teacherLessons.find((l) => l && l.id === selectedLessonId);
 
-      if (currentLesson) {
+      if (matchedCachedNote) {
+        if (matchedCachedNote.studentEmail && matchedCachedNote.studentEmail !== selectedStudentEmail) {
+          setSelectedStudentEmail(matchedCachedNote.studentEmail);
+        }
+        initialTopic = matchedCachedNote.topic || currentLesson?.title || 'Live Coaching Session';
+        const noteDocContent = matchedCachedNote.rawContent || matchedCachedNote.content || '';
+        const lessonDocContent = currentLesson
+          ? (currentLesson.sessionNotesDocument || currentLesson.liveNotes || currentLesson.recommendations || '')
+          : '';
+        const chosenContent = noteDocContent.trim() ? noteDocContent : lessonDocContent;
+
+        if (chosenContent.trim() && !isOnlyOldTemplate(chosenContent)) {
+          initialContent = chosenContent;
+        } else {
+          const sName = resolveStudentName(
+            activeStudent,
+            currentLesson || null,
+            matchedCachedNote.studentEmail || selectedStudentEmail
+          );
+          const dateStr = matchedCachedNote.sessionDate || sessionDate;
+          initialContent = getStarterTemplate(sName, dateStr, initialTopic);
+        }
+
+        if (matchedCachedNote.updatedAt) {
+          initialSavedAt = matchedCachedNote.updatedAt;
+        }
+        if (matchedCachedNote.driveFileId) {
+          initialDriveId = matchedCachedNote.driveFileId;
+          initialDriveUrl = matchedCachedNote.driveFileUrl || null;
+          initialDriveSyncedAt = matchedCachedNote.driveLastSyncedAt || null;
+        }
+      } else if (currentLesson) {
         if (currentLesson.studentEmail && currentLesson.studentEmail !== selectedStudentEmail) {
           setSelectedStudentEmail(currentLesson.studentEmail);
         }
@@ -737,6 +1068,27 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     setDriveLastSyncedAt(initialDriveSyncedAt);
     setDriveSyncStatus(initialDriveId ? 'synced' : 'idle');
 
+    // Hydrate cached draft/approved/versions non-destructively when available immediately
+    if (matchedCachedNote) {
+      if (matchedCachedNote.draftTransformation) {
+        setDraftTransformation(matchedCachedNote.draftTransformation);
+        if (matchedCachedNote.draftTransformation.transformation) {
+          setEditableTransformation(JSON.parse(JSON.stringify(matchedCachedNote.draftTransformation.transformation)));
+        }
+      }
+      if (matchedCachedNote.lastApprovedVersion) {
+        setLastApprovedVersion(matchedCachedNote.lastApprovedVersion);
+        if (!matchedCachedNote.draftTransformation?.transformation && matchedCachedNote.lastApprovedVersion.transformation) {
+          setEditableTransformation(JSON.parse(JSON.stringify(matchedCachedNote.lastApprovedVersion.transformation)));
+        }
+      }
+      setApprovalStatus(
+        matchedCachedNote.approvalStatus ||
+        (matchedCachedNote.lastApprovedVersion ? 'approved' : matchedCachedNote.draftTransformation ? 'draft_in_progress' : 'unapproved')
+      );
+      setVersionHistory(Array.isArray(matchedCachedNote.versionHistory) ? matchedCachedNote.versionHistory : []);
+    }
+
     // Mark as clean initial state
     isDirtyRef.current = false;
     lastSavedContentRef.current = {
@@ -756,13 +1108,14 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       focusEditorAtEnd(editor);
     }
 
-    // Asynchronously verify with /api/session-notes to guarantee the full HTML is retrieved
+    // Asynchronously verify with /api/session-notes to guarantee the full HTML & version history are retrieved
     let cancelled = false;
     const fetchSavedNotes = async () => {
       try {
+        const lookupId = selectedSessionNoteKey || currentSessionKey;
         const queryParams = new URLSearchParams();
         if (selectedLessonId) queryParams.set('lessonId', selectedLessonId);
-        if (currentSessionKey) queryParams.set('id', currentSessionKey);
+        if (lookupId) queryParams.set('id', lookupId);
         if (selectedStudentEmail) queryParams.set('studentEmail', selectedStudentEmail);
         const resolvedStudentUid = studentResolution.uid;
         if (resolvedStudentUid) queryParams.set('studentUid', resolvedStudentUid);
@@ -778,8 +1131,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           const data = await res.json();
           const savedNote = Array.isArray(data) ? data[0] : data;
           if (savedNote) {
-            if (savedNote.content && savedNote.content.trim() && !isOnlyOldTemplate(savedNote.content)) {
-              const serverContent = savedNote.content;
+            const serverContent = savedNote.rawContent || savedNote.content || '';
+            if (serverContent && serverContent.trim() && !isOnlyOldTemplate(serverContent)) {
               setNotesContent(serverContent);
               if (savedNote.topic) setTopic(savedNote.topic);
               if (savedNote.updatedAt) setLastSavedTimestamp(savedNote.updatedAt);
@@ -789,6 +1142,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 setDriveLastSyncedAt(savedNote.driveLastSyncedAt || null);
                 setDriveSyncStatus('synced');
               }
+              isDirtyRef.current = false;
               lastSavedContentRef.current = {
                 content: serverContent,
                 topic: savedNote.topic || initialTopic,
@@ -807,6 +1161,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               setDraftTransformation(savedNote.draftTransformation);
               if (savedNote.draftTransformation.transformation) {
                 setEditableTransformation(JSON.parse(JSON.stringify(savedNote.draftTransformation.transformation)));
+              } else if (savedNote.lastApprovedVersion?.transformation) {
+                setEditableTransformation(JSON.parse(JSON.stringify(savedNote.lastApprovedVersion.transformation)));
               }
             } else {
               setDraftTransformation(null);
@@ -814,11 +1170,14 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
             if (savedNote.lastApprovedVersion) {
               setLastApprovedVersion(savedNote.lastApprovedVersion);
-              if (!savedNote.draftTransformation && savedNote.lastApprovedVersion.transformation) {
+              if (!savedNote.draftTransformation?.transformation && savedNote.lastApprovedVersion.transformation) {
                 setEditableTransformation(JSON.parse(JSON.stringify(savedNote.lastApprovedVersion.transformation)));
               }
             } else {
               setLastApprovedVersion(null);
+              if (!savedNote.draftTransformation) {
+                setEditableTransformation(null);
+              }
             }
 
             setApprovalStatus(
@@ -826,17 +1185,30 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               (savedNote.lastApprovedVersion ? 'approved' : savedNote.draftTransformation ? 'draft_in_progress' : 'unapproved')
             );
             setVersionHistory(Array.isArray(savedNote.versionHistory) ? savedNote.versionHistory : []);
+
+            if (savedNote.id && savedNote.id !== selectedSessionNoteKey) {
+              loadedSessionKeyRef.current = `note_${savedNote.id}`;
+              lastSavedContentRef.current.sessionKey = `note_${savedNote.id}`;
+              setSelectedSessionNoteKey(savedNote.id);
+              setSelectedOptionKey((prev) =>
+                prev || (savedNote.lessonId ? `lesson_opt_${savedNote.lessonId}` : `note_opt_${savedNote.id}`)
+              );
+            }
           }
         }
       } catch {
         // silent fallback to initialContent
+      } finally {
+        if (!cancelled) {
+          isDirtyRef.current = false;
+        }
       }
     };
     fetchSavedNotes();
 
     const timer = setTimeout(() => {
       isInitialLoadRef.current = false;
-    }, 100);
+    }, 150);
 
     return () => {
       cancelled = true;
@@ -873,76 +1245,117 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     updateDocumentHeader(undefined, undefined, newTopic);
   };
 
-  const handleSessionChange = useCallback(
-    (newLessonId: string) => {
+  const handleSelectUnifiedSession = useCallback(
+    (selectionValue: string) => {
       // If dirty, persist current document before switching
       if (isDirtyRef.current && lastSavedContentRef.current.sessionKey) {
         persistSessionDocumentRef.current?.(notesContent, topic, false);
       }
 
-      setSelectedLessonId(newLessonId);
-
-      if (newLessonId) {
-        const chosenLesson = teacherLessons.find((l) => l && l.id === newLessonId);
-        if (chosenLesson) {
-          if (chosenLesson.studentEmail && chosenLesson.studentEmail !== selectedStudentEmail) {
-            setSelectedStudentEmail(chosenLesson.studentEmail);
-          }
-          if (chosenLesson.startDateTime && typeof chosenLesson.startDateTime === 'string') {
-            const datePart = chosenLesson.startDateTime.split('T')[0];
-            if (datePart) {
-              setSessionDate(datePart);
-              updateDocumentHeader(datePart, chosenLesson.studentEmail, chosenLesson.title);
-            }
-          }
-          if (chosenLesson.title) {
-            setTopic(chosenLesson.title);
-          }
-        }
-      } else {
-        // Switched to New Lesson Today: always reset date to current date (=today)
+      if (!selectionValue) {
         const todayStr = getTodayDateStr();
+        setSelectedOptionKey('');
+        setSelectedLessonId('');
+        setSelectedSessionNoteKey('');
         setSessionDate(todayStr);
         setTopic('Trial');
+        isDirtyRef.current = false;
         updateDocumentHeader(todayStr, undefined, 'Trial');
+        return;
       }
+
+      const cleanStrip = (val?: string) => (val ? String(val).replace(/^lesson_+/, '').trim() : '');
+      const selClean = cleanStrip(selectionValue);
+      const chosenOption = unifiedStudentSessions.find(
+        (opt) =>
+          opt.optionKey === selectionValue ||
+          opt.sessionKey === selectionValue ||
+          (opt.lessonId && (opt.lessonId === selectionValue || cleanStrip(opt.lessonId) === selClean))
+      );
+
+      if (chosenOption) {
+        setSelectedOptionKey(chosenOption.optionKey);
+        setSelectedLessonId(chosenOption.lesson ? chosenOption.lesson.id : (chosenOption.lessonId || ''));
+        setSelectedSessionNoteKey(chosenOption.noteDoc?.id || (chosenOption.lesson ? '' : chosenOption.sessionKey));
+        if (chosenOption.studentEmail && chosenOption.studentEmail !== selectedStudentEmail) {
+          setSelectedStudentEmail(chosenOption.studentEmail);
+        }
+        if (chosenOption.sessionDate) {
+          setSessionDate(chosenOption.sessionDate);
+        }
+        if (chosenOption.topic) {
+          setTopic(chosenOption.topic);
+        }
+        isDirtyRef.current = false;
+        return;
+      }
+
+      // Direct fallback for legacy callers passing a raw lessonId
+      setSelectedOptionKey(`lesson_opt_${selectionValue}`);
+      setSelectedLessonId(selectionValue);
+      setSelectedSessionNoteKey('');
+      const chosenLesson = teacherLessons.find((l) => l && l.id === selectionValue);
+      if (chosenLesson) {
+        if (chosenLesson.studentEmail && chosenLesson.studentEmail !== selectedStudentEmail) {
+          setSelectedStudentEmail(chosenLesson.studentEmail);
+        }
+        if (chosenLesson.startDateTime && typeof chosenLesson.startDateTime === 'string') {
+          const datePart = chosenLesson.startDateTime.split('T')[0];
+          if (datePart) {
+            setSessionDate(datePart);
+          }
+        }
+        if (chosenLesson.title) {
+          setTopic(chosenLesson.title);
+        }
+      }
+      isDirtyRef.current = false;
     },
-    [teacherLessons, selectedStudentEmail, notesContent, topic, updateDocumentHeader, getTodayDateStr]
+    [unifiedStudentSessions, teacherLessons, selectedStudentEmail, notesContent, topic, updateDocumentHeader, getTodayDateStr]
+  );
+
+  const handleSessionChange = useCallback(
+    (newLessonId: string) => {
+      handleSelectUnifiedSession(newLessonId);
+    },
+    [handleSelectUnifiedSession]
   );
 
   const handleDateChange = useCallback(
     (newDate: string) => {
       if (!newDate) return;
-      isDirtyRef.current = true;
       setSessionDate(newDate);
-      updateDocumentHeader(newDate);
 
-      // Check if there is an existing session for this student on the chosen date
-      const studentClean = (selectedStudentEmail || '').toLowerCase().trim();
-      const matchingLessons = teacherLessons.filter((l) => {
-        if (!l?.startDateTime || typeof l.startDateTime !== 'string') return false;
-        const lStudentClean = (l.studentEmail || '').toLowerCase().trim();
-        const matchesStudent = !studentClean || (lStudentClean && lStudentClean === studentClean);
-        return matchesStudent && l.startDateTime.startsWith(newDate);
-      });
+      // Check if there is an existing lesson OR standalone session_notes doc for this student on the chosen date
+      const matchingOptions = unifiedStudentSessions.filter((opt) => opt.sessionDate === newDate);
 
-      if (matchingLessons.length > 0) {
-        // If current selectedLessonId is already one of the lessons on this date, keep it
-        const alreadySelected = matchingLessons.find((l) => l.id === selectedLessonId);
+      if (matchingOptions.length > 0) {
+        const alreadySelected = matchingOptions.find(
+          (opt) =>
+            (selectedOptionKey && opt.optionKey === selectedOptionKey) ||
+            (selectedLessonId && opt.lessonId === selectedLessonId) ||
+            (selectedSessionNoteKey && opt.sessionKey === selectedSessionNoteKey)
+        );
         if (!alreadySelected) {
-          // Synchronize to the matching lesson on that date
-          const targetLesson = matchingLessons[0];
-          setSelectedLessonId(targetLesson.id);
-          if (targetLesson.title) {
-            setTopic(targetLesson.title);
+          const targetOpt = matchingOptions[0];
+          setSelectedOptionKey(targetOpt.optionKey);
+          setSelectedLessonId(targetOpt.lesson ? targetOpt.lesson.id : (targetOpt.lessonId || ''));
+          setSelectedSessionNoteKey(targetOpt.noteDoc?.id || (targetOpt.lesson ? '' : targetOpt.sessionKey));
+          if (targetOpt.topic) {
+            setTopic(targetOpt.topic);
           }
         }
+        isDirtyRef.current = false;
       } else {
-        // Independent: No existing lesson on this date, allow free custom date session on newDate without reverting!
+        // Independent: No existing session on this date, allow free custom date session on newDate without overwriting
+        isDirtyRef.current = true;
+        setSelectedOptionKey('');
         setSelectedLessonId('');
+        setSelectedSessionNoteKey('');
+        updateDocumentHeader(newDate);
       }
     },
-    [selectedStudentEmail, teacherLessons, selectedLessonId, updateDocumentHeader]
+    [unifiedStudentSessions, selectedOptionKey, selectedLessonId, selectedSessionNoteKey, updateDocumentHeader]
   );
 
   const handleResetDocument = () => {
@@ -966,28 +1379,19 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     }
   };
 
-  // Past notes history for this student (sorted in descending order by date)
+  // Past notes history for this student (sorted in descending order by date, including standalone session_notes)
   const studentHistory = useMemo(() => {
-    return teacherLessons
-      .filter((l) => {
-        if (!l) return false;
-        const lEmail = (l.studentEmail || '').toLowerCase().trim();
-        const currEmail = (selectedStudentEmail || '').toLowerCase().trim();
-        const matchesStudent = !currEmail || (lEmail && lEmail === currEmail);
-        const hasNotes = Boolean(
-          (l.sessionNotesDocument && l.sessionNotesDocument.trim()) ||
-          (l.liveNotes && l.liveNotes.trim()) ||
-          (l.recommendations && l.recommendations.trim()) ||
-          (Array.isArray(l.vocabularyNotes) && l.vocabularyNotes.length > 0)
-        );
-        return matchesStudent && hasNotes;
-      })
-      .sort((a, b) => {
-        const timeA = a.startDateTime ? new Date(a.startDateTime).getTime() : 0;
-        const timeB = b.startDateTime ? new Date(b.startDateTime).getTime() : 0;
-        return timeB - timeA; // Descending: newest first
-      });
-  }, [teacherLessons, selectedStudentEmail]);
+    return unifiedStudentSessions.filter((opt) => {
+      if (!opt) return false;
+      const hasNotes = Boolean(
+        (opt.rawContent && opt.rawContent.trim()) ||
+        opt.noteDoc?.draftTransformation ||
+        opt.noteDoc?.lastApprovedVersion ||
+        (Array.isArray(opt.lesson?.vocabularyNotes) && opt.lesson!.vocabularyNotes.length > 0)
+      );
+      return hasNotes;
+    });
+  }, [unifiedStudentSessions]);
 
   /**
    * Executes Google Drive file upload/update using the teacher's Google OAuth credentials directly
@@ -1033,11 +1437,13 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           return;
         }
 
+        const resolvedStudentUid = studentResolution.uid;
         const targetLessonId = selectedLessonId || (activeLesson ? activeLesson.id : '');
         const cleanEmail = (selectedStudentEmail || '').toLowerCase().trim();
         const sessionKey =
+          selectedSessionNoteKey ||
           targetLessonId ||
-          `session_${effDate}_${cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : 'notes'}`;
+          `session_${effDate}_${(resolvedStudentUid || (cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : 'notes'))}`;
 
         let resolvedFileId = targetFileId || driveFileId || (activeLesson as any)?.driveFileId || undefined;
 
@@ -1107,7 +1513,6 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           // Server API sync with Drive metadata (skipDriveSync prevents duplicate Google Drive operations)
           try {
             const idToken = await auth.currentUser?.getIdToken().catch(() => null);
-            const resolvedStudentUid = studentResolution.uid;
             const resolvedTeacherUid = (currentAccount?.uid || auth.currentUser?.uid || '').trim();
 
             const syncApiRes = await fetch('/api/session-notes', {
@@ -1162,6 +1567,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     },
     [
       studentResolution,
+      selectedSessionNoteKey,
       selectedLessonId,
       activeLesson,
       selectedStudentEmail,
@@ -1208,10 +1614,11 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       const cleanEmail = (selectedStudentEmail || '').toLowerCase().trim();
       const effectiveDate = sessionDate || new Date().toISOString().split('T')[0];
       const sessionKey =
+        selectedSessionNoteKey ||
         targetLessonId ||
-        `session_${effectiveDate}_${cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : 'notes'}`;
+        `session_${effectiveDate}_${(resolvedStudentUid || (cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : 'notes'))}`;
 
-      if (!cleanEmail && !targetLessonId) return false;
+      if (!cleanEmail && !targetLessonId && !selectedSessionNoteKey) return false;
 
       // If not an explicit manual save or forced pre-AI sync, require the dirty flag and ensure content actually changed
       if (!explicitSave && !forceServerSync) {
@@ -1277,6 +1684,17 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             setSaveError(errData.error || errData.message || 'Error saving notes to server.');
           } else {
             const savedPayload = await apiRes.json().catch(() => null);
+            if (savedPayload?.sessionNote) {
+              if (savedPayload.sessionNote.id) {
+                loadedSessionKeyRef.current = `note_${savedPayload.sessionNote.id}`;
+                lastSavedContentRef.current.sessionKey = savedPayload.sessionNote.id;
+                setSelectedSessionNoteKey(savedPayload.sessionNote.id);
+                if (!selectedLessonId && !selectedOptionKey) {
+                  setSelectedOptionKey(`note_opt_${savedPayload.sessionNote.id}`);
+                }
+              }
+              upsertFetchedStudentNote(savedPayload.sessionNote);
+            }
             if (Array.isArray(savedPayload?.sessionNote?.versionHistory)) {
               setVersionHistory(savedPayload.sessionNote.versionHistory);
             }
@@ -1324,6 +1742,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       studentResolution,
       selectedStudentEmail,
       selectedLessonId,
+      selectedSessionNoteKey,
+      selectedOptionKey,
       sessionDate,
       activeLesson,
       activeStudent,
@@ -1333,18 +1753,20 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       driveLastSyncedAt,
       onSaveLessonNotes,
       resolveStudentName,
+      upsertFetchedStudentNote,
     ]
   );
 
   const resolveCanonicalServerSessionKey = useCallback(() => {
+    if (selectedSessionNoteKey) {
+      return selectedSessionNoteKey;
+    }
     const targetLessonId = selectedLessonId || (activeLesson ? activeLesson.id : '');
+    if (targetLessonId) return targetLessonId;
     const cleanEmail = (selectedStudentEmail || '').toLowerCase().trim();
     const effectiveDate = sessionDate || new Date().toISOString().split('T')[0];
-    return (
-      targetLessonId ||
-      `session_${effectiveDate}_${cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : 'notes'}`
-    );
-  }, [selectedLessonId, activeLesson, selectedStudentEmail, sessionDate]);
+    return `session_${effectiveDate}_${(studentResolution.uid || (cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : 'notes'))}`;
+  }, [selectedSessionNoteKey, selectedLessonId, activeLesson, selectedStudentEmail, studentResolution.uid, sessionDate]);
 
   /**
    * FASE NF-DOC.2C: Apply AI
@@ -1407,6 +1829,9 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         setDraftTransformation(data.draftTransformation);
         if (data.draftTransformation.transformation) {
           setEditableTransformation(JSON.parse(JSON.stringify(data.draftTransformation.transformation)));
+        }
+        if (data.sessionNote) {
+          upsertFetchedStudentNote(data.sessionNote);
         }
         if (Array.isArray(data.sessionNote?.versionHistory)) {
           setVersionHistory(data.sessionNote.versionHistory);
@@ -1480,6 +1905,9 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       } else {
         if (data.sessionNote?.draftTransformation) {
           setDraftTransformation(data.sessionNote.draftTransformation);
+        }
+        if (data.sessionNote) {
+          upsertFetchedStudentNote(data.sessionNote);
         }
         if (Array.isArray(data.sessionNote?.versionHistory)) {
           setVersionHistory(data.sessionNote.versionHistory);
@@ -1590,6 +2018,9 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         if (data.approvedVersion) {
           setLastApprovedVersion(data.approvedVersion);
           setEditableTransformation(JSON.parse(JSON.stringify(data.approvedVersion.transformation)));
+        }
+        if (data.sessionNote) {
+          upsertFetchedStudentNote(data.sessionNote);
         }
         if (Array.isArray(data.sessionNote?.versionHistory)) {
           setVersionHistory(data.sessionNote.versionHistory);
@@ -1926,13 +2357,12 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     };
   }, [notesContent, topic]);
 
-  // Keep contentEditable innerHTML in sync when external notesContent changes (and not from internal typing)
+  // Keep contentEditable innerHTML in sync when notesContent, activeTab, or editorViewMode changes (and not from internal typing)
   useEffect(() => {
+    if (activeTab !== 'editor') return;
     const editor = getActiveEditor();
     if (!editor) return;
 
-    // If the change came from user typing or editing inside this editor, NEVER overwrite innerHTML
-    if (notesContent === lastInternalHtmlRef.current) return;
     if (isUserTypingRef.current) return;
 
     const isFocused = document.activeElement === editor || editor.contains(document.activeElement);
@@ -1943,7 +2373,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       editor.innerHTML = formatted;
       lastInternalHtmlRef.current = formatted;
     }
-  }, [notesContent, getActiveEditor, formatContentForEditor]);
+  }, [notesContent, activeTab, editorViewMode, getActiveEditor, formatContentForEditor]);
 
   /**
    * Helper: Insert fully formed, pre-styled inline tag component at current caret/selection position
@@ -3569,8 +3999,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 Session:
               </span>
               <select
-                value={selectedLessonId}
-                onChange={(e) => handleSessionChange(e.target.value)}
+                value={selectedOptionKey}
+                onChange={(e) => handleSelectUnifiedSession(e.target.value)}
                 className="w-full bg-white border border-[#607EC9]/40 rounded-xl px-2.5 py-1.5 text-xs font-semibold text-[#000035] focus:outline-hidden focus:ring-2 focus:ring-[#1C4C96] cursor-pointer shadow-2xs truncate"
               >
                 <option value="">
@@ -3578,34 +4008,28 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                     ? `-- ➕ New Lesson (Today - ${formatDateInTimeZone(getTodayDateStr(), timeZone, 'en')}) --`
                     : `-- ➕ New Lesson (${sessionDate}) --`}
                 </option>
-                {teacherLessons
-                  .filter(
-                    (l) =>
-                      !selectedStudentEmail ||
-                      (l?.studentEmail &&
-                        (l.studentEmail || '').toLowerCase().trim() ===
-                          (selectedStudentEmail || '').toLowerCase().trim()) ||
-                      l?.id === selectedLessonId
-                  )
-                  .sort((a, b) => {
-                    const timeA = a.startDateTime ? new Date(a.startDateTime).getTime() : 0;
-                    const timeB = b.startDateTime ? new Date(b.startDateTime).getTime() : 0;
-                    return timeB - timeA; // Descending: newest first
-                  })
-                  .map((l) => {
-                    const lDate = l.startDateTime
-                      ? formatDateInTimeZone(l.startDateTime, timeZone, 'en')
-                      : 'Session';
-                    const lTime = l.startDateTime
-                      ? formatTimeInTimeZone(l.startDateTime, timeZone)
-                      : '';
-                    return (
-                      <option key={l.id} value={l.id}>
-                        {lDate} {lTime ? `at ${lTime}` : ''} - {l.title || 'Lesson'} (
-                        {l.status || 'scheduled'})
-                      </option>
-                    );
-                  })}
+                {unifiedStudentSessions.map((opt) => {
+                  const lDate = opt.startDateTime
+                    ? formatDateInTimeZone(opt.startDateTime, timeZone, 'en')
+                    : opt.sessionDate
+                    ? formatDateInTimeZone(opt.sessionDate, timeZone, 'en')
+                    : 'Session';
+                  const lTime = opt.startDateTime
+                    ? formatTimeInTimeZone(opt.startDateTime, timeZone)
+                    : '';
+                  const approvalLabel =
+                    opt.approvalStatus === 'approved'
+                      ? `Approved${opt.approvedVersionNumber ? ` v${opt.approvedVersionNumber}` : ''}`
+                      : opt.approvalStatus === 'draft_in_progress'
+                      ? 'Draft'
+                      : 'Raw';
+                  const originTag = opt.lesson ? '' : ' • Note only';
+                  return (
+                    <option key={opt.optionKey} value={opt.optionKey}>
+                      {lDate} {lTime ? `at ${lTime}` : ''} - {opt.topic} [{approvalLabel}{originTag}]
+                    </option>
+                  );
+                })}
               </select>
             </div>
 
@@ -4353,7 +4777,12 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             <span>{studentHistory.length} recorded session(s)</span>
           </div>
 
-          {studentHistory.length === 0 ? (
+          {isLoadingStudentNotes && studentHistory.length === 0 ? (
+            <div className="py-10 text-center text-slate-500 text-xs bg-slate-50 rounded-2xl border border-slate-200 flex flex-col items-center gap-2">
+              <Loader2 className="w-6 h-6 text-[#1C4C96] animate-spin" />
+              <p>Loading historical session records...</p>
+            </div>
+          ) : studentHistory.length === 0 ? (
             <div className="py-10 text-center text-slate-400 text-xs italic bg-slate-50 rounded-2xl border border-dashed border-slate-200 space-y-1">
               <FileText className="w-8 h-8 text-slate-300 mx-auto" />
               <p>No previous session records found for this student.</p>
@@ -4364,13 +4793,11 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           ) : (
             <div className="space-y-3 max-h-96 overflow-y-auto pr-1">
               {studentHistory.map((hist) => {
-                const effectiveText =
-                  hist.sessionNotesDocument ||
-                  hist.liveNotes ||
-                  hist.recommendations ||
-                  '';
+                const effectiveText = hist.rawContent || '';
                 const formattedDate = hist.startDateTime
                   ? formatDateInTimeZone(hist.startDateTime, timeZone, 'en')
+                  : hist.sessionDate
+                  ? formatDateInTimeZone(hist.sessionDate, timeZone, 'en')
                   : 'Past Session';
                 const formattedTime = hist.startDateTime
                   ? formatTimeInTimeZone(hist.startDateTime, timeZone)
@@ -4378,17 +4805,35 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
                 return (
                   <div
-                    key={hist.id}
+                    key={hist.optionKey}
                     className="p-4 bg-slate-50/90 rounded-2xl border border-[#607EC9]/30 space-y-2.5 shadow-2xs hover:border-[#607EC9] transition"
                   >
                     <div className="flex items-center justify-between gap-2 flex-wrap">
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 flex-wrap">
                         <span className="font-bold text-xs text-[#000035]">
-                          {hist.title || 'Live Coaching Session'}
+                          {hist.topic || 'Live Coaching Session'}
                         </span>
                         <span className="px-2 py-0.5 rounded-md bg-[#9AB4FF]/20 text-[#062863] text-[10px] font-mono font-bold">
                           {formattedDate} {formattedTime ? `• ${formattedTime}` : ''}
                         </span>
+                        {hist.approvalStatus === 'approved' ? (
+                          <span className="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-[10px] font-bold">
+                            ✓ Approved{hist.approvedVersionNumber ? ` (v${hist.approvedVersionNumber})` : ''}
+                          </span>
+                        ) : hist.approvalStatus === 'draft_in_progress' ? (
+                          <span className="px-2 py-0.5 rounded-full bg-amber-50 text-amber-800 border border-amber-200 text-[10px] font-bold">
+                            ✎ Draft
+                          </span>
+                        ) : (
+                          <span className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200 text-[10px] font-semibold">
+                            Raw Notes
+                          </span>
+                        )}
+                        {!hist.lesson && (
+                          <span className="px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200 text-[10px] font-semibold">
+                            Standalone Note
+                          </span>
+                        )}
                       </div>
 
                       <div className="flex items-center gap-1.5 flex-wrap">
@@ -4416,10 +4861,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                         <button
                           type="button"
                           onClick={() => {
-                            handleSessionChange(hist.id);
-                            if (hist.startDateTime && typeof hist.startDateTime === 'string') {
-                              setSessionDate(hist.startDateTime.split('T')[0]);
-                            }
+                            handleSelectUnifiedSession(hist.optionKey);
                             setActiveTab('editor');
                           }}
                           className="px-2.5 py-1 bg-[#1C4C96] hover:bg-[#062863] text-white rounded-lg text-xs font-bold transition cursor-pointer"

@@ -5499,39 +5499,116 @@ export async function saveSessionNotesToFirestoreServer(
   }
 }
 
+function buildSessionKeyCandidates(sessionKey: string, extraLessonId?: string): string[] {
+  const candidates: string[] = [];
+  const add = (val?: string) => {
+    const raw = (val || '').trim();
+    if (!raw) return;
+    if (!candidates.includes(raw)) candidates.push(raw);
+    const clean = raw.replace(/[^a-zA-Z0-9_-]/g, '_');
+    if (clean && !candidates.includes(clean)) candidates.push(clean);
+    const stripped = clean.replace(/^lesson_+/, '');
+    if (stripped) {
+      if (!candidates.includes(stripped)) candidates.push(stripped);
+      const prefixed = `lesson_${stripped}`;
+      if (!candidates.includes(prefixed)) candidates.push(prefixed);
+    }
+    const rawStripped = raw.replace(/^lesson_+/, '');
+    if (rawStripped && !candidates.includes(rawStripped)) {
+      candidates.push(rawStripped);
+    }
+  };
+  add(sessionKey);
+  if (extraLessonId) add(extraLessonId);
+  return candidates;
+}
+
 export async function fetchSessionNotesFromFirestoreServer(
   sessionKey: string,
-  options?: { studentUid?: string }
+  options?: { studentUid?: string; lessonId?: string }
 ): Promise<any | null> {
   const db = getFirestoreDb();
-  if (!db || !sessionKey) return null;
+  if (!db || (!sessionKey && !options?.lessonId)) return null;
   try {
-    const cleanKey = sessionKey.replace(/[^a-zA-Z0-9_-]/g, '_');
-    // 1. Canonical root collection session_notes/{sessionKey}
-    const snap = await db.collection('session_notes').doc(cleanKey).get();
-    if (snap && snap.exists) {
-      const d = snap.data();
-      if (d) {
-        return {
-          id: snap.id || cleanKey,
-          sessionKey: d.sessionKey || snap.id || cleanKey,
-          ...d,
-        };
-      }
-    }
-    // 2. Read-only legacy fallback in users/{studentUid}/session_notes/{sessionKey}
+    const candidates = buildSessionKeyCandidates(sessionKey || '', options?.lessonId);
     const studentUid = (options?.studentUid || '').trim();
-    if (studentUid && isValidCanonicalUid(studentUid) && cleanKey !== 'review_cycle') {
-      const legacySnap = await db.collection('users').doc(studentUid).collection('session_notes').doc(cleanKey).get();
-      if (legacySnap && legacySnap.exists) {
-        const ld = legacySnap.data();
-        if (ld && (!ld.studentUid || ld.studentUid === studentUid)) {
+
+    // 1. Canonical root collection session_notes/{docId} across key variants
+    for (const cand of candidates) {
+      const snap = await db.collection('session_notes').doc(cand).get();
+      if (snap && snap.exists) {
+        const d = snap.data();
+        if (d) {
           return {
-            id: legacySnap.id || cleanKey,
-            sessionKey: ld.sessionKey || legacySnap.id || cleanKey,
-            ...ld,
+            id: snap.id || cand,
+            sessionKey: d.sessionKey || snap.id || cand,
+            ...d,
           };
         }
+      }
+    }
+
+    // 2. Canonical root collection fallback query by lessonId field (for docs stored under session_{date}_{uid|email} with lessonId linked)
+    for (const cand of candidates) {
+      if (cand.startsWith('session_')) continue;
+      try {
+        const byLessonSnap = await db.collection('session_notes').where('lessonId', '==', cand).get();
+        if (byLessonSnap && !byLessonSnap.empty) {
+          const docs = byLessonSnap.docs.filter((docSnap: any) => Boolean(docSnap?.data()));
+          if (docs.length > 0) {
+            const matched =
+              (studentUid ? docs.find((docSnap: any) => docSnap.data()?.studentUid === studentUid) : null) ||
+              docs[0];
+            const d = matched.data();
+            return {
+              id: matched.id,
+              sessionKey: d.sessionKey || matched.id,
+              ...d,
+            };
+          }
+        }
+      } catch {}
+    }
+
+    // 3. Read-only legacy fallback in users/{studentUid}/session_notes/{sessionKey}
+    if (studentUid && isValidCanonicalUid(studentUid)) {
+      for (const cand of candidates) {
+        if (cand === 'review_cycle') continue;
+        const legacySnap = await db.collection('users').doc(studentUid).collection('session_notes').doc(cand).get();
+        if (legacySnap && legacySnap.exists) {
+          const ld = legacySnap.data();
+          if (ld && (!ld.studentUid || ld.studentUid === studentUid)) {
+            return {
+              id: legacySnap.id || cand,
+              sessionKey: ld.sessionKey || legacySnap.id || cand,
+              ...ld,
+            };
+          }
+        }
+      }
+      for (const cand of candidates) {
+        if (cand === 'review_cycle' || cand.startsWith('session_')) continue;
+        try {
+          const legacyByLesson = await db
+            .collection('users')
+            .doc(studentUid)
+            .collection('session_notes')
+            .where('lessonId', '==', cand)
+            .get();
+          if (legacyByLesson && !legacyByLesson.empty) {
+            const first = legacyByLesson.docs.find((docSnap: any) => docSnap.id !== 'review_cycle' && docSnap.data());
+            if (first) {
+              const ld = first.data();
+              if (!ld.studentUid || ld.studentUid === studentUid) {
+                return {
+                  id: first.id,
+                  sessionKey: ld.sessionKey || first.id,
+                  ...ld,
+                };
+              }
+            }
+          }
+        } catch {}
       }
     }
     return null;
@@ -5548,36 +5625,68 @@ export async function fetchSessionNotesFromFirestoreServer(
  * ARCH.2F.2C: Prioritizes canonical session_notes/{sessionKey}, with read-only legacy fallback
  * to users/{studentUid}/session_notes/{sessionKey} when absent from canonical collection.
  */
-export async function fetchSessionNotesForStudentServer(studentUid: string, sessionKey?: string): Promise<any[]> {
+export async function fetchSessionNotesForStudentServer(
+  studentUid: string,
+  sessionKey?: string,
+  options?: { lessonId?: string }
+): Promise<any[]> {
   const db = getFirestoreDb();
   if (!db || !studentUid || !isValidCanonicalUid(studentUid)) return [];
   try {
     const resultsMap = new Map<string, any>();
 
-    if (sessionKey) {
-      const cleanKey = sessionKey.replace(/[^a-zA-Z0-9_-]/g, '_');
-      // 1. Check canonical root collection session_notes first
-      const globalSnap = await db.collection('session_notes').doc(cleanKey).get();
-      if (globalSnap && globalSnap.exists) {
-        const d = globalSnap.data();
-        if (d && d.studentUid === studentUid) {
-          return [{
-            id: globalSnap.id,
-            ...d,
-            rawContent: d.rawContent || d.content,
-            content: d.content || d.rawContent,
-          }];
+    if (sessionKey || options?.lessonId) {
+      const candidates = buildSessionKeyCandidates(sessionKey || '', options?.lessonId);
+      // 1. Check canonical root collection session_notes first across key variants
+      for (const cand of candidates) {
+        const globalSnap = await db.collection('session_notes').doc(cand).get();
+        if (globalSnap && globalSnap.exists) {
+          const d = globalSnap.data();
+          if (d && d.studentUid === studentUid) {
+            return [{
+              id: globalSnap.id,
+              sessionKey: d.sessionKey || globalSnap.id,
+              ...d,
+              rawContent: d.rawContent || d.content,
+              content: d.content || d.rawContent,
+            }];
+          }
+          // Existing root doc belongs to a different student — stop immediately so RBAC returns 403
+          return [];
         }
-        return [];
       }
-      // 2. Read-only legacy fallback in user subcollection (when canonical doc does not exist)
-      if (cleanKey !== 'review_cycle') {
-        const snap = await db.collection('users').doc(studentUid).collection('session_notes').doc(cleanKey).get();
+
+      // 2. Fallback query in canonical root session_notes where lessonId matches
+      for (const cand of candidates) {
+        if (cand.startsWith('session_')) continue;
+        try {
+          const byLessonSnap = await db.collection('session_notes').where('lessonId', '==', cand).get();
+          if (byLessonSnap && !byLessonSnap.empty) {
+            const ownMatch = byLessonSnap.docs.find((docSnap: any) => docSnap.data()?.studentUid === studentUid);
+            if (ownMatch) {
+              const d = ownMatch.data();
+              return [{
+                id: ownMatch.id,
+                sessionKey: d.sessionKey || ownMatch.id,
+                ...d,
+                rawContent: d.rawContent || d.content,
+                content: d.content || d.rawContent,
+              }];
+            }
+          }
+        } catch {}
+      }
+
+      // 3. Read-only legacy fallback in user subcollection (when canonical doc does not exist)
+      for (const cand of candidates) {
+        if (cand === 'review_cycle') continue;
+        const snap = await db.collection('users').doc(studentUid).collection('session_notes').doc(cand).get();
         if (snap && snap.exists) {
           const d = snap.data();
           if (d && (d.studentUid === studentUid || !d.studentUid)) {
             return [{
               id: snap.id,
+              sessionKey: d.sessionKey || snap.id,
               ...d,
               rawContent: d.rawContent || d.content,
               content: d.content || d.rawContent,
@@ -5587,6 +5696,23 @@ export async function fetchSessionNotesForStudentServer(studentUid: string, sess
       }
       return [];
     }
+
+    const representedIds = new Set<string>();
+    const trackRepresented = (docId: string, d: any) => {
+      const addId = (val?: string) => {
+        const v = String(val || '').trim();
+        if (!v) return;
+        representedIds.add(v);
+        const clean = v.replace(/^lesson_+/, '');
+        if (clean) {
+          representedIds.add(clean);
+          representedIds.add(`lesson_${clean}`);
+        }
+      };
+      addId(docId);
+      addId(d?.sessionKey);
+      addId(d?.lessonId);
+    };
 
     // 1. Query canonical root session_notes collection by studentUid
     try {
@@ -5599,10 +5725,12 @@ export async function fetchSessionNotesForStudentServer(studentUid: string, sess
             const key = docSnap.id;
             resultsMap.set(key, {
               id: key,
+              sessionKey: d.sessionKey || key,
               ...d,
               rawContent,
               content: d.content || rawContent,
             });
+            trackRepresented(key, d);
           }
         });
       }
@@ -5622,14 +5750,24 @@ export async function fetchSessionNotesForStudentServer(studentUid: string, sess
           // In user subcollection: accept matches or historical records with no conflicting studentUid
           if (d && (d.studentUid === studentUid || !d.studentUid)) {
             const key = docSnap.id;
-            if (!resultsMap.has(key)) {
+            const cleanKey = key.replace(/^lesson_+/, '');
+            const cleanLesson = String(d.lessonId || '').replace(/^lesson_+/, '');
+            const alreadyInRoot =
+              resultsMap.has(key) ||
+              representedIds.has(key) ||
+              (cleanKey && representedIds.has(cleanKey)) ||
+              (d.lessonId && representedIds.has(String(d.lessonId))) ||
+              (cleanLesson && representedIds.has(cleanLesson));
+            if (!alreadyInRoot) {
               const rawContent = d.rawContent || d.content || '';
               resultsMap.set(key, {
                 id: key,
+                sessionKey: d.sessionKey || key,
                 ...d,
                 rawContent,
                 content: d.content || rawContent,
               });
+              trackRepresented(key, d);
             }
           }
         });
@@ -5710,6 +5848,16 @@ export async function fetchAllSessionNotesServer(): Promise<any[]> {
   if (!db) return [];
   const map = new Map<string, any>();
   const representedLessonIds = new Set<string>();
+  const addRepresentedId = (rawVal?: string) => {
+    const v = String(rawVal || '').trim();
+    if (!v) return;
+    representedLessonIds.add(v);
+    const clean = v.replace(/^lesson_+/, '');
+    if (clean) {
+      representedLessonIds.add(clean);
+      representedLessonIds.add(`lesson_${clean}`);
+    }
+  };
 
   try {
     const snap = await db.collection('session_notes').get();
@@ -5726,7 +5874,8 @@ export async function fetchAllSessionNotesServer(): Promise<any[]> {
           rawContent,
           content: d.content || rawContent,
         });
-        if (d.lessonId) representedLessonIds.add(String(d.lessonId));
+        addRepresentedId(key);
+        if (d.lessonId) addRepresentedId(String(d.lessonId));
       });
     }
   } catch (err) {
@@ -5743,9 +5892,15 @@ export async function fetchAllSessionNotesServer(): Promise<any[]> {
         const lId = docSnap.id || l?.id;
         const noteContent = l?.sessionNotesDocument || l?.liveNotes || l?.recommendations || '';
         if (!lId || !noteContent || !String(noteContent).trim()) return;
-        const cleanLessonId = String(lId).replace(/^lesson_/, '');
+        const cleanLessonId = String(lId).replace(/^lesson_+/, '');
         const prefixedKey = `lesson_${cleanLessonId}`;
-        if (!map.has(lId) && !map.has(prefixedKey) && !representedLessonIds.has(lId)) {
+        if (
+          !map.has(lId) &&
+          !map.has(prefixedKey) &&
+          !representedLessonIds.has(lId) &&
+          !representedLessonIds.has(cleanLessonId) &&
+          !representedLessonIds.has(prefixedKey)
+        ) {
           map.set(prefixedKey, normalizeLessonFallbackNote(lId, l));
         }
       });
@@ -5770,6 +5925,16 @@ export async function fetchSessionNotesByTeacherServer(teacherUid: string, teach
 
   const map = new Map<string, any>();
   const representedLessonIds = new Set<string>();
+  const addRepresentedId = (rawVal?: string) => {
+    const v = String(rawVal || '').trim();
+    if (!v) return;
+    representedLessonIds.add(v);
+    const clean = v.replace(/^lesson_+/, '');
+    if (clean) {
+      representedLessonIds.add(clean);
+      representedLessonIds.add(`lesson_${clean}`);
+    }
+  };
 
   const addNoteIfAuthorized = (docId: string, d: any) => {
     if (!d) return;
@@ -5788,7 +5953,8 @@ export async function fetchSessionNotesByTeacherServer(teacherUid: string, teach
       rawContent,
       content: d.content || rawContent,
     });
-    if (d.lessonId) representedLessonIds.add(String(d.lessonId));
+    addRepresentedId(docId);
+    if (d.lessonId) addRepresentedId(String(d.lessonId));
   };
 
   try {
@@ -5827,9 +5993,15 @@ export async function fetchSessionNotesByTeacherServer(teacherUid: string, teach
         const lId = docSnap.id || l?.id;
         const noteContent = l?.sessionNotesDocument || l?.liveNotes || l?.recommendations || '';
         if (!lId || !noteContent || !String(noteContent).trim()) return;
-        const cleanLessonId = String(lId).replace(/^lesson_/, '');
+        const cleanLessonId = String(lId).replace(/^lesson_+/, '');
         const prefixedKey = `lesson_${cleanLessonId}`;
-        if (!map.has(lId) && !map.has(prefixedKey) && !representedLessonIds.has(lId)) {
+        if (
+          !map.has(lId) &&
+          !map.has(prefixedKey) &&
+          !representedLessonIds.has(lId) &&
+          !representedLessonIds.has(cleanLessonId) &&
+          !representedLessonIds.has(prefixedKey)
+        ) {
           map.set(prefixedKey, normalizeLessonFallbackNote(lId, l));
         }
       });

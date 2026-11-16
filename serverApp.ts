@@ -9258,11 +9258,10 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
   }
   const sessionDate = dateMatch[0];
 
-  const sessionKey = lessonId
+  const explicitBodyId = (req.body?.id && typeof req.body.id === 'string' ? req.body.id.trim() : '');
+  const defaultSessionKey = lessonId
     ? lessonId
-    : (req.body?.id && typeof req.body.id === 'string' && req.body.id.trim()
-        ? req.body.id.trim()
-        : `session_${sessionDate}_${studentUid}`);
+    : (explicitBodyId || `session_${sessionDate}_${studentUid}`);
 
   // 8. Extract rawContent & content (mandatory)
   const rawContent = (
@@ -9288,10 +9287,22 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
   }
 
   // 8. Fetch existing document from Firestore to preserve approved version, original notes, and version history (FASE NF-DOC.2A)
+  // Resolve across explicitBodyId, defaultSessionKey, and lessonId variants so updates to historical docs never fork duplicates.
   let existingDoc: any = null;
   try {
-    existingDoc = await fetchSessionNotesFromFirestoreServer(sessionKey, { studentUid });
+    const candidateLookupKey = explicitBodyId || defaultSessionKey;
+    const fsCandidate = await fetchSessionNotesFromFirestoreServer(candidateLookupKey, {
+      studentUid,
+      lessonId: lessonId || undefined,
+    });
+    if (fsCandidate && (!fsCandidate.studentUid || fsCandidate.studentUid === studentUid)) {
+      existingDoc = fsCandidate;
+    }
   } catch {}
+
+  const sessionKey = (existingDoc?.id && typeof existingDoc.id === 'string' && existingDoc.id.trim())
+    ? existingDoc.id.trim()
+    : defaultSessionKey;
 
   const authorContext = {
     authorUid: teacherUid,
@@ -10004,24 +10015,21 @@ async function resolveApprovedTeacherForSessionNotes(
 async function resolveExistingSessionNoteWithKeyFallback(
   _db: any,
   rawSessionKey: string,
-  studentUid?: string
+  studentUid?: string,
+  explicitLessonId?: string
 ): Promise<{ effectiveKey: string; existingDoc: any | null }> {
-  const candidateKeys = [rawSessionKey];
-  if (rawSessionKey.startsWith('lesson_')) {
-    const stripped = rawSessionKey.replace(/^lesson_/, '').trim();
-    if (stripped && !candidateKeys.includes(stripped)) {
-      candidateKeys.push(stripped);
+  try {
+    const fsDoc = await fetchSessionNotesFromFirestoreServer(rawSessionKey, {
+      studentUid,
+      lessonId: explicitLessonId,
+    });
+    if (fsDoc) {
+      return {
+        effectiveKey: (fsDoc.id && String(fsDoc.id).trim()) || rawSessionKey,
+        existingDoc: fsDoc,
+      };
     }
-  }
-
-  for (const key of candidateKeys) {
-    try {
-      const fsDoc = await fetchSessionNotesFromFirestoreServer(key, { studentUid });
-      if (fsDoc) {
-        return { effectiveKey: key, existingDoc: fsDoc };
-      }
-    } catch {}
-  }
+  } catch {}
 
   return { effectiveKey: rawSessionKey, existingDoc: null };
 }
@@ -10069,7 +10077,12 @@ async function handleSessionNoteDraftInternal(req: any, res: any) {
     return res.status(400).json({ error: 'SESSION_ID_REQUIRED', code: 'SESSION_ID_REQUIRED', message: 'Session identifier is required.' });
   }
 
-  const { effectiveKey: targetSessionKey, existingDoc } = await resolveExistingSessionNoteWithKeyFallback(db, rawSessionKey);
+  const { effectiveKey: targetSessionKey, existingDoc } = await resolveExistingSessionNoteWithKeyFallback(
+    db,
+    rawSessionKey,
+    undefined,
+    typeof req.body?.lessonId === 'string' ? req.body.lessonId.trim() : undefined
+  );
 
   if (!existingDoc) {
     return res.status(404).json({ error: 'NOT_FOUND', code: 'SESSION_NOTE_NOT_FOUND', message: 'Session note document not found.' });
@@ -10212,7 +10225,12 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
     });
   }
 
-  const { effectiveKey: targetSessionKey, existingDoc } = await resolveExistingSessionNoteWithKeyFallback(db, rawSessionKey);
+  const { effectiveKey: targetSessionKey, existingDoc } = await resolveExistingSessionNoteWithKeyFallback(
+    db,
+    rawSessionKey,
+    undefined,
+    typeof req.body?.lessonId === 'string' ? req.body.lessonId.trim() : undefined
+  );
 
   if (!existingDoc) {
     return res.status(404).json({
@@ -10561,7 +10579,12 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
     });
   }
 
-  const { effectiveKey: targetSessionKey, existingDoc } = await resolveExistingSessionNoteWithKeyFallback(db, rawSessionKey);
+  const { effectiveKey: targetSessionKey, existingDoc } = await resolveExistingSessionNoteWithKeyFallback(
+    db,
+    rawSessionKey,
+    undefined,
+    typeof req.body?.lessonId === 'string' ? req.body.lessonId.trim() : undefined
+  );
 
   if (!existingDoc) {
     return res.status(404).json({
@@ -10788,10 +10811,12 @@ app.get('/api/session-notes/:id/versions', firebaseAuthMiddleware, async (req, r
   const targetSessionKey = decodeURIComponent(req.params.id).trim();
 
   const db = readDb();
+  const queryStudentUidForVersions = typeof req.query?.studentUid === 'string' ? req.query.studentUid.trim() : undefined;
   const { existingDoc } = await resolveExistingSessionNoteWithKeyFallback(
     db,
     targetSessionKey,
-    !isCallerAdmin ? callerUid : undefined
+    queryStudentUidForVersions || (!isCallerAdmin ? callerUid : undefined),
+    typeof req.query?.lessonId === 'string' ? req.query.lessonId.trim() : undefined
   );
 
   if (!existingDoc) {
@@ -11595,28 +11620,26 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
   // 2. Direct lookup by id or lessonId
   if (id || lessonId) {
     const targetKey = id || lessonId;
-    const cleanId = targetKey.replace(/^lesson_/, '');
+    const cleanId = targetKey.replace(/^lesson_+/, '');
 
     // First check Firestore canonical storage (and read-only legacy fallback when targetStudentUid present)
     let firestoreNote: any = null;
     if (targetStudentUid) {
       try {
-        const studentNotes = await fetchSessionNotesForStudentServer(targetStudentUid, targetKey);
+        const studentNotes = await fetchSessionNotesForStudentServer(targetStudentUid, targetKey, {
+          lessonId: lessonId || undefined,
+        });
         if (studentNotes && studentNotes.length > 0) {
           firestoreNote = studentNotes[0];
-        } else if (cleanId && cleanId !== targetKey) {
-          const cleanNotes = await fetchSessionNotesForStudentServer(targetStudentUid, cleanId);
-          if (cleanNotes && cleanNotes.length > 0) {
-            firestoreNote = cleanNotes[0];
-          }
         }
       } catch {}
     }
     if (!firestoreNote) {
       try {
-        firestoreNote =
-          (await fetchSessionNotesFromFirestoreServer(targetKey)) ||
-          (cleanId && cleanId !== targetKey ? await fetchSessionNotesFromFirestoreServer(cleanId) : null);
+        firestoreNote = await fetchSessionNotesFromFirestoreServer(targetKey, {
+          studentUid: targetStudentUid || undefined,
+          lessonId: lessonId || undefined,
+        });
       } catch {}
     }
 
@@ -11626,7 +11649,10 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
       try {
         const fs = getFirestoreDb();
         if (fs) {
-          const candidateIds = Array.from(new Set([targetKey, cleanId].filter(Boolean)));
+          const cleanLessonQuery = lessonId ? lessonId.replace(/^lesson_+/, '') : '';
+          const candidateIds = Array.from(
+            new Set([targetKey, cleanId, lessonId, cleanLessonQuery].filter(Boolean))
+          );
           for (const cid of candidateIds) {
             const lSnap = await fs.collection('lessons').doc(cid).get().catch(() => null);
             if (lSnap && lSnap.exists) {
@@ -11719,12 +11745,22 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
             const noteContent = l?.sessionNotesDocument || l?.liveNotes || l?.recommendations || '';
             if (noteContent && noteContent.trim()) {
               const lDate = l.sessionDate || (l.startDateTime ? l.startDateTime.split('T')[0] : '');
-              const cleanLessonId = lId ? String(lId).replace(/^lesson_/, '') : '';
+              const cleanLessonId = lId ? String(lId).replace(/^lesson_+/, '') : '';
               const mapKey = cleanLessonId ? `lesson_${cleanLessonId}` : (lId || `session_${lDate}_${targetStudentUid}`);
               const alreadyPresent =
                 map.has(mapKey) ||
                 map.has(lId) ||
-                Array.from(map.values()).some((ex: any) => ex.lessonId === lId || ex.id === lId || ex.id === mapKey);
+                (cleanLessonId ? map.has(cleanLessonId) : false) ||
+                Array.from(map.values()).some((ex: any) => {
+                  const exLessonClean = String(ex.lessonId || '').replace(/^lesson_+/, '');
+                  const exIdClean = String(ex.id || '').replace(/^lesson_+/, '');
+                  return (
+                    ex.lessonId === lId ||
+                    ex.id === lId ||
+                    ex.id === mapKey ||
+                    (cleanLessonId && (exLessonClean === cleanLessonId || exIdClean === cleanLessonId))
+                  );
+                });
               if (!alreadyPresent) {
                 map.set(mapKey, {
                   id: mapKey,
