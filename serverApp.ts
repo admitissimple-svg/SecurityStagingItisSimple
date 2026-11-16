@@ -9495,10 +9495,29 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
   }
 
   // 6. Lesson check (canonical Firestore lessons/{lessonId} across prefix variants)
-  const rawLessonId = (explicitLessonId || req.body?.lessonId || (req.body?.id && !String(req.body.id).startsWith('session_') ? req.body.id : '')).trim();
-  const { canonicalLessonId: lessonId, lesson } = fsDb && rawLessonId
-    ? await resolveCanonicalLessonServer(fsDb, rawLessonId)
-    : { canonicalLessonId: rawLessonId, lesson: null };
+  const explicitOrBodyLessonId = String(explicitLessonId || req.body?.lessonId || '').trim();
+  let rawLessonId = explicitOrBodyLessonId;
+  let lessonId = explicitOrBodyLessonId;
+  let lesson: any | null = null;
+
+  if (fsDb && explicitOrBodyLessonId) {
+    const resolved = await resolveCanonicalLessonServer(fsDb, explicitOrBodyLessonId);
+    lessonId = resolved.canonicalLessonId;
+    lesson = resolved.lesson;
+  } else if (
+    fsDb &&
+    req.body?.id &&
+    !String(req.body.id).startsWith('session_') &&
+    !String(req.body.id).startsWith('note_')
+  ) {
+    const candidateId = String(req.body.id).trim();
+    const resolved = await resolveCanonicalLessonServer(fsDb, candidateId);
+    if (resolved.lesson) {
+      rawLessonId = candidateId;
+      lessonId = resolved.canonicalLessonId;
+      lesson = resolved.lesson;
+    }
+  }
 
   const callerTeacherUids = new Set(
     [
@@ -9847,7 +9866,7 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
           const noteRef = fsDb.collection('session_notes').doc(targetSessionKey);
           tx.set(noteRef, sanitizedDoc, { merge: true });
 
-          if (sanitizedDoc.lessonId) {
+          if (sanitizedDoc.lessonId && txLessonData) {
             const lessonMirror = JSON.parse(JSON.stringify({
               canonicalSessionNoteKey: targetSessionKey,
               sessionNotesDocument: sanitizedDoc.content,
@@ -10639,7 +10658,7 @@ async function handleSessionNoteDraftInternal(req: any, res: any) {
   return withSessionNoteWriteLock(
     [rawSessionKey, rawLessonIdInput || undefined],
     async () => {
-      const lessonCand = rawLessonIdInput || (!rawSessionKey.startsWith('session_') ? rawSessionKey : '');
+      const lessonCand = rawLessonIdInput || (!rawSessionKey.startsWith('session_') && !rawSessionKey.startsWith('note_') ? rawSessionKey : '');
       const { canonicalLessonId } = lessonCand
         ? await resolveCanonicalLessonServer(fsDb, lessonCand)
         : { canonicalLessonId: '' };
@@ -10900,7 +10919,7 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
   }
 
   const rawLessonIdInput = typeof req.body?.lessonId === 'string' ? req.body.lessonId.trim() : '';
-  const lessonCand = rawLessonIdInput || (!rawSessionKey.startsWith('session_') ? rawSessionKey : '');
+  const lessonCand = rawLessonIdInput || (!rawSessionKey.startsWith('session_') && !rawSessionKey.startsWith('note_') ? rawSessionKey : '');
   const { canonicalLessonId } = lessonCand
     ? await resolveCanonicalLessonServer(fsDb, lessonCand)
     : { canonicalLessonId: '' };
@@ -11444,7 +11463,7 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
   return withSessionNoteWriteLock(
     [rawSessionKey, rawLessonIdInput || undefined],
     async () => {
-      const lessonCand = rawLessonIdInput || (!rawSessionKey.startsWith('session_') ? rawSessionKey : '');
+      const lessonCand = rawLessonIdInput || (!rawSessionKey.startsWith('session_') && !rawSessionKey.startsWith('note_') ? rawSessionKey : '');
       const { canonicalLessonId } = lessonCand
         ? await resolveCanonicalLessonServer(fsDb, lessonCand)
         : { canonicalLessonId: '' };
@@ -12704,6 +12723,7 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
     }
 
     let foundDoc = firestoreNote;
+    let isLessonFallbackDoc = false;
 
     if (!foundDoc) {
       try {
@@ -12739,6 +12759,7 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
                   driveLastSyncedAt: matchLesson.driveLastSyncedAt,
                   updatedAt: matchLesson.updatedAt || matchLesson.notesLastSavedAt || new Date().toISOString(),
                 };
+                isLessonFallbackDoc = true;
                 break;
               }
             }
@@ -12767,6 +12788,16 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
         }
       }
       const rawContent = foundDoc.rawContent || foundDoc.content || '';
+      if (isLessonFallbackDoc) {
+        return res.json({
+          ...foundDoc,
+          rawContent,
+          content: foundDoc.content || rawContent,
+          revisionToken: null,
+          contentRevision: 0,
+          isLessonFallback: true,
+        });
+      }
       return res.json(withResponseRevisionMetadata({
         ...foundDoc,
         rawContent,
@@ -12822,7 +12853,7 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
                   );
                 });
               if (!alreadyPresent) {
-                map.set(mapKey, withResponseRevisionMetadata({
+                map.set(mapKey, {
                   id: mapKey,
                   sessionKey: mapKey,
                   sessionDate: lDate,
@@ -12841,7 +12872,10 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
                   driveFolderName: l.driveFolderName,
                   driveLastSyncedAt: l.driveLastSyncedAt,
                   updatedAt: l.updatedAt || l.notesLastSavedAt || new Date().toISOString(),
-                }));
+                  revisionToken: null,
+                  contentRevision: 0,
+                  isLessonFallback: true,
+                });
               }
             }
           });
@@ -12880,8 +12914,20 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
     });
 
     if (sessionDate) {
-      const match = results.find((n: any) => n.sessionDate === sessionDate);
-      return res.json(match || null);
+      const standaloneOnly = String(req.query.standalone || '').toLowerCase() === 'true';
+      const dateMatches = results.filter((n: any) => {
+        if (!n || n.sessionDate !== sessionDate) return false;
+        if (isCallerTeacher && !isCallerAdmin) {
+          if (n.teacherUid && n.teacherUid !== callerUid) return false;
+        }
+        if (standaloneOnly && n.lessonId) return false;
+        return true;
+      });
+      const match =
+        dateMatches.find((n: any) => !n.lessonId) ||
+        (standaloneOnly ? null : dateMatches[0]) ||
+        null;
+      return res.json(match);
     }
 
     return res.json(results);

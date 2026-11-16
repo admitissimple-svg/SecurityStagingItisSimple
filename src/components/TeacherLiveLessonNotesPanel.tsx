@@ -275,6 +275,11 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   } | null>(null);
   const hasRevisionConflictRef = useRef<boolean>(false);
   const [isReloadingConflict, setIsReloadingConflict] = useState<boolean>(false);
+  const [showReloadConfirm, setShowReloadConfirm] = useState<boolean>(false);
+  const [isLoadingSessionNote, setIsLoadingSessionNote] = useState<boolean>(false);
+  const isLoadingSessionNoteRef = useRef<boolean>(false);
+  const activeContextSeqRef = useRef<number>(1);
+  const confirmedNoteIdRef = useRef<string>('');
 
   const applyServerRevisionToken = useCallback((token: string | null | undefined) => {
     const clean = typeof token === 'string' && token.trim() ? token.trim() : null;
@@ -285,6 +290,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   const clearRevisionConflict = useCallback(() => {
     hasRevisionConflictRef.current = false;
     setRevisionConflict(null);
+    setShowReloadConfirm(false);
   }, []);
 
   // FASE NF-DOC.2C: AI Transformation & Teacher Approval States
@@ -446,6 +452,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       prevStudentFilterRef.current = selectedStudentFilter;
 
       // Immediately clear previous student's document state on student switch
+      activeContextSeqRef.current += 1;
+      confirmedNoteIdRef.current = '';
       setSelectedSessionNoteKey('');
       setSelectedOptionKey('');
       loadedSessionKeyRef.current = '';
@@ -902,11 +910,16 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     });
   }, [teacherLessons, fetchedStudentNotes, selectedStudentEmail, studentResolution.uid, selectedLessonId]);
 
+  const activeTargetStudentUid = (studentResolution.uid || '').trim();
   const currentSessionKey = selectedSessionNoteKey
     ? `note_${selectedSessionNoteKey}`
     : selectedLessonId
     ? `lesson_${selectedLessonId}`
-    : `student_${(selectedStudentEmail || '').toLowerCase().trim()}_${sessionDate}`;
+    : activeTargetStudentUid
+    ? `standalone_ctx_${activeTargetStudentUid}_${sessionDate}`
+    : selectedStudentEmail
+    ? `pending_uid_${sessionDate}`
+    : '';
 
   // When selected lesson, standalone note, or student changes, populate document cleanly without triggering save loops
   useEffect(() => {
@@ -916,6 +929,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     }
     loadedSessionKeyRef.current = currentSessionKey;
     isInitialLoadRef.current = true;
+    const effectContextSeq = activeContextSeqRef.current;
 
     // Clear any pending autosave from previous session
     if (autoSaveTimeoutRef.current) {
@@ -935,6 +949,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     setSaveError(null);
     clearRevisionConflict();
     applyServerRevisionToken(null);
+    confirmedNoteIdRef.current = selectedSessionNoteKey || '';
 
     let initialContent = '';
     let initialTopic = '';
@@ -954,11 +969,18 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         const lClean = cleanStrip(selectedLessonId);
         return cleanStrip(n.lessonId) === lClean || cleanStrip(n.id) === lClean;
       }
+      if (!selectedLessonId && !selectedSessionNoteKey && sessionDate && !n.lessonId && n.sessionDate === sessionDate) {
+        if (activeTargetStudentUid && n.studentUid) {
+          return n.studentUid === activeTargetStudentUid;
+        }
+        return true;
+      }
       return false;
     });
 
     try {
       const currentLesson = teacherLessons.find((l) => l && l.id === selectedLessonId);
+      const isRealCachedNote = Boolean(matchedCachedNote && !(matchedCachedNote as any).isLessonFallback);
 
       if (matchedCachedNote) {
         if (matchedCachedNote.studentEmail && matchedCachedNote.studentEmail !== selectedStudentEmail) {
@@ -991,7 +1013,17 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           initialDriveUrl = matchedCachedNote.driveFileUrl || null;
           initialDriveSyncedAt = matchedCachedNote.driveLastSyncedAt || null;
         }
-        initialRevisionToken = deriveLegacyRevisionToken(matchedCachedNote);
+        if (isRealCachedNote) {
+          initialRevisionToken =
+            matchedCachedNote.revisionToken !== undefined
+              ? (matchedCachedNote.revisionToken || null)
+              : deriveLegacyRevisionToken(matchedCachedNote);
+          if (matchedCachedNote.id) {
+            confirmedNoteIdRef.current = matchedCachedNote.id;
+          }
+        } else {
+          initialRevisionToken = null;
+        }
       } else if (currentLesson) {
         if (currentLesson.studentEmail && currentLesson.studentEmail !== selectedStudentEmail) {
           setSelectedStudentEmail(currentLesson.studentEmail);
@@ -1030,52 +1062,14 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           initialDriveUrl = currentLesson.driveFileUrl || null;
           initialDriveSyncedAt = currentLesson.driveLastSyncedAt || null;
         }
-        initialRevisionToken = deriveLegacyRevisionToken(currentLesson);
+        // Never derive legacy token from LiveLesson object; wait for canonical session_notes verification
+        initialRevisionToken = null;
       } else if (selectedStudentEmail) {
-        const studentEmailLower = selectedStudentEmail.toLowerCase().trim();
-        const studentLessons = teacherLessons.filter(
-          (l) => l?.studentEmail && (l.studentEmail || '').toLowerCase().trim() === studentEmailLower
-        );
-        // Check if there is a lesson on this exact sessionDate with notes
-        const lessonOnDate = studentLessons.find(
-          (l) =>
-            l &&
-            l.startDateTime &&
-            typeof l.startDateTime === 'string' &&
-            l.startDateTime.startsWith(sessionDate) &&
-            (l.sessionNotesDocument || l.liveNotes || l.recommendations)
-        );
-
-        if (
-          lessonOnDate &&
-          !isOnlyOldTemplate(
-            lessonOnDate.sessionNotesDocument ||
-              lessonOnDate.liveNotes ||
-              lessonOnDate.recommendations ||
-              ''
-          )
-        ) {
-          initialTopic = lessonOnDate.title || 'Trial';
-          initialContent =
-            lessonOnDate.sessionNotesDocument ||
-            lessonOnDate.liveNotes ||
-            lessonOnDate.recommendations ||
-            '';
-          if (lessonOnDate.notesLastSavedAt) {
-            initialSavedAt = lessonOnDate.notesLastSavedAt;
-          }
-          if (lessonOnDate.driveFileId) {
-            initialDriveId = lessonOnDate.driveFileId;
-            initialDriveUrl = lessonOnDate.driveFileUrl || null;
-            initialDriveSyncedAt = lessonOnDate.driveLastSyncedAt || null;
-          }
-          initialRevisionToken = deriveLegacyRevisionToken(lessonOnDate);
-        } else {
-          const defaultTopic = 'Trial';
-          initialTopic = defaultTopic;
-          const sName = resolveStudentName(activeStudent, null, selectedStudentEmail);
-          initialContent = getStarterTemplate(sName, sessionDate, defaultTopic);
-        }
+        const defaultTopic = 'Trial';
+        initialTopic = defaultTopic;
+        const sName = resolveStudentName(activeStudent, null, selectedStudentEmail);
+        initialContent = getStarterTemplate(sName, sessionDate, defaultTopic);
+        initialRevisionToken = null;
       }
     } catch (err) {
       console.warn('TeacherLiveLessonNotesPanel: Error populating notes document', err);
@@ -1091,7 +1085,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     applyServerRevisionToken(initialRevisionToken);
 
     // Hydrate cached draft/approved/versions non-destructively when available immediately
-    if (matchedCachedNote) {
+    if (matchedCachedNote && !(matchedCachedNote as any).isLessonFallback) {
       if (matchedCachedNote.draftTransformation) {
         setDraftTransformation(matchedCachedNote.draftTransformation);
         if (matchedCachedNote.draftTransformation.transformation) {
@@ -1130,34 +1124,81 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       focusEditorAtEnd(editor);
     }
 
-    // Asynchronously verify with /api/session-notes to guarantee the full HTML, version history & revision token are retrieved
+    // Wait until canonical student UID (or explicit note/lesson key) is resolved before querying server
+    if (!selectedSessionNoteKey && !selectedLessonId && !activeTargetStudentUid) {
+      isLoadingSessionNoteRef.current = false;
+      setIsLoadingSessionNote(false);
+      isInitialLoadRef.current = false;
+      return;
+    }
+
+    // Asynchronously verify with /api/session-notes to guarantee the full HTML, version history & canonical revision token are retrieved
     let cancelled = false;
+    isLoadingSessionNoteRef.current = true;
+    setIsLoadingSessionNote(true);
+
     const fetchSavedNotes = async () => {
       try {
-        const lookupId = selectedSessionNoteKey || currentSessionKey;
+        const lookupId = selectedSessionNoteKey || '';
         const queryParams = new URLSearchParams();
         if (selectedLessonId) queryParams.set('lessonId', selectedLessonId);
         if (lookupId) queryParams.set('id', lookupId);
         if (selectedStudentEmail) queryParams.set('studentEmail', selectedStudentEmail);
-        const resolvedStudentUid = studentResolution.uid;
-        if (resolvedStudentUid) queryParams.set('studentUid', resolvedStudentUid);
+        if (activeTargetStudentUid) queryParams.set('studentUid', activeTargetStudentUid);
         if (sessionDate) queryParams.set('sessionDate', sessionDate);
+        if (!lookupId && !selectedLessonId) queryParams.set('standalone', 'true');
 
         const idToken = await auth.currentUser?.getIdToken().catch(() => null);
+        if (cancelled || effectContextSeq !== activeContextSeqRef.current) return;
+
         const res = await fetch(`/api/session-notes?${queryParams.toString()}`, {
           headers: {
             ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
           },
         });
-        if (res.ok && !cancelled) {
+        if (cancelled || effectContextSeq !== activeContextSeqRef.current) return;
+
+        if (res.ok) {
+          const data = await res.json();
+          if (cancelled || effectContextSeq !== activeContextSeqRef.current) return;
+
+          const rawCandidate = Array.isArray(data) ? data[0] : data;
+          const savedNote =
+            !selectedLessonId && !selectedSessionNoteKey && rawCandidate?.lessonId
+              ? null
+              : rawCandidate;
+
+          const isRealSavedDoc = Boolean(savedNote && !(savedNote as any).isLessonFallback);
+
           // Never clobber unsaved local edits or conflict state with background fetch results
           if (isDirtyRef.current || hasRevisionConflictRef.current) {
+            if (isRealSavedDoc && isDirtyRef.current && !hasRevisionConflictRef.current && !revisionTokenRef.current) {
+              const serverTok =
+                savedNote.revisionToken !== undefined
+                  ? (savedNote.revisionToken || null)
+                  : deriveLegacyRevisionToken(savedNote);
+              hasRevisionConflictRef.current = true;
+              setRevisionConflict({
+                message:
+                  'An existing version of this session note was found on the server while loading. Your local edits were preserved; review or reload before saving.',
+                serverRevisionToken: serverTok,
+              });
+            }
             return;
           }
-          const data = await res.json();
-          const savedNote = Array.isArray(data) ? data[0] : data;
+
           if (savedNote) {
-            applyServerRevisionToken(savedNote.revisionToken || deriveLegacyRevisionToken(savedNote));
+            const resolvedTok = isRealSavedDoc
+              ? (savedNote.revisionToken !== undefined
+                  ? (savedNote.revisionToken || null)
+                  : deriveLegacyRevisionToken(savedNote))
+              : null;
+            applyServerRevisionToken(resolvedTok);
+
+            if (isRealSavedDoc && savedNote.id) {
+              confirmedNoteIdRef.current = savedNote.id;
+            }
+
             const serverContent = savedNote.rawContent || savedNote.content || '';
             if (serverContent && serverContent.trim() && !isOnlyOldTemplate(serverContent)) {
               setNotesContent(serverContent);
@@ -1173,7 +1214,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               lastSavedContentRef.current = {
                 content: serverContent,
                 topic: savedNote.topic || initialTopic,
-                sessionKey: currentSessionKey,
+                sessionKey: savedNote.id || currentSessionKey,
               };
               const f = formatContentForEditor(serverContent);
               const ed = getActiveEditor();
@@ -1183,59 +1224,66 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               }
             }
 
-            // FASE NF-DOC.2C: Restore draft, approved versions and editable transformation
-            if (savedNote.draftTransformation) {
-              setDraftTransformation(savedNote.draftTransformation);
-              if (savedNote.draftTransformation.transformation) {
-                setEditableTransformation(JSON.parse(JSON.stringify(savedNote.draftTransformation.transformation)));
-              } else if (savedNote.lastApprovedVersion?.transformation) {
-                setEditableTransformation(JSON.parse(JSON.stringify(savedNote.lastApprovedVersion.transformation)));
+            if (isRealSavedDoc) {
+              // FASE NF-DOC.2C: Restore draft, approved versions and editable transformation
+              if (savedNote.draftTransformation) {
+                setDraftTransformation(savedNote.draftTransformation);
+                if (savedNote.draftTransformation.transformation) {
+                  setEditableTransformation(JSON.parse(JSON.stringify(savedNote.draftTransformation.transformation)));
+                } else if (savedNote.lastApprovedVersion?.transformation) {
+                  setEditableTransformation(JSON.parse(JSON.stringify(savedNote.lastApprovedVersion.transformation)));
+                }
+              } else {
+                setDraftTransformation(null);
               }
-            } else {
-              setDraftTransformation(null);
-            }
 
-            if (savedNote.lastApprovedVersion) {
-              setLastApprovedVersion(savedNote.lastApprovedVersion);
-              if (!savedNote.draftTransformation?.transformation && savedNote.lastApprovedVersion.transformation) {
-                setEditableTransformation(JSON.parse(JSON.stringify(savedNote.lastApprovedVersion.transformation)));
+              if (savedNote.lastApprovedVersion) {
+                setLastApprovedVersion(savedNote.lastApprovedVersion);
+                if (!savedNote.draftTransformation?.transformation && savedNote.lastApprovedVersion.transformation) {
+                  setEditableTransformation(JSON.parse(JSON.stringify(savedNote.lastApprovedVersion.transformation)));
+                }
+              } else {
+                setLastApprovedVersion(null);
+                if (!savedNote.draftTransformation) {
+                  setEditableTransformation(null);
+                }
               }
-            } else {
-              setLastApprovedVersion(null);
-              if (!savedNote.draftTransformation) {
-                setEditableTransformation(null);
-              }
-            }
 
-            setApprovalStatus(
-              savedNote.approvalStatus ||
-              (savedNote.lastApprovedVersion ? 'approved' : savedNote.draftTransformation ? 'draft_in_progress' : 'unapproved')
-            );
-            setVersionHistory(Array.isArray(savedNote.versionHistory) ? savedNote.versionHistory : []);
-
-            if (savedNote.id && savedNote.id !== selectedSessionNoteKey) {
-              loadedSessionKeyRef.current = `note_${savedNote.id}`;
-              lastSavedContentRef.current.sessionKey = `note_${savedNote.id}`;
-              setSelectedSessionNoteKey(savedNote.id);
-              setSelectedOptionKey((prev) =>
-                prev || (savedNote.lessonId ? `lesson_opt_${savedNote.lessonId}` : `note_opt_${savedNote.id}`)
+              setApprovalStatus(
+                savedNote.approvalStatus ||
+                (savedNote.lastApprovedVersion ? 'approved' : savedNote.draftTransformation ? 'draft_in_progress' : 'unapproved')
               );
+              setVersionHistory(Array.isArray(savedNote.versionHistory) ? savedNote.versionHistory : []);
+
+              if (savedNote.id && savedNote.id !== selectedSessionNoteKey) {
+                loadedSessionKeyRef.current = `note_${savedNote.id}`;
+                lastSavedContentRef.current.sessionKey = `note_${savedNote.id}`;
+                setSelectedSessionNoteKey(savedNote.id);
+                setSelectedOptionKey((prev) =>
+                  prev || (savedNote.lessonId ? `lesson_opt_${savedNote.lessonId}` : `note_opt_${savedNote.id}`)
+                );
+              }
             }
+          } else {
+            applyServerRevisionToken(null);
           }
+        } else if (res.status === 404 && !isDirtyRef.current && !hasRevisionConflictRef.current) {
+          applyServerRevisionToken(null);
         }
       } catch {
         // silent fallback to initialContent
+      } finally {
+        if (!cancelled && effectContextSeq === activeContextSeqRef.current) {
+          isLoadingSessionNoteRef.current = false;
+          setIsLoadingSessionNote(false);
+          isInitialLoadRef.current = false;
+        }
       }
     };
     fetchSavedNotes();
 
-    const timer = setTimeout(() => {
-      isInitialLoadRef.current = false;
-    }, 150);
-
     return () => {
       cancelled = true;
-      clearTimeout(timer);
     };
   }, [currentSessionKey]);
 
@@ -1270,13 +1318,22 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
   const handleSelectUnifiedSession = useCallback(
     (selectionValue: string) => {
-      // If dirty (and not blocked by unresolved 409 conflict), persist current document before switching
-      if (isDirtyRef.current && !hasRevisionConflictRef.current && lastSavedContentRef.current.sessionKey) {
+      // If dirty (and not blocked by unresolved 409 conflict or canonical loading), persist current document before switching
+      if (
+        isDirtyRef.current &&
+        !hasRevisionConflictRef.current &&
+        !isLoadingSessionNoteRef.current &&
+        lastSavedContentRef.current.sessionKey
+      ) {
         persistSessionDocumentRef.current?.(notesContent, topic, false);
       }
 
+      activeContextSeqRef.current += 1;
+      setShowReloadConfirm(false);
+
       if (!selectionValue) {
         const todayStr = getTodayDateStr();
+        confirmedNoteIdRef.current = '';
         setSelectedOptionKey('');
         setSelectedLessonId('');
         setSelectedSessionNoteKey('');
@@ -1299,9 +1356,14 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       );
 
       if (chosenOption) {
+        const nextNoteKey = chosenOption.noteDoc?.id || (chosenOption.lesson ? '' : chosenOption.sessionKey);
+        confirmedNoteIdRef.current =
+          chosenOption.noteDoc && !(chosenOption.noteDoc as any).isLessonFallback
+            ? (chosenOption.noteDoc.id || '')
+            : (chosenOption.lesson ? '' : chosenOption.sessionKey);
         setSelectedOptionKey(chosenOption.optionKey);
         setSelectedLessonId(chosenOption.lesson ? chosenOption.lesson.id : (chosenOption.lessonId || ''));
-        setSelectedSessionNoteKey(chosenOption.noteDoc?.id || (chosenOption.lesson ? '' : chosenOption.sessionKey));
+        setSelectedSessionNoteKey(nextNoteKey);
         if (chosenOption.studentEmail && chosenOption.studentEmail !== selectedStudentEmail) {
           setSelectedStudentEmail(chosenOption.studentEmail);
         }
@@ -1316,6 +1378,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       }
 
       // Direct fallback for legacy callers passing a raw lessonId
+      confirmedNoteIdRef.current = '';
       setSelectedOptionKey(`lesson_opt_${selectionValue}`);
       setSelectedLessonId(selectionValue);
       setSelectedSessionNoteKey('');
@@ -1336,7 +1399,17 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       }
       isDirtyRef.current = false;
     },
-    [unifiedStudentSessions, teacherLessons, selectedStudentEmail, notesContent, topic, updateDocumentHeader, getTodayDateStr]
+    [
+      unifiedStudentSessions,
+      teacherLessons,
+      selectedStudentEmail,
+      notesContent,
+      topic,
+      updateDocumentHeader,
+      getTodayDateStr,
+      applyServerRevisionToken,
+      clearRevisionConflict,
+    ]
   );
 
   const handleSessionChange = useCallback(
@@ -1349,6 +1422,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   const handleDateChange = useCallback(
     (newDate: string) => {
       if (!newDate) return;
+      activeContextSeqRef.current += 1;
+      setShowReloadConfirm(false);
       setSessionDate(newDate);
 
       // Check if there is an existing lesson OR standalone session_notes doc for this student on the chosen date
@@ -1363,9 +1438,14 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         );
         if (!alreadySelected) {
           const targetOpt = matchingOptions[0];
+          const nextNoteKey = targetOpt.noteDoc?.id || (targetOpt.lesson ? '' : targetOpt.sessionKey);
+          confirmedNoteIdRef.current =
+            targetOpt.noteDoc && !(targetOpt.noteDoc as any).isLessonFallback
+              ? (targetOpt.noteDoc.id || '')
+              : (targetOpt.lesson ? '' : targetOpt.sessionKey);
           setSelectedOptionKey(targetOpt.optionKey);
           setSelectedLessonId(targetOpt.lesson ? targetOpt.lesson.id : (targetOpt.lessonId || ''));
-          setSelectedSessionNoteKey(targetOpt.noteDoc?.id || (targetOpt.lesson ? '' : targetOpt.sessionKey));
+          setSelectedSessionNoteKey(nextNoteKey);
           if (targetOpt.topic) {
             setTopic(targetOpt.topic);
           }
@@ -1373,14 +1453,25 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         isDirtyRef.current = false;
       } else {
         // Independent: No existing session on this date, allow free custom date session on newDate without overwriting
+        confirmedNoteIdRef.current = '';
         isDirtyRef.current = true;
+        applyServerRevisionToken(null);
+        clearRevisionConflict();
         setSelectedOptionKey('');
         setSelectedLessonId('');
         setSelectedSessionNoteKey('');
         updateDocumentHeader(newDate);
       }
     },
-    [unifiedStudentSessions, selectedOptionKey, selectedLessonId, selectedSessionNoteKey, updateDocumentHeader]
+    [
+      unifiedStudentSessions,
+      selectedOptionKey,
+      selectedLessonId,
+      selectedSessionNoteKey,
+      updateDocumentHeader,
+      applyServerRevisionToken,
+      clearRevisionConflict,
+    ]
   );
 
   const handleResetDocument = () => {
@@ -1430,12 +1521,13 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       effDate: string,
       targetFileId?: string
     ) => {
-      if (isSavingRef.current || driveSyncStatus === 'syncing') return;
+      if (isSavingRef.current || driveSyncStatus === 'syncing' || isLoadingSessionNoteRef.current) return;
       if (studentResolution.error || !studentResolution.uid) {
         setDriveSyncStatus('error');
         setDriveSyncError(studentResolution.error || 'Identity Error: Canonical student UID missing. Google Drive sync blocked.');
         return;
       }
+      const requestContextSeq = activeContextSeqRef.current;
       isSavingRef.current = true;
       try {
         setDriveSyncStatus('syncing');
@@ -1448,11 +1540,18 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             activeToken = await connectGoogleDrive(currentAccount?.email || undefined);
           } catch (authErr: any) {
             console.warn('Google Drive auth error:', authErr);
-            setDriveSyncStatus('error');
-            setDriveSyncError('Google Drive authentication required. Please authorize your account.');
+            if (requestContextSeq === activeContextSeqRef.current) {
+              setDriveSyncStatus('error');
+              setDriveSyncError('Google Drive authentication required. Please authorize your account.');
+            }
             isSavingRef.current = false;
             return;
           }
+        }
+
+        if (requestContextSeq !== activeContextSeqRef.current) {
+          isSavingRef.current = false;
+          return;
         }
 
         if (!activeToken) {
@@ -1466,9 +1565,10 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         const targetLessonId = selectedLessonId || (activeLesson ? activeLesson.id : '');
         const cleanEmail = (selectedStudentEmail || '').toLowerCase().trim();
         const sessionKey =
+          confirmedNoteIdRef.current ||
           selectedSessionNoteKey ||
           targetLessonId ||
-          `session_${effDate}_${(resolvedStudentUid || (cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : 'notes'))}`;
+          `session_${effDate}_${resolvedStudentUid}`;
 
         let resolvedFileId = targetFileId || driveFileId || (activeLesson as any)?.driveFileId || undefined;
 
@@ -1491,6 +1591,10 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         if (res.requiresAuth) {
           try {
             activeToken = await connectGoogleDrive(currentAccount?.email || undefined);
+            if (requestContextSeq !== activeContextSeqRef.current) {
+              isSavingRef.current = false;
+              return;
+            }
             if (activeToken) {
               res = await syncSessionNotesToGoogleDrive({
                 accessToken: activeToken,
@@ -1507,11 +1611,18 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               });
             }
           } catch (reAuthErr) {
-            setDriveSyncStatus('error');
-            setDriveSyncError('Session expired. Please authorize Google Drive again.');
+            if (requestContextSeq === activeContextSeqRef.current) {
+              setDriveSyncStatus('error');
+              setDriveSyncError('Session expired. Please authorize Google Drive again.');
+            }
             isSavingRef.current = false;
             return;
           }
+        }
+
+        if (requestContextSeq !== activeContextSeqRef.current) {
+          isSavingRef.current = false;
+          return;
         }
 
         if (res.success && res.fileId) {
@@ -1566,6 +1677,9 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               }),
             });
             const syncData = await syncApiRes.json().catch(() => ({}));
+            if (requestContextSeq !== activeContextSeqRef.current) {
+              return;
+            }
             if (syncApiRes.ok) {
               driveServerSaveOk = true;
               clearRevisionConflict();
@@ -1574,6 +1688,9 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 syncData?.sessionNote?.revisionToken ||
                 deriveLegacyRevisionToken(syncData?.sessionNote)
               );
+              if (syncData?.sessionNote?.id) {
+                confirmedNoteIdRef.current = syncData.sessionNote.id;
+              }
               if (syncData?.sessionNote) {
                 upsertFetchedStudentNote(syncData.sessionNote);
               }
@@ -1598,20 +1715,22 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           } catch {}
 
           // 3. Update lesson state in parent (skip duplicate server write when /api/session-notes already succeeded, and never fallback on 409/403/4xx)
-          if (!driveDefinitiveError && targetLessonId && typeof onSaveLessonNotes === 'function') {
-            onSaveLessonNotes(
-              targetLessonId,
-              {
-                topic: topicToSync,
-                liveNotes: contentToSync,
-                recommendations: contentToSync,
-                sessionNotesDocument: contentToSync,
-                sessionDate: effDate,
-                baseRevisionToken: revisionTokenRef.current ?? null,
-                ...drivePayload,
-              },
-              { skipServerSave: driveServerSaveOk }
-            );
+          if (requestContextSeq === activeContextSeqRef.current) {
+            if (!driveDefinitiveError && targetLessonId && typeof onSaveLessonNotes === 'function') {
+              onSaveLessonNotes(
+                targetLessonId,
+                {
+                  topic: topicToSync,
+                  liveNotes: contentToSync,
+                  recommendations: contentToSync,
+                  sessionNotesDocument: contentToSync,
+                  sessionDate: effDate,
+                  baseRevisionToken: revisionTokenRef.current ?? null,
+                  ...drivePayload,
+                },
+                { skipServerSave: driveServerSaveOk }
+              );
+            }
           }
         } else {
           setDriveSyncStatus('error');
@@ -1619,8 +1738,10 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         }
       } catch (err: any) {
         console.warn('executeDriveSync error:', err);
-        setDriveSyncStatus('error');
-        setDriveSyncError(err?.message || 'Error communicating with Google Drive.');
+        if (requestContextSeq === activeContextSeqRef.current) {
+          setDriveSyncStatus('error');
+          setDriveSyncError(err?.message || 'Error communicating with Google Drive.');
+        }
       } finally {
         isSavingRef.current = false;
       }
@@ -1655,8 +1776,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       explicitSave: boolean = false,
       forceServerSync: boolean = false
     ): Promise<boolean> => {
-      // 1. Concurrency, conflict, and dirty guard
-      if (isSavingRef.current) {
+      // 1. Concurrency, loading, conflict, and dirty guard
+      if (isSavingRef.current || isLoadingSessionNoteRef.current) {
         return false;
       }
       if (!explicitSave && hasRevisionConflictRef.current) {
@@ -1675,16 +1796,18 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         return false;
       }
 
+      const requestContextSeq = activeContextSeqRef.current;
       const resolvedStudentUid = studentResolution.uid;
       const targetLessonId = selectedLessonId || (activeLesson ? activeLesson.id : '');
       const cleanEmail = (selectedStudentEmail || '').toLowerCase().trim();
       const effectiveDate = sessionDate || new Date().toISOString().split('T')[0];
       const sessionKey =
+        confirmedNoteIdRef.current ||
         selectedSessionNoteKey ||
         targetLessonId ||
-        `session_${effectiveDate}_${(resolvedStudentUid || (cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : 'notes'))}`;
+        `session_${effectiveDate}_${resolvedStudentUid}`;
 
-      if (!cleanEmail && !targetLessonId && !selectedSessionNoteKey) return false;
+      if (!resolvedStudentUid && !targetLessonId && !selectedSessionNoteKey) return false;
 
       // If not an explicit manual save or forced pre-AI sync, require the dirty flag and ensure content actually changed
       if (!explicitSave && !forceServerSync) {
@@ -1711,6 +1834,9 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         let definitiveServerError = false;
         try {
           const idToken = await auth.currentUser?.getIdToken().catch(() => null);
+          if (requestContextSeq !== activeContextSeqRef.current) {
+            return false;
+          }
           const resolvedTeacherUid = (currentAccount?.uid || auth.currentUser?.uid || '').trim();
           const tokenToSend = revisionTokenRef.current ?? null;
 
@@ -1741,9 +1867,15 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               skipDriveSync: true,
             }),
           });
+          if (requestContextSeq !== activeContextSeqRef.current) {
+            return false;
+          }
           if (!apiRes.ok) {
             serverSaveOk = false;
             const errData = await apiRes.json().catch(() => ({}));
+            if (requestContextSeq !== activeContextSeqRef.current) {
+              return false;
+            }
             if (apiRes.status === 409) {
               definitiveServerError = true;
               hasRevisionConflictRef.current = true;
@@ -1765,6 +1897,9 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             }
           } else {
             const savedPayload = await apiRes.json().catch(() => null);
+            if (requestContextSeq !== activeContextSeqRef.current) {
+              return false;
+            }
             const confirmedKey = savedPayload?.sessionNote?.id || sessionKey;
             isDirtyRef.current = false;
             lastSavedContentRef.current = {
@@ -1781,6 +1916,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
             if (savedPayload?.sessionNote) {
               if (savedPayload.sessionNote.id) {
+                confirmedNoteIdRef.current = savedPayload.sessionNote.id;
                 loadedSessionKeyRef.current = `note_${savedPayload.sessionNote.id}`;
                 setSelectedSessionNoteKey(savedPayload.sessionNote.id);
                 if (!selectedLessonId && !selectedOptionKey) {
@@ -1799,6 +1935,10 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         } catch (err) {
           serverSaveOk = false;
           console.warn('Server /api/session-notes notice:', err);
+        }
+
+        if (requestContextSeq !== activeContextSeqRef.current) {
+          return false;
         }
 
         // 3. Update lesson state in parent (skip duplicate server write when /api/session-notes already succeeded, and NEVER trigger fallback on 409/403/4xx)
@@ -1831,7 +1971,9 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         return serverSaveOk;
       } catch (err: any) {
         console.error('persistSessionDocument error:', err);
-        setSavedSuccessBanner(false);
+        if (requestContextSeq === activeContextSeqRef.current) {
+          setSavedSuccessBanner(false);
+        }
         return false;
       } finally {
         isSavingRef.current = false;
@@ -1861,26 +2003,39 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
   const handleReloadServerVersion = useCallback(async () => {
     if (isReloadingConflict) return;
+    const requestContextSeq = activeContextSeqRef.current;
     setIsReloadingConflict(true);
     try {
-      const lookupId = selectedSessionNoteKey || currentSessionKey;
+      const lookupId = confirmedNoteIdRef.current || selectedSessionNoteKey || '';
       const queryParams = new URLSearchParams();
       if (selectedLessonId) queryParams.set('lessonId', selectedLessonId);
       if (lookupId) queryParams.set('id', lookupId);
       if (selectedStudentEmail) queryParams.set('studentEmail', selectedStudentEmail);
       if (studentResolution.uid) queryParams.set('studentUid', studentResolution.uid);
       if (sessionDate) queryParams.set('sessionDate', sessionDate);
+      if (!lookupId && !selectedLessonId) queryParams.set('standalone', 'true');
 
       const idToken = await auth.currentUser?.getIdToken().catch(() => null);
+      if (requestContextSeq !== activeContextSeqRef.current) return;
+
       const res = await fetch(`/api/session-notes?${queryParams.toString()}`, {
         headers: {
           ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
         },
       });
+      if (requestContextSeq !== activeContextSeqRef.current) return;
+
       if (res.ok) {
         const data = await res.json();
-        const savedNote = Array.isArray(data) ? data[0] : data;
+        if (requestContextSeq !== activeContextSeqRef.current) return;
+
+        const rawCandidate = Array.isArray(data) ? data[0] : data;
+        const savedNote =
+          !selectedLessonId && !selectedSessionNoteKey && rawCandidate?.lessonId
+            ? null
+            : rawCandidate;
         if (savedNote) {
+          const isRealSavedDoc = !(savedNote as any).isLessonFallback;
           const serverContent = savedNote.rawContent || savedNote.content || '';
           const serverTopic = savedNote.topic || topic;
           setNotesContent(serverContent);
@@ -1892,7 +2047,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             ed.innerHTML = f;
             lastInternalHtmlRef.current = f;
           }
-          if (savedNote.draftTransformation) {
+          if (isRealSavedDoc && savedNote.draftTransformation) {
             setDraftTransformation(savedNote.draftTransformation);
             if (savedNote.draftTransformation.transformation) {
               setEditableTransformation(JSON.parse(JSON.stringify(savedNote.draftTransformation.transformation)));
@@ -1900,7 +2055,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           } else {
             setDraftTransformation(null);
           }
-          if (savedNote.lastApprovedVersion) {
+          if (isRealSavedDoc && savedNote.lastApprovedVersion) {
             setLastApprovedVersion(savedNote.lastApprovedVersion);
             if (!savedNote.draftTransformation?.transformation && savedNote.lastApprovedVersion.transformation) {
               setEditableTransformation(JSON.parse(JSON.stringify(savedNote.lastApprovedVersion.transformation)));
@@ -1908,7 +2063,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           } else {
             setLastApprovedVersion(null);
           }
-          if (Array.isArray(savedNote.versionHistory)) {
+          if (isRealSavedDoc && Array.isArray(savedNote.versionHistory)) {
             setVersionHistory(savedNote.versionHistory);
           }
           isDirtyRef.current = false;
@@ -1917,11 +2072,28 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             topic: serverTopic,
             sessionKey: savedNote.id || currentSessionKey,
           };
-          applyServerRevisionToken(savedNote.revisionToken || deriveLegacyRevisionToken(savedNote));
+          const resolvedTok = isRealSavedDoc
+            ? (savedNote.revisionToken !== undefined
+                ? (savedNote.revisionToken || null)
+                : deriveLegacyRevisionToken(savedNote))
+            : null;
+          applyServerRevisionToken(resolvedTok);
+          if (isRealSavedDoc && savedNote.id) {
+            confirmedNoteIdRef.current = savedNote.id;
+            loadedSessionKeyRef.current = `note_${savedNote.id}`;
+            if (savedNote.id !== selectedSessionNoteKey) {
+              setSelectedSessionNoteKey(savedNote.id);
+              setSelectedOptionKey((prev) =>
+                prev || (savedNote.lessonId ? `lesson_opt_${savedNote.lessonId}` : `note_opt_${savedNote.id}`)
+              );
+            }
+          }
           clearRevisionConflict();
           setSaveError(null);
           setAiError(null);
-          upsertFetchedStudentNote(savedNote);
+          if (isRealSavedDoc) {
+            upsertFetchedStudentNote(savedNote);
+          }
         }
       }
     } catch {
@@ -1946,15 +2118,17 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   ]);
 
   const resolveCanonicalServerSessionKey = useCallback(() => {
+    if (confirmedNoteIdRef.current) {
+      return confirmedNoteIdRef.current;
+    }
     if (selectedSessionNoteKey) {
       return selectedSessionNoteKey;
     }
     const targetLessonId = selectedLessonId || (activeLesson ? activeLesson.id : '');
     if (targetLessonId) return targetLessonId;
-    const cleanEmail = (selectedStudentEmail || '').toLowerCase().trim();
     const effectiveDate = sessionDate || new Date().toISOString().split('T')[0];
-    return `session_${effectiveDate}_${(studentResolution.uid || (cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : 'notes'))}`;
-  }, [selectedSessionNoteKey, selectedLessonId, activeLesson, selectedStudentEmail, studentResolution.uid, sessionDate]);
+    return studentResolution.uid ? `session_${effectiveDate}_${studentResolution.uid}` : '';
+  }, [selectedSessionNoteKey, selectedLessonId, activeLesson, studentResolution.uid, sessionDate]);
 
   const compactNotesText = useMemo(() => convertNotesHtmlToCompactText(notesContent), [notesContent]);
   const wordCount = useMemo(
@@ -1976,7 +2150,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
    * 5. Preserves original content and last approved version upon failure
    */
   const handleApplyAi = useCallback(async () => {
-    if (isApplyingAi || isSaving) return;
+    if (isApplyingAi || isSaving || isLoadingSessionNoteRef.current) return;
 
     if (!notesContent || !notesContent.trim() || !compactNotesText.trim()) {
       setAiError('Notes are empty. Write session notes with pedagogical terms before applying AI.');
@@ -1990,6 +2164,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       return;
     }
 
+    const requestContextSeq = activeContextSeqRef.current;
     setAiError(null);
     setAiSuccessMessage(null);
     setIsApplyingAi(true);
@@ -1997,6 +2172,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     try {
       // 1. Mandatory: Save original notes first to ensure server is in sync
       const savedOk = await persistSessionDocument(notesContent, topic, false, true);
+      if (requestContextSeq !== activeContextSeqRef.current) return;
       if (!savedOk) {
         setAiError('Failed to save original notes before executing transformation.');
         setIsApplyingAi(false);
@@ -2004,6 +2180,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       }
 
       const idToken = await auth.currentUser?.getIdToken().catch(() => null);
+      if (requestContextSeq !== activeContextSeqRef.current) return;
+
       const resolvedTeacherUid = (currentAccount?.uid || (currentAccount as any)?.id || auth.currentUser?.uid || '').trim();
       const resolvedStudentUid = studentResolution.uid;
       const targetKey = resolveCanonicalServerSessionKey();
@@ -2026,8 +2204,10 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           baseRevisionToken: revisionTokenRef.current ?? null,
         }),
       });
+      if (requestContextSeq !== activeContextSeqRef.current) return;
 
       const data = await res.json().catch(() => ({}));
+      if (requestContextSeq !== activeContextSeqRef.current) return;
 
       if (!res.ok) {
         const errMsg = data.message || data.error || 'Pedagogical transformation via AI failed. Original document was preserved intact without publishing.';
@@ -2061,7 +2241,9 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         setAiError('Unexpected AI response. The original document was kept intact.');
       }
     } catch (err: any) {
-      setAiError(err.message || 'Connection error when calling the AI service.');
+      if (requestContextSeq === activeContextSeqRef.current) {
+        setAiError(err.message || 'Connection error when calling the AI service.');
+      }
     } finally {
       setIsApplyingAi(false);
     }
@@ -2084,7 +2266,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
    * Persist edited AI draft to Firestore via POST /api/session-notes/:id/draft
    */
   const handleSaveDraft = useCallback(async () => {
-    if (isSavingDraft || isApproving || !editableTransformation) return;
+    if (isSavingDraft || isApproving || !editableTransformation || isLoadingSessionNoteRef.current) return;
 
     if (isTransformationOutdated) {
       setAiError(
@@ -2095,12 +2277,15 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       return;
     }
 
+    const requestContextSeq = activeContextSeqRef.current;
     setAiError(null);
     setAiSuccessMessage(null);
     setIsSavingDraft(true);
 
     try {
       const idToken = await auth.currentUser?.getIdToken().catch(() => null);
+      if (requestContextSeq !== activeContextSeqRef.current) return;
+
       const resolvedTeacherUid = (currentAccount?.uid || (currentAccount as any)?.id || auth.currentUser?.uid || '').trim();
       const resolvedStudentUid = studentResolution.uid;
       const targetKey = resolveCanonicalServerSessionKey();
@@ -2122,8 +2307,11 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           changeSummary: 'Teacher saved draft edits prior to publishing',
         }),
       });
+      if (requestContextSeq !== activeContextSeqRef.current) return;
 
       const data = await res.json().catch(() => ({}));
+      if (requestContextSeq !== activeContextSeqRef.current) return;
+
       if (!res.ok) {
         const errMsg = data.message || data.error || 'Failed to save pedagogical draft.';
         setAiError(errMsg);
@@ -2155,7 +2343,9 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         setAiSuccessMessage('Draft edits saved to Firestore.');
       }
     } catch (err: any) {
-      setAiError(err.message || 'Connection error while saving draft.');
+      if (requestContextSeq === activeContextSeqRef.current) {
+        setAiError(err.message || 'Connection error while saving draft.');
+      }
     } finally {
       setIsSavingDraft(false);
     }
@@ -2179,17 +2369,23 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     setShowVersionHistory(nextOpen);
     if (!nextOpen) return;
 
+    const requestContextSeq = activeContextSeqRef.current;
     setIsLoadingVersions(true);
     try {
       const idToken = await auth.currentUser?.getIdToken().catch(() => null);
+      if (requestContextSeq !== activeContextSeqRef.current) return;
+
       const targetKey = resolveCanonicalServerSessionKey();
       const res = await fetch(`/api/session-notes/${encodeURIComponent(targetKey)}/versions`, {
         headers: {
           ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
         },
       });
+      if (requestContextSeq !== activeContextSeqRef.current) return;
+
       if (res.ok) {
         const data = await res.json().catch(() => ({}));
+        if (requestContextSeq !== activeContextSeqRef.current) return;
         if (Array.isArray(data?.versionHistory)) {
           setVersionHistory(data.versionHistory);
         }
@@ -2209,7 +2405,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
    * 4. Clears active draft and updates approval status
    */
   const handleApproveAndPublish = useCallback(async () => {
-    if (isApproving || !editableTransformation) return;
+    if (isApproving || !editableTransformation || isLoadingSessionNoteRef.current) return;
 
     if (isTransformationOutdated) {
       setAiError(
@@ -2220,12 +2416,15 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       return;
     }
 
+    const requestContextSeq = activeContextSeqRef.current;
     setAiError(null);
     setAiSuccessMessage(null);
     setIsApproving(true);
 
     try {
       const idToken = await auth.currentUser?.getIdToken().catch(() => null);
+      if (requestContextSeq !== activeContextSeqRef.current) return;
+
       const resolvedTeacherUid = (currentAccount?.uid || (currentAccount as any)?.id || auth.currentUser?.uid || '').trim();
       const resolvedStudentUid = studentResolution.uid;
       const targetKey = resolveCanonicalServerSessionKey();
@@ -2247,8 +2446,10 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           changeSummary: 'Teacher reviewed and approved pedagogical notes for student',
         }),
       });
+      if (requestContextSeq !== activeContextSeqRef.current) return;
 
       const data = await res.json().catch(() => ({}));
+      if (requestContextSeq !== activeContextSeqRef.current) return;
 
       if (!res.ok) {
         const errMsg = data.message || data.error || 'Failed to approve pedagogical report.';
@@ -2282,7 +2483,9 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         window.dispatchEvent(new CustomEvent('native-notes-updated'));
       }
     } catch (err: any) {
-      setAiError(err.message || 'Connection error while approving report.');
+      if (requestContextSeq === activeContextSeqRef.current) {
+        setAiError(err.message || 'Connection error while approving report.');
+      }
     } finally {
       setIsApproving(false);
     }
@@ -2519,7 +2722,12 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         lastInternalHtmlRef.current = currentHtml;
         setNotesContent(currentHtml);
       }
-      if (isDirtyRef.current && !isSavingRef.current && !hasRevisionConflictRef.current) {
+      if (
+        isDirtyRef.current &&
+        !isSavingRef.current &&
+        !hasRevisionConflictRef.current &&
+        !isLoadingSessionNoteRef.current
+      ) {
         if (autoSaveTimeoutRef.current) {
           clearTimeout(autoSaveTimeoutRef.current);
           autoSaveTimeoutRef.current = null;
@@ -2590,7 +2798,14 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
   // Controlled debounced auto-save (2.5 seconds after user stops typing)
   useEffect(() => {
-    if (isInitialLoadRef.current || !isDirtyRef.current || hasRevisionConflictRef.current) return;
+    if (
+      isInitialLoadRef.current ||
+      !isDirtyRef.current ||
+      hasRevisionConflictRef.current ||
+      isLoadingSessionNoteRef.current
+    ) {
+      return;
+    }
 
     if (autoSaveTimeoutRef.current) {
       clearTimeout(autoSaveTimeoutRef.current);
@@ -2601,6 +2816,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       if (!isDirtyRef.current) return;
       if (isSavingRef.current) return;
       if (hasRevisionConflictRef.current) return;
+      if (isLoadingSessionNoteRef.current) return;
 
       persistSessionDocumentRef.current?.(notesContent, topic, false);
     }, 2500);
@@ -4245,24 +4461,62 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           {revisionConflict && (
             <div
               data-testid="revision-conflict-banner"
-              className="p-3.5 bg-amber-50 border border-amber-300 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-amber-950 text-xs font-semibold shadow-xs animate-in fade-in duration-200"
+              className="p-3.5 bg-amber-50 border border-amber-300 rounded-2xl flex flex-col gap-3 text-amber-950 text-xs font-semibold shadow-xs animate-in fade-in duration-200"
             >
-              <div className="flex items-start gap-2.5 flex-1">
-                <AlertCircle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
-                <div>
-                  <span className="font-bold">Revision Conflict (409): </span>
-                  <span>{revisionConflict.message}</span>
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="flex items-start gap-2.5 flex-1">
+                  <AlertCircle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-bold">Revision Conflict (409): </span>
+                    <span>{revisionConflict.message}</span>
+                  </div>
                 </div>
+                {!showReloadConfirm && (
+                  <button
+                    type="button"
+                    data-testid="btn-reload-server-version"
+                    disabled={isReloadingConflict}
+                    onClick={() => setShowReloadConfirm(true)}
+                    className="px-3 py-1.5 rounded-xl bg-amber-700 hover:bg-amber-800 text-white text-xs font-bold shrink-0 transition cursor-pointer disabled:opacity-50"
+                  >
+                    {isReloadingConflict ? 'Reloading...' : 'Reload Server Version'}
+                  </button>
+                )}
               </div>
-              <button
-                type="button"
-                data-testid="btn-reload-server-version"
-                disabled={isReloadingConflict}
-                onClick={handleReloadServerVersion}
-                className="px-3 py-1.5 rounded-xl bg-amber-700 hover:bg-amber-800 text-white text-xs font-bold shrink-0 transition cursor-pointer disabled:opacity-50"
-              >
-                {isReloadingConflict ? 'Reloading...' : 'Reload Server Version'}
-              </button>
+
+              {showReloadConfirm && (
+                <div
+                  data-testid="reload-server-confirm"
+                  className="p-3 bg-white border border-amber-300 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-2.5"
+                >
+                  <span className="text-amber-950 text-xs font-bold">
+                    Discard your unsaved local changes and load the server version?
+                  </span>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      data-testid="btn-cancel-reload-server-version"
+                      disabled={isReloadingConflict}
+                      onClick={() => setShowReloadConfirm(false)}
+                      className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold transition cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="btn-confirm-reload-server-version"
+                      disabled={isReloadingConflict}
+                      onClick={() => {
+                        setShowReloadConfirm(false);
+                        handleReloadServerVersion();
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-rose-700 hover:bg-rose-800 text-white text-xs font-bold transition cursor-pointer disabled:opacity-50"
+                    >
+                      {isReloadingConflict ? 'Reloading...' : 'Confirm Reload'}
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -4602,7 +4856,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 <button
                   type="button"
                   id="btn-apply-ai-top"
-                  disabled={isApplyingAi || isSaving || isOverCharLimit}
+                  disabled={isApplyingAi || isSaving || isLoadingSessionNote || isOverCharLimit}
                   onClick={handleApplyAi}
                   className="px-3 py-1.5 bg-white hover:bg-slate-50 text-[#1C4C96] border border-[#1C4C96]/40 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer shadow-2xs disabled:opacity-50 disabled:cursor-not-allowed"
                   title={
@@ -5024,10 +5278,10 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               <button
                 type="button"
                 id="btn-save-notes"
-                disabled={isSaving}
+                disabled={isSaving || isLoadingSessionNote}
                 onClick={() => persistSessionDocument(notesContent, topic, true)}
                 className={`px-5 py-2.5 rounded-xl text-xs font-bold transition flex items-center gap-2 shadow-xs border border-[#9AB4FF]/40 active:scale-98 ${
-                  isSaving
+                  isSaving || isLoadingSessionNote
                     ? 'bg-[#1C4C96]/70 text-white cursor-not-allowed'
                     : 'bg-[#1C4C96] hover:bg-[#062863] text-white cursor-pointer'
                 }`}
@@ -5038,13 +5292,13 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 ) : (
                   <Save className="w-4 h-4 text-[#9AB4FF]" />
                 )}
-                <span>{isSaving ? 'Saving...' : 'Save Notes'}</span>
+                <span>{isSaving ? 'Saving...' : isLoadingSessionNote ? 'Loading Note...' : 'Save Notes'}</span>
               </button>
 
               <button
                 type="button"
                 id="btn-apply-ai-bottom"
-                disabled={isApplyingAi || isSaving || isOverCharLimit}
+                disabled={isApplyingAi || isSaving || isLoadingSessionNote || isOverCharLimit}
                 onClick={handleApplyAi}
                 className="px-5 py-2.5 bg-white hover:bg-slate-50 text-[#1C4C96] border border-[#1C4C96]/40 rounded-xl text-xs font-bold transition flex items-center gap-2 cursor-pointer shadow-xs disabled:opacity-50 disabled:cursor-not-allowed active:scale-98"
                 title={
