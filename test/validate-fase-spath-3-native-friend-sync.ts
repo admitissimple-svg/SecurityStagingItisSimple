@@ -32,6 +32,7 @@ import {
   getDateForDayInCurrentWeek,
   getIsoDateInTimeZone,
 } from '../src/utils/timezone';
+import { evaluateTutorLiveCompletedForDay } from '../src/utils/tutorLiveCycle';
 
 let totalTests = 0;
 let passedTests = 0;
@@ -75,29 +76,15 @@ function evaluateSPathPillar(
   dayKey: DayOfWeek,
   activeWeekRefDate: Date = new Date()
 ): boolean {
-  if (!Array.isArray(lessons) || lessons.length === 0) return false;
-
-  const cleanStudentUid = (studentUid || '').trim();
-  const cleanStudentEmail = (studentEmail || '').toLowerCase().trim();
-  const studentTimezone = userProfile?.timezone || DEFAULT_STUDENT_TIMEZONE;
-  const targetDayCivilDate = getDateForDayInCurrentWeek(dayKey, activeWeekRefDate, studentTimezone);
-
-  return lessons.some((l) => {
-    if (!l) return false;
-    if (l.status !== 'completed') return false;
-    if (Boolean(l.cancelledAt) || (l.status as string) === 'cancelled' || (l.status as string) === 'canceled') {
-      return false;
-    }
-    const lStudentUid = (l.studentUid || '').trim();
-    const lStudentEmail = (l.studentEmail || '').toLowerCase().trim();
-    const isStudentMatch =
-      (cleanStudentUid && lStudentUid && cleanStudentUid === lStudentUid) ||
-      (cleanStudentEmail && lStudentEmail && cleanStudentEmail === lStudentEmail);
-    if (!isStudentMatch) return false;
-    if (!l.startDateTime) return false;
-    const lessonCivilDate = getIsoDateInTimeZone(l.startDateTime, studentTimezone);
-    return lessonCivilDate === targetDayCivilDate;
-  });
+  return evaluateTutorLiveCompletedForDay(
+    dayKey,
+    lessons,
+    studentUid,
+    studentEmail,
+    userProfile,
+    undefined,
+    activeWeekRefDate
+  );
 }
 
 function calculateSPathProgress(
@@ -132,9 +119,10 @@ async function runTests() {
     teacherUid: 'teacher-auth-sarah-202',
   };
 
-  // Common reference date: Tuesday of current week
-  const refDate = new Date();
+  // Common reference date: Friday evening of current week so Tuesday/Thursday lessons are already past
   const studentTz = profile.timezone!;
+  const fridayCivilDate = getDateForDayInCurrentWeek('friday', new Date(), studentTz);
+  const refDate = new Date(`${fridayCivilDate}T18:00:00-03:00`);
   const targetDayCivilDate = getDateForDayInCurrentWeek('tuesday', refDate, studentTz);
   const lessonStartIso = `${targetDayCivilDate}T14:00:00.000Z`;
   const lessonEndIso = `${targetDayCivilDate}T14:30:00.000Z`;

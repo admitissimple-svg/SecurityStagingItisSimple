@@ -11,56 +11,29 @@ import {
   DEFAULT_STUDENT_TIMEZONE,
 } from '../src/utils/studentPersistence';
 import { executeStartNewWeek } from '../src/utils/StartNewWeekHandler';
-import { LiveLesson, StudentJournalEntry, UserProfile, DayOfWeek, EnglishLevel } from '../src/types';
+import { evaluateTutorLiveCompletedForDay } from '../src/utils/tutorLiveCycle';
+import { LiveLesson, StudentJournalEntry, UserProfile, DayOfWeek, EnglishLevel, WeeklyHistoryDoc } from '../src/types';
 
 console.log('=== TEST SUITE: HOTFIX 3B.2 — S-Path "Chat with Your Native Friend" (tutor_live) Validation ===\n');
 
-/**
- * Pure evaluation function mirroring StudentWeeklyActivitySection.tsx `isActivityCompleted` for tutor_live
- */
 function evaluateTutorLiveCompleted(
   dayKey: DayOfWeek,
   lessons: LiveLesson[] | undefined,
   studentUid: string,
   studentEmail: string,
   userProfile?: UserProfile,
-  refDate: Date = new Date()
+  refDate: Date = new Date(),
+  weeklyHistories?: WeeklyHistoryDoc[]
 ): boolean {
-  if (!Array.isArray(lessons) || lessons.length === 0) {
-    return false;
-  }
-
-  const cleanStudentUid = (studentUid || '').trim();
-  const cleanStudentEmail = (studentEmail || '').toLowerCase().trim();
-  const studentTimezone = userProfile?.timezone || DEFAULT_STUDENT_TIMEZONE;
-  const targetDayCivilDate = getDateForDayInCurrentWeek(dayKey, refDate, studentTimezone);
-  const assignedTeacherEmail = (userProfile?.teacherEmail || '').toLowerCase().trim();
-  const assignedTeacherUid = (userProfile?.teacherUid || '').trim();
-
-  return lessons.some((l) => {
-    if (!l) return false;
-    if (l.status !== 'completed') return false;
-    if (Boolean(l.cancelledAt) || (l.status as string) === 'cancelled' || (l.status as string) === 'canceled') return false;
-
-    const lStudentUid = (l.studentUid || '').trim();
-    const lStudentEmail = (l.studentEmail || '').toLowerCase().trim();
-    const isStudentMatch =
-      (cleanStudentUid && lStudentUid && cleanStudentUid === lStudentUid) ||
-      (cleanStudentEmail && lStudentEmail && cleanStudentEmail === lStudentEmail);
-    if (!isStudentMatch) return false;
-
-    if (!l.startDateTime) return false;
-    const lessonCivilDate = getIsoDateInTimeZone(l.startDateTime, studentTimezone);
-    if (lessonCivilDate !== targetDayCivilDate) return false;
-
-    const lTeacherUid = (l.teacherUid || (l as any).tutorUid || '').trim();
-    const lTeacherEmail = (l.teacherEmail || (l as any).tutorEmail || '').toLowerCase().trim();
-    if (!lTeacherUid && !lTeacherEmail) return false;
-    if (assignedTeacherUid && lTeacherUid && assignedTeacherUid !== lTeacherUid) return false;
-    if (assignedTeacherEmail && lTeacherEmail && assignedTeacherEmail !== lTeacherEmail) return false;
-
-    return true;
-  });
+  return evaluateTutorLiveCompletedForDay(
+    dayKey,
+    lessons,
+    studentUid,
+    studentEmail,
+    userProfile,
+    weeklyHistories,
+    refDate
+  );
 }
 
 async function runTests() {
@@ -102,6 +75,7 @@ async function runTests() {
 
   const refDate = new Date();
   const currentWedCivilDate = getDateForDayInCurrentWeek('wednesday', refDate, 'America/Sao_Paulo');
+  const wedEvalRefDate = new Date(`${currentWedCivilDate}T18:00:00-03:00`);
 
   // Compute a previous week's Wednesday date (7 days before)
   const prevWedDateObj = new Date(new Date(currentWedCivilDate + 'T12:00:00Z').getTime() - 7 * 86400000);
@@ -110,8 +84,8 @@ async function runTests() {
   console.log(`Current active Wednesday civil date: ${currentWedCivilDate}`);
   console.log(`Previous week Wednesday civil date: ${prevWedCivilDate}`);
 
-  // Test 1: Aula concluída numa quarta-feira de semana anterior não marca a quarta-feira atual
-  console.log('\n--- Test 1: Completed lesson on previous week Wednesday does NOT mark current Wednesday ---');
+  // Test 1: Aula concluída em ciclo anterior encerrado não marca o novo ciclo ativo (S-PATH.2 + HOTFIX 3B.2)
+  console.log('\n--- Test 1: Completed lesson from closed Cycle 1 does NOT mark Cycle 2 Wednesday ---');
   {
     const oldLesson = createMockLesson({
       id: 'lesson_old_wed',
@@ -120,9 +94,25 @@ async function runTests() {
       status: 'completed',
     });
 
-    const isMarked = evaluateTutorLiveCompleted('wednesday', [oldLesson], mockStudentUid, mockStudentEmail, userProfile, refDate);
-    assert.strictEqual(isMarked, false, 'Previous week Wednesday lesson must NOT mark current Wednesday');
-    console.log('✓ Test 1 Passed: Previous week completed lesson does not mark current week.');
+    const cycle2AfterNewWeek: UserProfile = {
+      ...userProfile,
+      weeklyCycle: 2,
+      cycleTransition: {
+        previousCycle: 1,
+        targetCycle: 2,
+        status: 'completed',
+        startedAt: new Date(refDate.getTime() - 86400000).toISOString(),
+        completedAt: new Date(refDate.getTime() - 86400000).toISOString(),
+      },
+    };
+
+    const isMarkedInCycle2 = evaluateTutorLiveCompleted('wednesday', [oldLesson], mockStudentUid, mockStudentEmail, cycle2AfterNewWeek, refDate);
+    assert.strictEqual(isMarkedInCycle2, false, 'Closed Cycle 1 Wednesday lesson must NOT mark Cycle 2 Wednesday');
+
+    // Without Start a New Week (still in Cycle 1), the lesson remains recognized across calendar weeks
+    const isMarkedInCycle1 = evaluateTutorLiveCompleted('wednesday', [oldLesson], mockStudentUid, mockStudentEmail, userProfile, refDate);
+    assert.strictEqual(isMarkedInCycle1, true, 'Active Cycle 1 lesson must remain recognized across calendar weeks until Start a New Week');
+    console.log('✓ Test 1 Passed: Closed-cycle lesson excluded in Cycle 2 while active-cycle lesson persists across calendar weeks.');
   }
 
   // Test 2: Aula agendada não marca
@@ -165,7 +155,7 @@ async function runTests() {
       status: 'completed',
     });
 
-    const isMarked = evaluateTutorLiveCompleted('wednesday', [completedLesson], mockStudentUid, mockStudentEmail, userProfile, refDate);
+    const isMarked = evaluateTutorLiveCompleted('wednesday', [completedLesson], mockStudentUid, mockStudentEmail, userProfile, wedEvalRefDate);
     assert.strictEqual(isMarked, true, 'Legitimate completed lesson on current week Wednesday must mark S-Path');
     console.log('✓ Test 4 Passed: Completed lesson on current civil date marks automatically.');
   }
@@ -250,10 +240,10 @@ async function runTests() {
     });
 
     // Before refresh
-    const beforeRefresh = evaluateTutorLiveCompleted('wednesday', [completedLesson], mockStudentUid, mockStudentEmail, userProfile, refDate);
+    const beforeRefresh = evaluateTutorLiveCompleted('wednesday', [completedLesson], mockStudentUid, mockStudentEmail, userProfile, wedEvalRefDate);
     // After reload simulation (clearing local in-memory caches and re-evaluating freshly loaded lessons)
     clearAllLocalPersistenceCaches();
-    const afterRefresh = evaluateTutorLiveCompleted('wednesday', [completedLesson], mockStudentUid, mockStudentEmail, userProfile, refDate);
+    const afterRefresh = evaluateTutorLiveCompleted('wednesday', [completedLesson], mockStudentUid, mockStudentEmail, userProfile, wedEvalRefDate);
 
     assert.strictEqual(beforeRefresh, true);
     assert.strictEqual(afterRefresh, true);
@@ -272,7 +262,18 @@ async function runTests() {
       status: 'completed',
     });
 
-    const week2Profile: UserProfile = { ...userProfile, weeklyCycle: 2 };
+    const transitionIso = new Date(refDate.getTime() + 5 * 86400000).toISOString();
+    const week2Profile: UserProfile = {
+      ...userProfile,
+      weeklyCycle: 2,
+      cycleTransition: {
+        previousCycle: 1,
+        targetCycle: 2,
+        status: 'completed',
+        startedAt: transitionIso,
+        completedAt: transitionIso,
+      },
+    };
     const isMarkedInWeek2 = evaluateTutorLiveCompleted('wednesday', [completedLessonWeek1], mockStudentUid, mockStudentEmail, week2Profile, nextWeekRefDate);
     assert.strictEqual(isMarkedInWeek2, false, 'Week 2 must NOT inherit Week 1 completed lesson');
     console.log('✓ Test 10 Passed: Start New Week does not inherit old lessons.');

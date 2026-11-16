@@ -548,6 +548,8 @@ export default function App() {
                 level: (authCanonicalLevelType || EnglishLevel.BEGINNER) as EnglishLevel,
                 weeklyCycle: typeof firestoreDoc?.weeklyCycle === 'number' ? firestoreDoc.weeklyCycle : 1,
                 ...(firestoreDoc?.cycleTransition ? { cycleTransition: firestoreDoc.cycleTransition } : {}),
+                ...(firestoreDoc?.timezone ? { timezone: firestoreDoc.timezone } : {}),
+                ...(firestoreDoc?.studentTimezone ? { studentTimezone: firestoreDoc.studentTimezone } : {}),
                 learningGoal: firestoreDoc?.learningGoal || '',
                 weeklyStudyDaysTarget: typeof firestoreDoc?.weeklyStudyDaysTarget === 'number' ? firestoreDoc.weeklyStudyDaysTarget : 4,
                 weeklyStudyDays: firestoreDoc?.weeklyStudyDays || ['monday', 'tuesday', 'wednesday', 'thursday'],

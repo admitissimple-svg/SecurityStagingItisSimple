@@ -174,14 +174,27 @@ export function isTutorLiveLessonInActiveCycle(
   const lTeacherEmail = (lesson.teacherEmail || (lesson as any).tutorEmail || '').toLowerCase().trim();
 
   if (!lTeacherUid && !lTeacherEmail && !lTeacherPublicId) return false;
-  if (assignedTeacherUid && (lTeacherUid || lTeacherPublicId)) {
-    const matchesUid =
-      (lTeacherUid && assignedTeacherUid === lTeacherUid) ||
-      (lTeacherPublicId && assignedTeacherUid === lTeacherPublicId);
-    if (!matchesUid) return false;
-  }
-  if (assignedTeacherEmail && lTeacherEmail && assignedTeacherEmail !== lTeacherEmail) {
-    return false;
+
+  const hasAssignedTeacher = Boolean(assignedTeacherUid || assignedTeacherEmail);
+  if (hasAssignedTeacher) {
+    const matchesUid = Boolean(
+      assignedTeacherUid &&
+        ((lTeacherUid && assignedTeacherUid === lTeacherUid) ||
+          (lTeacherPublicId && assignedTeacherUid === lTeacherPublicId))
+    );
+    const matchesEmail = Boolean(
+      assignedTeacherEmail && lTeacherEmail && assignedTeacherEmail === lTeacherEmail
+    );
+
+    if (assignedTeacherUid && (lTeacherUid || lTeacherPublicId) && !matchesUid) {
+      return false;
+    }
+    if (assignedTeacherEmail && lTeacherEmail && !matchesEmail) {
+      return false;
+    }
+    if (!matchesUid && !matchesEmail) {
+      return false;
+    }
   }
 
   // Must have a valid startDateTime and must NOT be a future lesson
