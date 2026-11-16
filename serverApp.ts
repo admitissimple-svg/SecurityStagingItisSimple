@@ -4594,11 +4594,39 @@ app.all('/api/dictionary/define', firebaseAuthMiddleware, async (req, res) => {
     return res.json(curatedResult);
   }
 
-  // Security Hotfix (Etapa 2 & Residuals): Rate limiting per UID and single-flight lock before AI invocation
-  const rateLimitCheck = await checkAndConsumeRateLimit(caller.uid, 'dictionary_define');
+  // Security Hotfix (Etapa 2 & Residuals + AI.BOUNDS.2A): Rate limiting per UID and single-flight lock before AI invocation
+  let rateLimitCheck: { allowed: boolean; unavailable?: boolean; retryAfterSeconds?: number; currentCount?: number } | null = null;
+  try {
+    rateLimitCheck = await checkAndConsumeRateLimit(caller.uid, 'dictionary_define');
+  } catch (err: any) {
+    logGeminiAudited({
+      feature: 'dictionary_define',
+      status: 'FALLBACK',
+      callerRole: caller.role,
+      detail: `Rate limit check failed unexpectedly: ${String(err?.message || err).slice(0, 100)}`,
+    });
+    rateLimitCheck = { allowed: false, unavailable: true, retryAfterSeconds: 5 };
+  }
+
+  if (!rateLimitCheck || typeof rateLimitCheck.allowed !== 'boolean') {
+    logGeminiAudited({
+      feature: 'dictionary_define',
+      status: 'FALLBACK',
+      callerRole: caller.role,
+      detail: 'Rate limiter returned invalid result; failing closed without calling Gemini.',
+    });
+    return sendGeminiCostControlUnavailable(res, 5);
+  }
+
   if (!rateLimitCheck.allowed) {
     if (rateLimitCheck.unavailable) {
-      return sendGeminiCostControlUnavailable(res, 5);
+      logGeminiAudited({
+        feature: 'dictionary_define',
+        status: 'FALLBACK',
+        callerRole: caller.role,
+        detail: 'Rate limiter unavailable; failing closed without calling Gemini.',
+      });
+      return sendGeminiCostControlUnavailable(res, rateLimitCheck.retryAfterSeconds || 5);
     }
     logGeminiAudited({
       feature: 'dictionary_define',
@@ -4624,20 +4652,73 @@ app.all('/api/dictionary/define', firebaseAuthMiddleware, async (req, res) => {
       };
       return res.json(offlineResult);
     }
+    if (rateLimitCheck.retryAfterSeconds && typeof res.setHeader === 'function') {
+      res.setHeader('Retry-After', String(rateLimitCheck.retryAfterSeconds));
+    }
+    return res.status(429).json({
+      success: false,
+      error: 'Rate limit exceeded',
+      message: 'Limite de consultas ao dicionário atingido para este usuário. Aguarde alguns instantes.',
+      retryAfterSeconds: rateLimitCheck.retryAfterSeconds,
+      rateLimited: true,
+      word: cleanWord,
+    });
   }
 
   // 2. Query Gemini AI for personalized pedagogical entry with single-flight protection
-  const flightLock = await acquireSingleFlightLock(`dictionary_define:${cacheKey}`);
-  if (!flightLock.acquired && flightLock.unavailable) {
+  let flightLock: { acquired: boolean; unavailable?: boolean; release: () => Promise<void> } | null = null;
+  try {
+    flightLock = await acquireSingleFlightLock(`dictionary_define:${cacheKey}`);
+  } catch (err: any) {
+    logGeminiAudited({
+      feature: 'dictionary_define',
+      status: 'FALLBACK',
+      callerRole: caller.role,
+      detail: `Single-flight lock check failed unexpectedly: ${String(err?.message || err).slice(0, 100)}`,
+    });
     return sendGeminiCostControlUnavailable(res, 5);
   }
-  let aiResult: any = null;
-  if (flightLock.acquired) {
-    try {
-      aiResult = await queryAiPedagogicalDefinition(cleanWord, studentLevel, cefr, caller.role);
-    } finally {
-      await flightLock.release();
+
+  if (!flightLock || !flightLock.acquired) {
+    if (!flightLock || flightLock.unavailable) {
+      return sendGeminiCostControlUnavailable(res, 5);
     }
+    if (pedagogicalDictCache.has(cacheKey)) {
+      const cachedAfterWait = pedagogicalDictCache.get(cacheKey);
+      if (cachedAfterWait && !cachedAfterWait.notFound && !cachedAfterWait.unavailable && !isGenericPedagogicalDefinition(cachedAfterWait.definitionEn)) {
+        return res.json(cachedAfterWait);
+      }
+    }
+    logGeminiAudited({
+      feature: 'dictionary_define',
+      status: 'INFLIGHT_LOCKED',
+      callerRole: caller.role,
+      detail: 'Concurrent dictionary definition in progress',
+    });
+    if (typeof res.setHeader === 'function') {
+      res.setHeader('Retry-After', '4');
+    }
+    return res.status(429).json({
+      success: false,
+      error: 'Concurrent generation in progress',
+      message: 'Uma definição para este termo já está em processamento. Aguarde alguns instantes.',
+      retryAfterSeconds: 4,
+      rateLimited: true,
+      word: cleanWord,
+    });
+  }
+
+  let aiResult: any = null;
+  try {
+    if (pedagogicalDictCache.has(cacheKey)) {
+      const cachedOnAcquire = pedagogicalDictCache.get(cacheKey);
+      if (cachedOnAcquire && !cachedOnAcquire.notFound && !cachedOnAcquire.unavailable && !isGenericPedagogicalDefinition(cachedOnAcquire.definitionEn)) {
+        return res.json(cachedOnAcquire);
+      }
+    }
+    aiResult = await queryAiPedagogicalDefinition(cleanWord, studentLevel, cefr, caller.role);
+  } finally {
+    await flightLock.release();
   }
 
   if (aiResult) {
