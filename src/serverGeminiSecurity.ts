@@ -137,6 +137,7 @@ export type GeminiFeature =
   | 'check_writing'
   | 'homework_evaluate'
   | 'dictionary_define'
+  | 'dictionary_enrich'
   | 'vocab_generate'
   | 'lesson_insights';
 
@@ -202,6 +203,14 @@ export const GEMINI_POLICIES: Record<GeminiFeature, FeaturePolicy> = {
     maxOutputTokens: 800,
     rateLimitWindowSeconds: 60,
     rateLimitMaxRequests: 20,
+    maxInputLengthChars: 1500,
+    timeoutMs: 8000,
+    totalDeadlineMs: 20000,
+  },
+  dictionary_enrich: {
+    maxOutputTokens: 800,
+    rateLimitWindowSeconds: 60,
+    rateLimitMaxRequests: 10,
     maxInputLengthChars: 1500,
     timeoutMs: 8000,
     totalDeadlineMs: 20000,

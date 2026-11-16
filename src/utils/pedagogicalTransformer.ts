@@ -1,10 +1,25 @@
 import { EnglishLevel, LiveLesson } from '../types';
 import { NATIVE_FRIENDS_DICTIONARY_DATABASE } from '../data/dictionaryDatabase';
-import { parseNotesHtml, ParsedNotesResult, isPedagogicalTermMatch, hasValidPedagogicalContent } from './notesHtmlParser';
+import {
+  parseNotesHtml,
+  ParsedNotesResult,
+  isPedagogicalTermMatch,
+  hasValidPedagogicalContent,
+  convertNotesHtmlToCompactText,
+  MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS,
+} from './notesHtmlParser';
 import { isGenericPedagogicalDefinition, isGenericPedagogicalExample } from './dictionaryService';
 import { auth } from '../firebase';
 
-export { parseNotesHtml, isGenericPedagogicalDefinition, isGenericPedagogicalExample, isPedagogicalTermMatch, hasValidPedagogicalContent };
+export {
+  parseNotesHtml,
+  isGenericPedagogicalDefinition,
+  isGenericPedagogicalExample,
+  isPedagogicalTermMatch,
+  hasValidPedagogicalContent,
+  convertNotesHtmlToCompactText,
+  MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS,
+};
 export type { ParsedNotesResult };
 
 export interface PedagogicalMistakeAnalysis {
@@ -1095,6 +1110,22 @@ export async function fetchPedagogicalTransformation(params: {
       };
     }
 
+    if (res.status === 400 || res.status === 429) {
+      const errData = await res.json().catch(() => ({} as any));
+      const defaultMsg =
+        res.status === 429
+          ? 'Limite de solicitações ou geração simultânea em andamento. Aguarde alguns instantes.'
+          : 'As anotações enviadas excedem o limite permitido ou não contêm conteúdo pedagógico válido.';
+      const apiErr: any = new Error(errData?.message || errData?.error || defaultMsg);
+      apiErr.status = res.status;
+      apiErr.code = errData?.code || (res.status === 429 ? 'RATE_LIMIT_OR_CONCURRENT' : 'BAD_REQUEST');
+      if (typeof errData?.retryAfterSeconds === 'number') {
+        apiErr.retryAfterSeconds = errData.retryAfterSeconds;
+      }
+      apiErr.isHttpError = true;
+      throw apiErr;
+    }
+
     if (res.ok) {
       const data = await res.json();
       if (data && data.transformation && Array.isArray(data.transformation.mistakesAnalysis)) {
@@ -1103,8 +1134,11 @@ export async function fetchPedagogicalTransformation(params: {
         }
       }
     }
-  } catch (err) {
-    console.warn('Backend pedagogical transform request notice:', (err as any)?.message || 'NETWORK_FAILURE');
+  } catch (err: any) {
+    if (err?.isHttpError || err?.status === 400 || err?.status === 429) {
+      throw err;
+    }
+    console.warn('Backend pedagogical transform request notice:', err?.message || 'NETWORK_FAILURE');
   }
 
   // Graceful deterministic fallback strictly faithful to raw notes

@@ -5354,6 +5354,9 @@ export async function saveSessionNotesToFirestoreServer(
     driveFileUrl?: string;
     driveFolderName?: string;
     driveLastSyncedAt?: string;
+  },
+  options?: {
+    preserveExistingVersioningFields?: boolean;
   }
 ): Promise<boolean> {
   if (isCloudWriteDisabled) return false;
@@ -5375,103 +5378,119 @@ export async function saveSessionNotesToFirestoreServer(
 
   try {
     const cleanKey = sessionKey.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const preserveExisting = Boolean(options?.preserveExistingVersioningFields);
+    const noteRef = db.collection('session_notes').doc(cleanKey);
 
-    // Idempotency check: preserve original createdAt, versioning state, and Drive metadata if doc exists
-    let existingCreatedAt = data.createdAt;
-    let existingApprovedVersion = data.lastApprovedVersion;
-    let existingOriginalNotes = data.originalTeacherNotes;
-    let existingDraft = data.draftTransformation;
-    let existingHistory = data.versionHistory;
-    let existingApprovalStatus = data.approvalStatus;
-    let existingDriveFileId = data.driveFileId || '';
-    let existingDriveFileUrl = data.driveFileUrl || '';
-    let existingDriveFolderName = data.driveFolderName || '';
-    let existingDriveLastSyncedAt = data.driveLastSyncedAt || '';
+    const buildMergedPayload = (exData: any | null) => {
+      const hasExisting = Boolean(exData && typeof exData === 'object');
+      const existingCreatedAt = (hasExisting && exData.createdAt) || data.createdAt;
+      const existingOriginalNotes = (hasExisting && exData.originalTeacherNotes) || data.originalTeacherNotes || null;
 
-    try {
-      const existingDoc = await db.collection('session_notes').doc(cleanKey).get();
-      if (existingDoc && existingDoc.exists) {
-        const exData = existingDoc.data() || {};
-        existingCreatedAt = exData.createdAt || existingCreatedAt;
-        // FASE NF-DOC.2A: A new edit MUST NOT erase or unpublish the previously approved version
-        if (existingApprovedVersion === undefined && exData.lastApprovedVersion) {
-          existingApprovedVersion = exData.lastApprovedVersion;
+      // Never allow a raw note save (or null incoming approvedVersion) to erase an existing lastApprovedVersion
+      const existingApprovedVersion =
+        hasExisting && exData.lastApprovedVersion
+          ? exData.lastApprovedVersion
+          : undefined;
+      const effectiveApprovedVersion = preserveExisting
+        ? (existingApprovedVersion || data.lastApprovedVersion || null)
+        : (data.lastApprovedVersion ? data.lastApprovedVersion : (existingApprovedVersion || null));
+
+      // When preserving existing versioning fields (raw note saves), never overwrite an existing draftTransformation
+      const effectiveDraft = preserveExisting
+        ? (hasExisting && exData.draftTransformation !== undefined
+            ? exData.draftTransformation
+            : (data.draftTransformation !== undefined ? data.draftTransformation : null))
+        : (data.draftTransformation !== undefined
+            ? data.draftTransformation
+            : (hasExisting && exData.draftTransformation !== undefined ? exData.draftTransformation : null));
+
+      // Merge versionHistory monotonically so concurrent entries are never dropped
+      const exHistory: any[] = hasExisting && Array.isArray(exData.versionHistory) ? exData.versionHistory : [];
+      const inHistory: any[] = Array.isArray(data.versionHistory) ? data.versionHistory : [];
+      let effectiveHistory: any[];
+      if (preserveExisting && exHistory.length > 0) {
+        const seenIds = new Set(exHistory.map((v: any) => v?.versionId).filter(Boolean));
+        const merged = [...exHistory];
+        let maxVer = merged.reduce((m: number, v: any) => Math.max(m, Number(v?.versionNumber) || 0), 0);
+        for (const entry of inHistory) {
+          if (!entry || (entry.versionId && seenIds.has(entry.versionId))) continue;
+          const lastMerged = merged[merged.length - 1];
+          if (
+            entry.type === 'teacher_raw' &&
+            lastMerged &&
+            lastMerged.contentHash === entry.contentHash &&
+            lastMerged.rawContent === entry.rawContent
+          ) {
+            continue;
+          }
+          maxVer += 1;
+          merged.push({ ...entry, versionNumber: maxVer });
+          if (entry.versionId) seenIds.add(entry.versionId);
         }
-        if (!existingOriginalNotes && exData.originalTeacherNotes) {
-          existingOriginalNotes = exData.originalTeacherNotes;
-        }
-        if (existingDraft === undefined && exData.draftTransformation) {
-          existingDraft = exData.draftTransformation;
-        }
-        if ((!existingHistory || existingHistory.length === 0) && Array.isArray(exData.versionHistory)) {
-          existingHistory = exData.versionHistory;
-        }
-        if (!existingApprovalStatus && exData.approvalStatus) {
-          existingApprovalStatus = exData.approvalStatus;
-        }
-        if (!existingDriveFileId && exData.driveFileId) {
-          existingDriveFileId = exData.driveFileId;
-        }
-        if (!existingDriveFileUrl && exData.driveFileUrl) {
-          existingDriveFileUrl = exData.driveFileUrl;
-        }
-        if (!existingDriveFolderName && exData.driveFolderName) {
-          existingDriveFolderName = exData.driveFolderName;
-        }
-        if (!existingDriveLastSyncedAt && exData.driveLastSyncedAt) {
-          existingDriveLastSyncedAt = exData.driveLastSyncedAt;
-        }
+        effectiveHistory = merged;
+      } else {
+        effectiveHistory = inHistory.length > 0 ? inHistory : exHistory;
       }
-    } catch {}
 
-    const nowIso = new Date().toISOString();
-    const effectiveCreatedAt = existingCreatedAt || nowIso;
-    const rawContent = data.rawContent || data.content || '';
+      const existingApprovalStatus = hasExisting ? exData.approvalStatus : undefined;
+      const existingDriveFileId = data.driveFileId || (hasExisting ? exData.driveFileId : '') || '';
+      const existingDriveFileUrl = data.driveFileUrl || (hasExisting ? exData.driveFileUrl : '') || '';
+      const existingDriveFolderName = data.driveFolderName || (hasExisting ? exData.driveFolderName : '') || '';
+      const existingDriveLastSyncedAt = data.driveLastSyncedAt || (hasExisting ? exData.driveLastSyncedAt : '') || '';
 
-    const effectiveApprovedVersion = data.lastApprovedVersion !== undefined ? data.lastApprovedVersion : (existingApprovedVersion || null);
-    const effectiveDraft = data.draftTransformation !== undefined ? data.draftTransformation : (existingDraft || null);
-    const effectiveApprovalStatus = effectiveApprovedVersion ? 'approved' : effectiveDraft ? 'draft_in_progress' : (data.approvalStatus || existingApprovalStatus || 'unapproved');
+      const nowIso = new Date().toISOString();
+      const effectiveCreatedAt = existingCreatedAt || nowIso;
+      const rawContent = data.rawContent || data.content || '';
 
-    const sanitized = JSON.parse(JSON.stringify({
-      ...data,
-      id: cleanKey,
-      sessionId: cleanKey,
-      sessionKey: cleanKey,
-      lessonId: data.lessonId || '',
-      studentUid,
-      teacherUid,
-      sessionDate: data.sessionDate,
-      rawContent,
-      content: data.content || rawContent,
-      topic: data.topic || '',
-      originalTeacherNotes: data.originalTeacherNotes || existingOriginalNotes || null,
-      draftTransformation: effectiveDraft,
-      lastApprovedVersion: effectiveApprovedVersion,
-      approvalStatus: effectiveApprovalStatus,
-      versionHistory: data.versionHistory || existingHistory || [],
-      currentVersionNumber: data.currentVersionNumber || (Array.isArray(existingHistory) && existingHistory.length > 0 ? Math.max(...existingHistory.map((v: any) => v.versionNumber || 0)) : 1),
-      driveFileId: existingDriveFileId || '',
-      driveFileUrl: existingDriveFileUrl || '',
-      driveFolderName: existingDriveFolderName || '',
-      driveLastSyncedAt: existingDriveLastSyncedAt || '',
-      createdAt: effectiveCreatedAt,
-      updatedAt: data.updatedAt || nowIso,
-      lastSavedByUid: teacherUid,
-    }));
+      const effectiveApprovalStatus = effectiveApprovedVersion
+        ? 'approved'
+        : effectiveDraft
+        ? 'draft_in_progress'
+        : (existingApprovalStatus || data.approvalStatus || 'unapproved');
 
-    // ARCH.2F.2C: Canonical persistence in session_notes/{sessionKey} + link mirror on lessons/{lessonId} (no new users/{uid}/session_notes mirror writes)
-    const savePromises: Promise<any>[] = [
-      db.collection('session_notes').doc(cleanKey).set(sanitized, { merge: true }),
-    ];
+      const maxHistoryVer = Array.isArray(effectiveHistory) && effectiveHistory.length > 0
+        ? Math.max(...effectiveHistory.map((v: any) => v?.versionNumber || 0))
+        : 0;
+      const effectiveVersionNumber = Math.max(
+        1,
+        maxHistoryVer,
+        Number(data.currentVersionNumber) || 0,
+        hasExisting ? (Number(exData.currentVersionNumber) || 0) : 0
+      );
 
-    if (data.lessonId) {
-      savePromises.push(
-        db.collection('lessons').doc(data.lessonId).set(
-          {
-            sessionNotesDocument: data.content,
-            liveNotes: data.content,
-            recommendations: data.content,
-            title: data.topic,
+      const sanitized = JSON.parse(JSON.stringify({
+        ...data,
+        id: cleanKey,
+        sessionId: cleanKey,
+        sessionKey: cleanKey,
+        lessonId: data.lessonId || (hasExisting ? exData.lessonId : '') || '',
+        studentUid,
+        teacherUid,
+        sessionDate: data.sessionDate,
+        rawContent,
+        content: data.content || rawContent,
+        topic: data.topic || '',
+        originalTeacherNotes: existingOriginalNotes,
+        draftTransformation: effectiveDraft,
+        lastApprovedVersion: effectiveApprovedVersion,
+        approvalStatus: effectiveApprovalStatus,
+        versionHistory: effectiveHistory,
+        currentVersionNumber: effectiveVersionNumber,
+        driveFileId: existingDriveFileId,
+        driveFileUrl: existingDriveFileUrl,
+        driveFolderName: existingDriveFolderName,
+        driveLastSyncedAt: existingDriveLastSyncedAt,
+        createdAt: effectiveCreatedAt,
+        updatedAt: data.updatedAt || nowIso,
+        lastSavedByUid: teacherUid,
+      }));
+
+      const lessonMirror = sanitized.lessonId
+        ? {
+            sessionNotesDocument: sanitized.content,
+            liveNotes: sanitized.content,
+            recommendations: sanitized.content,
+            title: sanitized.topic,
             notesLastSavedAt: sanitized.updatedAt,
             updatedAt: sanitized.updatedAt,
             studentUid,
@@ -5480,13 +5499,47 @@ export async function saveSessionNotesToFirestoreServer(
             ...(existingDriveFileUrl ? { driveFileUrl: existingDriveFileUrl } : {}),
             ...(existingDriveFolderName ? { driveFolderName: existingDriveFolderName } : {}),
             ...(existingDriveLastSyncedAt ? { driveLastSyncedAt: existingDriveLastSyncedAt } : {}),
-          },
-          { merge: true }
-        )
-      );
+          }
+        : null;
+
+      return { sanitized, lessonMirror };
+    };
+
+    if (typeof (db as any).runTransaction === 'function') {
+      await (db as any).runTransaction(async (tx: any) => {
+        const existingDocSnap = await tx.get(noteRef);
+        const exData = existingDocSnap && existingDocSnap.exists ? (existingDocSnap.data() || {}) : null;
+        const { sanitized, lessonMirror } = buildMergedPayload(exData);
+        tx.set(noteRef, sanitized, { merge: true });
+        if (lessonMirror && sanitized.lessonId) {
+          tx.set(db.collection('lessons').doc(sanitized.lessonId), lessonMirror, { merge: true });
+        }
+      });
+    } else {
+      let exData: any = null;
+      try {
+        const existingDoc = await noteRef.get();
+        if (existingDoc && existingDoc.exists) {
+          exData = existingDoc.data() || {};
+        }
+      } catch {}
+
+      const { sanitized, lessonMirror } = buildMergedPayload(exData);
+
+      // ARCH.2F.2C: Canonical persistence in session_notes/{sessionKey} + link mirror on lessons/{lessonId} (no new users/{uid}/session_notes mirror writes)
+      const savePromises: Promise<any>[] = [
+        noteRef.set(sanitized, { merge: true }),
+      ];
+
+      if (lessonMirror && sanitized.lessonId) {
+        savePromises.push(
+          db.collection('lessons').doc(sanitized.lessonId).set(lessonMirror, { merge: true })
+        );
+      }
+
+      await Promise.all(savePromises);
     }
 
-    await Promise.all(savePromises);
     return true;
   } catch (err: any) {
     if (isPermissionError(err)) {

@@ -5552,6 +5552,9 @@ export default function App() {
       driveFileUrl?: string;
       driveFolderName?: string;
       driveLastSyncedAt?: string;
+    },
+    options?: {
+      skipServerSave?: boolean;
     }
   ) => {
     setLessons((prev) => {
@@ -5622,6 +5625,10 @@ export default function App() {
         sourceActivityName: `Live Session with ${currentAccount?.name || 'Native Friend'}`,
       }));
       handleAddWordsToDictionary(dictEntries, targetStudentEmail);
+    }
+
+    if (options?.skipServerSave) {
+      return;
     }
 
     try {

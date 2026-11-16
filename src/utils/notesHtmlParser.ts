@@ -69,6 +69,116 @@ export function stripHtmlTags(str: string): string {
   return str.replace(/<[^>]+>/g, '');
 }
 
+export const MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS = 10000;
+
+function isCoachingBadgeText(text: string): boolean {
+  const clean = text.trim();
+  if (!clean) return true;
+  return (
+    /^[✓✔✗✖✦🎯\s]*(new word|pronounce|correct|incorrect)?[✓✔✗✖✦🎯\s]*$/i.test(clean) ||
+    clean === '✦ New Word' ||
+    clean === '🎯 Pronounce' ||
+    clean === '[New Word]' ||
+    clean === '[Pronounce]' ||
+    clean === '[Correct]' ||
+    clean === '[Incorrect]'
+  );
+}
+
+/**
+ * Shared HTML-to-compact-pedagogical-text converter for Native Friends Notes.
+ * Strips inline styling and HTML bloat while preserving:
+ * - ✗, ✓, [New Word], [Pronounce] markings (and legacy (Alt+N/Y/W/P) text stamps)
+ * - Phrase associations (error -> correction), item ordering, and line breaks
+ */
+export function convertNotesHtmlToCompactText(rawContent: string): string {
+  if (!rawContent || typeof rawContent !== 'string') return '';
+
+  let text = rawContent
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/\u00A0/g, ' ')
+    .replace(/\r\n?/g, '\n');
+
+  // Remove HTML comments, <style>, and <script> blocks if pasted from external editors
+  text = text
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '');
+
+  // Convert coaching tag spans (both inline badge spans and legacy wrapper spans) into compact markers.
+  // Match only opening <span> with coaching attributes/classes so outer generic spans never swallow inner coaching spans.
+  text = text.replace(
+    /<span\b([^>]*?(?:data-tag-type\s*=\s*["']?(?:new-word|pronounce|correct|incorrect)["']?|class\s*=\s*["'][^"']*\b(?:new-word|pronounce|correct|incorrect)(?:-tag)?\b)[^>]*)>([\s\S]*?)<\/span>/gi,
+    (_fullMatch, attrs: string, inner: string) => {
+      const tagTypeMatch = attrs.match(/data-tag-type\s*=\s*["']?(new-word|pronounce|correct|incorrect)["']?/i);
+      const classMatch = attrs.match(/class\s*=\s*["']([^"']*)["']/i);
+      const tagTypeAttr = (tagTypeMatch?.[1] || '').toLowerCase();
+      const classAttr = (classMatch?.[1] || '').toLowerCase();
+
+      const isIncorrect =
+        tagTypeAttr === 'incorrect' || /\bincorrect(?:-tag)?\b/i.test(classAttr);
+      const isCorrect =
+        !isIncorrect &&
+        (tagTypeAttr === 'correct' || /\bcorrect(?:-tag)?\b/i.test(classAttr));
+      const isNewWord =
+        tagTypeAttr === 'new-word' || /\bnew-word(?:-tag)?\b/i.test(classAttr);
+      const isPronounce =
+        tagTypeAttr === 'pronounce' || /\bpronounce(?:-tag)?\b/i.test(classAttr);
+
+      let marker = '';
+      if (isIncorrect) marker = '✗';
+      else if (isCorrect) marker = '✓';
+      else if (isNewWord) marker = '[New Word]';
+      else if (isPronounce) marker = '[Pronounce]';
+
+      const innerPlain = decodeHtmlEntities(
+        stripHtmlTags(inner.replace(/<br\s*\/?>/gi, ' '))
+      ).trim();
+
+      if (!innerPlain || isCoachingBadgeText(innerPlain)) {
+        return marker ? ` ${marker} ` : ' ';
+      }
+
+      const cleanedInner = innerPlain
+        .replace(/^\[(new word|pronounce|correct|incorrect)\]\s*/i, '')
+        .replace(/^[✓✔✗✖✦🎯]+\s*/, '')
+        .trim();
+
+      if (!cleanedInner) {
+        return marker ? ` ${marker} ` : ' ';
+      }
+      return marker ? ` ${marker} ${cleanedInner} ` : ` ${cleanedInner} `;
+    }
+  );
+
+  // Preserve intentional blank lines represented by empty <div><br></div> or <p><br></p>
+  text = text
+    .replace(/<(div|p)\b[^>]*>\s*(?:<br\s*\/?>\s*)+<\/\1>/gi, '\u0000AIBOUNDS_NL\u0000')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(div|h[1-6]|tr|blockquote|section|article)>\s*<\1\b[^>]*>/gi, '\n')
+    .replace(/<\/p>\s*<p\b[^>]*>/gi, '\n\n')
+    .replace(/<\/li>\s*<li\b[^>]*>/gi, '\n• ')
+    .replace(/<li\b[^>]*>/gi, '\n• ')
+    .replace(/<\/li>/gi, '\n')
+    .replace(/<(?:\/p|p)\b[^>]*>/gi, '\n\n')
+    .replace(/<(?:\/div|div|\/h[1-6]|h[1-6]|\/tr|tr|\/ul|ul|\/ol|ol|\/table|table|\/blockquote|blockquote|hr\s*\/?)\b[^>]*>/gi, '\n')
+    .replace(/<(?:td|th)\b[^>]*>/gi, ' ')
+    .replace(/\u0000AIBOUNDS_NL\u0000/g, '\n');
+
+  // Strip remaining HTML tags and decode entities AFTER tag stripping so literal '<' / '>' stay intact
+  const stripped = stripHtmlTags(text);
+  const decoded = decodeHtmlEntities(stripped);
+
+  const normalizedLines = decoded
+    .split('\n')
+    .map((line) => line.replace(/[ \t\f\v]+/g, ' ').trim());
+
+  return normalizedLines
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 /**
  * Cleans extracted expression string by removing leftover decorative symbols,
  * quotes, bullets, and excessive whitespace.

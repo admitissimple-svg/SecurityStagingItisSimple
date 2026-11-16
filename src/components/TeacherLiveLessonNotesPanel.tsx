@@ -51,6 +51,10 @@ import {
 } from '../types';
 import { isValidCanonicalUid } from '../utils/studentPersistence';
 import { computeNotesContentHash } from '../utils/notesVersioning';
+import {
+  convertNotesHtmlToCompactText,
+  MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS,
+} from '../utils/notesHtmlParser';
 import { formatDateInTimeZone, formatTimeInTimeZone } from '../utils/timezone';
 import { auth } from '../firebase';
 import { useAuth } from '../context/AuthContext';
@@ -84,6 +88,9 @@ interface TeacherLiveLessonNotesPanelProps {
       driveFileUrl?: string;
       driveFolderName?: string;
       driveLastSyncedAt?: string;
+    },
+    options?: {
+      skipServerSave?: boolean;
     }
   ) => void;
   onAddWordsToDictionary?: (
@@ -329,24 +336,9 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     return formatted;
   }, [convertPlainSymbolsToTags]);
 
-  // Safe converter: Inline tag HTML -> Clean plain symbols for Google Meet Chat
+  // Safe converter: Inline tag HTML -> Compact pedagogical plain symbols (shared with backend AI transform)
   const convertTagsToPlainSymbolsForMeet = useCallback((htmlOrText: string): string => {
-    if (!htmlOrText) return '';
-    return htmlOrText
-      .replace(/<span[^>]*data-tag-type="correct"[^>]*>[\s\S]*?<\/span>/gi, '✓')
-      .replace(/<span[^>]*data-tag-type="incorrect"[^>]*>[\s\S]*?<\/span>/gi, '✗')
-      .replace(/<span[^>]*data-tag-type="new-word"[^>]*>[\s\S]*?<\/span>/gi, '[New Word]')
-      .replace(/<span[^>]*data-tag-type="pronounce"[^>]*>[\s\S]*?<\/span>/gi, '[Pronounce]')
-      .replace(/<br\s*[\/]?>/gi, '\n')
-      .replace(/<\/div>/gi, '\n')
-      .replace(/<div>/gi, '')
-      .replace(/<\/p>/gi, '\n\n')
-      .replace(/<p>/gi, '')
-      .replace(/<[^>]+>/g, '')
-      .replace(/&nbsp;/g, ' ')
-      .replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>');
+    return convertNotesHtmlToCompactText(htmlOrText);
   }, []);
 
   // Coaching stamps metrics (counts both pre-styled tags and any raw plain symbols without double counting)
@@ -1511,6 +1503,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           };
 
           // Server API sync with Drive metadata (skipDriveSync prevents duplicate Google Drive operations)
+          let driveServerSaveOk = false;
           try {
             const idToken = await auth.currentUser?.getIdToken().catch(() => null);
             const resolvedTeacherUid = (currentAccount?.uid || auth.currentUser?.uid || '').trim();
@@ -1538,20 +1531,25 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               }),
             });
             if (syncApiRes.ok) {
+              driveServerSaveOk = true;
               window.dispatchEvent(new CustomEvent('native-notes-updated'));
             }
           } catch {}
 
-          // 3. Update lesson state in parent
+          // 3. Update lesson state in parent (skip duplicate server write when /api/session-notes already succeeded)
           if (targetLessonId && typeof onSaveLessonNotes === 'function') {
-            onSaveLessonNotes(targetLessonId, {
-              topic: topicToSync,
-              liveNotes: contentToSync,
-              recommendations: contentToSync,
-              sessionNotesDocument: contentToSync,
-              sessionDate: effDate,
-              ...drivePayload,
-            });
+            onSaveLessonNotes(
+              targetLessonId,
+              {
+                topic: topicToSync,
+                liveNotes: contentToSync,
+                recommendations: contentToSync,
+                sessionNotesDocument: contentToSync,
+                sessionDate: effDate,
+                ...drivePayload,
+              },
+              { skipServerSave: driveServerSaveOk }
+            );
           }
         } else {
           setDriveSyncStatus('error');
@@ -1706,19 +1704,23 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           console.warn('Server /api/session-notes notice:', err);
         }
 
-        // 3. Update lesson state in parent
+        // 3. Update lesson state in parent (skip duplicate server write when /api/session-notes already succeeded)
         if (targetLessonId && typeof onSaveLessonNotes === 'function') {
-          onSaveLessonNotes(targetLessonId, {
-            topic: topicToSave,
-            liveNotes: contentToSave,
-            recommendations: contentToSave,
-            sessionNotesDocument: contentToSave,
-            sessionDate: effectiveDate,
-            driveFileId: driveFileId || undefined,
-            driveFileUrl: driveFileUrl || undefined,
-            driveFolderName: GOOGLE_DRIVE_SESSION_FOLDER,
-            driveLastSyncedAt: driveLastSyncedAt || undefined,
-          });
+          onSaveLessonNotes(
+            targetLessonId,
+            {
+              topic: topicToSave,
+              liveNotes: contentToSave,
+              recommendations: contentToSave,
+              sessionNotesDocument: contentToSave,
+              sessionDate: effectiveDate,
+              driveFileId: driveFileId || undefined,
+              driveFileUrl: driveFileUrl || undefined,
+              driveFolderName: GOOGLE_DRIVE_SESSION_FOLDER,
+              driveLastSyncedAt: driveLastSyncedAt || undefined,
+            },
+            { skipServerSave: serverSaveOk }
+          );
         }
 
         setLastSavedTimestamp(nowIso);
@@ -1768,6 +1770,17 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     return `session_${effectiveDate}_${(studentResolution.uid || (cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : 'notes'))}`;
   }, [selectedSessionNoteKey, selectedLessonId, activeLesson, selectedStudentEmail, studentResolution.uid, sessionDate]);
 
+  const compactNotesText = useMemo(() => convertNotesHtmlToCompactText(notesContent), [notesContent]);
+  const wordCount = useMemo(
+    () => (compactNotesText.trim() ? compactNotesText.trim().split(/\s+/).length : 0),
+    [compactNotesText]
+  );
+  const charCount = compactNotesText.length;
+  const isNearCharLimit =
+    charCount >= Math.floor(MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS * 0.9) &&
+    charCount <= MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS;
+  const isOverCharLimit = charCount > MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS;
+
   /**
    * FASE NF-DOC.2C: Apply AI
    * 1. Preserves editor, formatting, history, and shortcuts Alt+Y/N/W/P
@@ -1779,8 +1792,15 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   const handleApplyAi = useCallback(async () => {
     if (isApplyingAi || isSaving) return;
 
-    if (!notesContent || !notesContent.trim()) {
+    if (!notesContent || !notesContent.trim() || !compactNotesText.trim()) {
       setAiError('Notes are empty. Write session notes with pedagogical terms before applying AI.');
+      return;
+    }
+
+    if (charCount > MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS) {
+      setAiError(
+        `Compact pedagogical notes exceed the ${MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS.toLocaleString('en-US')}-character AI limit (${charCount.toLocaleString('en-US')} characters). Please shorten the notes before applying AI.`
+      );
       return;
     }
 
@@ -1850,6 +1870,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     isApplyingAi,
     isSaving,
     notesContent,
+    compactNotesText,
+    charCount,
     topic,
     persistSessionDocument,
     currentAccount,
@@ -2629,10 +2651,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     }
   };
 
-  // Word and character statistics (computed from clean plain text)
-  const plainNotesText = convertTagsToPlainSymbolsForMeet(notesContent);
-  const wordCount = plainNotesText.trim() ? plainNotesText.trim().split(/\s+/).length : 0;
-  const charCount = plainNotesText.length;
+  // Word and character statistics are computed via compactNotesText above to stay aligned with backend AI bounds
 
   // Global hotkey listener for Coaching Stamps (Alt+Y, Alt+N, Alt+W, Alt+P)
   useEffect(() => {
@@ -3144,9 +3163,14 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             </div>
             <button
               type="button"
-              disabled={isApplyingAi}
+              disabled={isApplyingAi || isOverCharLimit}
               onClick={handleApplyAi}
-              className="px-3 py-1.5 bg-amber-700 hover:bg-amber-800 text-white rounded-xl text-xs font-bold shrink-0 transition flex items-center gap-1.5 cursor-pointer shadow-2xs disabled:opacity-50"
+              className="px-3 py-1.5 bg-amber-700 hover:bg-amber-800 text-white rounded-xl text-xs font-bold shrink-0 transition flex items-center gap-1.5 cursor-pointer shadow-2xs disabled:opacity-50 disabled:cursor-not-allowed"
+              title={
+                isOverCharLimit
+                  ? `Compact notes exceed the ${MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS.toLocaleString('en-US')}-character AI limit`
+                  : undefined
+              }
             >
               <Sparkles className="w-3.5 h-3.5" />
               <span>Update with AI</span>
@@ -3182,9 +3206,14 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             <div className="pt-2">
               <button
                 type="button"
-                disabled={isApplyingAi || !notesContent.trim()}
+                disabled={isApplyingAi || !compactNotesText.trim() || isOverCharLimit}
                 onClick={handleApplyAi}
                 className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-xs font-bold bg-[#1C4C96] hover:bg-[#062863] text-white shadow-xs transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                title={
+                  isOverCharLimit
+                    ? `Compact notes exceed the ${MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS.toLocaleString('en-US')}-character AI limit`
+                    : undefined
+                }
               >
                 <Sparkles className="w-4 h-4 text-[#F4CA54]" />
                 <span>Apply AI to Notes</span>
@@ -4315,10 +4344,14 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 <button
                   type="button"
                   id="btn-apply-ai-top"
-                  disabled={isApplyingAi || isSaving}
+                  disabled={isApplyingAi || isSaving || isOverCharLimit}
                   onClick={handleApplyAi}
                   className="px-3 py-1.5 bg-white hover:bg-slate-50 text-[#1C4C96] border border-[#1C4C96]/40 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer shadow-2xs disabled:opacity-50 disabled:cursor-not-allowed"
-                  title="Saves notes and triggers Gemini to synthesize the pedagogical report"
+                  title={
+                    isOverCharLimit
+                      ? `Compact notes exceed the ${MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS.toLocaleString('en-US')}-character AI limit (${charCount.toLocaleString('en-US')} chars)`
+                      : 'Saves notes and triggers Gemini to synthesize the pedagogical report'
+                  }
                   aria-label="Apply AI"
                 >
                   {isApplyingAi ? (
@@ -4578,9 +4611,35 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             {/* Document Status & Statistics Footer */}
             <div className="bg-white border-t border-slate-200 p-3 px-4 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-500">
               <div className="flex items-center gap-3 flex-wrap">
-                <span className="font-semibold text-slate-600">
-                  {wordCount} words • {charCount} characters
+                <span
+                  data-testid="notes-compact-char-counter"
+                  className={`font-semibold ${
+                    isOverCharLimit
+                      ? 'text-rose-700 font-bold'
+                      : isNearCharLimit
+                      ? 'text-amber-700 font-bold'
+                      : 'text-slate-600'
+                  }`}
+                >
+                  {wordCount} words • {charCount.toLocaleString('en-US')} / {MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS.toLocaleString('en-US')} characters
                 </span>
+                {isOverCharLimit && (
+                  <span
+                    data-testid="notes-char-limit-warning"
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-rose-50 border border-rose-200 text-rose-700 text-[11px] font-bold"
+                  >
+                    <AlertCircle className="w-3 h-3 shrink-0" />
+                    Exceeds {MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS.toLocaleString('en-US')}-char AI limit ({(charCount - MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS).toLocaleString('en-US')} over)
+                  </span>
+                )}
+                {isNearCharLimit && !isOverCharLimit && (
+                  <span
+                    data-testid="notes-char-limit-warning"
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-50 border border-amber-200 text-amber-800 text-[11px] font-semibold"
+                  >
+                    Approaching {MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS.toLocaleString('en-US')}-char AI limit ({(MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS - charCount).toLocaleString('en-US')} left)
+                  </span>
+                )}
                 <span className="hidden sm:inline text-slate-300">•</span>
                 <span className="text-[11px] text-slate-500 flex items-center gap-1.5 flex-wrap">
                   <span>Shortcuts:</span>
@@ -4685,6 +4744,17 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   <span>{aiError}</span>
                 </div>
               )}
+              {isOverCharLimit && !aiError && (
+                <div
+                  data-testid="notes-char-limit-banner"
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-rose-50 text-rose-800 text-xs font-bold border border-rose-200"
+                >
+                  <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                  <span>
+                    Notes exceed {MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS.toLocaleString('en-US')}-character AI limit ({charCount.toLocaleString('en-US')} / {MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS.toLocaleString('en-US')}). You can still save notes, or trim before Apply AI.
+                  </span>
+                </div>
+              )}
               {isTransformationOutdated && (
                 <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-amber-50 text-amber-800 text-xs font-semibold border border-amber-200">
                   <span>⚠️ {isDraftStale ? 'Draft' : 'Report'} outdated with original notes</span>
@@ -4716,10 +4786,14 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               <button
                 type="button"
                 id="btn-apply-ai-bottom"
-                disabled={isApplyingAi || isSaving}
+                disabled={isApplyingAi || isSaving || isOverCharLimit}
                 onClick={handleApplyAi}
                 className="px-5 py-2.5 bg-white hover:bg-slate-50 text-[#1C4C96] border border-[#1C4C96]/40 rounded-xl text-xs font-bold transition flex items-center gap-2 cursor-pointer shadow-xs disabled:opacity-50 disabled:cursor-not-allowed active:scale-98"
-                title="Saves notes and triggers Gemini to structure the pedagogical report"
+                title={
+                  isOverCharLimit
+                    ? `Compact notes exceed the ${MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS.toLocaleString('en-US')}-character AI limit (${charCount.toLocaleString('en-US')} chars)`
+                    : 'Saves notes and triggers Gemini to structure the pedagogical report'
+                }
                 aria-label="Apply AI"
               >
                 {isApplyingAi ? (
