@@ -50,7 +50,7 @@ import {
   SessionNoteVersionEntry,
 } from '../types';
 import { isValidCanonicalUid } from '../utils/studentPersistence';
-import { computeNotesContentHash } from '../utils/notesVersioning';
+import { computeNotesContentHash, deriveLegacyRevisionToken } from '../utils/notesVersioning';
 import {
   convertNotesHtmlToCompactText,
   MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS,
@@ -84,6 +84,7 @@ interface TeacherLiveLessonNotesPanelProps {
       vocabularyNotes?: LiveLessonVocabNote[];
       sessionNotesDocument?: string;
       sessionDate?: string;
+      baseRevisionToken?: string | null;
       driveFileId?: string;
       driveFileUrl?: string;
       driveFolderName?: string;
@@ -266,6 +267,25 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   const [copiedSuccess, setCopiedSuccess] = useState<boolean>(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedSuccessBanner, setSavedSuccessBanner] = useState<boolean>(false);
+  const [revisionToken, setRevisionToken] = useState<string | null>(null);
+  const revisionTokenRef = useRef<string | null>(null);
+  const [revisionConflict, setRevisionConflict] = useState<{
+    message: string;
+    serverRevisionToken?: string | null;
+  } | null>(null);
+  const hasRevisionConflictRef = useRef<boolean>(false);
+  const [isReloadingConflict, setIsReloadingConflict] = useState<boolean>(false);
+
+  const applyServerRevisionToken = useCallback((token: string | null | undefined) => {
+    const clean = typeof token === 'string' && token.trim() ? token.trim() : null;
+    revisionTokenRef.current = clean;
+    setRevisionToken(clean);
+  }, []);
+
+  const clearRevisionConflict = useCallback(() => {
+    hasRevisionConflictRef.current = false;
+    setRevisionConflict(null);
+  }, []);
 
   // FASE NF-DOC.2C: AI Transformation & Teacher Approval States
   const [draftTransformation, setDraftTransformation] = useState<NoteDraftTransformation | null>(null);
@@ -430,6 +450,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       setSelectedOptionKey('');
       loadedSessionKeyRef.current = '';
       isDirtyRef.current = false;
+      applyServerRevisionToken(null);
+      clearRevisionConflict();
 
       const todayStr = getTodayDateStr();
 
@@ -910,6 +932,9 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     setShowVersionHistory(false);
     setAiError(null);
     setAiSuccessMessage(null);
+    setSaveError(null);
+    clearRevisionConflict();
+    applyServerRevisionToken(null);
 
     let initialContent = '';
     let initialTopic = '';
@@ -917,6 +942,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     let initialDriveUrl: string | null = null;
     let initialDriveSyncedAt: string | null = null;
     let initialSavedAt: string | null = null;
+    let initialRevisionToken: string | null = null;
 
     const cleanStrip = (val?: string) => (val ? String(val).replace(/^lesson_+/, '').trim() : '');
     const matchedCachedNote = fetchedStudentNotes.find((n) => {
@@ -965,6 +991,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           initialDriveUrl = matchedCachedNote.driveFileUrl || null;
           initialDriveSyncedAt = matchedCachedNote.driveLastSyncedAt || null;
         }
+        initialRevisionToken = deriveLegacyRevisionToken(matchedCachedNote);
       } else if (currentLesson) {
         if (currentLesson.studentEmail && currentLesson.studentEmail !== selectedStudentEmail) {
           setSelectedStudentEmail(currentLesson.studentEmail);
@@ -1003,6 +1030,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           initialDriveUrl = currentLesson.driveFileUrl || null;
           initialDriveSyncedAt = currentLesson.driveLastSyncedAt || null;
         }
+        initialRevisionToken = deriveLegacyRevisionToken(currentLesson);
       } else if (selectedStudentEmail) {
         const studentEmailLower = selectedStudentEmail.toLowerCase().trim();
         const studentLessons = teacherLessons.filter(
@@ -1041,6 +1069,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             initialDriveUrl = lessonOnDate.driveFileUrl || null;
             initialDriveSyncedAt = lessonOnDate.driveLastSyncedAt || null;
           }
+          initialRevisionToken = deriveLegacyRevisionToken(lessonOnDate);
         } else {
           const defaultTopic = 'Trial';
           initialTopic = defaultTopic;
@@ -1059,6 +1088,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     setDriveFileUrl(initialDriveUrl);
     setDriveLastSyncedAt(initialDriveSyncedAt);
     setDriveSyncStatus(initialDriveId ? 'synced' : 'idle');
+    applyServerRevisionToken(initialRevisionToken);
 
     // Hydrate cached draft/approved/versions non-destructively when available immediately
     if (matchedCachedNote) {
@@ -1100,7 +1130,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       focusEditorAtEnd(editor);
     }
 
-    // Asynchronously verify with /api/session-notes to guarantee the full HTML & version history are retrieved
+    // Asynchronously verify with /api/session-notes to guarantee the full HTML, version history & revision token are retrieved
     let cancelled = false;
     const fetchSavedNotes = async () => {
       try {
@@ -1120,9 +1150,14 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           },
         });
         if (res.ok && !cancelled) {
+          // Never clobber unsaved local edits or conflict state with background fetch results
+          if (isDirtyRef.current || hasRevisionConflictRef.current) {
+            return;
+          }
           const data = await res.json();
           const savedNote = Array.isArray(data) ? data[0] : data;
           if (savedNote) {
+            applyServerRevisionToken(savedNote.revisionToken || deriveLegacyRevisionToken(savedNote));
             const serverContent = savedNote.rawContent || savedNote.content || '';
             if (serverContent && serverContent.trim() && !isOnlyOldTemplate(serverContent)) {
               setNotesContent(serverContent);
@@ -1190,10 +1225,6 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         }
       } catch {
         // silent fallback to initialContent
-      } finally {
-        if (!cancelled) {
-          isDirtyRef.current = false;
-        }
       }
     };
     fetchSavedNotes();
@@ -1239,8 +1270,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
   const handleSelectUnifiedSession = useCallback(
     (selectionValue: string) => {
-      // If dirty, persist current document before switching
-      if (isDirtyRef.current && lastSavedContentRef.current.sessionKey) {
+      // If dirty (and not blocked by unresolved 409 conflict), persist current document before switching
+      if (isDirtyRef.current && !hasRevisionConflictRef.current && lastSavedContentRef.current.sessionKey) {
         persistSessionDocumentRef.current?.(notesContent, topic, false);
       }
 
@@ -1252,6 +1283,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         setSessionDate(todayStr);
         setTopic('Trial');
         isDirtyRef.current = false;
+        applyServerRevisionToken(null);
+        clearRevisionConflict();
         updateDocumentHeader(todayStr, undefined, 'Trial');
         return;
       }
@@ -1504,6 +1537,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
           // Server API sync with Drive metadata (skipDriveSync prevents duplicate Google Drive operations)
           let driveServerSaveOk = false;
+          let driveDefinitiveError = false;
           try {
             const idToken = await auth.currentUser?.getIdToken().catch(() => null);
             const resolvedTeacherUid = (currentAccount?.uid || auth.currentUser?.uid || '').trim();
@@ -1526,18 +1560,45 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 topic: topicToSync,
                 content: contentToSync,
                 rawContent: contentToSync,
+                baseRevisionToken: revisionTokenRef.current ?? null,
                 skipDriveSync: true,
                 ...drivePayload,
               }),
             });
+            const syncData = await syncApiRes.json().catch(() => ({}));
             if (syncApiRes.ok) {
               driveServerSaveOk = true;
+              clearRevisionConflict();
+              applyServerRevisionToken(
+                syncData?.revisionToken ||
+                syncData?.sessionNote?.revisionToken ||
+                deriveLegacyRevisionToken(syncData?.sessionNote)
+              );
+              if (syncData?.sessionNote) {
+                upsertFetchedStudentNote(syncData.sessionNote);
+              }
               window.dispatchEvent(new CustomEvent('native-notes-updated'));
+            } else {
+              if (syncApiRes.status === 409) {
+                driveDefinitiveError = true;
+                hasRevisionConflictRef.current = true;
+                const conflictMsg =
+                  syncData?.message ||
+                  'Conflict (409): This session note was updated elsewhere while syncing. Your unsaved local notes were preserved.';
+                setRevisionConflict({
+                  message: conflictMsg,
+                  serverRevisionToken: syncData?.currentRevisionToken ?? null,
+                });
+                setSaveError(conflictMsg);
+              } else if (syncApiRes.status === 403 || (syncApiRes.status >= 400 && syncApiRes.status < 500)) {
+                driveDefinitiveError = true;
+                setSaveError(syncData?.message || syncData?.error || 'Server rejected Drive metadata sync.');
+              }
             }
           } catch {}
 
-          // 3. Update lesson state in parent (skip duplicate server write when /api/session-notes already succeeded)
-          if (targetLessonId && typeof onSaveLessonNotes === 'function') {
+          // 3. Update lesson state in parent (skip duplicate server write when /api/session-notes already succeeded, and never fallback on 409/403/4xx)
+          if (!driveDefinitiveError && targetLessonId && typeof onSaveLessonNotes === 'function') {
             onSaveLessonNotes(
               targetLessonId,
               {
@@ -1546,6 +1607,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 recommendations: contentToSync,
                 sessionNotesDocument: contentToSync,
                 sessionDate: effDate,
+                baseRevisionToken: revisionTokenRef.current ?? null,
                 ...drivePayload,
               },
               { skipServerSave: driveServerSaveOk }
@@ -1576,6 +1638,9 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       googleOAuthToken,
       connectGoogleDrive,
       onSaveLessonNotes,
+      applyServerRevisionToken,
+      clearRevisionConflict,
+      upsertFetchedStudentNote,
     ]
   );
 
@@ -1590,8 +1655,11 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       explicitSave: boolean = false,
       forceServerSync: boolean = false
     ): Promise<boolean> => {
-      // 1. Concurrency and dirty guard
+      // 1. Concurrency, conflict, and dirty guard
       if (isSavingRef.current) {
+        return false;
+      }
+      if (!explicitSave && hasRevisionConflictRef.current) {
         return false;
       }
 
@@ -1633,12 +1701,6 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
       isSavingRef.current = true;
       setIsSaving(true);
-      isDirtyRef.current = false;
-      lastSavedContentRef.current = {
-        content: contentToSave,
-        topic: topicToSave,
-        sessionKey,
-      };
 
       try {
         const nowIso = new Date().toISOString();
@@ -1646,9 +1708,11 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
         // Server API Persistence (canonical Firestore sync via backend without touching Google Drive)
         let serverSaveOk = true;
+        let definitiveServerError = false;
         try {
           const idToken = await auth.currentUser?.getIdToken().catch(() => null);
           const resolvedTeacherUid = (currentAccount?.uid || auth.currentUser?.uid || '').trim();
+          const tokenToSend = revisionTokenRef.current ?? null;
 
           const apiRes = await fetch('/api/session-notes', {
             method: 'POST',
@@ -1669,6 +1733,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               topic: topicToSave,
               content: contentToSave,
               rawContent: contentToSave,
+              baseRevisionToken: tokenToSend,
               driveFileId: driveFileId || undefined,
               driveFileUrl: driveFileUrl || undefined,
               driveFolderName: GOOGLE_DRIVE_SESSION_FOLDER,
@@ -1679,13 +1744,44 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           if (!apiRes.ok) {
             serverSaveOk = false;
             const errData = await apiRes.json().catch(() => ({}));
-            setSaveError(errData.error || errData.message || 'Error saving notes to server.');
+            if (apiRes.status === 409) {
+              definitiveServerError = true;
+              hasRevisionConflictRef.current = true;
+              const conflictMsg =
+                errData?.message ||
+                'Conflict (409): This session note was updated in another tab or session. Your unsaved local content has been preserved.';
+              setRevisionConflict({
+                message: conflictMsg,
+                serverRevisionToken: errData?.currentRevisionToken ?? null,
+              });
+              setSaveError(conflictMsg);
+              setSavedSuccessBanner(false);
+            } else if (apiRes.status === 403 || (apiRes.status >= 400 && apiRes.status < 500)) {
+              definitiveServerError = true;
+              setSaveError(errData.message || errData.error || 'Error saving notes to server.');
+              setSavedSuccessBanner(false);
+            } else {
+              setSaveError(errData.error || errData.message || 'Error saving notes to server.');
+            }
           } else {
             const savedPayload = await apiRes.json().catch(() => null);
+            const confirmedKey = savedPayload?.sessionNote?.id || sessionKey;
+            isDirtyRef.current = false;
+            lastSavedContentRef.current = {
+              content: contentToSave,
+              topic: topicToSave,
+              sessionKey: confirmedKey,
+            };
+            clearRevisionConflict();
+            const confirmedToken =
+              savedPayload?.revisionToken ||
+              savedPayload?.sessionNote?.revisionToken ||
+              deriveLegacyRevisionToken(savedPayload?.sessionNote);
+            applyServerRevisionToken(confirmedToken);
+
             if (savedPayload?.sessionNote) {
               if (savedPayload.sessionNote.id) {
                 loadedSessionKeyRef.current = `note_${savedPayload.sessionNote.id}`;
-                lastSavedContentRef.current.sessionKey = savedPayload.sessionNote.id;
                 setSelectedSessionNoteKey(savedPayload.sessionNote.id);
                 if (!selectedLessonId && !selectedOptionKey) {
                   setSelectedOptionKey(`note_opt_${savedPayload.sessionNote.id}`);
@@ -1696,6 +1792,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             if (Array.isArray(savedPayload?.sessionNote?.versionHistory)) {
               setVersionHistory(savedPayload.sessionNote.versionHistory);
             }
+            setLastSavedTimestamp(nowIso);
             setSaveError(null);
             window.dispatchEvent(new CustomEvent('native-notes-updated'));
           }
@@ -1704,8 +1801,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           console.warn('Server /api/session-notes notice:', err);
         }
 
-        // 3. Update lesson state in parent (skip duplicate server write when /api/session-notes already succeeded)
-        if (targetLessonId && typeof onSaveLessonNotes === 'function') {
+        // 3. Update lesson state in parent (skip duplicate server write when /api/session-notes already succeeded, and NEVER trigger fallback on 409/403/4xx)
+        if (!definitiveServerError && targetLessonId && typeof onSaveLessonNotes === 'function') {
           onSaveLessonNotes(
             targetLessonId,
             {
@@ -1714,6 +1811,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               recommendations: contentToSave,
               sessionNotesDocument: contentToSave,
               sessionDate: effectiveDate,
+              baseRevisionToken: revisionTokenRef.current ?? null,
               driveFileId: driveFileId || undefined,
               driveFileUrl: driveFileUrl || undefined,
               driveFolderName: GOOGLE_DRIVE_SESSION_FOLDER,
@@ -1723,11 +1821,11 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           );
         }
 
-        setLastSavedTimestamp(nowIso);
-
-        if (explicitSave) {
+        if (explicitSave && serverSaveOk) {
           setSavedSuccessBanner(true);
           setTimeout(() => setSavedSuccessBanner(false), 3000);
+        } else if (!serverSaveOk) {
+          setSavedSuccessBanner(false);
         }
 
         return serverSaveOk;
@@ -1756,8 +1854,96 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       onSaveLessonNotes,
       resolveStudentName,
       upsertFetchedStudentNote,
+      applyServerRevisionToken,
+      clearRevisionConflict,
     ]
   );
+
+  const handleReloadServerVersion = useCallback(async () => {
+    if (isReloadingConflict) return;
+    setIsReloadingConflict(true);
+    try {
+      const lookupId = selectedSessionNoteKey || currentSessionKey;
+      const queryParams = new URLSearchParams();
+      if (selectedLessonId) queryParams.set('lessonId', selectedLessonId);
+      if (lookupId) queryParams.set('id', lookupId);
+      if (selectedStudentEmail) queryParams.set('studentEmail', selectedStudentEmail);
+      if (studentResolution.uid) queryParams.set('studentUid', studentResolution.uid);
+      if (sessionDate) queryParams.set('sessionDate', sessionDate);
+
+      const idToken = await auth.currentUser?.getIdToken().catch(() => null);
+      const res = await fetch(`/api/session-notes?${queryParams.toString()}`, {
+        headers: {
+          ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+        },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const savedNote = Array.isArray(data) ? data[0] : data;
+        if (savedNote) {
+          const serverContent = savedNote.rawContent || savedNote.content || '';
+          const serverTopic = savedNote.topic || topic;
+          setNotesContent(serverContent);
+          if (savedNote.topic) setTopic(savedNote.topic);
+          if (savedNote.updatedAt) setLastSavedTimestamp(savedNote.updatedAt);
+          const f = formatContentForEditor(serverContent);
+          const ed = getActiveEditor();
+          if (ed && ed.innerHTML !== f) {
+            ed.innerHTML = f;
+            lastInternalHtmlRef.current = f;
+          }
+          if (savedNote.draftTransformation) {
+            setDraftTransformation(savedNote.draftTransformation);
+            if (savedNote.draftTransformation.transformation) {
+              setEditableTransformation(JSON.parse(JSON.stringify(savedNote.draftTransformation.transformation)));
+            }
+          } else {
+            setDraftTransformation(null);
+          }
+          if (savedNote.lastApprovedVersion) {
+            setLastApprovedVersion(savedNote.lastApprovedVersion);
+            if (!savedNote.draftTransformation?.transformation && savedNote.lastApprovedVersion.transformation) {
+              setEditableTransformation(JSON.parse(JSON.stringify(savedNote.lastApprovedVersion.transformation)));
+            }
+          } else {
+            setLastApprovedVersion(null);
+          }
+          if (Array.isArray(savedNote.versionHistory)) {
+            setVersionHistory(savedNote.versionHistory);
+          }
+          isDirtyRef.current = false;
+          lastSavedContentRef.current = {
+            content: serverContent,
+            topic: serverTopic,
+            sessionKey: savedNote.id || currentSessionKey,
+          };
+          applyServerRevisionToken(savedNote.revisionToken || deriveLegacyRevisionToken(savedNote));
+          clearRevisionConflict();
+          setSaveError(null);
+          setAiError(null);
+          upsertFetchedStudentNote(savedNote);
+        }
+      }
+    } catch {
+      // keep existing local content intact if reload fails
+    } finally {
+      setIsReloadingConflict(false);
+    }
+  }, [
+    isReloadingConflict,
+    selectedSessionNoteKey,
+    currentSessionKey,
+    selectedLessonId,
+    selectedStudentEmail,
+    studentResolution.uid,
+    sessionDate,
+    topic,
+    formatContentForEditor,
+    getActiveEditor,
+    applyServerRevisionToken,
+    clearRevisionConflict,
+    upsertFetchedStudentNote,
+  ]);
 
   const resolveCanonicalServerSessionKey = useCallback(() => {
     if (selectedSessionNoteKey) {
@@ -1837,6 +2023,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           language: 'pt',
           studentUid: resolvedStudentUid,
           teacherUid: resolvedTeacherUid,
+          baseRevisionToken: revisionTokenRef.current ?? null,
         }),
       });
 
@@ -1845,7 +2032,19 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       if (!res.ok) {
         const errMsg = data.message || data.error || 'Pedagogical transformation via AI failed. Original document was preserved intact without publishing.';
         setAiError(errMsg);
+        if (res.status === 409 && data?.code === 'STALE_REVISION') {
+          hasRevisionConflictRef.current = true;
+          setRevisionConflict({
+            message: errMsg,
+            serverRevisionToken: data?.currentRevisionToken ?? null,
+          });
+        }
       } else if (data.draftTransformation) {
+        applyServerRevisionToken(
+          data?.revisionToken ||
+          data?.sessionNote?.revisionToken ||
+          deriveLegacyRevisionToken(data?.sessionNote)
+        );
         setDraftTransformation(data.draftTransformation);
         if (data.draftTransformation.transformation) {
           setEditableTransformation(JSON.parse(JSON.stringify(data.draftTransformation.transformation)));
@@ -1877,6 +2076,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     currentAccount,
     studentResolution,
     resolveCanonicalServerSessionKey,
+    applyServerRevisionToken,
+    upsertFetchedStudentNote,
   ]);
 
   /**
@@ -1917,14 +2118,28 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           transformation: editableTransformation,
           studentUid: resolvedStudentUid,
           teacherUid: resolvedTeacherUid,
+          baseRevisionToken: revisionTokenRef.current ?? null,
           changeSummary: 'Teacher saved draft edits prior to publishing',
         }),
       });
 
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setAiError(data.message || data.error || 'Failed to save pedagogical draft.');
+        const errMsg = data.message || data.error || 'Failed to save pedagogical draft.';
+        setAiError(errMsg);
+        if (res.status === 409 && data?.code === 'STALE_REVISION') {
+          hasRevisionConflictRef.current = true;
+          setRevisionConflict({
+            message: errMsg,
+            serverRevisionToken: data?.currentRevisionToken ?? null,
+          });
+        }
       } else {
+        applyServerRevisionToken(
+          data?.revisionToken ||
+          data?.sessionNote?.revisionToken ||
+          deriveLegacyRevisionToken(data?.sessionNote)
+        );
         if (data.sessionNote?.draftTransformation) {
           setDraftTransformation(data.sessionNote.draftTransformation);
         }
@@ -1955,6 +2170,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     resolveCanonicalServerSessionKey,
     draftTransformation,
     approvalStatus,
+    applyServerRevisionToken,
+    upsertFetchedStudentNote,
   ]);
 
   const handleToggleVersionHistory = useCallback(async () => {
@@ -2026,6 +2243,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           transformation: editableTransformation,
           studentUid: resolvedStudentUid,
           teacherUid: resolvedTeacherUid,
+          baseRevisionToken: revisionTokenRef.current ?? null,
           changeSummary: 'Teacher reviewed and approved pedagogical notes for student',
         }),
       });
@@ -2035,7 +2253,19 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       if (!res.ok) {
         const errMsg = data.message || data.error || 'Failed to approve pedagogical report.';
         setAiError(errMsg);
+        if (res.status === 409 && data?.code === 'STALE_REVISION') {
+          hasRevisionConflictRef.current = true;
+          setRevisionConflict({
+            message: errMsg,
+            serverRevisionToken: data?.currentRevisionToken ?? null,
+          });
+        }
       } else {
+        applyServerRevisionToken(
+          data?.revisionToken ||
+          data?.sessionNote?.revisionToken ||
+          deriveLegacyRevisionToken(data?.sessionNote)
+        );
         setApprovalStatus('approved');
         if (data.approvedVersion) {
           setLastApprovedVersion(data.approvedVersion);
@@ -2065,6 +2295,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     draftTransformation,
     studentResolution,
     currentAccount,
+    applyServerRevisionToken,
+    upsertFetchedStudentNote,
   ]);
 
   // Inline editing handlers for Pedagogical Report
@@ -2287,7 +2519,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         lastInternalHtmlRef.current = currentHtml;
         setNotesContent(currentHtml);
       }
-      if (isDirtyRef.current && !isSavingRef.current) {
+      if (isDirtyRef.current && !isSavingRef.current && !hasRevisionConflictRef.current) {
         if (autoSaveTimeoutRef.current) {
           clearTimeout(autoSaveTimeoutRef.current);
           autoSaveTimeoutRef.current = null;
@@ -2358,7 +2590,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
   // Controlled debounced auto-save (2.5 seconds after user stops typing)
   useEffect(() => {
-    if (isInitialLoadRef.current || !isDirtyRef.current) return;
+    if (isInitialLoadRef.current || !isDirtyRef.current || hasRevisionConflictRef.current) return;
 
     if (autoSaveTimeoutRef.current) {
       clearTimeout(autoSaveTimeoutRef.current);
@@ -2368,6 +2600,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       if (isInitialLoadRef.current) return;
       if (!isDirtyRef.current) return;
       if (isSavingRef.current) return;
+      if (hasRevisionConflictRef.current) return;
 
       persistSessionDocumentRef.current?.(notesContent, topic, false);
     }, 2500);
@@ -4008,12 +4241,37 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
 
       {activeTab === 'editor' ? (
         <div className="space-y-4">
-          {/* Identity Error Banner */}
-          {Boolean(studentResolution.error || saveError) && (
+          {/* Revision Conflict Banner (HTTP 409) */}
+          {revisionConflict && (
+            <div
+              data-testid="revision-conflict-banner"
+              className="p-3.5 bg-amber-50 border border-amber-300 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-amber-950 text-xs font-semibold shadow-xs animate-in fade-in duration-200"
+            >
+              <div className="flex items-start gap-2.5 flex-1">
+                <AlertCircle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-bold">Revision Conflict (409): </span>
+                  <span>{revisionConflict.message}</span>
+                </div>
+              </div>
+              <button
+                type="button"
+                data-testid="btn-reload-server-version"
+                disabled={isReloadingConflict}
+                onClick={handleReloadServerVersion}
+                className="px-3 py-1.5 rounded-xl bg-amber-700 hover:bg-amber-800 text-white text-xs font-bold shrink-0 transition cursor-pointer disabled:opacity-50"
+              >
+                {isReloadingConflict ? 'Reloading...' : 'Reload Server Version'}
+              </button>
+            </div>
+          )}
+
+          {/* Identity / Save Error Banner */}
+          {Boolean(studentResolution.error || (saveError && !revisionConflict)) && (
             <div className="p-3.5 bg-rose-50 border border-rose-200 rounded-2xl flex items-center gap-3 text-rose-800 text-xs font-semibold shadow-xs animate-in fade-in duration-200">
               <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
               <div className="flex-1">
-                <span className="font-bold">Identity Warning: </span>
+                <span className="font-bold">{studentResolution.error ? 'Identity Warning: ' : 'Save Warning: '}</span>
                 <span>{studentResolution.error || saveError}</span>
               </div>
             </div>

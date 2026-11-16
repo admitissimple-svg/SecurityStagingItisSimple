@@ -4,6 +4,7 @@ import { normalizeDictionaryWord } from './utils/studentDictionaryLibrary';
 import { isGenericPedagogicalDefinition } from './serverGeminiSecurity';
 import { isLegacyGenericTransformation } from './utils/pedagogicalTransformer';
 import { createCleanStudentRoutines } from './data/defaultRoutines';
+import { deriveLegacyRevisionToken, mintSessionNoteRevisionToken } from './utils/notesVersioning';
 
 /**
  * Active identifiers for staging persistence.
@@ -5347,6 +5348,8 @@ export async function saveSessionNotesToFirestoreServer(
     approvalStatus?: 'unapproved' | 'draft_in_progress' | 'approved';
     versionHistory?: any[];
     currentVersionNumber?: number;
+    contentRevision?: number;
+    revisionToken?: string;
     createdAt?: string;
     updatedAt?: string;
     lastSavedByUid?: string;
@@ -5357,6 +5360,7 @@ export async function saveSessionNotesToFirestoreServer(
   },
   options?: {
     preserveExistingVersioningFields?: boolean;
+    preserveExistingContent?: boolean;
   }
 ): Promise<boolean> {
   if (isCloudWriteDisabled) return false;
@@ -5379,10 +5383,18 @@ export async function saveSessionNotesToFirestoreServer(
   try {
     const cleanKey = sessionKey.replace(/[^a-zA-Z0-9_-]/g, '_');
     const preserveExisting = Boolean(options?.preserveExistingVersioningFields);
+    const preserveExistingContent = Boolean(options?.preserveExistingContent);
     const noteRef = db.collection('session_notes').doc(cleanKey);
 
     const buildMergedPayload = (exData: any | null) => {
       const hasExisting = Boolean(exData && typeof exData === 'object');
+      const existingRawContent =
+        hasExisting && typeof (exData.rawContent || exData.content) === 'string'
+          ? String(exData.rawContent || exData.content)
+          : '';
+      const shouldPreserveExistingContent =
+        preserveExistingContent && hasExisting && existingRawContent.trim().length > 0;
+
       const existingCreatedAt = (hasExisting && exData.createdAt) || data.createdAt;
       const existingOriginalNotes = (hasExisting && exData.originalTeacherNotes) || data.originalTeacherNotes || null;
 
@@ -5440,9 +5452,22 @@ export async function saveSessionNotesToFirestoreServer(
 
       const nowIso = new Date().toISOString();
       const effectiveCreatedAt = existingCreatedAt || nowIso;
-      const rawContent = data.rawContent || data.content || '';
+      const rawContent = shouldPreserveExistingContent
+        ? (exData.rawContent || existingRawContent)
+        : (data.rawContent || data.content || '');
+      const content = shouldPreserveExistingContent
+        ? (exData.content || rawContent)
+        : (data.content || rawContent);
+      const topic = shouldPreserveExistingContent
+        ? ((typeof exData.topic === 'string' && exData.topic.trim()) ? exData.topic : (data.topic || ''))
+        : (data.topic || '');
+      const effectiveLessonId = shouldPreserveExistingContent
+        ? ((hasExisting && exData.lessonId && String(exData.lessonId).trim()) || data.lessonId || '')
+        : (data.lessonId || (hasExisting ? exData.lessonId : '') || '');
 
-      const effectiveApprovalStatus = effectiveApprovedVersion
+      const effectiveApprovalStatus = shouldPreserveExistingContent && existingApprovalStatus
+        ? existingApprovalStatus
+        : effectiveApprovedVersion
         ? 'approved'
         : effectiveDraft
         ? 'draft_in_progress'
@@ -5458,48 +5483,125 @@ export async function saveSessionNotesToFirestoreServer(
         hasExisting ? (Number(exData.currentVersionNumber) || 0) : 0
       );
 
-      const sanitized = JSON.parse(JSON.stringify({
-        ...data,
-        id: cleanKey,
-        sessionId: cleanKey,
-        sessionKey: cleanKey,
-        lessonId: data.lessonId || (hasExisting ? exData.lessonId : '') || '',
-        studentUid,
-        teacherUid,
-        sessionDate: data.sessionDate,
-        rawContent,
-        content: data.content || rawContent,
-        topic: data.topic || '',
-        originalTeacherNotes: existingOriginalNotes,
-        draftTransformation: effectiveDraft,
-        lastApprovedVersion: effectiveApprovedVersion,
-        approvalStatus: effectiveApprovalStatus,
-        versionHistory: effectiveHistory,
-        currentVersionNumber: effectiveVersionNumber,
-        driveFileId: existingDriveFileId,
-        driveFileUrl: existingDriveFileUrl,
-        driveFolderName: existingDriveFolderName,
-        driveLastSyncedAt: existingDriveLastSyncedAt,
-        createdAt: effectiveCreatedAt,
-        updatedAt: data.updatedAt || nowIso,
-        lastSavedByUid: teacherUid,
-      }));
+      let effectiveContentRevision: number;
+      let effectiveRevisionToken: string;
+      if (shouldPreserveExistingContent) {
+        effectiveContentRevision = Number(exData.contentRevision || 1);
+        effectiveRevisionToken = exData.revisionToken || deriveLegacyRevisionToken(exData) || mintSessionNoteRevisionToken(effectiveContentRevision);
+      } else if (!hasExisting) {
+        effectiveContentRevision = Number(data.contentRevision || 1);
+        effectiveRevisionToken = (typeof data.revisionToken === 'string' && data.revisionToken.trim())
+          ? data.revisionToken.trim()
+          : mintSessionNoteRevisionToken(effectiveContentRevision);
+      } else {
+        const existingTopic = String(exData.topic || '');
+        const hasRelevantChange = rawContent !== existingRawContent || topic !== existingTopic;
+        const baseRev = Number(exData.contentRevision || 1);
+        if (hasRelevantChange) {
+          effectiveContentRevision = Math.max(baseRev + 1, Number(data.contentRevision || 0));
+          effectiveRevisionToken = (typeof data.revisionToken === 'string' && data.revisionToken.trim() && data.revisionToken !== exData.revisionToken)
+            ? data.revisionToken.trim()
+            : mintSessionNoteRevisionToken(effectiveContentRevision);
+        } else {
+          effectiveContentRevision = Math.max(baseRev, Number(data.contentRevision || 0));
+          effectiveRevisionToken = exData.revisionToken || (typeof data.revisionToken === 'string' && data.revisionToken.trim() ? data.revisionToken.trim() : '') || deriveLegacyRevisionToken(exData) || mintSessionNoteRevisionToken(effectiveContentRevision);
+        }
+      }
+
+      const sanitized = JSON.parse(JSON.stringify(
+        shouldPreserveExistingContent
+          ? {
+              ...data,
+              ...exData,
+              id: cleanKey,
+              sessionId: cleanKey,
+              sessionKey: cleanKey,
+              lessonId: effectiveLessonId,
+              studentUid,
+              studentEmail: (exData.studentEmail && String(exData.studentEmail).trim()) || data.studentEmail || '',
+              teacherUid,
+              teacherEmail: (exData.teacherEmail && String(exData.teacherEmail).trim()) || data.teacherEmail || '',
+              teacherName: (exData.teacherName && String(exData.teacherName).trim()) || data.teacherName || 'Native Friend',
+              sessionDate: (exData.sessionDate && String(exData.sessionDate).trim()) || data.sessionDate,
+              rawContent,
+              content,
+              topic,
+              originalTeacherNotes: existingOriginalNotes,
+              draftTransformation: effectiveDraft,
+              lastApprovedVersion: effectiveApprovedVersion,
+              approvalStatus: effectiveApprovalStatus,
+              versionHistory: effectiveHistory,
+              currentVersionNumber: effectiveVersionNumber,
+              contentRevision: effectiveContentRevision,
+              revisionToken: effectiveRevisionToken,
+              driveFileId: existingDriveFileId,
+              driveFileUrl: existingDriveFileUrl,
+              driveFolderName: existingDriveFolderName,
+              driveLastSyncedAt: existingDriveLastSyncedAt,
+              createdAt: effectiveCreatedAt,
+              updatedAt: data.updatedAt || nowIso,
+              lastSavedByUid: exData.lastSavedByUid || teacherUid,
+            }
+          : {
+              ...data,
+              id: cleanKey,
+              sessionId: cleanKey,
+              sessionKey: cleanKey,
+              lessonId: effectiveLessonId,
+              studentUid,
+              teacherUid,
+              sessionDate: data.sessionDate,
+              rawContent,
+              content,
+              topic,
+              originalTeacherNotes: existingOriginalNotes,
+              draftTransformation: effectiveDraft,
+              lastApprovedVersion: effectiveApprovedVersion,
+              approvalStatus: effectiveApprovalStatus,
+              versionHistory: effectiveHistory,
+              currentVersionNumber: effectiveVersionNumber,
+              contentRevision: effectiveContentRevision,
+              revisionToken: effectiveRevisionToken,
+              driveFileId: existingDriveFileId,
+              driveFileUrl: existingDriveFileUrl,
+              driveFolderName: existingDriveFolderName,
+              driveLastSyncedAt: existingDriveLastSyncedAt,
+              createdAt: effectiveCreatedAt,
+              updatedAt: data.updatedAt || nowIso,
+              lastSavedByUid: teacherUid,
+            }
+      ));
+
+      const isLinkingNewlyToLesson =
+        shouldPreserveExistingContent && !String(exData?.lessonId || '').trim();
 
       const lessonMirror = sanitized.lessonId
-        ? {
-            sessionNotesDocument: sanitized.content,
-            liveNotes: sanitized.content,
-            recommendations: sanitized.content,
-            title: sanitized.topic,
-            notesLastSavedAt: sanitized.updatedAt,
-            updatedAt: sanitized.updatedAt,
-            studentUid,
-            teacherUid,
-            ...(existingDriveFileId ? { driveFileId: existingDriveFileId } : {}),
-            ...(existingDriveFileUrl ? { driveFileUrl: existingDriveFileUrl } : {}),
-            ...(existingDriveFolderName ? { driveFolderName: existingDriveFolderName } : {}),
-            ...(existingDriveLastSyncedAt ? { driveLastSyncedAt: existingDriveLastSyncedAt } : {}),
-          }
+        ? (shouldPreserveExistingContent && !isLinkingNewlyToLesson
+            ? {
+                canonicalSessionNoteKey: cleanKey,
+                updatedAt: sanitized.updatedAt,
+                studentUid,
+                teacherUid,
+                ...(existingDriveFileId ? { driveFileId: existingDriveFileId } : {}),
+                ...(existingDriveFileUrl ? { driveFileUrl: existingDriveFileUrl } : {}),
+                ...(existingDriveFolderName ? { driveFolderName: existingDriveFolderName } : {}),
+                ...(existingDriveLastSyncedAt ? { driveLastSyncedAt: existingDriveLastSyncedAt } : {}),
+              }
+            : {
+                canonicalSessionNoteKey: cleanKey,
+                sessionNotesDocument: sanitized.content,
+                liveNotes: sanitized.content,
+                recommendations: sanitized.content,
+                title: sanitized.topic,
+                notesLastSavedAt: sanitized.updatedAt,
+                updatedAt: sanitized.updatedAt,
+                studentUid,
+                teacherUid,
+                ...(existingDriveFileId ? { driveFileId: existingDriveFileId } : {}),
+                ...(existingDriveFileUrl ? { driveFileUrl: existingDriveFileUrl } : {}),
+                ...(existingDriveFolderName ? { driveFolderName: existingDriveFolderName } : {}),
+                ...(existingDriveLastSyncedAt ? { driveLastSyncedAt: existingDriveLastSyncedAt } : {}),
+              })
         : null;
 
       return { sanitized, lessonMirror };
@@ -5552,7 +5654,7 @@ export async function saveSessionNotesToFirestoreServer(
   }
 }
 
-function buildSessionKeyCandidates(sessionKey: string, extraLessonId?: string): string[] {
+export function buildSessionKeyCandidates(sessionKey: string, extraLessonId?: string): string[] {
   const candidates: string[] = [];
   const add = (val?: string) => {
     const raw = (val || '').trim();

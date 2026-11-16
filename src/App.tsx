@@ -5548,6 +5548,7 @@ export default function App() {
       vocabularyNotes?: LiveLessonVocabNote[];
       sessionNotesDocument?: string;
       sessionDate?: string;
+      baseRevisionToken?: string | null;
       driveFileId?: string;
       driveFileUrl?: string;
       driveFolderName?: string;
@@ -5637,7 +5638,7 @@ export default function App() {
       const studentUid = targetLesson?.studentUid || (targetLesson as any)?.studentId || targetStudent?.uid || targetStudent?.id;
       const rawContent = notes.liveNotes || notes.sessionNotesDocument || notes.recommendations || notes.topic || '';
 
-      await fetch(`/api/lessons/${lessonId}/notes`, {
+      const res = await fetch(`/api/lessons/${lessonId}/notes`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -5650,8 +5651,12 @@ export default function App() {
           rawContent,
           teacherEmail: currentAccount?.email,
           teacherName: currentAccount?.name,
+          ...(notes.baseRevisionToken !== undefined ? { baseRevisionToken: notes.baseRevisionToken } : {}),
         }),
       });
+      if (!res.ok) {
+        return;
+      }
     } catch {
       // local fallback
     }

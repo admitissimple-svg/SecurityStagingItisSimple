@@ -90,6 +90,7 @@ import {
   markVocabularyWordsPracticedServer,
   resolveCanonicalStudentIdentity,
   saveSessionNotesToFirestoreServer,
+  buildSessionKeyCandidates,
   fetchSessionNotesFromFirestoreServer,
   fetchSessionNotesForStudentServer,
   fetchAllSessionNotesServer,
@@ -253,6 +254,7 @@ import {
 import {
   mergeSessionNoteWithVersioning,
   computeNotesContentHash,
+  deriveLegacyRevisionToken,
 } from './src/utils/notesVersioning';
 import {
   NoteDraftTransformation,
@@ -9207,6 +9209,176 @@ async function withSessionNoteWriteLock<T>(
   }
 }
 
+function sanitizeSessionNoteDocKey(raw: string): string {
+  return String(raw || '').trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+function normalizeRevisionTokenInput(val: unknown): string | null | undefined {
+  if (val === undefined) return undefined;
+  if (val === null) return null;
+  if (typeof val === 'string') {
+    const trimmed = val.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+  return String(val);
+}
+
+function withResponseRevisionMetadata<T extends Record<string, any>>(doc: T): T {
+  if (!doc || typeof doc !== 'object') return doc;
+  return {
+    ...doc,
+    revisionToken: deriveLegacyRevisionToken(doc) || undefined,
+    contentRevision: Number(doc.contentRevision || 1),
+  };
+}
+
+async function resolveCanonicalLessonServer(
+  fsDb: any,
+  rawLessonId: string
+): Promise<{ canonicalLessonId: string; lesson: any | null }> {
+  const cleanRaw = String(rawLessonId || '').trim();
+  if (!cleanRaw || !fsDb) {
+    return { canonicalLessonId: cleanRaw, lesson: null };
+  }
+  const candidates = buildSessionKeyCandidates(cleanRaw);
+  for (const cand of candidates) {
+    try {
+      const lSnap = await fsDb.collection('lessons').doc(cand).get().catch(() => null);
+      if (lSnap && lSnap.exists) {
+        return { canonicalLessonId: lSnap.id || cand, lesson: lSnap.data() || null };
+      }
+    } catch {}
+  }
+  return { canonicalLessonId: cleanRaw, lesson: null };
+}
+
+async function resolveCanonicalSessionNoteInTx(
+  tx: any,
+  fsDb: any,
+  params: {
+    canonicalLessonId?: string;
+    rawSessionKey?: string;
+    explicitBodyId?: string;
+    explicitSessionKey?: string;
+    defaultSessionKey?: string;
+    preDiscoveredDoc?: any | null;
+    preDiscoveredFromCanonicalRoot?: boolean;
+  }
+): Promise<{
+  existingDoc: any | null;
+  targetSessionKey: string;
+  txLessonData: any | null;
+  lessonRef: any | null;
+}> {
+  const canonicalLessonId = String(params.canonicalLessonId || '').trim();
+  const lessonRef = canonicalLessonId ? fsDb.collection('lessons').doc(canonicalLessonId) : null;
+  let txLessonData: any | null = null;
+  if (lessonRef) {
+    try {
+      const lessonSnap = await tx.get(lessonRef);
+      if (lessonSnap && lessonSnap.exists) {
+        txLessonData = lessonSnap.data() || null;
+      }
+    } catch {}
+  }
+
+  const candidateIds: string[] = [];
+  const pushCandidate = (raw?: string | null) => {
+    const clean = sanitizeSessionNoteDocKey(String(raw || ''));
+    if (clean && !candidateIds.includes(clean)) {
+      candidateIds.push(clean);
+    }
+  };
+
+  if (txLessonData?.canonicalSessionNoteKey) {
+    pushCandidate(String(txLessonData.canonicalSessionNoteKey));
+  }
+  if (params.preDiscoveredFromCanonicalRoot && params.preDiscoveredDoc?.id) {
+    pushCandidate(String(params.preDiscoveredDoc.id));
+  }
+  if (canonicalLessonId) {
+    pushCandidate(canonicalLessonId);
+    for (const c of buildSessionKeyCandidates(canonicalLessonId)) {
+      pushCandidate(c);
+    }
+  }
+  if (params.rawSessionKey) {
+    pushCandidate(params.rawSessionKey);
+    for (const c of buildSessionKeyCandidates(params.rawSessionKey)) {
+      pushCandidate(c);
+    }
+  }
+  if (params.explicitBodyId) pushCandidate(params.explicitBodyId);
+  if (params.explicitSessionKey) pushCandidate(params.explicitSessionKey);
+  if (params.defaultSessionKey) pushCandidate(params.defaultSessionKey);
+
+  let foundDoc: any | null = null;
+  let foundId = '';
+
+  for (const cand of candidateIds) {
+    const snap = await tx.get(fsDb.collection('session_notes').doc(cand));
+    if (snap && snap.exists && !foundDoc) {
+      const data = snap.data() || {};
+      foundDoc = {
+        id: snap.id || cand,
+        sessionKey: data.sessionKey || snap.id || cand,
+        ...data,
+      };
+      foundId = snap.id || cand;
+    }
+  }
+
+  if (foundDoc) {
+    return {
+      existingDoc: foundDoc,
+      targetSessionKey: foundId,
+      txLessonData,
+      lessonRef,
+    };
+  }
+
+  if (params.preDiscoveredDoc) {
+    const fallbackTarget = sanitizeSessionNoteDocKey(
+      canonicalLessonId ||
+        String(params.preDiscoveredDoc.id || '') ||
+        String(params.defaultSessionKey || '') ||
+        String(params.rawSessionKey || '')
+    );
+    return {
+      existingDoc: params.preDiscoveredDoc,
+      targetSessionKey: fallbackTarget,
+      txLessonData,
+      lessonRef,
+    };
+  }
+
+  const newTargetKey = sanitizeSessionNoteDocKey(
+    canonicalLessonId ||
+      String(params.defaultSessionKey || '') ||
+      String(params.rawSessionKey || '')
+  );
+
+  return {
+    existingDoc: null,
+    targetSessionKey: newTargetKey,
+    txLessonData,
+    lessonRef,
+  };
+}
+
+async function runFirestoreTransactionCompat<T>(fsDb: any, fn: (tx: any) => Promise<T>): Promise<T> {
+  if (typeof fsDb?.runTransaction === 'function') {
+    return fsDb.runTransaction(fn);
+  }
+  const compatTx = {
+    get: async (ref: any) => ref.get(),
+    set: async (ref: any, val: any, opts?: any) => ref.set(val, opts),
+    update: async (ref: any, val: any) => ref.update(val),
+    delete: async (ref: any) => ref.delete(),
+  };
+  return fn(compatTx);
+}
+
 async function handleSaveSessionNotesInternal(req: any, res: any, explicitLessonId?: string) {
   if (!req.user || !req.user.uid) {
     return res.status(401).json({
@@ -9283,10 +9455,10 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
 
   // 4. Verify student identity exists in canonical persistence (do NOT auto-create mock users)
   let studentDoc: any = null;
+  const fsDb = getFirestoreDb();
   try {
-    const fs = getFirestoreDb();
-    if (fs) {
-      const uSnap = await fs.collection('users').doc(studentUid).get().catch(() => null);
+    if (fsDb) {
+      const uSnap = await fsDb.collection('users').doc(studentUid).get().catch(() => null);
       if (uSnap && uSnap.exists) {
         studentDoc = uSnap.data();
       }
@@ -9322,52 +9494,45 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
     }
   }
 
-  // 6. Lesson check (canonical Firestore lessons/{lessonId} only — decoupled from db.liveLessons and legacy subcollections)
-  const lessonId = (explicitLessonId || req.body?.lessonId || (req.body?.id && !req.body.id.startsWith('session_') ? req.body.id : '')).trim();
-  let lesson: any = null;
-  if (lessonId) {
-    try {
-      const fs = getFirestoreDb();
-      if (fs) {
-        const lSnap = await fs.collection('lessons').doc(lessonId).get().catch(() => null);
-        if (lSnap && lSnap.exists) {
-          lesson = lSnap.data();
-        }
-      }
-    } catch {}
-    if (lesson) {
-      if (lesson.studentUid && lesson.studentUid !== studentUid) {
-        return res.status(403).json({
-          error: 'STUDENT_LESSON_MISMATCH',
-          code: 'STUDENT_LESSON_MISMATCH',
-          message: 'The specified lesson belongs to a different student. Save blocked.',
-        });
-      }
-      const lessonTeacherUids = [
-        lesson.teacherUid,
-        lesson.teacherAuthUid,
-        lesson.tutorUid,
-        lesson.teacherPublicId,
-      ]
-        .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
-        .map((v) => v.trim());
-      const callerTeacherUids = new Set(
-        [
-          teacherUid,
-          callerUid,
-          teacherResolution?.authUid,
-          teacherResolution?.publicTutorId,
-        ]
-          .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
-          .map((v) => v.trim())
-      );
-      if (!isCallerAdmin && lessonTeacherUids.length > 0 && !lessonTeacherUids.some((id) => callerTeacherUids.has(id))) {
-        return res.status(403).json({
-          error: 'TEACHER_LESSON_MISMATCH',
-          code: 'TEACHER_LESSON_MISMATCH',
-          message: 'Native Friend is not authorized to teach or save notes for this lesson.',
-        });
-      }
+  // 6. Lesson check (canonical Firestore lessons/{lessonId} across prefix variants)
+  const rawLessonId = (explicitLessonId || req.body?.lessonId || (req.body?.id && !String(req.body.id).startsWith('session_') ? req.body.id : '')).trim();
+  const { canonicalLessonId: lessonId, lesson } = fsDb && rawLessonId
+    ? await resolveCanonicalLessonServer(fsDb, rawLessonId)
+    : { canonicalLessonId: rawLessonId, lesson: null };
+
+  const callerTeacherUids = new Set(
+    [
+      teacherUid,
+      callerUid,
+      teacherResolution?.authUid,
+      teacherResolution?.publicTutorId,
+    ]
+      .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+      .map((v) => v.trim())
+  );
+
+  if (lesson) {
+    if (lesson.studentUid && lesson.studentUid !== studentUid) {
+      return res.status(403).json({
+        error: 'STUDENT_LESSON_MISMATCH',
+        code: 'STUDENT_LESSON_MISMATCH',
+        message: 'The specified lesson belongs to a different student. Save blocked.',
+      });
+    }
+    const lessonTeacherUids = [
+      lesson.teacherUid,
+      lesson.teacherAuthUid,
+      lesson.tutorUid,
+      lesson.teacherPublicId,
+    ]
+      .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+      .map((v) => v.trim());
+    if (!isCallerAdmin && lessonTeacherUids.length > 0 && !lessonTeacherUids.some((id) => callerTeacherUids.has(id))) {
+      return res.status(403).json({
+        error: 'TEACHER_LESSON_MISMATCH',
+        code: 'TEACHER_LESSON_MISMATCH',
+        message: 'Native Friend is not authorized to teach or save notes for this lesson.',
+      });
     }
   }
 
@@ -9394,9 +9559,10 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
   const sessionDate = dateMatch[0];
 
   const explicitBodyId = (req.body?.id && typeof req.body.id === 'string' ? req.body.id.trim() : '');
+  const explicitSessionKey = (req.body?.sessionKey && typeof req.body.sessionKey === 'string' ? req.body.sessionKey.trim() : '');
   const defaultSessionKey = lessonId
     ? lessonId
-    : (explicitBodyId || `session_${sessionDate}_${studentUid}`);
+    : (explicitBodyId || explicitSessionKey || `session_${sessionDate}_${studentUid}`);
 
   // 8. Extract rawContent & content (mandatory)
   const rawContent = (
@@ -9414,33 +9580,51 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
   const topic = req.body?.topic || lesson?.title || 'Live Coaching Session';
   const targetStudentEmail = (studentDoc?.email || req.body?.studentEmail || '').toLowerCase().trim();
 
-  if (!getFirestoreDb()) {
+  if (!fsDb) {
     return res.status(503).json({
       error: 'FirestoreUnavailable',
       message: 'Canonical Firestore (default) database is unavailable.',
     });
   }
 
+  // Extract revision token contract from caller (never trust clientUpdatedAt as authority)
+  const hasBaseTokenProp = Object.prototype.hasOwnProperty.call(req.body || {}, 'baseRevisionToken');
+  const hasExpectedTokenProp = Object.prototype.hasOwnProperty.call(req.body || {}, 'expectedRevisionToken');
+  const requireRevisionToken = req.body?.requireRevisionToken === true;
+  const hasExplicitRevisionToken = hasBaseTokenProp || hasExpectedTokenProp || requireRevisionToken;
+  const providedRevisionToken = hasBaseTokenProp
+    ? normalizeRevisionTokenInput(req.body.baseRevisionToken)
+    : hasExpectedTokenProp
+    ? normalizeRevisionTokenInput(req.body.expectedRevisionToken)
+    : undefined;
+  const hasDriveMetadata = Boolean(
+    req.body?.driveFileId || req.body?.driveFileUrl || req.body?.driveLastSyncedAt
+  );
+
   return withSessionNoteWriteLock(
-    [explicitLessonId, lessonId, explicitBodyId, defaultSessionKey],
+    [explicitLessonId, rawLessonId, lessonId, explicitBodyId, explicitSessionKey, defaultSessionKey],
     async () => {
-      // 8. Fetch existing document from Firestore to preserve approved version, original notes, and version history (FASE NF-DOC.2A)
-      // Resolve across explicitBodyId, defaultSessionKey, and lessonId variants so updates to historical docs never fork duplicates.
-      let existingDoc: any = null;
+      // Pre-discover any existing doc (including query by lessonId or legacy user subcollection fallback)
+      let preDiscoveredDoc: any = null;
+      let preDiscoveredFromCanonicalRoot = false;
       try {
-        const candidateLookupKey = explicitBodyId || defaultSessionKey;
+        const candidateLookupKey = explicitBodyId || explicitSessionKey || defaultSessionKey;
         const fsCandidate = await fetchSessionNotesFromFirestoreServer(candidateLookupKey, {
           studentUid,
-          lessonId: lessonId || undefined,
+          lessonId: lessonId || rawLessonId || undefined,
         });
-        if (fsCandidate && (!fsCandidate.studentUid || fsCandidate.studentUid === studentUid)) {
-          existingDoc = fsCandidate;
+        if (fsCandidate) {
+          preDiscoveredDoc = fsCandidate;
+          if (fsCandidate.id) {
+            const rootCheck = await fsDb
+              .collection('session_notes')
+              .doc(sanitizeSessionNoteDocKey(String(fsCandidate.id)))
+              .get()
+              .catch(() => null);
+            preDiscoveredFromCanonicalRoot = Boolean(rootCheck && rootCheck.exists);
+          }
         }
       } catch {}
-
-      const sessionKey = (existingDoc?.id && typeof existingDoc.id === 'string' && existingDoc.id.trim())
-        ? existingDoc.id.trim()
-        : defaultSessionKey;
 
       const authorContext = {
         authorUid: teacherUid,
@@ -9449,7 +9633,7 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
         teacherName: teacherResolution?.name || req.body?.teacherName || req.user.name || 'Native Friend',
       };
 
-      // Strip server-managed versioning/AI fields from req.body so raw saves can never overwrite draft/approved/history
+      // Strip server-managed versioning/revision/AI fields from req.body
       const {
         draftTransformation: _ignoredDraft,
         lastApprovedVersion: _ignoredApproved,
@@ -9457,44 +9641,249 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
         versionHistory: _ignoredVersionHistory,
         originalTeacherNotes: _ignoredOriginalNotes,
         currentVersionNumber: _ignoredCurrentVersionNumber,
+        revisionToken: _ignoredRevisionToken,
+        contentRevision: _ignoredContentRevision,
+        baseRevisionToken: _ignoredBaseRevisionToken,
+        expectedRevisionToken: _ignoredExpectedRevisionToken,
+        requireRevisionToken: _ignoredRequireRevisionToken,
+        clientUpdatedAt: _ignoredClientUpdatedAt,
         ...safeIncomingBody
       } = (req.body && typeof req.body === 'object' ? req.body : {});
 
-      const noteDoc = mergeSessionNoteWithVersioning({
-        existingNote: existingDoc,
-        incomingNote: {
-          ...safeIncomingBody,
-          id: sessionKey,
-          sessionId: sessionKey,
-          sessionKey,
-          sessionDate,
-          lessonId: lessonId || existingDoc?.lessonId || '',
-          studentUid,
-          studentEmail: targetStudentEmail,
-          teacherUid,
-          teacherEmail: authorContext.authorEmail,
-          teacherName: authorContext.teacherName,
-          topic,
-          content: rawContent,
-          rawContent,
-          pronunciationNotes: req.body?.pronunciationNotes,
-          grammarAndPhrasing: req.body?.grammarAndPhrasing,
-          vocabularyNotes: req.body?.vocabularyNotes,
-          driveFileId: req.body?.driveFileId || existingDoc?.driveFileId || '',
-          driveFileUrl: req.body?.driveFileUrl || existingDoc?.driveFileUrl || '',
-          driveFolderName: req.body?.driveFolderName || existingDoc?.driveFolderName || GOOGLE_DRIVE_SESSION_FOLDER,
-          driveLastSyncedAt: req.body?.driveLastSyncedAt || existingDoc?.driveLastSyncedAt || '',
-        },
-        author: authorContext,
-        changeSummary: req.body?.changeSummary,
-      });
+      try {
+        const txResult = await runFirestoreTransactionCompat(fsDb, async (tx) => {
+          const {
+            existingDoc,
+            targetSessionKey,
+            txLessonData,
+          } = await resolveCanonicalSessionNoteInTx(tx, fsDb, {
+            canonicalLessonId: lessonId,
+            rawSessionKey: explicitBodyId || explicitSessionKey || defaultSessionKey,
+            explicitBodyId,
+            explicitSessionKey,
+            defaultSessionKey,
+            preDiscoveredDoc,
+            preDiscoveredFromCanonicalRoot,
+          });
 
-      // 10. Persist canonically to Firestore (default) under session_notes/{sessionKey} and lessons/{lessonId}
-      // ARCH.2F.2C: Zero db.sessionNotesMap and zero writeDbSync (never triggers app_state write).
-      const savedOk = await saveSessionNotesToFirestoreServer(sessionKey, noteDoc, {
-        preserveExistingVersioningFields: true,
-      });
-      if (!savedOk) {
+          if (!targetSessionKey) {
+            return {
+              ok: false as const,
+              status: 400,
+              body: {
+                success: false,
+                error: 'SESSION_ID_REQUIRED',
+                code: 'SESSION_ID_REQUIRED',
+                message: 'Canonical session key could not be resolved.',
+              },
+            };
+          }
+
+          // Re-verify lesson ownership inside transaction
+          if (txLessonData) {
+            if (txLessonData.studentUid && txLessonData.studentUid !== studentUid) {
+              return {
+                ok: false as const,
+                status: 403,
+                body: {
+                  success: false,
+                  error: 'STUDENT_LESSON_MISMATCH',
+                  code: 'STUDENT_LESSON_MISMATCH',
+                  message: 'The specified lesson belongs to a different student. Save blocked.',
+                },
+              };
+            }
+            const txTeacherUids = [
+              txLessonData.teacherUid,
+              txLessonData.teacherAuthUid,
+              txLessonData.tutorUid,
+              txLessonData.teacherPublicId,
+            ]
+              .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+              .map((v) => v.trim());
+            if (!isCallerAdmin && txTeacherUids.length > 0 && !txTeacherUids.some((id) => callerTeacherUids.has(id))) {
+              return {
+                ok: false as const,
+                status: 403,
+                body: {
+                  success: false,
+                  error: 'TEACHER_LESSON_MISMATCH',
+                  code: 'TEACHER_LESSON_MISMATCH',
+                  message: 'Native Friend is not authorized to teach or save notes for this lesson.',
+                },
+              };
+            }
+          }
+
+          // Strict UID ownership protection on existing canonical document inside transaction
+          if (existingDoc) {
+            if (existingDoc.studentUid && existingDoc.studentUid !== studentUid) {
+              return {
+                ok: false as const,
+                status: 403,
+                body: {
+                  success: false,
+                  error: 'Forbidden',
+                  code: 'STUDENT_UID_MISMATCH',
+                  message: 'Existing session note belongs to a different student.',
+                },
+              };
+            }
+            if (!isCallerAdmin && existingDoc.teacherUid && existingDoc.teacherUid !== teacherUid) {
+              return {
+                ok: false as const,
+                status: 403,
+                body: {
+                  success: false,
+                  error: 'Forbidden',
+                  code: 'TEACHER_MISMATCH',
+                  message: 'Teacher is not authorized to overwrite a session note belonging to another teacher.',
+                },
+              };
+            }
+          }
+
+          // Optimistic concurrency revision token validation inside transaction
+          const serverToken = existingDoc ? deriveLegacyRevisionToken(existingDoc) : null;
+          const serverContentRevision = existingDoc ? Number(existingDoc.contentRevision || 1) : 0;
+
+          if (hasExplicitRevisionToken) {
+            if (providedRevisionToken === undefined) {
+              return {
+                ok: false as const,
+                status: 409,
+                body: {
+                  success: false,
+                  error: 'Conflict',
+                  code: 'REVISION_TOKEN_REQUIRED',
+                  reason: 'MISSING_REVISION_TOKEN',
+                  message: 'Revision token is required to save changes to this session note.',
+                  currentRevisionToken: serverToken,
+                  currentContentRevision: serverContentRevision,
+                },
+              };
+            }
+            if (!existingDoc) {
+              if (providedRevisionToken !== null) {
+                return {
+                  ok: false as const,
+                  status: 409,
+                  body: {
+                    success: false,
+                    error: 'Conflict',
+                    code: 'STALE_REVISION',
+                    reason: 'REVISION_MISMATCH_NEW_DOC',
+                    message: 'The submitted revision token is invalid for this session note state.',
+                    currentRevisionToken: null,
+                    currentContentRevision: 0,
+                    expectedRevisionToken: providedRevisionToken,
+                  },
+                };
+              }
+            } else if (!providedRevisionToken || providedRevisionToken !== serverToken) {
+              return {
+                ok: false as const,
+                status: 409,
+                body: {
+                  success: false,
+                  error: 'Conflict',
+                  code: 'STALE_REVISION',
+                  reason: 'REVISION_MISMATCH',
+                  message: 'The session note was modified in another session or tab. Your unsaved local changes were preserved; review before saving again.',
+                  currentRevisionToken: serverToken,
+                  currentContentRevision: serverContentRevision,
+                  expectedRevisionToken: providedRevisionToken,
+                },
+              };
+            }
+          } else if (hasDriveMetadata && existingDoc) {
+            // Prevent post-Drive callers without a revision token from overwriting existing content
+            return {
+              ok: false as const,
+              status: 409,
+              body: {
+                success: false,
+                error: 'Conflict',
+                code: 'REVISION_TOKEN_REQUIRED',
+                reason: 'DRIVE_METADATA_WITHOUT_REVISION_TOKEN',
+                message: 'A current revision token is required when persisting notes alongside Google Drive sync metadata.',
+                currentRevisionToken: serverToken,
+                currentContentRevision: serverContentRevision,
+              },
+            };
+          }
+
+          const effectiveLessonId = lessonId || existingDoc?.lessonId || '';
+          const noteDoc = mergeSessionNoteWithVersioning({
+            existingNote: existingDoc,
+            incomingNote: {
+              ...safeIncomingBody,
+              id: targetSessionKey,
+              sessionId: targetSessionKey,
+              sessionKey: targetSessionKey,
+              sessionDate,
+              lessonId: effectiveLessonId,
+              studentUid,
+              studentEmail: targetStudentEmail,
+              teacherUid,
+              teacherEmail: authorContext.authorEmail,
+              teacherName: authorContext.teacherName,
+              topic,
+              content: rawContent,
+              rawContent,
+              pronunciationNotes: req.body?.pronunciationNotes,
+              grammarAndPhrasing: req.body?.grammarAndPhrasing,
+              vocabularyNotes: req.body?.vocabularyNotes,
+              driveFileId: req.body?.driveFileId || existingDoc?.driveFileId || '',
+              driveFileUrl: req.body?.driveFileUrl || existingDoc?.driveFileUrl || '',
+              driveFolderName: req.body?.driveFolderName || existingDoc?.driveFolderName || GOOGLE_DRIVE_SESSION_FOLDER,
+              driveLastSyncedAt: req.body?.driveLastSyncedAt || existingDoc?.driveLastSyncedAt || '',
+            },
+            author: authorContext,
+            changeSummary: req.body?.changeSummary,
+          });
+
+          const sanitizedDoc = JSON.parse(JSON.stringify(noteDoc));
+          const noteRef = fsDb.collection('session_notes').doc(targetSessionKey);
+          tx.set(noteRef, sanitizedDoc, { merge: true });
+
+          if (sanitizedDoc.lessonId) {
+            const lessonMirror = JSON.parse(JSON.stringify({
+              canonicalSessionNoteKey: targetSessionKey,
+              sessionNotesDocument: sanitizedDoc.content,
+              liveNotes: sanitizedDoc.content,
+              recommendations: sanitizedDoc.content,
+              title: sanitizedDoc.topic,
+              notesLastSavedAt: sanitizedDoc.updatedAt,
+              updatedAt: sanitizedDoc.updatedAt,
+              studentUid,
+              teacherUid,
+              ...(sanitizedDoc.driveFileId ? { driveFileId: sanitizedDoc.driveFileId } : {}),
+              ...(sanitizedDoc.driveFileUrl ? { driveFileUrl: sanitizedDoc.driveFileUrl } : {}),
+              ...(sanitizedDoc.driveFolderName ? { driveFolderName: sanitizedDoc.driveFolderName } : {}),
+              ...(sanitizedDoc.driveLastSyncedAt ? { driveLastSyncedAt: sanitizedDoc.driveLastSyncedAt } : {}),
+            }));
+            tx.set(fsDb.collection('lessons').doc(sanitizedDoc.lessonId), lessonMirror, { merge: true });
+          }
+
+          return {
+            ok: true as const,
+            noteDoc: sanitizedDoc,
+          };
+        });
+
+        if (!txResult.ok) {
+          return res.status(txResult.status).json(txResult.body);
+        }
+
+        return res.json({
+          success: true,
+          sessionNote: txResult.noteDoc,
+          revisionToken: txResult.noteDoc.revisionToken,
+          contentRevision: txResult.noteDoc.contentRevision,
+        });
+      } catch (txErr: any) {
+        console.warn('[handleSaveSessionNotesInternal] Transaction failed:', txErr);
         return res.status(500).json({
           success: false,
           error: 'FIRESTORE_SAVE_FAILED',
@@ -9502,8 +9891,6 @@ async function handleSaveSessionNotesInternal(req: any, res: any, explicitLesson
           message: 'Failed to persist session notes to Firestore.',
         });
       }
-
-      return res.json({ success: true, sessionNote: noteDoc });
     }
   );
 }
@@ -10231,107 +10618,227 @@ async function handleSessionNoteDraftInternal(req: any, res: any) {
     return res.status(400).json({ error: 'SESSION_ID_REQUIRED', code: 'SESSION_ID_REQUIRED', message: 'Session identifier is required.' });
   }
 
+  const fsDb = getFirestoreDb();
+  if (!fsDb) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
+  }
+
+  const rawLessonIdInput = typeof req.body?.lessonId === 'string' ? req.body.lessonId.trim() : '';
+  const hasBaseTokenProp = Object.prototype.hasOwnProperty.call(req.body || {}, 'baseRevisionToken');
+  const hasExpectedTokenProp = Object.prototype.hasOwnProperty.call(req.body || {}, 'expectedRevisionToken');
+  const hasExplicitRevisionToken = hasBaseTokenProp || hasExpectedTokenProp;
+  const providedRevisionToken = hasBaseTokenProp
+    ? normalizeRevisionTokenInput(req.body.baseRevisionToken)
+    : hasExpectedTokenProp
+    ? normalizeRevisionTokenInput(req.body.expectedRevisionToken)
+    : undefined;
+
   return withSessionNoteWriteLock(
-    [rawSessionKey, typeof req.body?.lessonId === 'string' ? req.body.lessonId : undefined],
+    [rawSessionKey, rawLessonIdInput || undefined],
     async () => {
-      const { effectiveKey: targetSessionKey, existingDoc } = await resolveExistingSessionNoteWithKeyFallback(
+      const lessonCand = rawLessonIdInput || (!rawSessionKey.startsWith('session_') ? rawSessionKey : '');
+      const { canonicalLessonId } = lessonCand
+        ? await resolveCanonicalLessonServer(fsDb, lessonCand)
+        : { canonicalLessonId: '' };
+
+      const preDiscovered = await resolveExistingSessionNoteWithKeyFallback(
         db,
         rawSessionKey,
         undefined,
-        typeof req.body?.lessonId === 'string' ? req.body.lessonId.trim() : undefined
+        canonicalLessonId || rawLessonIdInput || undefined
       );
 
-      if (!existingDoc) {
-        return res.status(404).json({ error: 'NOT_FOUND', code: 'SESSION_NOTE_NOT_FOUND', message: 'Session note document not found.' });
+      let preDiscoveredFromCanonicalRoot = false;
+      if (preDiscovered.existingDoc?.id) {
+        const rootSnap = await fsDb
+          .collection('session_notes')
+          .doc(sanitizeSessionNoteDocKey(String(preDiscovered.existingDoc.id)))
+          .get()
+          .catch(() => null);
+        preDiscoveredFromCanonicalRoot = Boolean(rootSnap && rootSnap.exists);
       }
 
-      const studentUid = existingDoc.studentUid;
-      if (!studentUid || !isValidCanonicalUid(studentUid)) {
-        return res.status(400).json({ error: 'INVALID_STUDENT_IDENTITY', code: 'CANONICAL_STUDENT_UID_REQUIRED', message: 'Canonical student identity is missing or invalid in this document.' });
-      }
-      const docTeacherUid = existingDoc.teacherUid;
-      if (!docTeacherUid || !isValidCanonicalUid(docTeacherUid)) {
-        return res.status(400).json({ error: 'INVALID_TEACHER_IDENTITY', code: 'CANONICAL_TEACHER_UID_REQUIRED', message: 'Canonical teacher identity is missing or invalid in this document.' });
-      }
-      if (req.body?.studentUid && String(req.body.studentUid).trim() !== studentUid) {
-        return res.status(403).json({ error: 'Forbidden', code: 'STUDENT_UID_MISMATCH', message: 'Provided studentUid does not match the canonical owner of this document.' });
-      }
-
-      if (isCallerTeacher && !isCallerAdmin) {
-        if (req.body?.teacherUid && String(req.body.teacherUid).trim() !== callerUid) {
-          return res.status(403).json({ error: 'Forbidden', code: 'TEACHER_MISMATCH', message: 'Invalid teacherUid parameter for the authenticated teacher.' });
-        }
-        const isAuthorized = await verifyCanonicalPedagogicalLinkServer(callerUid, studentUid);
+      const preStudentUid = preDiscovered.existingDoc?.studentUid;
+      if (isCallerTeacher && !isCallerAdmin && preStudentUid && isValidCanonicalUid(preStudentUid)) {
+        const isAuthorized = await verifyCanonicalPedagogicalLinkServer(callerUid, preStudentUid);
         if (!isAuthorized) {
-          return res.status(403).json({ error: 'Forbidden', code: 'UNAUTHORIZED_PEDAGOGICAL_LINK', message: 'Native Friend does not have an authorized pedagogical link with this student.' });
-        }
-        if (docTeacherUid !== callerUid) {
-          return res.status(403).json({ error: 'Forbidden', code: 'TEACHER_MISMATCH', message: 'Teacher is not authorized to edit drafts belonging to another teacher.' });
+          return res.status(403).json({
+            error: 'Forbidden',
+            code: 'UNAUTHORIZED_PEDAGOGICAL_LINK',
+            message: 'Native Friend does not have an authorized pedagogical link with this student.',
+          });
         }
       }
 
-      const transformation = req.body?.transformation;
-      const customTeacherNotes = typeof req.body?.customTeacherNotes === 'string' ? req.body.customTeacherNotes : undefined;
-      const reviewNotes = typeof req.body?.reviewNotes === 'string' ? req.body.reviewNotes : undefined;
+      const txResult = await runFirestoreTransactionCompat(fsDb, async (tx) => {
+        const { existingDoc, targetSessionKey } = await resolveCanonicalSessionNoteInTx(tx, fsDb, {
+          canonicalLessonId,
+          rawSessionKey,
+          explicitBodyId: typeof req.body?.id === 'string' ? req.body.id.trim() : undefined,
+          explicitSessionKey: typeof req.body?.sessionKey === 'string' ? req.body.sessionKey.trim() : undefined,
+          preDiscoveredDoc: preDiscovered.existingDoc,
+          preDiscoveredFromCanonicalRoot,
+        });
 
-      const currentVersion = existingDoc.currentVersionNumber || 1;
-      const nextDraftVersion = currentVersion + 1;
-      const rawNoteText = existingDoc.rawContent || existingDoc.content || '';
-      const contentHash = computeNotesContentHash(rawNoteText);
+        if (!existingDoc) {
+          return {
+            ok: false as const,
+            status: 404,
+            body: { error: 'NOT_FOUND', code: 'SESSION_NOTE_NOT_FOUND', message: 'Session note document not found.' },
+          };
+        }
 
-      const draftTransformation: NoteDraftTransformation = {
-        draftId: `draft_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-        versionNumber: nextDraftVersion,
-        status: 'draft',
-        contentHash,
-        rawNotesSnippet: rawNoteText.slice(0, 300),
-        transformation: transformation || undefined,
-        customTeacherNotes,
-        reviewNotes,
-        createdAt: existingDoc.draftTransformation?.createdAt || new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        editorUid: callerUid,
-        editorEmail: req.user.email,
-      };
+        const studentUid = existingDoc.studentUid;
+        if (!studentUid || !isValidCanonicalUid(studentUid)) {
+          return {
+            ok: false as const,
+            status: 400,
+            body: { error: 'INVALID_STUDENT_IDENTITY', code: 'CANONICAL_STUDENT_UID_REQUIRED', message: 'Canonical student identity is missing or invalid in this document.' },
+          };
+        }
+        const docTeacherUid = existingDoc.teacherUid;
+        if (!docTeacherUid || !isValidCanonicalUid(docTeacherUid)) {
+          return {
+            ok: false as const,
+            status: 400,
+            body: { error: 'INVALID_TEACHER_IDENTITY', code: 'CANONICAL_TEACHER_UID_REQUIRED', message: 'Canonical teacher identity is missing or invalid in this document.' },
+          };
+        }
+        if (req.body?.studentUid && String(req.body.studentUid).trim() !== studentUid) {
+          return {
+            ok: false as const,
+            status: 403,
+            body: { error: 'Forbidden', code: 'STUDENT_UID_MISMATCH', message: 'Provided studentUid does not match the canonical owner of this document.' },
+          };
+        }
 
-      const authorContext = {
-        authorUid: callerUid,
-        authorEmail: req.user.email,
-        authorRole: (isCallerAdmin ? 'admin' : 'teacher') as 'teacher' | 'admin',
-        teacherName: teacherResolution?.name || (req.user as any)?.name || 'Native Friend',
-      };
+        if (isCallerTeacher && !isCallerAdmin) {
+          if (req.body?.teacherUid && String(req.body.teacherUid).trim() !== callerUid) {
+            return {
+              ok: false as const,
+              status: 403,
+              body: { error: 'Forbidden', code: 'TEACHER_MISMATCH', message: 'Invalid teacherUid parameter for the authenticated teacher.' },
+            };
+          }
+          if (docTeacherUid !== callerUid) {
+            return {
+              ok: false as const,
+              status: 403,
+              body: { error: 'Forbidden', code: 'TEACHER_MISMATCH', message: 'Teacher is not authorized to edit drafts belonging to another teacher.' },
+            };
+          }
+          if (preStudentUid && studentUid !== preStudentUid) {
+            return {
+              ok: false as const,
+              status: 403,
+              body: { error: 'Forbidden', code: 'STUDENT_UID_MISMATCH', message: 'Canonical student ownership changed concurrently.' },
+            };
+          }
+        }
 
-      const updatedDoc = mergeSessionNoteWithVersioning({
-        existingNote: existingDoc,
-        incomingNote: {
-          ...existingDoc,
-          draftTransformation,
-          studentUid,
-          teacherUid: existingDoc.teacherUid || callerUid,
-          sessionDate: existingDoc.sessionDate,
-        },
-        author: authorContext,
-        changeSummary: req.body?.changeSummary || 'Teacher updated draft AI transformation in progress',
+        const serverToken = deriveLegacyRevisionToken(existingDoc);
+        if (hasExplicitRevisionToken) {
+          if (!providedRevisionToken || providedRevisionToken !== serverToken) {
+            return {
+              ok: false as const,
+              status: 409,
+              body: {
+                success: false,
+                error: 'Conflict',
+                code: 'STALE_REVISION',
+                reason: 'REVISION_MISMATCH',
+                message: 'The session note was modified in another session or tab. Reload or reconcile before saving draft changes.',
+                currentRevisionToken: serverToken,
+                currentContentRevision: Number(existingDoc.contentRevision || 1),
+              },
+            };
+          }
+        }
+
+        const transformation = req.body?.transformation;
+        const customTeacherNotes = typeof req.body?.customTeacherNotes === 'string' ? req.body.customTeacherNotes : undefined;
+        const reviewNotes = typeof req.body?.reviewNotes === 'string' ? req.body.reviewNotes : undefined;
+
+        const currentVersion = existingDoc.currentVersionNumber || 1;
+        const nextDraftVersion = currentVersion + 1;
+        const rawNoteText = existingDoc.rawContent || existingDoc.content || '';
+        const contentHash = computeNotesContentHash(rawNoteText);
+
+        if (transformation?.contentHash && transformation.contentHash !== contentHash) {
+          return {
+            ok: false as const,
+            status: 409,
+            body: {
+              success: false,
+              error: 'Conflict',
+              code: 'STALE_DRAFT',
+              message: 'The submitted draft transformation is outdated compared to the current session notes.',
+              currentRevisionToken: serverToken,
+              currentContentRevision: Number(existingDoc.contentRevision || 1),
+            },
+          };
+        }
+
+        const draftTransformation: NoteDraftTransformation = {
+          draftId: `draft_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+          versionNumber: nextDraftVersion,
+          status: 'draft',
+          contentHash,
+          rawNotesSnippet: rawNoteText.slice(0, 300),
+          transformation: transformation || undefined,
+          customTeacherNotes,
+          reviewNotes,
+          createdAt: existingDoc.draftTransformation?.createdAt || new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          editorUid: callerUid,
+          editorEmail: req.user.email,
+        };
+
+        const authorContext = {
+          authorUid: callerUid,
+          authorEmail: req.user.email,
+          authorRole: (isCallerAdmin ? 'admin' : 'teacher') as 'teacher' | 'admin',
+          teacherName: teacherResolution?.name || (req.user as any)?.name || 'Native Friend',
+        };
+
+        const updatedDoc = mergeSessionNoteWithVersioning({
+          existingNote: existingDoc,
+          incomingNote: {
+            ...existingDoc,
+            id: targetSessionKey,
+            sessionId: targetSessionKey,
+            sessionKey: targetSessionKey,
+            draftTransformation,
+            studentUid,
+            teacherUid: existingDoc.teacherUid || callerUid,
+            sessionDate: existingDoc.sessionDate,
+          },
+          author: authorContext,
+          changeSummary: req.body?.changeSummary || 'Teacher updated draft AI transformation in progress',
+        });
+
+        const sanitizedDoc = JSON.parse(JSON.stringify(updatedDoc));
+        tx.set(fsDb.collection('session_notes').doc(targetSessionKey), sanitizedDoc, { merge: true });
+
+        return {
+          ok: true as const,
+          noteDoc: sanitizedDoc,
+        };
       });
 
-      if (!getFirestoreDb()) {
-        return res.status(503).json({
-          error: 'FirestoreUnavailable',
-          message: 'Canonical Firestore (default) database is unavailable.',
-        });
+      if (!txResult.ok) {
+        return res.status(txResult.status).json(txResult.body);
       }
 
-      const savedOk = await saveSessionNotesToFirestoreServer(targetSessionKey, updatedDoc);
-      if (!savedOk) {
-        return res.status(500).json({
-          success: false,
-          error: 'FIRESTORE_SAVE_FAILED',
-          code: 'FIRESTORE_SAVE_FAILED',
-          message: 'Failed to persist draft transformation to Firestore.',
-        });
-      }
-
-      return res.json({ success: true, sessionNote: updatedDoc });
+      return res.json({
+        success: true,
+        sessionNote: txResult.noteDoc,
+        revisionToken: txResult.noteDoc.revisionToken,
+        contentRevision: txResult.noteDoc.contentRevision,
+      });
     }
   );
 }
@@ -10384,11 +10891,25 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
     });
   }
 
+  const fsDb = getFirestoreDb();
+  if (!fsDb) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
+  }
+
+  const rawLessonIdInput = typeof req.body?.lessonId === 'string' ? req.body.lessonId.trim() : '';
+  const lessonCand = rawLessonIdInput || (!rawSessionKey.startsWith('session_') ? rawSessionKey : '');
+  const { canonicalLessonId } = lessonCand
+    ? await resolveCanonicalLessonServer(fsDb, lessonCand)
+    : { canonicalLessonId: '' };
+
   const { effectiveKey: targetSessionKey, existingDoc } = await resolveExistingSessionNoteWithKeyFallback(
     db,
     rawSessionKey,
     undefined,
-    typeof req.body?.lessonId === 'string' ? req.body.lessonId.trim() : undefined
+    canonicalLessonId || rawLessonIdInput || undefined
   );
 
   if (!existingDoc) {
@@ -10397,6 +10918,16 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
       code: 'SESSION_NOTE_NOT_FOUND',
       message: 'Session note document not found.',
     });
+  }
+
+  let preDiscoveredFromCanonicalRoot = false;
+  if (existingDoc.id) {
+    const rootSnap = await fsDb
+      .collection('session_notes')
+      .doc(sanitizeSessionNoteDocKey(String(existingDoc.id)))
+      .get()
+      .catch(() => null);
+    preDiscoveredFromCanonicalRoot = Boolean(rootSnap && rootSnap.exists);
   }
 
   const studentUid = existingDoc.studentUid;
@@ -10448,6 +10979,26 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
     }
   }
 
+  const expectedRevisionToken = deriveLegacyRevisionToken(existingDoc);
+  const hasBaseTokenProp = Object.prototype.hasOwnProperty.call(req.body || {}, 'baseRevisionToken');
+  const hasExpectedTokenProp = Object.prototype.hasOwnProperty.call(req.body || {}, 'expectedRevisionToken');
+  if (hasBaseTokenProp || hasExpectedTokenProp) {
+    const providedRevisionToken = hasBaseTokenProp
+      ? normalizeRevisionTokenInput(req.body.baseRevisionToken)
+      : normalizeRevisionTokenInput(req.body.expectedRevisionToken);
+    if (!providedRevisionToken || providedRevisionToken !== expectedRevisionToken) {
+      return res.status(409).json({
+        success: false,
+        error: 'Conflict',
+        code: 'STALE_REVISION',
+        reason: 'REVISION_MISMATCH',
+        message: 'The session note was modified in another session or tab before AI transformation started.',
+        currentRevisionToken: expectedRevisionToken,
+        currentContentRevision: Number(existingDoc.contentRevision || 1),
+      });
+    }
+  }
+
   const rawNotes = (existingDoc.rawContent || existingDoc.content || '').trim();
   const compactNotes = convertNotesHtmlToCompactText(rawNotes);
   const bounds = validatePayloadBounds('pedagogical_transform', { text: compactNotes });
@@ -10475,11 +11026,8 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
   const language = (req.body?.language || req.body?.lang || 'pt').toLowerCase().trim();
   let fsStudentProfile: any = null;
   try {
-    const fs = getFirestoreDb();
-    if (fs && studentUid) {
-      const uSnap = await fs.collection('users').doc(studentUid).get().catch(() => null);
-      if (uSnap && uSnap.exists) fsStudentProfile = uSnap.data();
-    }
+    const uSnap = await fsDb.collection('users').doc(studentUid).get().catch(() => null);
+    if (uSnap && uSnap.exists) fsStudentProfile = uSnap.data();
   } catch {}
   const registeredStudent = (db.students || []).find((s: any) =>
     (studentUid && (s.uid === studentUid || s.id === studentUid)) ||
@@ -10532,72 +11080,108 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
 
     if (reusableTransformation) {
       if (existingDoc.draftTransformation?.contentHash === contentHash && existingDoc.draftTransformation?.transformation === reusableTransformation) {
+        const respDoc = withResponseRevisionMetadata(existingDoc);
         return res.json({
           success: true,
           cached: true,
           draftTransformation: existingDoc.draftTransformation,
-          sessionNote: existingDoc,
+          sessionNote: respDoc,
+          revisionToken: respDoc.revisionToken,
+          contentRevision: respDoc.contentRevision,
         });
       }
 
       return withSessionNoteWriteLock(
-        [rawSessionKey, targetSessionKey, existingDoc.lessonId, typeof req.body?.lessonId === 'string' ? req.body.lessonId : undefined],
+        [rawSessionKey, targetSessionKey, canonicalLessonId || undefined, existingDoc.lessonId, rawLessonIdInput || undefined],
         async () => {
-          const { effectiveKey: latestKey, existingDoc: latestDoc } = await resolveExistingSessionNoteWithKeyFallback(
-            db,
-            targetSessionKey,
-            studentUid,
-            existingDoc.lessonId || (typeof req.body?.lessonId === 'string' ? req.body.lessonId.trim() : undefined)
-          );
-          const commitExistingDoc = latestDoc || existingDoc;
-          const commitKey = latestKey || targetSessionKey;
-          const currentVersion = commitExistingDoc.currentVersionNumber || 1;
-          const reusedDraft: NoteDraftTransformation = {
-            draftId: `draft_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-            versionNumber: currentVersion + 1,
-            status: 'draft',
-            contentHash,
-            rawNotesSnippet: rawNotes.slice(0, 300),
-            transformation: reusableTransformation,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-            editorUid: callerUid,
-            editorEmail: req.user.email,
-          };
+          const txRes = await runFirestoreTransactionCompat(fsDb, async (tx) => {
+            const { existingDoc: latestDoc, targetSessionKey: commitKey } = await resolveCanonicalSessionNoteInTx(tx, fsDb, {
+              canonicalLessonId: canonicalLessonId || existingDoc.lessonId,
+              rawSessionKey: targetSessionKey,
+              preDiscoveredDoc: existingDoc,
+              preDiscoveredFromCanonicalRoot,
+            });
+            const commitExistingDoc = latestDoc || existingDoc;
+            const latestRaw = (commitExistingDoc.rawContent || commitExistingDoc.content || '').trim();
+            const latestHash = computeNotesContentHash(latestRaw);
+            const latestToken = deriveLegacyRevisionToken(commitExistingDoc);
+            if (
+              commitExistingDoc.studentUid !== studentUid ||
+              (!isCallerAdmin && commitExistingDoc.teacherUid !== docTeacherUid)
+            ) {
+              return {
+                ok: false as const,
+                status: 403,
+                body: { error: 'Forbidden', code: 'OWNERSHIP_MISMATCH', message: 'Document ownership mismatch.' },
+              };
+            }
+            if (latestRaw !== rawNotes || latestHash !== contentHash || latestToken !== expectedRevisionToken) {
+              return {
+                ok: false as const,
+                status: 409,
+                body: {
+                  success: false,
+                  error: 'Conflict',
+                  code: 'STALE_DRAFT',
+                  reason: 'CONTENT_CHANGED_DURING_TRANSFORM',
+                  message: 'The session notes were modified while preparing the transformation. Please try again.',
+                  currentRevisionToken: latestToken,
+                  currentContentRevision: Number(commitExistingDoc.contentRevision || 1),
+                },
+              };
+            }
 
-          const updatedDoc = mergeSessionNoteWithVersioning({
-            existingNote: commitExistingDoc,
-            incomingNote: {
-              ...commitExistingDoc,
-              draftTransformation: reusedDraft,
-              studentUid,
-              teacherUid: commitExistingDoc.teacherUid || callerUid,
-              sessionDate: commitExistingDoc.sessionDate,
-            },
-            author: {
-              authorUid: callerUid,
-              authorEmail: req.user.email,
-              authorRole: (isCallerAdmin ? 'admin' : 'teacher') as 'teacher' | 'admin',
-              teacherName: teacherResolution?.name || (req.user as any)?.name || 'Native Friend',
-            },
-            changeSummary: req.body?.changeSummary || 'Reused validated pedagogical transformation for unchanged notes',
+            const currentVersion = commitExistingDoc.currentVersionNumber || 1;
+            const reusedDraft: NoteDraftTransformation = {
+              draftId: `draft_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+              versionNumber: currentVersion + 1,
+              status: 'draft',
+              contentHash,
+              rawNotesSnippet: rawNotes.slice(0, 300),
+              transformation: reusableTransformation,
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+              editorUid: callerUid,
+              editorEmail: req.user.email,
+            };
+
+            const updatedDoc = mergeSessionNoteWithVersioning({
+              existingNote: commitExistingDoc,
+              incomingNote: {
+                ...commitExistingDoc,
+                id: commitKey,
+                sessionId: commitKey,
+                sessionKey: commitKey,
+                draftTransformation: reusedDraft,
+                studentUid,
+                teacherUid: commitExistingDoc.teacherUid || callerUid,
+                sessionDate: commitExistingDoc.sessionDate,
+              },
+              author: {
+                authorUid: callerUid,
+                authorEmail: req.user.email,
+                authorRole: (isCallerAdmin ? 'admin' : 'teacher') as 'teacher' | 'admin',
+                teacherName: teacherResolution?.name || (req.user as any)?.name || 'Native Friend',
+              },
+              changeSummary: req.body?.changeSummary || 'Reused validated pedagogical transformation for unchanged notes',
+            });
+
+            const sanitizedDoc = JSON.parse(JSON.stringify(updatedDoc));
+            tx.set(fsDb.collection('session_notes').doc(commitKey), sanitizedDoc, { merge: true });
+            return { ok: true as const, reusedDraft, noteDoc: sanitizedDoc };
           });
 
-          const savedOk = await saveSessionNotesToFirestoreServer(commitKey, updatedDoc);
-          if (!savedOk) {
-            return res.status(500).json({
-              success: false,
-              error: 'FIRESTORE_SAVE_FAILED',
-              code: 'FIRESTORE_SAVE_FAILED',
-              message: 'Failed to persist reused draft transformation to Firestore.',
-            });
+          if (!txRes.ok) {
+            return res.status(txRes.status).json(txRes.body);
           }
 
           return res.json({
             success: true,
             cached: true,
-            draftTransformation: reusedDraft,
-            sessionNote: updatedDoc,
+            draftTransformation: txRes.reusedDraft,
+            sessionNote: txRes.noteDoc,
+            revisionToken: txRes.noteDoc.revisionToken,
+            contentRevision: txRes.noteDoc.contentRevision,
           });
         }
       );
@@ -10634,6 +11218,7 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
   }
 
   try {
+    // Gemini execution strictly OUTSIDE any Firestore transaction
     const coreResult = await executePedagogicalTransformationCore({
       rawNotes,
       topic: existingDoc.topic || 'Live Coaching Session',
@@ -10665,68 +11250,124 @@ async function handleSessionNoteTransformInternal(req: any, res: any) {
     }
 
     return await withSessionNoteWriteLock(
-      [rawSessionKey, targetSessionKey, existingDoc.lessonId, typeof req.body?.lessonId === 'string' ? req.body.lessonId : undefined],
+      [rawSessionKey, targetSessionKey, canonicalLessonId || undefined, existingDoc.lessonId, rawLessonIdInput || undefined],
       async () => {
-        const { effectiveKey: latestKey, existingDoc: latestDoc } = await resolveExistingSessionNoteWithKeyFallback(
-          db,
-          targetSessionKey,
-          studentUid,
-          existingDoc.lessonId || (typeof req.body?.lessonId === 'string' ? req.body.lessonId.trim() : undefined)
-        );
-        const commitExistingDoc = latestDoc || existingDoc;
-        const commitKey = latestKey || targetSessionKey;
+        const txRes = await runFirestoreTransactionCompat(fsDb, async (tx) => {
+          const { existingDoc: latestDoc, targetSessionKey: commitKey } = await resolveCanonicalSessionNoteInTx(tx, fsDb, {
+            canonicalLessonId: canonicalLessonId || existingDoc.lessonId,
+            rawSessionKey: targetSessionKey,
+            preDiscoveredDoc: existingDoc,
+            preDiscoveredFromCanonicalRoot,
+          });
 
-        const currentVersion = commitExistingDoc.currentVersionNumber || 1;
-        const nextDraftVersion = currentVersion + 1;
+          if (!latestDoc) {
+            return {
+              ok: false as const,
+              status: 404,
+              body: { error: 'NOT_FOUND', code: 'SESSION_NOTE_NOT_FOUND', message: 'Session note document not found.' },
+            };
+          }
 
-        const draftTransformation: NoteDraftTransformation = {
-          draftId: `draft_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-          versionNumber: nextDraftVersion,
-          status: 'draft',
-          contentHash,
-          rawNotesSnippet: rawNotes.slice(0, 300),
-          transformation: coreResult.transformation,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-          editorUid: callerUid,
-          editorEmail: req.user.email,
-        };
+          if (latestDoc.studentUid && latestDoc.studentUid !== studentUid) {
+            return {
+              ok: false as const,
+              status: 403,
+              body: { error: 'Forbidden', code: 'STUDENT_UID_MISMATCH', message: 'Canonical student ownership changed concurrently.' },
+            };
+          }
+          if (!isCallerAdmin && latestDoc.teacherUid && latestDoc.teacherUid !== docTeacherUid) {
+            return {
+              ok: false as const,
+              status: 403,
+              body: { error: 'Forbidden', code: 'TEACHER_MISMATCH', message: 'Canonical teacher ownership changed concurrently.' },
+            };
+          }
 
-        const authorContext = {
-          authorUid: callerUid,
-          authorEmail: req.user.email,
-          authorRole: (isCallerAdmin ? 'admin' : 'teacher') as 'teacher' | 'admin',
-          teacherName: teacherResolution?.name || (req.user as any)?.name || 'Native Friend',
-        };
+          const latestRaw = (latestDoc.rawContent || latestDoc.content || '').trim();
+          const latestHash = computeNotesContentHash(latestRaw);
+          const latestRevisionToken = deriveLegacyRevisionToken(latestDoc);
 
-        const updatedDoc = mergeSessionNoteWithVersioning({
-          existingNote: commitExistingDoc,
-          incomingNote: {
-            ...commitExistingDoc,
+          if (
+            latestRaw !== rawNotes ||
+            latestHash !== contentHash ||
+            latestRevisionToken !== expectedRevisionToken
+          ) {
+            return {
+              ok: false as const,
+              status: 409,
+              body: {
+                success: false,
+                error: 'Conflict',
+                code: 'STALE_DRAFT',
+                reason: 'CONTENT_CHANGED_DURING_TRANSFORM',
+                message: 'The session notes were modified while the AI transformation was running. The stale draft was rejected.',
+                currentRevisionToken: latestRevisionToken,
+                currentContentRevision: Number(latestDoc.contentRevision || 1),
+              },
+            };
+          }
+
+          const currentVersion = latestDoc.currentVersionNumber || 1;
+          const nextDraftVersion = currentVersion + 1;
+
+          const draftTransformation: NoteDraftTransformation = {
+            draftId: `draft_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+            versionNumber: nextDraftVersion,
+            status: 'draft',
+            contentHash,
+            rawNotesSnippet: rawNotes.slice(0, 300),
+            transformation: coreResult.transformation,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            editorUid: callerUid,
+            editorEmail: req.user.email,
+          };
+
+          const authorContext = {
+            authorUid: callerUid,
+            authorEmail: req.user.email,
+            authorRole: (isCallerAdmin ? 'admin' : 'teacher') as 'teacher' | 'admin',
+            teacherName: teacherResolution?.name || (req.user as any)?.name || 'Native Friend',
+          };
+
+          const updatedDoc = mergeSessionNoteWithVersioning({
+            existingNote: latestDoc,
+            incomingNote: {
+              ...latestDoc,
+              id: commitKey,
+              sessionId: commitKey,
+              sessionKey: commitKey,
+              draftTransformation,
+              studentUid,
+              teacherUid: latestDoc.teacherUid || callerUid,
+              sessionDate: latestDoc.sessionDate,
+            },
+            author: authorContext,
+            changeSummary: req.body?.changeSummary || 'Gemini generated pedagogical draft transformation',
+          });
+
+          const sanitizedDoc = JSON.parse(JSON.stringify(updatedDoc));
+          tx.set(fsDb.collection('session_notes').doc(commitKey), sanitizedDoc, { merge: true });
+
+          return {
+            ok: true as const,
             draftTransformation,
-            studentUid,
-            teacherUid: commitExistingDoc.teacherUid || callerUid,
-            sessionDate: commitExistingDoc.sessionDate,
-          },
-          author: authorContext,
-          changeSummary: req.body?.changeSummary || 'Gemini generated pedagogical draft transformation',
+            noteDoc: sanitizedDoc,
+          };
         });
 
-        await savePedagogicalTransformationToFirestoreServer(compositeCacheKey, coreResult.transformation, { rawNotes }).catch(() => null);
-        const savedOk = await saveSessionNotesToFirestoreServer(commitKey, updatedDoc);
-        if (!savedOk) {
-          return res.status(500).json({
-            success: false,
-            error: 'FIRESTORE_SAVE_FAILED',
-            code: 'FIRESTORE_SAVE_FAILED',
-            message: 'Failed to persist generated draft transformation to Firestore.',
-          });
+        if (!txRes.ok) {
+          return res.status(txRes.status).json(txRes.body);
         }
+
+        await savePedagogicalTransformationToFirestoreServer(compositeCacheKey, coreResult.transformation, { rawNotes }).catch(() => null);
 
         return res.json({
           success: true,
-          draftTransformation,
-          sessionNote: updatedDoc,
+          draftTransformation: txRes.draftTransformation,
+          sessionNote: txRes.noteDoc,
+          revisionToken: txRes.noteDoc.revisionToken,
+          contentRevision: txRes.noteDoc.contentRevision,
         });
       }
     );
@@ -10782,57 +11423,52 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
     });
   }
 
+  const fsDb = getFirestoreDb();
+  if (!fsDb) {
+    return res.status(503).json({
+      error: 'FirestoreUnavailable',
+      message: 'Canonical Firestore (default) database is unavailable.',
+    });
+  }
+
+  const rawLessonIdInput = typeof req.body?.lessonId === 'string' ? req.body.lessonId.trim() : '';
+  const hasBaseTokenProp = Object.prototype.hasOwnProperty.call(req.body || {}, 'baseRevisionToken');
+  const hasExpectedTokenProp = Object.prototype.hasOwnProperty.call(req.body || {}, 'expectedRevisionToken');
+  const hasExplicitRevisionToken = hasBaseTokenProp || hasExpectedTokenProp;
+  const providedRevisionToken = hasBaseTokenProp
+    ? normalizeRevisionTokenInput(req.body.baseRevisionToken)
+    : hasExpectedTokenProp
+    ? normalizeRevisionTokenInput(req.body.expectedRevisionToken)
+    : undefined;
+
   return withSessionNoteWriteLock(
-    [rawSessionKey, typeof req.body?.lessonId === 'string' ? req.body.lessonId : undefined],
+    [rawSessionKey, rawLessonIdInput || undefined],
     async () => {
-      const { effectiveKey: targetSessionKey, existingDoc } = await resolveExistingSessionNoteWithKeyFallback(
+      const lessonCand = rawLessonIdInput || (!rawSessionKey.startsWith('session_') ? rawSessionKey : '');
+      const { canonicalLessonId } = lessonCand
+        ? await resolveCanonicalLessonServer(fsDb, lessonCand)
+        : { canonicalLessonId: '' };
+
+      const preDiscovered = await resolveExistingSessionNoteWithKeyFallback(
         db,
         rawSessionKey,
         undefined,
-        typeof req.body?.lessonId === 'string' ? req.body.lessonId.trim() : undefined
+        canonicalLessonId || rawLessonIdInput || undefined
       );
 
-      if (!existingDoc) {
-        return res.status(404).json({
-          error: 'NOT_FOUND',
-          code: 'SESSION_NOTE_NOT_FOUND',
-          message: 'Session note document not found.',
-        });
+      let preDiscoveredFromCanonicalRoot = false;
+      if (preDiscovered.existingDoc?.id) {
+        const rootSnap = await fsDb
+          .collection('session_notes')
+          .doc(sanitizeSessionNoteDocKey(String(preDiscovered.existingDoc.id)))
+          .get()
+          .catch(() => null);
+        preDiscoveredFromCanonicalRoot = Boolean(rootSnap && rootSnap.exists);
       }
 
-      const studentUid = existingDoc.studentUid;
-      if (!studentUid || !isValidCanonicalUid(studentUid)) {
-        return res.status(400).json({
-          error: 'INVALID_STUDENT_IDENTITY',
-          code: 'CANONICAL_STUDENT_UID_REQUIRED',
-          message: 'Canonical student identity is missing or invalid in this document.',
-        });
-      }
-      const docTeacherUid = existingDoc.teacherUid;
-      if (!docTeacherUid || !isValidCanonicalUid(docTeacherUid)) {
-        return res.status(400).json({
-          error: 'INVALID_TEACHER_IDENTITY',
-          code: 'CANONICAL_TEACHER_UID_REQUIRED',
-          message: 'Canonical teacher identity is missing or invalid in this document.',
-        });
-      }
-      if (req.body?.studentUid && String(req.body.studentUid).trim() !== studentUid) {
-        return res.status(403).json({
-          error: 'Forbidden',
-          code: 'STUDENT_UID_MISMATCH',
-          message: 'Provided studentUid does not match the canonical owner of this document.',
-        });
-      }
-
-      if (isCallerTeacher && !isCallerAdmin) {
-        if (req.body?.teacherUid && String(req.body.teacherUid).trim() !== callerUid) {
-          return res.status(403).json({
-            error: 'Forbidden',
-            code: 'TEACHER_MISMATCH',
-            message: 'Invalid teacherUid parameter for the authenticated teacher.',
-          });
-        }
-        const isAuthorized = await verifyCanonicalPedagogicalLinkServer(callerUid, studentUid);
+      const preStudentUid = preDiscovered.existingDoc?.studentUid;
+      if (isCallerTeacher && !isCallerAdmin && preStudentUid && isValidCanonicalUid(preStudentUid)) {
+        const isAuthorized = await verifyCanonicalPedagogicalLinkServer(callerUid, preStudentUid);
         if (!isAuthorized) {
           return res.status(403).json({
             error: 'Forbidden',
@@ -10840,160 +11476,294 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
             message: 'Native Friend does not have an authorized pedagogical link with this student.',
           });
         }
-        if (docTeacherUid !== callerUid) {
-          return res.status(403).json({
-            error: 'Forbidden',
-            code: 'TEACHER_MISMATCH',
-            message: 'Teacher is not authorized to approve notes belonging to another teacher.',
-          });
+      }
+
+      const txRes = await runFirestoreTransactionCompat(fsDb, async (tx) => {
+        const { existingDoc, targetSessionKey } = await resolveCanonicalSessionNoteInTx(tx, fsDb, {
+          canonicalLessonId,
+          rawSessionKey,
+          explicitBodyId: typeof req.body?.id === 'string' ? req.body.id.trim() : undefined,
+          explicitSessionKey: typeof req.body?.sessionKey === 'string' ? req.body.sessionKey.trim() : undefined,
+          preDiscoveredDoc: preDiscovered.existingDoc,
+          preDiscoveredFromCanonicalRoot,
+        });
+
+        if (!existingDoc) {
+          return {
+            ok: false as const,
+            status: 404,
+            body: {
+              error: 'NOT_FOUND',
+              code: 'SESSION_NOTE_NOT_FOUND',
+              message: 'Session note document not found.',
+            },
+          };
         }
-      }
 
-      const currentRawContent = existingDoc.rawContent || existingDoc.content || '';
-      const currentContentHash = computeNotesContentHash(currentRawContent);
-
-      // Stale draft & version protection
-      if (existingDoc.draftTransformation) {
-        if (req.body?.draftId && existingDoc.draftTransformation.draftId !== req.body.draftId) {
-          return res.status(409).json({
-            error: 'Conflict',
-            code: 'DRAFT_ID_MISMATCH',
-            message: 'The submitted draft ID does not match the current active draft.',
-          });
+        const studentUid = existingDoc.studentUid;
+        if (!studentUid || !isValidCanonicalUid(studentUid)) {
+          return {
+            ok: false as const,
+            status: 400,
+            body: {
+              error: 'INVALID_STUDENT_IDENTITY',
+              code: 'CANONICAL_STUDENT_UID_REQUIRED',
+              message: 'Canonical student identity is missing or invalid in this document.',
+            },
+          };
         }
-        if (existingDoc.draftTransformation.contentHash && existingDoc.draftTransformation.contentHash !== currentContentHash) {
-          return res.status(409).json({
-            error: 'Conflict',
-            code: 'STALE_DRAFT',
-            message: 'The pedagogical draft is outdated compared to the current session notes. Notes were modified after this draft was generated. Generate or edit a new draft before approving.',
-          });
+        const docTeacherUid = existingDoc.teacherUid;
+        if (!docTeacherUid || !isValidCanonicalUid(docTeacherUid)) {
+          return {
+            ok: false as const,
+            status: 400,
+            body: {
+              error: 'INVALID_TEACHER_IDENTITY',
+              code: 'CANONICAL_TEACHER_UID_REQUIRED',
+              message: 'Canonical teacher identity is missing or invalid in this document.',
+            },
+          };
         }
-      }
+        if (req.body?.studentUid && String(req.body.studentUid).trim() !== studentUid) {
+          return {
+            ok: false as const,
+            status: 403,
+            body: {
+              error: 'Forbidden',
+              code: 'STUDENT_UID_MISMATCH',
+              message: 'Provided studentUid does not match the canonical owner of this document.',
+            },
+          };
+        }
 
-      if (req.body?.transformation?.contentHash && req.body.transformation.contentHash !== currentContentHash) {
-        return res.status(409).json({
-          error: 'Conflict',
-          code: 'STALE_DRAFT',
-          message: 'The submitted transformation is outdated compared to the current session notes.',
+        if (isCallerTeacher && !isCallerAdmin) {
+          if (req.body?.teacherUid && String(req.body.teacherUid).trim() !== callerUid) {
+            return {
+              ok: false as const,
+              status: 403,
+              body: {
+                error: 'Forbidden',
+                code: 'TEACHER_MISMATCH',
+                message: 'Invalid teacherUid parameter for the authenticated teacher.',
+              },
+            };
+          }
+          if (docTeacherUid !== callerUid) {
+            return {
+              ok: false as const,
+              status: 403,
+              body: {
+                error: 'Forbidden',
+                code: 'TEACHER_MISMATCH',
+                message: 'Teacher is not authorized to approve notes belonging to another teacher.',
+              },
+            };
+          }
+          if (preStudentUid && studentUid !== preStudentUid) {
+            return {
+              ok: false as const,
+              status: 403,
+              body: {
+                error: 'Forbidden',
+                code: 'STUDENT_UID_MISMATCH',
+                message: 'Canonical student ownership changed concurrently.',
+              },
+            };
+          }
+        }
+
+        const serverToken = deriveLegacyRevisionToken(existingDoc);
+        if (hasExplicitRevisionToken) {
+          if (!providedRevisionToken || providedRevisionToken !== serverToken) {
+            return {
+              ok: false as const,
+              status: 409,
+              body: {
+                success: false,
+                error: 'Conflict',
+                code: 'STALE_REVISION',
+                reason: 'REVISION_MISMATCH',
+                message: 'The session note was modified in another session or tab. Reload or reconcile before approving.',
+                currentRevisionToken: serverToken,
+                currentContentRevision: Number(existingDoc.contentRevision || 1),
+              },
+            };
+          }
+        }
+
+        const currentRawContent = existingDoc.rawContent || existingDoc.content || '';
+        const currentContentHash = computeNotesContentHash(currentRawContent);
+
+        // Stale draft & version protection
+        if (existingDoc.draftTransformation) {
+          if (req.body?.draftId && existingDoc.draftTransformation.draftId !== req.body.draftId) {
+            return {
+              ok: false as const,
+              status: 409,
+              body: {
+                error: 'Conflict',
+                code: 'DRAFT_ID_MISMATCH',
+                message: 'The submitted draft ID does not match the current active draft.',
+              },
+            };
+          }
+          if (existingDoc.draftTransformation.contentHash && existingDoc.draftTransformation.contentHash !== currentContentHash) {
+            return {
+              ok: false as const,
+              status: 409,
+              body: {
+                error: 'Conflict',
+                code: 'STALE_DRAFT',
+                message: 'The pedagogical draft is outdated compared to the current session notes. Notes were modified after this draft was generated. Generate or edit a new draft before approving.',
+              },
+            };
+          }
+        }
+
+        if (req.body?.transformation?.contentHash && req.body.transformation.contentHash !== currentContentHash) {
+          return {
+            ok: false as const,
+            status: 409,
+            body: {
+              error: 'Conflict',
+              code: 'STALE_DRAFT',
+              message: 'The submitted transformation is outdated compared to the current session notes.',
+            },
+          };
+        }
+
+        // Idempotency check: already approved with identical content
+        if (
+          existingDoc.approvalStatus === 'approved' &&
+          existingDoc.lastApprovedVersion &&
+          existingDoc.lastApprovedVersion.contentHash === currentContentHash &&
+          !existingDoc.draftTransformation
+        ) {
+          const respDoc = withResponseRevisionMetadata(existingDoc);
+          return {
+            ok: true as const,
+            alreadyApproved: true,
+            approvedVersion: existingDoc.lastApprovedVersion,
+            noteDoc: respDoc,
+          };
+        }
+
+        const rawIncomingTransformation = req.body?.transformation;
+        const transformation =
+          rawIncomingTransformation?.transformation ||
+          (rawIncomingTransformation?.mistakesAnalysis ? rawIncomingTransformation : null) ||
+          existingDoc.draftTransformation?.transformation;
+        if (!transformation) {
+          return {
+            ok: false as const,
+            status: 400,
+            body: {
+              error: 'TRANSFORMATION_REQUIRED',
+              code: 'TRANSFORMATION_REQUIRED',
+              message: 'A valid pedagogical transformation is required for approval.',
+            },
+          };
+        }
+
+        if (
+          !Array.isArray(transformation.mistakesAnalysis) ||
+          !Array.isArray(transformation.grammarPoints) ||
+          !Array.isArray(transformation.vocabularyAndExpressions) ||
+          !transformation.reviewSummary ||
+          typeof transformation.reviewSummary !== 'object' ||
+          Array.isArray(transformation.reviewSummary)
+        ) {
+          return {
+            ok: false as const,
+            status: 400,
+            body: {
+              error: 'INVALID_TRANSFORMATION',
+              code: 'INVALID_TRANSFORMATION_STRUCTURE',
+              message: 'Invalid pedagogical transformation structure: all 4 canonical parts are required.',
+            },
+          };
+        }
+
+        if (
+          transformation.isFallback === true ||
+          transformation.isProvisional === true ||
+          (transformation.isAiGenerated && isLegacyGenericTransformation(transformation, currentRawContent))
+        ) {
+          return {
+            ok: false as const,
+            status: 400,
+            body: {
+              error: 'SYNTHETIC_TRANSFORMATION_REJECTED',
+              code: 'SYNTHETIC_TRANSFORMATION_REJECTED',
+              message: 'Synthetic or pre-fabricated fallback transformations cannot be approved.',
+            },
+          };
+        }
+
+        const currentVersion = existingDoc.currentVersionNumber || 1;
+        const nextApprovedVersion = currentVersion + 1;
+
+        const approvedVersion: NoteApprovedVersion = {
+          approvedVersionId: `appr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+          versionNumber: nextApprovedVersion,
+          status: 'approved',
+          contentHash: currentContentHash,
+          rawNotesSnippet: currentRawContent.slice(0, 300),
+          transformation,
+          approvedAt: new Date().toISOString(),
+          approvedByUid: callerUid,
+          approvedByEmail: req.user.email,
+          approvedByName: teacherResolution?.name || (req.user as any)?.name || 'Native Friend',
+          notesSummary: req.body?.notesSummary || 'Teacher reviewed and approved pedagogical notes for student',
+        };
+
+        const authorContext = {
+          authorUid: callerUid,
+          authorEmail: req.user.email,
+          authorRole: (isCallerAdmin ? 'admin' : 'teacher') as 'teacher' | 'admin',
+          teacherName: teacherResolution?.name || (req.user as any)?.name || 'Native Friend',
+        };
+
+        const updatedDoc = mergeSessionNoteWithVersioning({
+          existingNote: existingDoc,
+          incomingNote: {
+            ...existingDoc,
+            id: targetSessionKey,
+            sessionId: targetSessionKey,
+            sessionKey: targetSessionKey,
+            lastApprovedVersion: approvedVersion,
+            draftTransformation: null, // Draft is cleared upon approval and publication!
+            studentUid,
+            teacherUid: docTeacherUid,
+            sessionDate: existingDoc.sessionDate,
+          },
+          author: authorContext,
+          changeSummary: req.body?.changeSummary || `Version ${nextApprovedVersion} approved and published for student`,
         });
-      }
 
-      // Idempotency check: already approved with identical content
-      if (
-        existingDoc.approvalStatus === 'approved' &&
-        existingDoc.lastApprovedVersion &&
-        existingDoc.lastApprovedVersion.contentHash === currentContentHash &&
-        !existingDoc.draftTransformation
-      ) {
-        return res.json({
-          success: true,
-          approvalStatus: existingDoc.approvalStatus,
-          approvedVersion: existingDoc.lastApprovedVersion,
-          sessionNote: existingDoc,
-          alreadyApproved: true,
-        });
-      }
+        const sanitizedDoc = JSON.parse(JSON.stringify(updatedDoc));
+        tx.set(fsDb.collection('session_notes').doc(targetSessionKey), sanitizedDoc, { merge: true });
 
-      const rawIncomingTransformation = req.body?.transformation;
-      const transformation =
-        rawIncomingTransformation?.transformation ||
-        (rawIncomingTransformation?.mistakesAnalysis ? rawIncomingTransformation : null) ||
-        existingDoc.draftTransformation?.transformation;
-      if (!transformation) {
-        return res.status(400).json({
-          error: 'TRANSFORMATION_REQUIRED',
-          code: 'TRANSFORMATION_REQUIRED',
-          message: 'A valid pedagogical transformation is required for approval.',
-        });
-      }
-
-      if (
-        !Array.isArray(transformation.mistakesAnalysis) ||
-        !Array.isArray(transformation.grammarPoints) ||
-        !Array.isArray(transformation.vocabularyAndExpressions) ||
-        !transformation.reviewSummary ||
-        typeof transformation.reviewSummary !== 'object' ||
-        Array.isArray(transformation.reviewSummary)
-      ) {
-        return res.status(400).json({
-          error: 'INVALID_TRANSFORMATION',
-          code: 'INVALID_TRANSFORMATION_STRUCTURE',
-          message: 'Invalid pedagogical transformation structure: all 4 canonical parts are required.',
-        });
-      }
-
-      if (
-        transformation.isFallback === true ||
-        transformation.isProvisional === true ||
-        (transformation.isAiGenerated && isLegacyGenericTransformation(transformation, currentRawContent))
-      ) {
-        return res.status(400).json({
-          error: 'SYNTHETIC_TRANSFORMATION_REJECTED',
-          code: 'SYNTHETIC_TRANSFORMATION_REJECTED',
-          message: 'Synthetic or pre-fabricated fallback transformations cannot be approved.',
-        });
-      }
-
-      const currentVersion = existingDoc.currentVersionNumber || 1;
-      const nextApprovedVersion = currentVersion + 1;
-
-      const approvedVersion: NoteApprovedVersion = {
-        approvedVersionId: `appr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-        versionNumber: nextApprovedVersion,
-        status: 'approved',
-        contentHash: currentContentHash,
-        rawNotesSnippet: currentRawContent.slice(0, 300),
-        transformation,
-        approvedAt: new Date().toISOString(),
-        approvedByUid: callerUid,
-        approvedByEmail: req.user.email,
-        approvedByName: teacherResolution?.name || (req.user as any)?.name || 'Native Friend',
-        notesSummary: req.body?.notesSummary || 'Teacher reviewed and approved pedagogical notes for student',
-      };
-
-      const authorContext = {
-        authorUid: callerUid,
-        authorEmail: req.user.email,
-        authorRole: (isCallerAdmin ? 'admin' : 'teacher') as 'teacher' | 'admin',
-        teacherName: teacherResolution?.name || (req.user as any)?.name || 'Native Friend',
-      };
-
-      const updatedDoc = mergeSessionNoteWithVersioning({
-        existingNote: existingDoc,
-        incomingNote: {
-          ...existingDoc,
-          lastApprovedVersion: approvedVersion,
-          draftTransformation: null, // Draft is cleared upon approval and publication!
-          studentUid,
-          teacherUid: docTeacherUid,
-          sessionDate: existingDoc.sessionDate,
-        },
-        author: authorContext,
-        changeSummary: req.body?.changeSummary || `Version ${nextApprovedVersion} approved and published for student`,
+        return {
+          ok: true as const,
+          alreadyApproved: false,
+          approvedVersion,
+          noteDoc: sanitizedDoc,
+        };
       });
 
-      if (!getFirestoreDb()) {
-        return res.status(503).json({
-          error: 'FirestoreUnavailable',
-          message: 'Canonical Firestore (default) database is unavailable.',
-        });
-      }
-
-      const savedOk = await saveSessionNotesToFirestoreServer(targetSessionKey, updatedDoc);
-      if (!savedOk) {
-        return res.status(500).json({
-          success: false,
-          error: 'FIRESTORE_SAVE_FAILED',
-          code: 'FIRESTORE_SAVE_FAILED',
-          message: 'Failed to persist approved version to Firestore.',
-        });
+      if (!txRes.ok) {
+        return res.status(txRes.status).json(txRes.body);
       }
 
       return res.json({
         success: true,
-        approvalStatus: updatedDoc.approvalStatus,
-        approvedVersion,
-        sessionNote: updatedDoc,
+        approvalStatus: txRes.noteDoc.approvalStatus,
+        approvedVersion: txRes.approvedVersion,
+        sessionNote: txRes.noteDoc,
+        revisionToken: txRes.noteDoc.revisionToken,
+        contentRevision: txRes.noteDoc.contentRevision,
+        ...(txRes.alreadyApproved ? { alreadyApproved: true } : {}),
       });
     }
   );
@@ -11051,6 +11821,7 @@ app.get('/api/session-notes/:id/versions', firebaseAuthMiddleware, async (req, r
     }
   }
 
+  const withRev = withResponseRevisionMetadata(existingDoc);
   return res.json({
     success: true,
     sessionId: existingDoc.id,
@@ -11059,6 +11830,8 @@ app.get('/api/session-notes/:id/versions', firebaseAuthMiddleware, async (req, r
     teacherUid: existingDoc.teacherUid,
     approvalStatus: existingDoc.approvalStatus || (existingDoc.lastApprovedVersion ? 'approved' : 'unapproved'),
     currentVersionNumber: existingDoc.currentVersionNumber || 1,
+    revisionToken: withRev.revisionToken,
+    contentRevision: withRev.contentRevision,
     originalTeacherNotes: existingDoc.originalTeacherNotes || null,
     draftTransformation: existingDoc.draftTransformation || null,
     lastApprovedVersion: existingDoc.lastApprovedVersion || null,
@@ -11552,8 +12325,67 @@ app.post('/api/drive/sync-session-notes', firebaseAuthMiddleware, async (req, re
     });
   }
 
-  const effectiveKey = cleanSessionKey || cleanLessonId || `session_${cleanDate}_${targetStudentUid}`;
-  const { existingDoc } = await resolveExistingSessionNoteWithKeyFallback(db, effectiveKey);
+  const defaultCanonicalKey = cleanLessonId || cleanSessionKey || `session_${cleanDate}_${targetStudentUid}`;
+
+  const resolveCanonicalNoteForDriveSync = async (): Promise<{ existingDoc: any | null; canonicalKey: string }> => {
+    let resolved: any = null;
+    if (cleanLessonId) {
+      const byLesson = await resolveExistingSessionNoteWithKeyFallback(
+        db,
+        cleanLessonId,
+        targetStudentUid,
+        cleanLessonId
+      );
+      if (byLesson.existingDoc) {
+        resolved = byLesson.existingDoc;
+      }
+    }
+    if (!resolved && cleanSessionKey && cleanSessionKey !== cleanLessonId) {
+      const bySessionKey = await resolveExistingSessionNoteWithKeyFallback(
+        db,
+        cleanSessionKey,
+        targetStudentUid,
+        cleanLessonId || undefined
+      );
+      if (bySessionKey.existingDoc) {
+        const docStudentUid = String(bySessionKey.existingDoc.studentUid || '').trim();
+        const docLessonId = String(bySessionKey.existingDoc.lessonId || '').trim();
+        const sameOrUnboundStudent = !docStudentUid || docStudentUid === targetStudentUid;
+        if (!sameOrUnboundStudent || !cleanLessonId || !docLessonId || docLessonId === cleanLessonId) {
+          resolved = bySessionKey.existingDoc;
+        }
+      }
+    }
+    if (!resolved && !cleanLessonId && !cleanSessionKey) {
+      const byDefault = await resolveExistingSessionNoteWithKeyFallback(
+        db,
+        defaultCanonicalKey,
+        targetStudentUid,
+        undefined
+      );
+      if (byDefault.existingDoc) {
+        resolved = byDefault.existingDoc;
+      }
+    }
+    if (!resolved && cleanExistingFileId) {
+      const byFileId = await findSessionNoteByDriveFileIdServer(cleanExistingFileId);
+      if (byFileId) {
+        const docStudentUid = String(byFileId.studentUid || '').trim();
+        const docLessonId = String(byFileId.lessonId || '').trim();
+        const sameOrUnboundStudent = !docStudentUid || docStudentUid === targetStudentUid;
+        if (!sameOrUnboundStudent || !cleanLessonId || !docLessonId || docLessonId === cleanLessonId) {
+          resolved = byFileId;
+        }
+      }
+    }
+    const resolvedKey =
+      (resolved?.id && typeof resolved.id === 'string' && resolved.id.trim())
+        ? resolved.id.trim()
+        : defaultCanonicalKey;
+    return { existingDoc: resolved, canonicalKey: resolvedKey };
+  };
+
+  const { existingDoc, canonicalKey } = await resolveCanonicalNoteForDriveSync();
 
   if (existingDoc) {
     if (existingDoc.studentUid && existingDoc.studentUid !== targetStudentUid) {
@@ -11592,8 +12424,8 @@ app.post('/api/drive/sync-session-notes', firebaseAuthMiddleware, async (req, re
       content: content || '',
       topic: topic || 'Native Friend Live Coaching',
       existingFileId: cleanExistingFileId || undefined,
-      lessonId: cleanLessonId || undefined,
-      sessionKey: effectiveKey,
+      lessonId: cleanLessonId || existingDoc?.lessonId || undefined,
+      sessionKey: canonicalKey,
       teacherEmail: effectiveTeacherEmail,
       teacherName: effectiveTeacherName,
       teacherUid: effectiveTeacherUid,
@@ -11601,54 +12433,74 @@ app.post('/api/drive/sync-session-notes', firebaseAuthMiddleware, async (req, re
 
     const nowIso = driveRes.syncedAt || new Date().toISOString();
 
-    const updatedNote = {
-      ...(existingDoc || {}),
-      id: effectiveKey,
-      sessionId: effectiveKey,
-      sessionKey: effectiveKey,
-      sessionDate: cleanDate || existingDoc?.sessionDate || '',
-      lessonId: cleanLessonId || existingDoc?.lessonId || '',
-      studentUid: targetStudentUid,
-      studentEmail: targetStudentEmail || existingDoc?.studentEmail || '',
-      teacherUid: effectiveTeacherUid || existingDoc?.teacherUid || callerUid,
-      teacherEmail: effectiveTeacherEmail || existingDoc?.teacherEmail || '',
-      teacherName: effectiveTeacherName || existingDoc?.teacherName || 'Native Friend',
-      topic: topic || existingDoc?.topic || '',
-      content: content || existingDoc?.content || '',
-      rawContent: content || existingDoc?.rawContent || existingDoc?.content || '',
-      driveFileId: driveRes.fileId,
-      driveFileUrl: driveRes.webViewLink,
-      driveFolderName: driveRes.folderName,
-      driveLastSyncedAt: nowIso,
-      updatedAt: nowIso,
-    };
+    const persistResult = await withSessionNoteWriteLock(
+      [canonicalKey, cleanLessonId, cleanSessionKey, existingDoc?.id],
+      async () => {
+        const { existingDoc: latestDoc, canonicalKey: commitKey } = await resolveCanonicalNoteForDriveSync();
 
-    const savedOk = await saveSessionNotesToFirestoreServer(effectiveKey, updatedNote);
-    if (!savedOk) {
-      return res.status(500).json({ error: 'Failed to persist synced Drive session notes to Firestore.' });
-    }
-    if (cleanLessonId) {
-      const firestore = getFirestoreDb();
-      if (firestore) {
-        await firestore
-          .collection('lessons')
-          .doc(cleanLessonId)
-          .set(
-            {
-              ...(topic ? { title: topic } : {}),
-              ...(content ? { liveNotes: content, recommendations: content, sessionNotesDocument: content } : {}),
-              studentUid: targetStudentUid,
-              teacherUid: effectiveTeacherUid,
-              driveFileId: driveRes.fileId,
-              driveFileUrl: driveRes.webViewLink,
-              driveFolderName: driveRes.folderName,
-              driveLastSyncedAt: nowIso,
-              updatedAt: nowIso,
-            },
-            { merge: true }
-          )
-          .catch(() => null);
+        if (latestDoc) {
+          if (latestDoc.studentUid && latestDoc.studentUid !== targetStudentUid) {
+            return {
+              ok: false as const,
+              status: 403,
+              body: {
+                error: 'Forbidden',
+                code: 'STUDENT_UID_MISMATCH',
+                message: 'Existing session note belongs to a different student.',
+              },
+            };
+          }
+          if (!isCallerAdmin && latestDoc.teacherUid && latestDoc.teacherUid !== callerUid) {
+            return {
+              ok: false as const,
+              status: 403,
+              body: {
+                error: 'Forbidden',
+                code: 'TEACHER_MISMATCH',
+                message: 'Teacher is not authorized to modify another teacher\'s session note.',
+              },
+            };
+          }
+        }
+
+        const drivePersistPayload = {
+          id: commitKey,
+          sessionId: commitKey,
+          sessionKey: commitKey,
+          sessionDate: cleanDate || latestDoc?.sessionDate || '',
+          lessonId: cleanLessonId || latestDoc?.lessonId || existingDoc?.lessonId || '',
+          studentUid: targetStudentUid,
+          studentEmail: targetStudentEmail || latestDoc?.studentEmail || '',
+          teacherUid: effectiveTeacherUid || latestDoc?.teacherUid || callerUid,
+          teacherEmail: effectiveTeacherEmail || latestDoc?.teacherEmail || '',
+          teacherName: effectiveTeacherName || latestDoc?.teacherName || 'Native Friend',
+          topic: typeof topic === 'string' ? topic : '',
+          content: typeof content === 'string' ? content : '',
+          rawContent: typeof content === 'string' ? content : '',
+          driveFileId: driveRes.fileId,
+          driveFileUrl: driveRes.webViewLink,
+          driveFolderName: driveRes.folderName,
+          driveLastSyncedAt: nowIso,
+          updatedAt: nowIso,
+        };
+
+        const savedOk = await saveSessionNotesToFirestoreServer(commitKey, drivePersistPayload, {
+          preserveExistingVersioningFields: true,
+          preserveExistingContent: true,
+        });
+        if (!savedOk) {
+          return {
+            ok: false as const,
+            status: 500,
+            body: { error: 'Failed to persist synced Drive session notes to Firestore.' },
+          };
+        }
+        return { ok: true as const };
       }
+    );
+
+    if (!persistResult.ok) {
+      return res.status(persistResult.status).json(persistResult.body);
     }
 
     res.json({
@@ -11915,11 +12767,11 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
         }
       }
       const rawContent = foundDoc.rawContent || foundDoc.content || '';
-      return res.json({
+      return res.json(withResponseRevisionMetadata({
         ...foundDoc,
         rawContent,
         content: foundDoc.content || rawContent,
-      });
+      }));
     }
 
     return res.status(404).json({ error: 'Session note not found' });
@@ -11936,7 +12788,7 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
         fsNotes.forEach((n: any) => {
           const rawContent = n.rawContent || n.content || '';
           const key = n.id || n.sessionKey || (n.sessionDate ? `session_${n.sessionDate}` : 'session');
-          map.set(key, { ...n, rawContent, content: n.content || rawContent });
+          map.set(key, withResponseRevisionMetadata({ ...n, rawContent, content: n.content || rawContent }));
         });
       }
     } catch {}
@@ -11970,7 +12822,7 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
                   );
                 });
               if (!alreadyPresent) {
-                map.set(mapKey, {
+                map.set(mapKey, withResponseRevisionMetadata({
                   id: mapKey,
                   sessionKey: mapKey,
                   sessionDate: lDate,
@@ -11989,7 +12841,7 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
                   driveFolderName: l.driveFolderName,
                   driveLastSyncedAt: l.driveLastSyncedAt,
                   updatedAt: l.updatedAt || l.notesLastSavedAt || new Date().toISOString(),
-                });
+                }));
               }
             }
           });
@@ -12038,13 +12890,13 @@ app.get('/api/session-notes', firebaseAuthMiddleware, async (req, res) => {
   // 4. Admin listing all notes from Firestore (default)
   if (isCallerAdmin) {
     const all = await fetchAllSessionNotesServer();
-    return res.json(all);
+    return res.json(Array.isArray(all) ? all.map((n: any) => withResponseRevisionMetadata(n)) : []);
   }
 
   // Teacher listing notes for their lessons from Firestore (default)
   if (isCallerTeacher) {
     const teacherNotes = await fetchSessionNotesByTeacherServer(callerUid, req.user?.email);
-    return res.json(teacherNotes);
+    return res.json(Array.isArray(teacherNotes) ? teacherNotes.map((n: any) => withResponseRevisionMetadata(n)) : []);
   }
 
   return res.json([]);

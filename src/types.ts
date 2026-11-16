@@ -609,6 +609,8 @@ export interface LiveLesson {
   driveFileUrl?: string;
   driveFolderName?: string;
   driveLastSyncedAt?: string;
+  contentRevision?: number;
+  revisionToken?: string;
 }
 
 export interface TeacherOriginalNotes {
@@ -686,6 +688,10 @@ export interface SessionNotesDocument {
   approvalStatus?: 'unapproved' | 'draft_in_progress' | 'approved';
   versionHistory?: SessionNoteVersionEntry[];
   currentVersionNumber?: number;
+
+  // NF.FLOW.1.3 Server-issued optimistic concurrency revision control
+  contentRevision?: number;
+  revisionToken?: string;
 
   driveFileId?: string;
   driveFileUrl?: string;

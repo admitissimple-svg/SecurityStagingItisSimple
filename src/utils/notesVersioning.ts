@@ -32,6 +32,43 @@ export function computeNotesContentHash(str: string): string {
   return Math.abs(hash).toString(16);
 }
 
+/**
+ * Generates an opaque, unique revision token tied to the contentRevision counter.
+ * Eliminates the ABA problem because every relevant edit increments contentRevision and adds fresh entropy.
+ * Compatible with both browser (Vite) and Node.js runtimes.
+ */
+export function mintSessionNoteRevisionToken(contentRevision: number): string {
+  let randomHex = '';
+  try {
+    const cryptoObj = (globalThis as any)?.crypto;
+    if (cryptoObj && typeof cryptoObj.getRandomValues === 'function') {
+      const bytes = new Uint8Array(12);
+      cryptoObj.getRandomValues(bytes);
+      randomHex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    }
+  } catch {}
+  if (!randomHex) {
+    randomHex = `${Date.now().toString(16)}_${Math.random().toString(16).slice(2, 10)}${Math.random().toString(16).slice(2, 10)}`;
+  }
+  const safeRev = Number.isFinite(contentRevision) && contentRevision >= 1 ? Math.floor(contentRevision) : 1;
+  return `rev_${safeRev}_${randomHex}`;
+}
+
+/**
+ * Resolves the authoritative revision token for an existing document, deterministically
+ * deriving a legacy token for pre-existing documents that have not yet been stamped.
+ */
+export function deriveLegacyRevisionToken(doc: any): string | null {
+  if (!doc || typeof doc !== 'object') return null;
+  if (typeof doc.revisionToken === 'string' && doc.revisionToken.trim().length > 0) {
+    return doc.revisionToken.trim();
+  }
+  const ver = Number(doc.contentRevision || doc.currentVersionNumber || 1);
+  const raw = String(doc.rawContent !== undefined ? doc.rawContent : (doc.content || ''));
+  const topic = String(doc.topic || '');
+  return `legacy_r${Number.isFinite(ver) && ver >= 1 ? Math.floor(ver) : 1}_${computeNotesContentHash(`${raw}\n::topic::\n${topic}`)}`;
+}
+
 export interface AuthorIdentityContext {
   authorUid: string;
   authorEmail?: string;
@@ -58,6 +95,7 @@ export interface MergeSessionNoteOptions {
  * - Immutability of studentUid and teacherUid
  * - No automatic approval for legacy content
  * - Monotonic version increment in versionHistory
+ * - Monotonic contentRevision & opaque revisionToken on relevant rawContent/topic edits (anti-ABA)
  */
 export function mergeSessionNoteWithVersioning(options: MergeSessionNoteOptions): SessionNotesDocument {
   const { existingNote, incomingNote, author, changeSummary } = options;
@@ -87,6 +125,7 @@ export function mergeSessionNoteWithVersioning(options: MergeSessionNoteOptions)
   const cleanSessionDate = incomingNote.sessionDate;
   const canonicalId = incomingNote.id || incomingNote.sessionKey || incomingNote.sessionId || existingNote?.id || `session_${cleanSessionDate}_${incomingNote.studentUid}`;
   const lessonId = incomingNote.lessonId || existingNote?.lessonId || '';
+  const resolvedTopic = incomingNote.topic || existingNote?.topic || 'Live Coaching Session';
 
   // 2. Track Original Notes
   let originalTeacherNotes: TeacherOriginalNotes;
@@ -206,7 +245,27 @@ export function mergeSessionNoteWithVersioning(options: MergeSessionNoteOptions)
     ? Math.max(...updatedVersionHistory.map((v) => v.versionNumber || 0))
     : 1;
 
-  // 7. Assemble Complete Canonical Document
+  // 7. Revision Token & Content Revision (anti-ABA: always bump on rawContent or topic change)
+  let nextContentRevision: number;
+  let nextRevisionToken: string;
+  if (!existingNote) {
+    nextContentRevision = 1;
+    nextRevisionToken = mintSessionNoteRevisionToken(1);
+  } else {
+    const existingRaw = String(existingNote.rawContent !== undefined ? existingNote.rawContent : (existingNote.content || ''));
+    const existingTopic = String(existingNote.topic || 'Live Coaching Session');
+    const prevContentRevision = Number(existingNote.contentRevision || 1);
+    const hasRelevantContentChange = rawContent !== existingRaw || resolvedTopic !== existingTopic;
+    if (hasRelevantContentChange) {
+      nextContentRevision = (Number.isFinite(prevContentRevision) && prevContentRevision >= 1 ? Math.floor(prevContentRevision) : 1) + 1;
+      nextRevisionToken = mintSessionNoteRevisionToken(nextContentRevision);
+    } else {
+      nextContentRevision = Number.isFinite(prevContentRevision) && prevContentRevision >= 1 ? Math.floor(prevContentRevision) : 1;
+      nextRevisionToken = deriveLegacyRevisionToken(existingNote) || mintSessionNoteRevisionToken(nextContentRevision);
+    }
+  }
+
+  // 8. Assemble Complete Canonical Document
   const resultDoc: SessionNotesDocument = {
     id: canonicalId,
     sessionId: canonicalId,
@@ -218,7 +277,7 @@ export function mergeSessionNoteWithVersioning(options: MergeSessionNoteOptions)
     teacherUid: incomingNote.teacherUid,
     teacherEmail: incomingNote.teacherEmail || existingNote?.teacherEmail || author.authorEmail || '',
     teacherName: incomingNote.teacherName || existingNote?.teacherName || author.teacherName || 'Native Friend',
-    topic: incomingNote.topic || existingNote?.topic || 'Live Coaching Session',
+    topic: resolvedTopic,
     content: rawContent,
     rawContent,
     originalTeacherNotes,
@@ -227,6 +286,8 @@ export function mergeSessionNoteWithVersioning(options: MergeSessionNoteOptions)
     approvalStatus,
     versionHistory: updatedVersionHistory,
     currentVersionNumber: finalEffectiveVersion,
+    contentRevision: nextContentRevision,
+    revisionToken: nextRevisionToken,
     driveFileId: incomingNote.driveFileId || existingNote?.driveFileId || '',
     driveFileUrl: incomingNote.driveFileUrl || existingNote?.driveFileUrl || '',
     driveFolderName: incomingNote.driveFolderName || existingNote?.driveFolderName || 'Native Friends Notes',
