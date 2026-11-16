@@ -21,6 +21,7 @@ import {
   LiveLessonVocabNote,
   DailyJournalEntry,
   WritingEvaluationResult,
+  WeeklyHistoryDoc,
 } from './types';
 import { defaultRoutinesByDay, createCleanStudentRoutines } from './data/defaultRoutines';
 import { INITIAL_NATIVE_FRIENDS } from './data/tutors';
@@ -49,7 +50,7 @@ import {
   addTrackToListenedHistoryInFirestore,
   initializeCleanStudentRoutinesInFirestore,
 } from './hooks/useRoutine';
-import { recordConsumedVideo, recordConsumedTrack } from './hooks/useStudentHistory';
+import { fetchAllWeeklyHistories, recordConsumedVideo, recordConsumedTrack } from './hooks/useStudentHistory';
 import { extractYouTubeVideoId, getYouTubeWatchUrl } from './utils/youtube';
 import { getInstantOrCachedWord, lookupWord, isGenericPedagogicalDefinition, isGenericPedagogicalExample } from './utils/dictionaryService';
 import { auth, getDb, getAllFirestoreDbs } from './firebase';
@@ -546,6 +547,7 @@ export default function App() {
                 avatar: account.picture,
                 level: (authCanonicalLevelType || EnglishLevel.BEGINNER) as EnglishLevel,
                 weeklyCycle: typeof firestoreDoc?.weeklyCycle === 'number' ? firestoreDoc.weeklyCycle : 1,
+                ...(firestoreDoc?.cycleTransition ? { cycleTransition: firestoreDoc.cycleTransition } : {}),
                 learningGoal: firestoreDoc?.learningGoal || '',
                 weeklyStudyDaysTarget: typeof firestoreDoc?.weeklyStudyDaysTarget === 'number' ? firestoreDoc.weeklyStudyDaysTarget : 4,
                 weeklyStudyDays: firestoreDoc?.weeklyStudyDays || ['monday', 'tuesday', 'wednesday', 'thursday'],
@@ -641,8 +643,9 @@ export default function App() {
   }, [weeklyHomework]);
   const [homeworkTargetDay, setHomeworkTargetDay] = useState<DayOfWeek>(getTodayDayOfWeek());
 
-  // 7b. S-Path (Gráfico S) Weekly Checks & Student Journal State (Multi-device Single Source of Truth)
+  // 7b. S-Path (Gráfico S) Weekly Checks, Histories & Student Journal State (Multi-device Single Source of Truth)
   const [weeklyChecks, setWeeklyChecks] = useState<Record<string, boolean>>({});
+  const [weeklyHistories, setWeeklyHistories] = useState<WeeklyHistoryDoc[]>([]);
   const [studentJournal, setStudentJournal] = useState<StudentJournalEntry[]>([]);
 
   // 8. Notifications State
@@ -1551,6 +1554,7 @@ export default function App() {
       setLessons([]);
       setStudents([]);
       setWeeklyChecks({});
+      setWeeklyHistories([]);
       setStudentJournal([]);
       setWeeklyHomework(null);
       setStudentDictionaryEntries([]);
@@ -1673,6 +1677,7 @@ export default function App() {
       setDictionaryHydrationStatus('loading');
       // Preserve existing weeklyChecks during hydration to prevent race conditions and F5 zeroing
       setWeeklyChecks((prev) => prev);
+      setWeeklyHistories([]);
       setStudentJournal([]);
       setWeeklyHomework(null);
       setStudentDictionaryEntries([]);
@@ -1879,6 +1884,16 @@ export default function App() {
               .catch((err) => {
                 console.warn('Notice loading weekly checks from Firestore:', err);
               });
+          }
+
+          if (effectiveStudentUid && isValidCanonicalUid(effectiveStudentUid)) {
+            fetchAllWeeklyHistories(effectiveStudentUid)
+              .then((histories) => {
+                if (!isCancelled && activeStudentUidRef.current === uid && Array.isArray(histories)) {
+                  setWeeklyHistories(histories);
+                }
+              })
+              .catch(() => {});
           }
 
           // Fetch student exclusions first from Firestore/server
@@ -4560,7 +4575,18 @@ export default function App() {
           weeklyCycle: effectiveCycle,
           weeklyStudyDaysTarget: effectiveStudyTarget,
           weeklyStudyDays: effectiveStudyDays,
+          ...(result.cycleTransition ? { cycleTransition: result.cycleTransition } : {}),
         }));
+
+        if (uid && isValidCanonicalUid(uid)) {
+          fetchAllWeeklyHistories(uid)
+            .then((histories) => {
+              if (activeStudentUidRef.current === uid && Array.isArray(histories)) {
+                setWeeklyHistories(histories);
+              }
+            })
+            .catch(() => {});
+        }
 
         setWeeklyHomework(null);
         if (weeklyHomeworkRef.current) {
@@ -7943,6 +7969,7 @@ export default function App() {
                   routinesByDay={routinesByDay}
                   lessons={lessons}
                   userProfile={userProfile}
+                  weeklyHistories={weeklyHistories}
                   studentJournal={studentJournal}
                   onOpenHomeworkModal={handleOpenHomeworkModal}
                   onOpenDictionaryModal={() => setIsPersonalDictionaryOpen(true)}

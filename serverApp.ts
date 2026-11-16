@@ -7604,7 +7604,10 @@ app.post(['/api/student-routines/start-new-week', '/api/student/reset-week'], fi
       txResult.cycleTransition?.status === 'completed' &&
       txResult.lastCycleResult
     ) {
-      return res.status(200).json(txResult.lastCycleResult);
+      return res.status(200).json({
+        ...txResult.lastCycleResult,
+        cycleTransition: txResult.cycleTransition,
+      });
     }
 
     // 6. Coordinated idempotent & recoverable preparation for the new weekly cycle
@@ -7632,7 +7635,10 @@ app.post(['/api/student-routines/start-new-week', '/api/student/reset-week'], fi
       });
     }
 
-    return res.status(200).json(prepRes.result);
+    return res.status(200).json({
+      ...prepRes.result,
+      ...(prepRes.cycleTransition ? { cycleTransition: prepRes.cycleTransition } : {}),
+    });
   } finally {
     if (inProcessCycleLocks.get(lockKey) === lockPromise) {
       inProcessCycleLocks.delete(lockKey);

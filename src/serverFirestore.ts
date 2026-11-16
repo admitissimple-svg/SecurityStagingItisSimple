@@ -11965,6 +11965,7 @@ export async function prepareNewWeeklyCycleServer(params: {
 }): Promise<{
   ok: boolean;
   result?: any;
+  cycleTransition?: CycleTransitionRecord | null;
   alreadyPrepared?: boolean;
   inProgress?: boolean;
   code?: string;
@@ -12086,12 +12087,19 @@ export async function prepareNewWeeklyCycleServer(params: {
       return { ok: false, statusCode: 500, error: 'Failed to acquire preparation lease in Firestore.' };
     }
     if (leaseAcquireRes.action === 'already_completed') {
+      const existingTransition = (leaseAcquireRes.uData?.cycleTransition as CycleTransitionRecord | undefined) || null;
       if (leaseAcquireRes.result) {
-        return { ok: true, alreadyPrepared: true, result: leaseAcquireRes.result };
+        return {
+          ok: true,
+          alreadyPrepared: true,
+          result: leaseAcquireRes.result,
+          cycleTransition: existingTransition,
+        };
       }
       return {
         ok: true,
         alreadyPrepared: true,
+        cycleTransition: existingTransition,
         result: {
           success: true,
           weeklyCycle: targetCycle,
@@ -12543,7 +12551,7 @@ export async function prepareNewWeeklyCycleServer(params: {
           { merge: true }
         );
 
-        return confirmedResult;
+        return { confirmedResult, completedTransition };
       }),
       4500
     );
@@ -12552,7 +12560,11 @@ export async function prepareNewWeeklyCycleServer(params: {
       return { ok: false, statusCode: 500, error: 'Failed to finalize cycleTransition status in Firestore.' };
     }
 
-    return { ok: true, result: finalizedResult };
+    return {
+      ok: true,
+      result: finalizedResult.confirmedResult,
+      cycleTransition: finalizedResult.completedTransition,
+    };
   } catch (err: any) {
     if (err instanceof PreparationFencingError) {
       console.warn('[serverFirestore] prepareNewWeeklyCycleServer fenced:', err.message);

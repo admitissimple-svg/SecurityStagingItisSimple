@@ -1,4 +1,4 @@
-import { DayOfWeek, RoutineItem } from '../types';
+import { DayOfWeek, RoutineItem, UserProfile } from '../types';
 import { getAuthHeaders } from '../hooks/useRoutine';
 import { normalizeStudentIdForPath, withFirestoreTimeout } from '../utils/routineSync';
 import { normalizeStudentLevel } from '../utils/spotify';
@@ -23,6 +23,7 @@ export interface StartNewWeekResult {
   weeklyStudyDays: DayOfWeek[];
   routines: Record<DayOfWeek, RoutineItem[]>;
   message: string;
+  cycleTransition?: UserProfile['cycleTransition'];
 }
 
 const ALL_DAYS: DayOfWeek[] = [
@@ -174,13 +175,17 @@ export async function executeStartNewWeek(
 
           if (!isPending && (attemptWasConfirmed || confirmedCycle === expectedCycle + 1)) {
             console.info('Recovery confirmed: start-new-week was successfully committed on the server despite HTTP timeout.');
-            data = statusData.lastCycleResult || {
+            const recoveredBase = statusData.lastCycleResult || {
               success: true,
               weeklyCycle: confirmedCycle,
               weeklyStudyDaysTarget: statusData.weeklyStudyDaysTarget || targetDays,
               weeklyStudyDays: statusData.weeklyStudyDays || chosenDays,
               routines: statusData.routines,
               message: 'New weekly cycle activated successfully (recovered).',
+            };
+            data = {
+              ...recoveredBase,
+              cycleTransition: recoveredBase.cycleTransition ?? statusData.cycleTransition ?? undefined,
             };
           } else if (confirmedCycle === expectedCycle && !attemptWasConfirmed) {
             console.warn('Recovery confirmed: advance was NOT executed before failure.');
@@ -298,6 +303,7 @@ export async function executeStartNewWeek(
       weeklyStudyDays: data.weeklyStudyDays || chosenDays,
       routines: sanitizedRoutines,
       message: data.message || 'New week cycle started successfully with all days ready for Choose a Topic.',
+      ...(data.cycleTransition ? { cycleTransition: data.cycleTransition } : {}),
     };
   } catch (unexpectedError) {
     console.error('Critical error in executeStartNewWeek, reporting backend failure:', unexpectedError);

@@ -24,11 +24,14 @@ import {
   StudentDictionaryEntry,
   StudentJournalEntry,
   LiveLesson,
+  WeeklyHistoryDoc,
 } from '../types';
 import { Translations, getTranslations } from '../utils/i18n';
 import { DAYS_OF_WEEK, getTodayDayOfWeek } from '../utils/notifications';
 import { getDailyMemorizationSchedule } from '../utils/homeworkGenerator';
 import { getAccessToken } from '../utils/auth';
+import { evaluateTutorLiveCompletedForDay } from '../utils/tutorLiveCycle';
+import { fetchAllWeeklyHistories } from '../hooks/useStudentHistory';
 import {
   saveStudentWeeklyChecksToFirestore,
   fetchStudentWeeklyChecksFromFirestore,
@@ -46,8 +49,6 @@ import {
   normalizeWeekId,
   parseWeekCycleNumber,
   normalizeDictionaryWord,
-  getIsoDateInTimeZone,
-  DEFAULT_STUDENT_TIMEZONE,
 } from '../utils/studentPersistence';
 
 interface StudentWeeklyActivitySectionProps {
@@ -55,6 +56,7 @@ interface StudentWeeklyActivitySectionProps {
   routinesByDay: Record<DayOfWeek, RoutineItem[]>;
   lessons?: LiveLesson[];
   userProfile?: UserProfile;
+  weeklyHistories?: WeeklyHistoryDoc[];
   studentJournal?: StudentJournalEntry[];
   onOpenHomeworkModal: (targetDay?: DayOfWeek) => void;
   onOpenDictionaryModal: () => void;
@@ -123,6 +125,7 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
   routinesByDay,
   lessons,
   userProfile,
+  weeklyHistories: propWeeklyHistories,
   studentJournal: propStudentJournal,
   onOpenHomeworkModal,
   onOpenDictionaryModal,
@@ -145,6 +148,34 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
   // Canonical active week cycle and week ID derived strictly from userProfile.weeklyCycle
   const activeWeekCycle = parseWeekCycleNumber(userProfile?.weeklyCycle) ?? 1;
   const activeWeekId = normalizeWeekId(userProfile?.weeklyCycle) || 'week-1';
+
+  const [fallbackWeeklyHistories, setFallbackWeeklyHistories] = useState<WeeklyHistoryDoc[]>([]);
+  useEffect(() => {
+    if (propWeeklyHistories !== undefined || !studentUid || !activeWeekCycle || activeWeekCycle < 2) {
+      return;
+    }
+    if (
+      userProfile?.cycleTransition &&
+      parseWeekCycleNumber(userProfile.cycleTransition.targetCycle) === activeWeekCycle &&
+      (userProfile.cycleTransition.startedAt || userProfile.cycleTransition.completedAt)
+    ) {
+      return;
+    }
+    let cancelled = false;
+    fetchAllWeeklyHistories(studentUid)
+      .then((histories) => {
+        if (!cancelled && Array.isArray(histories)) {
+          setFallbackWeeklyHistories(histories);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [propWeeklyHistories, studentUid, activeWeekCycle, userProfile?.cycleTransition]);
+
+  const effectiveWeeklyHistories =
+    propWeeklyHistories !== undefined ? propWeeklyHistories : fallbackWeeklyHistories;
 
   // Active study days from student's single source of truth plan
   const activeStudyDays: DayOfWeek[] = useMemo(() => {
@@ -572,50 +603,17 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
       }
 
       // 4. Live Tutor Lessons (strictly completed lessons only, never scheduled bookings or pending trials)
-      // HOTFIX 3B.2: Consider completed ONLY a lesson belonging to this authenticated student,
-      // with status === 'completed', not cancelled, with startDateTime matching the active week's civil date,
-      // and linked to a legitimate Native Friend. Manual checkmarks, journal entries, or old week lessons NEVER count.
+      // HOTFIX 3B.2 + S-PATH.2: Evaluate active weeklyCycle membership using persisted cycle boundary
+      // (cycleTransition / closed weeklyHistory), never calendar Monday rollover.
       if (rowId === 'tutor_live') {
-        if (!Array.isArray(lessons) || lessons.length === 0) {
-          return false;
-        }
-
-        const cleanStudentUid = (studentUid || '').trim();
-        const cleanStudentEmail = (studentEmail || '').toLowerCase().trim();
-        const studentTimezone = userProfile?.timezone || DEFAULT_STUDENT_TIMEZONE;
-        const targetDayCivilDate = getDateForDayInCurrentWeek(dayKey, new Date(), studentTimezone);
-        const assignedTeacherEmail = (userProfile?.teacherEmail || '').toLowerCase().trim();
-        const assignedTeacherUid = (userProfile?.teacherUid || '').trim();
-
-        return lessons.some((l) => {
-          if (!l) return false;
-          // Must have completed status
-          if (l.status !== 'completed') return false;
-          // Must not be cancelled
-          if (Boolean(l.cancelledAt) || (l.status as string) === 'cancelled' || (l.status as string) === 'canceled') return false;
-
-          // Must belong to authenticated student
-          const lStudentUid = (l.studentUid || '').trim();
-          const lStudentEmail = (l.studentEmail || '').toLowerCase().trim();
-          const isStudentMatch =
-            (cleanStudentUid && lStudentUid && cleanStudentUid === lStudentUid) ||
-            (cleanStudentEmail && lStudentEmail && cleanStudentEmail === lStudentEmail);
-          if (!isStudentMatch) return false;
-
-          // Must match civil date of active week
-          if (!l.startDateTime) return false;
-          const lessonCivilDate = getIsoDateInTimeZone(l.startDateTime, studentTimezone);
-          if (lessonCivilDate !== targetDayCivilDate) return false;
-
-          // Must be linked to a legitimate Native Friend
-          const lTeacherUid = (l.teacherUid || (l as any).tutorUid || '').trim();
-          const lTeacherEmail = (l.teacherEmail || (l as any).tutorEmail || '').toLowerCase().trim();
-          if (!lTeacherUid && !lTeacherEmail) return false;
-          if (assignedTeacherUid && lTeacherUid && assignedTeacherUid !== lTeacherUid) return false;
-          if (assignedTeacherEmail && lTeacherEmail && assignedTeacherEmail !== lTeacherEmail) return false;
-
-          return true;
-        });
+        return evaluateTutorLiveCompletedForDay(
+          dayKey,
+          lessons,
+          studentUid,
+          studentEmail,
+          userProfile,
+          effectiveWeeklyHistories
+        );
       }
 
       return false;
@@ -630,9 +628,8 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
       studentUid,
       studentEmail,
       activeStudyDays,
-      userProfile?.timezone,
-      userProfile?.teacherEmail,
-      userProfile?.teacherUid,
+      userProfile,
+      effectiveWeeklyHistories,
     ]
   );
 

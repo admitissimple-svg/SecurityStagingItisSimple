@@ -364,6 +364,14 @@ export interface UserProfile {
   weeklyStudyDaysTarget?: number;
   weeklyStudyDays?: DayOfWeek[];
   weeklyCycle?: number;
+  cycleTransition?: {
+    attemptId?: string | null;
+    previousCycle?: number;
+    targetCycle?: number;
+    status?: 'pending_preparation' | 'completed' | string;
+    startedAt?: string;
+    completedAt?: string;
+  } | null;
   subscriptionType?: 'monthly' | 'trial' | 'package';
   monthlyFrequency?: '1x' | '2x' | '4x';
   autoRenew?: boolean;
