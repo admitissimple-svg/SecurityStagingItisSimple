@@ -50,7 +50,11 @@ import {
   SessionNoteVersionEntry,
 } from '../types';
 import { isValidCanonicalUid } from '../utils/studentPersistence';
-import { computeNotesContentHash, deriveLegacyRevisionToken } from '../utils/notesVersioning';
+import {
+  computeNotesContentHash,
+  deriveLegacyRevisionToken,
+  arePedagogicalTransformationsEqual,
+} from '../utils/notesVersioning';
 import {
   convertNotesHtmlToCompactText,
   MAX_PEDAGOGICAL_COMPACT_NOTES_CHARS,
@@ -306,6 +310,23 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   const [isLoadingVersions, setIsLoadingVersions] = useState<boolean>(false);
   const [aiError, setAiError] = useState<string | null>(null);
   const [aiSuccessMessage, setAiSuccessMessage] = useState<string | null>(null);
+  const [showUnsavedApproveConfirm, setShowUnsavedApproveConfirm] = useState<boolean>(false);
+
+  const savedReviewTransformation = useMemo(() => {
+    if (draftTransformation?.transformation) {
+      return draftTransformation.transformation;
+    }
+    if (lastApprovedVersion?.transformation) {
+      return lastApprovedVersion.transformation;
+    }
+    return null;
+  }, [draftTransformation, lastApprovedVersion]);
+
+  const hasUnsavedReviewChanges = useMemo(() => {
+    if (!editableTransformation) return false;
+    if (!savedReviewTransformation) return true;
+    return !arePedagogicalTransformationsEqual(editableTransformation, savedReviewTransformation);
+  }, [editableTransformation, savedReviewTransformation]);
 
   const currentNotesHash = useMemo(() => computeNotesContentHash(notesContent), [notesContent]);
 
@@ -460,6 +481,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
       isDirtyRef.current = false;
       applyServerRevisionToken(null);
       clearRevisionConflict();
+      setShowUnsavedApproveConfirm(false);
 
       const todayStr = getTodayDateStr();
 
@@ -946,6 +968,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     setShowVersionHistory(false);
     setAiError(null);
     setAiSuccessMessage(null);
+    setShowUnsavedApproveConfirm(false);
     setSaveError(null);
     clearRevisionConflict();
     applyServerRevisionToken(null);
@@ -2062,6 +2085,15 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             }
           } else {
             setLastApprovedVersion(null);
+            if (isRealSavedDoc && !savedNote.draftTransformation) {
+              setEditableTransformation(null);
+            }
+          }
+          if (isRealSavedDoc) {
+            setApprovalStatus(
+              savedNote.approvalStatus ||
+              (savedNote.lastApprovedVersion ? 'approved' : savedNote.draftTransformation ? 'draft_in_progress' : 'unapproved')
+            );
           }
           if (isRealSavedDoc && Array.isArray(savedNote.versionHistory)) {
             setVersionHistory(savedNote.versionHistory);
@@ -2089,6 +2121,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
             }
           }
           clearRevisionConflict();
+          setShowUnsavedApproveConfirm(false);
           setSaveError(null);
           setAiError(null);
           if (isRealSavedDoc) {
@@ -2167,6 +2200,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     const requestContextSeq = activeContextSeqRef.current;
     setAiError(null);
     setAiSuccessMessage(null);
+    setShowUnsavedApproveConfirm(false);
     setIsApplyingAi(true);
 
     try {
@@ -2265,69 +2299,80 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   /**
    * Persist edited AI draft to Firestore via POST /api/session-notes/:id/draft
    */
-  const handleSaveDraft = useCallback(async () => {
-    if (isSavingDraft || isApproving || !editableTransformation || isLoadingSessionNoteRef.current) return;
+  const saveReviewDraftToServer = useCallback(
+    async (
+      transformationOverride?: any,
+      options?: { silentSuccess?: boolean }
+    ): Promise<{ ok: boolean; draftId?: string; revisionToken?: string | null; sessionNote?: any }> => {
+      const transformationToSave = transformationOverride || editableTransformation;
+      if (isSavingDraft || isApproving || !transformationToSave || isLoadingSessionNoteRef.current) {
+        return { ok: false };
+      }
 
-    if (isTransformationOutdated) {
-      setAiError(
-        isDraftStale
-          ? 'The pedagogical draft is outdated compared to the current session notes. Click Apply AI to refresh the draft first.'
-          : 'No active draft matches the current session notes, and the approved report belongs to another version. Click Apply AI to generate a new draft first.'
-      );
-      return;
-    }
+      if (isTransformationOutdated) {
+        setAiError(
+          isDraftStale
+            ? 'The pedagogical draft is outdated compared to the current session notes. Click Apply AI to refresh the draft first.'
+            : 'No active draft matches the current session notes, and the approved report belongs to another version. Click Apply AI to generate a new draft first.'
+        );
+        return { ok: false };
+      }
 
-    const requestContextSeq = activeContextSeqRef.current;
-    setAiError(null);
-    setAiSuccessMessage(null);
-    setIsSavingDraft(true);
+      const requestContextSeq = activeContextSeqRef.current;
+      setAiError(null);
+      setAiSuccessMessage(null);
+      setIsSavingDraft(true);
 
-    try {
-      const idToken = await auth.currentUser?.getIdToken().catch(() => null);
-      if (requestContextSeq !== activeContextSeqRef.current) return;
+      try {
+        const idToken = await auth.currentUser?.getIdToken().catch(() => null);
+        if (requestContextSeq !== activeContextSeqRef.current) return { ok: false };
 
-      const resolvedTeacherUid = (currentAccount?.uid || (currentAccount as any)?.id || auth.currentUser?.uid || '').trim();
-      const resolvedStudentUid = studentResolution.uid;
-      const targetKey = resolveCanonicalServerSessionKey();
+        const resolvedTeacherUid = (currentAccount?.uid || (currentAccount as any)?.id || auth.currentUser?.uid || '').trim();
+        const resolvedStudentUid = studentResolution.uid;
+        const targetKey = resolveCanonicalServerSessionKey();
+        const targetLessonId = selectedLessonId || activeLesson?.id || '';
 
-      const res = await fetch(`/api/session-notes/${encodeURIComponent(targetKey)}/draft`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
-        },
-        body: JSON.stringify({
-          id: targetKey,
-          sessionId: targetKey,
-          draftId: draftTransformation?.draftId,
-          transformation: editableTransformation,
-          studentUid: resolvedStudentUid,
-          teacherUid: resolvedTeacherUid,
-          baseRevisionToken: revisionTokenRef.current ?? null,
-          changeSummary: 'Teacher saved draft edits prior to publishing',
-        }),
-      });
-      if (requestContextSeq !== activeContextSeqRef.current) return;
+        const res = await fetch(`/api/session-notes/${encodeURIComponent(targetKey)}/draft`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+          },
+          body: JSON.stringify({
+            id: targetKey,
+            sessionId: targetKey,
+            ...(targetLessonId ? { lessonId: targetLessonId } : {}),
+            draftId: draftTransformation?.draftId,
+            transformation: transformationToSave,
+            studentUid: resolvedStudentUid,
+            teacherUid: resolvedTeacherUid,
+            baseRevisionToken: revisionTokenRef.current ?? null,
+            changeSummary: 'Teacher saved draft edits prior to publishing',
+          }),
+        });
+        if (requestContextSeq !== activeContextSeqRef.current) return { ok: false };
 
-      const data = await res.json().catch(() => ({}));
-      if (requestContextSeq !== activeContextSeqRef.current) return;
+        const data = await res.json().catch(() => ({}));
+        if (requestContextSeq !== activeContextSeqRef.current) return { ok: false };
 
-      if (!res.ok) {
-        const errMsg = data.message || data.error || 'Failed to save pedagogical draft.';
-        setAiError(errMsg);
-        if (res.status === 409 && data?.code === 'STALE_REVISION') {
-          hasRevisionConflictRef.current = true;
-          setRevisionConflict({
-            message: errMsg,
-            serverRevisionToken: data?.currentRevisionToken ?? null,
-          });
+        if (!res.ok) {
+          const errMsg = data.message || data.error || 'Failed to save pedagogical draft.';
+          setAiError(errMsg);
+          if (res.status === 409 && (data?.code === 'STALE_REVISION' || data?.code === 'DRAFT_ID_MISMATCH')) {
+            hasRevisionConflictRef.current = true;
+            setRevisionConflict({
+              message: errMsg,
+              serverRevisionToken: data?.currentRevisionToken ?? null,
+            });
+          }
+          return { ok: false };
         }
-      } else {
-        applyServerRevisionToken(
+
+        const nextRevTok =
           data?.revisionToken ||
           data?.sessionNote?.revisionToken ||
-          deriveLegacyRevisionToken(data?.sessionNote)
-        );
+          deriveLegacyRevisionToken(data?.sessionNote);
+        applyServerRevisionToken(nextRevTok);
         if (data.sessionNote?.draftTransformation) {
           setDraftTransformation(data.sessionNote.draftTransformation);
         }
@@ -2337,32 +2382,49 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
         if (Array.isArray(data.sessionNote?.versionHistory)) {
           setVersionHistory(data.sessionNote.versionHistory);
         }
+        setShowUnsavedApproveConfirm(false);
         if (approvalStatus !== 'approved') {
           setApprovalStatus('draft_in_progress');
         }
-        setAiSuccessMessage('Draft edits saved to Firestore.');
+        if (!options?.silentSuccess) {
+          setAiSuccessMessage('Draft edits saved to Firestore.');
+        }
+        return {
+          ok: true,
+          draftId: data.sessionNote?.draftTransformation?.draftId || draftTransformation?.draftId,
+          revisionToken: nextRevTok,
+          sessionNote: data.sessionNote,
+        };
+      } catch (err: any) {
+        if (requestContextSeq === activeContextSeqRef.current) {
+          setAiError(err.message || 'Connection error while saving draft.');
+        }
+        return { ok: false };
+      } finally {
+        setIsSavingDraft(false);
       }
-    } catch (err: any) {
-      if (requestContextSeq === activeContextSeqRef.current) {
-        setAiError(err.message || 'Connection error while saving draft.');
-      }
-    } finally {
-      setIsSavingDraft(false);
-    }
-  }, [
-    isSavingDraft,
-    isApproving,
-    editableTransformation,
-    isDraftStale,
-    isTransformationOutdated,
-    currentAccount,
-    studentResolution,
-    resolveCanonicalServerSessionKey,
-    draftTransformation,
-    approvalStatus,
-    applyServerRevisionToken,
-    upsertFetchedStudentNote,
-  ]);
+    },
+    [
+      isSavingDraft,
+      isApproving,
+      editableTransformation,
+      isDraftStale,
+      isTransformationOutdated,
+      currentAccount,
+      studentResolution,
+      resolveCanonicalServerSessionKey,
+      selectedLessonId,
+      activeLesson,
+      draftTransformation,
+      approvalStatus,
+      applyServerRevisionToken,
+      upsertFetchedStudentNote,
+    ]
+  );
+
+  const handleSaveDraft = useCallback(async () => {
+    await saveReviewDraftToServer();
+  }, [saveReviewDraftToServer]);
 
   const handleToggleVersionHistory = useCallback(async () => {
     const nextOpen = !showVersionHistory;
@@ -2397,71 +2459,76 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
     }
   }, [showVersionHistory, resolveCanonicalServerSessionKey]);
 
-  /**
-   * FASE NF-DOC.2C: Approve & Publish
-   * 1. Publishes only when teacher clicks button
-   * 2. Blocks stale drafts (when rawContent changed after draft)
-   * 3. Publishes edited transformation directly to lastApprovedVersion
-   * 4. Clears active draft and updates approval status
-   */
-  const handleApproveAndPublish = useCallback(async () => {
-    if (isApproving || !editableTransformation || isLoadingSessionNoteRef.current) return;
+  const executeApproveWithServer = useCallback(
+    async (
+      transformationToApprove: any,
+      draftIdOverride?: string,
+      revisionTokenOverride?: string | null
+    ): Promise<boolean> => {
+      if (isApproving || !transformationToApprove || isLoadingSessionNoteRef.current) return false;
 
-    if (isTransformationOutdated) {
-      setAiError(
-        isDraftStale
-          ? 'The pedagogical draft is outdated compared to the current session notes. Modifications were made to notes after the draft. Generate or edit a new draft before approving.'
-          : 'No active draft matches the current session notes, and the approved report belongs to another version. Click Apply AI before approving.'
-      );
-      return;
-    }
+      if (isTransformationOutdated) {
+        setAiError(
+          isDraftStale
+            ? 'The pedagogical draft is outdated compared to the current session notes. Modifications were made to notes after the draft. Generate or edit a new draft before approving.'
+            : 'No active draft matches the current session notes, and the approved report belongs to another version. Click Apply AI before approving.'
+        );
+        return false;
+      }
 
-    const requestContextSeq = activeContextSeqRef.current;
-    setAiError(null);
-    setAiSuccessMessage(null);
-    setIsApproving(true);
+      const requestContextSeq = activeContextSeqRef.current;
+      setAiError(null);
+      setAiSuccessMessage(null);
+      setIsApproving(true);
 
-    try {
-      const idToken = await auth.currentUser?.getIdToken().catch(() => null);
-      if (requestContextSeq !== activeContextSeqRef.current) return;
+      try {
+        const idToken = await auth.currentUser?.getIdToken().catch(() => null);
+        if (requestContextSeq !== activeContextSeqRef.current) return false;
 
-      const resolvedTeacherUid = (currentAccount?.uid || (currentAccount as any)?.id || auth.currentUser?.uid || '').trim();
-      const resolvedStudentUid = studentResolution.uid;
-      const targetKey = resolveCanonicalServerSessionKey();
+        const resolvedTeacherUid = (currentAccount?.uid || (currentAccount as any)?.id || auth.currentUser?.uid || '').trim();
+        const resolvedStudentUid = studentResolution.uid;
+        const targetKey = resolveCanonicalServerSessionKey();
+        const targetLessonId = selectedLessonId || activeLesson?.id || '';
 
-      const res = await fetch(`/api/session-notes/${encodeURIComponent(targetKey)}/approve`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
-        },
-        body: JSON.stringify({
-          id: targetKey,
-          sessionId: targetKey,
-          draftId: draftTransformation?.draftId,
-          transformation: editableTransformation,
-          studentUid: resolvedStudentUid,
-          teacherUid: resolvedTeacherUid,
-          baseRevisionToken: revisionTokenRef.current ?? null,
-          changeSummary: 'Teacher reviewed and approved pedagogical notes for student',
-        }),
-      });
-      if (requestContextSeq !== activeContextSeqRef.current) return;
+        const res = await fetch(`/api/session-notes/${encodeURIComponent(targetKey)}/approve`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+          },
+          body: JSON.stringify({
+            id: targetKey,
+            sessionId: targetKey,
+            ...(targetLessonId ? { lessonId: targetLessonId } : {}),
+            draftId: draftIdOverride !== undefined ? draftIdOverride : draftTransformation?.draftId,
+            transformation: transformationToApprove,
+            studentUid: resolvedStudentUid,
+            teacherUid: resolvedTeacherUid,
+            baseRevisionToken:
+              revisionTokenOverride !== undefined
+                ? revisionTokenOverride
+                : (revisionTokenRef.current ?? null),
+            changeSummary: 'Teacher reviewed and approved pedagogical notes for student',
+          }),
+        });
+        if (requestContextSeq !== activeContextSeqRef.current) return false;
 
-      const data = await res.json().catch(() => ({}));
-      if (requestContextSeq !== activeContextSeqRef.current) return;
+        const data = await res.json().catch(() => ({}));
+        if (requestContextSeq !== activeContextSeqRef.current) return false;
 
-      if (!res.ok) {
-        const errMsg = data.message || data.error || 'Failed to approve pedagogical report.';
-        setAiError(errMsg);
-        if (res.status === 409 && data?.code === 'STALE_REVISION') {
-          hasRevisionConflictRef.current = true;
-          setRevisionConflict({
-            message: errMsg,
-            serverRevisionToken: data?.currentRevisionToken ?? null,
-          });
+        if (!res.ok) {
+          const errMsg = data.message || data.error || 'Failed to approve pedagogical report.';
+          setAiError(errMsg);
+          if (res.status === 409 && (data?.code === 'STALE_REVISION' || data?.code === 'DRAFT_ID_MISMATCH')) {
+            hasRevisionConflictRef.current = true;
+            setRevisionConflict({
+              message: errMsg,
+              serverRevisionToken: data?.currentRevisionToken ?? null,
+            });
+          }
+          return false;
         }
-      } else {
+
         applyServerRevisionToken(
           data?.revisionToken ||
           data?.sessionNote?.revisionToken ||
@@ -2479,31 +2546,96 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
           setVersionHistory(data.sessionNote.versionHistory);
         }
         setDraftTransformation(null);
-        setAiSuccessMessage('Pedagogical report successfully approved and published for the student!');
+        setShowUnsavedApproveConfirm(false);
+        setAiSuccessMessage(
+          data?.alreadyApproved
+            ? 'Current pedagogical report is already approved and up to date.'
+            : 'Pedagogical report successfully approved and published for the student!'
+        );
         window.dispatchEvent(new CustomEvent('native-notes-updated'));
+        return true;
+      } catch (err: any) {
+        if (requestContextSeq === activeContextSeqRef.current) {
+          setAiError(err.message || 'Connection error while approving report.');
+        }
+        return false;
+      } finally {
+        setIsApproving(false);
       }
-    } catch (err: any) {
-      if (requestContextSeq === activeContextSeqRef.current) {
-        setAiError(err.message || 'Connection error while approving report.');
-      }
-    } finally {
-      setIsApproving(false);
+    },
+    [
+      isApproving,
+      isDraftStale,
+      isTransformationOutdated,
+      resolveCanonicalServerSessionKey,
+      selectedLessonId,
+      activeLesson,
+      draftTransformation,
+      studentResolution,
+      currentAccount,
+      applyServerRevisionToken,
+      upsertFetchedStudentNote,
+    ]
+  );
+
+  /**
+   * FASE NF-DOC.2C & NF.FLOW.2: Approve & Publish
+   * 1. Publishes only when teacher explicitly confirms
+   * 2. Blocks stale drafts (when rawContent changed after draft)
+   * 3. Never silently drops or ignores unsaved Review edits: prompts explicit Save-before-Approve action
+   * 4. Preserves previously approved version intact on error/409
+   */
+  const handleApproveAndPublish = useCallback(async () => {
+    if (isApproving || isSavingDraft || !editableTransformation || isLoadingSessionNoteRef.current) return;
+
+    if (isTransformationOutdated) {
+      setAiError(
+        isDraftStale
+          ? 'The pedagogical draft is outdated compared to the current session notes. Modifications were made to notes after the draft. Generate or edit a new draft before approving.'
+          : 'No active draft matches the current session notes, and the approved report belongs to another version. Click Apply AI before approving.'
+      );
+      return;
     }
+
+    if (hasUnsavedReviewChanges) {
+      setAiError(null);
+      setAiSuccessMessage(null);
+      setShowUnsavedApproveConfirm(true);
+      return;
+    }
+
+    setShowUnsavedApproveConfirm(false);
+    await executeApproveWithServer(editableTransformation);
   }, [
     isApproving,
+    isSavingDraft,
     editableTransformation,
     isDraftStale,
     isTransformationOutdated,
-    resolveCanonicalServerSessionKey,
-    draftTransformation,
-    studentResolution,
-    currentAccount,
-    applyServerRevisionToken,
-    upsertFetchedStudentNote,
+    hasUnsavedReviewChanges,
+    executeApproveWithServer,
+  ]);
+
+  const handleConfirmSaveAndApprove = useCallback(async () => {
+    if (isApproving || isSavingDraft || !editableTransformation || isLoadingSessionNoteRef.current) return;
+    const snapshot = JSON.parse(JSON.stringify(editableTransformation));
+    const draftSaveRes = await saveReviewDraftToServer(snapshot, { silentSuccess: true });
+    if (!draftSaveRes.ok) {
+      return;
+    }
+    await executeApproveWithServer(snapshot, draftSaveRes.draftId, draftSaveRes.revisionToken);
+  }, [
+    isApproving,
+    isSavingDraft,
+    editableTransformation,
+    saveReviewDraftToServer,
+    executeApproveWithServer,
   ]);
 
   // Inline editing handlers for Pedagogical Report
   const handleUpdateMistake = useCallback((index: number, field: string, value: any) => {
+    setAiSuccessMessage(null);
+    setAiError(null);
     setEditableTransformation((prev: any) => {
       if (!prev) return prev;
       const list = Array.isArray(prev.mistakesAnalysis) ? [...prev.mistakesAnalysis] : [];
@@ -2514,6 +2646,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   }, []);
 
   const handleAddMistake = useCallback(() => {
+    setAiSuccessMessage(null);
+    setAiError(null);
     setEditableTransformation((prev: any) => {
       const list = Array.isArray(prev?.mistakesAnalysis) ? [...prev.mistakesAnalysis] : [];
       list.push({
@@ -2532,6 +2666,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   }, []);
 
   const handleRemoveMistake = useCallback((index: number) => {
+    setAiSuccessMessage(null);
+    setAiError(null);
     setEditableTransformation((prev: any) => {
       if (!prev) return prev;
       const list = Array.isArray(prev.mistakesAnalysis) ? [...prev.mistakesAnalysis] : [];
@@ -2541,6 +2677,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   }, []);
 
   const handleUpdateGrammar = useCallback((index: number, field: string, value: any) => {
+    setAiSuccessMessage(null);
+    setAiError(null);
     setEditableTransformation((prev: any) => {
       if (!prev) return prev;
       const list = Array.isArray(prev.grammarPoints) ? [...prev.grammarPoints] : [];
@@ -2551,6 +2689,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   }, []);
 
   const handleAddGrammar = useCallback(() => {
+    setAiSuccessMessage(null);
+    setAiError(null);
     setEditableTransformation((prev: any) => {
       const list = Array.isArray(prev?.grammarPoints) ? [...prev.grammarPoints] : [];
       list.push({
@@ -2568,6 +2708,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   }, []);
 
   const handleRemoveGrammar = useCallback((index: number) => {
+    setAiSuccessMessage(null);
+    setAiError(null);
     setEditableTransformation((prev: any) => {
       if (!prev) return prev;
       const list = Array.isArray(prev.grammarPoints) ? [...prev.grammarPoints] : [];
@@ -2577,6 +2719,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   }, []);
 
   const handleUpdateVocab = useCallback((index: number, field: string, value: any) => {
+    setAiSuccessMessage(null);
+    setAiError(null);
     setEditableTransformation((prev: any) => {
       if (!prev) return prev;
       const list = Array.isArray(prev.vocabularyAndExpressions) ? [...prev.vocabularyAndExpressions] : [];
@@ -2587,6 +2731,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   }, []);
 
   const handleToggleVocabTag = useCallback((index: number, tag: 'isNewWord' | 'isPronunciationFocus') => {
+    setAiSuccessMessage(null);
+    setAiError(null);
     setEditableTransformation((prev: any) => {
       if (!prev) return prev;
       const list = Array.isArray(prev.vocabularyAndExpressions) ? [...prev.vocabularyAndExpressions] : [];
@@ -2597,6 +2743,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   }, []);
 
   const handleAddVocab = useCallback(() => {
+    setAiSuccessMessage(null);
+    setAiError(null);
     setEditableTransformation((prev: any) => {
       const list = Array.isArray(prev?.vocabularyAndExpressions) ? [...prev.vocabularyAndExpressions] : [];
       list.push({
@@ -2618,6 +2766,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   }, []);
 
   const handleRemoveVocab = useCallback((index: number) => {
+    setAiSuccessMessage(null);
+    setAiError(null);
     setEditableTransformation((prev: any) => {
       if (!prev) return prev;
       const list = Array.isArray(prev.vocabularyAndExpressions) ? [...prev.vocabularyAndExpressions] : [];
@@ -2627,6 +2777,8 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   }, []);
 
   const handleUpdateQuickReview = useCallback((field: string, value: any) => {
+    setAiSuccessMessage(null);
+    setAiError(null);
     setEditableTransformation((prev: any) => {
       const summary = prev?.reviewSummary ? { ...prev.reviewSummary } : {};
       summary[field] = value;
@@ -2635,6 +2787,9 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
   }, []);
 
   const handleResetToAiSuggestion = useCallback(() => {
+    setAiSuccessMessage(null);
+    setAiError(null);
+    setShowUnsavedApproveConfirm(false);
     if (draftTransformation?.transformation) {
       setEditableTransformation(JSON.parse(JSON.stringify(draftTransformation.transformation)));
     } else if (lastApprovedVersion?.transformation) {
@@ -3461,16 +3616,29 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                 className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200 text-xs font-bold"
               >
                 <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                <span>Approved & Published {lastApprovedVersion?.versionNumber ? `(v${lastApprovedVersion.versionNumber})` : ''}</span>
+                <span>
+                  {!hasUnsavedReviewChanges && !draftTransformation && !isTransformationOutdated
+                    ? `Approved & Published ${lastApprovedVersion?.versionNumber ? `(v${lastApprovedVersion.versionNumber})` : ''}`
+                    : `Published: ${lastApprovedVersion?.versionNumber ? `v${lastApprovedVersion.versionNumber}` : 'Active'}`}
+                </span>
               </span>
             )}
-            {approvalStatus !== 'approved' && draftTransformation && !isDraftStale && (
+            {draftTransformation && !isDraftStale && (
               <span
                 id="pedagogical-draft-badge"
                 className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-50 text-amber-800 border border-amber-200 text-xs font-bold"
               >
                 <Sparkles className="w-3.5 h-3.5 text-amber-600" />
                 <span>AI Draft (In Review)</span>
+              </span>
+            )}
+            {hasUnsavedReviewChanges && (
+              <span
+                data-testid="review-unsaved-badge"
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-blue-50 text-[#1C4C96] border border-[#1C4C96]/30 text-xs font-bold"
+              >
+                <Edit3 className="w-3.5 h-3.5 text-[#1C4C96]" />
+                <span>Unsaved Review Edits</span>
               </span>
             )}
             {isTransformationOutdated && (
@@ -4321,6 +4489,56 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
               </div>
             </section>
 
+            {/* Explicit Save-Before-Approve Confirmation for Unsaved Review Edits */}
+            {showUnsavedApproveConfirm && hasUnsavedReviewChanges && !isTransformationOutdated && (
+              <div
+                data-testid="review-unsaved-approve-confirm"
+                className="p-4 bg-amber-50 border border-amber-300 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-amber-950 shadow-2xs"
+              >
+                <div className="space-y-1">
+                  <div className="font-bold flex items-center gap-1.5 text-amber-900">
+                    <AlertCircle className="w-4 h-4 text-amber-700 shrink-0" />
+                    <span>Save your Review edits before publishing?</span>
+                  </div>
+                  <p className="text-amber-800 leading-relaxed">
+                    You have unsaved edits in the Pedagogical Review.
+                    {lastApprovedVersion?.versionNumber
+                      ? ` Previously published v${lastApprovedVersion.versionNumber} remains intact for the student until the new version is approved.`
+                      : ' Save them as a draft first or save and approve the updated version now.'}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 flex-wrap shrink-0">
+                  <button
+                    type="button"
+                    data-testid="btn-save-draft-before-approve"
+                    disabled={isSavingDraft || isApproving}
+                    onClick={handleSaveDraft}
+                    className="px-3 py-1.5 rounded-xl bg-white hover:bg-slate-50 text-[#1C4C96] border border-[#1C4C96]/40 font-bold transition cursor-pointer disabled:opacity-50"
+                  >
+                    {isSavingDraft ? 'Saving Draft...' : 'Save Draft First'}
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="btn-confirm-save-and-approve"
+                    disabled={isSavingDraft || isApproving}
+                    onClick={handleConfirmSaveAndApprove}
+                    className="px-3.5 py-1.5 rounded-xl bg-[#15803d] hover:bg-[#166534] text-white font-bold transition cursor-pointer disabled:opacity-50"
+                  >
+                    {isSavingDraft || isApproving ? 'Saving & Publishing...' : 'Save & Approve Now'}
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="btn-cancel-unsaved-approve"
+                    disabled={isSavingDraft || isApproving}
+                    onClick={() => setShowUnsavedApproveConfirm(false)}
+                    className="px-3 py-1.5 rounded-xl bg-amber-100 hover:bg-amber-200 text-amber-900 font-semibold transition cursor-pointer disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Editorial Approval Footer */}
             <div className="pt-4 border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between gap-3">
               <div className="text-xs text-slate-500">
@@ -4328,6 +4546,24 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   <span className="text-rose-600 font-semibold flex items-center gap-1">
                     <AlertCircle className="w-3.5 h-3.5" />
                     <span>Notes modified after generation. Update via Apply AI to enable approval.</span>
+                  </span>
+                ) : hasUnsavedReviewChanges ? (
+                  <span className="text-[#1C4C96] font-semibold flex items-center gap-1">
+                    <Edit3 className="w-3.5 h-3.5" />
+                    <span>
+                      Unsaved Review edits pending.
+                      {lastApprovedVersion?.versionNumber
+                        ? ` Version v${lastApprovedVersion.versionNumber} remains published until you approve.`
+                        : ' Save Draft or Approve & Publish to persist your changes.'}
+                    </span>
+                  </span>
+                ) : draftTransformation ? (
+                  <span className="text-amber-700 font-semibold flex items-center gap-1">
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>
+                      Draft saved in review. Click Approve & Publish to publish
+                      {lastApprovedVersion?.versionNumber ? ` (v${lastApprovedVersion.versionNumber} stays live until approved)` : ' for the student'}.
+                    </span>
                   </span>
                 ) : approvalStatus === 'approved' ? (
                   <span className="text-emerald-700 font-semibold flex items-center gap-1">
@@ -4368,7 +4604,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   className={`px-5 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 shadow-xs border ${
                     isTransformationOutdated
                       ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
-                      : approvalStatus === 'approved'
+                      : !hasUnsavedReviewChanges && !draftTransformation && approvalStatus === 'approved'
                       ? 'bg-emerald-600 hover:bg-emerald-700 text-white border-emerald-700 cursor-pointer'
                       : 'bg-[#15803d] hover:bg-[#166534] text-white border-[#15803d] cursor-pointer active:scale-98'
                   }`}
@@ -4382,7 +4618,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                   <span>
                     {isApproving
                       ? 'Publishing...'
-                      : !isTransformationOutdated && approvalStatus === 'approved'
+                      : !isTransformationOutdated && !hasUnsavedReviewChanges && !draftTransformation && approvalStatus === 'approved'
                       ? 'Approved & Published ✓'
                       : 'Approve & Publish'}
                   </span>
@@ -4884,7 +5120,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                     className={`px-3 py-1.5 rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-2xs border ${
                       isTransformationOutdated
                         ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
-                        : approvalStatus === 'approved'
+                        : !hasUnsavedReviewChanges && !draftTransformation && approvalStatus === 'approved'
                         ? 'bg-emerald-50 text-emerald-700 border-emerald-300 cursor-pointer'
                         : 'bg-[#15803d] text-white hover:bg-[#166534] border-[#15803d] cursor-pointer'
                     }`}
@@ -4903,7 +5139,7 @@ const TeacherLiveLessonNotesPanelComponent: React.FC<TeacherLiveLessonNotesPanel
                     <span>
                       {isApproving
                         ? 'Publishing...'
-                        : !isTransformationOutdated && approvalStatus === 'approved'
+                        : !isTransformationOutdated && !hasUnsavedReviewChanges && !draftTransformation && approvalStatus === 'approved'
                         ? 'Published ✓'
                         : 'Approve & Publish'}
                     </span>

@@ -32,6 +32,35 @@ export function computeNotesContentHash(str: string): string {
   return Math.abs(hash).toString(16);
 }
 
+function normalizePedagogicalValue(value: any): any {
+  if (value === null || value === undefined) return null;
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizePedagogicalValue(item));
+  }
+  if (typeof value === 'object') {
+    const out: Record<string, any> = {};
+    const keys = Object.keys(value).sort();
+    for (const k of keys) {
+      if (value[k] !== undefined) {
+        out[k] = normalizePedagogicalValue(value[k]);
+      }
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Compares two pedagogical transformation objects canonically (order-independent object keys).
+ */
+export function arePedagogicalTransformationsEqual(a: any, b: any): boolean {
+  if (a === b) return true;
+  if ((a === null || a === undefined) && (b === null || b === undefined)) return true;
+  if (a === null || a === undefined || b === null || b === undefined) return false;
+  return JSON.stringify(normalizePedagogicalValue(a)) === JSON.stringify(normalizePedagogicalValue(b));
+}
+
+
 /**
  * Generates an opaque, unique revision token tied to the contentRevision counter.
  * Eliminates the ABA problem because every relevant edit increments contentRevision and adds fresh entropy.
@@ -245,7 +274,7 @@ export function mergeSessionNoteWithVersioning(options: MergeSessionNoteOptions)
     ? Math.max(...updatedVersionHistory.map((v) => v.versionNumber || 0))
     : 1;
 
-  // 7. Revision Token & Content Revision (anti-ABA: always bump on rawContent or topic change)
+  // 7. Revision Token & Content Revision (anti-ABA: always bump on rawContent, topic, draft, or approval change)
   let nextContentRevision: number;
   let nextRevisionToken: string;
   if (!existingNote) {
@@ -255,7 +284,28 @@ export function mergeSessionNoteWithVersioning(options: MergeSessionNoteOptions)
     const existingRaw = String(existingNote.rawContent !== undefined ? existingNote.rawContent : (existingNote.content || ''));
     const existingTopic = String(existingNote.topic || 'Live Coaching Session');
     const prevContentRevision = Number(existingNote.contentRevision || 1);
-    const hasRelevantContentChange = rawContent !== existingRaw || resolvedTopic !== existingTopic;
+    const existingDraft = existingNote.draftTransformation || null;
+    const existingApproved = existingNote.lastApprovedVersion || null;
+    const draftChanged =
+      Boolean(draftTransformation) !== Boolean(existingDraft) ||
+      (Boolean(draftTransformation) &&
+        Boolean(existingDraft) &&
+        (draftTransformation!.draftId !== existingDraft!.draftId ||
+          !arePedagogicalTransformationsEqual(draftTransformation!.transformation, existingDraft!.transformation) ||
+          (draftTransformation!.customTeacherNotes ?? '') !== (existingDraft!.customTeacherNotes ?? '') ||
+          (draftTransformation!.reviewNotes ?? '') !== (existingDraft!.reviewNotes ?? '')));
+    const approvedChanged =
+      Boolean(lastApprovedVersion) !== Boolean(existingApproved) ||
+      (Boolean(lastApprovedVersion) &&
+        Boolean(existingApproved) &&
+        (lastApprovedVersion!.approvedVersionId !== existingApproved!.approvedVersionId ||
+          lastApprovedVersion!.versionNumber !== existingApproved!.versionNumber ||
+          !arePedagogicalTransformationsEqual(lastApprovedVersion!.transformation, existingApproved!.transformation)));
+    const hasRelevantContentChange =
+      rawContent !== existingRaw ||
+      resolvedTopic !== existingTopic ||
+      draftChanged ||
+      approvedChanged;
     if (hasRelevantContentChange) {
       nextContentRevision = (Number.isFinite(prevContentRevision) && prevContentRevision >= 1 ? Math.floor(prevContentRevision) : 1) + 1;
       nextRevisionToken = mintSessionNoteRevisionToken(nextContentRevision);

@@ -255,6 +255,7 @@ import {
   mergeSessionNoteWithVersioning,
   computeNotesContentHash,
   deriveLegacyRevisionToken,
+  arePedagogicalTransformationsEqual,
 } from './src/utils/notesVersioning';
 import {
   NoteDraftTransformation,
@@ -10777,16 +10778,43 @@ async function handleSessionNoteDraftInternal(req: any, res: any) {
           }
         }
 
-        const transformation = req.body?.transformation;
+        const rawIncomingTransformation = req.body?.transformation;
+        const transformation = rawIncomingTransformation?.transformation || rawIncomingTransformation;
         const customTeacherNotes = typeof req.body?.customTeacherNotes === 'string' ? req.body.customTeacherNotes : undefined;
         const reviewNotes = typeof req.body?.reviewNotes === 'string' ? req.body.reviewNotes : undefined;
 
-        const currentVersion = existingDoc.currentVersionNumber || 1;
-        const nextDraftVersion = currentVersion + 1;
+        if (!transformation || typeof transformation !== 'object' || Array.isArray(transformation)) {
+          return {
+            ok: false as const,
+            status: 400,
+            body: {
+              error: 'TRANSFORMATION_REQUIRED',
+              code: 'TRANSFORMATION_REQUIRED',
+              message: 'A valid pedagogical transformation is required to save a draft.',
+            },
+          };
+        }
+
         const rawNoteText = existingDoc.rawContent || existingDoc.content || '';
         const contentHash = computeNotesContentHash(rawNoteText);
 
-        if (transformation?.contentHash && transformation.contentHash !== contentHash) {
+        if (existingDoc.draftTransformation && req.body?.draftId && existingDoc.draftTransformation.draftId !== req.body.draftId) {
+          return {
+            ok: false as const,
+            status: 409,
+            body: {
+              success: false,
+              error: 'Conflict',
+              code: 'DRAFT_ID_MISMATCH',
+              message: 'The submitted draft ID does not match the current active draft.',
+              currentRevisionToken: serverToken,
+              currentContentRevision: Number(existingDoc.contentRevision || 1),
+            },
+          };
+        }
+
+        const submittedDraftHash = rawIncomingTransformation?.contentHash || transformation?.contentHash;
+        if (submittedDraftHash && submittedDraftHash !== contentHash) {
           return {
             ok: false as const,
             status: 409,
@@ -10801,13 +10829,38 @@ async function handleSessionNoteDraftInternal(req: any, res: any) {
           };
         }
 
+        if (
+          existingDoc.draftTransformation &&
+          existingDoc.draftTransformation.contentHash === contentHash &&
+          arePedagogicalTransformationsEqual(existingDoc.draftTransformation.transformation, transformation) &&
+          (existingDoc.draftTransformation.customTeacherNotes ?? '') === (customTeacherNotes ?? '') &&
+          (existingDoc.draftTransformation.reviewNotes ?? '') === (reviewNotes ?? '')
+        ) {
+          const respDoc = withResponseRevisionMetadata(existingDoc);
+          return {
+            ok: true as const,
+            unchanged: true,
+            noteDoc: respDoc,
+          };
+        }
+
+        const existingHistory = Array.isArray(existingDoc.versionHistory) ? existingDoc.versionHistory : [];
+        const maxHistoryVer = existingHistory.length > 0
+          ? Math.max(...existingHistory.map((v: any) => Number(v?.versionNumber || 0)))
+          : 0;
+        const nextDraftVersion = Math.max(
+          Number(existingDoc.currentVersionNumber || 0),
+          maxHistoryVer,
+          Number(existingDoc.lastApprovedVersion?.versionNumber || 0)
+        ) + 1;
+
         const draftTransformation: NoteDraftTransformation = {
           draftId: `draft_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
           versionNumber: nextDraftVersion,
           status: 'draft',
           contentHash,
           rawNotesSnippet: rawNoteText.slice(0, 300),
-          transformation: transformation || undefined,
+          transformation,
           customTeacherNotes,
           reviewNotes,
           createdAt: existingDoc.draftTransformation?.createdAt || new Date().toISOString(),
@@ -10844,6 +10897,7 @@ async function handleSessionNoteDraftInternal(req: any, res: any) {
 
         return {
           ok: true as const,
+          unchanged: false,
           noteDoc: sanitizedDoc,
         };
       });
@@ -10854,6 +10908,7 @@ async function handleSessionNoteDraftInternal(req: any, res: any) {
 
       return res.json({
         success: true,
+        ...(txResult.unchanged ? { unchanged: true } : {}),
         sessionNote: txResult.noteDoc,
         revisionToken: txResult.noteDoc.revisionToken,
         contentRevision: txResult.noteDoc.contentRevision,
@@ -11613,6 +11668,19 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
         const currentRawContent = existingDoc.rawContent || existingDoc.content || '';
         const currentContentHash = computeNotesContentHash(currentRawContent);
 
+        const rawIncomingTransformation = req.body?.transformation;
+        const incomingTransformation =
+          rawIncomingTransformation?.transformation ||
+          (rawIncomingTransformation &&
+          typeof rawIncomingTransformation === 'object' &&
+          !Array.isArray(rawIncomingTransformation) &&
+          (rawIncomingTransformation.mistakesAnalysis ||
+            rawIncomingTransformation.grammarPoints ||
+            rawIncomingTransformation.vocabularyAndExpressions ||
+            rawIncomingTransformation.reviewSummary)
+            ? rawIncomingTransformation
+            : null);
+
         // Stale draft & version protection
         if (existingDoc.draftTransformation) {
           if (req.body?.draftId && existingDoc.draftTransformation.draftId !== req.body.draftId) {
@@ -11620,9 +11688,12 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
               ok: false as const,
               status: 409,
               body: {
+                success: false,
                 error: 'Conflict',
                 code: 'DRAFT_ID_MISMATCH',
                 message: 'The submitted draft ID does not match the current active draft.',
+                currentRevisionToken: serverToken,
+                currentContentRevision: Number(existingDoc.contentRevision || 1),
               },
             };
           }
@@ -11631,32 +11702,48 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
               ok: false as const,
               status: 409,
               body: {
+                success: false,
                 error: 'Conflict',
                 code: 'STALE_DRAFT',
                 message: 'The pedagogical draft is outdated compared to the current session notes. Notes were modified after this draft was generated. Generate or edit a new draft before approving.',
+                currentRevisionToken: serverToken,
+                currentContentRevision: Number(existingDoc.contentRevision || 1),
               },
             };
           }
         }
 
-        if (req.body?.transformation?.contentHash && req.body.transformation.contentHash !== currentContentHash) {
+        const submittedTransformationHash =
+          req.body?.transformation?.contentHash || incomingTransformation?.contentHash;
+        if (submittedTransformationHash && submittedTransformationHash !== currentContentHash) {
           return {
             ok: false as const,
             status: 409,
             body: {
+              success: false,
               error: 'Conflict',
               code: 'STALE_DRAFT',
               message: 'The submitted transformation is outdated compared to the current session notes.',
+              currentRevisionToken: serverToken,
+              currentContentRevision: Number(existingDoc.contentRevision || 1),
             },
           };
         }
 
-        // Idempotency check: already approved with identical content
+        const hasMatchingApprovedTransformation =
+          !incomingTransformation ||
+          arePedagogicalTransformationsEqual(
+            existingDoc.lastApprovedVersion?.transformation,
+            incomingTransformation
+          );
+
+        // Idempotency check: only short-circuit when there is no active draft AND no edits vs lastApprovedVersion
         if (
           existingDoc.approvalStatus === 'approved' &&
           existingDoc.lastApprovedVersion &&
           existingDoc.lastApprovedVersion.contentHash === currentContentHash &&
-          !existingDoc.draftTransformation
+          !existingDoc.draftTransformation &&
+          hasMatchingApprovedTransformation
         ) {
           const respDoc = withResponseRevisionMetadata(existingDoc);
           return {
@@ -11667,10 +11754,8 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
           };
         }
 
-        const rawIncomingTransformation = req.body?.transformation;
         const transformation =
-          rawIncomingTransformation?.transformation ||
-          (rawIncomingTransformation?.mistakesAnalysis ? rawIncomingTransformation : null) ||
+          incomingTransformation ||
           existingDoc.draftTransformation?.transformation;
         if (!transformation) {
           return {
@@ -11719,8 +11804,15 @@ async function handleSessionNoteApproveInternal(req: any, res: any) {
           };
         }
 
-        const currentVersion = existingDoc.currentVersionNumber || 1;
-        const nextApprovedVersion = currentVersion + 1;
+        const existingHistory = Array.isArray(existingDoc.versionHistory) ? existingDoc.versionHistory : [];
+        const maxHistoryVer = existingHistory.length > 0
+          ? Math.max(...existingHistory.map((v: any) => Number(v?.versionNumber || 0)))
+          : 0;
+        const nextApprovedVersion = Math.max(
+          Number(existingDoc.currentVersionNumber || 0),
+          maxHistoryVer,
+          Number(existingDoc.lastApprovedVersion?.versionNumber || 0)
+        ) + 1;
 
         const approvedVersion: NoteApprovedVersion = {
           approvedVersionId: `appr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
