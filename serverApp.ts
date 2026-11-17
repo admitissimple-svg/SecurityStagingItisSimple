@@ -1928,28 +1928,49 @@ app.get('/api/auth/check-user', async (req, res) => {
         ]);
 
         const fsUserRole = (fsUser?.role || fsUser?.userRole || '').toLowerCase().trim();
+        const isFsTutorApproved = Boolean(
+          fsTutor &&
+          (fsTutor.role || '').toLowerCase().trim() !== 'student' &&
+          (fsTutor.approvalStatus === 'approved' || fsTutor.status === 'approved') &&
+          (fsTutor.isApproved === true || fsTutor.approved === true)
+        );
+        const isFsTutorPending = Boolean(
+          fsTutor &&
+          !isFsTutorApproved &&
+          (fsTutor.approvalStatus === 'pending' || fsTutor.status === 'pending' || fsTutor.isApproved === false)
+        );
+        const isFsUserApprovedTeacher = Boolean(
+          fsUser &&
+          (fsUserRole === 'teacher' || fsUserRole === 'tutor' || fsUserRole === 'native_friend') &&
+          (fsUser.approvalStatus === 'approved' || fsUser.status === 'approved') &&
+          (fsUser.isApproved === true || fsUser.approved === true)
+        );
+        const isFsUserPendingTeacher = Boolean(
+          fsUser &&
+          !isFsUserApprovedTeacher &&
+          (fsUserRole === 'teacher' || fsUserRole === 'tutor' || fsUserRole === 'native_friend') &&
+          (fsUser.approvalStatus === 'pending' || fsUser.status === 'pending' || fsUser.isApproved === false)
+        );
+
         if (fsUserRole === 'admin' || claimRole === 'admin') {
           existingRole = 'admin';
-        } else if (
-          fsUserRole === 'teacher' ||
-          fsUserRole === 'tutor' ||
-          fsUserRole === 'native_friend' ||
-          (fsTutor && fsUserRole !== 'student') ||
-          claimRole === 'teacher'
-        ) {
+        } else if (isFsUserApprovedTeacher || isFsTutorApproved) {
           existingRole = 'teacher';
-          tutorDoc = fsTutor || (fsUserRole === 'teacher' ? fsUser : null);
-        } else if (fsUser) {
+          tutorDoc = fsTutor || fsUser;
+        } else if (isFsTutorPending || isFsUserPendingTeacher) {
+          existingRole = 'pending_teacher';
+          tutorDoc = fsTutor || fsUser;
+        } else if (fsUser && (!fsUserRole || fsUserRole === 'student')) {
           existingRole = 'student';
           profileDoc = fsUser;
           studentDoc = fsUser;
         } else {
-          existingRole = claimRole || null;
+          existingRole = null;
         }
 
         existingName = fsUser?.name || fsTutor?.name || authUserRecord.displayName || null;
       } catch {
-        existingRole = claimRole || null;
+        existingRole = claimRole === 'admin' ? 'admin' : null;
         existingName = authUserRecord.displayName || null;
       }
     }
@@ -2889,7 +2910,66 @@ app.post('/api/auth/google', async (req, res) => {
   const firestoreDb = getFirestoreDb();
   const fsUserRes = await fetchUserWithStatusFromFirestore(cleanEmail, targetUid);
   const existingFsUser = fsUserRes.user;
-  const isDeletedInDb = Boolean((db.deletedStudentEmails || []).includes(cleanEmail));
+
+  let deletedStudentSet = new Set(
+    (db.deletedStudentEmails || []).map((e: string) => String(e || '').toLowerCase().trim()).filter(Boolean)
+  );
+  let deletedTutorEmailSet = new Set(
+    (db.deletedTutorEmails || []).map((e: string) => String(e || '').toLowerCase().trim()).filter(Boolean)
+  );
+  let deletedTutorIdSet = new Set(
+    (db.deletedTutorIds || []).map((id: string) => String(id || '').toLowerCase().trim()).filter(Boolean)
+  );
+
+  let isDeletedInDb =
+    deletedStudentSet.has(cleanEmail) ||
+    deletedTutorEmailSet.has(cleanEmail) ||
+    deletedTutorIdSet.has(targetUid.toLowerCase());
+
+  if (!isDeletedInDb && firestoreDb && !existingFsUser && resolution.role !== 'admin' && resolution.role !== 'teacher') {
+    try {
+      const [mainSnap, tutorsSnap] = await Promise.all([
+        firestoreDb.collection('app_state').doc('main_data').get().catch(() => null),
+        firestoreDb.collection('app_state').doc('tutors').get().catch(() => null),
+      ]);
+      const cloudDeletedStudents: string[] = Array.isArray(mainSnap?.data()?.deletedStudentEmails)
+        ? mainSnap!.data()!.deletedStudentEmails
+        : [];
+      const cloudDeletedTutorEmails: string[] = Array.isArray(tutorsSnap?.data()?.deletedTutorEmails)
+        ? tutorsSnap!.data()!.deletedTutorEmails
+        : [];
+      const cloudDeletedTutorIds: string[] = Array.isArray(tutorsSnap?.data()?.deletedTutorIds)
+        ? tutorsSnap!.data()!.deletedTutorIds
+        : [];
+
+      cloudDeletedStudents.forEach((e) => deletedStudentSet.add(String(e || '').toLowerCase().trim()));
+      cloudDeletedTutorEmails.forEach((e) => deletedTutorEmailSet.add(String(e || '').toLowerCase().trim()));
+      cloudDeletedTutorIds.forEach((id) => deletedTutorIdSet.add(String(id || '').toLowerCase().trim()));
+
+      if (deletedStudentSet.has(cleanEmail) && !(db.deletedStudentEmails || []).includes(cleanEmail)) {
+        db.deletedStudentEmails = Array.from(deletedStudentSet).filter(Boolean);
+      }
+      if (deletedTutorEmailSet.has(cleanEmail) && !(db.deletedTutorEmails || []).includes(cleanEmail)) {
+        db.deletedTutorEmails = Array.from(deletedTutorEmailSet).filter(Boolean);
+      }
+      if (deletedTutorIdSet.has(targetUid.toLowerCase()) && !(db.deletedTutorIds || []).includes(targetUid.toLowerCase())) {
+        db.deletedTutorIds = Array.from(deletedTutorIdSet).filter(Boolean);
+      }
+
+      isDeletedInDb =
+        deletedStudentSet.has(cleanEmail) ||
+        deletedTutorEmailSet.has(cleanEmail) ||
+        deletedTutorIdSet.has(targetUid.toLowerCase());
+    } catch {}
+  }
+
+  if (isDeletedInDb && !existingFsUser && resolution.role !== 'admin' && resolution.role !== 'teacher') {
+    return res.status(403).json({
+      error: 'Forbidden',
+      code: 'ACCOUNT_DELETED',
+      message: 'Esta conta foi excluída pela administração e não pode ser recriada automaticamente.',
+    });
+  }
 
   let canonicalProfileResponse: any = null;
   let canonicalStudentResponse: any = null;
@@ -4282,6 +4362,26 @@ app.delete('/api/tutors/:id', firebaseAuthMiddleware, requireAdmin, async (req, 
   });
   if (targetTutor?.id && targetTutor.id !== tutorId) {
     await deleteTutorFromFirestore(targetTutor.id).catch(() => {});
+  }
+
+  const firestoreDb = getFirestoreDb();
+  if (firestoreDb && !getIsCloudWriteDisabled()) {
+    try {
+      const tutorsRef = firestoreDb.collection('app_state').doc('tutors');
+      const tutorsSnap = await tutorsRef.get().catch(() => null);
+      const existingIds = Array.isArray(tutorsSnap?.data()?.deletedTutorIds) ? tutorsSnap!.data()!.deletedTutorIds : [];
+      const existingEmails = Array.isArray(tutorsSnap?.data()?.deletedTutorEmails) ? tutorsSnap!.data()!.deletedTutorEmails : [];
+      db.deletedTutorIds = Array.from(new Set([...existingIds, ...(db.deletedTutorIds || [])].map((v: string) => String(v || '').toLowerCase().trim()).filter(Boolean)));
+      db.deletedTutorEmails = Array.from(new Set([...existingEmails, ...(db.deletedTutorEmails || [])].map((v: string) => String(v || '').toLowerCase().trim()).filter(Boolean)));
+      await tutorsRef.set(
+        {
+          deletedTutorIds: db.deletedTutorIds,
+          deletedTutorEmails: db.deletedTutorEmails,
+          updatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      ).catch(() => {});
+    } catch {}
   }
 
   await writeDbSync(db);
@@ -5760,7 +5860,7 @@ app.get('/api/students', async (req, res) => {
         teacherPublicId = identityRes.publicTutorId || '';
       }
     } catch {
-      isTeacher = verifiedCaller.role === 'teacher';
+      isTeacher = false;
     }
   }
 
@@ -6067,21 +6167,46 @@ app.delete('/api/students/:identifier', firebaseAuthMiddleware, requireAdmin, as
   console.log(`[DELETE /api/students] Request to delete student: ${clean}`);
 
   let targetEmail = clean.includes('@') ? clean : '';
+  let targetUid = !clean.includes('@') && isValidCanonicalUid(rawId) ? rawId.trim() : '';
   const matchingStudent = (db.students || []).find((s: any) => {
     const sEmail = (s.email || s.studentEmail || '').toLowerCase().trim();
     const sId = (s.id || '').toLowerCase().trim();
-    return sEmail === clean || sId === clean;
+    const sUid = (s.uid || '').toLowerCase().trim();
+    return sEmail === clean || sId === clean || sUid === clean;
   });
 
   if (matchingStudent) {
     targetEmail = (matchingStudent.email || matchingStudent.studentEmail || targetEmail).toLowerCase().trim();
+    if (!targetUid) {
+      const mUid = (matchingStudent.uid || matchingStudent.id || '').trim();
+      if (isValidCanonicalUid(mUid)) targetUid = mUid;
+    }
+  }
+
+  const firestoreDb = getFirestoreDb();
+  if (firestoreDb && (!targetEmail || !targetUid)) {
+    try {
+      if (targetUid) {
+        const uSnap = await firestoreDb.collection('users').doc(targetUid).get().catch(() => null);
+        if (uSnap && uSnap.exists) {
+          const uEmail = String(uSnap.data()?.email || '').toLowerCase().trim();
+          if (uEmail && !targetEmail) targetEmail = uEmail;
+        }
+      } else if (targetEmail) {
+        const qSnap = await firestoreDb.collection('users').where('email', '==', targetEmail).limit(1).get().catch(() => null);
+        if (qSnap && !qSnap.empty) {
+          targetUid = qSnap.docs[0].id;
+        }
+      }
+    } catch {}
   }
 
   // Remove from students array
   db.students = (db.students || []).filter((s: any) => {
     const sEmail = (s.email || s.studentEmail || '').toLowerCase().trim();
     const sId = (s.id || '').toLowerCase().trim();
-    return sEmail !== clean && sId !== clean && (!targetEmail || sEmail !== targetEmail);
+    const sUid = (s.uid || '').toLowerCase().trim();
+    return sEmail !== clean && sId !== clean && sUid !== clean && (!targetEmail || sEmail !== targetEmail);
   });
 
   // Remove from userProfiles
@@ -6112,9 +6237,27 @@ app.delete('/api/students/:identifier', firebaseAuthMiddleware, requireAdmin, as
     db.deletedStudentEmails.push(targetEmail);
   }
 
+  if (firestoreDb && !getIsCloudWriteDisabled() && targetEmail) {
+    try {
+      const mainRef = firestoreDb.collection('app_state').doc('main_data');
+      const mainSnap = await mainRef.get().catch(() => null);
+      const existingDeleted = Array.isArray(mainSnap?.data()?.deletedStudentEmails)
+        ? mainSnap!.data()!.deletedStudentEmails
+        : [];
+      const mergedDeleted = Array.from(
+        new Set([...existingDeleted, ...db.deletedStudentEmails].map((e: string) => String(e || '').toLowerCase().trim()).filter(Boolean))
+      );
+      db.deletedStudentEmails = mergedDeleted;
+      await mainRef.set({ deletedStudentEmails: mergedDeleted, updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+    } catch {}
+  }
+
   await writeDbSync(db);
 
-  // Clean from Firestore users collection if present
+  // Clean from Firestore users collection if present (both by UID and by email)
+  if (targetUid && firestoreDb && !getIsCloudWriteDisabled()) {
+    await firestoreDb.collection('users').doc(targetUid).delete().catch(() => {});
+  }
   if (targetEmail) {
     await deleteUserByEmailFromFirestore(targetEmail).catch((e) => {
       console.warn('Could not delete user from Firestore users collection:', e);
@@ -6181,6 +6324,24 @@ app.post('/api/students/profile', async (req, res) => {
   const safeLevel = profile.level || fsUser?.level || existingProfile.level;
   const safeGoal = profile.learningGoal || fsUser?.learningGoal || existingProfile.learningGoal;
   const safeDailyGoalMinutes = profile.dailyGoalMinutes ?? fsUser?.dailyGoalMinutes ?? existingProfile.dailyGoalMinutes ?? 30;
+  const parsedIncomingNativeTarget =
+    profile.weeklyNativeLessonsTarget !== undefined && profile.weeklyNativeLessonsTarget !== null && profile.weeklyNativeLessonsTarget !== ''
+      ? Number(profile.weeklyNativeLessonsTarget)
+      : NaN;
+  const safeWeeklyNativeLessonsTarget =
+    Number.isInteger(parsedIncomingNativeTarget) && parsedIncomingNativeTarget >= 1 && parsedIncomingNativeTarget <= 7
+      ? parsedIncomingNativeTarget
+      : (typeof fsUser?.weeklyNativeLessonsTarget === 'number' &&
+          Number.isInteger(fsUser.weeklyNativeLessonsTarget) &&
+          fsUser.weeklyNativeLessonsTarget >= 1 &&
+          fsUser.weeklyNativeLessonsTarget <= 7
+          ? fsUser.weeklyNativeLessonsTarget
+          : (typeof existingProfile.weeklyNativeLessonsTarget === 'number' &&
+              Number.isInteger(existingProfile.weeklyNativeLessonsTarget) &&
+              existingProfile.weeklyNativeLessonsTarget >= 1 &&
+              existingProfile.weeklyNativeLessonsTarget <= 7
+              ? existingProfile.weeklyNativeLessonsTarget
+              : 1));
   const safeAvatar = picture || profile.avatar || fsUser?.avatar || existingProfile.avatar;
   const safePicture = picture || profile.picture || fsUser?.picture || existingProfile.picture;
   const safeVideoTime = profile.routineVideoTime || fsUser?.routineVideoTime || existingProfile.routineVideoTime || '09:00';
@@ -6210,6 +6371,7 @@ app.post('/api/students/profile', async (req, res) => {
     level: safeLevel,
     learningGoal: safeGoal,
     dailyGoalMinutes: safeDailyGoalMinutes,
+    weeklyNativeLessonsTarget: safeWeeklyNativeLessonsTarget,
     avatar: safeAvatar,
     picture: safePicture,
     // Preserve authoritative counters & flags
@@ -6224,6 +6386,8 @@ app.post('/api/students/profile', async (req, res) => {
     teacherEmail: fsUser?.teacherEmail ?? existingProfile.teacherEmail ?? null,
     teacherName: fsUser?.teacherName ?? existingProfile.teacherName ?? null,
   };
+  if (!db.weeklyNativeTargets) db.weeklyNativeTargets = {};
+  db.weeklyNativeTargets[cleanEmail] = safeWeeklyNativeLessonsTarget;
 
   const idx = db.students.findIndex((s) => s.uid === targetUid || (s.email || s.studentEmail || '').toLowerCase() === cleanEmail);
   if (idx >= 0) {
@@ -6237,6 +6401,7 @@ app.post('/api/students/profile', async (req, res) => {
       learningGoal: safeGoal || db.students[idx].learningGoal,
       picture: safePicture || db.students[idx].picture,
       avatar: safeAvatar || db.students[idx].avatar,
+      weeklyNativeLessonsTarget: safeWeeklyNativeLessonsTarget,
       routineVideoTime: safeVideoTime,
       routineAudioTime: safeAudioTime,
       dailyPhraseTime: safePhraseTime,
@@ -6490,6 +6655,17 @@ app.get('/api/user-profile', async (req, res) => {
     if (studyTarget !== undefined) {
       profile.weeklyStudyDaysTarget = studyTarget;
     }
+    const nativeTargetCandidate =
+      fsUser?.weeklyNativeLessonsTarget ??
+      cachedProfile?.weeklyNativeLessonsTarget ??
+      studentInDb?.weeklyNativeLessonsTarget ??
+      db.weeklyNativeTargets?.[email] ??
+      profile.weeklyNativeLessonsTarget;
+    const parsedNativeTarget = Number(nativeTargetCandidate);
+    profile.weeklyNativeLessonsTarget =
+      Number.isInteger(parsedNativeTarget) && parsedNativeTarget >= 1 && parsedNativeTarget <= 7
+        ? parsedNativeTarget
+        : 1;
     let journalEntries = Array.isArray(profile.studentJournal) ? profile.studentJournal : [];
     if (targetUid && isValidCanonicalUid(targetUid)) {
       const canonicalActivityRes = await fetchStudentActivityJournalFromServerFirestore(targetUid).catch(() => null);
@@ -6747,6 +6923,7 @@ app.post('/api/user-profile', async (req, res) => {
     'learningGoal',
     'goal',
     'dailyGoalMinutes',
+    'weeklyNativeLessonsTarget',
     'weeklyStudyDaysTarget',
     'weeklyPracticeDays',
     'weeklyStudyDays',
@@ -6779,6 +6956,27 @@ app.post('/api/user-profile', async (req, res) => {
       safeStudentFields[key] = val;
     }
   }
+
+  const rawNativeTarget = safeStudentFields.weeklyNativeLessonsTarget;
+  const parsedNativeTarget =
+    rawNativeTarget !== undefined && rawNativeTarget !== null && rawNativeTarget !== ''
+      ? Number(rawNativeTarget)
+      : NaN;
+  const resolvedNativeLessonsTarget =
+    Number.isInteger(parsedNativeTarget) && parsedNativeTarget >= 1 && parsedNativeTarget <= 7
+      ? parsedNativeTarget
+      : (typeof fsUser?.weeklyNativeLessonsTarget === 'number' &&
+          Number.isInteger(fsUser.weeklyNativeLessonsTarget) &&
+          fsUser.weeklyNativeLessonsTarget >= 1 &&
+          fsUser.weeklyNativeLessonsTarget <= 7
+          ? fsUser.weeklyNativeLessonsTarget
+          : (typeof existing.weeklyNativeLessonsTarget === 'number' &&
+              Number.isInteger(existing.weeklyNativeLessonsTarget) &&
+              existing.weeklyNativeLessonsTarget >= 1 &&
+              existing.weeklyNativeLessonsTarget <= 7
+              ? existing.weeklyNativeLessonsTarget
+              : 1));
+  safeStudentFields.weeklyNativeLessonsTarget = resolvedNativeLessonsTarget;
 
   const oldLevelKey = normalizeStudentLevel(existing.level).key;
   const newLevelKey = normalizeStudentLevel(safeStudentFields.level || existing.level).key;
@@ -6813,6 +7011,7 @@ app.post('/api/user-profile', async (req, res) => {
     userLevel: resolvedLevel,
     learningGoal: resolvedLearningGoal,
     dailyGoalMinutes: safeStudentFields.dailyGoalMinutes ?? existing.dailyGoalMinutes ?? 30,
+    weeklyNativeLessonsTarget: resolvedNativeLessonsTarget,
     completedLessonsCount: authoritativeCompletedLessonsCount,
     teacherEmail: finalTeacherEmail,
     teacherName: finalTeacherName,
@@ -6904,6 +7103,8 @@ app.post('/api/user-profile', async (req, res) => {
   };
 
   db.userProfiles[targetEmail] = fullProfileWithAuthoritativeCredits;
+  if (!db.weeklyNativeTargets) db.weeklyNativeTargets = {};
+  db.weeklyNativeTargets[targetEmail] = resolvedNativeLessonsTarget;
 
   const studentIdx = (db.students || []).findIndex(
     (s: any) =>
@@ -6923,6 +7124,7 @@ app.post('/api/user-profile', async (req, res) => {
       studentLevel: updatedProfileObj.level,
       goal: updatedProfileObj.learningGoal,
       learningGoal: updatedProfileObj.learningGoal,
+      weeklyNativeLessonsTarget: resolvedNativeLessonsTarget,
       picture: updatedProfileObj.picture,
       avatar: updatedProfileObj.avatar,
       teacherEmail: updatedProfileObj.teacherEmail,
@@ -6947,6 +7149,7 @@ app.post('/api/user-profile', async (req, res) => {
       studentLevel: updatedProfileObj.level,
       goal: updatedProfileObj.learningGoal,
       learningGoal: updatedProfileObj.learningGoal,
+      weeklyNativeLessonsTarget: resolvedNativeLessonsTarget,
       ...(effectiveContracted !== undefined ? { contractedLessons: effectiveContracted } : {}),
       ...(effectiveAvailable !== undefined ? { availableLessons: effectiveAvailable } : {}),
       completedLessonsCount: authoritativeCompletedLessonsCount,
@@ -25385,6 +25588,37 @@ Output STRICT JSON matching this schema:
 app.post('/api/lesson/vocab-generate', firebaseAuthMiddleware, requireTeacher, async (req, res) => {
   const caller = req.user!;
   const callerUid = caller.uid;
+  if (caller.role !== 'admin') {
+    try {
+      const dbState = readDb();
+      const callerIdentity = await resolveCanonicalUserRoleAndIdentity({
+        uid: callerUid,
+        email: caller.email,
+        tokenRole: caller.role,
+        dbState,
+      });
+      if (
+        callerIdentity.role === 'pending_teacher' ||
+        callerIdentity.role === 'conflict' ||
+        callerIdentity.role === 'student'
+      ) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Acesso restrito a Amigo Nativo aprovado.',
+        });
+      }
+      if (callerIdentity.role === 'unregistered') {
+        const fsDb = getFirestoreDb();
+        const rawTutor = fsDb ? await fetchTutorDocumentFromFirestore(callerUid, 1500).catch(() => null) : null;
+        if (rawTutor) {
+          return res.status(403).json({
+            error: 'Forbidden',
+            message: 'Cadastro de Amigo Nativo não aprovado.',
+          });
+        }
+      }
+    } catch {}
+  }
   const { words, topic, notes } = req.body || {};
   if (!words || !Array.isArray(words) || words.length === 0) {
     return res.status(400).json({ error: 'words array is required' });

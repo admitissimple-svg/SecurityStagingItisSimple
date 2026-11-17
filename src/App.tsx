@@ -368,6 +368,7 @@ export default function App() {
         let authoritativePicture: string = fbUser.photoURL || '';
         let isConflict = false;
         let isPending = false;
+        let isUnregistered = false;
 
         if (idToken) {
           try {
@@ -383,6 +384,8 @@ export default function App() {
               if (verifyData?.role === 'teacher' || verifyData?.role === 'admin' || verifyData?.role === 'student') {
                 resolvedRole = verifyData.role;
                 if (verifyData.name) authoritativeName = verifyData.name;
+              } else if (verifyData?.role === 'unregistered' || verifyData?.identityStatus === 'unregistered') {
+                isUnregistered = true;
               } else if (verifyData?.role === 'conflict' || verifyData?.identityStatus === 'conflict' || verifyData?.identityStatus === 'divergent_uid') {
                 isConflict = true;
               } else if (verifyData?.role === 'pending_teacher' || verifyData?.approvalStatus === 'pending') {
@@ -403,9 +406,7 @@ export default function App() {
 
         // Se backend não respondeu (ex: offline temporário), inspeciona estritamente Firestore em modo leitura
         // JAMAIS grava perfil de student durante F5 ou login
-        // Se backend não respondeu (ex: offline temporário), inspeciona estritamente Firestore em modo leitura
-        // JAMAIS grava perfil de student durante F5 ou login
-        if (!resolvedRole && !isConflict && !isPending) {
+        if (!resolvedRole && !isConflict && !isPending && !isUnregistered) {
           try {
             const db = getDb();
             if (db) {
@@ -552,6 +553,12 @@ export default function App() {
                 ...(firestoreDoc?.timezone ? { timezone: firestoreDoc.timezone } : {}),
                 ...(firestoreDoc?.studentTimezone ? { studentTimezone: firestoreDoc.studentTimezone } : {}),
                 learningGoal: firestoreDoc?.learningGoal || '',
+                weeklyNativeLessonsTarget:
+                  typeof firestoreDoc?.weeklyNativeLessonsTarget === 'number' &&
+                  firestoreDoc.weeklyNativeLessonsTarget >= 1 &&
+                  firestoreDoc.weeklyNativeLessonsTarget <= 7
+                    ? firestoreDoc.weeklyNativeLessonsTarget
+                    : 1,
                 weeklyStudyDaysTarget: typeof firestoreDoc?.weeklyStudyDaysTarget === 'number' ? firestoreDoc.weeklyStudyDaysTarget : 4,
                 weeklyStudyDays: firestoreDoc?.weeklyStudyDays || ['monday', 'tuesday', 'wednesday', 'thursday'],
                 routineVideoTime: firestoreDoc?.routineVideoTime || '09:00',
@@ -1816,6 +1823,12 @@ export default function App() {
               : ((apiProfileData?.teacherUid && isValidCanonicalUid(apiProfileData.teacherUid)) ? apiProfileData.teacherUid : null),
             assignedNativeFriendUID: fsProfile?.assignedNativeFriendUID || fsProfile?.nativeFriendUID || apiProfileData?.assignedNativeFriendUID || null,
             nativeFriendUID: fsProfile?.nativeFriendUID || fsProfile?.assignedNativeFriendUID || apiProfileData?.nativeFriendUID || null,
+            weeklyNativeLessonsTarget:
+              typeof fsProfile?.weeklyNativeLessonsTarget === 'number' && fsProfile.weeklyNativeLessonsTarget >= 1 && fsProfile.weeklyNativeLessonsTarget <= 7
+                ? fsProfile.weeklyNativeLessonsTarget
+                : (typeof apiProfileData?.weeklyNativeLessonsTarget === 'number' && apiProfileData.weeklyNativeLessonsTarget >= 1 && apiProfileData.weeklyNativeLessonsTarget <= 7
+                    ? apiProfileData.weeklyNativeLessonsTarget
+                    : (baseProfile.weeklyNativeLessonsTarget || 1)),
             enrollmentStatus: effectiveEnrollment,
           };
           if (loadedProfile) {
@@ -3669,10 +3682,10 @@ export default function App() {
   };
 
   // Handler: Update contracted lessons (Admin-only authoritative Firestore mutation)
-  const handleUpdateContractedLessons = async (studentEmail: string, count: number) => {
+  const handleUpdateContractedLessons = async (studentEmail: string, count: number): Promise<boolean> => {
     if (!currentAccount || currentAccount.role !== 'admin') {
       console.warn('[RBAC] Somente administradores podem alterar saldos contratuais.');
-      return;
+      return false;
     }
 
     const cleanEmail = (studentEmail || '').toLowerCase().trim();
@@ -3687,7 +3700,23 @@ export default function App() {
       const idToken =
         (await auth.currentUser?.getIdToken().catch(() => null)) ||
         (await getAccessToken().catch(() => null));
-      if (!idToken) return;
+      if (!idToken) {
+        setNotifications((prev) => [
+          {
+            id: `contract-auth-err-${Date.now()}`,
+            title: currentLanguage === 'en' ? 'Authentication Required' : 'Autenticação Necessária',
+            message:
+              currentLanguage === 'en'
+                ? 'Could not verify administrator session to update credits.'
+                : 'Não foi possível verificar a sessão de administrador para alterar créditos.',
+            type: 'warning',
+            timestamp: new Date().toISOString(),
+            read: false,
+          },
+          ...prev,
+        ]);
+        return false;
+      }
 
       const res = await fetch('/api/students/contract', {
         method: 'POST',
@@ -3704,7 +3733,29 @@ export default function App() {
       const data = await res.json().catch(() => ({}));
       if (!res.ok || !data.success) {
         console.error('[handleUpdateContractedLessons] Rejected by server:', data);
-        return;
+        const isLegacyBlocked = res.status === 501 || data?.error === 'LEGACY_CREDIT_MUTATION_BLOCKED';
+        setNotifications((prev) => [
+          {
+            id: `contract-err-${Date.now()}`,
+            title: isLegacyBlocked
+              ? (currentLanguage === 'en' ? 'Credit Adjustment Temporarily Disabled' : 'Ajuste de Créditos Bloqueado')
+              : (currentLanguage === 'en' ? 'Could Not Update Credits' : 'Falha ao Atualizar Créditos'),
+            message:
+              data?.message ||
+              (isLegacyBlocked
+                ? (currentLanguage === 'en'
+                    ? 'Direct credit adjustment via legacy route is temporarily blocked for security.'
+                    : 'Ajuste direto de créditos via rota legada está temporariamente bloqueado por segurança.')
+                : (currentLanguage === 'en'
+                    ? 'Could not update contracted lessons.'
+                    : 'Não foi possível atualizar as aulas contratadas.')),
+            type: isLegacyBlocked ? 'warning' : 'error',
+            timestamp: new Date().toISOString(),
+            read: false,
+          },
+          ...prev,
+        ]);
+        return false;
       }
 
       const authContracted = Number(data.contractedLessons ?? count);
@@ -3730,8 +3781,24 @@ export default function App() {
           ...(authAvailable !== undefined ? { availableLessons: authAvailable } : {}),
         }));
       }
+      return true;
     } catch (err) {
       console.error('[handleUpdateContractedLessons] Network error:', err);
+      setNotifications((prev) => [
+        {
+          id: `contract-net-err-${Date.now()}`,
+          title: currentLanguage === 'en' ? 'Connection Error' : 'Erro de Conexão',
+          message:
+            currentLanguage === 'en'
+              ? 'Unable to reach server to update contracted lessons.'
+              : 'Não foi possível conectar ao servidor para atualizar as aulas contratadas.',
+          type: 'error',
+          timestamp: new Date().toISOString(),
+          read: false,
+        },
+        ...prev,
+      ]);
+      return false;
     }
   };
 

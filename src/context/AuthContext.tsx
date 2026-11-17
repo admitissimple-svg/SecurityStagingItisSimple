@@ -170,7 +170,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           const claimRole = (tokenResult?.claims?.role as UserRole) || null;
           const idToken = await user.getIdToken().catch(() => null);
 
-          let resolvedRole: UserRole | null = claimRole === 'admin' ? 'admin' : (claimRole === 'teacher' ? 'teacher' : (claimRole === 'student' ? 'student' : null));
+          let resolvedRole: UserRole | null = claimRole === 'admin' ? 'admin' : null;
 
           if (idToken) {
             try {
@@ -179,7 +179,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
               });
               if (verifyRes.ok) {
                 const verifyData = await verifyRes.json();
-                if (verifyData.role === 'admin' || verifyData.role === 'teacher' || verifyData.role === 'student' || verifyData.role === 'pending_teacher' || verifyData.role === 'conflict') {
+                if (
+                  verifyData.role === 'admin' ||
+                  verifyData.role === 'teacher' ||
+                  verifyData.role === 'student' ||
+                  verifyData.role === 'pending_teacher' ||
+                  verifyData.role === 'conflict' ||
+                  verifyData.role === 'unregistered'
+                ) {
                   resolvedRole = verifyData.role;
                 }
               } else if (verifyRes.status === 409) {
@@ -211,10 +218,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 });
                 if (profRes.ok) {
                   const profData = await profRes.json();
-                  if (profData && typeof profData === 'object') {
+                  const unwrappedProfile =
+                    profData && typeof profData === 'object'
+                      ? (profData.profile && typeof profData.profile === 'object'
+                          ? profData.profile
+                          : !('profile' in profData)
+                            ? profData
+                            : null)
+                      : null;
+                  if (unwrappedProfile) {
                     setUserProfile((prev) => ({
                       ...(prev || {}),
-                      ...profData,
+                      ...unwrappedProfile,
                       id: user.uid,
                       uid: user.uid,
                     }));

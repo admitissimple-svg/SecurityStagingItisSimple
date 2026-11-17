@@ -770,9 +770,13 @@ export async function resolveCanonicalUserRoleAndIdentity(params: {
   const userRole = (userData?.role || userData?.userRole || '').toLowerCase().trim();
   const tutorRole = (linkedTutorData?.role || (linkedTutorData?.isTeacher ? 'teacher' : '')).toLowerCase().trim();
 
-  const isTokenTeacher = tokenRole === 'teacher';
+  const isTutorRejected = Boolean(
+    (linkedTutorData && (linkedTutorData.approvalStatus === 'rejected' || linkedTutorData.status === 'rejected')) ||
+    (userData && (userRole === 'teacher' || userRole === 'native_friend' || userRole === 'tutor') && (userData.approvalStatus === 'rejected' || userData.status === 'rejected'))
+  );
 
   const isUserApprovedTeacher = Boolean(
+    !isTutorRejected &&
     userData &&
     (userRole === 'teacher' || userRole === 'native_friend' || userRole === 'tutor') &&
     (userData.approvalStatus === 'approved' || userData.status === 'approved') &&
@@ -786,26 +790,27 @@ export async function resolveCanonicalUserRoleAndIdentity(params: {
   );
 
   const isTutorApproved = Boolean(
-    (hasValidTutorProfileRole &&
-      (linkedTutorData.approvalStatus === 'approved' || linkedTutorData.status === 'approved') &&
-      (linkedTutorData.isApproved === true || linkedTutorData.approved === true)) ||
-    (isTokenTeacher && (!linkedTutorData || linkedTutorData.approvalStatus !== 'pending'))
+    !isTutorRejected &&
+    hasValidTutorProfileRole &&
+    (linkedTutorData.approvalStatus === 'approved' || linkedTutorData.status === 'approved') &&
+    (linkedTutorData.isApproved === true || linkedTutorData.approved === true)
   );
 
   const isTutorPending = Boolean(
-    (linkedTutorData &&
+    !isTutorRejected &&
+    ((linkedTutorData &&
       !isTutorApproved &&
       (linkedTutorData.approvalStatus === 'pending' || linkedTutorData.isApproved === false || linkedTutorData.status === 'pending')) ||
     (userData &&
       !isUserApprovedTeacher &&
       !isTutorApproved &&
       (userRole === 'teacher' || userRole === 'native_friend' || userRole === 'tutor') &&
-      (userData.approvalStatus === 'pending' || userData.isApproved === false || userData.status === 'pending'))
+      (userData.approvalStatus === 'pending' || userData.isApproved === false || userData.status === 'pending')))
   );
 
   // 5. Conflito de Identidade: Registro em users/{uid} como student mas aprovado em tutors
   if (userData && userRole === 'student') {
-    if (isTutorApproved || isTokenTeacher) {
+    if (isTutorApproved || isUserApprovedTeacher) {
       console.warn(`[resolveCanonicalUserRoleAndIdentity] Conflito de identidade detectado para ${cleanUid}: aluno em users vs professor aprovado em tutors.`);
       return {
         role: 'conflict',
@@ -827,8 +832,8 @@ export async function resolveCanonicalUserRoleAndIdentity(params: {
     };
   }
 
-  // 6. Professor Aprovado com vínculo inequívoco ao UID autenticado
-  if (isUserApprovedTeacher || isTutorApproved || isTokenTeacher) {
+  // 6. Professor Aprovado com vínculo inequívoco ao UID autenticado (nunca por custom claim isolada)
+  if (isUserApprovedTeacher || isTutorApproved) {
     const effectiveTutorDoc = linkedTutorData || userData;
     const name = effectiveTutorDoc?.name || userData?.name || 'Native Friend';
     const publicTutorId =
@@ -864,15 +869,15 @@ export async function resolveCanonicalUserRoleAndIdentity(params: {
     };
   }
 
-  // 7.1 Aluno autenticado com custom claim ou papel verificado de student no token Firebase
-  if (tokenRole === 'student' && !isTutorApproved && !isUserApprovedTeacher) {
+  // 7.1 Documento legado em users/{uid} explicitamente cadastrado no Firestore sem campo role definido
+  if (userData && !userRole && !linkedTutorData && !isTutorPending && !isTutorRejected) {
     return {
       role: 'student',
       identityStatus: 'authorized',
       uid: cleanUid,
-      email: cleanEmail,
-      name: userData?.name || cleanEmail.split('@')[0],
-      rawDoc: userData || { uid: cleanUid, email: cleanEmail, role: 'student' },
+      email: userData.email || cleanEmail,
+      name: userData.name || cleanEmail.split('@')[0],
+      rawDoc: userData,
     };
   }
 
@@ -893,7 +898,7 @@ export async function resolveCanonicalUserRoleAndIdentity(params: {
     }
   }
 
-  // 9. Perfil ausente na base canônica (NUNCA assume student como fallback silencioso)
+  // 9. Perfil ausente na base canônica (NUNCA assume student nem teacher a partir de custom claims isoladas)
   return {
     role: 'unregistered',
     identityStatus: 'unregistered',

@@ -42,7 +42,7 @@ interface StudentHeaderSectionProps {
   teachers?: GoogleAccount[];
   teacherMeetSettings?: Record<string, TeacherMeetSettings>;
   contractedLessons?: Record<string, number>;
-  onUpdateContractedLessons?: (studentEmail: string, totalContracted: number) => void;
+  onUpdateContractedLessons?: (studentEmail: string, totalContracted: number) => void | Promise<boolean | void>;
   onOpenScheduleModal: () => void;
   onOpenManageSubscription?: () => void;
   onCancelLesson?: (
@@ -231,10 +231,28 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
   });
   const studentScheduledCount = activeScheduledLessons.length;
 
-  const handleSaveContract = (e: React.FormEvent) => {
+  const [isSavingContract, setIsSavingContract] = useState<boolean>(false);
+  const [contractEditFeedback, setContractEditFeedback] = useState<string | null>(null);
+
+  const handleSaveContract = async (e: React.FormEvent) => {
     e.preventDefault();
+    setContractEditFeedback(null);
     if (onUpdateContractedLessons) {
-      onUpdateContractedLessons(studentEmail, Math.max(0, contractInputVal));
+      setIsSavingContract(true);
+      try {
+        const result = await onUpdateContractedLessons(studentEmail, Math.max(0, contractInputVal));
+        if (result === false) {
+          setContractEditFeedback(
+            isEn
+              ? 'Direct credit editing is temporarily disabled for security.'
+              : 'Ajuste direto de créditos temporariamente bloqueado por segurança.'
+          );
+          setIsEditingContract(false);
+          return;
+        }
+      } finally {
+        setIsSavingContract(false);
+      }
     }
     setIsEditingContract(false);
   };
@@ -258,11 +276,12 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
             </div>
 
             {currentAccount?.role === 'admin' && onUpdateContractedLessons && (
-              <div className="shrink-0">
+              <div className="shrink-0 flex flex-col items-end gap-1">
                 {!isEditingContract ? (
                   <button
                     type="button"
                     onClick={() => {
+                      setContractEditFeedback(null);
                       setContractInputVal(totalContractedCount);
                       setIsEditingContract(true);
                     }}
@@ -282,21 +301,29 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
                       onChange={(e) => setContractInputVal(parseInt(e.target.value, 10) || 0)}
                       className="w-12 px-1 py-0.2 bg-white border border-[#1C4C96] rounded text-[10px] font-black text-center text-[#000035] focus:outline-none"
                       autoFocus
+                      disabled={isSavingContract}
                     />
                     <button
                       type="submit"
-                      className="px-2 py-0.2 bg-[#1C4C96] hover:bg-[#062863] text-white rounded text-[10px] font-bold cursor-pointer"
+                      disabled={isSavingContract}
+                      className="px-2 py-0.2 bg-[#1C4C96] hover:bg-[#062863] disabled:opacity-50 text-white rounded text-[10px] font-bold cursor-pointer"
                     >
-                      {isEn ? 'Save' : 'Salvar'}
+                      {isSavingContract ? '...' : isEn ? 'Save' : 'Salvar'}
                     </button>
                     <button
                       type="button"
+                      disabled={isSavingContract}
                       onClick={() => setIsEditingContract(false)}
                       className="px-1.5 py-0.2 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded text-[10px] cursor-pointer"
                     >
                       ✕
                     </button>
                   </form>
+                )}
+                {contractEditFeedback && (
+                  <span className="text-[10px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-md">
+                    {contractEditFeedback}
+                  </span>
                 )}
               </div>
             )}

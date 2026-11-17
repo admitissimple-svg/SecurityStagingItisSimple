@@ -44,7 +44,7 @@ interface LiveLessonsPanelProps {
   teachers: GoogleAccount[];
   teacherMeetSettings: Record<string, TeacherMeetSettings>;
   contractedLessons?: Record<string, number>;
-  onUpdateContractedLessons?: (studentEmail: string, count: number) => void;
+  onUpdateContractedLessons?: (studentEmail: string, count: number) => void | Promise<boolean | void>;
   onOpenScheduleModal: () => void;
   onOpenTeacherMeetConfig: (teacherEmail: string) => void;
   onCancelLesson: (lessonId: string) => void;
@@ -171,10 +171,10 @@ export const LiveLessonsPanel: React.FC<LiveLessonsPanelProps> = ({
     setIsEditingContract(true);
   };
 
-  const handleSaveContract = (e?: React.FormEvent) => {
+  const handleSaveContract = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (onUpdateContractedLessons && editingEmail) {
-      onUpdateContractedLessons(editingEmail, Math.max(0, Number(contractInputVal) || 0));
+      await onUpdateContractedLessons(editingEmail, Math.max(0, Number(contractInputVal) || 0));
     }
     setIsEditingContract(false);
   };
