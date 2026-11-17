@@ -57,6 +57,7 @@ import { auth, getDb, getAllFirestoreDbs } from './firebase';
 import { getAccessToken, getAdminAccessToken, waitForAuthUser, isAuthorizedAdminUser, firebaseSignUpWithEmail, firebaseSignInWithEmail } from './utils/auth';
 import { isValidHomeworkEvaluation, isSyntheticHomeworkEvaluation } from './utils/writingChecker';
 import { useNativeFriends, isTutorApproved, isTeacherRole } from './hooks/useNativeFriends';
+import { validateAdminCommissionPercent, ALLOWED_COMMISSION_MODEL } from './utils/tutorCommission';
 import { onAuthStateChanged, signOut as firebaseSignOutAuth } from 'firebase/auth';
 import { doc, getDoc, collection, getDocs, onSnapshot, deleteDoc, query, where } from 'firebase/firestore';
 import { apiClient, ApiError } from './utils/apiClient';
@@ -6203,8 +6204,12 @@ export default function App() {
     }
   }, [isAdminApprovalsOpen]);
 
-  // Handler: Admin Approve Tutor
-  const handleApproveTutor = async (tutorId: string, tutorObj?: NativeFriendTutor): Promise<{ success: boolean; error?: string }> => {
+  // Handler: Admin Approve Tutor (FIN.2B: comissão individual obrigatória)
+  const handleApproveTutor = async (
+    tutorId: string,
+    tutorObj?: NativeFriendTutor,
+    adminCommissionPercent?: number
+  ): Promise<{ success: boolean; error?: string }> => {
     const existing = tutors.find(
       (t) => t.id === tutorId || t.email?.toLowerCase() === tutorId.toLowerCase()
     );
@@ -6217,6 +6222,15 @@ export default function App() {
       return {
         success: false,
         error: isTeacher ? 'Only administrators can approve Native Friends.' : 'Apenas administradores podem aprovar Amigos Nativos.',
+      };
+    }
+
+    // 1.5 Validate mandatory platform commission (0% to 100%, never default/fallback)
+    const commissionCheck = validateAdminCommissionPercent(adminCommissionPercent);
+    if (!commissionCheck.valid) {
+      return {
+        success: false,
+        error: commissionCheck.error,
       };
     }
 
@@ -6235,7 +6249,7 @@ export default function App() {
       };
     }
 
-    // 3. Make authorized request to backend
+    // 3. Make authorized request to backend with explicit commission & MARKUP model
     let res: Response;
     try {
       res = await fetch(`/api/tutors/${encodeURIComponent(tutorId)}/approve`, {
@@ -6244,7 +6258,10 @@ export default function App() {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({}),
+        body: JSON.stringify({
+          adminCommissionPercent: commissionCheck.value,
+          commissionModel: ALLOWED_COMMISSION_MODEL,
+        }),
       });
     } catch (networkErr: any) {
       return {
@@ -6271,6 +6288,7 @@ export default function App() {
     // 4. Update UI state only upon verified server success
     setTutors((prev) => {
       const serverTutors = Array.isArray(data.tutors) ? data.tutors : null;
+      const serverApprovedTutor: NativeFriendTutor | null = data.approvedTutor || null;
       if (serverTutors) {
         const map = new Map<string, NativeFriendTutor>();
         prev.forEach((t) => map.set((t.email || t.id).toLowerCase().trim(), t));
@@ -6283,6 +6301,10 @@ export default function App() {
             isApproved: t.id === tutorId || (cleanEmail && t.email?.toLowerCase() === cleanEmail) ? true : t.isApproved,
           });
         });
+        if (serverApprovedTutor) {
+          const k = (serverApprovedTutor.email || serverApprovedTutor.id).toLowerCase().trim();
+          map.set(k, { ...(map.get(k) || {}), ...serverApprovedTutor });
+        }
         return Array.from(map.values());
       }
 
@@ -6290,17 +6312,118 @@ export default function App() {
         t.id === tutorId || (cleanEmail && t.email?.toLowerCase() === cleanEmail)
           ? {
               ...t,
+              ...(serverApprovedTutor || {}),
               approvalStatus: 'approved',
               isApproved: true,
               status: 'approved',
               approved: true,
-              updatedAt: new Date().toISOString(),
+              adminCommissionPercent: serverApprovedTutor?.adminCommissionPercent ?? commissionCheck.value,
+              commissionModel: serverApprovedTutor?.commissionModel ?? ALLOWED_COMMISSION_MODEL,
+              updatedAt: serverApprovedTutor?.updatedAt || new Date().toISOString(),
             }
           : t
       );
     });
 
     // 5. Backend API handles canonical Firestore persistence in /tutors/{canonicalAuthUid} and /users/{canonicalAuthUid}
+    return { success: true };
+  };
+
+  // Handler: Admin Configure or Update Commission on existing/legacy tutor (generates new version)
+  const handleUpdateTutorCommission = async (
+    tutorId: string,
+    adminCommissionPercent: number,
+    tutorObj?: NativeFriendTutor
+  ): Promise<{ success: boolean; error?: string }> => {
+    const isLocalAdmin = currentAccount?.role === 'admin';
+    if (!isLocalAdmin) {
+      return {
+        success: false,
+        error: isTeacher ? 'Only administrators can update commission.' : 'Apenas administradores podem configurar ou atualizar comissão.',
+      };
+    }
+
+    const commissionCheck = validateAdminCommissionPercent(adminCommissionPercent);
+    if (!commissionCheck.valid) {
+      return {
+        success: false,
+        error: commissionCheck.error,
+      };
+    }
+
+    let token = await getAdminAccessToken().catch(() => null);
+    if (!token) {
+      token = await getAccessToken(true).catch(() => null);
+    }
+    if (!token) {
+      return {
+        success: false,
+        error: isTeacher
+          ? 'Missing administrative credentials in Firebase Auth session. Please log in as Administrator.'
+          : 'Sessão administrativa não autenticada no Firebase Auth. Efetue login como Administrador.',
+      };
+    }
+
+    const existing = tutors.find(
+      (t) => t.id === tutorId || t.email?.toLowerCase() === tutorId.toLowerCase()
+    );
+    const targetTutor = tutorObj || existing;
+    const cleanEmail = (targetTutor?.email || (tutorId.includes('@') ? tutorId : '')).toLowerCase().trim();
+
+    let res: Response;
+    try {
+      res = await fetch(`/api/tutors/${encodeURIComponent(tutorId)}/commission`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          adminCommissionPercent: commissionCheck.value,
+          commissionModel: ALLOWED_COMMISSION_MODEL,
+        }),
+      });
+    } catch (networkErr: any) {
+      return {
+        success: false,
+        error: networkErr?.message || 'Falha de comunicação com o servidor ao atualizar comissão.',
+      };
+    }
+
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      return {
+        success: false,
+        error: errData.message || errData.error || `Erro ao atualizar comissão (HTTP ${res.status}).`,
+      };
+    }
+
+    const data = await res.json();
+    const updatedServerTutor: NativeFriendTutor | null = data.tutor || null;
+
+    setTutors((prev) => {
+      const serverTutors = Array.isArray(data.tutors) ? data.tutors : null;
+      if (serverTutors) {
+        const map = new Map<string, NativeFriendTutor>();
+        prev.forEach((t) => map.set((t.email || t.id).toLowerCase().trim(), t));
+        serverTutors.forEach((t: NativeFriendTutor) => {
+          const k = (t.email || t.id).toLowerCase().trim();
+          map.set(k, { ...(map.get(k) || {}), ...t });
+        });
+        if (updatedServerTutor) {
+          const k = (updatedServerTutor.email || updatedServerTutor.id).toLowerCase().trim();
+          map.set(k, { ...(map.get(k) || {}), ...updatedServerTutor });
+        }
+        return Array.from(map.values());
+      }
+      if (!updatedServerTutor) return prev;
+      return prev.map((t) =>
+        t.id === tutorId || (cleanEmail && t.email?.toLowerCase() === cleanEmail)
+          ? { ...t, ...updatedServerTutor }
+          : t
+      );
+    });
+
     return { success: true };
   };
 
@@ -8605,6 +8728,7 @@ export default function App() {
         onClose={() => setIsAdminApprovalsOpen(false)}
         tutors={allTutors}
         onApproveTutor={handleApproveTutor}
+        onUpdateTutorCommission={handleUpdateTutorCommission}
         onRejectTutor={handleRejectTutor}
         onDeleteTutor={handleDeleteTutor}
         onRefresh={fetchLatestTutors}

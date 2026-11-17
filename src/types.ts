@@ -73,6 +73,28 @@ export interface NativeFriendTutor {
   availability?: Record<string, string[]>;
   availableHoursByDay?: Record<string, string[]>;
   role?: 'teacher' | 'student' | 'admin' | string;
+  updatedAt?: string;
+  // FIN.2B: Administrative commission & versioning (admin-only, never public)
+  adminCommissionPercent?: number;
+  commissionModel?: 'MARKUP' | string;
+  commissionVersion?: number;
+  effectiveFrom?: string;
+  updatedByUid?: string;
+  commissionUpdatedAt?: string;
+  commissionHistory?: TutorCommissionHistoryEntry[];
+  financialConfigurationPending?: boolean;
+  isCommercializable?: boolean;
+}
+
+export interface TutorCommissionHistoryEntry {
+  version: number;
+  adminCommissionPercent: number;
+  commissionModel: 'MARKUP';
+  effectiveFrom: string;
+  updatedAt: string;
+  updatedByUid: string;
+  previousPercent: number | null;
+  action: 'initial_approval' | 'admin_configuration' | 'admin_update';
 }
 
 export interface AdminLandingContent {

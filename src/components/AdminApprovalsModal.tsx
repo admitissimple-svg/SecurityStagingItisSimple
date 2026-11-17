@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   X,
   UserCheck,
@@ -14,15 +14,31 @@ import {
   Trash2,
   RefreshCw,
   Calendar,
-  Sparkles,
+  Percent,
+  AlertTriangle,
+  History,
 } from 'lucide-react';
 import { NativeFriendTutor, Language } from '../types';
+import {
+  validateAdminCommissionPercent,
+  hasValidPersistedCommission,
+  ALLOWED_COMMISSION_MODEL,
+} from '../utils/tutorCommission';
 
 interface AdminApprovalsModalProps {
   isOpen: boolean;
   onClose: () => void;
   tutors: NativeFriendTutor[];
-  onApproveTutor: (tutorId: string, tutor?: NativeFriendTutor) => Promise<{ success: boolean; error?: string } | void> | void;
+  onApproveTutor: (
+    tutorId: string,
+    tutor?: NativeFriendTutor,
+    adminCommissionPercent?: number
+  ) => Promise<{ success: boolean; error?: string } | void> | void;
+  onUpdateTutorCommission?: (
+    tutorId: string,
+    adminCommissionPercent: number,
+    tutor?: NativeFriendTutor
+  ) => Promise<{ success: boolean; error?: string } | void> | void;
   onRejectTutor: (tutorId: string, tutor?: NativeFriendTutor) => Promise<{ success: boolean; error?: string } | void> | void;
   onDeleteTutor?: (tutorId: string, tutorEmail?: string) => Promise<{ success: boolean; error?: string } | void> | void;
   onRefresh?: () => void;
@@ -36,6 +52,7 @@ export const AdminApprovalsModal: React.FC<AdminApprovalsModalProps> = ({
   onClose,
   tutors,
   onApproveTutor,
+  onUpdateTutorCommission,
   onRejectTutor,
   onDeleteTutor,
   onRefresh,
@@ -61,10 +78,18 @@ export const AdminApprovalsModal: React.FC<AdminApprovalsModalProps> = ({
   const [actionNotification, setActionNotification] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
+  // FIN.2B: Estado controlado do campo "Comissão da Plataforma (%)" — NUNCA pré-preenchido
+  const [commissionInputs, setCommissionInputs] = useState<Record<string, string>>({});
+  const [commissionErrors, setCommissionErrors] = useState<Record<string, string>>({});
+  const [expandedHistoryId, setExpandedHistoryId] = useState<string | null>(null);
+  const inFlightIdsRef = useRef<Set<string>>(new Set());
+
   // When modal opens, default to pending if any are waiting for review, otherwise show all
   useEffect(() => {
     if (isOpen) {
       setFilter(pendingCount > 0 ? 'pending' : 'all');
+      setCommissionErrors({});
+      setActionError(null);
     }
   }, [isOpen]);
 
@@ -83,6 +108,41 @@ export const AdminApprovalsModal: React.FC<AdminApprovalsModalProps> = ({
   if (!isOpen) return null;
 
   const isEn = currentLanguage === 'en';
+
+  const getTutorKey = (tutor: NativeFriendTutor) =>
+    tutor.uid || tutor.authUid || tutor.id || tutor.email;
+
+  const getRawBaseUsd = (tutor: NativeFriendTutor): number | null => {
+    const raw =
+      typeof tutor.pricePerSessionUsd === 'number'
+        ? tutor.pricePerSessionUsd
+        : typeof (tutor as any).hourlyRateUsd === 'number'
+        ? (tutor as any).hourlyRateUsd
+        : Number(tutor.pricePerSessionUsd ?? (tutor as any).hourlyRateUsd);
+    return Number.isFinite(raw) && raw >= 0 ? raw : null;
+  };
+
+  const handleCommissionInputChange = (tutorKey: string, nextVal: string) => {
+    setCommissionInputs((prev) => ({ ...prev, [tutorKey]: nextVal }));
+    if (nextVal.trim() === '') {
+      setCommissionErrors((prev) => {
+        const copy = { ...prev };
+        delete copy[tutorKey];
+        return copy;
+      });
+      return;
+    }
+    const check = validateAdminCommissionPercent(nextVal);
+    if (!check.valid) {
+      setCommissionErrors((prev) => ({ ...prev, [tutorKey]: check.error }));
+    } else {
+      setCommissionErrors((prev) => {
+        const copy = { ...prev };
+        delete copy[tutorKey];
+        return copy;
+      });
+    }
+  };
 
   const filteredTutors = tutors.filter((t) => {
     const status = isTutorApproved(t)
@@ -122,8 +182,8 @@ export const AdminApprovalsModal: React.FC<AdminApprovalsModalProps> = ({
               </div>
               <p className="text-xs text-[#9AB4FF]">
                 {isEn
-                  ? 'Review and authorize native friends before they appear on the public directory.'
-                  : 'Revise e aprove cadastros antes de serem listados publicamente na plataforma.'}
+                  ? 'Review and authorize native friends with mandatory individual commission before public listing.'
+                  : 'Revise cadastros e defina a comissão individual da plataforma antes de aprovar.'}
               </p>
             </div>
           </div>
@@ -239,6 +299,15 @@ export const AdminApprovalsModal: React.FC<AdminApprovalsModalProps> = ({
                 tutor.photoUrl ||
                 (tutor as any).picture ||
                 '';
+              const tutorKey = getTutorKey(tutor);
+              const baseUsd = getRawBaseUsd(tutor);
+              const hasCommission = hasValidPersistedCommission(tutor);
+              const rawInput = commissionInputs[tutorKey] ?? '';
+              const inputValidation = validateAdminCommissionPercent(rawInput);
+              const inlineError = commissionErrors[tutorKey];
+              const isBusy = processingId === tutor.id;
+              const historyList = Array.isArray(tutor.commissionHistory) ? tutor.commissionHistory : [];
+              const isHistoryOpen = expandedHistoryId === tutorKey;
 
               return (
                 <div
@@ -246,7 +315,7 @@ export const AdminApprovalsModal: React.FC<AdminApprovalsModalProps> = ({
                   className="p-5 rounded-3xl bg-white border border-slate-200 shadow-sm hover:border-[#607EC9]/70 transition flex flex-col md:flex-row items-start justify-between gap-5"
                 >
                   {/* Tutor Info */}
-                  <div className="flex items-start gap-4 flex-1">
+                  <div className="flex items-start gap-4 flex-1 w-full">
                     {/* Tutor Avatar with Flag Badge */}
                     <div className="relative shrink-0">
                       {avatarSrc && avatarSrc.trim() !== '' ? (
@@ -266,7 +335,7 @@ export const AdminApprovalsModal: React.FC<AdminApprovalsModalProps> = ({
                       </div>
                     </div>
 
-                    <div className="space-y-1.5 flex-1">
+                    <div className="space-y-1.5 flex-1 min-w-0">
                       <div className="flex items-center gap-2.5 flex-wrap">
                         <h3 className="text-base font-black text-[#000035]">{tutor.name}</h3>
                         {tutor.headline && (
@@ -291,6 +360,12 @@ export const AdminApprovalsModal: React.FC<AdminApprovalsModalProps> = ({
                             {isEn ? 'Rejected' : 'Recusado'}
                           </span>
                         )}
+                        {status === 'approved' && !hasCommission && (
+                          <span className="text-[10px] font-extrabold px-2.5 py-0.5 rounded-full bg-orange-100 text-orange-900 border border-orange-300 flex items-center gap-1">
+                            <AlertTriangle className="w-3 h-3 text-orange-600" />
+                            {isEn ? 'Pending financial configuration' : 'Pendente de configuração financeira'}
+                          </span>
+                        )}
                       </div>
 
                       <div className="flex items-center gap-3 text-xs text-slate-500 flex-wrap">
@@ -303,10 +378,171 @@ export const AdminApprovalsModal: React.FC<AdminApprovalsModalProps> = ({
                           {tutor.country || (tutor as any).nativeCountry || (tutor as any).location || 'United States'}
                           {tutor.accent ? ` • ${tutor.accent}` : ''}
                         </span>
-                        <span className="flex items-center gap-1 font-bold text-slate-700">
+                        <span className="flex items-center gap-1 font-bold text-slate-800 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-lg">
                           <DollarSign className="w-3.5 h-3.5 text-emerald-600" />
-                          ${tutor.pricePerSessionUsd || (tutor as any).hourlyRateUsd || 15} USD / sessão
+                          {baseUsd !== null
+                            ? `${isEn ? 'Teacher base price:' : 'Preço-base USD:'} $${baseUsd.toFixed(2)} USD / 50 min`
+                            : (isEn ? 'Base USD price not informed' : 'Preço-base USD não informado')}
                         </span>
+                      </div>
+
+                      {/* FIN.2B: Configuração e histórico administrativo da comissão individual (MARKUP) */}
+                      <div className="mt-2 p-3 rounded-2xl bg-slate-50 border border-slate-200 space-y-2">
+                        <div className="flex items-center justify-between gap-2 flex-wrap">
+                          <div className="flex items-center gap-1.5 text-xs font-black text-[#000035]">
+                            <Percent className="w-3.5 h-3.5 text-[#1C4C96]" />
+                            <span>
+                              {status === 'approved' && hasCommission
+                                ? (isEn
+                                    ? `Platform Commission (${tutor.commissionModel || ALLOWED_COMMISSION_MODEL})`
+                                    : `Comissão da Plataforma (${tutor.commissionModel || ALLOWED_COMMISSION_MODEL})`)
+                                : (isEn
+                                    ? 'Platform Commission (%) *'
+                                    : 'Comissão da Plataforma (%) *')}
+                            </span>
+                            <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-blue-100 text-[#1C4C96]">
+                              {ALLOWED_COMMISSION_MODEL}
+                            </span>
+                          </div>
+
+                          {hasCommission && (
+                            <div className="flex items-center gap-2 text-[11px] font-bold text-emerald-800">
+                              <span>
+                                {isEn ? 'Active:' : 'Vigente:'}{' '}
+                                <strong>{tutor.adminCommissionPercent}%</strong>
+                                {tutor.commissionVersion ? ` (v${tutor.commissionVersion})` : ''}
+                              </span>
+                              {historyList.length > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() => setExpandedHistoryId(isHistoryOpen ? null : tutorKey)}
+                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-white border border-slate-300 text-slate-700 hover:bg-slate-100 cursor-pointer text-[10px] font-bold"
+                                >
+                                  <History className="w-3 h-3" />
+                                  <span>
+                                    {isHistoryOpen
+                                      ? (isEn ? 'Hide history' : 'Ocultar histórico')
+                                      : `${isEn ? 'History' : 'Histórico'} (${historyList.length})`}
+                                  </span>
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </div>
+
+                        {(status !== 'approved' || onUpdateTutorCommission) && (
+                          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                            <div className="relative flex-1 max-w-xs">
+                              <input
+                                type="number"
+                                min={0}
+                                max={100}
+                                step="any"
+                                inputMode="decimal"
+                                disabled={isBusy}
+                                value={rawInput}
+                                onChange={(e) => handleCommissionInputChange(tutorKey, e.target.value)}
+                                placeholder={
+                                  status === 'approved' && hasCommission
+                                    ? (isEn ? 'New commission % (0 to 100)' : 'Nova comissão % (0 a 100)')
+                                    : (isEn ? 'Required: 0 to 100 (%)' : 'Obrigatório: 0 a 100 (%)')
+                                }
+                                aria-label={`Comissão da Plataforma (%) para ${tutor.name}`}
+                                className={`w-full px-3 py-1.5 pr-8 rounded-xl border text-xs font-bold bg-white text-[#000035] focus:outline-none focus:ring-2 ${
+                                  inlineError
+                                    ? 'border-rose-400 focus:ring-rose-200'
+                                    : 'border-slate-300 focus:ring-[#607EC9]/40 focus:border-[#1C4C96]'
+                                }`}
+                              />
+                              <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-xs font-black text-slate-400">
+                                %
+                              </span>
+                            </div>
+
+                            {status === 'approved' && onUpdateTutorCommission && (
+                              <button
+                                type="button"
+                                disabled={isBusy}
+                                onClick={async () => {
+                                  if (inFlightIdsRef.current.has(tutor.id)) return;
+                                  const check = validateAdminCommissionPercent(rawInput);
+                                  if (!check.valid) {
+                                    setCommissionErrors((prev) => ({ ...prev, [tutorKey]: check.error }));
+                                    return;
+                                  }
+                                  inFlightIdsRef.current.add(tutor.id);
+                                  setActionError(null);
+                                  setActionNotification(null);
+                                  setProcessingId(tutor.id);
+                                  try {
+                                    const res = await onUpdateTutorCommission(tutor.id, check.value, tutor);
+                                    if (res && res.success === false) {
+                                      const errMsg = res.error || (isEn ? 'Failed to update commission' : 'Falha ao atualizar comissão');
+                                      setCommissionErrors((prev) => ({ ...prev, [tutorKey]: errMsg }));
+                                      setActionError(errMsg);
+                                    } else {
+                                      setCommissionInputs((prev) => ({ ...prev, [tutorKey]: '' }));
+                                      setCommissionErrors((prev) => {
+                                        const copy = { ...prev };
+                                        delete copy[tutorKey];
+                                        return copy;
+                                      });
+                                      setActionNotification(
+                                        isEn
+                                          ? `Commission (${check.value}% MARKUP) saved for "${tutor.name}".`
+                                          : `Comissão (${check.value}% MARKUP) registrada para "${tutor.name}".`
+                                      );
+                                      setTimeout(() => setActionNotification(null), 5000);
+                                    }
+                                  } catch (err: any) {
+                                    const msg = err?.message || (isEn ? 'Failed to update commission' : 'Falha ao atualizar comissão');
+                                    setCommissionErrors((prev) => ({ ...prev, [tutorKey]: msg }));
+                                    setActionError(msg);
+                                  } finally {
+                                    inFlightIdsRef.current.delete(tutor.id);
+                                    setProcessingId(null);
+                                  }
+                                }}
+                                className="px-3.5 py-1.5 bg-[#1C4C96] hover:bg-[#062863] disabled:opacity-50 text-white rounded-xl text-xs font-black transition cursor-pointer shrink-0"
+                              >
+                                {isBusy
+                                  ? (isEn ? 'Saving...' : 'Salvando...')
+                                  : hasCommission
+                                  ? (isEn ? 'Update Commission' : 'Atualizar Comissão')
+                                  : (isEn ? 'Set Commission' : 'Definir Comissão')}
+                              </button>
+                            )}
+                          </div>
+                        )}
+
+                        {inlineError && (
+                          <p className="text-[11px] font-bold text-rose-700" role="alert">
+                            {inlineError}
+                          </p>
+                        )}
+
+                        {isHistoryOpen && historyList.length > 0 && (
+                          <div className="pt-1.5 border-t border-slate-200 space-y-1">
+                            <p className="text-[10px] font-extrabold uppercase tracking-wider text-slate-500">
+                              {isEn ? 'Immutable Commission Versions' : 'Histórico Imutável de Versões'}
+                            </p>
+                            <div className="space-y-1 max-h-32 overflow-y-auto">
+                              {[...historyList].reverse().map((h) => (
+                                <div
+                                  key={`v-${h.version}-${h.updatedAt}`}
+                                  className="text-[11px] text-slate-600 bg-white px-2.5 py-1 rounded-lg border border-slate-200 flex items-center justify-between gap-2 flex-wrap"
+                                >
+                                  <span>
+                                    <strong>v{h.version}</strong>: {h.adminCommissionPercent}% ({h.commissionModel})
+                                  </span>
+                                  <span className="text-[10px] text-slate-400">
+                                    {new Date(h.effectiveFrom || h.updatedAt).toLocaleString()}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                       </div>
 
                       {/* Bio */}
@@ -387,41 +623,73 @@ export const AdminApprovalsModal: React.FC<AdminApprovalsModalProps> = ({
                     {status !== 'approved' && (
                       <button
                         type="button"
-                        disabled={processingId === tutor.id}
+                        disabled={isBusy}
                         onClick={async () => {
+                          if (inFlightIdsRef.current.has(tutor.id)) return;
                           setActionError(null);
                           setActionNotification(null);
+
+                          const check = validateAdminCommissionPercent(rawInput);
+                          if (!check.valid) {
+                            setCommissionErrors((prev) => ({ ...prev, [tutorKey]: check.error }));
+                            setActionError(check.error);
+                            return;
+                          }
+
+                          inFlightIdsRef.current.add(tutor.id);
                           setProcessingId(tutor.id);
                           try {
-                            const res = await onApproveTutor(tutor.id, tutor);
+                            const res = await onApproveTutor(tutor.id, tutor, check.value);
                             if (res && res.success === false) {
-                              setActionError(res.error || (isEn ? 'Failed to approve native friend' : 'Falha ao aprovar Amigo Nativo'));
+                              const errMsg = res.error || (isEn ? 'Failed to approve native friend' : 'Falha ao aprovar Amigo Nativo');
+                              setCommissionErrors((prev) => ({ ...prev, [tutorKey]: errMsg }));
+                              setActionError(errMsg);
                             } else {
+                              setCommissionInputs((prev) => ({ ...prev, [tutorKey]: '' }));
+                              setCommissionErrors((prev) => {
+                                const copy = { ...prev };
+                                delete copy[tutorKey];
+                                return copy;
+                              });
                               setActionNotification(
                                 isEn
-                                  ? `Native Friend "${tutor.name}" approved successfully and published!`
-                                  : `Amigo Nativo "${tutor.name}" aprovado com sucesso e publicado!`
+                                  ? `Native Friend "${tutor.name}" approved with ${check.value}% commission and published!`
+                                  : `Amigo Nativo "${tutor.name}" aprovado com comissão de ${check.value}% e publicado!`
                               );
                               setTimeout(() => setActionNotification(null), 5000);
                             }
                           } catch (err: any) {
-                            setActionError(err?.message || (isEn ? 'Failed to approve native friend' : 'Falha ao aprovar Amigo Nativo'));
+                            const msg = err?.message || (isEn ? 'Failed to approve native friend' : 'Falha ao aprovar Amigo Nativo');
+                            setCommissionErrors((prev) => ({ ...prev, [tutorKey]: msg }));
+                            setActionError(msg);
                           } finally {
+                            inFlightIdsRef.current.delete(tutor.id);
                             setProcessingId(null);
                           }
                         }}
-                        className="flex-1 sm:flex-initial px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-xl text-xs font-black transition flex items-center justify-center gap-1.5 cursor-pointer shadow-sm"
+                        className={`flex-1 sm:flex-initial px-4 py-2 ${
+                          inputValidation.valid
+                            ? 'bg-emerald-600 hover:bg-emerald-700'
+                            : 'bg-slate-400 hover:bg-slate-500'
+                        } disabled:opacity-50 text-white rounded-xl text-xs font-black transition flex items-center justify-center gap-1.5 cursor-pointer shadow-sm`}
+                        title={
+                          !inputValidation.valid
+                            ? inputValidation.error
+                            : (isEn ? 'Approve Native Friend' : 'Aprovar Amigo Nativo')
+                        }
                       >
-                        <CheckCircle className={`w-4 h-4 ${processingId === tutor.id ? 'animate-spin' : ''}`} />
-                        <span>{processingId === tutor.id ? (isEn ? 'Approving...' : 'Aprovando...') : (isEn ? 'Approve' : 'Aprovar')}</span>
+                        <CheckCircle className={`w-4 h-4 ${isBusy ? 'animate-spin' : ''}`} />
+                        <span>{isBusy ? (isEn ? 'Approving...' : 'Aprovando...') : (isEn ? 'Approve' : 'Aprovar')}</span>
                       </button>
                     )}
 
                     {status !== 'rejected' && (
                       <button
                         type="button"
-                        disabled={processingId === tutor.id}
+                        disabled={isBusy}
                         onClick={async () => {
+                          if (inFlightIdsRef.current.has(tutor.id)) return;
+                          inFlightIdsRef.current.add(tutor.id);
                           setActionError(null);
                           setActionNotification(null);
                           setProcessingId(tutor.id);
@@ -440,13 +708,14 @@ export const AdminApprovalsModal: React.FC<AdminApprovalsModalProps> = ({
                           } catch (err: any) {
                             setActionError(err?.message || (isEn ? 'Failed to reject native friend' : 'Falha ao recusar Amigo Nativo'));
                           } finally {
+                            inFlightIdsRef.current.delete(tutor.id);
                             setProcessingId(null);
                           }
                         }}
                         className="flex-1 sm:flex-initial px-4 py-2 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white rounded-xl text-xs font-black transition flex items-center justify-center gap-1.5 cursor-pointer shadow-sm"
                       >
-                        <XCircle className={`w-4 h-4 ${processingId === tutor.id ? 'animate-spin' : ''}`} />
-                        <span>{processingId === tutor.id ? (isEn ? 'Rejecting...' : 'Recusando...') : (isEn ? 'Reject' : 'Recusar')}</span>
+                        <XCircle className={`w-4 h-4 ${isBusy ? 'animate-spin' : ''}`} />
+                        <span>{isBusy ? (isEn ? 'Rejecting...' : 'Recusando...') : (isEn ? 'Reject' : 'Recusar')}</span>
                       </button>
                     )}
 
@@ -516,3 +785,4 @@ export const AdminApprovalsModal: React.FC<AdminApprovalsModalProps> = ({
     </div>
   );
 };
+

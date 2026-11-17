@@ -149,8 +149,12 @@ export function normalizeTutorDoc(docId: string, data: any): NativeFriendTutor |
     reviewsCount: typeof data.reviewsCount === 'number' ? data.reviewsCount : 0,
     activeStudents: typeof data.activeStudents === 'number' ? data.activeStudents : 0,
     lessonsTaught: typeof data.lessonsTaught === 'number' ? data.lessonsTaught : 12,
-    pricePerSessionUsd: Number(data.pricePerSessionUsd) || (data.pricePerSessionBrl ? Math.round(Number(data.pricePerSessionBrl) / 5.5) : 20),
-    pricePerSessionBrl: Number(data.pricePerSessionBrl) || Math.round((Number(data.pricePerSessionUsd) || 20) * 5.5),
+    ...(typeof data.pricePerSessionUsd === 'number' && Number.isFinite(data.pricePerSessionUsd) && data.pricePerSessionUsd > 0
+      ? { pricePerSessionUsd: data.pricePerSessionUsd }
+      : {}),
+    ...(typeof data.pricePerSessionBrl === 'number' && Number.isFinite(data.pricePerSessionBrl) && data.pricePerSessionBrl > 0
+      ? { pricePerSessionBrl: data.pricePerSessionBrl }
+      : {}),
     headline: data.headline || 'English Conversational Native Friend',
     bio: data.bio || 'Native English speaker ready to help you speak with natural fluency.',
     specialties: Array.isArray(data.specialties) ? data.specialties : ['Conversação', 'Pronúncia', 'Fluência'],
@@ -174,6 +178,20 @@ export function normalizeTutorDoc(docId: string, data: any): NativeFriendTutor |
     availability: data.availability || {},
     availableHoursByDay: data.availableHoursByDay || {},
     role: 'teacher',
+    updatedAt: data.updatedAt,
+    ...(typeof data.adminCommissionPercent === 'number' && Number.isFinite(data.adminCommissionPercent)
+      ? { adminCommissionPercent: data.adminCommissionPercent }
+      : {}),
+    ...(data.commissionModel !== undefined ? { commissionModel: data.commissionModel } : {}),
+    ...(typeof data.commissionVersion === 'number' ? { commissionVersion: data.commissionVersion } : {}),
+    ...(data.effectiveFrom !== undefined ? { effectiveFrom: data.effectiveFrom } : {}),
+    ...(data.updatedByUid !== undefined ? { updatedByUid: data.updatedByUid } : {}),
+    ...(data.commissionUpdatedAt !== undefined ? { commissionUpdatedAt: data.commissionUpdatedAt } : {}),
+    ...(Array.isArray(data.commissionHistory) ? { commissionHistory: data.commissionHistory } : {}),
+    ...(typeof data.financialConfigurationPending === 'boolean'
+      ? { financialConfigurationPending: data.financialConfigurationPending }
+      : {}),
+    ...(typeof data.isCommercializable === 'boolean' ? { isCommercializable: data.isCommercializable } : {}),
   };
 }
 

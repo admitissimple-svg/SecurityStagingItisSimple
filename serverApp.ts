@@ -173,7 +173,21 @@ import {
   closeWeeklyHistorySnapshotServer,
   prepareNewWeeklyCycleServer,
   clearLocalInsightsCache,
+  resolveCanonicalUidForTutorModeration,
+  approveAndSaveTutorCommissionTransactionally,
 } from './src/serverFirestore';
+import {
+  validateAdminCommissionPercent,
+  validateCommissionModel,
+  hasValidPersistedCommission,
+  isTutorCommercializable,
+  payloadAttemptsCommissionMutation,
+  stripAdminCommissionFields,
+} from './src/utils/tutorCommission';
+import {
+  calculateFinancialPricingQuote,
+  FinancialPricingQuote,
+} from './src/utils/financialEngine';
 import { normalizeDictionaryWord } from './src/utils/studentDictionaryLibrary';
 import { buildWeeklyLearningInsights } from './src/utils/weeklyLearningInsights';
 import { DEFAULT_CURATED_PLAYLISTS } from './src/utils/youtubeService';
@@ -272,7 +286,7 @@ import {
   markAsVerifiedUser,
 } from './src/middleware/firebaseAuth';
 import { getFirebaseAdminAuth } from './src/serverFirebaseAdmin';
-import { getPtaxClosingD1, clearPtaxMemoryCache } from './src/serverPtax';
+import { getPtaxClosingD1, clearPtaxMemoryCache, PtaxQuoteResult } from './src/serverPtax';
 import {
   isDiagnosticMode,
   isAuthorizedOriginStrict,
@@ -1793,7 +1807,7 @@ app.post('/api/auth/login', async (req, res) => {
     role: account.role,
     profile: role === 'teacher' ? null : (studentProfile ? { ...studentProfile, role: 'student' } : null),
     student: role === 'teacher' ? null : (studentObj || (db.students || []).find((s) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail) || null),
-    tutor: tutorResponseObj,
+    tutor: tutorResponseObj ? sanitizePrivateTutorRecord(tutorResponseObj, { includeAdminCommission: false }) : null,
     isRoleEnforced,
     enforcedRole: role,
   });
@@ -2624,7 +2638,10 @@ const handleRegistration = async (req: any, res: any) => {
     account,
     profile: db.userProfiles?.[cleanEmail] || null,
     student: (db.students || []).find((s) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail) || null,
-    tutor: (db.tutorsList || []).find((t) => t.email.toLowerCase() === cleanEmail) || null,
+    tutor: (() => {
+      const matched = (db.tutorsList || []).find((t) => t.email.toLowerCase() === cleanEmail) || null;
+      return matched ? sanitizePrivateTutorRecord(matched, { includeAdminCommission: false }) : null;
+    })(),
   });
 };
 
@@ -2982,7 +2999,7 @@ app.post('/api/auth/google', async (req, res) => {
     role: account.role,
     profile: role === 'teacher' || role === 'admin' ? null : canonicalProfileResponse,
     student: role === 'teacher' || role === 'admin' ? null : canonicalStudentResponse,
-    tutor: role === 'teacher' ? canonicalTutorResponse : null,
+    tutor: role === 'teacher' && canonicalTutorResponse ? sanitizePrivateTutorRecord(canonicalTutorResponse, { includeAdminCommission: false }) : null,
     isRoleEnforced,
     enforcedRole: role,
   });
@@ -3017,7 +3034,10 @@ app.get('/api/teachers', firebaseAuthMiddleware, requireAdmin, async (req, res) 
       details: err?.message ? String(err.message).replace(/[<>{}\\]/g, '') : 'Query failed',
     });
   }
-  res.json({ teachers: db.teachers || [], tutors: db.tutorsList || [] });
+  res.json({
+    teachers: (db.teachers || []).map((t: any) => sanitizePrivateTutorRecord(t, { includeAdminCommission: true })),
+    tutors: (db.tutorsList || []).map((t: any) => sanitizePrivateTutorRecord(t, { includeAdminCommission: true })),
+  });
 });
 
 /**
@@ -3088,12 +3108,8 @@ function toPublicTutorDto(t: any): Record<string, any> {
     role: 'teacher',
   };
 
-  if (typeof t.pricePerSessionUsd === 'number') {
-    dto.pricePerSessionUsd = t.pricePerSessionUsd;
-  }
-  if (typeof t.pricePerSessionBrl === 'number') {
-    dto.pricePerSessionBrl = t.pricePerSessionBrl;
-  }
+  // FIN.2C: Raw teacher USD remuneration and legacy 5.5 BRL estimates are omitted from public catalog DTOs.
+  // Authoritative student-facing BRL pricing is served exclusively by /api/financial/pricing-quote*.
   // Genuine stats only, never fabricate fake metrics:
   if (typeof t.rating === 'number' && !isNaN(t.rating)) {
     dto.rating = t.rating;
@@ -3108,15 +3124,19 @@ function toPublicTutorDto(t: any): Record<string, any> {
     dto.lessonsTaught = t.lessonsTaught;
   }
 
-  return dto;
+  return stripAdminCommissionFields(dto);
 }
 
 /**
  * Sanitizes administrative / teacher tutor record for authorized viewers,
  * ensuring no credentials or password fields are ever exposed.
+ * Admin commission metadata is strictly restricted to verified administrators.
  */
-function sanitizePrivateTutorRecord(t: any): Record<string, any> {
-  const sanitized = { ...t };
+function sanitizePrivateTutorRecord(
+  t: any,
+  options?: { includeAdminCommission?: boolean }
+): Record<string, any> {
+  const sanitized: Record<string, any> = { ...t };
   const canonicalUid =
     (t.uid && isValidCanonicalUid(t.uid) ? t.uid.trim() : null) ||
     (t.authUid && isValidCanonicalUid(t.authUid) ? t.authUid.trim() : null) ||
@@ -3145,7 +3165,15 @@ function sanitizePrivateTutorRecord(t: any): Record<string, any> {
   delete sanitized.token;
   delete sanitized.secret;
   delete sanitized.apiKey;
-  return sanitized;
+
+  if (options?.includeAdminCommission === true) {
+    const validCommission = hasValidPersistedCommission(sanitized);
+    sanitized.financialConfigurationPending = !validCommission;
+    sanitized.isCommercializable = isTutorCommercializable(sanitized);
+    return sanitized;
+  }
+
+  return stripAdminCommissionFields(sanitized);
 }
 
 app.get('/api/tutors', async (req, res) => {
@@ -3210,7 +3238,7 @@ app.get('/api/tutors', async (req, res) => {
       const tId = (t.id || '').toLowerCase().trim();
       return !db.deletedTutorEmails?.includes(tEmail) && !db.deletedTutorIds?.includes(tId);
     });
-    return res.json(adminList.map(sanitizePrivateTutorRecord));
+    return res.json(adminList.map((t: any) => sanitizePrivateTutorRecord(t, { includeAdminCommission: true })));
   }
 
   // Non-admin / unauthenticated caller:
@@ -3243,8 +3271,8 @@ app.get('/api/tutors', async (req, res) => {
   });
 
   // Projection layer:
-  // - An authenticated teacher consulting their OWN record receives their full profile (with their private fields).
-  // - All third parties and unauthenticated visitors receive strictly the public DTO projection (no email, uid, meetUrl, meetLink).
+  // - An authenticated teacher consulting their OWN record receives their full profile (with their private fields, excluding admin commission).
+  // - All third parties and unauthenticated visitors receive strictly the public DTO projection (no email, uid, meetUrl, meetLink, commission).
   const projectedList = filteredList.map((t: any) => {
     const tEmail = (t.email || '').toLowerCase().trim();
     const isOwnRecord = Boolean(
@@ -3258,7 +3286,7 @@ app.get('/api/tutors', async (req, res) => {
     );
 
     if (isOwnRecord) {
-      return sanitizePrivateTutorRecord(t);
+      return sanitizePrivateTutorRecord(t, { includeAdminCommission: false });
     }
 
     return toPublicTutorDto(t);
@@ -3292,6 +3320,15 @@ app.post('/api/tutors', async (req, res) => {
   // Audit protection: Check if caller is verified admin
   const verifiedCaller = await getVerifiedUserFromRequest(req);
   const isAdminCaller = verifiedCaller?.role === 'admin';
+
+  // FIN.2B: Usuário não-admin jamais pode definir ou alterar comissão da plataforma
+  if (!isAdminCaller && payloadAttemptsCommissionMutation(rawTutor)) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      code: 'COMMISSION_ADMIN_ONLY',
+      message: 'Acesso negado: apenas administradores podem definir ou alterar a comissão da plataforma.',
+    });
+  }
 
   // Prevent hijacking or overwriting administrator accounts
   const isTargetAdmin =
@@ -3387,10 +3424,17 @@ app.post('/api/tutors', async (req, res) => {
   const extractedVideoId = rawTutor.youtubeEmbedId || extractYouTubeVideoId(rawVideoLink) || '';
 
   // Privilege audit: Non-admin callers CANNOT self-approve or assign approvalStatus
-  const resolvedApprovalStatus = isAdminCaller
-    ? (rawTutor.approvalStatus || (rawTutor.registeredByAdmin ? 'approved' : 'pending'))
-    : 'pending';
-  const resolvedIsApproved = isAdminCaller && (resolvedApprovalStatus === 'approved' || rawTutor.isApproved === true);
+  const adminRequestedApproval = isAdminCaller && (
+    rawTutor.approvalStatus === 'approved' ||
+    rawTutor.status === 'approved' ||
+    rawTutor.isApproved === true ||
+    rawTutor.approved === true ||
+    (rawTutor.registeredByAdmin === true && rawTutor.approvalStatus !== 'pending' && rawTutor.approvalStatus !== 'rejected')
+  );
+  const resolvedApprovalStatus = adminRequestedApproval
+    ? 'approved'
+    : (isAdminCaller ? (rawTutor.approvalStatus || 'pending') : 'pending');
+  const resolvedIsApproved = adminRequestedApproval;
 
   // Identity audit: Resolve canonical Firebase Auth UID via Admin SDK or verified token
   let canonicalAuthUid = '';
@@ -3520,11 +3564,40 @@ app.post('/api/tutors', async (req, res) => {
   delete (tutorEntry as any).password;
   delete (tutorEntry as any).token;
 
+  let persistedTutorEntry: Record<string, any> = tutorEntry;
+
+  // FIN.2B: Validação centralizada obrigatória de comissão antes de criar/aprovar tutor ativo
+  if (isAdminCaller && (resolvedIsApproved || rawTutor.adminCommissionPercent !== undefined || rawTutor.commissionModel !== undefined)) {
+    const txRes = await approveAndSaveTutorCommissionTransactionally({
+      canonicalUid: canonicalAuthUid,
+      baseTutor: tutorEntry,
+      updatedByUid: verifiedCaller!.uid,
+      incomingCommissionPercent: rawTutor.adminCommissionPercent,
+      incomingCommissionModel: rawTutor.commissionModel,
+      approve: resolvedIsApproved,
+      action: resolvedIsApproved ? 'initial_approval' : 'admin_configuration',
+      forceNewVersion: false,
+      dbState: db,
+    });
+    if (!txRes.ok) {
+      return res.status(txRes.status).json({
+        error: txRes.code,
+        message: txRes.error,
+      });
+    }
+    persistedTutorEntry = txRes.savedTutor;
+  } else {
+    // Cadastro pendente normal (sem aprovação e sem comissão): persiste diretamente no Firestore
+    await saveTutorToFirestore(tutorEntry).catch((err) => {
+      console.warn('Error saving tutor to Firestore collection:', err);
+    });
+  }
+
   db.tutorsList = db.tutorsList || [];
-  db.tutorsList.push(tutorEntry);
+  db.tutorsList.push(persistedTutorEntry);
 
   // Initialize teacher meet settings if configured during registration
-  const tutorMeetLink = (tutorEntry.meetUrl || tutorEntry.meetLink || '').trim();
+  const tutorMeetLink = (persistedTutorEntry.meetUrl || persistedTutorEntry.meetLink || '').trim();
   if (tutorMeetLink && !tutorMeetLink.includes('meet.google.com/new')) {
     if (!db.meetSettings) db.meetSettings = {};
     if (!db.teacherSettings) db.teacherSettings = {};
@@ -3535,10 +3608,10 @@ app.post('/api/tutors', async (req, res) => {
       workingHoursStart: '08:00',
       workingHoursEnd: '18:00',
       slotDurationMinutes: 30,
-      availableDays: tutorEntry.availableDays || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday'],
-      availability: tutorEntry.availability || tutorEntry.availableHoursByDay || {},
-      availableHoursByDay: tutorEntry.availableHoursByDay || tutorEntry.availability || {},
-      timezone: tutorEntry.timezone || 'America/Toronto',
+      availableDays: persistedTutorEntry.availableDays || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday'],
+      availability: persistedTutorEntry.availability || persistedTutorEntry.availableHoursByDay || {},
+      availableHoursByDay: persistedTutorEntry.availableHoursByDay || persistedTutorEntry.availability || {},
+      timezone: persistedTutorEntry.timezone || 'America/Toronto',
       updatedAt: new Date().toISOString(),
     };
     db.meetSettings[cleanEmail] = meetEntry;
@@ -3553,21 +3626,21 @@ app.post('/api/tutors', async (req, res) => {
   // Also maintain teachers list for auth
   db.teachers = db.teachers || [];
   db.teachers.push({
-    id: tutorEntry.id,
-    uid: tutorEntry.uid || tutorEntry.id,
+    id: persistedTutorEntry.id,
+    uid: persistedTutorEntry.uid || persistedTutorEntry.id,
     email: cleanEmail,
     name: cleanName,
     role: 'teacher',
-    approvalStatus: resolvedApprovalStatus,
-    isApproved: resolvedIsApproved,
-    status: resolvedApprovalStatus,
-    approved: resolvedIsApproved,
+    approvalStatus: persistedTutorEntry.approvalStatus || resolvedApprovalStatus,
+    isApproved: persistedTutorEntry.isApproved ?? resolvedIsApproved,
+    status: persistedTutorEntry.status || resolvedApprovalStatus,
+    approved: persistedTutorEntry.approved ?? resolvedIsApproved,
   });
 
   // Ensure auth record exists with role 'teacher' (NO PASSWORDS)
   if (!db.authUsers) db.authUsers = {};
   db.authUsers[cleanEmail] = {
-    uid: tutorEntry.uid || tutorEntry.id,
+    uid: persistedTutorEntry.uid || persistedTutorEntry.id,
     email: cleanEmail,
     name: cleanName,
     role: 'teacher',
@@ -3592,14 +3665,13 @@ app.post('/api/tutors', async (req, res) => {
     }
   }
 
-  // Persist directly to Cloud Firestore exclusively in tutors/{canonicalAuthUid} and users/{canonicalAuthUid}
-  await saveTutorToFirestore(tutorEntry).catch((err) => {
-    console.warn('Error saving tutor to Firestore collection:', err);
-  });
-
   writeDb(db);
 
-  res.status(200).json({ success: true, tutor: tutorEntry, tutors: db.tutorsList });
+  res.status(200).json({
+    success: true,
+    tutor: sanitizePrivateTutorRecord(persistedTutorEntry, { includeAdminCommission: isAdminCaller }),
+    tutors: (db.tutorsList || []).map((t: any) => sanitizePrivateTutorRecord(t, { includeAdminCommission: isAdminCaller })),
+  });
 });
 
 app.put('/api/tutors/:id', firebaseAuthMiddleware, async (req, res) => {
@@ -3764,6 +3836,15 @@ app.put('/api/tutors/:id', firebaseAuthMiddleware, async (req, res) => {
     });
   }
 
+  // FIN.2B: Usuário não-admin jamais pode definir ou alterar comissão da plataforma
+  if (!isAdmin && payloadAttemptsCommissionMutation(updatedData)) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      code: 'COMMISSION_ADMIN_ONLY',
+      message: 'Access denied: Only verified administrators can set or modify platform commission.',
+    });
+  }
+
   // Prevent modifying an administrator account through tutor profile endpoint by non-admin
   const isTargetAdmin =
     (db.teachers || []).some((t: any) => t.email?.toLowerCase() === existingEmail && t.role === 'admin') ||
@@ -3819,6 +3900,8 @@ app.put('/api/tutors/:id', firebaseAuthMiddleware, async (req, res) => {
       'reviewsCount',
       'activeStudents',
       'lessonsTaught',
+      'adminCommissionPercent',
+      'commissionModel',
     ]);
 
     for (const [key, val] of Object.entries(updatedData)) {
@@ -3827,11 +3910,28 @@ app.put('/api/tutors/:id', firebaseAuthMiddleware, async (req, res) => {
       }
     }
 
-    if (fieldsToApply.approvalStatus !== undefined) {
-      const isApp = fieldsToApply.approvalStatus === 'approved';
-      fieldsToApply.isApproved = fieldsToApply.isApproved ?? isApp;
-      fieldsToApply.status = fieldsToApply.status ?? fieldsToApply.approvalStatus;
-      fieldsToApply.approved = fieldsToApply.approved ?? isApp;
+    if (
+      fieldsToApply.approvalStatus !== undefined ||
+      fieldsToApply.status !== undefined ||
+      fieldsToApply.isApproved !== undefined ||
+      fieldsToApply.approved !== undefined
+    ) {
+      const wantsApp =
+        fieldsToApply.approvalStatus === 'approved' ||
+        fieldsToApply.status === 'approved' ||
+        fieldsToApply.isApproved === true ||
+        fieldsToApply.approved === true;
+      if (wantsApp) {
+        fieldsToApply.approvalStatus = 'approved';
+        fieldsToApply.status = 'approved';
+        fieldsToApply.isApproved = true;
+        fieldsToApply.approved = true;
+      } else if (fieldsToApply.approvalStatus !== undefined) {
+        const isApp = fieldsToApply.approvalStatus === 'approved';
+        fieldsToApply.isApproved = fieldsToApply.isApproved ?? isApp;
+        fieldsToApply.status = fieldsToApply.status ?? fieldsToApply.approvalStatus;
+        fieldsToApply.approved = fieldsToApply.approved ?? isApp;
+      }
     }
   } else {
     // Regular teacher: strictly apply ONLY fields from TEACHER_EDITABLE_FIELDS
@@ -3871,7 +3971,16 @@ app.put('/api/tutors/:id', firebaseAuthMiddleware, async (req, res) => {
     ? (fieldsToApply.approved ?? existingTutor.approved ?? resolvedIsApproved)
     : (existingTutor.approved ?? existingTutor.isApproved ?? false);
 
-  const updatedTutor = {
+  const wasAlreadyApproved =
+    existingTutor.approvalStatus === 'approved' && existingTutor.isApproved === true;
+  const isTransitioningToApproved =
+    !wasAlreadyApproved &&
+    (resolvedApprovalStatus === 'approved' || resolvedIsApproved === true || resolvedStatus === 'approved' || resolvedApproved === true);
+  const isCommissionProvidedByAdmin =
+    isAdmin &&
+    (updatedData.adminCommissionPercent !== undefined || updatedData.commissionModel !== undefined);
+
+  let updatedTutor: Record<string, any> = {
     ...existingTutor,
     ...fieldsToApply,
     id: existingTutor.publicTutorId || existingTutor.id || canonicalUid,
@@ -3906,24 +4015,48 @@ app.put('/api/tutors/:id', firebaseAuthMiddleware, async (req, res) => {
   };
 
   // 5. Persist directly to Cloud Firestore in /tutors/{canonicalUid} and /users/{canonicalUid}
-  try {
-    const saveSuccess = await saveTutorToFirestore(updatedTutor);
-    if (saveSuccess === false) {
+  if (isAdmin && (isTransitioningToApproved || isCommissionProvidedByAdmin)) {
+    // FIN.2B: Caminho centralizado e transacional obrigatório para aprovação ou alteração de comissão
+    const txRes = await approveAndSaveTutorCommissionTransactionally({
+      canonicalUid,
+      baseTutor: updatedTutor,
+      updatedByUid: callerUid,
+      incomingCommissionPercent: updatedData.adminCommissionPercent,
+      incomingCommissionModel: updatedData.commissionModel,
+      approve: resolvedApprovalStatus === 'approved' || resolvedIsApproved === true,
+      action: !hasValidPersistedCommission(existingTutor)
+        ? (isTransitioningToApproved ? 'initial_approval' : 'admin_configuration')
+        : 'admin_update',
+      forceNewVersion: isCommissionProvidedByAdmin && hasValidPersistedCommission(existingTutor),
+      dbState: db,
+    });
+    if (!txRes.ok) {
+      return res.status(txRes.status).json({
+        error: txRes.code,
+        message: txRes.error,
+      });
+    }
+    updatedTutor = txRes.savedTutor;
+  } else {
+    try {
+      const saveSuccess = await saveTutorToFirestore(updatedTutor);
+      if (saveSuccess === false) {
+        return res.status(500).json({
+          error: 'Persistence Error',
+          message: 'Failed to persist tutor profile to Firestore',
+        });
+      }
+    } catch (err: any) {
+      console.error('[serverApp] Error persisting tutor to Firestore in PUT /api/tutors/:id:', err);
       return res.status(500).json({
         error: 'Persistence Error',
         message: 'Failed to persist tutor profile to Firestore',
+        details: err?.message || String(err),
       });
     }
-  } catch (err: any) {
-    console.error('[serverApp] Error persisting tutor to Firestore in PUT /api/tutors/:id:', err);
-    return res.status(500).json({
-      error: 'Persistence Error',
-      message: 'Failed to persist tutor profile to Firestore',
-      details: err?.message || String(err),
-    });
   }
 
-  // 6. Update local in-memory DB & disk cache
+  // 6. Update local in-memory DB & disk cache ONLY after Firestore persistence succeeds
   db.tutorsList = db.tutorsList || [];
   const existingLocalIdx = db.tutorsList.findIndex(
     (t: any) =>
@@ -3951,10 +4084,10 @@ app.put('/api/tutors/:id', firebaseAuthMiddleware, async (req, res) => {
       timezone: updatedTutor.timezone,
       availableDays: updatedTutor.availableDays,
       videoIntroUrl: updatedTutor.videoIntroUrl,
-      approvalStatus: resolvedApprovalStatus,
-      isApproved: resolvedIsApproved,
-      status: resolvedStatus,
-      approved: resolvedApproved,
+      approvalStatus: updatedTutor.approvalStatus || resolvedApprovalStatus,
+      isApproved: updatedTutor.isApproved ?? resolvedIsApproved,
+      status: updatedTutor.status || resolvedStatus,
+      approved: updatedTutor.approved ?? resolvedApproved,
     };
   }
 
@@ -3971,7 +4104,11 @@ app.put('/api/tutors/:id', firebaseAuthMiddleware, async (req, res) => {
   }
 
   writeDb(db);
-  return res.status(200).json({ success: true, tutor: updatedTutor, tutors: db.tutorsList });
+  return res.status(200).json({
+    success: true,
+    tutor: sanitizePrivateTutorRecord(updatedTutor, { includeAdminCommission: isAdmin }),
+    tutors: (db.tutorsList || []).map((t: any) => sanitizePrivateTutorRecord(t, { includeAdminCommission: isAdmin })),
+  });
 });
 
   // Admin Delete Tutor
@@ -4054,102 +4191,162 @@ app.delete('/api/tutors/:id', firebaseAuthMiddleware, requireAdmin, async (req, 
 
 app.post('/api/tutors/:id/approve', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
   const db = readDb();
-  const tutorId = req.params.id;
-  let approvedEmail = '';
-  let approvedTutor: any = null;
+  const tutorId = decodeURIComponent(req.params.id || '').trim();
+  const adminUid = (req.user?.uid || '').trim();
+  if (!adminUid) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Autenticação administrativa obrigatória.',
+    });
+  }
 
-  // 1. Search in local db.tutorsList
-  db.tutorsList = (db.tutorsList || []).map((t) => {
-    if (t.id === tutorId || t.uid === tutorId || t.authUid === tutorId || t.email?.toLowerCase() === tutorId.toLowerCase()) {
-      approvedEmail = (t.email || '').toLowerCase().trim();
-      approvedTutor = {
-        ...t,
-        approvalStatus: 'approved',
-        isApproved: true,
-        status: 'approved',
-        approved: true,
-        updatedAt: new Date().toISOString(),
-      };
-      return approvedTutor;
+  const incomingCommissionPercent =
+    req.body?.adminCommissionPercent !== undefined
+      ? req.body.adminCommissionPercent
+      : req.body?.tutor?.adminCommissionPercent;
+  const incomingCommissionModel =
+    req.body?.commissionModel !== undefined
+      ? req.body.commissionModel
+      : req.body?.tutor?.commissionModel;
+
+  const modelCheck = validateCommissionModel(incomingCommissionModel);
+  if (!modelCheck.valid) {
+    return res.status(400).json({
+      error: modelCheck.code,
+      message: modelCheck.error,
+    });
+  }
+  if (incomingCommissionPercent !== undefined) {
+    const pctCheck = validateAdminCommissionPercent(incomingCommissionPercent);
+    if (!pctCheck.valid) {
+      return res.status(400).json({
+        error: pctCheck.code,
+        message: pctCheck.error,
+      });
     }
-    return t;
-  });
+  }
 
-  // 2. If not found in db.tutorsList, check db.teachers
-  if (!approvedTutor) {
+  // 1. Localiza candidato sem mutar in-memory antes da validação e transação
+  let candidateTutor: any = (db.tutorsList || []).find(
+    (t: any) =>
+      t.id === tutorId ||
+      t.uid === tutorId ||
+      t.authUid === tutorId ||
+      (t.publicTutorId && t.publicTutorId.toLowerCase() === tutorId.toLowerCase()) ||
+      (t.email && t.email.toLowerCase() === tutorId.toLowerCase())
+  );
+
+  if (!candidateTutor) {
     const teacher = (db.teachers || []).find(
-      (tc: any) => tc.id === tutorId || tc.uid === tutorId || tc.authUid === tutorId || (tc.email && tc.email.toLowerCase() === tutorId.toLowerCase())
+      (tc: any) =>
+        tc.id === tutorId ||
+        tc.uid === tutorId ||
+        tc.authUid === tutorId ||
+        (tc.email && tc.email.toLowerCase() === tutorId.toLowerCase())
     );
     if (teacher) {
-      approvedEmail = (teacher.email || '').toLowerCase().trim();
-      approvedTutor = {
-        ...teacher,
-        id: teacher.id || tutorId,
-        approvalStatus: 'approved',
-        isApproved: true,
-        status: 'approved',
-        approved: true,
-        updatedAt: new Date().toISOString(),
-      };
-      db.tutorsList = db.tutorsList || [];
-      db.tutorsList.push(approvedTutor);
+      candidateTutor = { ...teacher, id: teacher.id || tutorId };
     }
   }
 
-  // 3. Locate the tutor directly in Firestore (default) by route ID
-  if (!approvedTutor) {
+  if (!candidateTutor) {
     try {
-      const directTutor = await fetchTutorDocumentFromFirestore(tutorId).catch(() => null);
+      const directTutor = await fetchTutorDocumentFromFirestore(tutorId);
       if (directTutor) {
-        approvedEmail = (directTutor.email || '').toLowerCase().trim();
-        approvedTutor = {
-          ...directTutor,
-          id: directTutor.id || tutorId,
-          approvalStatus: 'approved',
-          isApproved: true,
-          status: 'approved',
-          approved: true,
-          updatedAt: new Date().toISOString(),
-        };
-        db.tutorsList = db.tutorsList || [];
-        db.tutorsList.push(approvedTutor);
+        candidateTutor = { ...directTutor, id: directTutor.id || tutorId };
       }
-    } catch (fsErr) {
+    } catch (fsErr: any) {
       console.warn('Error fetching tutor document from Firestore in POST /api/tutors/:id/approve:', fsErr);
+      return res.status(503).json({
+        error: 'FIRESTORE_QUERY_FAILED',
+        message: 'Falha ao consultar o registro do Native Friend no Firestore.',
+      });
     }
   }
 
-  // 4. Fallback if tutor was passed in body (e.g. legacy clients)
-  if (!approvedTutor) {
-    const passedTutor = req.body?.tutor;
-    if (passedTutor) {
-      approvedEmail = (passedTutor.email || '').toLowerCase().trim();
-      approvedTutor = {
-        ...passedTutor,
-        id: tutorId,
-        approvalStatus: 'approved',
-        isApproved: true,
-        status: 'approved',
-        approved: true,
-        updatedAt: new Date().toISOString(),
-      };
-      db.tutorsList = db.tutorsList || [];
-      db.tutorsList.push(approvedTutor);
-    }
+  if (!candidateTutor && req.body?.tutor) {
+    candidateTutor = { ...req.body.tutor, id: req.body.tutor.id || tutorId };
   }
 
-  if (!approvedTutor) {
+  if (!candidateTutor) {
     return res.status(404).json({
       error: 'NotFound',
       message: `Amigo Nativo "${tutorId}" não foi encontrado para aprovação.`,
     });
   }
 
+  // 2. Resolve UID canônico (sem exigir approvalStatus === 'approved' prévio e sem mutar estado local)
+  const uidResolution = await resolveCanonicalUidForTutorModeration({
+    candidateTutor,
+    tutorIdParam: tutorId,
+    dbState: db,
+  });
+  if (!uidResolution.ok) {
+    return res.status(uidResolution.status).json({
+      error: uidResolution.code,
+      message: uidResolution.error,
+    });
+  }
+
+  const canonicalUid = uidResolution.canonicalUid;
+  const mergedBaseTutor = {
+    ...(uidResolution.existingTutorDoc || {}),
+    ...candidateTutor,
+    id: canonicalUid,
+    uid: canonicalUid,
+    authUid: canonicalUid,
+    publicTutorId:
+      candidateTutor.publicTutorId ||
+      (!isValidCanonicalUid(tutorId) && !tutorId.includes('@') ? tutorId : undefined),
+  };
+
+  // 3. Valida comissão obrigatória (0..100, MARKUP) e persiste atomicamente em runTransaction
+  const txRes = await approveAndSaveTutorCommissionTransactionally({
+    canonicalUid,
+    baseTutor: mergedBaseTutor,
+    updatedByUid: adminUid,
+    incomingCommissionPercent,
+    incomingCommissionModel,
+    approve: true,
+    action: hasValidPersistedCommission(mergedBaseTutor) ? 'admin_update' : 'initial_approval',
+    forceNewVersion: false,
+    dbState: db,
+  });
+
+  if (!txRes.ok) {
+    return res.status(txRes.status).json({
+      error: txRes.code,
+      message: txRes.error,
+    });
+  }
+
+  const approvedTutor = txRes.savedTutor;
+  const approvedEmail = (approvedTutor.email || '').toLowerCase().trim();
+
+  // 4. Só após sucesso transacional atualiza o estado em memória e sincroniza app_state
+  db.tutorsList = db.tutorsList || [];
+  const existingIdx = db.tutorsList.findIndex(
+    (t: any) =>
+      (t.uid && t.uid === canonicalUid) ||
+      (t.authUid && t.authUid === canonicalUid) ||
+      t.id === tutorId ||
+      t.id === canonicalUid ||
+      (approvedEmail && (t.email || '').toLowerCase() === approvedEmail)
+  );
+  if (existingIdx >= 0) {
+    db.tutorsList[existingIdx] = approvedTutor;
+  } else {
+    db.tutorsList.push(approvedTutor);
+  }
+
   if (approvedEmail) {
-    const tIdx = (db.teachers || []).findIndex((tc: any) => (tc.email || '').toLowerCase() === approvedEmail);
+    const tIdx = (db.teachers || []).findIndex(
+      (tc: any) => (tc.email || '').toLowerCase() === approvedEmail || tc.uid === canonicalUid
+    );
     if (tIdx >= 0) {
       db.teachers[tIdx] = {
         ...db.teachers[tIdx],
+        uid: canonicalUid,
         approvalStatus: 'approved',
         isApproved: true,
         status: 'approved',
@@ -4158,7 +4355,8 @@ app.post('/api/tutors/:id/approve', firebaseAuthMiddleware, requireAdmin, async 
     } else {
       db.teachers = db.teachers || [];
       db.teachers.push({
-        id: approvedTutor.id || tutorId,
+        id: canonicalUid,
+        uid: canonicalUid,
         email: approvedEmail,
         name: approvedTutor.name || approvedEmail.split('@')[0],
         role: 'teacher',
@@ -4179,25 +4377,182 @@ app.post('/api/tutors/:id/approve', firebaseAuthMiddleware, requireAdmin, async 
     }
   }
 
-  // 1. Resolve canonical identity and persist exclusively in /tutors/{canonicalAuthUid} and /users/{canonicalAuthUid}
-  const approvedTeacherRes = await resolveTeacherCanonicalIdentity({
-    teacherId: tutorId,
-    publicTutorId: tutorId,
-    teacherEmail: approvedEmail,
+  await writeDbSync(db);
+  return res.json({
+    success: true,
+    tutors: (db.tutorsList || []).map((t: any) => sanitizePrivateTutorRecord(t, { includeAdminCommission: true })),
+    approvedTutor: sanitizePrivateTutorRecord(approvedTutor, { includeAdminCommission: true }),
+  });
+});
+
+// FIN.2B: Configuração ou atualização administrativa de comissão (gera nova versão preservando histórico imutável)
+app.put('/api/tutors/:id/commission', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
+  const db = readDb();
+  const tutorId = decodeURIComponent(req.params.id || '').trim();
+  const adminUid = (req.user?.uid || '').trim();
+  if (!adminUid) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Autenticação administrativa obrigatória.',
+    });
+  }
+
+  const incomingCommissionPercent = req.body?.adminCommissionPercent;
+  const incomingCommissionModel = req.body?.commissionModel;
+
+  const pctCheck = validateAdminCommissionPercent(incomingCommissionPercent);
+  if (!pctCheck.valid) {
+    return res.status(400).json({
+      error: pctCheck.code,
+      message: pctCheck.error,
+    });
+  }
+  const modelCheck = validateCommissionModel(incomingCommissionModel);
+  if (!modelCheck.valid) {
+    return res.status(400).json({
+      error: modelCheck.code,
+      message: modelCheck.error,
+    });
+  }
+
+  let candidateTutor: any = (db.tutorsList || []).find(
+    (t: any) =>
+      t.id === tutorId ||
+      t.uid === tutorId ||
+      t.authUid === tutorId ||
+      (t.publicTutorId && t.publicTutorId.toLowerCase() === tutorId.toLowerCase()) ||
+      (t.email && t.email.toLowerCase() === tutorId.toLowerCase())
+  );
+
+  if (!candidateTutor) {
+    try {
+      const directTutor = await fetchTutorDocumentFromFirestore(tutorId);
+      if (directTutor) {
+        candidateTutor = { ...directTutor, id: directTutor.id || tutorId };
+      }
+    } catch (fsErr) {
+      return res.status(503).json({
+        error: 'FIRESTORE_QUERY_FAILED',
+        message: 'Falha ao consultar o registro do Native Friend no Firestore.',
+      });
+    }
+  }
+
+  if (!candidateTutor) {
+    return res.status(404).json({
+      error: 'NotFound',
+      message: `Amigo Nativo "${tutorId}" não encontrado.`,
+    });
+  }
+
+  const uidResolution = await resolveCanonicalUidForTutorModeration({
+    candidateTutor,
+    tutorIdParam: tutorId,
     dbState: db,
   });
-  if (approvedTeacherRes && isValidCanonicalUid(approvedTeacherRes.canonicalUid)) {
-    approvedTutor.authUid = approvedTeacherRes.canonicalUid;
-    approvedTutor.uid = approvedTeacherRes.canonicalUid;
-    approvedTutor.publicTutorId = tutorId;
+  if (!uidResolution.ok) {
+    return res.status(uidResolution.status).json({
+      error: uidResolution.code,
+      message: uidResolution.error,
+    });
   }
-  await saveTutorToFirestore(approvedTutor, tutorId).catch((err) => {
-    console.warn('Error saving approved tutor to Firestore:', err);
+
+  const canonicalUid = uidResolution.canonicalUid;
+  const mergedBase = {
+    ...(uidResolution.existingTutorDoc || {}),
+    ...candidateTutor,
+    id: canonicalUid,
+    uid: canonicalUid,
+    authUid: canonicalUid,
+  };
+
+  const txRes = await approveAndSaveTutorCommissionTransactionally({
+    canonicalUid,
+    baseTutor: mergedBase,
+    updatedByUid: adminUid,
+    incomingCommissionPercent: pctCheck.value,
+    incomingCommissionModel: modelCheck.value,
+    approve: false, // Preserva status de aprovação atual (não aprova pendente nem revoga aprovado legado)
+    action: hasValidPersistedCommission(mergedBase) ? 'admin_update' : 'admin_configuration',
+    forceNewVersion: true,
+    dbState: db,
   });
 
-  // 2. Synchronize app_state/tutors and in-memory DB ensuring full consistency
+  if (!txRes.ok) {
+    return res.status(txRes.status).json({
+      error: txRes.code,
+      message: txRes.error,
+    });
+  }
+
+  const savedTutor = txRes.savedTutor;
+  const savedEmail = (savedTutor.email || '').toLowerCase().trim();
+
+  db.tutorsList = db.tutorsList || [];
+  const existingIdx = db.tutorsList.findIndex(
+    (t: any) =>
+      (t.uid && t.uid === canonicalUid) ||
+      (t.authUid && t.authUid === canonicalUid) ||
+      t.id === tutorId ||
+      t.id === canonicalUid ||
+      (savedEmail && (t.email || '').toLowerCase() === savedEmail)
+  );
+  if (existingIdx >= 0) {
+    db.tutorsList[existingIdx] = savedTutor;
+  } else {
+    db.tutorsList.push(savedTutor);
+  }
+
   await writeDbSync(db);
-  res.json({ success: true, tutors: db.tutorsList, approvedTutor });
+  return res.json({
+    success: true,
+    tutor: sanitizePrivateTutorRecord(savedTutor, { includeAdminCommission: true }),
+    tutors: (db.tutorsList || []).map((t: any) => sanitizePrivateTutorRecord(t, { includeAdminCommission: true })),
+  });
+});
+
+// FIN.2B: Leitura administrativa do histórico imutável de versões de comissão
+app.get('/api/tutors/:id/commission-history', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
+  const db = readDb();
+  const tutorId = decodeURIComponent(req.params.id || '').trim();
+
+  let candidateTutor: any = (db.tutorsList || []).find(
+    (t: any) =>
+      t.id === tutorId ||
+      t.uid === tutorId ||
+      t.authUid === tutorId ||
+      (t.publicTutorId && t.publicTutorId.toLowerCase() === tutorId.toLowerCase()) ||
+      (t.email && t.email.toLowerCase() === tutorId.toLowerCase())
+  );
+
+  try {
+    const directTutor = await fetchTutorDocumentFromFirestore(tutorId);
+    if (directTutor) {
+      candidateTutor = { ...(candidateTutor || {}), ...directTutor };
+    }
+  } catch {}
+
+  if (!candidateTutor) {
+    return res.status(404).json({
+      error: 'NotFound',
+      message: `Amigo Nativo "${tutorId}" não encontrado.`,
+    });
+  }
+
+  const sanitized = sanitizePrivateTutorRecord(candidateTutor, { includeAdminCommission: true });
+  return res.json({
+    success: true,
+    uid: sanitized.uid || sanitized.authUid || sanitized.id,
+    adminCommissionPercent: sanitized.adminCommissionPercent ?? null,
+    commissionModel: sanitized.commissionModel ?? null,
+    commissionVersion: sanitized.commissionVersion ?? null,
+    effectiveFrom: sanitized.effectiveFrom ?? null,
+    updatedAt: sanitized.updatedAt ?? null,
+    updatedByUid: sanitized.updatedByUid ?? null,
+    financialConfigurationPending: sanitized.financialConfigurationPending,
+    isCommercializable: sanitized.isCommercializable,
+    commissionHistory: Array.isArray(sanitized.commissionHistory) ? sanitized.commissionHistory : [],
+  });
 });
 
 app.post('/api/tutors/:id/reject', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
@@ -4302,13 +4657,14 @@ app.post('/api/tutors/:id/reject', firebaseAuthMiddleware, requireAdmin, async (
   res.json({ success: true, tutors: db.tutorsList });
 });
 
-app.post('/api/teachers', firebaseAuthMiddleware, requireAdmin, (req, res) => {
+app.post('/api/teachers', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
   const db = readDb();
   const newTeacher = req.body.teacher || req.body;
   if (!newTeacher || !newTeacher.email) {
     return res.status(400).json({ error: 'Invalid teacher data' });
   }
   const cleanEmail = newTeacher.email.toLowerCase().trim();
+  const adminUid = (req.user?.uid || '').trim();
 
   // Prevent modifying or downgrading administrator accounts
   const isTargetAdmin =
@@ -4322,20 +4678,123 @@ app.post('/api/teachers', firebaseAuthMiddleware, requireAdmin, (req, res) => {
     });
   }
 
+  const wantsApproved =
+    newTeacher.approvalStatus === 'approved' ||
+    newTeacher.status === 'approved' ||
+    newTeacher.isApproved === true ||
+    newTeacher.approved === true;
+
+  const existingIdx = (db.teachers || []).findIndex((t: any) => t.email.toLowerCase() === cleanEmail);
+  const existingTeacher = existingIdx >= 0 ? db.teachers[existingIdx] : null;
+  const existingTutor = (db.tutorsList || []).find((t: any) => (t.email || '').toLowerCase() === cleanEmail);
+  const existingRecord = existingTutor || existingTeacher || {};
+
+  // FIN.2B: Impede criação ou ativação de professor aprovado sem comissão válida nesta rota legada
+  if (wantsApproved || newTeacher.adminCommissionPercent !== undefined || newTeacher.commissionModel !== undefined) {
+    const modelCheck = validateCommissionModel(newTeacher.commissionModel);
+    if (!modelCheck.valid) {
+      return res.status(400).json({
+        error: modelCheck.code,
+        message: modelCheck.error,
+      });
+    }
+    if (newTeacher.adminCommissionPercent !== undefined) {
+      const pctCheck = validateAdminCommissionPercent(newTeacher.adminCommissionPercent);
+      if (!pctCheck.valid) {
+        return res.status(400).json({
+          error: pctCheck.code,
+          message: pctCheck.error,
+        });
+      }
+    }
+
+    const uidRes = await resolveCanonicalUidForTutorModeration({
+      candidateTutor: { ...existingRecord, ...newTeacher, email: cleanEmail },
+      tutorIdParam: cleanEmail,
+      dbState: db,
+    });
+    if (!uidRes.ok) {
+      // Sem UID canônico provado, se tentou aprovar sem comissão -> retorna 400 de comissão primeiro
+      if (newTeacher.adminCommissionPercent === undefined) {
+        return res.status(400).json({
+          error: 'COMMISSION_REQUIRED',
+          message: 'Comissão individual da plataforma (0% a 100%) é obrigatória para criar ou ativar professor aprovado.',
+        });
+      }
+      return res.status(uidRes.status).json({
+        error: uidRes.code,
+        message: uidRes.error,
+      });
+    }
+
+    const txRes = await approveAndSaveTutorCommissionTransactionally({
+      canonicalUid: uidRes.canonicalUid,
+      baseTutor: { ...existingRecord, ...newTeacher, email: cleanEmail, role: 'teacher' },
+      updatedByUid: adminUid,
+      incomingCommissionPercent: newTeacher.adminCommissionPercent,
+      incomingCommissionModel: newTeacher.commissionModel,
+      approve: wantsApproved,
+      action: wantsApproved ? 'initial_approval' : 'admin_configuration',
+      forceNewVersion: hasValidPersistedCommission(existingRecord) && newTeacher.adminCommissionPercent !== undefined,
+      dbState: db,
+    });
+
+    if (!txRes.ok) {
+      return res.status(txRes.status).json({
+        error: txRes.code,
+        message: txRes.error,
+      });
+    }
+
+    const saved = txRes.savedTutor;
+    const savedTeacherEntry = {
+      ...saved,
+      email: saved.email || cleanEmail,
+      name: saved.name || newTeacher.name || cleanEmail.split('@')[0],
+      role: 'teacher',
+    };
+    if (existingIdx >= 0) {
+      db.teachers[existingIdx] = { ...db.teachers[existingIdx], ...savedTeacherEntry };
+    } else {
+      db.teachers.push(savedTeacherEntry);
+    }
+    db.tutorsList = db.tutorsList || [];
+    const tutorIdx = db.tutorsList.findIndex((t: any) => t.uid === uidRes.canonicalUid || (t.email || '').toLowerCase() === cleanEmail);
+    if (tutorIdx >= 0) {
+      db.tutorsList[tutorIdx] = saved;
+    } else {
+      db.tutorsList.push(saved);
+    }
+    writeDb(db);
+    return res.json({
+      success: true,
+      teachers: (db.teachers || []).map((t: any) => sanitizePrivateTutorRecord(t, { includeAdminCommission: true })),
+    });
+  }
+
+  // Sem aprovação nem comissão informada: preserva apenas registro pendente e descarta metadados de comissão forjados
+  const cleanedInput = stripAdminCommissionFields({ ...newTeacher });
   const teacherEntry = {
-    ...newTeacher,
+    ...cleanedInput,
     email: cleanEmail,
+    name: cleanedInput.name || existingTeacher?.name || cleanEmail.split('@')[0],
     role: 'teacher', // strictly enforce teacher role
+    approvalStatus: existingTeacher ? (existingTeacher.approvalStatus || 'pending') : 'pending',
+    isApproved: existingTeacher ? Boolean(existingTeacher.isApproved === true && existingTeacher.approvalStatus === 'approved') : false,
+    status: existingTeacher ? (existingTeacher.status || existingTeacher.approvalStatus || 'pending') : 'pending',
+    approved: existingTeacher ? Boolean(existingTeacher.approved === true && existingTeacher.approvalStatus === 'approved') : false,
   };
 
-  const existingIdx = db.teachers.findIndex((t) => t.email.toLowerCase() === cleanEmail);
   if (existingIdx >= 0) {
     db.teachers[existingIdx] = { ...db.teachers[existingIdx], ...teacherEntry };
   } else {
     db.teachers.push(teacherEntry);
   }
   writeDb(db);
-  res.json({ success: true, teachers: db.teachers });
+  return res.json({
+    success: true,
+    teachers: (db.teachers || []).map((t: any) => sanitizePrivateTutorRecord(t, { includeAdminCommission: true })),
+  });
 });
 
 app.delete('/api/teachers/:email', firebaseAuthMiddleware, requireAdmin, (req, res) => {
@@ -6147,6 +6606,725 @@ app.get('/api/financial/ptax', async (req, res) => {
     });
   }
 });
+
+// =============================================================================
+// FASE FIN.2C — Endpoints autoritativos de cotação de preços e pacotes (BRL)
+// =============================================================================
+export interface PublicTutorPricingQuotePackageDto {
+  lessonsCount: number;
+  discountPercent: number;
+  labelPt: string;
+  labelEn: string;
+  grossTotalBrl: number;
+  discountAmountBrl: number;
+  finalPriceBrl: number;
+  effectiveLessonPriceBrl: number;
+  isPopular?: boolean;
+  isBestValue?: boolean;
+}
+
+export interface PublicTutorPricingQuoteDto {
+  success: true;
+  commercializable: true;
+  tutorId: string;
+  publicTutorId: string;
+  tutorName: string;
+  currency: 'BRL';
+  lessonDurationMinutes: number;
+  ptax: {
+    rate: number;
+    quoteDate: string;
+    pricingDate: string;
+    source: string;
+    tipoBoletim?: string;
+  };
+  unit: {
+    finalPriceBrl: number;
+  };
+  lowestEffectiveLessonPriceBrl: number;
+  packages: PublicTutorPricingQuotePackageDto[];
+}
+
+const PACKAGE_LABELS_BY_COUNT: Record<
+  number,
+  { labelPt: string; labelEn: string; isPopular?: boolean; isBestValue?: boolean }
+> = {
+  1: { labelPt: '1 Aula Avulsa', labelEn: '1 Single Lesson' },
+  4: { labelPt: 'Pacote 4 Aulas', labelEn: '4 Lessons Pack' },
+  8: { labelPt: 'Pacote 8 Aulas', labelEn: '8 Lessons Pack', isPopular: true },
+  12: { labelPt: 'Pacote 12 Aulas', labelEn: '12 Lessons Pack', isBestValue: true },
+};
+
+/**
+ * Constrói estritamente o DTO público de cotação para apresentação ao aluno.
+ * NUNCA inclui comissão administrativa, modelo/versão de comissão, preço-base USD ou repasses internos.
+ */
+export function buildPublicTutorPricingQuoteDto(params: {
+  canonicalUid: string;
+  publicTutorId: string;
+  tutorName: string;
+  ptax: PtaxQuoteResult;
+  quote: FinancialPricingQuote;
+}): PublicTutorPricingQuoteDto {
+  const enginePackages = Array.isArray(params.quote.packages?.list)
+    ? params.quote.packages.list
+    : [];
+  const packages: PublicTutorPricingQuotePackageDto[] = enginePackages.map((pkg) => {
+    const meta = PACKAGE_LABELS_BY_COUNT[pkg.lessonsCount] || {
+      labelPt: `Pacote ${pkg.lessonsCount} Aulas`,
+      labelEn: `${pkg.lessonsCount} Lessons Pack`,
+    };
+    return {
+      lessonsCount: pkg.lessonsCount,
+      discountPercent: pkg.discountPercent,
+      labelPt: meta.labelPt,
+      labelEn: meta.labelEn,
+      grossTotalBrl: pkg.grossTotalBrl,
+      discountAmountBrl: pkg.discountAmountBrl,
+      finalPriceBrl: pkg.finalPriceBrl,
+      effectiveLessonPriceBrl: pkg.effectiveLessonPriceBrl,
+      ...(meta.isPopular ? { isPopular: true } : {}),
+      ...(meta.isBestValue ? { isBestValue: true } : {}),
+    };
+  });
+
+  const lowestEffectiveLessonPriceBrl = packages.reduce(
+    (min, pkg) => (pkg.effectiveLessonPriceBrl < min ? pkg.effectiveLessonPriceBrl : min),
+    params.quote.unit.finalPriceBrl
+  );
+
+  return {
+    success: true,
+    commercializable: true,
+    tutorId: params.canonicalUid,
+    publicTutorId: params.publicTutorId || params.canonicalUid,
+    tutorName: params.tutorName,
+    currency: 'BRL',
+    lessonDurationMinutes: 50,
+    ptax: {
+      rate: params.ptax.ptaxRate as number,
+      quoteDate: params.ptax.quoteDate || '',
+      pricingDate: params.ptax.pricingDate || '',
+      source: params.ptax.source || 'BACEN_PTAX_D1',
+      ...(params.ptax.tipoBoletim ? { tipoBoletim: params.ptax.tipoBoletim } : {}),
+    },
+    unit: {
+      finalPriceBrl: params.quote.unit.finalPriceBrl,
+    },
+    lowestEffectiveLessonPriceBrl,
+    packages,
+  };
+}
+
+const pricingQuoteRateLimitMap = new Map<string, { count: number; resetTime: number }>();
+const PRICING_QUOTE_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const PRICING_QUOTE_RATE_LIMIT_MAX_REQUESTS = 180;
+
+function checkPricingQuoteRateLimit(req: express.Request, res: express.Response): boolean {
+  const clientIp =
+    (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
+    req.socket?.remoteAddress ||
+    'unknown';
+  const now = Date.now();
+  const record = pricingQuoteRateLimitMap.get(clientIp);
+
+  if (record && now < record.resetTime) {
+    record.count++;
+    if (record.count > PRICING_QUOTE_RATE_LIMIT_MAX_REQUESTS) {
+      const retryAfterSec = Math.ceil((record.resetTime - now) / 1000);
+      res.setHeader('Retry-After', String(retryAfterSec));
+      res.status(429).json({
+        success: false,
+        commercializable: false,
+        error: 'RATE_LIMIT_EXCEEDED',
+        message: `Limite de consultas de preços excedido. Tente novamente em ${retryAfterSec}s.`,
+      });
+      return false;
+    }
+  } else {
+    if (pricingQuoteRateLimitMap.size >= 1000) {
+      for (const [ip, rec] of pricingQuoteRateLimitMap.entries()) {
+        if (now >= rec.resetTime) pricingQuoteRateLimitMap.delete(ip);
+      }
+    }
+    setBoundedMapEntry(
+      pricingQuoteRateLimitMap,
+      clientIp,
+      { count: 1, resetTime: now + PRICING_QUOTE_RATE_LIMIT_WINDOW_MS },
+      1000
+    );
+  }
+  return true;
+}
+
+const FORBIDDEN_CLIENT_PRICING_QUERY_KEYS = new Set([
+  'price',
+  'baseprice',
+  'basepriceusd',
+  'pricepersessionusd',
+  'pricepersessionbrl',
+  'commission',
+  'admincommissionpercent',
+  'commissionmodel',
+  'ptax',
+  'ptaxrate',
+  'discount',
+  'discountpercent',
+  'rate',
+  'markup',
+  'total',
+  'finalpricebrl',
+  'admin',
+  'includepending',
+]);
+
+function rejectUntrustedPricingQueryParams(
+  req: express.Request,
+  res: express.Response,
+  allowedKeys: string[] = []
+): boolean {
+  const allowedSet = new Set(allowedKeys);
+  const queryKeys = req.query ? Object.keys(req.query) : [];
+  const extraKeys = queryKeys.filter((k) => !allowedSet.has(k));
+  if (extraKeys.length === 0) return false;
+
+  const isPricingTamper = extraKeys.some((k) =>
+    FORBIDDEN_CLIENT_PRICING_QUERY_KEYS.has(k.toLowerCase())
+  );
+  res.status(400).json({
+    success: false,
+    commercializable: false,
+    error: isPricingTamper ? 'CLIENT_PRICING_PARAMS_FORBIDDEN' : 'PARAMETROS_INVALIDOS',
+    message:
+      'Os preços e comissões são calculados exclusivamente no servidor. Parâmetros externos de cotação não são aceitos.',
+  });
+  return true;
+}
+
+function buildPublicTutorIdentifierSlug(t: any, canonicalUid: string): string {
+  if (t?.publicTutorId && typeof t.publicTutorId === 'string' && !isGenericTutorId(t.publicTutorId)) {
+    return t.publicTutorId.trim();
+  }
+  if (t?.id && typeof t.id === 'string' && !isValidCanonicalUid(t.id) && !isGenericTutorId(t.id)) {
+    return t.id.trim();
+  }
+  if (t?.name && typeof t.name === 'string' && !isGenericTutorId(t.name)) {
+    const slug = normalizeTutorName(t.name).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    if (slug && !isGenericTutorId(slug)) return slug;
+  }
+  return canonicalUid;
+}
+
+function extractValidTutorBasePriceUsd(tutor: any): number | null {
+  if (!tutor || typeof tutor !== 'object') return null;
+  const raw = tutor.pricePerSessionUsd;
+  const num = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isFinite(num) || num <= 0) return null;
+  return num;
+}
+
+async function loadAuthoritativeTutorsCatalog(db: any): Promise<{
+  ok: true;
+  tutors: any[];
+} | {
+  ok: false;
+  status: number;
+  error: string;
+  message: string;
+}> {
+  let firestoreQueryError: any = null;
+  let directTutors: any[] = [];
+  try {
+    directTutors = await fetchTutorsFromFirestore();
+  } catch (err: any) {
+    if (!isPermissionError(err)) {
+      firestoreQueryError = err;
+    }
+  }
+
+  const localTutors = Array.isArray(db?.tutorsList) ? db.tutorsList : [];
+  if (firestoreQueryError && localTutors.length === 0) {
+    return {
+      ok: false,
+      status: 503,
+      error: 'FIRESTORE_QUERY_FAILED',
+      message: 'Não foi possível consultar o catálogo oficial de professores no momento.',
+    };
+  }
+
+  return {
+    ok: true,
+    tutors: consolidateTutorsList([...localTutors, ...(directTutors || [])]),
+  };
+}
+
+function isTutorRecordApprovedForCatalog(t: any): boolean {
+  const role = (t?.role || '').toLowerCase().trim();
+  const isTeacher = role === 'teacher' || role === 'native_friend' || role === 'tutor' || !role;
+  return Boolean(isTeacher && t?.approvalStatus === 'approved' && t?.isApproved === true);
+}
+
+function isTutorDeletedInDb(t: any, db: any): boolean {
+  const tEmail = (t?.email || '').toLowerCase().trim();
+  const tId = (t?.id || '').toLowerCase().trim();
+  const tUid = (t?.uid || '').toLowerCase().trim();
+  return Boolean(
+    (tEmail && db?.deletedTutorEmails?.includes(tEmail)) ||
+    (tId && db?.deletedTutorIds?.includes(tId)) ||
+    (tUid && db?.deletedTutorIds?.includes(tUid))
+  );
+}
+
+function mergeFresherCommissionRecord(baseRecord: any, directDoc: any): any {
+  if (!directDoc) return baseRecord;
+  if (!baseRecord) return directDoc;
+  const localVer = typeof baseRecord.commissionVersion === 'number' ? baseRecord.commissionVersion : 0;
+  const remoteVer = typeof directDoc.commissionVersion === 'number' ? directDoc.commissionVersion : 0;
+  if (localVer > remoteVer) {
+    return { ...directDoc, ...baseRecord };
+  }
+  return { ...baseRecord, ...directDoc };
+}
+
+async function resolveAuthoritativeTutorForPricing(
+  rawTutorRef: string,
+  db: any
+): Promise<
+  | {
+      ok: true;
+      canonicalUid: string;
+      publicTutorId: string;
+      tutor: any;
+    }
+  | {
+      ok: false;
+      status: number;
+      error: string;
+      message: string;
+    }
+> {
+  const cleanRef = (rawTutorRef || '').trim();
+  if (!cleanRef || isGenericTutorId(cleanRef) || cleanRef.includes('@')) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'INVALID_TUTOR_IDENTIFIER',
+      message: 'Identificador canônico do Amigo Nativo inválido.',
+    };
+  }
+
+  const cleanRefLower = cleanRef.toLowerCase();
+  if (db?.deletedTutorIds?.includes(cleanRefLower)) {
+    return {
+      ok: false,
+      status: 404,
+      error: 'TUTOR_NOT_FOUND',
+      message: 'Amigo Nativo não encontrado.',
+    };
+  }
+
+  const catalogRes = await loadAuthoritativeTutorsCatalog(db);
+  if (!catalogRes.ok) {
+    return catalogRes;
+  }
+
+  let candidate: any = catalogRes.tutors.find(
+    (t: any) =>
+      t?.uid === cleanRef ||
+      t?.authUid === cleanRef ||
+      t?.id === cleanRef ||
+      (typeof t?.publicTutorId === 'string' &&
+        (t.publicTutorId === cleanRef || t.publicTutorId.toLowerCase() === cleanRefLower))
+  );
+
+  if (!candidate && isValidCanonicalUid(cleanRef)) {
+    try {
+      const directDoc = await fetchTutorDocumentFromFirestore(cleanRef);
+      if (directDoc) {
+        candidate = { ...directDoc, id: directDoc.id || cleanRef, uid: directDoc.uid || cleanRef };
+      }
+    } catch (err: any) {
+      if (!isPermissionError(err)) {
+        return {
+          ok: false,
+          status: 503,
+          error: 'FIRESTORE_QUERY_FAILED',
+          message: 'Falha ao consultar dados oficiais do professor.',
+        };
+      }
+    }
+  }
+
+  if (!candidate || isTutorDeletedInDb(candidate, db)) {
+    return {
+      ok: false,
+      status: 404,
+      error: 'TUTOR_NOT_FOUND',
+      message: 'Amigo Nativo não encontrado.',
+    };
+  }
+
+  if (!isTutorRecordApprovedForCatalog(candidate)) {
+    return {
+      ok: false,
+      status: 403,
+      error: 'TUTOR_NOT_APPROVED',
+      message: 'Este Amigo Nativo ainda não foi aprovado para comercialização.',
+    };
+  }
+
+  const identity = await resolveTeacherCanonicalIdentity({
+    teacherId: cleanRef,
+    publicTutorId: candidate.publicTutorId || cleanRef,
+    teacherUid:
+      candidate.uid ||
+      candidate.authUid ||
+      (isValidCanonicalUid(candidate.id) ? candidate.id : undefined),
+    teacherEmail: candidate.email,
+    dbState: db,
+  });
+
+  const fallbackUid = [candidate.uid, candidate.authUid, candidate.id].find((v) =>
+    isValidCanonicalUid(v)
+  );
+  const canonicalUid =
+    (identity?.canonicalUid && isValidCanonicalUid(identity.canonicalUid)
+      ? identity.canonicalUid
+      : '') ||
+    (fallbackUid ? String(fallbackUid).trim() : '');
+
+  if (!canonicalUid) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'TUTOR_CANONICAL_IDENTITY_REQUIRED',
+      message: 'Cadastro legado sem UID canônico válido. Comercialização indisponível.',
+    };
+  }
+
+  // Re-fetch freshest persisted record by canonical UID so commission/price updates take effect immediately
+  const localByCanonical = (db?.tutorsList || []).find(
+    (t: any) =>
+      t?.uid === canonicalUid ||
+      t?.authUid === canonicalUid ||
+      t?.id === canonicalUid
+  );
+  let authoritativeRecord = mergeFresherCommissionRecord(candidate, localByCanonical);
+
+  try {
+    const [fsTutorDoc, fsUserDoc] = await Promise.all([
+      fetchTutorDocumentFromFirestore(canonicalUid),
+      fetchUserDocumentFromFirestore(canonicalUid),
+    ]);
+    if (fsUserDoc && String(fsUserDoc.role || '').toLowerCase().trim() === 'student') {
+      return {
+        ok: false,
+        status: 403,
+        error: 'TUTOR_NOT_APPROVED',
+        message: 'Identificador não pertence a um professor aprovado.',
+      };
+    }
+    if (fsTutorDoc) {
+      authoritativeRecord = mergeFresherCommissionRecord(authoritativeRecord, fsTutorDoc);
+    }
+  } catch (err: any) {
+    if (!isPermissionError(err)) {
+      console.warn('[FIN.2C Pricing] Falha ao revalidar tutor no Firestore:', err?.message || err);
+    }
+  }
+
+  if (isTutorDeletedInDb(authoritativeRecord, db)) {
+    return {
+      ok: false,
+      status: 404,
+      error: 'TUTOR_NOT_FOUND',
+      message: 'Amigo Nativo não encontrado.',
+    };
+  }
+
+  if (!isTutorRecordApprovedForCatalog(authoritativeRecord)) {
+    return {
+      ok: false,
+      status: 403,
+      error: 'TUTOR_NOT_APPROVED',
+      message: 'Este Amigo Nativo não está aprovado para comercialização.',
+    };
+  }
+
+  const basePriceUsd = extractValidTutorBasePriceUsd(authoritativeRecord);
+  if (basePriceUsd === null) {
+    return {
+      ok: false,
+      status: 422,
+      error: 'TUTOR_BASE_PRICE_UNAVAILABLE',
+      message: 'O valor-base por aula deste Amigo Nativo não está configurado.',
+    };
+  }
+
+  if (!hasValidPersistedCommission(authoritativeRecord) || !isTutorCommercializable(authoritativeRecord)) {
+    return {
+      ok: false,
+      status: 422,
+      error: 'TUTOR_COMMISSION_NOT_CONFIGURED',
+      message: 'A configuração comercial deste Amigo Nativo ainda não foi concluída pela administração.',
+    };
+  }
+
+  return {
+    ok: true,
+    canonicalUid,
+    publicTutorId: buildPublicTutorIdentifierSlug(authoritativeRecord, canonicalUid),
+    tutor: authoritativeRecord,
+  };
+}
+
+async function handleSinglePricingQuoteRequest(
+  rawTutorRef: string,
+  req: express.Request,
+  res: express.Response,
+  allowedQueryKeys: string[] = []
+) {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+
+  if (!checkPricingQuoteRateLimit(req, res)) return;
+  if (rejectUntrustedPricingQueryParams(req, res, allowedQueryKeys)) return;
+
+  const db = readDb();
+  const resolved = await resolveAuthoritativeTutorForPricing(rawTutorRef, db);
+  if (!resolved.ok) {
+    return res.status(resolved.status).json({
+      success: false,
+      commercializable: false,
+      error: resolved.error,
+      message: resolved.message,
+    });
+  }
+
+  let ptaxResult: PtaxQuoteResult;
+  try {
+    ptaxResult = await getPtaxClosingD1();
+  } catch (err: any) {
+    return res.status(503).json({
+      success: false,
+      commercializable: false,
+      error: 'PTAX_UNAVAILABLE',
+      message: 'Cotação oficial PTAX D-1 indisponível no momento.',
+    });
+  }
+
+  if (!ptaxResult?.success || typeof ptaxResult.ptaxRate !== 'number' || !Number.isFinite(ptaxResult.ptaxRate) || ptaxResult.ptaxRate <= 0) {
+    return res.status(503).json({
+      success: false,
+      commercializable: false,
+      error: 'PTAX_UNAVAILABLE',
+      message: ptaxResult?.details || 'Cotação oficial PTAX D-1 indisponível no momento.',
+    });
+  }
+
+  try {
+    const basePriceUsd = extractValidTutorBasePriceUsd(resolved.tutor) as number;
+    const quote = calculateFinancialPricingQuote({
+      basePriceUsd,
+      adminCommissionPercent: Number(resolved.tutor.adminCommissionPercent),
+      ptaxRate: ptaxResult.ptaxRate,
+      commissionModel: 'MARKUP',
+      conversionBase: 'UNIT_PRICE_BRL',
+    });
+
+    const dto = buildPublicTutorPricingQuoteDto({
+      canonicalUid: resolved.canonicalUid,
+      publicTutorId: resolved.publicTutorId,
+      tutorName: String(resolved.tutor.name || ''),
+      ptax: ptaxResult,
+      quote,
+    });
+
+    return res.json(dto);
+  } catch (err: any) {
+    return res.status(500).json({
+      success: false,
+      commercializable: false,
+      error: 'PRICING_CALCULATION_FAILED',
+      message: 'Falha ao calcular cotação oficial de pacotes.',
+    });
+  }
+}
+
+app.get('/api/financial/pricing-quote/:tutorId', async (req, res) => {
+  const rawTutorId = decodeURIComponent(req.params.tutorId || '').trim();
+  return handleSinglePricingQuoteRequest(rawTutorId, req, res, []);
+});
+
+app.get('/api/financial/pricing-quote', async (req, res) => {
+  const rawTutorId = typeof req.query?.tutorId === 'string' ? req.query.tutorId.trim() : '';
+  return handleSinglePricingQuoteRequest(rawTutorId, req, res, ['tutorId']);
+});
+
+app.get('/api/financial/pricing-quotes', async (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+
+  if (!checkPricingQuoteRateLimit(req, res)) return;
+  if (rejectUntrustedPricingQueryParams(req, res, [])) return;
+
+  let ptaxResult: PtaxQuoteResult;
+  try {
+    ptaxResult = await getPtaxClosingD1();
+  } catch {
+    return res.status(503).json({
+      success: false,
+      error: 'PTAX_UNAVAILABLE',
+      message: 'Cotação oficial PTAX D-1 indisponível no momento.',
+    });
+  }
+
+  if (!ptaxResult?.success || typeof ptaxResult.ptaxRate !== 'number' || !Number.isFinite(ptaxResult.ptaxRate) || ptaxResult.ptaxRate <= 0) {
+    return res.status(503).json({
+      success: false,
+      error: 'PTAX_UNAVAILABLE',
+      message: ptaxResult?.details || 'Cotação oficial PTAX D-1 indisponível no momento.',
+    });
+  }
+
+  const db = readDb();
+  const catalogRes = await loadAuthoritativeTutorsCatalog(db);
+  if (!catalogRes.ok) {
+    return res.status(catalogRes.status).json({
+      success: false,
+      error: catalogRes.error,
+      message: catalogRes.message,
+    });
+  }
+
+  const quotesByTutorId: Record<string, PublicTutorPricingQuoteDto> = {};
+  const unavailableByTutorId: Record<
+    string,
+    { commercializable: false; error: string; message: string; httpStatus: number }
+  > = {};
+
+  for (const candidate of catalogRes.tutors) {
+    if (!candidate || isTutorDeletedInDb(candidate, db) || !isTutorRecordApprovedForCatalog(candidate)) {
+      continue;
+    }
+
+    const identity = await resolveTeacherCanonicalIdentity({
+      teacherId: candidate.id || candidate.publicTutorId || '',
+      publicTutorId: candidate.publicTutorId || '',
+      teacherUid:
+        candidate.uid ||
+        candidate.authUid ||
+        (isValidCanonicalUid(candidate.id) ? candidate.id : undefined),
+      teacherEmail: candidate.email,
+      dbState: db,
+    });
+
+    const fallbackUid = [candidate.uid, candidate.authUid, candidate.id].find((v) =>
+      isValidCanonicalUid(v)
+    );
+    const canonicalUid =
+      (identity?.canonicalUid && isValidCanonicalUid(identity.canonicalUid)
+        ? identity.canonicalUid
+        : '') || (fallbackUid ? String(fallbackUid).trim() : '');
+
+    const publicSlug = buildPublicTutorIdentifierSlug(candidate, canonicalUid || candidate.id || '');
+    const lookupKeys = Array.from(
+      new Set(
+        [canonicalUid, candidate.id, candidate.uid, candidate.authUid, publicSlug, publicSlug?.toLowerCase()]
+          .filter((k): k is string => typeof k === 'string' && k.trim() !== '' && !k.includes('@'))
+      )
+    );
+
+    if (!canonicalUid) {
+      const unavail = {
+        commercializable: false as const,
+        error: 'TUTOR_CANONICAL_IDENTITY_REQUIRED',
+        message: 'Cadastro legado sem UID canônico válido.',
+        httpStatus: 409,
+      };
+      for (const key of lookupKeys) unavailableByTutorId[key] = unavail;
+      continue;
+    }
+
+    const localByCanonical = (db?.tutorsList || []).find(
+      (t: any) =>
+        t?.uid === canonicalUid ||
+        t?.authUid === canonicalUid ||
+        t?.id === canonicalUid
+    );
+    const authoritativeTutor = mergeFresherCommissionRecord(candidate, localByCanonical);
+    const basePriceUsd = extractValidTutorBasePriceUsd(authoritativeTutor);
+
+    if (basePriceUsd === null) {
+      const unavail = {
+        commercializable: false as const,
+        error: 'TUTOR_BASE_PRICE_UNAVAILABLE',
+        message: 'Valor-base por aula indisponível.',
+        httpStatus: 422,
+      };
+      for (const key of lookupKeys) unavailableByTutorId[key] = unavail;
+      continue;
+    }
+
+    if (!hasValidPersistedCommission(authoritativeTutor) || !isTutorCommercializable(authoritativeTutor)) {
+      const unavail = {
+        commercializable: false as const,
+        error: 'TUTOR_COMMISSION_NOT_CONFIGURED',
+        message: 'Configuração comercial pendente pela administração.',
+        httpStatus: 422,
+      };
+      for (const key of lookupKeys) unavailableByTutorId[key] = unavail;
+      continue;
+    }
+
+    try {
+      const quote = calculateFinancialPricingQuote({
+        basePriceUsd,
+        adminCommissionPercent: Number(authoritativeTutor.adminCommissionPercent),
+        ptaxRate: ptaxResult.ptaxRate,
+        commissionModel: 'MARKUP',
+        conversionBase: 'UNIT_PRICE_BRL',
+      });
+
+      const dto = buildPublicTutorPricingQuoteDto({
+        canonicalUid,
+        publicTutorId: publicSlug || canonicalUid,
+        tutorName: String(authoritativeTutor.name || ''),
+        ptax: ptaxResult,
+        quote,
+      });
+
+      for (const key of lookupKeys) {
+        quotesByTutorId[key] = dto;
+      }
+    } catch {
+      const unavail = {
+        commercializable: false as const,
+        error: 'PRICING_CALCULATION_FAILED',
+        message: 'Falha ao calcular cotação deste professor.',
+        httpStatus: 500,
+      };
+      for (const key of lookupKeys) unavailableByTutorId[key] = unavail;
+    }
+  }
+
+  return res.json({
+    success: true,
+    currency: 'BRL',
+    ptax: {
+      rate: ptaxResult.ptaxRate,
+      quoteDate: ptaxResult.quoteDate || '',
+      pricingDate: ptaxResult.pricingDate || '',
+      source: ptaxResult.source || 'BACEN_PTAX_D1',
+      ...(ptaxResult.tipoBoletim ? { tipoBoletim: ptaxResult.tipoBoletim } : {}),
+    },
+    quotesByTutorId,
+    unavailableByTutorId,
+  });
+});
+
 
 // Purchase Lesson Package with a specific Native Friend (binds tutor as fixed + adds lessons)
 app.post('/api/students/purchase-package', async (req, res) => {

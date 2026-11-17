@@ -5,6 +5,11 @@ import { isGenericPedagogicalDefinition } from './serverGeminiSecurity';
 import { isLegacyGenericTransformation } from './utils/pedagogicalTransformer';
 import { createCleanStudentRoutines } from './data/defaultRoutines';
 import { deriveLegacyRevisionToken, mintSessionNoteRevisionToken } from './utils/notesVersioning';
+import {
+  buildVersionedCommissionFields,
+  hasValidPersistedCommission,
+  ALLOWED_COMMISSION_MODEL,
+} from './utils/tutorCommission';
 
 /**
  * Active identifiers for staging persistence.
@@ -144,6 +149,7 @@ import {
   mergeTutors,
   consolidateTutorsList,
   isValidCanonicalUid,
+  isSyntheticLegacyUid,
   isGenericTutorId,
   type CanonicalTutorRecord,
 } from './utils/tutorConsolidation';
@@ -12614,5 +12620,459 @@ export async function prepareNewWeeklyCycleServer(params: {
     return { ok: false, statusCode: 500, error: err?.message || 'Failed to prepare new weekly cycle.' };
   }
 }
+
+class CommissionTransactionError extends Error {
+  statusCode: number;
+  code: string;
+  constructor(statusCode: number, code: string, message: string) {
+    super(message);
+    this.statusCode = statusCode;
+    this.code = code;
+  }
+}
+
+/**
+ * FIN.2B: Resolve o Firebase Auth UID canônico de um Native Friend em fluxos de moderação/aprovação
+ * (suporta pendentes e aprovados), bloqueando contas canônicas de aluno e mapeamentos conflitantes.
+ */
+export async function resolveCanonicalUidForTutorModeration(params: {
+  candidateTutor?: any;
+  tutorIdParam?: string;
+  dbState?: any;
+}): Promise<
+  | { ok: true; canonicalUid: string; existingUserDoc?: any; existingTutorDoc?: any }
+  | { ok: false; status: number; code: string; error: string }
+> {
+  const { candidateTutor, tutorIdParam, dbState } = params;
+  const db = getFirestoreDb();
+
+  const candidateEmail = (candidateTutor?.email || (tutorIdParam && tutorIdParam.includes('@') ? tutorIdParam : '') || '')
+    .toLowerCase()
+    .trim();
+  const candidatePublicId = (
+    candidateTutor?.publicTutorId ||
+    (tutorIdParam && !tutorIdParam.includes('@') && !isValidCanonicalUid(tutorIdParam) ? tutorIdParam : '') ||
+    ''
+  )
+    .toLowerCase()
+    .trim();
+
+  const candidateUids = new Set<string>();
+  const addIfCanonical = (val: unknown) => {
+    if (typeof val === 'string') {
+      const trimmed = val.trim();
+      if (isValidCanonicalUid(trimmed) && !isSyntheticLegacyUid(trimmed)) {
+        candidateUids.add(trimmed);
+      }
+    }
+  };
+
+  addIfCanonical(candidateTutor?.authUid);
+  addIfCanonical(candidateTutor?.uid);
+  if (
+    !candidateTutor?.authUid &&
+    !candidateTutor?.uid &&
+    candidateTutor?.id &&
+    candidateTutor.id !== candidateTutor.publicTutorId
+  ) {
+    addIfCanonical(candidateTutor.id);
+  }
+  if (
+    candidateUids.size === 0 &&
+    tutorIdParam &&
+    (!candidatePublicId || tutorIdParam.toLowerCase() !== candidatePublicId)
+  ) {
+    addIfCanonical(tutorIdParam);
+  }
+
+  let existingUserDoc: any = null;
+  let existingTutorDoc: any = null;
+
+  if (db) {
+    try {
+      const firstUid = Array.from(candidateUids)[0];
+      if (firstUid) {
+        const [uSnap, tSnap] = await Promise.all([
+          db.collection('users').doc(firstUid).get().catch(() => null),
+          db.collection('tutors').doc(firstUid).get().catch(() => null),
+        ]);
+        if (uSnap && uSnap.exists) existingUserDoc = { id: uSnap.id, ...uSnap.data() };
+        if (tSnap && tSnap.exists) existingTutorDoc = { id: tSnap.id, ...tSnap.data() };
+      }
+
+      if (candidateUids.size === 0 && candidatePublicId) {
+        const [tPubSnap, uPubSnap] = await Promise.all([
+          db.collection('tutors').where('publicTutorId', '==', candidatePublicId).get().catch(() => null),
+          db.collection('users').where('publicTutorId', '==', candidatePublicId).get().catch(() => null),
+        ]);
+        const collectDocs = (snap: any, target: 'tutor' | 'user') => {
+          if (!snap) return;
+          const docs = snap.docs || [];
+          for (const d of docs) {
+            const data = typeof d.data === 'function' ? d.data() : {};
+            addIfCanonical(data?.authUid);
+            addIfCanonical(data?.uid);
+            if (!data?.authUid && !data?.uid && d.id !== data?.publicTutorId) {
+              addIfCanonical(d.id);
+            }
+            if (target === 'tutor' && !existingTutorDoc) existingTutorDoc = { id: d.id, ...data };
+            if (target === 'user' && !existingUserDoc) existingUserDoc = { id: d.id, ...data };
+          }
+        };
+        collectDocs(tPubSnap, 'tutor');
+        collectDocs(uPubSnap, 'user');
+      }
+
+      if (candidateUids.size === 0 && candidateEmail) {
+        const [tEmSnap, uEmSnap] = await Promise.all([
+          db.collection('tutors').where('email', '==', candidateEmail).get().catch(() => null),
+          db.collection('users').where('email', '==', candidateEmail).get().catch(() => null),
+        ]);
+        const collectEmailDocs = (snap: any, target: 'tutor' | 'user') => {
+          if (!snap) return;
+          const docs = snap.docs || [];
+          for (const d of docs) {
+            const data = typeof d.data === 'function' ? d.data() : {};
+            addIfCanonical(data?.authUid);
+            addIfCanonical(data?.uid);
+            if (!data?.authUid && !data?.uid && d.id !== data?.publicTutorId) {
+              addIfCanonical(d.id);
+            }
+            if (target === 'tutor' && !existingTutorDoc) existingTutorDoc = { id: d.id, ...data };
+            if (target === 'user' && !existingUserDoc) existingUserDoc = { id: d.id, ...data };
+          }
+        };
+        collectEmailDocs(tEmSnap, 'tutor');
+        collectEmailDocs(uEmSnap, 'user');
+      }
+    } catch (fsErr) {
+      console.warn('[resolveCanonicalUidForTutorModeration] Firestore inspection notice:', fsErr);
+    }
+  }
+
+  // Fallback check via Firebase Admin Auth by email if UID not yet resolved
+  if (candidateUids.size === 0 && candidateEmail) {
+    try {
+      const { getFirebaseAdminAuth } = await import('./serverFirebaseAdmin');
+      const adminAuth = getFirebaseAdminAuth();
+      if (adminAuth) {
+        const uRec = await adminAuth.getUserByEmail(candidateEmail).catch(() => null);
+        if (uRec?.uid) addIfCanonical(uRec.uid);
+      }
+    } catch {}
+  }
+
+  // Fallback check via in-memory dbState if provided
+  if (candidateUids.size === 0 && dbState) {
+    const allMem = [...(dbState.tutorsList || []), ...(dbState.teachers || [])];
+    for (const item of allMem) {
+      if (!item) continue;
+      const itemEm = (item.email || '').toLowerCase().trim();
+      const itemPub = (item.publicTutorId || item.id || '').toLowerCase().trim();
+      if (
+        (candidateEmail && itemEm === candidateEmail) ||
+        (candidatePublicId && itemPub === candidatePublicId)
+      ) {
+        addIfCanonical(item.authUid);
+        addIfCanonical(item.uid);
+        addIfCanonical(item.id);
+      }
+    }
+  }
+
+  if (candidateUids.size > 1) {
+    return {
+      ok: false,
+      status: 409,
+      code: 'CONFLICTING_CANONICAL_UID',
+      error: 'Mapeamento conflitante entre múltiplos UIDs canônicos para este Native Friend.',
+    };
+  }
+
+  const canonicalUid = Array.from(candidateUids)[0] || '';
+  if (!canonicalUid || !isValidCanonicalUid(canonicalUid)) {
+    return {
+      ok: false,
+      status: 409,
+      code: 'CANONICAL_UID_REQUIRED',
+      error: 'Não foi possível comprovar o UID canônico do Firebase Authentication para este Native Friend.',
+    };
+  }
+
+  // Fetch canonical users/{canonicalUid} if not yet read
+  if (db && !existingUserDoc) {
+    const uSnap = await db.collection('users').doc(canonicalUid).get().catch(() => null);
+    if (uSnap && uSnap.exists) {
+      existingUserDoc = { id: uSnap.id, ...uSnap.data() };
+    }
+  }
+
+  const userRole = String(existingUserDoc?.role || existingUserDoc?.userRole || '').toLowerCase().trim();
+  if (userRole === 'student') {
+    return {
+      ok: false,
+      status: 409,
+      code: 'ROLE_MUTATION_FORBIDDEN',
+      error: 'Conta registrada canonicamente como aluno em users/{uid} não pode ser promovida a Native Friend.',
+    };
+  }
+
+  return {
+    ok: true,
+    canonicalUid,
+    existingUserDoc,
+    existingTutorDoc,
+  };
+}
+
+/**
+ * FIN.2B: Executa validação, versionamento e persistência atômica (runTransaction) da comissão individual
+ * e da aprovação no registro canônico do professor vinculado ao Firebase Auth UID.
+ * Garante que falha parcial ou concorrência nunca deixe professor aprovado sem comissão válida
+ * e nunca sobrescreva o histórico imutável.
+ */
+export async function approveAndSaveTutorCommissionTransactionally(params: {
+  canonicalUid: string;
+  baseTutor: Record<string, any>;
+  updatedByUid: string;
+  incomingCommissionPercent?: unknown;
+  incomingCommissionModel?: unknown;
+  approve: boolean;
+  action?: 'initial_approval' | 'admin_configuration' | 'admin_update';
+  forceNewVersion?: boolean;
+  dbState?: any;
+}): Promise<
+  | { ok: true; savedTutor: Record<string, any> }
+  | { ok: false; status: number; code: string; error: string }
+> {
+  const {
+    canonicalUid,
+    baseTutor,
+    updatedByUid,
+    incomingCommissionPercent,
+    incomingCommissionModel,
+    approve,
+    action,
+    forceNewVersion = false,
+    dbState,
+  } = params;
+
+  if (!canonicalUid || !isValidCanonicalUid(canonicalUid)) {
+    return {
+      ok: false,
+      status: 409,
+      code: 'CANONICAL_UID_REQUIRED',
+      error: 'UID canônico inválido para persistência da comissão.',
+    };
+  }
+
+  const cleanAdminUid = typeof updatedByUid === 'string' ? updatedByUid.trim() : '';
+  if (!cleanAdminUid) {
+    return {
+      ok: false,
+      status: 401,
+      code: 'ADMIN_UID_REQUIRED',
+      error: 'UID do administrador autenticado é obrigatório.',
+    };
+  }
+
+  const cleanEmail = String(baseTutor?.email || '').toLowerCase().trim();
+  const publicTutorId =
+    (baseTutor?.publicTutorId && !isGenericTutorId(baseTutor.publicTutorId) ? String(baseTutor.publicTutorId).trim() : null) ||
+    (baseTutor?.id && !isValidCanonicalUid(baseTutor.id) && !isGenericTutorId(baseTutor.id) ? String(baseTutor.id).trim() : null) ||
+    (cleanEmail ? `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : null) ||
+    (baseTutor?.name && typeof baseTutor.name === 'string' && !isGenericTutorId(baseTutor.name)
+      ? normalizeTutorName(baseTutor.name).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+      : null) ||
+    canonicalUid;
+
+  const legacyIds = Array.from(
+    new Set(
+      [
+        ...(Array.isArray(baseTutor?.legacyIds) ? baseTutor.legacyIds : []),
+        baseTutor?.legacyId && baseTutor.legacyId !== canonicalUid ? baseTutor.legacyId : null,
+        baseTutor?.id && baseTutor.id !== canonicalUid ? baseTutor.id : null,
+      ].filter(Boolean)
+    )
+  );
+
+  const buildSanitizedFinalRecord = (authoritativeTutorDoc: any, authoritativeUserDoc: any) => {
+    // Reject canonical student account
+    const uRole = String(authoritativeUserDoc?.role || authoritativeUserDoc?.userRole || '').toLowerCase().trim();
+    if (uRole === 'student') {
+      throw new CommissionTransactionError(
+        409,
+        'ROLE_MUTATION_FORBIDDEN',
+        `Conta '${canonicalUid}' está registrada canonicamente como aluno em users/{uid}.`
+      );
+    }
+
+    if (dbState && !authoritativeTutorDoc?.approvalStatus) {
+      const isLocalStudent =
+        (dbState.students || []).some((s: any) => s.uid === canonicalUid || (cleanEmail && (s.email || s.studentEmail || '').toLowerCase() === cleanEmail)) ||
+        (dbState.userProfiles && Object.entries(dbState.userProfiles).some(([k, p]: any) => (p?.uid === canonicalUid || (cleanEmail && k.toLowerCase() === cleanEmail)) && p?.role === 'student'));
+      if (isLocalStudent && !authoritativeUserDoc?.role) {
+        throw new CommissionTransactionError(
+          409,
+          'ROLE_MUTATION_FORBIDDEN',
+          `Conta '${canonicalUid}' está registrada como aluno e não pode ser convertida em Native Friend.`
+        );
+      }
+    }
+
+    // Authoritative commission source inside transaction prevents concurrent overwrite of version history
+    const authoritativeCommissionSource = authoritativeTutorDoc
+      ? {
+          ...baseTutor,
+          ...(hasValidPersistedCommission(authoritativeTutorDoc)
+            ? {
+                adminCommissionPercent: authoritativeTutorDoc.adminCommissionPercent,
+                commissionModel: authoritativeTutorDoc.commissionModel || ALLOWED_COMMISSION_MODEL,
+                commissionVersion: authoritativeTutorDoc.commissionVersion,
+                effectiveFrom: authoritativeTutorDoc.effectiveFrom,
+                commissionUpdatedAt: authoritativeTutorDoc.commissionUpdatedAt,
+                updatedByUid: authoritativeTutorDoc.updatedByUid,
+                updatedAt: authoritativeTutorDoc.updatedAt,
+              }
+            : {}),
+          ...(Array.isArray(authoritativeTutorDoc.commissionHistory)
+            ? { commissionHistory: authoritativeTutorDoc.commissionHistory }
+            : {}),
+        }
+      : baseTutor;
+
+    const nowIso = new Date().toISOString();
+    const versioned = buildVersionedCommissionFields({
+      existingTutor: authoritativeCommissionSource,
+      incomingCommissionPercent,
+      incomingCommissionModel,
+      updatedByUid: cleanAdminUid,
+      nowIso,
+      action,
+      forceNewVersion,
+    });
+
+    if (!versioned.ok) {
+      throw new CommissionTransactionError(versioned.status, versioned.code, versioned.error);
+    }
+
+    const existingApprovalStatus = authoritativeTutorDoc?.approvalStatus ?? baseTutor?.approvalStatus ?? 'pending';
+    const existingIsApproved = Boolean(
+      (authoritativeTutorDoc?.isApproved ?? baseTutor?.isApproved) === true &&
+      existingApprovalStatus === 'approved'
+    );
+
+    const finalApprovalStatus = approve ? 'approved' : existingApprovalStatus;
+    const finalIsApproved = approve ? true : existingIsApproved;
+
+    const mergedRaw = {
+      ...(authoritativeTutorDoc || {}),
+      ...baseTutor,
+      id: canonicalUid,
+      uid: canonicalUid,
+      authUid: canonicalUid,
+      publicTutorId,
+      legacyIds,
+      email: cleanEmail || authoritativeTutorDoc?.email || baseTutor?.email || '',
+      role: 'teacher',
+      approvalStatus: finalApprovalStatus,
+      isApproved: finalIsApproved,
+      status: finalApprovalStatus,
+      approved: finalIsApproved,
+      ...versioned.fields,
+      isCommercializable: finalApprovalStatus === 'approved' && finalIsApproved === true,
+    };
+
+    return JSON.parse(JSON.stringify(mergedRaw));
+  };
+
+  const db = getFirestoreDb();
+
+  if (db && !isCloudWriteDisabled) {
+    const tutorRef = db.collection('tutors').doc(canonicalUid);
+    const userRef = db.collection('users').doc(canonicalUid);
+
+    try {
+      if (typeof (db as any).runTransaction === 'function') {
+        const committed = await (db as any).runTransaction(async (tx: any) => {
+          const [tSnap, uSnap] = await Promise.all([
+            tx.get(tutorRef),
+            tx.get(userRef),
+          ]);
+          const tData = tSnap && tSnap.exists ? tSnap.data() : null;
+          const uData = uSnap && uSnap.exists ? uSnap.data() : null;
+
+          const sanitized = buildSanitizedFinalRecord(tData, uData);
+
+          tx.set(tutorRef, sanitized, { merge: true });
+          if (sanitized.isApproved === true || (uData && uData.role === 'teacher')) {
+            tx.set(userRef, sanitized, { merge: true });
+          }
+
+          return sanitized;
+        });
+
+        return { ok: true, savedTutor: committed };
+      } else {
+        // Fallback for simplified test mocks without runTransaction
+        const [tSnap, uSnap] = await Promise.all([
+          tutorRef.get().catch(() => null),
+          userRef.get().catch(() => null),
+        ]);
+        const tData = tSnap && tSnap.exists ? tSnap.data() : null;
+        const uData = uSnap && uSnap.exists ? uSnap.data() : null;
+
+        const sanitized = buildSanitizedFinalRecord(tData, uData);
+
+        await tutorRef.set(sanitized, { merge: true });
+        if (sanitized.isApproved === true || (uData && uData.role === 'teacher')) {
+          await userRef.set(sanitized, { merge: true });
+        }
+
+        return { ok: true, savedTutor: sanitized };
+      }
+    } catch (err: any) {
+      if (err instanceof CommissionTransactionError) {
+        return {
+          ok: false,
+          status: err.statusCode,
+          code: err.code,
+          error: err.message,
+        };
+      }
+
+      const msg = String(err?.message || err || 'Erro ao persistir comissão no Firestore.');
+      console.error('[approveAndSaveTutorCommissionTransactionally] Firestore transaction failed:', msg);
+      return {
+        ok: false,
+        status: isPermissionError(err) ? 403 : 500,
+        code: 'FIRESTORE_TRANSACTION_FAILED',
+        error: `Falha ao persistir comissão e aprovação no Firestore: ${msg}`,
+      };
+    }
+  }
+
+  // Fallback when Firestore client is unavailable (only validates strictly, never bypasses validation)
+  try {
+    const sanitized = buildSanitizedFinalRecord(baseTutor, null);
+    return { ok: true, savedTutor: sanitized };
+  } catch (err: any) {
+    if (err instanceof CommissionTransactionError) {
+      return {
+        ok: false,
+        status: err.statusCode,
+        code: err.code,
+        error: err.message,
+      };
+    }
+    return {
+      ok: false,
+      status: 500,
+      code: 'COMMISSION_PERSISTENCE_ERROR',
+      error: err?.message || 'Erro ao processar comissão do Native Friend.',
+    };
+  }
+}
+
 
 

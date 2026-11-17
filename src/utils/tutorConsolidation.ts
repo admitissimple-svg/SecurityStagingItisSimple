@@ -45,6 +45,15 @@ export interface CanonicalTutorRecord {
   appliedAt?: string;
   createdAt?: string;
   updatedAt?: string;
+  adminCommissionPercent?: number;
+  commissionModel?: string;
+  commissionVersion?: number;
+  effectiveFrom?: string;
+  updatedByUid?: string;
+  commissionUpdatedAt?: string;
+  commissionHistory?: any[];
+  financialConfigurationPending?: boolean;
+  isCommercializable?: boolean;
   [key: string]: any;
 }
 
@@ -513,8 +522,8 @@ export function mergeTutors(existing: any, incoming: any): any {
     finalSpecialties = ['Conversação', 'Pronúncia', 'Fluência'];
   }
 
-  // Pricing resolution
-  let finalPriceUsd = 20;
+  // Pricing resolution (strictly preserve persisted values without inventing defaults or fixed multipliers)
+  let finalPriceUsd: number | undefined = undefined;
   if (typeof incoming.pricePerSessionUsd === 'number' && !isNaN(incoming.pricePerSessionUsd) && incoming.pricePerSessionUsd > 0) {
     finalPriceUsd = incoming.pricePerSessionUsd;
   } else if (incoming.pricePerSessionUsd !== undefined && Number(incoming.pricePerSessionUsd) > 0) {
@@ -525,7 +534,7 @@ export function mergeTutors(existing: any, incoming: any): any {
     finalPriceUsd = Number(existing.pricePerSessionUsd);
   }
 
-  let finalPriceBrl = Math.round(finalPriceUsd * 5.5);
+  let finalPriceBrl: number | undefined = undefined;
   if (typeof incoming.pricePerSessionBrl === 'number' && !isNaN(incoming.pricePerSessionBrl) && incoming.pricePerSessionBrl > 0) {
     finalPriceBrl = incoming.pricePerSessionBrl;
   } else if (incoming.pricePerSessionBrl !== undefined && Number(incoming.pricePerSessionBrl) > 0) {
@@ -613,8 +622,8 @@ export function mergeTutors(existing: any, incoming: any): any {
     availableHours: finalAvailableHours,
     availableHoursByDay: finalAvailableHoursByDay,
     availability: finalAvailability,
-    pricePerSessionUsd: finalPriceUsd,
-    pricePerSessionBrl: finalPriceBrl,
+    ...(finalPriceUsd !== undefined ? { pricePerSessionUsd: finalPriceUsd } : {}),
+    ...(finalPriceBrl !== undefined ? { pricePerSessionBrl: finalPriceBrl } : {}),
     videoIntroUrl: finalVideoLink,
     youtubeUrl: finalVideoLink,
     videoUrl: finalVideoLink,
@@ -636,6 +645,52 @@ export function mergeTutors(existing: any, incoming: any): any {
     role: 'teacher',
     appliedAt: existing.appliedAt || incoming.appliedAt || existing.createdAt || incoming.createdAt || new Date().toISOString(),
     updatedAt: incoming.updatedAt || existing.updatedAt || undefined,
+    // FIN.2B: Preserve administrative commission fields strictly without fallback or invention
+    ...(typeof incoming.adminCommissionPercent === 'number' && Number.isFinite(incoming.adminCommissionPercent)
+      ? { adminCommissionPercent: incoming.adminCommissionPercent }
+      : typeof existing.adminCommissionPercent === 'number' && Number.isFinite(existing.adminCommissionPercent)
+      ? { adminCommissionPercent: existing.adminCommissionPercent }
+      : {}),
+    ...(incoming.commissionModel !== undefined
+      ? { commissionModel: incoming.commissionModel }
+      : existing.commissionModel !== undefined
+      ? { commissionModel: existing.commissionModel }
+      : {}),
+    ...(typeof incoming.commissionVersion === 'number'
+      ? { commissionVersion: incoming.commissionVersion }
+      : typeof existing.commissionVersion === 'number'
+      ? { commissionVersion: existing.commissionVersion }
+      : {}),
+    ...(incoming.effectiveFrom !== undefined
+      ? { effectiveFrom: incoming.effectiveFrom }
+      : existing.effectiveFrom !== undefined
+      ? { effectiveFrom: existing.effectiveFrom }
+      : {}),
+    ...(incoming.updatedByUid !== undefined
+      ? { updatedByUid: incoming.updatedByUid }
+      : existing.updatedByUid !== undefined
+      ? { updatedByUid: existing.updatedByUid }
+      : {}),
+    ...(incoming.commissionUpdatedAt !== undefined
+      ? { commissionUpdatedAt: incoming.commissionUpdatedAt }
+      : existing.commissionUpdatedAt !== undefined
+      ? { commissionUpdatedAt: existing.commissionUpdatedAt }
+      : {}),
+    ...(Array.isArray(incoming.commissionHistory)
+      ? { commissionHistory: incoming.commissionHistory }
+      : Array.isArray(existing.commissionHistory)
+      ? { commissionHistory: existing.commissionHistory }
+      : {}),
+    ...(typeof incoming.financialConfigurationPending === 'boolean'
+      ? { financialConfigurationPending: incoming.financialConfigurationPending }
+      : typeof existing.financialConfigurationPending === 'boolean'
+      ? { financialConfigurationPending: existing.financialConfigurationPending }
+      : {}),
+    ...(typeof incoming.isCommercializable === 'boolean'
+      ? { isCommercializable: incoming.isCommercializable }
+      : typeof existing.isCommercializable === 'boolean'
+      ? { isCommercializable: existing.isCommercializable }
+      : {}),
   };
 }
 

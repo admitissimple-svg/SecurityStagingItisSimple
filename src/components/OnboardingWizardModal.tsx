@@ -30,6 +30,7 @@ import {
   Palette,
   MessageCircle,
   HelpCircle as QuestionIcon,
+  RefreshCw,
 } from 'lucide-react';
 import {
   DayOfWeek,
@@ -42,6 +43,8 @@ import {
 import { firebaseSignUpWithEmail, firebaseSignInWithEmail, googleSignIn, waitForAuthUser } from '../utils/auth';
 import { auth } from '../firebase';
 import { consolidateTutorsList, isGenericTutorId, normalizeTutorName, isValidCanonicalUid } from '../utils/tutorConsolidation';
+import { useBatchTutorPricingQuotes, useSingleTutorPricingQuote } from '../hooks/useTutorPricingQuote';
+import { findQuoteForTutor, formatBrl } from '../utils/pricingQuoteClient';
 
 export interface OnboardingResultData {
   learningGoal: string;
@@ -327,6 +330,23 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
     return '';
   });
   const [previewTutorModal, setPreviewTutorModal] = useState<NativeFriendTutor | null>(null);
+
+  const {
+    quotesByTutorId,
+    unavailableByTutorId,
+    isLoading: isBatchQuotesLoading,
+    error: batchQuoteError,
+    errorCode: batchQuoteErrorCode,
+    refresh: refreshBatchQuotes,
+  } = useBatchTutorPricingQuotes(isOpen && (currentStep === 4 || Boolean(previewTutorModal)), currentStep);
+
+  const {
+    quote: previewTutorQuote,
+    isLoading: isPreviewQuoteLoading,
+    error: previewQuoteError,
+    errorCode: previewQuoteErrorCode,
+    refresh: refreshPreviewQuote,
+  } = useSingleTutorPricingQuote(previewTutorModal, isOpen && Boolean(previewTutorModal));
 
   // Support ESC key to close preview tutor modal or main wizard modal
   useEffect(() => {
@@ -1402,15 +1422,71 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                       {/* Pricing & Actions Row */}
                       <div className="pt-2 border-t border-white/10 flex items-center justify-between gap-2 mt-auto">
                         <div>
-                          <div className="flex items-baseline gap-1">
-                            <span className="text-xs sm:text-sm font-black text-white">
-                              ${tutor.pricePerSessionUsd || 15} USD
-                            </span>
-                            <span className="text-[9.5px] text-slate-300">
-                              / 50 min
-                            </span>
-                          </div>
-                          <span className="text-[9px] font-bold text-emerald-400 block">
+                          {(() => {
+                            const { quote: tutorQuote } = findQuoteForTutor(
+                              tutor,
+                              quotesByTutorId,
+                              unavailableByTutorId
+                            );
+
+                            if (isBatchQuotesLoading && !tutorQuote) {
+                              return (
+                                <div className="space-y-1">
+                                  <div className="h-4 w-20 rounded bg-white/10 animate-pulse" />
+                                  <span className="text-[9px] text-[#9AB4FF] block">
+                                    {isEn ? 'Loading rate...' : 'Consultando valor...'}
+                                  </span>
+                                </div>
+                              );
+                            }
+
+                            if (tutorQuote) {
+                              return (
+                                <>
+                                  <div className="flex items-baseline gap-1 flex-wrap">
+                                    <span className="text-xs sm:text-sm font-black text-white">
+                                      {formatBrl(tutorQuote.unit.finalPriceBrl)}
+                                    </span>
+                                    <span className="text-[9.5px] text-slate-300">
+                                      / 50 min
+                                    </span>
+                                  </div>
+                                  <span className="text-[9px] text-[#F4CA54] font-bold block">
+                                    {isEn
+                                      ? `Packs from ${formatBrl(tutorQuote.lowestEffectiveLessonPriceBrl)}`
+                                      : `Pacotes desde ${formatBrl(tutorQuote.lowestEffectiveLessonPriceBrl)}`}
+                                  </span>
+                                </>
+                              );
+                            }
+
+                            if (batchQuoteError) {
+                              return (
+                                <div className="space-y-0.5">
+                                  <span className="text-[10px] font-bold text-amber-300 block">
+                                    {isEn ? 'Quote unavailable' : 'Cotação indisponível'}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      refreshBatchQuotes();
+                                    }}
+                                    className="text-[9px] text-[#9AB4FF] hover:text-white underline cursor-pointer"
+                                  >
+                                    {isEn ? 'Retry' : 'Tentar novamente'}
+                                  </button>
+                                </div>
+                              );
+                            }
+
+                            return (
+                              <span className="text-[10px] font-bold text-slate-300 block">
+                                {isEn ? 'Packages pending setup' : 'Pacotes em configuração'}
+                              </span>
+                            );
+                          })()}
+                          <span className="text-[9px] font-bold text-emerald-400 block mt-0.5">
                             {isEn ? '1st Lesson Free (25 min)' : '1ª Aula Grátis (25 min)'}
                           </span>
                         </div>
@@ -1556,45 +1632,134 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                             </span>
                           </div>
                           <span className="text-[11px] text-emerald-400 font-bold bg-emerald-500/20 px-2 py-0.5 rounded-full">
-                            {isEn ? '1st Lesson: Free ($0 USD / 25 min)' : '1ª Aula: Grátis ($0 USD / 25 min)'}
+                            {isEn ? '1st Lesson: Free (25 min)' : '1ª Aula: Grátis (25 min)'}
                           </span>
                         </div>
 
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                          <div className="p-3 rounded-xl bg-[#000035]/80 border border-white/10">
-                            <span className="text-[10px] text-slate-400 uppercase font-bold block">
-                              {isEn ? 'Single / On-demand Lesson (50 min)' : 'Aula Avulsa / Flexível (50 min)'}
-                            </span>
-                            <div className="flex items-baseline gap-1 mt-1">
-                              <span className="text-xl font-black text-white">
-                                ${previewTutorModal.pricePerSessionUsd || 15} USD
-                              </span>
-                              <span className="text-xs text-blue-200 font-semibold">
-                                / 50 min
-                              </span>
-                            </div>
-                            <p className="text-[10px] text-slate-300 mt-1">
-                              {isEn ? '50 min individual session via Google Meet' : 'Sessão individual de 50 min no Google Meet'}
-                            </p>
-                          </div>
+                        {(() => {
+                          const fallbackBatch = findQuoteForTutor(
+                            previewTutorModal,
+                            quotesByTutorId,
+                            unavailableByTutorId
+                          );
+                          const resolvedPreviewQuote = previewTutorQuote || fallbackBatch.quote;
 
-                          <div className="p-3 rounded-xl bg-[#000035]/80 border border-[#F4CA54]/30">
-                            <span className="text-[10px] text-[#F4CA54] uppercase font-bold block">
-                              {isEn ? 'Monthly Plans (Post-Trial)' : 'Planos Mensais (Pós-Teste)'}
-                            </span>
-                            <div className="flex items-baseline gap-1 mt-1">
-                              <span className="text-base font-black text-white">
-                                {isEn ? 'From $13 USD / lesson' : 'A partir de $13 USD / aula'}
-                              </span>
-                              <span className="text-[10px] text-emerald-400 font-bold">
-                                (até 15% OFF)
-                              </span>
+                          if (isPreviewQuoteLoading && !resolvedPreviewQuote) {
+                            return (
+                              <div className="p-4 rounded-xl bg-[#000035]/80 border border-white/10 text-center space-y-2">
+                                <div className="h-5 w-36 mx-auto rounded bg-white/10 animate-pulse" />
+                                <p className="text-[11px] text-[#9AB4FF]">
+                                  {isEn ? 'Fetching official BRL package quote...' : 'Consultando cotação oficial em reais...'}
+                                </p>
+                              </div>
+                            );
+                          }
+
+                          if (resolvedPreviewQuote) {
+                            const discountedPacks = resolvedPreviewQuote.packages.filter((p) => p.lessonsCount > 1);
+                            return (
+                              <div className="space-y-3">
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                  <div className="p-3 rounded-xl bg-[#000035]/80 border border-white/10">
+                                    <span className="text-[10px] text-slate-400 uppercase font-bold block">
+                                      {isEn ? 'Single / On-demand Lesson (50 min)' : 'Aula Avulsa / Flexível (50 min)'}
+                                    </span>
+                                    <div className="flex items-baseline gap-1 mt-1">
+                                      <span className="text-xl font-black text-white">
+                                        {formatBrl(resolvedPreviewQuote.unit.finalPriceBrl)}
+                                      </span>
+                                      <span className="text-xs text-blue-200 font-semibold">
+                                        / 50 min
+                                      </span>
+                                    </div>
+                                    <p className="text-[10px] text-slate-300 mt-1">
+                                      {isEn
+                                        ? `Official BACEN PTAX D-1 (${resolvedPreviewQuote.ptax.quoteDate})`
+                                        : `Câmbio oficial PTAX D-1 (${resolvedPreviewQuote.ptax.quoteDate})`}
+                                    </p>
+                                  </div>
+
+                                  <div className="p-3 rounded-xl bg-[#000035]/80 border border-[#F4CA54]/30">
+                                    <span className="text-[10px] text-[#F4CA54] uppercase font-bold block">
+                                      {isEn ? 'Monthly Plans (Post-Trial)' : 'Planos Mensais (Pós-Teste)'}
+                                    </span>
+                                    <div className="flex items-baseline gap-1.5 mt-1 flex-wrap">
+                                      <span className="text-base font-black text-white">
+                                        {isEn
+                                          ? `From ${formatBrl(resolvedPreviewQuote.lowestEffectiveLessonPriceBrl)} / lesson`
+                                          : `A partir de ${formatBrl(resolvedPreviewQuote.lowestEffectiveLessonPriceBrl)} / aula`}
+                                      </span>
+                                      <span className="text-[10px] text-emerald-400 font-bold">
+                                        (até 15% OFF)
+                                      </span>
+                                    </div>
+                                    <p className="text-[10px] text-slate-300 mt-1">
+                                      {isEn ? 'Packages of 4, 8 or 12 lessons with progressive discounts' : 'Pacotes de 4, 8 ou 12 aulas com descontos progressivos'}
+                                    </p>
+                                  </div>
+                                </div>
+
+                                {discountedPacks.length > 0 && (
+                                  <div className="grid grid-cols-3 gap-2">
+                                    {discountedPacks.map((pkg) => (
+                                      <div
+                                        key={pkg.lessonsCount}
+                                        className="p-2 rounded-lg bg-[#000035]/70 border border-white/10 text-center"
+                                      >
+                                        <span className="text-[10px] font-bold text-[#9AB4FF] block">
+                                          {pkg.lessonsCount} {isEn ? 'lessons' : 'aulas'} (-{pkg.discountPercent}%)
+                                        </span>
+                                        <span className="text-xs font-black text-white block mt-0.5">
+                                          {formatBrl(pkg.finalPriceBrl)}
+                                        </span>
+                                        <span className="text-[9.5px] text-emerald-300 block">
+                                          {formatBrl(pkg.effectiveLessonPriceBrl)}/{isEn ? 'ea' : 'aula'}
+                                        </span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          }
+
+                          const isPtaxIssue =
+                            previewQuoteErrorCode === 'PTAX_UNAVAILABLE' ||
+                            batchQuoteErrorCode === 'PTAX_UNAVAILABLE';
+
+                          return (
+                            <div className="p-3.5 rounded-xl bg-[#000035]/80 border border-amber-400/30 space-y-2">
+                              <div className="flex items-start gap-2 text-xs text-amber-200">
+                                <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                                <div>
+                                  <span className="font-bold block text-amber-300">
+                                    {isPtaxIssue
+                                      ? (isEn ? 'Official Exchange Rate Unavailable' : 'Cotação Oficial PTAX Indisponível')
+                                      : (isEn ? 'Commercial Packages Unavailable' : 'Pacotes Temporariamente Indisponíveis')}
+                                  </span>
+                                  <span className="text-[11px] text-slate-300 block mt-0.5">
+                                    {previewQuoteError ||
+                                      batchQuoteError ||
+                                      fallbackBatch.unavailable?.message ||
+                                      (isEn
+                                        ? 'Official BRL package pricing is not yet available for this Native Friend. Your 25-minute free trial lesson remains available.'
+                                        : 'Os valores oficiais em reais ainda não estão configurados para este Amigo Nativo. Você pode escolher este tutor para sua aula experimental gratuita de 25 minutos.')}
+                                  </span>
+                                </div>
+                              </div>
+                              {(previewQuoteError || batchQuoteError) && (
+                                <button
+                                  type="button"
+                                  onClick={refreshPreviewQuote}
+                                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-[11px] font-bold text-[#9AB4FF] cursor-pointer transition"
+                                >
+                                  <RefreshCw className="w-3 h-3" />
+                                  <span>{isEn ? 'Try again' : 'Atualizar cotação'}</span>
+                                </button>
+                              )}
                             </div>
-                            <p className="text-[10px] text-slate-300 mt-1">
-                              {isEn ? 'Options of 1x, 2x or 4x per week with cancel anytime' : 'Opções de 1x, 2x ou 4x por semana sem multas'}
-                            </p>
-                          </div>
-                        </div>
+                          );
+                        })()}
                       </div>
 
                       {/* Bio / About Section */}

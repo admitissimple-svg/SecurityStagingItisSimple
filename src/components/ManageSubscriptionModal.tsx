@@ -27,9 +27,14 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import { GoogleAccount, Language, NativeFriendTutor, UserProfile } from '../types';
-import { isValidCanonicalUid } from '../utils/tutorConsolidation';
+import { useBatchTutorPricingQuotes, useSingleTutorPricingQuote } from '../hooks/useTutorPricingQuote';
+import {
+  PublicTutorPricingQuoteDto,
+  findQuoteForTutor,
+  formatBrl,
+} from '../utils/pricingQuoteClient';
 
-interface LessonPackageOption {
+export interface LessonPackageOption {
   lessonsCount: number;
   labelPt: string;
   labelEn: string;
@@ -37,6 +42,7 @@ interface LessonPackageOption {
   priceUsd: number;
   baseTotalUsd: number;
   baseTotalBrl: number;
+  discountAmountBrl: number;
   discountPercent: number;
   pricePerLessonUsd: number;
   pricePerLessonBrl: number;
@@ -54,8 +60,8 @@ export function generateLessonPackages(
   baseRateUsd: number,
   baseRateBrl?: number
 ): { monthly: LessonPackageOption[]; flexible: LessonPackageOption[] } {
-  const safeUsd = Number(baseRateUsd) > 0 ? Number(baseRateUsd) : 15;
-  const safeBrl = Number(baseRateBrl) > 0 ? Number(baseRateBrl) : Math.round(safeUsd * 5.5);
+  const safeUsd = Number(baseRateUsd) > 0 ? Number(baseRateUsd) : 0;
+  const safeBrl = Number(baseRateBrl) > 0 ? Number(baseRateBrl) : 0;
 
   const calcUsd = (count: number, discountPct: number) => {
     const raw = count * safeUsd * (1 - discountPct / 100);
@@ -64,7 +70,7 @@ export function generateLessonPackages(
 
   const calcBrl = (count: number, discountPct: number) => {
     const raw = count * safeBrl * (1 - discountPct / 100);
-    return Math.round(raw);
+    return Math.round(raw * 100) / 100;
   };
 
   const monthly: LessonPackageOption[] = [
@@ -77,10 +83,11 @@ export function generateLessonPackages(
       discountPercent: 5,
       baseTotalUsd: 4 * safeUsd,
       baseTotalBrl: 4 * safeBrl,
+      discountAmountBrl: Math.round((4 * safeBrl - calcBrl(4, 5)) * 100) / 100,
       priceUsd: calcUsd(4, 5),
       priceBrl: calcBrl(4, 5),
       pricePerLessonUsd: Math.round((calcUsd(4, 5) / 4) * 100) / 100,
-      pricePerLessonBrl: Math.round(calcBrl(4, 5) / 4),
+      pricePerLessonBrl: Math.round((calcBrl(4, 5) / 4) * 100) / 100,
       discountBadgePt: '5% OFF • RECORRÊNCIA MENSAL',
       discountBadgeEn: '5% OFF • MONTHLY AUTO-RENEW',
       descriptionPt: '1 encontro semanal com seu Amigo Nativo para manter contato constante e hábitos sólidos.',
@@ -95,10 +102,11 @@ export function generateLessonPackages(
       discountPercent: 10,
       baseTotalUsd: 8 * safeUsd,
       baseTotalBrl: 8 * safeBrl,
+      discountAmountBrl: Math.round((8 * safeBrl - calcBrl(8, 10)) * 100) / 100,
       priceUsd: calcUsd(8, 10),
       priceBrl: calcBrl(8, 10),
       pricePerLessonUsd: Math.round((calcUsd(8, 10) / 8) * 100) / 100,
-      pricePerLessonBrl: Math.round(calcBrl(8, 10) / 8),
+      pricePerLessonBrl: Math.round((calcBrl(8, 10) / 8) * 100) / 100,
       discountBadgePt: 'MAIS RECOMENDADO • 10% OFF',
       discountBadgeEn: 'MOST POPULAR • 10% OFF',
       isPopular: true,
@@ -114,10 +122,11 @@ export function generateLessonPackages(
       discountPercent: 15,
       baseTotalUsd: 12 * safeUsd,
       baseTotalBrl: 12 * safeBrl,
+      discountAmountBrl: Math.round((12 * safeBrl - calcBrl(12, 15)) * 100) / 100,
       priceUsd: calcUsd(12, 15),
       priceBrl: calcBrl(12, 15),
       pricePerLessonUsd: Math.round((calcUsd(12, 15) / 12) * 100) / 100,
-      pricePerLessonBrl: Math.round(calcBrl(12, 15) / 12),
+      pricePerLessonBrl: Math.round((calcBrl(12, 15) / 12) * 100) / 100,
       discountBadgePt: 'IMERSÃO INTENSIVA • 15% OFF',
       discountBadgeEn: 'INTENSIVE IMMERSION • 15% OFF',
       isBestValue: true,
@@ -134,6 +143,7 @@ export function generateLessonPackages(
       discountPercent: 0,
       baseTotalUsd: safeUsd,
       baseTotalBrl: safeBrl,
+      discountAmountBrl: 0,
       priceUsd: safeUsd,
       priceBrl: safeBrl,
       pricePerLessonUsd: safeUsd,
@@ -148,10 +158,11 @@ export function generateLessonPackages(
       discountPercent: 5,
       baseTotalUsd: 4 * safeUsd,
       baseTotalBrl: 4 * safeBrl,
+      discountAmountBrl: Math.round((4 * safeBrl - calcBrl(4, 5)) * 100) / 100,
       priceUsd: calcUsd(4, 5),
       priceBrl: calcBrl(4, 5),
       pricePerLessonUsd: Math.round((calcUsd(4, 5) / 4) * 100) / 100,
-      pricePerLessonBrl: Math.round(calcBrl(4, 5) / 4),
+      pricePerLessonBrl: Math.round((calcBrl(4, 5) / 4) * 100) / 100,
       discountBadgePt: '5% OFF',
       discountBadgeEn: '5% OFF',
       descriptionPt: 'Começo consistente para destravar a fala no dia a dia.',
@@ -164,10 +175,11 @@ export function generateLessonPackages(
       discountPercent: 10,
       baseTotalUsd: 8 * safeUsd,
       baseTotalBrl: 8 * safeBrl,
+      discountAmountBrl: Math.round((8 * safeBrl - calcBrl(8, 10)) * 100) / 100,
       priceUsd: calcUsd(8, 10),
       priceBrl: calcBrl(8, 10),
       pricePerLessonUsd: Math.round((calcUsd(8, 10) / 8) * 100) / 100,
-      pricePerLessonBrl: Math.round(calcBrl(8, 10) / 8),
+      pricePerLessonBrl: Math.round((calcBrl(8, 10) / 8) * 100) / 100,
       discountBadgePt: 'MAIS POPULAR • 10% OFF',
       discountBadgeEn: 'MOST POPULAR • 10% OFF',
       isPopular: true,
@@ -181,10 +193,11 @@ export function generateLessonPackages(
       discountPercent: 15,
       baseTotalUsd: 12 * safeUsd,
       baseTotalBrl: 12 * safeBrl,
+      discountAmountBrl: Math.round((12 * safeBrl - calcBrl(12, 15)) * 100) / 100,
       priceUsd: calcUsd(12, 15),
       priceBrl: calcBrl(12, 15),
       pricePerLessonUsd: Math.round((calcUsd(12, 15) / 12) * 100) / 100,
-      pricePerLessonBrl: Math.round(calcBrl(12, 15) / 12),
+      pricePerLessonBrl: Math.round((calcBrl(12, 15) / 12) * 100) / 100,
       discountBadgePt: 'MELHOR VALOR • 15% OFF',
       discountBadgeEn: 'BEST VALUE • 15% OFF',
       isBestValue: true,
@@ -196,10 +209,144 @@ export function generateLessonPackages(
   return { monthly, flexible };
 }
 
-const defaultPackageSet = generateLessonPackages(15);
-export const MONTHLY_PACKAGES: LessonPackageOption[] = defaultPackageSet.monthly;
-export const FLEXIBLE_PACKAGES: LessonPackageOption[] = defaultPackageSet.flexible;
-const LESSON_PACKAGES: LessonPackageOption[] = [...MONTHLY_PACKAGES, ...FLEXIBLE_PACKAGES];
+const MONTHLY_PACKAGE_META: Record<
+  number,
+  {
+    frequency: '1x' | '2x' | '3x';
+    labelPt: string;
+    labelEn: string;
+    discountBadgePt: string;
+    discountBadgeEn: string;
+    descriptionPt: string;
+    descriptionEn: string;
+  }
+> = {
+  4: {
+    frequency: '1x',
+    labelPt: '1x por semana (4 aulas/mês)',
+    labelEn: '1x per week (4 lessons/mo)',
+    discountBadgePt: '5% OFF • RECORRÊNCIA MENSAL',
+    discountBadgeEn: '5% OFF • MONTHLY AUTO-RENEW',
+    descriptionPt: '1 encontro semanal com seu Amigo Nativo para manter contato constante e hábitos sólidos.',
+    descriptionEn: '1 weekly session with your Native Friend for steady practice and solid habits.',
+  },
+  8: {
+    frequency: '2x',
+    labelPt: '2x por semana (8 aulas/mês)',
+    labelEn: '2x per week (8 lessons/mo)',
+    discountBadgePt: 'MAIS RECOMENDADO • 10% OFF',
+    discountBadgeEn: 'MOST POPULAR • 10% OFF',
+    descriptionPt: 'Ritmo ideal de imersão para destravar fluência, segurança e vocabulário ativo.',
+    descriptionEn: 'Ideal immersion rhythm to unlock fluency, confidence and active vocabulary.',
+  },
+  12: {
+    frequency: '3x',
+    labelPt: '3x por semana (12 aulas/mês)',
+    labelEn: '3x per week (12 lessons/mo)',
+    discountBadgePt: 'IMERSÃO INTENSIVA • 15% OFF',
+    discountBadgeEn: 'INTENSIVE IMMERSION • 15% OFF',
+    descriptionPt: 'Aceleração máxima: viva o inglês quase todos os dias com seu mentor dedicado.',
+    descriptionEn: 'Maximum speed: live English almost every day with your dedicated mentor.',
+  },
+};
+
+const FLEXIBLE_PACKAGE_META: Record<
+  number,
+  {
+    discountBadgePt?: string;
+    discountBadgeEn?: string;
+    descriptionPt: string;
+    descriptionEn: string;
+  }
+> = {
+  1: {
+    descriptionPt: 'Ideal para experimentar a dinâmica e conhecer seu novo Amigo Nativo.',
+    descriptionEn: 'Perfect to test the dynamic and meet your new Native Friend.',
+  },
+  4: {
+    discountBadgePt: '5% OFF',
+    discountBadgeEn: '5% OFF',
+    descriptionPt: 'Começo consistente para destravar a fala no dia a dia.',
+    descriptionEn: 'Consistent start to unlock daily conversation.',
+  },
+  8: {
+    discountBadgePt: 'MAIS POPULAR • 10% OFF',
+    discountBadgeEn: 'MOST POPULAR • 10% OFF',
+    descriptionPt: 'Recomendado para manter encontros regulares e fixar vocabulário real.',
+    descriptionEn: 'Recommended for regular sessions and solid routine retention.',
+  },
+  12: {
+    discountBadgePt: 'MELHOR VALOR • 15% OFF',
+    discountBadgeEn: 'BEST VALUE • 15% OFF',
+    descriptionPt: 'Imersão completa para alcançar fluência conversacional acelerada.',
+    descriptionEn: 'Full immersion to reach conversational fluency faster.',
+  },
+};
+
+/**
+ * Constrói os pacotes exclusivamente a partir da cotação oficial calculada no servidor (BRL + PTAX D-1).
+ */
+export function buildPackagesFromAuthoritativeQuote(
+  quote: PublicTutorPricingQuoteDto
+): { monthly: LessonPackageOption[]; flexible: LessonPackageOption[] } {
+  const monthly: LessonPackageOption[] = quote.packages
+    .filter((pkg) => pkg.lessonsCount >= 4 && Boolean(MONTHLY_PACKAGE_META[pkg.lessonsCount]))
+    .map((pkg) => {
+      const meta = MONTHLY_PACKAGE_META[pkg.lessonsCount];
+      return {
+        lessonsCount: pkg.lessonsCount,
+        frequency: meta.frequency,
+        isRecurringMonthly: true,
+        labelPt: meta.labelPt,
+        labelEn: meta.labelEn,
+        discountPercent: pkg.discountPercent,
+        baseTotalUsd: 0,
+        baseTotalBrl: pkg.grossTotalBrl,
+        discountAmountBrl: pkg.discountAmountBrl,
+        priceUsd: 0,
+        priceBrl: pkg.finalPriceBrl,
+        pricePerLessonUsd: 0,
+        pricePerLessonBrl: pkg.effectiveLessonPriceBrl,
+        discountBadgePt: meta.discountBadgePt,
+        discountBadgeEn: meta.discountBadgeEn,
+        isPopular: pkg.isPopular,
+        isBestValue: pkg.isBestValue,
+        descriptionPt: meta.descriptionPt,
+        descriptionEn: meta.descriptionEn,
+      };
+    });
+
+  const flexible: LessonPackageOption[] = quote.packages.map((pkg) => {
+    const meta = FLEXIBLE_PACKAGE_META[pkg.lessonsCount] || {
+      discountBadgePt: pkg.discountPercent > 0 ? `${pkg.discountPercent}% OFF` : undefined,
+      discountBadgeEn: pkg.discountPercent > 0 ? `${pkg.discountPercent}% OFF` : undefined,
+      descriptionPt: 'Pacote oficial de aulas individuais de 50 minutos.',
+      descriptionEn: 'Official 50-minute individual lesson package.',
+    };
+    return {
+      lessonsCount: pkg.lessonsCount,
+      isRecurringMonthly: false,
+      labelPt: pkg.labelPt,
+      labelEn: pkg.labelEn,
+      discountPercent: pkg.discountPercent,
+      baseTotalUsd: 0,
+      baseTotalBrl: pkg.grossTotalBrl,
+      discountAmountBrl: pkg.discountAmountBrl,
+      priceUsd: 0,
+      priceBrl: pkg.finalPriceBrl,
+      pricePerLessonUsd: 0,
+      pricePerLessonBrl: pkg.effectiveLessonPriceBrl,
+      discountBadgePt: meta.discountBadgePt,
+      discountBadgeEn: meta.discountBadgeEn,
+      isPopular: pkg.isPopular,
+      isBestValue: pkg.isBestValue,
+      descriptionPt: meta.descriptionPt,
+      descriptionEn: meta.descriptionEn,
+    };
+  });
+
+  return { monthly, flexible };
+}
 
 interface ManageSubscriptionModalProps {
   isOpen: boolean;
@@ -285,23 +432,37 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
     uid: currentTeacherUid || undefined,
     name: currentTeacherName || (currentTeacherEmail ? currentTeacherEmail.split('@')[0] : 'Native Friend'),
     email: currentTeacherEmail,
-    pricePerSessionUsd: 15,
-    pricePerSessionBrl: 83,
   } as NativeFriendTutor : undefined);
 
-  // Active base lesson rates dynamically derived from selected tutor (or current tutor / fallback 15 USD)
-  const activeBaseRateUsd = Number(selectedTutorForPurchase?.pricePerSessionUsd) > 0
-    ? Number(selectedTutorForPurchase?.pricePerSessionUsd)
-    : (Number(currentTutor?.pricePerSessionUsd) > 0 ? Number(currentTutor?.pricePerSessionUsd) : 15);
+  // Authoritative server-calculated BRL pricing quotes (FIN.2C)
+  const {
+    quotesByTutorId,
+    unavailableByTutorId,
+    isLoading: isBatchQuotesLoading,
+    error: batchQuoteError,
+    errorCode: batchQuoteErrorCode,
+    refresh: refreshBatchQuotes,
+  } = useBatchTutorPricingQuotes(isOpen, isOpen);
 
-  const activeBaseRateBrl = Number(selectedTutorForPurchase?.pricePerSessionBrl) > 0
-    ? Number(selectedTutorForPurchase?.pricePerSessionBrl)
-    : (Number(currentTutor?.pricePerSessionBrl) > 0 ? Number(currentTutor?.pricePerSessionBrl) : Math.round(activeBaseRateUsd * 5.5));
+  const {
+    quote: singleTutorQuote,
+    isLoading: isSingleQuoteLoading,
+    error: singleQuoteError,
+    errorCode: singleQuoteErrorCode,
+    refresh: refreshSingleQuote,
+  } = useSingleTutorPricingQuote(
+    selectedTutorForPurchase,
+    isOpen && Boolean(selectedTutorForPurchase),
+    isOpen
+  );
 
-  // Dynamically calculate packages strictly with 5%, 10%, 15% volume discounts based on the tutor's registered base rate
+  // Packages calculated strictly on backend from persisted commission + teacher USD base + PTAX D-1
   const { monthly: dynamicMonthlyPackages, flexible: dynamicFlexiblePackages } = useMemo(() => {
-    return generateLessonPackages(activeBaseRateUsd, activeBaseRateBrl);
-  }, [activeBaseRateUsd, activeBaseRateBrl]);
+    if (!singleTutorQuote) {
+      return { monthly: [], flexible: [] };
+    }
+    return buildPackagesFromAuthoritativeQuote(singleTutorQuote);
+  }, [singleTutorQuote]);
 
   const activePackageList = packageCategoryTab === 'monthly' ? dynamicMonthlyPackages : dynamicFlexiblePackages;
 
@@ -498,273 +659,67 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
                   </div>
                 </div>
 
-                <div className="bg-white px-3 py-2 rounded-xl border border-[#607EC9]/30 text-right">
+                <div className="bg-white px-3 py-2 rounded-xl border border-[#607EC9]/30 text-right shrink-0">
                   <span className="text-[10px] text-[#607EC9] font-bold uppercase block">
-                    {isEn ? 'Lesson Rate' : 'Valor Base'}
+                    {isEn ? 'Lesson Rate' : 'Valor da Aula'}
                   </span>
-                  <span className="text-base font-black text-[#000035]">
-                    ${activeBaseRateUsd} USD
-                  </span>
-                  <span className="text-[10px] text-[#607EC9] font-semibold block">/ {isEn ? 'session' : 'sessão'}</span>
-                </div>
-              </div>
-
-              {/* Informational Banner about Fixed Binding & Volume Discounts */}
-              <div className="p-3.5 bg-blue-50/70 rounded-2xl border border-[#9AB4FF]/50 flex items-start gap-2.5 text-xs text-[#062863]">
-                <ShieldCheck className="w-5 h-5 text-[#1C4C96] shrink-0 mt-0.5" />
-                <div>
-                  <span className="font-bold block">
-                    {isEn ? 'Fixed Assignment on Purchase • Volume Discounts' : 'Vínculo Fixo Garantido • Descontos Progressivos'}
-                  </span>
-                  <span>
-                    {isEn
-                      ? `By completing the purchase of any package below, ${selectedTutorForPurchase.name} will be permanently assigned as your fixed Native Friend. Package prices are based strictly on their rate of $${activeBaseRateUsd} USD/session with automatic volume discounts (4 lessons: 5% OFF, 8 lessons: 10% OFF, 12 lessons: 15% OFF).`
-                      : `Ao confirmar a compra de qualquer pacote abaixo, ${selectedTutorForPurchase.name} passará a ser automaticamente seu Amigo Nativo fixo na plataforma. Os valores são baseados na taxa de $${activeBaseRateUsd} USD/aula do professor com descontos progressivos (4 aulas: 5% OFF, 8 aulas: 10% OFF, 12 aulas: 15% OFF).`}
-                  </span>
-                </div>
-              </div>
-
-              {/* Package Category Tabs */}
-              <div className="flex items-center gap-2 p-1 bg-slate-100 rounded-xl border border-slate-200">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setPackageCategoryTab('monthly');
-                    if (selectedPackageLessons === 1) {
-                      setSelectedPackageLessons(8);
-                    }
-                  }}
-                  className={`flex-1 py-2 px-3 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer ${
-                    packageCategoryTab === 'monthly'
-                      ? 'bg-white text-[#000035] shadow-xs border border-slate-200/80'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  <RefreshCw className="w-3.5 h-3.5 text-[#1C4C96]" />
-                  <span>{isEn ? 'Monthly Plans (Recommended)' : 'Planos Mensais (Recomendado)'}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setPackageCategoryTab('flexible');
-                  }}
-                  className={`flex-1 py-2 px-3 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer ${
-                    packageCategoryTab === 'flexible'
-                      ? 'bg-white text-[#000035] shadow-xs border border-slate-200/80'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  <ShoppingBag className="w-3.5 h-3.5 text-[#1C4C96]" />
-                  <span>{isEn ? 'Flexible Lesson Packs' : 'Pacotes Avulsos Flexíveis'}</span>
-                </button>
-              </div>
-
-              {/* Package Selection Grid */}
-              <div className="space-y-3">
-                <div className="flex items-center justify-between">
-                  <h4 className="font-black text-sm text-[#000035] flex items-center gap-2">
-                    <ShoppingBag className="w-4 h-4 text-[#1C4C96]" />
-                    <span>
-                      {packageCategoryTab === 'monthly'
-                        ? (isEn ? 'Select Monthly Subscription Frequency' : 'Escolha a Frequência Mensal do Amigo Nativo')
-                        : (isEn ? 'Select Flexible Lesson Pack' : 'Escolha o Pacote de Aulas Avulsas')}
+                  {isSingleQuoteLoading ? (
+                    <span className="text-xs font-bold text-[#607EC9] block py-0.5">
+                      {isEn ? 'Loading...' : 'Consultando...'}
                     </span>
-                  </h4>
-                  {packageCategoryTab === 'monthly' && (
-                    <span className="text-[11px] text-emerald-700 font-bold bg-emerald-50 px-2.5 py-0.5 rounded-full border border-emerald-200">
-                      {isEn ? 'Auto-renews monthly • Cancel anytime' : 'Renovação mensal • Cancele quando quiser'}
+                  ) : singleTutorQuote ? (
+                    <>
+                      <span className="text-base font-black text-[#000035]">
+                        {formatBrl(singleTutorQuote.unit.finalPriceBrl)}
+                      </span>
+                      <span className="text-[10px] text-[#607EC9] font-semibold block">
+                        / {isEn ? '50 min lesson' : 'aula de 50 min'}
+                      </span>
+                    </>
+                  ) : (
+                    <span className="text-xs font-bold text-amber-700 block py-0.5">
+                      {isEn ? 'Unavailable' : 'Indisponível'}
                     </span>
                   )}
                 </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  {activePackageList.map((pkg) => {
-                    const isSelected = selectedPackageLessons === pkg.lessonsCount;
-                    return (
-                      <div
-                        key={`${packageCategoryTab}-${pkg.lessonsCount}`}
-                        onClick={() => setSelectedPackageLessons(pkg.lessonsCount)}
-                        className={`p-4 rounded-2xl border transition-all cursor-pointer relative flex flex-col justify-between ${
-                          isSelected
-                            ? 'bg-blue-50/60 border-[#1C4C96] ring-2 ring-[#1C4C96] shadow-sm'
-                            : 'bg-white border-[#607EC9]/30 hover:border-[#1C4C96]/60 shadow-2xs'
-                        }`}
-                      >
-                        {pkg.discountBadgePt && (
-                          <div className="absolute -top-2.5 right-3">
-                            <span
-                              className={`px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-wider text-white shadow-xs ${
-                                pkg.isPopular
-                                  ? 'bg-[#1C4C96]'
-                                  : pkg.isBestValue
-                                  ? 'bg-emerald-600'
-                                  : 'bg-blue-600'
-                              }`}
-                            >
-                              {isEn ? pkg.discountBadgeEn : pkg.discountBadgePt}
-                            </span>
-                          </div>
-                        )}
-
-                        <div className="space-y-1">
-                          <div className="flex items-center justify-between">
-                            <h5 className="font-black text-sm text-[#000035]">
-                              {isEn ? pkg.labelEn : pkg.labelPt}
-                            </h5>
-                            <div
-                              className={`w-4 h-4 rounded-full border flex items-center justify-center ${
-                                isSelected ? 'border-[#1C4C96] bg-[#1C4C96]' : 'border-slate-300'
-                              }`}
-                            >
-                              {isSelected && <Check className="w-2.5 h-2.5 text-white stroke-[3]" />}
-                            </div>
-                          </div>
-
-                          <div className="flex items-baseline gap-1.5 pt-1 flex-wrap">
-                            <span className="text-xl font-black text-[#000035]">
-                              ${pkg.priceUsd % 1 === 0 ? pkg.priceUsd : pkg.priceUsd.toFixed(2)} USD
-                            </span>
-                            {pkg.discountPercent > 0 && (
-                              <span className="text-xs text-slate-400 line-through font-semibold">
-                                ${pkg.baseTotalUsd}
-                              </span>
-                            )}
-                            <span className="text-xs text-[#607EC9] font-medium">
-                              {pkg.isRecurringMonthly ? (isEn ? '/mo' : '/mês') : ''}
-                            </span>
-                          </div>
-
-                          <div className="flex items-center gap-1.5 pt-0.5">
-                            <p className="text-[11px] text-[#062863] font-bold">
-                              ${pkg.pricePerLessonUsd % 1 === 0 ? pkg.pricePerLessonUsd : pkg.pricePerLessonUsd.toFixed(2)} USD {isEn ? '/ lesson' : '/ aula'}
-                            </p>
-                            {pkg.discountPercent > 0 && (
-                              <span className="text-[10px] text-emerald-700 font-extrabold bg-emerald-50 px-1.5 py-0.2 rounded border border-emerald-200">
-                                -{pkg.discountPercent}%
-                              </span>
-                            )}
-                          </div>
-
-                          <p className="text-xs text-slate-600 pt-1 leading-relaxed">
-                            {isEn ? pkg.descriptionEn : pkg.descriptionPt}
-                          </p>
-
-                          <span className="text-[10px] text-slate-400 font-medium block pt-0.5">
-                            ≈ R$ {pkg.priceBrl} BRL
-                          </span>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
               </div>
 
-              {/* Payment Method Selector */}
-              <div className="space-y-2.5 pt-2">
-                <h4 className="font-black text-xs uppercase tracking-wider text-[#062863]">
-                  {isEn ? 'Payment Method' : 'Forma de Pagamento'}
-                </h4>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <div
-                    onClick={() => setSelectedPaymentMethod('pix')}
-                    className={`p-3 rounded-xl border flex items-center gap-2.5 cursor-pointer transition ${
-                      selectedPaymentMethod === 'pix'
-                        ? 'bg-emerald-50/60 border-emerald-600 ring-2 ring-emerald-500/40'
-                        : 'bg-white border-slate-200 hover:border-slate-300'
-                    }`}
-                  >
-                    <div className="w-8 h-8 rounded-lg bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0">
-                      <QrCode className="w-4 h-4" />
-                    </div>
-                    <div>
-                      <span className="font-bold text-xs text-[#000035] block">PIX</span>
-                      <span className="text-[10px] text-emerald-700 font-semibold">
-                        {isEn ? 'Instant Release' : 'Liberação Imediata'}
-                      </span>
-                    </div>
-                  </div>
-
-                  <div
-                    onClick={() => setSelectedPaymentMethod('credit_card')}
-                    className={`p-3 rounded-xl border flex items-center gap-2.5 cursor-pointer transition ${
-                      selectedPaymentMethod === 'credit_card'
-                        ? 'bg-blue-50/60 border-[#1C4C96] ring-2 ring-[#1C4C96]/40'
-                        : 'bg-white border-slate-200 hover:border-slate-300'
-                    }`}
-                  >
-                    <div className="w-8 h-8 rounded-lg bg-blue-100 text-[#1C4C96] flex items-center justify-center shrink-0">
-                      <CreditCard className="w-4 h-4" />
-                    </div>
-                    <div>
-                      <span className="font-bold text-xs text-[#000035] block">
-                        {isEn ? 'Credit Card' : 'Cartão de Crédito'}
-                      </span>
-                      <span className="text-[10px] text-[#607EC9] font-medium">
-                        {isEn ? 'Up to 12x' : 'Em até 12x'}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* Order Summary & Purchase CTA */}
-              <div className="bg-[#000035] text-white rounded-2xl p-4 space-y-3">
-                {/* Pre-commercialization notice banner */}
-                <div className="bg-amber-500/15 border border-amber-400/30 rounded-xl p-3 flex items-start gap-2.5 text-amber-200">
-                  <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
-                  <div className="text-[11px] leading-relaxed">
-                    <strong className="block text-amber-300 font-bold mb-0.5">
-                      {isEn ? 'Purchases Temporarily Unavailable' : 'Contratações Temporariamente Indisponíveis'}
-                    </strong>
+              {isSingleQuoteLoading ? (
+                <div className="p-6 rounded-2xl border border-[#607EC9]/30 bg-slate-50 text-center space-y-2.5">
+                  <RefreshCw className="w-6 h-6 text-[#1C4C96] animate-spin mx-auto" />
+                  <p className="text-xs font-bold text-[#000035]">
                     {isEn
-                      ? 'The platform is currently operating in pre-commercialization mode without an active payment gateway. You can view all package pricing above, and schedule your free 25-minute trial lesson below.'
-                      : 'O It\'s Simple está operando em modo pré-comercialização sem gateway de pagamento ativo. Você pode consultar os valores e pacotes acima, e agendar sua aula experimental gratuita de 25 minutos.'}
-                  </div>
+                      ? 'Fetching official BRL package quote and PTAX D-1 exchange rate...'
+                      : 'Consultando cotação oficial em reais e PTAX D-1 no servidor...'}
+                  </p>
                 </div>
-
-                <div className="flex items-center justify-between text-xs border-b border-[#1C4C96] pb-2">
-                  <span className="text-[#9AB4FF] font-medium">
-                    {isEn ? 'Tutor to be assigned:' : 'Amigo Nativo a vincular:'}
-                  </span>
-                  <span className="font-bold text-white flex items-center gap-1">
-                    <span>{selectedTutorForPurchase.name}</span>
-                    <span>{selectedTutorForPurchase.flag}</span>
-                  </span>
-                </div>
-
-                <div className="flex items-center justify-between text-xs border-b border-[#1C4C96] pb-2">
-                  <span className="text-[#9AB4FF] font-medium">{isEn ? 'Package:' : 'Pacote Escolhido:'}</span>
-                  <span className="font-bold text-white">
-                    {selectedPkg.lessonsCount === 1
-                      ? (isEn ? '1 Single Lesson (50 min)' : '1 Aula Avulsa (50 min)')
-                      : `${selectedPkg.lessonsCount} ${isEn ? 'Lessons (50 min)' : 'Aulas de 50 min'}`}
-                    {selectedPkg.discountPercent > 0 ? ` (${selectedPkg.discountPercent}% OFF)` : ''}
-                  </span>
-                </div>
-
-                <div className="flex items-center justify-between gap-3 flex-wrap">
-                  <div>
-                    <span className="text-[10px] text-[#9AB4FF] font-bold uppercase block">Total</span>
-                    <div className="flex items-baseline gap-1.5 flex-wrap">
-                      <span className="text-xl font-black text-white">
-                        ${selectedPkg.priceUsd % 1 === 0 ? selectedPkg.priceUsd : selectedPkg.priceUsd.toFixed(2)} USD
-                      </span>
-                      {selectedPkg.discountPercent > 0 && (
-                        <span className="text-xs text-[#9AB4FF]/70 line-through">
-                          ${selectedPkg.baseTotalUsd}
-                        </span>
-                      )}
-                      {selectedPkg.isRecurringMonthly && (
-                        <span className="text-xs text-[#9AB4FF]">{isEn ? '/month' : '/mês'}</span>
-                      )}
+              ) : !singleTutorQuote || !selectedPkg ? (
+                <div className="p-5 rounded-2xl border border-amber-300 bg-amber-50 space-y-3">
+                  <div className="flex items-start gap-2.5 text-amber-950">
+                    <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                    <div className="text-xs space-y-1">
+                      <strong className="block text-sm font-black text-amber-950">
+                        {singleQuoteErrorCode === 'PTAX_UNAVAILABLE'
+                          ? (isEn ? 'Official Exchange Rate (PTAX D-1) Unavailable' : 'Cotação Oficial PTAX D-1 Indisponível')
+                          : (isEn ? 'Packages Unavailable for This Native Friend' : 'Pacotes Indisponíveis para Este Amigo Nativo')}
+                      </strong>
+                      <p className="text-amber-900 leading-relaxed">
+                        {singleQuoteError ||
+                          (isEn
+                            ? 'This Native Friend does not yet have an active commercial pricing configuration. You can still schedule your free 25-minute trial lesson.'
+                            : 'Este Amigo Nativo ainda não possui configuração comercial ativa para exibição de pacotes. Você pode agendar sua aula experimental gratuita de 25 minutos.')}
+                      </p>
                     </div>
-                    <span className="text-[10px] text-[#9AB4FF]/80 block">
-                      ≈ R$ {selectedPkg.priceBrl} BRL
-                    </span>
                   </div>
-
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={refreshSingleQuote}
+                      className="px-3.5 py-2 rounded-xl bg-white border border-amber-300 hover:bg-amber-100 text-amber-950 text-xs font-bold transition flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      <span>{isEn ? 'Retry Quote' : 'Tentar Novamente'}</span>
+                    </button>
                     {onScheduleTrialLessonWithTutor && selectedTutorForPurchase && (
                       <button
                         type="button"
@@ -774,28 +729,303 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
                           onClose();
                           onScheduleTrialLessonWithTutor(tutorToTrial);
                         }}
-                        className="px-3.5 py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-bold text-xs transition flex items-center gap-1.5 cursor-pointer shadow-xs"
+                        className="px-3.5 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-bold text-xs transition flex items-center gap-1.5 cursor-pointer shadow-xs"
                       >
                         <CalendarCheck className="w-3.5 h-3.5 text-[#9AB4FF]" />
                         <span>{isEn ? 'Free Trial (25 min)' : 'Aula Experimental (25 min)'}</span>
                       </button>
                     )}
-
-                    <button
-                      type="button"
-                      disabled={true}
-                      aria-disabled="true"
-                      className="px-4 py-2.5 bg-slate-700/80 text-slate-300 rounded-xl font-bold text-xs flex items-center gap-2 cursor-not-allowed border border-slate-600/50 shadow-xs"
-                      title={isEn ? 'Purchases temporarily unavailable' : 'Contratações temporariamente indisponíveis'}
-                    >
-                      <Lock className="w-4 h-4 text-amber-400" />
-                      <span>
-                        {isEn ? 'Purchases Unavailable' : 'Contratações Indisponíveis'}
-                      </span>
-                    </button>
                   </div>
                 </div>
-              </div>
+              ) : (
+                <>
+                  {/* Informational Banner about Fixed Binding & Volume Discounts */}
+                  <div className="p-3.5 bg-blue-50/70 rounded-2xl border border-[#9AB4FF]/50 flex items-start gap-2.5 text-xs text-[#062863]">
+                    <ShieldCheck className="w-5 h-5 text-[#1C4C96] shrink-0 mt-0.5" />
+                    <div>
+                      <span className="font-bold block">
+                        {isEn ? 'Fixed Assignment on Purchase • Volume Discounts' : 'Vínculo Fixo Garantido • Descontos Progressivos'}
+                      </span>
+                      <span>
+                        {isEn
+                          ? `All prices below are calculated in BRL with official BACEN PTAX D-1 (${singleTutorQuote.ptax.quoteDate}) based on ${formatBrl(singleTutorQuote.unit.finalPriceBrl)} per 50-min lesson and progressive package discounts (4 lessons: 5% OFF, 8 lessons: 10% OFF, 12 lessons: 15% OFF).`
+                          : `Todos os valores abaixo são calculados em reais (BRL) pela PTAX oficial D-1 (${singleTutorQuote.ptax.quoteDate}) a partir de ${formatBrl(singleTutorQuote.unit.finalPriceBrl)} por aula de 50 min, com descontos progressivos (4 aulas: 5% OFF, 8 aulas: 10% OFF, 12 aulas: 15% OFF).`}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Package Category Tabs */}
+                  <div className="flex items-center gap-2 p-1 bg-slate-100 rounded-xl border border-slate-200">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setPackageCategoryTab('monthly');
+                        if (selectedPackageLessons === 1) {
+                          setSelectedPackageLessons(8);
+                        }
+                      }}
+                      className={`flex-1 py-2 px-3 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer ${
+                        packageCategoryTab === 'monthly'
+                          ? 'bg-white text-[#000035] shadow-xs border border-slate-200/80'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      <RefreshCw className="w-3.5 h-3.5 text-[#1C4C96]" />
+                      <span>{isEn ? 'Monthly Plans (Recommended)' : 'Planos Mensais (Recomendado)'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setPackageCategoryTab('flexible');
+                      }}
+                      className={`flex-1 py-2 px-3 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer ${
+                        packageCategoryTab === 'flexible'
+                          ? 'bg-white text-[#000035] shadow-xs border border-slate-200/80'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      <ShoppingBag className="w-3.5 h-3.5 text-[#1C4C96]" />
+                      <span>{isEn ? 'Flexible Lesson Packs' : 'Pacotes Avulsos Flexíveis'}</span>
+                    </button>
+                  </div>
+
+                  {/* Package Selection Grid */}
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between flex-wrap gap-2">
+                      <h4 className="font-black text-sm text-[#000035] flex items-center gap-2">
+                        <ShoppingBag className="w-4 h-4 text-[#1C4C96]" />
+                        <span>
+                          {packageCategoryTab === 'monthly'
+                            ? (isEn ? 'Select Monthly Subscription Frequency' : 'Escolha a Frequência Mensal do Amigo Nativo')
+                            : (isEn ? 'Select Flexible Lesson Pack' : 'Escolha o Pacote de Aulas Avulsas')}
+                        </span>
+                      </h4>
+                      {packageCategoryTab === 'monthly' && (
+                        <span className="text-[11px] text-emerald-700 font-bold bg-emerald-50 px-2.5 py-0.5 rounded-full border border-emerald-200">
+                          {isEn ? 'Auto-renews monthly • Cancel anytime' : 'Renovação mensal • Cancele quando quiser'}
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      {activePackageList.map((pkg) => {
+                        const isSelected = selectedPackageLessons === pkg.lessonsCount;
+                        return (
+                          <div
+                            key={`${packageCategoryTab}-${pkg.lessonsCount}`}
+                            onClick={() => setSelectedPackageLessons(pkg.lessonsCount)}
+                            className={`p-4 rounded-2xl border transition-all cursor-pointer relative flex flex-col justify-between ${
+                              isSelected
+                                ? 'bg-blue-50/60 border-[#1C4C96] ring-2 ring-[#1C4C96] shadow-sm'
+                                : 'bg-white border-[#607EC9]/30 hover:border-[#1C4C96]/60 shadow-2xs'
+                            }`}
+                          >
+                            {pkg.discountBadgePt && (
+                              <div className="absolute -top-2.5 right-3">
+                                <span
+                                  className={`px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-wider text-white shadow-xs ${
+                                    pkg.isPopular
+                                      ? 'bg-[#1C4C96]'
+                                      : pkg.isBestValue
+                                      ? 'bg-emerald-600'
+                                      : 'bg-blue-600'
+                                  }`}
+                                >
+                                  {isEn ? pkg.discountBadgeEn : pkg.discountBadgePt}
+                                </span>
+                              </div>
+                            )}
+
+                            <div className="space-y-1">
+                              <div className="flex items-center justify-between">
+                                <h5 className="font-black text-sm text-[#000035]">
+                                  {isEn ? pkg.labelEn : pkg.labelPt}
+                                </h5>
+                                <div
+                                  className={`w-4 h-4 rounded-full border flex items-center justify-center ${
+                                    isSelected ? 'border-[#1C4C96] bg-[#1C4C96]' : 'border-slate-300'
+                                  }`}
+                                >
+                                  {isSelected && <Check className="w-2.5 h-2.5 text-white stroke-[3]" />}
+                                </div>
+                              </div>
+
+                              <div className="flex items-baseline gap-1.5 pt-1 flex-wrap">
+                                <span className="text-xl font-black text-[#000035]">
+                                  {formatBrl(pkg.priceBrl)}
+                                </span>
+                                {pkg.discountPercent > 0 && (
+                                  <span className="text-xs text-slate-400 line-through font-semibold">
+                                    {formatBrl(pkg.baseTotalBrl)}
+                                  </span>
+                                )}
+                                <span className="text-xs text-[#607EC9] font-medium">
+                                  {pkg.isRecurringMonthly ? (isEn ? '/mo' : '/mês') : ''}
+                                </span>
+                              </div>
+
+                              <div className="flex items-center gap-1.5 pt-0.5 flex-wrap">
+                                <p className="text-[11px] text-[#062863] font-bold">
+                                  {formatBrl(pkg.pricePerLessonBrl)} {isEn ? '/ lesson' : '/ aula'}
+                                </p>
+                                {pkg.discountPercent > 0 && (
+                                  <span className="text-[10px] text-emerald-700 font-extrabold bg-emerald-50 px-1.5 py-0.2 rounded border border-emerald-200">
+                                    -{pkg.discountPercent}% ({isEn ? 'save' : 'economize'} {formatBrl(pkg.discountAmountBrl)})
+                                  </span>
+                                )}
+                              </div>
+
+                              <p className="text-xs text-slate-600 pt-1 leading-relaxed">
+                                {isEn ? pkg.descriptionEn : pkg.descriptionPt}
+                              </p>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Payment Method Selector */}
+                  <div className="space-y-2.5 pt-2">
+                    <h4 className="font-black text-xs uppercase tracking-wider text-[#062863]">
+                      {isEn ? 'Payment Method' : 'Forma de Pagamento'}
+                    </h4>
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div
+                        onClick={() => setSelectedPaymentMethod('pix')}
+                        className={`p-3 rounded-xl border flex items-center gap-2.5 cursor-pointer transition ${
+                          selectedPaymentMethod === 'pix'
+                            ? 'bg-emerald-50/60 border-emerald-600 ring-2 ring-emerald-500/40'
+                            : 'bg-white border-slate-200 hover:border-slate-300'
+                        }`}
+                      >
+                        <div className="w-8 h-8 rounded-lg bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0">
+                          <QrCode className="w-4 h-4" />
+                        </div>
+                        <div>
+                          <span className="font-bold text-xs text-[#000035] block">PIX</span>
+                          <span className="text-[10px] text-emerald-700 font-semibold">
+                            {isEn ? 'Instant Release' : 'Liberação Imediata'}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div
+                        onClick={() => setSelectedPaymentMethod('credit_card')}
+                        className={`p-3 rounded-xl border flex items-center gap-2.5 cursor-pointer transition ${
+                          selectedPaymentMethod === 'credit_card'
+                            ? 'bg-blue-50/60 border-[#1C4C96] ring-2 ring-[#1C4C96]/40'
+                            : 'bg-white border-slate-200 hover:border-slate-300'
+                        }`}
+                      >
+                        <div className="w-8 h-8 rounded-lg bg-blue-100 text-[#1C4C96] flex items-center justify-center shrink-0">
+                          <CreditCard className="w-4 h-4" />
+                        </div>
+                        <div>
+                          <span className="font-bold text-xs text-[#000035] block">
+                            {isEn ? 'Credit Card' : 'Cartão de Crédito'}
+                          </span>
+                          <span className="text-[10px] text-[#607EC9] font-medium">
+                            {isEn ? 'Up to 12x' : 'Em até 12x'}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Order Summary & Purchase CTA */}
+                  <div className="bg-[#000035] text-white rounded-2xl p-4 space-y-3">
+                    {/* Pre-commercialization notice banner */}
+                    <div className="bg-amber-500/15 border border-amber-400/30 rounded-xl p-3 flex items-start gap-2.5 text-amber-200">
+                      <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                      <div className="text-[11px] leading-relaxed">
+                        <strong className="block text-amber-300 font-bold mb-0.5">
+                          {isEn ? 'Purchases Temporarily Unavailable' : 'Contratações Temporariamente Indisponíveis'}
+                        </strong>
+                        {isEn
+                          ? 'The platform is currently operating in pre-commercialization mode without an active payment gateway. You can review authoritative BRL package pricing above, and schedule your free 25-minute trial lesson below.'
+                          : 'O It\'s Simple está operando em modo pré-comercialização sem gateway de pagamento ativo. Você pode consultar os valores oficiais em reais acima e agendar sua aula experimental gratuita de 25 minutos.'}
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-between text-xs border-b border-[#1C4C96] pb-2">
+                      <span className="text-[#9AB4FF] font-medium">
+                        {isEn ? 'Tutor to be assigned:' : 'Amigo Nativo a vincular:'}
+                      </span>
+                      <span className="font-bold text-white flex items-center gap-1">
+                        <span>{selectedTutorForPurchase.name}</span>
+                        <span>{selectedTutorForPurchase.flag}</span>
+                      </span>
+                    </div>
+
+                    <div className="flex items-center justify-between text-xs border-b border-[#1C4C96] pb-2">
+                      <span className="text-[#9AB4FF] font-medium">{isEn ? 'Package:' : 'Pacote Escolhido:'}</span>
+                      <span className="font-bold text-white">
+                        {selectedPkg.lessonsCount === 1
+                          ? (isEn ? '1 Single Lesson (50 min)' : '1 Aula Avulsa (50 min)')
+                          : `${selectedPkg.lessonsCount} ${isEn ? 'Lessons (50 min)' : 'Aulas de 50 min'}`}
+                        {selectedPkg.discountPercent > 0 ? ` (${selectedPkg.discountPercent}% OFF)` : ''}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center justify-between gap-3 flex-wrap">
+                      <div>
+                        <span className="text-[10px] text-[#9AB4FF] font-bold uppercase block">Total</span>
+                        <div className="flex items-baseline gap-1.5 flex-wrap">
+                          <span className="text-xl font-black text-white">
+                            {formatBrl(selectedPkg.priceBrl)}
+                          </span>
+                          {selectedPkg.discountPercent > 0 && (
+                            <span className="text-xs text-[#9AB4FF]/70 line-through">
+                              {formatBrl(selectedPkg.baseTotalBrl)}
+                            </span>
+                          )}
+                          {selectedPkg.isRecurringMonthly && (
+                            <span className="text-xs text-[#9AB4FF]">{isEn ? '/month' : '/mês'}</span>
+                          )}
+                        </div>
+                        <span className="text-[10px] text-[#9AB4FF]/80 block">
+                          {isEn
+                            ? `Official BACEN PTAX D-1 (${singleTutorQuote.ptax.quoteDate}): R$ ${singleTutorQuote.ptax.rate.toFixed(4)}`
+                            : `PTAX venda oficial D-1 (${singleTutorQuote.ptax.quoteDate}): R$ ${singleTutorQuote.ptax.rate.toFixed(4)}`}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        {onScheduleTrialLessonWithTutor && selectedTutorForPurchase && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const tutorToTrial = selectedTutorForPurchase;
+                              setSelectedTutorForPurchase(null);
+                              onClose();
+                              onScheduleTrialLessonWithTutor(tutorToTrial);
+                            }}
+                            className="px-3.5 py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-bold text-xs transition flex items-center gap-1.5 cursor-pointer shadow-xs"
+                          >
+                            <CalendarCheck className="w-3.5 h-3.5 text-[#9AB4FF]" />
+                            <span>{isEn ? 'Free Trial (25 min)' : 'Aula Experimental (25 min)'}</span>
+                          </button>
+                        )}
+
+                        <button
+                          type="button"
+                          disabled={true}
+                          aria-disabled="true"
+                          className="px-4 py-2.5 bg-slate-700/80 text-slate-300 rounded-xl font-bold text-xs flex items-center gap-2 cursor-not-allowed border border-slate-600/50 shadow-xs"
+                          title={isEn ? 'Purchases temporarily unavailable' : 'Contratações temporariamente indisponíveis'}
+                        >
+                          <Lock className="w-4 h-4 text-amber-400" />
+                          <span>
+                            {isEn ? 'Purchases Unavailable' : 'Contratações Indisponíveis'}
+                          </span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
           ) : (
             /* VIEW MODE 2: OVERVIEW & NATIVE FRIENDS BROWSER */
@@ -1017,6 +1247,27 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
                     </div>
                   </div>
 
+                {batchQuoteError && (
+                  <div className="p-3 rounded-xl bg-amber-50 border border-amber-300 flex items-center justify-between gap-3 text-xs text-amber-950">
+                    <div className="flex items-center gap-2">
+                      <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+                      <span>
+                        {batchQuoteErrorCode === 'PTAX_UNAVAILABLE'
+                          ? (isEn ? 'Official PTAX D-1 quote temporarily unavailable.' : 'Cotação oficial PTAX D-1 temporariamente indisponível.')
+                          : batchQuoteError}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={refreshBatchQuotes}
+                      className="px-2.5 py-1 rounded-lg bg-white border border-amber-300 hover:bg-amber-100 font-bold text-[11px] flex items-center gap-1 cursor-pointer shrink-0"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                      <span>{isEn ? 'Retry' : 'Atualizar'}</span>
+                    </button>
+                  </div>
+                )}
+
                 <div className="grid grid-cols-1 gap-3">
                   {approvedTutors.map((tutor) => {
                     const isSelected = Boolean(
@@ -1024,6 +1275,14 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
                       (currentTeacherEmail && tutor.email && tutor.email.toLowerCase() === currentTeacherEmail) ||
                       (currentTeacherEmail && tutor.id && tutor.id.toLowerCase() === currentTeacherEmail)
                     ) && hasActiveSubscription;
+
+                    const { quote: tutorQuote, unavailable: tutorUnavailable } = findQuoteForTutor(
+                      tutor,
+                      quotesByTutorId,
+                      unavailableByTutorId
+                    );
+                    const packagesEnabledForTutor = Boolean(tutorQuote && tutorQuote.commercializable);
+
                     return (
                       <div
                         key={tutor.id || tutor.email}
@@ -1073,12 +1332,31 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
                           </div>
 
                           <div className="shrink-0 flex sm:flex-col items-center sm:items-end justify-between gap-2 border-t sm:border-t-0 pt-2 sm:pt-0 border-slate-100">
-                            {/* Price preview */}
-                            <div className="text-right hidden sm:block">
-                              <span className="text-xs font-black text-[#000035]">
-                                ${tutor.pricePerSessionUsd || 15} USD
-                              </span>
-                              <span className="text-[10px] text-[#607EC9]"> / {isEn ? 'session' : 'sessão'}</span>
+                            {/* Authoritative BRL Price preview */}
+                            <div className="text-right">
+                              {isBatchQuotesLoading && !tutorQuote ? (
+                                <span className="text-[11px] font-bold text-[#607EC9]">
+                                  {isEn ? 'Loading quote...' : 'Consultando...'}
+                                </span>
+                              ) : tutorQuote ? (
+                                <div>
+                                  <span className="text-sm font-black text-[#000035]">
+                                    {formatBrl(tutorQuote.unit.finalPriceBrl)}
+                                  </span>
+                                  <span className="text-[10px] text-[#607EC9]"> / {isEn ? 'session' : 'sessão'}</span>
+                                  <span className="text-[10px] font-bold text-emerald-700 block">
+                                    {isEn
+                                      ? `Packs from ${formatBrl(tutorQuote.lowestEffectiveLessonPriceBrl)}`
+                                      : `Pacotes desde ${formatBrl(tutorQuote.lowestEffectiveLessonPriceBrl)}`}
+                                  </span>
+                                </div>
+                              ) : (
+                                <span className="text-[11px] font-bold text-amber-700">
+                                  {batchQuoteError
+                                    ? (isEn ? 'Quote unavailable' : 'Cotação indisponível')
+                                    : (isEn ? 'Packages unavailable' : 'Pacotes indisponíveis')}
+                                </span>
+                              )}
                             </div>
 
                             {/* Actions */}
@@ -1101,17 +1379,39 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
                                 </button>
                               ) : (
                                 <>
-                                  {/* Primary: Buy Package & Link */}
+                                  {/* Primary: View / Buy Package & Link (strictly disabled if tutor lacks valid commercial configuration or PTAX) */}
                                   <button
                                     type="button"
-                                    onClick={() => setSelectedTutorForPurchase(tutor)}
-                                    className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer shadow-xs active:scale-98"
+                                    disabled={!packagesEnabledForTutor}
+                                    onClick={() => {
+                                      if (packagesEnabledForTutor) {
+                                        setSelectedTutorForPurchase(tutor);
+                                      }
+                                    }}
+                                    title={
+                                      packagesEnabledForTutor
+                                        ? undefined
+                                        : (tutorUnavailable?.message ||
+                                          batchQuoteError ||
+                                          (isEn ? 'Commercial packages unavailable for this tutor' : 'Pacotes indisponíveis para este Amigo Nativo'))
+                                    }
+                                    className={`px-3.5 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-xs ${
+                                      packagesEnabledForTutor
+                                        ? 'bg-emerald-600 hover:bg-emerald-500 text-white cursor-pointer active:scale-98'
+                                        : 'bg-slate-200 text-slate-500 cursor-not-allowed border border-slate-300'
+                                    }`}
                                   >
-                                    <ShoppingBag className="w-3.5 h-3.5 text-white" />
+                                    {packagesEnabledForTutor ? (
+                                      <ShoppingBag className="w-3.5 h-3.5 text-white" />
+                                    ) : (
+                                      <Lock className="w-3.5 h-3.5 text-slate-400" />
+                                    )}
                                     <span>
-                                      {isSelected
-                                        ? (isEn ? 'Buy More Lessons' : 'Comprar Mais Aulas')
-                                        : (isEn ? 'Buy Package & Bind' : 'Comprar Pacote & Vincular')}
+                                      {!packagesEnabledForTutor
+                                        ? (isEn ? 'Packages Unavailable' : 'Pacotes Indisponíveis')
+                                        : isSelected
+                                        ? (isEn ? 'View / Buy More' : 'Ver Pacotes / Renovar')
+                                        : (isEn ? 'View Packages' : 'Ver Pacotes & Valores')}
                                     </span>
                                   </button>
 

@@ -15,6 +15,8 @@ import {
   Globe,
   Clock,
   Award,
+  RefreshCw,
+  AlertCircle,
 } from 'lucide-react';
 import { NativeFriendTutor, INITIAL_NATIVE_FRIENDS } from '../data/tutors';
 import { isTutorApproved, isTeacherRole } from '../hooks/useNativeFriends';
@@ -22,6 +24,8 @@ import { consolidateTutorsList, normalizeTutorName } from '../utils/tutorConsoli
 import { Language } from '../types';
 import { getTranslations } from '../utils/i18n';
 import { extractYouTubeVideoId } from '../utils/youtube';
+import { useBatchTutorPricingQuotes, useSingleTutorPricingQuote } from '../hooks/useTutorPricingQuote';
+import { findQuoteForTutor, formatBrl } from '../utils/pricingQuoteClient';
 
 interface FindTutorsSectionProps {
   currentLanguage: Language;
@@ -67,6 +71,23 @@ export const FindTutorsSection: React.FC<FindTutorsSectionProps> = ({
   const [selectedSpecialty, setSelectedSpecialty] = useState<string>('all');
   const [activeVideoModal, setActiveVideoModal] = useState<NativeFriendTutor | null>(null);
   const [detailedProfileTutor, setDetailedProfileTutor] = useState<NativeFriendTutor | null>(null);
+
+  const {
+    quotesByTutorId,
+    unavailableByTutorId,
+    isLoading: isQuotesLoading,
+    error: batchQuoteError,
+    errorCode: batchQuoteErrorCode,
+    refresh: refreshBatchQuotes,
+  } = useBatchTutorPricingQuotes(true, tutors.length);
+
+  const {
+    quote: detailedQuote,
+    isLoading: isDetailedQuoteLoading,
+    error: detailedQuoteError,
+    errorCode: detailedQuoteErrorCode,
+    refresh: refreshDetailedQuote,
+  } = useSingleTutorPricingQuote(detailedProfileTutor, Boolean(detailedProfileTutor));
 
   // Support ESC key to close video modal or detailed profile modal
   useEffect(() => {
@@ -384,26 +405,93 @@ export const FindTutorsSection: React.FC<FindTutorsSectionProps> = ({
                     )}
                   </div>
 
-                  {/* Right Column: Discovery Action Panel (Zero commercial packages, 100% Start Living Integration) */}
+                  {/* Right Column: Discovery Action Panel (Authoritative BRL Pricing + Start Living Integration) */}
                   <div className="w-full lg:w-56 shrink-0 bg-[#000035]/95 rounded-2xl p-4 border border-[#607EC9]/50 flex flex-col justify-between gap-3 shadow-lg">
                     <div className="space-y-2">
                       <div className="flex items-baseline justify-between">
                         <span className="text-[10px] font-bold uppercase tracking-wider text-[#9AB4FF]/80">
-                          {isEn ? 'Standard Rate' : 'Valor da Aula'}
+                          {isEn ? 'Lesson Rate' : 'Valor da Aula'}
                         </span>
                         <span className="text-[11px] text-slate-300 font-semibold">
                           50 min Meet
                         </span>
                       </div>
 
-                      <div className="flex items-baseline gap-1">
-                        <span className="text-xl sm:text-2xl font-black text-white">
-                          ${tutor.pricePerSessionUsd ?? 15} USD
-                        </span>
-                        <span className="text-[11px] text-[#9AB4FF] font-semibold">
-                          / 50 min
-                        </span>
-                      </div>
+                      {(() => {
+                        const { quote: tutorQuote, unavailable: tutorUnavailable } = findQuoteForTutor(
+                          tutor,
+                          quotesByTutorId,
+                          unavailableByTutorId
+                        );
+
+                        if (isQuotesLoading && !tutorQuote) {
+                          return (
+                            <div className="py-1.5 space-y-1.5">
+                              <div className="h-6 w-28 rounded-md bg-white/10 animate-pulse" />
+                              <span className="text-[10px] text-[#9AB4FF] block">
+                                {isEn ? 'Fetching official BRL quote...' : 'Consultando cotação oficial...'}
+                              </span>
+                            </div>
+                          );
+                        }
+
+                        if (tutorQuote) {
+                          return (
+                            <div className="space-y-1">
+                              <div className="flex items-baseline gap-1 flex-wrap">
+                                <span className="text-xl sm:text-2xl font-black text-white">
+                                  {formatBrl(tutorQuote.unit.finalPriceBrl)}
+                                </span>
+                                <span className="text-[11px] text-[#9AB4FF] font-semibold">
+                                  / 50 min
+                                </span>
+                              </div>
+                              <span className="text-[10px] font-bold text-[#F4CA54] block leading-snug">
+                                {isEn
+                                  ? `Packs up to 15% OFF (from ${formatBrl(tutorQuote.lowestEffectiveLessonPriceBrl)}/lesson)`
+                                  : `Pacotes até 15% OFF (desde ${formatBrl(tutorQuote.lowestEffectiveLessonPriceBrl)}/aula)`}
+                              </span>
+                            </div>
+                          );
+                        }
+
+                        if (batchQuoteError) {
+                          return (
+                            <div className="p-2 rounded-lg bg-amber-500/15 border border-amber-400/30 space-y-1">
+                              <div className="flex items-center gap-1 text-[10px] font-bold text-amber-300">
+                                <AlertCircle className="w-3 h-3 shrink-0" />
+                                <span>
+                                  {batchQuoteErrorCode === 'PTAX_UNAVAILABLE'
+                                    ? (isEn ? 'PTAX quote unavailable' : 'Cotação PTAX indisponível')
+                                    : (isEn ? 'Pricing temporarily unavailable' : 'Preços indisponíveis agora')}
+                                </span>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={refreshBatchQuotes}
+                                className="inline-flex items-center gap-1 text-[10px] font-bold text-[#9AB4FF] hover:text-white underline cursor-pointer"
+                              >
+                                <RefreshCw className="w-2.5 h-2.5" />
+                                <span>{isEn ? 'Retry' : 'Tentar novamente'}</span>
+                              </button>
+                            </div>
+                          );
+                        }
+
+                        return (
+                          <div className="p-2 rounded-lg bg-slate-800/80 border border-white/10">
+                            <span className="text-[11px] font-bold text-slate-200 block">
+                              {isEn ? 'Packages pending setup' : 'Pacotes em configuração'}
+                            </span>
+                            <span className="text-[9.5px] text-slate-400 block mt-0.5 leading-snug">
+                              {tutorUnavailable?.message ||
+                                (isEn
+                                  ? 'Commercial values under configuration'
+                                  : 'Valores comerciais sendo configurados')}
+                            </span>
+                          </div>
+                        );
+                      })()}
 
                       {/* Free Trial Lesson Guarantee */}
                       <div className="p-2 rounded-xl bg-emerald-500/15 border border-emerald-400/40 text-emerald-300">
@@ -656,42 +744,134 @@ export const FindTutorsSection: React.FC<FindTutorsSectionProps> = ({
                     </span>
                   </div>
                   <span className="text-[11px] text-emerald-400 font-bold bg-emerald-500/20 px-2 py-0.5 rounded-full">
-                    {isEn ? '1st Lesson: Free ($0 USD / 25 min)' : '1ª Aula: Grátis ($0 USD / 25 min)'}
+                    {isEn ? '1st Lesson: Free (25 min)' : '1ª Aula: Grátis (25 min)'}
                   </span>
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div className="p-3 rounded-xl bg-[#000035]/80 border border-white/10">
-                    <span className="text-[10px] text-slate-400 uppercase font-bold block">
-                      {isEn ? 'Standard Session (50 min)' : 'Aula Padrão (50 min)'}
-                    </span>
-                    <div className="flex items-baseline gap-1 mt-1">
-                      <span className="text-xl font-black text-white">
-                        ${detailedProfileTutor.pricePerSessionUsd ?? 15} USD
-                      </span>
-                      <span className="text-xs text-blue-200 font-semibold">
-                        / 50 min
-                      </span>
-                    </div>
-                    <p className="text-[10px] text-slate-300 mt-1">
-                      {isEn ? 'Individual Google Meet conversation session' : 'Sessão individual via Google Meet'}
-                    </p>
-                  </div>
+                {(() => {
+                  const fallbackBatch = findQuoteForTutor(
+                    detailedProfileTutor,
+                    quotesByTutorId,
+                    unavailableByTutorId
+                  );
+                  const resolvedQuote = detailedQuote || fallbackBatch.quote;
 
-                  <div className="p-3 rounded-xl bg-[#000035]/80 border border-[#F4CA54]/30">
-                    <span className="text-[10px] text-[#F4CA54] uppercase font-bold block">
-                      {isEn ? 'Post-Trial Options' : 'Opções Pós-Teste'}
-                    </span>
-                    <div className="flex items-baseline gap-1 mt-1">
-                      <span className="text-base font-black text-white">
-                        {isEn ? 'Flexible Packages' : 'Planos Flexíveis'}
-                      </span>
+                  if (isDetailedQuoteLoading && !resolvedQuote) {
+                    return (
+                      <div className="p-4 rounded-xl bg-[#000035]/80 border border-white/10 text-center space-y-2">
+                        <div className="h-6 w-36 mx-auto rounded bg-white/10 animate-pulse" />
+                        <p className="text-[11px] text-[#9AB4FF]">
+                          {isEn ? 'Fetching official BRL package quote...' : 'Consultando cotação oficial em reais...'}
+                        </p>
+                      </div>
+                    );
+                  }
+
+                  if (resolvedQuote) {
+                    const discountedPacks = resolvedQuote.packages.filter((p) => p.lessonsCount > 1);
+                    return (
+                      <div className="space-y-3">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          <div className="p-3 rounded-xl bg-[#000035]/80 border border-white/10">
+                            <span className="text-[10px] text-slate-400 uppercase font-bold block">
+                              {isEn ? 'Single Lesson (50 min)' : 'Aula Avulsa (50 min)'}
+                            </span>
+                            <div className="flex items-baseline gap-1 mt-1">
+                              <span className="text-xl font-black text-white">
+                                {formatBrl(resolvedQuote.unit.finalPriceBrl)}
+                              </span>
+                              <span className="text-xs text-blue-200 font-semibold">
+                                / 50 min
+                              </span>
+                            </div>
+                            <p className="text-[10px] text-slate-300 mt-1">
+                              {isEn
+                                ? `Official BACEN PTAX D-1 (${resolvedQuote.ptax.quoteDate})`
+                                : `Câmbio oficial PTAX D-1 (${resolvedQuote.ptax.quoteDate})`}
+                            </p>
+                          </div>
+
+                          <div className="p-3 rounded-xl bg-[#000035]/80 border border-[#F4CA54]/30">
+                            <span className="text-[10px] text-[#F4CA54] uppercase font-bold block">
+                              {isEn ? 'Post-Trial Packages' : 'Pacotes Pós-Teste'}
+                            </span>
+                            <div className="flex items-baseline gap-1.5 mt-1 flex-wrap">
+                              <span className="text-base font-black text-white">
+                                {isEn
+                                  ? `From ${formatBrl(resolvedQuote.lowestEffectiveLessonPriceBrl)} / lesson`
+                                  : `Desde ${formatBrl(resolvedQuote.lowestEffectiveLessonPriceBrl)} / aula`}
+                              </span>
+                              <span className="text-[10px] text-emerald-400 font-bold">
+                                (até 15% OFF)
+                              </span>
+                            </div>
+                            <p className="text-[10px] text-slate-300 mt-1">
+                              {isEn ? 'Packages of 4, 8 or 12 lessons (5% to 15% OFF)' : 'Pacotes de 4, 8 ou 12 aulas (5% a 15% OFF)'}
+                            </p>
+                          </div>
+                        </div>
+
+                        {discountedPacks.length > 0 && (
+                          <div className="grid grid-cols-3 gap-2">
+                            {discountedPacks.map((pkg) => (
+                              <div
+                                key={pkg.lessonsCount}
+                                className="p-2 rounded-lg bg-[#000035]/70 border border-white/10 text-center"
+                              >
+                                <span className="text-[10px] font-bold text-[#9AB4FF] block">
+                                  {pkg.lessonsCount} {isEn ? 'lessons' : 'aulas'} (-{pkg.discountPercent}%)
+                                </span>
+                                <span className="text-xs font-black text-white block mt-0.5">
+                                  {formatBrl(pkg.finalPriceBrl)}
+                                </span>
+                                <span className="text-[9.5px] text-emerald-300 block">
+                                  {formatBrl(pkg.effectiveLessonPriceBrl)}/{isEn ? 'ea' : 'aula'}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  }
+
+                  const isPtaxIssue =
+                    detailedQuoteErrorCode === 'PTAX_UNAVAILABLE' ||
+                    batchQuoteErrorCode === 'PTAX_UNAVAILABLE';
+
+                  return (
+                    <div className="p-3.5 rounded-xl bg-[#000035]/80 border border-amber-400/30 space-y-2">
+                      <div className="flex items-start gap-2 text-xs text-amber-200">
+                        <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                        <div>
+                          <span className="font-bold block text-amber-300">
+                            {isPtaxIssue
+                              ? (isEn ? 'Official Exchange Rate Unavailable' : 'Cotação Oficial PTAX Indisponível')
+                              : (isEn ? 'Commercial Packages Unavailable' : 'Pacotes Temporariamente Indisponíveis')}
+                          </span>
+                          <span className="text-[11px] text-slate-300 block mt-0.5">
+                            {detailedQuoteError ||
+                              batchQuoteError ||
+                              fallbackBatch.unavailable?.message ||
+                              (isEn
+                                ? 'Official BRL package pricing is not yet available for this Native Friend. You can still schedule your free 25-minute trial.'
+                                : 'Os valores oficiais em reais ainda não estão disponíveis para este Amigo Nativo. Sua aula teste gratuita de 25 minutos continua liberada.')}
+                          </span>
+                        </div>
+                      </div>
+                      {(detailedQuoteError || batchQuoteError) && (
+                        <button
+                          type="button"
+                          onClick={refreshDetailedQuote}
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-[11px] font-bold text-[#9AB4FF] cursor-pointer transition"
+                        >
+                          <RefreshCw className="w-3 h-3" />
+                          <span>{isEn ? 'Try again' : 'Atualizar cotação'}</span>
+                        </button>
+                      )}
                     </div>
-                    <p className="text-[10px] text-slate-300 mt-1">
-                      {isEn ? 'Available after your free trial session' : 'Disponíveis após a conclusão da aula teste'}
-                    </p>
-                  </div>
-                </div>
+                  );
+                })()}
               </div>
 
               {/* Bio Section */}
