@@ -216,6 +216,12 @@ async function runSuite() {
       if (token === 'token-deleted-student') {
         return { uid: deletedStudentUid, email: deletedStudentEmail, email_verified: true };
       }
+      if (token === 'token-synth-google') {
+        return { uid: 'google-1788181232049', email: 'synth2@arch2b.com', email_verified: true };
+      }
+      if (token === 'token-synth-st') {
+        return { uid: 'st-1788181232049', email: 'synth3@arch2b.com', email_verified: true };
+      }
       throw new Error('Invalid token');
     },
     getUser: async (uid: string) => {
@@ -239,27 +245,45 @@ async function runSuite() {
       const dbBefore = readDb();
       const synthEmails = ['synth1@arch2b.com', 'synth2@arch2b.com', 'synth3@arch2b.com'];
 
-      const resMissing = await makeRequest(server, 'POST', '/api/auth/google', {
+      const resUnauth = await makeRequest(server, 'POST', '/api/auth/google', {
         email: synthEmails[0],
-        name: 'No UID',
+        name: 'No Token',
       });
-      assert.strictEqual(resMissing.status, 400);
+      assert.strictEqual(resUnauth.status, 401);
 
-      const resGooglePrefix = await makeRequest(server, 'POST', '/api/auth/google', {
-        uid: 'google-1788181232049',
-        email: synthEmails[1],
-        name: 'Synthetic Google',
-      });
+      const resGooglePrefix = await makeRequest(
+        server,
+        'POST',
+        '/api/auth/google',
+        {
+          uid: 'google-1788181232049',
+          email: synthEmails[1],
+          name: 'Synthetic Google',
+        },
+        { Authorization: 'Bearer token-synth-google' }
+      );
       assert.strictEqual(resGooglePrefix.status, 400);
 
-      const resStPrefix = await makeRequest(server, 'POST', '/api/auth/google', {
-        uid: 'st-1788181232049',
-        email: synthEmails[2],
-        name: 'Synthetic St',
-      });
+      const resStPrefix = await makeRequest(
+        server,
+        'POST',
+        '/api/auth/google',
+        {
+          uid: 'st-1788181232049',
+          email: synthEmails[2],
+          name: 'Synthetic St',
+        },
+        { Authorization: 'Bearer token-synth-st' }
+      );
       assert.strictEqual(resStPrefix.status, 400);
 
-      const resGetProfileSynth = await makeRequest(server, 'GET', '/api/user-profile?uid=usr-123456');
+      const resGetProfileSynth = await makeRequest(
+        server,
+        'GET',
+        '/api/user-profile?uid=usr-123456',
+        undefined,
+        { Authorization: 'Bearer token-student-arch2b' }
+      );
       assert.strictEqual(resGetProfileSynth.status, 400);
 
       for (const em of synthEmails) {
@@ -439,7 +463,9 @@ async function runSuite() {
       const profileRes = await makeRequest(
         server,
         'GET',
-        `/api/user-profile?email=${encodeURIComponent(firestoreOnlyEmail)}&uid=${firestoreOnlyUid}`
+        `/api/user-profile?email=${encodeURIComponent(firestoreOnlyEmail)}&uid=${firestoreOnlyUid}`,
+        undefined,
+        { Authorization: 'Bearer token-teacher-noclaim' }
       );
       assert.strictEqual(profileRes.status, 200);
       assert.strictEqual(profileRes.data.profile?.uid, firestoreOnlyUid);
@@ -483,7 +509,9 @@ async function runSuite() {
       const getProfAfter = await makeRequest(
         server,
         'GET',
-        `/api/user-profile?email=${encodeURIComponent(deletedStudentEmail)}&uid=${deletedStudentUid}`
+        `/api/user-profile?email=${encodeURIComponent(deletedStudentEmail)}&uid=${deletedStudentUid}`,
+        undefined,
+        { Authorization: 'Bearer token-deleted-student' }
       );
       assert.strictEqual(getProfAfter.status, 200);
       assert.strictEqual(getProfAfter.data.profile, null, 'GET /api/user-profile não ressuscita usuária excluída');

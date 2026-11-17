@@ -180,7 +180,7 @@ async function runNativeFriendLoginTests() {
     app,
     'GET',
     `/api/user-profile?email=${encodeURIComponent(testTeacherEmail)}&uid=${encodeURIComponent(testTeacherUid)}`,
-    {},
+    { Authorization: 'Bearer valid-teacher-token' },
     {}
   );
 

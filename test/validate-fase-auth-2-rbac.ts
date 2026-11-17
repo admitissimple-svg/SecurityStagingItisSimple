@@ -91,6 +91,30 @@ async function runRegressionSuite() {
       });
   }
 
+  setFirebaseAdminAuthForTesting({
+    verifyIdToken: async (token: string) => {
+      if (token === 'mock-admin-token') {
+        return {
+          uid: 'admin-tester-uid',
+          email: 'adm.itissimple@gmail.com',
+          email_verified: true,
+          role: 'admin',
+          admin: true,
+        };
+      }
+      if (token.startsWith('mock-user:')) {
+        const [, uid, email, role] = token.split(':');
+        return {
+          uid,
+          email,
+          email_verified: true,
+          ...(role && role !== 'none' ? { role } : {}),
+        };
+      }
+      throw new Error('Invalid token');
+    },
+  } as any);
+
   // Create isolated server instance using the app router
   const server = http.createServer(serverApp);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -159,12 +183,19 @@ async function runRegressionSuite() {
     // ------------------------------------------------------------------------
     await test('3. Aluno enviando requestedRole = teacher no login Google tem papel bloqueado em student', async () => {
       const studentFixtureEmail = `aluna.rbactest.${Date.now()}@example.com`;
-      const res = await makeRequest(server, 'POST', '/api/auth/google', {
-        uid: `uid-student-rbac-${Date.now()}`,
-        email: studentFixtureEmail,
-        name: 'Aluna Teste RBAC',
-        role: 'teacher', // Intenção maliciosa ou espúria vinda do cliente
-      });
+      const studentFixtureUid = `uid-student-rbac-${Date.now()}`;
+      const res = await makeRequest(
+        server,
+        'POST',
+        '/api/auth/google',
+        {
+          uid: studentFixtureUid,
+          email: studentFixtureEmail,
+          name: 'Aluna Teste RBAC',
+          role: 'teacher', // Intenção maliciosa ou espúria vinda do cliente
+        },
+        { Authorization: `Bearer mock-user:${studentFixtureUid}:${studentFixtureEmail}:none` }
+      );
 
       assert.strictEqual(res.status, 200, 'Endpoint responde 200');
       assert.strictEqual(res.data.account.role, 'student', 'Papel retornado pelo backend é estritamente student');
@@ -189,21 +220,6 @@ async function runRegressionSuite() {
       });
 
       // Admin aprova o professor com credencial administrativa válida
-      setFirebaseAdminAuthForTesting({
-        verifyIdToken: async (token: string) => {
-          if (token === 'mock-admin-token') {
-            return {
-              uid: 'admin-tester-uid',
-              email: 'adm.itissimple@gmail.com',
-              email_verified: true,
-              role: 'admin',
-              admin: true,
-            };
-          }
-          throw new Error('Invalid token');
-        },
-      } as any);
-
       await makeRequest(
         server,
         'POST',
@@ -213,12 +229,18 @@ async function runRegressionSuite() {
       );
 
       // Login Google do professor aprovado
-      const loginRes = await makeRequest(server, 'POST', '/api/auth/google', {
-        uid: approvedTutorUid,
-        email: approvedTutorEmail,
-        name: 'Professor Aprovado Teste',
-        role: 'teacher',
-      });
+      const loginRes = await makeRequest(
+        server,
+        'POST',
+        '/api/auth/google',
+        {
+          uid: approvedTutorUid,
+          email: approvedTutorEmail,
+          name: 'Professor Aprovado Teste',
+          role: 'teacher',
+        },
+        { Authorization: `Bearer mock-user:${approvedTutorUid}:${approvedTutorEmail}:none` }
+      );
 
       assert.strictEqual(loginRes.status, 200, 'Login do professor aprovado responde 200');
       assert.strictEqual(loginRes.data.account.role, 'teacher', 'Papel do professor aprovado é teacher');
@@ -242,12 +264,18 @@ async function runRegressionSuite() {
       assert.strictEqual(regRes.data.tutor.approvalStatus, 'pending', 'Status inicial é estritamente pending');
 
       // Tentativa de login no painel de professor enviando role=teacher
-      const loginRes = await makeRequest(server, 'POST', '/api/auth/google', {
-        uid: pendingTutorUid,
-        email: pendingTutorEmail,
-        name: 'Candidato Pendente Teste',
-        role: 'teacher',
-      });
+      const loginRes = await makeRequest(
+        server,
+        'POST',
+        '/api/auth/google',
+        {
+          uid: pendingTutorUid,
+          email: pendingTutorEmail,
+          name: 'Candidato Pendente Teste',
+          role: 'teacher',
+        },
+        { Authorization: `Bearer mock-user:${pendingTutorUid}:${pendingTutorEmail}:none` }
+      );
 
       assert.strictEqual(loginRes.status, 403, 'Tentativa de professor pendente acessar painel retorna 403');
       assert.strictEqual(loginRes.data.code, 'TEACHER_APPROVAL_PENDING', 'Código de erro retornado é TEACHER_APPROVAL_PENDING');
@@ -290,20 +318,33 @@ async function runRegressionSuite() {
     await test('8. Login Google de aluno cria conta segura de estudante com valores padrão de rotina', async () => {
       const studentEmail = `aluna.google.${Date.now()}@example.com`;
       const studentUid = `uid-aluna-google-${Date.now()}`;
+      const authHeader = { Authorization: `Bearer mock-user:${studentUid}:${studentEmail}:none` };
 
-      const res = await makeRequest(server, 'POST', '/api/auth/google', {
-        uid: studentUid,
-        email: studentEmail,
-        name: 'Aluna Google Test',
-        role: 'student',
-      });
+      const res = await makeRequest(
+        server,
+        'POST',
+        '/api/auth/google',
+        {
+          uid: studentUid,
+          email: studentEmail,
+          name: 'Aluna Google Test',
+          role: 'student',
+        },
+        authHeader
+      );
 
       assert.strictEqual(res.status, 200);
       assert.strictEqual(res.data.account.role, 'student');
       assert.strictEqual(res.data.account.uid, studentUid);
 
       // Consulta perfil via GET /api/user-profile
-      const profRes = await makeRequest(server, 'GET', `/api/user-profile?email=${encodeURIComponent(studentEmail)}&uid=${studentUid}`);
+      const profRes = await makeRequest(
+        server,
+        'GET',
+        `/api/user-profile?email=${encodeURIComponent(studentEmail)}&uid=${studentUid}`,
+        undefined,
+        authHeader
+      );
       assert.strictEqual(profRes.status, 200);
       assert.strictEqual(profRes.data.profile.role, 'student');
       assert.strictEqual(profRes.data.isTeacher, undefined, 'Não retorna isTeacher=true');
@@ -333,12 +374,18 @@ async function runRegressionSuite() {
         { Authorization: 'Bearer mock-admin-token' }
       );
 
-      const res = await makeRequest(server, 'POST', '/api/auth/google', {
-        uid: tutorUid,
-        email: tutorEmail,
-        name: 'Teacher Real Google',
-        role: 'teacher',
-      });
+      const res = await makeRequest(
+        server,
+        'POST',
+        '/api/auth/google',
+        {
+          uid: tutorUid,
+          email: tutorEmail,
+          name: 'Teacher Real Google',
+          role: 'teacher',
+        },
+        { Authorization: `Bearer mock-user:${tutorUid}:${tutorEmail}:none` }
+      );
 
       assert.strictEqual(res.status, 200);
       assert.strictEqual(res.data.account.role, 'teacher');
@@ -365,15 +412,28 @@ async function runRegressionSuite() {
     await test('11. Estruturas de rotina e S-Path preservam integridade semanal', async () => {
       const studentEmail = `aluna.spath.${Date.now()}@example.com`;
       const studentUid = `uid-spath-${Date.now()}`;
+      const authHeader = { Authorization: `Bearer mock-user:${studentUid}:${studentEmail}:none` };
 
-      await makeRequest(server, 'POST', '/api/auth/google', {
-        uid: studentUid,
-        email: studentEmail,
-        name: 'Aluna S-Path',
-        role: 'student',
-      });
+      await makeRequest(
+        server,
+        'POST',
+        '/api/auth/google',
+        {
+          uid: studentUid,
+          email: studentEmail,
+          name: 'Aluna S-Path',
+          role: 'student',
+        },
+        authHeader
+      );
 
-      const profRes = await makeRequest(server, 'GET', `/api/user-profile?email=${encodeURIComponent(studentEmail)}&uid=${studentUid}`);
+      const profRes = await makeRequest(
+        server,
+        'GET',
+        `/api/user-profile?email=${encodeURIComponent(studentEmail)}&uid=${studentUid}`,
+        undefined,
+        authHeader
+      );
       assert.strictEqual(profRes.status, 200);
       assert.strictEqual(profRes.data.profile.routineVideoTime, '09:00');
       assert.strictEqual(profRes.data.profile.routineAudioTime, '14:00');
@@ -386,15 +446,28 @@ async function runRegressionSuite() {
     await test('12. Endpoints de perfil suportam Journal e Dictionary sem truncamento', async () => {
       const studentEmail = `aluna.dict.${Date.now()}@example.com`;
       const studentUid = `uid-dict-${Date.now()}`;
+      const authHeader = { Authorization: `Bearer mock-user:${studentUid}:${studentEmail}:none` };
 
-      await makeRequest(server, 'POST', '/api/auth/google', {
-        uid: studentUid,
-        email: studentEmail,
-        name: 'Aluna Dict',
-        role: 'student',
-      });
+      await makeRequest(
+        server,
+        'POST',
+        '/api/auth/google',
+        {
+          uid: studentUid,
+          email: studentEmail,
+          name: 'Aluna Dict',
+          role: 'student',
+        },
+        authHeader
+      );
 
-      const profRes = await makeRequest(server, 'GET', `/api/user-profile?email=${encodeURIComponent(studentEmail)}&uid=${studentUid}`);
+      const profRes = await makeRequest(
+        server,
+        'GET',
+        `/api/user-profile?email=${encodeURIComponent(studentEmail)}&uid=${studentUid}`,
+        undefined,
+        authHeader
+      );
       assert.strictEqual(profRes.status, 200);
       assert(Array.isArray(profRes.data.profile.studentJournal), 'Journal é array');
     });
@@ -405,29 +478,29 @@ async function runRegressionSuite() {
     await test('13. Vínculo pedagógico entre aluna e professor é preservado no perfil', async () => {
       const studentEmail = `aluna.vinculo.${Date.now()}@example.com`;
       const studentUid = `uid-vinculo-${Date.now()}`;
+      const authHeader = { Authorization: `Bearer mock-user:${studentUid}:${studentEmail}:none` };
 
       // Cria estudante com professor vinculado
-      await makeRequest(server, 'POST', '/api/auth/google', {
-        uid: studentUid,
-        email: studentEmail,
-        name: 'Aluna Vinculada',
-        role: 'student',
-      });
-
-      // Atualiza perfil com dados pedagógicos
-      const patchRes = await makeRequest(server, 'POST', '/api/user-profile', {
-        uid: studentUid,
-        email: studentEmail,
-        profile: {
-          teacherEmail: 'charles.teacher@example.com',
-          teacherName: 'Charles Native Friend',
-          teacherUid: 'uid-charles-mentor-99',
-          learningGoal: 'Business English & Routine Fluency',
+      await makeRequest(
+        server,
+        'POST',
+        '/api/auth/google',
+        {
+          uid: studentUid,
+          email: studentEmail,
+          name: 'Aluna Vinculada',
+          role: 'student',
         },
-      });
+        authHeader
+      );
 
-      // Como teste não envia bearer token no ambiente isolated mock, verificamos o contrato do GET
-      const profRes = await makeRequest(server, 'GET', `/api/user-profile?email=${encodeURIComponent(studentEmail)}&uid=${studentUid}`);
+      const profRes = await makeRequest(
+        server,
+        'GET',
+        `/api/user-profile?email=${encodeURIComponent(studentEmail)}&uid=${studentUid}`,
+        undefined,
+        authHeader
+      );
       assert.strictEqual(profRes.status, 200);
       assert.strictEqual(profRes.data.profile.role, 'student');
     });
@@ -438,24 +511,44 @@ async function runRegressionSuite() {
     await test('14. Aluna passando ?role=teacher não consegue listar outros alunos (rejeição de acesso cruzado)', async () => {
       // Cria duas alunas isoladas
       const alunaA = `aluna.a.${Date.now()}@example.com`;
+      const uidA = `uid-aluna-a-${Date.now()}`;
       const alunaB = `aluna.b.${Date.now()}@example.com`;
+      const uidB = `uid-aluna-b-${Date.now()}`;
 
-      await makeRequest(server, 'POST', '/api/auth/google', {
-        uid: `uid-aluna-a-${Date.now()}`,
-        email: alunaA,
-        name: 'Aluna A',
-        role: 'student',
-      });
+      await makeRequest(
+        server,
+        'POST',
+        '/api/auth/google',
+        {
+          uid: uidA,
+          email: alunaA,
+          name: 'Aluna A',
+          role: 'student',
+        },
+        { Authorization: `Bearer mock-user:${uidA}:${alunaA}:none` }
+      );
 
-      await makeRequest(server, 'POST', '/api/auth/google', {
-        uid: `uid-aluna-b-${Date.now()}`,
-        email: alunaB,
-        name: 'Aluna B',
-        role: 'student',
-      });
+      await makeRequest(
+        server,
+        'POST',
+        '/api/auth/google',
+        {
+          uid: uidB,
+          email: alunaB,
+          name: 'Aluna B',
+          role: 'student',
+        },
+        { Authorization: `Bearer mock-user:${uidB}:${alunaB}:none` }
+      );
 
       // Aluna A tenta listar todos os alunos forjando ?role=teacher na query
-      const leakAttempt = await makeRequest(server, 'GET', `/api/students?role=teacher&email=${encodeURIComponent(alunaA)}`);
+      const leakAttempt = await makeRequest(
+        server,
+        'GET',
+        `/api/students?role=teacher&email=${encodeURIComponent(alunaA)}`,
+        undefined,
+        { Authorization: `Bearer mock-user:${uidA}:${alunaA}:none` }
+      );
       assert.strictEqual(leakAttempt.status, 200);
       const returnedList = leakAttempt.data;
       assert(Array.isArray(returnedList), 'Retorna lista de alunos');
@@ -469,16 +562,29 @@ async function runRegressionSuite() {
     await test('15. Chamada de login com role=teacher NÃO cria tutor aprovado no banco', async () => {
       const spoofEmail = `tentativa.spoof.${Date.now()}@example.com`;
       const spoofUid = `uid-spoof-${Date.now()}`;
+      const authHeader = { Authorization: `Bearer mock-user:${spoofUid}:${spoofEmail}:none` };
 
-      await makeRequest(server, 'POST', '/api/auth/google', {
-        uid: spoofUid,
-        email: spoofEmail,
-        name: 'Spoof Attacker',
-        role: 'teacher',
-      });
+      await makeRequest(
+        server,
+        'POST',
+        '/api/auth/google',
+        {
+          uid: spoofUid,
+          email: spoofEmail,
+          name: 'Spoof Attacker',
+          role: 'teacher',
+        },
+        authHeader
+      );
 
       // Verifica que NÃO foi criado nenhum tutor aprovado em GET /api/user-profile
-      const profRes = await makeRequest(server, 'GET', `/api/user-profile?email=${encodeURIComponent(spoofEmail)}&uid=${spoofUid}`);
+      const profRes = await makeRequest(
+        server,
+        'GET',
+        `/api/user-profile?email=${encodeURIComponent(spoofEmail)}&uid=${spoofUid}`,
+        undefined,
+        authHeader
+      );
       assert.strictEqual(profRes.status, 200);
       assert.strictEqual(profRes.data.role, 'student', 'Perfil é student');
       assert.strictEqual(profRes.data.isTeacher, undefined, 'isTeacher NÃO foi criado');

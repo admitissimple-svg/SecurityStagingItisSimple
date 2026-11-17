@@ -256,9 +256,11 @@ async function runTests() {
       process.env.PAYMENTS_ENABLED = 'false';
 
       // Consulta perfil do aluno antes
-      const resProfileBefore = await fetch(`${baseUrl}/api/user-profile?email=${STUDENT_EMAIL}`);
+      const resProfileBefore = await fetch(`${baseUrl}/api/user-profile?email=${STUDENT_EMAIL}`, {
+        headers: { 'Authorization': 'Bearer valid-student-token' },
+      });
       const beforeData = await resProfileBefore.json();
-      const initialCredits = beforeData.contractedLessons || 0;
+      const initialCredits = beforeData.profile?.contractedLessons ?? beforeData.contractedLessons ?? 0;
 
       // Executa tentativa bloqueada
       await fetch(`${baseUrl}/api/students/purchase-package`, {
@@ -276,9 +278,11 @@ async function runTests() {
       });
 
       // Consulta perfil do aluno depois
-      const resProfileAfter = await fetch(`${baseUrl}/api/user-profile?email=${STUDENT_EMAIL}`);
+      const resProfileAfter = await fetch(`${baseUrl}/api/user-profile?email=${STUDENT_EMAIL}`, {
+        headers: { 'Authorization': 'Bearer valid-student-token' },
+      });
       const afterData = await resProfileAfter.json();
-      const afterCredits = afterData.contractedLessons || 0;
+      const afterCredits = afterData.profile?.contractedLessons ?? afterData.contractedLessons ?? 0;
 
       assert(initialCredits === afterCredits, 'Saldo de aulas contratadas permanece estritamente idêntico após tentativa rejeitada');
 

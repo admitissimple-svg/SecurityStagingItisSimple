@@ -595,6 +595,11 @@ export function mergeTutors(existing: any, incoming: any): any {
 
   const resolvedId = resolvedCanonicalUid || safePublicId || 'native-friend';
 
+  const existingCommVer = typeof existing.commissionVersion === 'number' && Number.isFinite(existing.commissionVersion) ? existing.commissionVersion : 0;
+  const incomingCommVer = typeof incoming.commissionVersion === 'number' && Number.isFinite(incoming.commissionVersion) ? incoming.commissionVersion : 0;
+  const commPrimary = existingCommVer > incomingCommVer ? existing : incoming;
+  const commSecondary = existingCommVer > incomingCommVer ? incoming : existing;
+
   return {
     ...existing,
     ...incoming,
@@ -645,51 +650,51 @@ export function mergeTutors(existing: any, incoming: any): any {
     role: 'teacher',
     appliedAt: existing.appliedAt || incoming.appliedAt || existing.createdAt || incoming.createdAt || new Date().toISOString(),
     updatedAt: incoming.updatedAt || existing.updatedAt || undefined,
-    // FIN.2B: Preserve administrative commission fields strictly without fallback or invention
-    ...(typeof incoming.adminCommissionPercent === 'number' && Number.isFinite(incoming.adminCommissionPercent)
-      ? { adminCommissionPercent: incoming.adminCommissionPercent }
-      : typeof existing.adminCommissionPercent === 'number' && Number.isFinite(existing.adminCommissionPercent)
-      ? { adminCommissionPercent: existing.adminCommissionPercent }
+    // FIN.2B: Preserve administrative commission fields strictly without fallback or invention, honoring latest commissionVersion
+    ...(typeof commPrimary.adminCommissionPercent === 'number' && Number.isFinite(commPrimary.adminCommissionPercent)
+      ? { adminCommissionPercent: commPrimary.adminCommissionPercent }
+      : typeof commSecondary.adminCommissionPercent === 'number' && Number.isFinite(commSecondary.adminCommissionPercent)
+      ? { adminCommissionPercent: commSecondary.adminCommissionPercent }
       : {}),
-    ...(incoming.commissionModel !== undefined
-      ? { commissionModel: incoming.commissionModel }
-      : existing.commissionModel !== undefined
-      ? { commissionModel: existing.commissionModel }
+    ...(commPrimary.commissionModel !== undefined
+      ? { commissionModel: commPrimary.commissionModel }
+      : commSecondary.commissionModel !== undefined
+      ? { commissionModel: commSecondary.commissionModel }
       : {}),
-    ...(typeof incoming.commissionVersion === 'number'
-      ? { commissionVersion: incoming.commissionVersion }
-      : typeof existing.commissionVersion === 'number'
-      ? { commissionVersion: existing.commissionVersion }
+    ...(typeof commPrimary.commissionVersion === 'number'
+      ? { commissionVersion: commPrimary.commissionVersion }
+      : typeof commSecondary.commissionVersion === 'number'
+      ? { commissionVersion: commSecondary.commissionVersion }
       : {}),
-    ...(incoming.effectiveFrom !== undefined
-      ? { effectiveFrom: incoming.effectiveFrom }
-      : existing.effectiveFrom !== undefined
-      ? { effectiveFrom: existing.effectiveFrom }
+    ...(commPrimary.effectiveFrom !== undefined
+      ? { effectiveFrom: commPrimary.effectiveFrom }
+      : commSecondary.effectiveFrom !== undefined
+      ? { effectiveFrom: commSecondary.effectiveFrom }
       : {}),
-    ...(incoming.updatedByUid !== undefined
-      ? { updatedByUid: incoming.updatedByUid }
-      : existing.updatedByUid !== undefined
-      ? { updatedByUid: existing.updatedByUid }
+    ...(commPrimary.updatedByUid !== undefined
+      ? { updatedByUid: commPrimary.updatedByUid }
+      : commSecondary.updatedByUid !== undefined
+      ? { updatedByUid: commSecondary.updatedByUid }
       : {}),
-    ...(incoming.commissionUpdatedAt !== undefined
-      ? { commissionUpdatedAt: incoming.commissionUpdatedAt }
-      : existing.commissionUpdatedAt !== undefined
-      ? { commissionUpdatedAt: existing.commissionUpdatedAt }
+    ...(commPrimary.commissionUpdatedAt !== undefined
+      ? { commissionUpdatedAt: commPrimary.commissionUpdatedAt }
+      : commSecondary.commissionUpdatedAt !== undefined
+      ? { commissionUpdatedAt: commSecondary.commissionUpdatedAt }
       : {}),
-    ...(Array.isArray(incoming.commissionHistory)
-      ? { commissionHistory: incoming.commissionHistory }
-      : Array.isArray(existing.commissionHistory)
-      ? { commissionHistory: existing.commissionHistory }
+    ...(Array.isArray(commPrimary.commissionHistory)
+      ? { commissionHistory: commPrimary.commissionHistory }
+      : Array.isArray(commSecondary.commissionHistory)
+      ? { commissionHistory: commSecondary.commissionHistory }
       : {}),
-    ...(typeof incoming.financialConfigurationPending === 'boolean'
-      ? { financialConfigurationPending: incoming.financialConfigurationPending }
-      : typeof existing.financialConfigurationPending === 'boolean'
-      ? { financialConfigurationPending: existing.financialConfigurationPending }
+    ...(typeof commPrimary.financialConfigurationPending === 'boolean'
+      ? { financialConfigurationPending: commPrimary.financialConfigurationPending }
+      : typeof commSecondary.financialConfigurationPending === 'boolean'
+      ? { financialConfigurationPending: commSecondary.financialConfigurationPending }
       : {}),
-    ...(typeof incoming.isCommercializable === 'boolean'
-      ? { isCommercializable: incoming.isCommercializable }
-      : typeof existing.isCommercializable === 'boolean'
-      ? { isCommercializable: existing.isCommercializable }
+    ...(typeof commPrimary.isCommercializable === 'boolean'
+      ? { isCommercializable: commPrimary.isCommercializable }
+      : typeof commSecondary.isCommercializable === 'boolean'
+      ? { isCommercializable: commSecondary.isCommercializable }
       : {}),
   };
 }

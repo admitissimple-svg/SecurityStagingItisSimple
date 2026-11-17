@@ -3060,7 +3060,6 @@ export default function App() {
             teacherName: finalTeacherName,
             selectedTutorEmail: (finalTeacherEmail && finalTeacherEmail.includes('@')) ? finalTeacherEmail : undefined,
             selectedTutorName: finalTeacherName,
-            contractedLessons: 1,
           }),
         });
 
@@ -3101,7 +3100,7 @@ export default function App() {
         assignedNativeFriendUID: canonicalTutorUid || undefined,
         nativeFriendUID: canonicalTutorUid || undefined,
         enrollmentStatus: 'active',
-        contractedLessons: userProfile.contractedLessons !== undefined ? Math.max(userProfile.contractedLessons, 1) : 1,
+        contractedLessons: typeof userProfile.contractedLessons === 'number' ? userProfile.contractedLessons : 0,
         availableLessons: userProfile.availableLessons,
         hasCompletedTrialLesson: false,
         subscriptionType: 'trial',
@@ -6837,17 +6836,28 @@ export default function App() {
       }
     }
 
-    try {
-      fetch('/api/students/profile', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          profile: cleanProfile,
-          picture: cleanPic,
-          uid: currentAccount?.uid,
-        }),
-      }).catch(() => {});
-    } catch {}
+    void (async () => {
+      try {
+        const idToken =
+          (await auth?.currentUser?.getIdToken().catch(() => null)) ||
+          (await getAccessToken().catch(() => null)) ||
+          null;
+        if (idToken) {
+          await fetch('/api/students/profile', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${idToken}`,
+            },
+            body: JSON.stringify({
+              profile: cleanProfile,
+              picture: cleanPic,
+              uid: currentAccount?.uid,
+            }),
+          }).catch(() => {});
+        }
+      } catch {}
+    })();
   };
 
   // Punctual time update for any activity in the timeline

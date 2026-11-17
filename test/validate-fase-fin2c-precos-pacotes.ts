@@ -26,7 +26,6 @@ import http from 'http';
 import { AddressInfo } from 'net';
 import fs from 'fs';
 import path from 'path';
-import { app, isPaymentsEnabled } from '../serverApp';
 import { setFirebaseAdminAuthForTesting } from '../src/serverFirebaseAdmin';
 import {
   setFirebaseAdminFirestoreForTesting,
@@ -175,7 +174,8 @@ const UIDS = {
   TUTOR_100: 'TUTOR_100PCT_UID_FIN2C_0005',
   TUTOR_LEGACY_NO_COMM: 'TUTOR_LEGACY_UID_FIN2C_00006',
   TUTOR_PENDING: 'TUTOR_PENDING_UID_FIN2C_0007',
-  TUTOR_NO_PRICE: 'TUTOR_NOPRICE_UID_FIN2C_0008',
+  TUTOR_REJECTED: 'TUTOR_REJECT_UID_FIN2C_0008',
+  TUTOR_NO_PRICE: 'TUTOR_NOPRICE_UID_FIN2C_0009',
 };
 
 const TOKENS = {
@@ -258,6 +258,8 @@ async function runTests() {
   console.log('=========================================================================');
   console.log(' TEST SUITE: FASE FIN.2C — INTEGRAÇÃO SEGURA DE PREÇOS E PACOTES');
   console.log('=========================================================================\n');
+
+  const { app, isPaymentsEnabled } = await import('../serverApp');
 
   setFirebaseAdminAuthForTesting({
     verifyIdToken: async (token: string) => {
@@ -418,6 +420,28 @@ async function runTests() {
       approvalStatus: 'pending',
       isApproved: false,
     },
+    [`tutors/${UIDS.TUTOR_REJECTED}`]: {
+      id: UIDS.TUTOR_REJECTED,
+      uid: UIDS.TUTOR_REJECTED,
+      authUid: UIDS.TUTOR_REJECTED,
+      publicTutorId: 'ava-rejected',
+      email: 'rejected@example.com',
+      name: 'Ava Rejected',
+      role: 'teacher',
+      approvalStatus: 'rejected',
+      isApproved: false,
+      pricePerSessionUsd: 20,
+      adminCommissionPercent: 20,
+      commissionModel: 'MARKUP',
+      commissionVersion: 1,
+    },
+    [`users/${UIDS.TUTOR_REJECTED}`]: {
+      uid: UIDS.TUTOR_REJECTED,
+      email: 'rejected@example.com',
+      role: 'teacher',
+      approvalStatus: 'rejected',
+      isApproved: false,
+    },
     [`tutors/${UIDS.TUTOR_NO_PRICE}`]: {
       id: UIDS.TUTOR_NO_PRICE,
       uid: UIDS.TUTOR_NO_PRICE,
@@ -441,7 +465,7 @@ async function runTests() {
   };
 
   const mockFs = createMockFirestore(initialFirestore);
-  setFirebaseAdminFirestoreForTesting(mockFs);
+  setFirebaseAdminFirestoreForTesting(mockFs as any);
   clearPtaxMemoryCache();
 
   const server = app.listen(0);
@@ -560,6 +584,10 @@ async function runTests() {
     assert(pendingSingle.status === 403 && pendingSingle.body?.error === 'TUTOR_NOT_APPROVED', 'Professor pendente/não aprovado é bloqueado com 403 TUTOR_NOT_APPROVED');
     assert(!batchRes.body.quotesByTutorId?.[UIDS.TUTOR_PENDING] && !batchRes.body.unavailableByTutorId?.[UIDS.TUTOR_PENDING], 'Professor não aprovado nunca aparece no batch público');
 
+    const rejectedSingle = await httpRequest(baseUrl, 'GET', `/api/financial/pricing-quote/${UIDS.TUTOR_REJECTED}`);
+    assert(rejectedSingle.status === 403 && rejectedSingle.body?.error === 'TUTOR_NOT_APPROVED', 'Professor rejeitado é bloqueado com 403 TUTOR_NOT_APPROVED');
+    assert(!batchRes.body.quotesByTutorId?.[UIDS.TUTOR_REJECTED] && !batchRes.body.unavailableByTutorId?.[UIDS.TUTOR_REJECTED], 'Professor rejeitado nunca aparece no batch público');
+
     const studentAsTutor = await httpRequest(baseUrl, 'GET', `/api/financial/pricing-quote/${UIDS.STUDENT}`);
     assert(studentAsTutor.status === 404 || studentAsTutor.status === 403, 'UID de estudante é rejeitado como alvo de cotação');
 
@@ -641,6 +669,33 @@ async function runTests() {
       'Batch /api/financial/pricing-quotes também reflete imediatamente a nova comissão de 35%'
     );
 
+    // Direct Firestore commissionVersion bump (simulating multi-instance / external Firestore write)
+    mockFs._store[`tutors/${UIDS.TUTOR_20}`] = {
+      ...mockFs._store[`tutors/${UIDS.TUTOR_20}`],
+      adminCommissionPercent: 40,
+      commissionVersion: 99,
+      updatedAt: '2020-01-01T00:00:00.000Z',
+    };
+    const expected40 = calculateFinancialPricingQuote({
+      basePriceUsd: 25,
+      adminCommissionPercent: 40,
+      ptaxRate: PTAX_RATE,
+      commissionModel: 'MARKUP',
+      conversionBase: 'UNIT_PRICE_BRL',
+    });
+    const batchFreshRes = await httpRequest(baseUrl, 'GET', '/api/financial/pricing-quotes');
+    assert(
+      approxEq(batchFreshRes.body.quotesByTutorId?.[UIDS.TUTOR_20]?.unit?.finalPriceBrl, expected40.unit.finalPriceBrl),
+      'Batch respeita commissionVersion mais recente do Firestore mesmo com updatedAt anterior'
+    );
+    // Restore version 2 (35%) for consistency checks below
+    mockFs._store[`tutors/${UIDS.TUTOR_20}`] = {
+      ...mockFs._store[`tutors/${UIDS.TUTOR_20}`],
+      adminCommissionPercent: 35,
+      commissionVersion: 2,
+      updatedAt: new Date().toISOString(),
+    };
+
     // -------------------------------------------------------------------------
     // 7. Falha explícita de PTAX D-1 (sem fallback 5.5)
     // -------------------------------------------------------------------------
@@ -720,7 +775,7 @@ async function runTests() {
 
     // Normalizers must not fabricate $20 / * 5.5 prices when absent
     const normMissingPrice = normalizeTutorDoc('legacy-doc', { name: 'Legacy Doc', approvalStatus: 'approved', isApproved: true });
-    assert(normMissingPrice.pricePerSessionUsd === undefined && normMissingPrice.pricePerSessionBrl === undefined, 'useNativeFriends.normalizeTutorDoc não inventa 20 USD nem 5.5 BRL');
+    assert(Boolean(normMissingPrice) && normMissingPrice?.pricePerSessionUsd === undefined && normMissingPrice?.pricePerSessionBrl === undefined, 'useNativeFriends.normalizeTutorDoc não inventa 20 USD nem 5.5 BRL');
 
     const consolidatedMissingPrice = consolidateTutorsList([{ id: 'legacy-1', name: 'Legacy One', approvalStatus: 'approved', isApproved: true } as any]);
     assert(consolidatedMissingPrice[0].pricePerSessionUsd === undefined && consolidatedMissingPrice[0].pricePerSessionBrl === undefined, 'tutorConsolidation não inventa 20 USD nem 5.5 BRL');
