@@ -25,8 +25,8 @@
 
 import {
   scheduleLessonAtomicServer,
+  executePackageCreditOperationAtomicServer,
   setFirebaseAdminFirestoreForTesting,
-  resolveTeacherCanonicalIdentity,
 } from '../src/serverFirestore';
 import { setFirebaseAdminAuthForTesting } from '../src/serverFirebaseAdmin';
 import { isValidCanonicalUid } from '../src/utils/studentPersistence';
@@ -224,127 +224,61 @@ async function executePurchasePackage(
     return { status: 400, body: { error: 'Identificador do Amigo Nativo é obrigatório.' } };
   }
 
-  const teacherRes = await resolveTeacherCanonicalIdentity({
-    teacherId: body.teacherId || body.publicTutorId,
-    teacherUid: body.teacherUid,
-    teacherEmail: cleanTeacherEmail,
-    publicTutorId: body.publicTutorId,
-    dbState: dbState || {},
-  });
-
-  if (!teacherRes || !teacherRes.isApproved || !isValidCanonicalUid(teacherRes.canonicalUid)) {
-    return { status: 400, body: { error: 'Amigo Nativo inválido ou não aprovado.' } };
-  }
-
-  const canonicalTeacherUid = teacherRes.canonicalUid;
-  const finalTeacherEmail = teacherRes.email || cleanTeacherEmail;
-  const finalTeacherName = teacherRes.name || body.teacherName || 'Native Friend';
-  const lessonsToAdd = Number(body.packageLessons) > 0 ? Number(body.packageLessons) : 4;
-  const nowIso = new Date().toISOString();
-
   if (!firestoreDb) {
     return { status: 503, body: { success: false, error: 'Serviço de persistência Firestore indisponível' } };
   }
 
-  let atomicContractedTotal: number | null = null;
-  let atomicAvailableTotal: number | null = null;
-  let isIdempotentReplay = false;
+  const lessonsToAdd = Number(body.packageLessons) > 0 ? Number(body.packageLessons) : 4;
+  const result = await executePackageCreditOperationAtomicServer({
+    actorUid: caller.uid,
+    actorEmail: caller.email,
+    actorRole: caller.role === 'admin' ? 'admin' : 'student',
+    studentUid: targetStudentUid,
+    studentEmail: cleanStudentEmail,
+    teacherId: body.teacherId || body.publicTutorId,
+    teacherUid: body.teacherUid,
+    publicTutorId: body.publicTutorId,
+    teacherEmail: cleanTeacherEmail,
+    teacherName: body.teacherName,
+    packageLessons: lessonsToAdd,
+    idempotencyKey,
+    isPaidPurchase: true,
+    gatewayConfirmation: {
+      verifiedByServer: true,
+      gatewayProvider: 'stripe',
+      gatewayTransactionId: `gw_fase4_${idempotencyKey}`,
+    },
+    dbState: dbState || {},
+    ptaxOverride: {
+      success: true,
+      ptaxRate: 5.5,
+      quoteDate: '2026-11-17',
+      pricingDate: '2026-11-18',
+      source: 'BACEN_PTAX_D1',
+    },
+  });
 
-  try {
-    await firestoreDb.runTransaction(async (transaction: any) => {
-      const studentRef = firestoreDb.collection('users').doc(targetStudentUid);
-      const teacherRef = firestoreDb.collection('users').doc(canonicalTeacherUid);
-
-      const [studentSnap, teacherSnap] = await Promise.all([
-        transaction.get(studentRef),
-        transaction.get(teacherRef).catch(() => null),
-      ]);
-
-      if (!studentSnap.exists) {
-        const notFound = new Error('Aluno não encontrado no Firestore.');
-        (notFound as any).statusCode = 404;
-        throw notFound;
-      }
-
-      const studentData = studentSnap.data() || {};
-      const processedPurchases = studentData.processedPurchases || {};
-
-      if (idempotencyKey && processedPurchases[idempotencyKey]) {
-        const prevTx = processedPurchases[idempotencyKey];
-        atomicContractedTotal = typeof studentData.contractedLessons === 'number'
-          ? studentData.contractedLessons
-          : prevTx.contractedLessons;
-        atomicAvailableTotal = typeof studentData.availableLessons === 'number'
-          ? studentData.availableLessons
-          : prevTx.availableLessons;
-        isIdempotentReplay = true;
-        return;
-      }
-
-      const currentAvailable = typeof studentData.availableLessons === 'number' ? studentData.availableLessons : 0;
-      const currentContracted = typeof studentData.contractedLessons === 'number' ? studentData.contractedLessons : currentAvailable;
-
-      const txContracted = currentContracted + lessonsToAdd;
-      const txAvailable = currentAvailable + lessonsToAdd;
-
-      atomicContractedTotal = txContracted;
-      atomicAvailableTotal = txAvailable;
-
-      const updatedProcessedPurchases = { ...processedPurchases };
-      if (idempotencyKey) {
-        updatedProcessedPurchases[idempotencyKey] = {
-          lessonsAdded: lessonsToAdd,
-          contractedLessons: txContracted,
-          availableLessons: txAvailable,
-          teacherUid: canonicalTeacherUid,
-          timestamp: nowIso,
-        };
-      }
-
-      transaction.set(studentRef, {
-        contractedLessons: txContracted,
-        availableLessons: txAvailable,
-        teacherUid: canonicalTeacherUid,
-        assignedNativeFriendUID: canonicalTeacherUid,
-        nativeFriendUID: canonicalTeacherUid,
-        teacherEmail: finalTeacherEmail,
-        teacherName: finalTeacherName,
-        enrollmentStatus: 'active',
-        subscriptionType: 'package',
-        processedPurchases: updatedProcessedPurchases,
-        updatedAt: nowIso,
-      }, { merge: true });
-
-      if (teacherSnap && teacherSnap.exists) {
-        transaction.set(teacherRef, { updatedAt: nowIso }, { merge: true });
-      }
-    });
-  } catch (fsErr: any) {
-    if (fsErr?.statusCode === 404) {
-      return { status: 404, body: { success: false, error: fsErr.message } };
-    }
-    const msg = String(fsErr?.message || '');
-    const isPerm = msg.includes('PERMISSION_DENIED') || fsErr?.code === 7;
-    if (isPerm) {
-      return { status: 500, body: { success: false, error: 'Erro de infraestrutura ao persistir créditos de aulas' } };
-    }
-    const isTimeout = msg.includes('DEADLINE_EXCEEDED') || msg.includes('timeout') || fsErr?.code === 4;
-    if (isTimeout) {
-      return { status: 504, body: { success: false, error: 'Tempo limite esgotado ao persistir créditos' } };
-    }
-    return { status: 500, body: { success: false, error: 'Falha ao processar e persistir compra de créditos', message: msg } };
+  if (!result.success) {
+    return {
+      status: result.statusCode || 500,
+      body: {
+        success: false,
+        error: result.error || 'Falha ao processar e persistir compra de créditos',
+        code: result.code,
+      },
+    };
   }
 
   return {
     status: 200,
     body: {
       success: true,
-      contractedLessons: atomicContractedTotal,
-      availableLessons: atomicAvailableTotal,
-      isIdempotent: isIdempotentReplay,
+      contractedLessons: result.contractedLessons,
+      availableLessons: result.availableLessons,
+      isIdempotent: Boolean(result.isIdempotent),
       profile: {
-        contractedLessons: atomicContractedTotal,
-        availableLessons: atomicAvailableTotal,
+        contractedLessons: result.contractedLessons,
+        availableLessons: result.availableLessons,
       },
     },
   };
@@ -442,6 +376,11 @@ async function runFase4ValidationSuite() {
     isApproved: true,
     approvalStatus: 'approved',
     publicTutorId: PUBLIC_TUTOR_ID,
+    pricePerSessionUsd: 10,
+    adminCommissionPercent: 30,
+    commissionModel: 'MARKUP',
+    commissionVersion: 1,
+    isCommercializable: true,
     meetUrl: 'https://meet.google.com/abc-defg-hij',
   });
   await mockStore.collection('tutors').doc(TEACHER_UID).set({
@@ -452,6 +391,11 @@ async function runFase4ValidationSuite() {
     isApproved: true,
     approvalStatus: 'approved',
     publicTutorId: PUBLIC_TUTOR_ID,
+    pricePerSessionUsd: 10,
+    adminCommissionPercent: 30,
+    commissionModel: 'MARKUP',
+    commissionVersion: 1,
+    isCommercializable: true,
     meetUrl: 'https://meet.google.com/abc-defg-hij',
   });
 

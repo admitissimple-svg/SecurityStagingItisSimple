@@ -860,11 +860,48 @@ async function runSuite() {
       assert.strictEqual(cancelFail.status, 409);
       assert.strictEqual(cancelFail.data.code, 'CREDIT_LEDGER_DIVERGENCE');
 
+      // 5e. Post-initialization divergence when availableLessons is overwritten to 0 while lotsSum > 0 -> 409 CREDIT_LEDGER_DIVERGENCE (NOT 402)
+      mockDb._setDoc('users', STUDENT_B_UID, { ...bCorruptDoc, availableLessons: 0 });
+      const schedZeroDivergence = await makeRequest(
+        server,
+        'POST',
+        '/api/lessons/schedule',
+        {
+          requestId: 'lesson-nf2a-b-div-zero',
+          teacherUid: TEACHER_UID,
+          startDateTime: '2026-12-21T16:00:00.000Z',
+          endDateTime: '2026-12-21T16:50:00.000Z',
+          title: 'Should Fail 409 Not 402',
+          isTrialLesson: false,
+        },
+        { Authorization: 'Bearer tok-student-b' }
+      );
+      assert.strictEqual(schedZeroDivergence.status, 409);
+      assert.strictEqual(schedZeroDivergence.data.code, 'CREDIT_LEDGER_DIVERGENCE');
+
+      // 5f. Post-initialization divergence when availableLessons is missing/undefined on refund or adjust -> 409 CREDIT_LEDGER_DIVERGENCE
+      const bWithoutAvail = { ...bCorruptDoc };
+      delete bWithoutAvail.availableLessons;
+      mockDb._setDoc('users', STUDENT_B_UID, bWithoutAvail);
+      const adjMissingAvail = await makeRequest(
+        server,
+        'POST',
+        '/api/admin/credits/adjust',
+        {
+          studentUid: STUDENT_B_UID,
+          delta: 1,
+          reason: 'Should fail when availableLessons missing post-init',
+          idempotencyKey: 'nf2a-adj-b-missing-avail',
+        },
+        { Authorization: 'Bearer tok-admin' }
+      );
+      assert.strictEqual(adjMissingAvail.status, 409);
+      assert.strictEqual(adjMissingAvail.data.error, 'CREDIT_LEDGER_DIVERGENCE');
+
       // Confirm NO silent legacy_unreconciled lot was materialized and NO silent self-correction happened!
       const bLotsAfter = mockDb._listCol('credit_lots').filter((d) => d.data.studentUid === STUDENT_B_UID);
       assert.strictEqual(bLotsAfter.length, 1);
       assert.strictEqual(bLotsAfter[0].data.origin, 'courtesy');
-      assert.strictEqual(mockDb._getDoc('users', STUDENT_B_UID).availableLessons, 10);
 
       // Restore B's availableLessons to 3 so B is clean for further checks
       mockDb._setDoc('users', STUDENT_B_UID, { ...mockDb._getDoc('users', STUDENT_B_UID), availableLessons: 3 });

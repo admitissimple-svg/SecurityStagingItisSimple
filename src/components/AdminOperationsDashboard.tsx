@@ -5,8 +5,10 @@ import {
   AlertCircle,
   Filter,
   RotateCcw,
+  ShieldCheck,
 } from 'lucide-react';
 import { getAdminAccessToken } from '../utils/auth';
+import { AdminLegacyCreditReconciliationModal } from './AdminLegacyCreditReconciliationModal';
 import type { Language } from '../types';
 import type {
   AdminOperationsDashboardData,
@@ -27,6 +29,7 @@ interface DashboardCopy {
   subtitle: string;
   refresh: string;
   refreshing: string;
+  reconcileLegacy: string;
   clearFilters: string;
   retry: string;
   nd: string;
@@ -83,6 +86,7 @@ const DASHBOARD_COPY: Record<SupportedDashboardLang, DashboardCopy> = {
     subtitle: 'Operação mensal por Native Friend — competência de compra e realização de aulas · Firestore (default)',
     refresh: 'Atualizar',
     refreshing: 'Atualizando...',
+    reconcileLegacy: 'Conciliar Créditos Legados',
     clearFilters: 'Limpar filtros',
     retry: 'Tentar novamente',
     nd: 'N/D',
@@ -138,6 +142,7 @@ const DASHBOARD_COPY: Record<SupportedDashboardLang, DashboardCopy> = {
     subtitle: 'Monthly operations per Native Friend — purchase and lesson realization competence · Firestore (default)',
     refresh: 'Refresh',
     refreshing: 'Refreshing...',
+    reconcileLegacy: 'Reconcile Legacy Credits',
     clearFilters: 'Clear filters',
     retry: 'Try again',
     nd: 'N/A',
@@ -276,6 +281,7 @@ export const AdminOperationsDashboard: React.FC<AdminOperationsDashboardProps> =
   const [data, setData] = useState<AdminOperationsDashboardData | null>(initialData);
   const [loading, setLoading] = useState<boolean>(!initialData);
   const [error, setError] = useState<string | null>(null);
+  const [isReconcileModalOpen, setIsReconcileModalOpen] = useState<boolean>(false);
   const requestSeqRef = useRef(0);
   const skipInitialFetchRef = useRef<boolean>(Boolean(initialData));
 
@@ -418,6 +424,15 @@ export const AdminOperationsDashboard: React.FC<AdminOperationsDashboardProps> =
               <span>{copy.clearFilters}</span>
             </button>
           )}
+          <button
+            type="button"
+            onClick={() => setIsReconcileModalOpen(true)}
+            data-testid="open-legacy-reconciliation-btn"
+            className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#000035] hover:bg-[#062863] text-white font-bold text-xs transition cursor-pointer whitespace-nowrap shrink-0"
+          >
+            <ShieldCheck className="w-3.5 h-3.5 text-[#9AB4FF]" />
+            <span>{copy.reconcileLegacy}</span>
+          </button>
           <button
             type="button"
             onClick={() =>
@@ -901,6 +916,14 @@ export const AdminOperationsDashboard: React.FC<AdminOperationsDashboardProps> =
           </>
         )}
       </div>
+
+      {isReconcileModalOpen && (
+        <AdminLegacyCreditReconciliationModal
+          isOpen={isReconcileModalOpen}
+          onClose={() => setIsReconcileModalOpen(false)}
+          currentLanguage={currentLanguage}
+        />
+      )}
     </section>
   );
 };

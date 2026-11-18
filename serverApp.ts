@@ -179,6 +179,9 @@ import {
   executePackageCreditOperationAtomicServer,
   listFinancialTransactionsForAdmin,
   fetchAdminOperationsSourceDataFromFirestore,
+  listPendingLegacyCreditStudentsForAdmin,
+  listCreditReconciliationAuditsForAdmin,
+  reconcileStudentLegacyCreditsAtomicServer,
 } from './src/serverFirestore';
 import {
   buildAdminOperationsDashboard,
@@ -8084,7 +8087,7 @@ function hasForgedPaidPurchaseFlags(body: Record<string, any>): boolean {
   );
 }
 
-function sanitizePackageTransactionForCaller(
+export function sanitizePackageTransactionForCaller(
   tx: Record<string, any> | undefined,
   isAdminCaller: boolean
 ): Record<string, any> | undefined {
@@ -8097,8 +8100,12 @@ function sanitizePackageTransactionForCaller(
     basePriceUsd: _bp,
     teacherShareUsd: _tsu,
     teacherShareBrl: _tsb,
+    teacherShareUsdCents: _tsuc,
+    teacherShareBrlCents: _tsbc,
     platformRevenueUsd: _pru,
     platformRevenueBrl: _prb,
+    platformRevenueUsdCents: _pruc,
+    platformRevenueBrlCents: _prbc,
     teacherEmail: _te,
     performedByEmail: _pe,
     ...publicSafeTx
@@ -8644,6 +8651,130 @@ app.post('/api/admin/credits/adjust', firebaseAuthMiddleware, requireAdmin, asyn
     previousAvailableLessons: result.previousAvailableLessons,
     availableLessons: result.availableLessons,
     transaction: result.transaction,
+  });
+});
+
+// NF.SWITCH.2B: ADM-only read-only listing of students with pending legacy_unreconciled credits
+app.get('/api/admin/credit-reconciliation/pending', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+
+  const verifiedAdmin = req.user;
+  if (!verifiedAdmin || !verifiedAdmin.uid || verifiedAdmin.role !== 'admin') {
+    return res.status(403).json({
+      success: false,
+      error: 'Forbidden',
+      message: 'Acesso negado: privilégios de administrador obrigatórios.',
+    });
+  }
+
+  const result = await listPendingLegacyCreditStudentsForAdmin();
+  if (!result.success) {
+    return res.status(result.statusCode || 503).json({
+      success: false,
+      error: result.code || 'LEGACY_RECONCILIATION_QUERY_FAILED',
+      message: result.error || 'Falha ao consultar créditos legados pendentes no Firestore (default).',
+    });
+  }
+
+  return res.status(200).json({
+    success: true,
+    count: result.students.length,
+    students: result.students,
+    teachers: result.teachers,
+  });
+});
+
+// NF.SWITCH.2B: ADM-only read-only listing of immutable credit reconciliation audits
+app.get('/api/admin/credit-reconciliation/audits', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+
+  const verifiedAdmin = req.user;
+  if (!verifiedAdmin || !verifiedAdmin.uid || verifiedAdmin.role !== 'admin') {
+    return res.status(403).json({
+      success: false,
+      error: 'Forbidden',
+      message: 'Acesso negado: privilégios de administrador obrigatórios.',
+    });
+  }
+
+  const studentUid = typeof req.query?.studentUid === 'string' ? req.query.studentUid.trim() : undefined;
+  const rawLimit = typeof req.query?.limit === 'string' ? Number(req.query.limit) : undefined;
+
+  const result = await listCreditReconciliationAuditsForAdmin({
+    studentUid,
+    limit: rawLimit,
+  });
+
+  if (!result.success) {
+    return res.status(result.statusCode || 503).json({
+      success: false,
+      error: result.code || 'LEGACY_RECONCILIATION_AUDITS_FAILED',
+      message: result.error || 'Falha ao consultar auditoria de conciliações.',
+    });
+  }
+
+  return res.status(200).json({
+    success: true,
+    count: result.audits.length,
+    audits: result.audits,
+  });
+});
+
+// NF.SWITCH.2B: ADM-only atomic, idempotent, and auditable reconciliation of legacy_unreconciled credits
+app.post('/api/admin/credit-reconciliation/reconcile', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
+  const verifiedAdmin = req.user;
+  if (!verifiedAdmin || !verifiedAdmin.uid || verifiedAdmin.role !== 'admin') {
+    return res.status(403).json({
+      success: false,
+      error: 'Forbidden',
+      message: 'Acesso negado: privilégios de administrador obrigatórios.',
+    });
+  }
+
+  const rawBody = req.body && typeof req.body === 'object' ? req.body : {};
+  const studentUid = typeof rawBody.studentUid === 'string' ? rawBody.studentUid : '';
+  const justification = typeof rawBody.justification === 'string' ? rawBody.justification : '';
+  const allocations = Array.isArray(rawBody.allocations) ? rawBody.allocations : [];
+  const headerIdempKey = typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'] : '';
+  const idempotencyKey =
+    typeof rawBody.idempotencyKey === 'string' && rawBody.idempotencyKey.trim()
+      ? rawBody.idempotencyKey
+      : headerIdempKey;
+
+  const result = await reconcileStudentLegacyCreditsAtomicServer({
+    adminUid: verifiedAdmin.uid,
+    adminEmail: verifiedAdmin.email,
+    studentUid,
+    idempotencyKey,
+    justification,
+    allocations,
+    expectedLegacyRemainingLessons: rawBody.expectedLegacyRemainingLessons,
+    expectedLegacyLotUpdatedAt:
+      typeof rawBody.expectedLegacyLotUpdatedAt === 'string' ? rawBody.expectedLegacyLotUpdatedAt : undefined,
+    rawPayload: rawBody,
+  });
+
+  if (!result.success) {
+    return res.status(result.statusCode || 400).json({
+      success: false,
+      error: result.code || 'LEGACY_RECONCILIATION_FAILED',
+      message: result.error || 'Falha ao executar conciliação administrativa de créditos legados.',
+    });
+  }
+
+  return res.status(200).json({
+    success: true,
+    isIdempotent: Boolean(result.isIdempotent),
+    studentUid: result.studentUid,
+    availableLessonsBefore: result.availableLessonsBefore,
+    availableLessonsAfter: result.availableLessonsAfter,
+    legacyLot: result.legacyLot || null,
+    createdLots: result.createdLots || [],
+    audit: result.audit,
   });
 });
 

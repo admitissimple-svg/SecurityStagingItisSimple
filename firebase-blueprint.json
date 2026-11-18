@@ -18,6 +18,9 @@
         "studentJournal": { "type": "array", "description": "Unified student activity log & journal (video, audio, memorization, lesson) for cross-device S-Path sync" },
         "vocabulary": { "type": "array", "description": "Accumulated personal dictionary vocabulary words" },
         "scheduledLessons": { "type": "array", "description": "Scheduled live lessons list" },
+        "creditLotsInitializedAt": { "type": "string", "format": "date-time", "description": "Single-time atomic credit lots initialization timestamp" },
+        "activeCreditLotIds": { "type": "array", "description": "Ordered index of active credit lot IDs" },
+        "creditLotSequence": { "type": "number", "description": "Monotonic per-student credit lot sequence counter" },
         "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp" }
       },
       "required": ["uid", "email", "role"]
@@ -91,6 +94,13 @@
         "cancelledAt": { "type": "string", "format": "date-time", "description": "Cancellation timestamp" },
         "cancelledBy": { "type": "string", "description": "Responsible party for cancellation" },
         "cancellationReason": { "type": "string", "description": "Motive for lesson cancellation" },
+        "creditLotId": { "type": "string", "description": "Exact credit lot ID consumed when scheduling" },
+        "creditOrigin": { "type": "string", "enum": ["courtesy", "paid", "legacy_unreconciled"], "description": "Origin of consumed credit lot" },
+        "creditSourceType": { "type": "string", "description": "Source type of consumed credit lot" },
+        "creditUnitIndex": { "type": "number", "description": "Deterministic 0-based unit index consumed within creditLotId" },
+        "refundedCreditLotId": { "type": "string", "description": "Exact credit lot ID refunded on eligible cancellation or not_completed" },
+        "refundedCreditOrigin": { "type": "string", "enum": ["courtesy", "paid", "legacy_unreconciled"], "description": "Origin of refunded credit lot" },
+        "refundedCreditUnitIndex": { "type": "number", "description": "Exact unit index restored to refundedCreditLotId" },
         "updatedAt": { "type": "string", "format": "date-time", "description": "Last update timestamp" }
       },
       "required": ["studentEmail", "teacherEmail", "startDateTime", "endDateTime", "status"]
@@ -321,6 +331,82 @@
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["sessionDate", "studentEmail", "content"]
+    },
+    "CreditLot": {
+      "title": "CreditLot",
+      "description": "Immutable-provenance student credit lot in root credit_lots collection partitioned by studentUid",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Globally unique credit lot ID scoped to studentUid and operation" },
+        "studentUid": { "type": "string", "description": "Canonical student Firebase UID" },
+        "studentEmail": { "type": "string", "format": "email", "description": "Student email" },
+        "origin": { "type": "string", "enum": ["courtesy", "paid", "legacy_unreconciled"], "description": "Credit lot origin for Q1 consumption priority" },
+        "sourceType": { "type": "string", "enum": ["PACKAGE_PURCHASE", "ADMIN_PACKAGE_GRANT", "ADMIN_CREDIT_ADJUSTMENT", "LEGACY_INITIAL_HYDRATION", "LEGACY_RECONCILIATION_PAID", "LEGACY_RECONCILIATION_COURTESY"], "description": "Originating transaction source type" },
+        "status": { "type": "string", "enum": ["active", "exhausted"], "description": "Current lot balance status" },
+        "initialLessons": { "type": "number", "description": "Initial lesson units granted to this lot" },
+        "remainingLessons": { "type": "number", "description": "Remaining available lesson units in this lot" },
+        "consumedLessons": { "type": "number", "description": "Consumed lesson units from this lot" },
+        "lotSequence": { "type": "number", "description": "Monotonic per-student sequence number for FIFO ordering" },
+        "isPaidPurchase": { "type": "boolean", "description": "Whether this lot originated from a gateway-verified paid purchase" },
+        "countsAsRevenue": { "type": "boolean", "description": "Whether this lot counts toward recognized revenue" },
+        "financialAttributionStatus": { "type": "string", "enum": ["paid_verified", "courtesy_non_revenue", "unreconciled_no_presumed_value"], "description": "Financial attribution state" },
+        "sourceTransactionId": { "type": "string", "description": "Originating financial_transactions document ID" },
+        "pricedTeacherUid": { "type": "string", "description": "Teacher UID used for paid pricing (strictly null for legacy_unreconciled)" },
+        "reconciledFromLotId": { "type": "string", "description": "Source legacy_unreconciled lot ID when created by administrative reconciliation" },
+        "reconciliationAuditId": { "type": "string", "description": "Immutable credit_reconciliation_audits document ID" },
+        "reconciledAt": { "type": "string", "format": "date-time", "description": "Timestamp when lot was reconciled from legacy_unreconciled" },
+        "totalPaidBrlCents": { "type": "number", "description": "Exact lot total paid in BRL integer cents" },
+        "teacherShareBrlCents": { "type": "number", "description": "Exact lot teacher share in BRL integer cents" },
+        "platformRevenueBrlCents": { "type": "number", "description": "Exact lot platform revenue in BRL integer cents" },
+        "remainingTotalPaidBrlCents": { "type": "number", "description": "Remaining paid BRL integer cents across unconsumed units" },
+        "consumedTotalPaidBrlCents": { "type": "number", "description": "Consumed paid BRL integer cents across consumed units" },
+        "unitCentsSchedule": { "type": "array", "description": "Deterministic per-unit integer cents schedule indexed by unitIndex" },
+        "availableUnitIndices": { "type": "array", "description": "Sorted available 0-based unit indices in this lot" },
+        "consumedUnitIndices": { "type": "array", "description": "Sorted consumed 0-based unit indices in this lot" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "studentUid", "origin", "sourceType", "status", "initialLessons", "remainingLessons", "consumedLessons", "lotSequence"]
+    },
+    "CreditReconciliationAudit": {
+      "title": "CreditReconciliationAudit",
+      "description": "Immutable audit record of administrative legacy_unreconciled credit lot reconciliations",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Deterministic audit record ID derived from idempotencyKey" },
+        "idempotencyKey": { "type": "string", "description": "Required idempotency key for the reconciliation operation" },
+        "studentUid": { "type": "string", "description": "Canonical student Firebase UID" },
+        "sourceLotId": { "type": "string", "description": "Source legacy_unreconciled credit lot ID" },
+        "availableLessonsBefore": { "type": "number", "description": "Student availableLessons before reconciliation" },
+        "availableLessonsAfter": { "type": "number", "description": "Student availableLessons after reconciliation (strictly preserved)" },
+        "reconciledTotalLessons": { "type": "number", "description": "Total legacy lessons classified in this operation" },
+        "targetLotIds": { "type": "array", "description": "Created target credit lot IDs" },
+        "allocations": { "type": "array", "description": "Explicitly classified allocation details" },
+        "justification": { "type": "string", "maxLength": 1000, "description": "Mandatory administrative justification" },
+        "performedByUid": { "type": "string", "description": "Admin UID who performed the reconciliation" },
+        "performedByEmail": { "type": "string", "format": "email", "description": "Admin email who performed the reconciliation" },
+        "performedByRole": { "type": "string", "enum": ["admin"], "description": "Verified role of operator" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "immutable": { "type": "boolean" }
+      },
+      "required": ["id", "idempotencyKey", "studentUid", "sourceLotId", "reconciledTotalLessons", "justification", "performedByUid", "immutable"]
+    },
+    "FinancialEvidenceAllocation": {
+      "title": "FinancialEvidenceAllocation",
+      "description": "Transactional backing capacity tracker preventing double attribution of historical financial_transactions",
+      "type": "object",
+      "properties": {
+        "evidenceKey": { "type": "string", "description": "Deterministic key for the historical financial transaction or gateway receipt" },
+        "sourceTransactionId": { "type": "string", "description": "Referenced financial_transactions document ID" },
+        "studentUid": { "type": "string", "description": "Student UID owning the historical transaction" },
+        "teacherUid": { "type": "string", "description": "Teacher UID recorded on the historical transaction" },
+        "evidenceLessons": { "type": "number", "description": "Total lesson units proven by the historical transaction" },
+        "allocatedLessons": { "type": "number", "description": "Lesson units already backed across credit_lots and reconciliations" },
+        "evidenceTotalPaidBrlCents": { "type": "number", "description": "Total BRL cents proven by the historical transaction" },
+        "allocatedTotalPaidBrlCents": { "type": "number", "description": "BRL cents already backed across credit_lots and reconciliations" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["evidenceKey", "sourceTransactionId", "evidenceLessons", "allocatedLessons", "evidenceTotalPaidBrlCents", "allocatedTotalPaidBrlCents"]
     }
   },
   "firestore": {
@@ -391,6 +477,18 @@
     "/teacher_availability/{userId}": {
       "schema": "TeacherAvailability",
       "description": "Teacher availability schedule partitioned by teacher UID or ID"
+    },
+    "/credit_lots/{lotId}": {
+      "schema": "CreditLot",
+      "description": "Root collection of student credit lots strictly partitioned by studentUid"
+    },
+    "/credit_reconciliation_audits/{auditId}": {
+      "schema": "CreditReconciliationAudit",
+      "description": "Immutable administrative legacy credit reconciliation audit records"
+    },
+    "/financial_evidence_allocations/{evidenceKey}": {
+      "schema": "FinancialEvidenceAllocation",
+      "description": "Transactional capacity lock preventing double financial attribution across reconciliations"
     }
   }
 }

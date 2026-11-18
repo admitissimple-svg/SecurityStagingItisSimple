@@ -233,6 +233,7 @@ export function extractBrazilYearMonth(
 export function isPaidPurchaseTransaction(tx: Record<string, any> | null | undefined): boolean {
   if (!tx || typeof tx !== 'object') return false;
   if (tx.status === 'cancelled' || tx.status === 'refunded' || tx.status === 'void') return false;
+  if (tx.type === 'LEGACY_CREDIT_RECONCILIATION' || tx.category === 'legacy_credit_reconciliation') return false;
   if (tx.type === 'ADMIN_PACKAGE_GRANT' || tx.type === 'ADMIN_CREDIT_ADJUSTMENT') return false;
   if (tx.category === 'administrative_package_grant' || tx.category === 'administrative_adjustment') return false;
   if (tx.isAdministrativeOperation === true) return false;
@@ -253,6 +254,7 @@ export function isPaidPurchaseTransaction(tx: Record<string, any> | null | undef
 export function isAdministrativeTransaction(tx: Record<string, any> | null | undefined): boolean {
   if (!tx || typeof tx !== 'object') return false;
   if (tx.status === 'cancelled' || tx.status === 'void') return false;
+  if (tx.type === 'LEGACY_CREDIT_RECONCILIATION' || tx.category === 'legacy_credit_reconciliation') return false;
   if (isPaidPurchaseTransaction(tx)) return false;
   return (
     tx.type === 'ADMIN_PACKAGE_GRANT' ||

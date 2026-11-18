@@ -645,10 +645,16 @@ export interface LiveLesson {
   driveLastSyncedAt?: string;
   contentRevision?: number;
   revisionToken?: string;
-  // NF.SWITCH.2A: Exact credit lot provenance for atomic consumption and exact-lot refund
+  // NF.SWITCH.2A + NF.SWITCH.2C.0: Exact credit lot and unit index provenance for atomic consumption and exact-unit refund
   creditLotId?: string;
   creditOrigin?: CreditLotOrigin;
   creditSourceType?: CreditLotSourceType | string;
+  creditUnitIndex?: number;
+  creditRefunded?: boolean;
+  creditRefundedAt?: string;
+  refundedCreditLotId?: string;
+  refundedCreditOrigin?: CreditLotOrigin;
+  refundedCreditUnitIndex?: number;
 }
 
 export interface TeacherOriginalNotes {
@@ -1036,7 +1042,9 @@ export type CreditLotSourceType =
   | 'PACKAGE_PURCHASE'
   | 'ADMIN_PACKAGE_GRANT'
   | 'ADMIN_CREDIT_ADJUSTMENT'
-  | 'LEGACY_INITIAL_HYDRATION';
+  | 'LEGACY_INITIAL_HYDRATION'
+  | 'LEGACY_RECONCILIATION_PAID'
+  | 'LEGACY_RECONCILIATION_COURTESY';
 
 export type CreditLotStatus = 'active' | 'exhausted';
 
@@ -1044,6 +1052,16 @@ export type CreditLotFinancialAttributionStatus =
   | 'paid_verified'
   | 'courtesy_non_revenue'
   | 'unreconciled_no_presumed_value';
+
+export interface CreditLotUnitLedgerEntry {
+  unitIndex: number;
+  totalPaidBrlCents: number | null;
+  totalPaidUsdCents: number | null;
+  teacherShareBrlCents: number | null;
+  teacherShareUsdCents: number | null;
+  platformRevenueBrlCents: number | null;
+  platformRevenueUsdCents: number | null;
+}
 
 export interface CreditLot {
   id: string;
@@ -1093,11 +1111,159 @@ export interface CreditLot {
   platformRevenueUsd: number | null;
   platformLessonRevenueBrl: number | null;
   platformLessonRevenueUsd: number | null;
+  // NF.SWITCH.2C.0: Exact integer cents totals, balances, and deterministic per-unit schedule
+  totalPaidBrlCents?: number | null;
+  totalPaidUsdCents?: number | null;
+  teacherShareBrlCents?: number | null;
+  teacherShareUsdCents?: number | null;
+  platformRevenueBrlCents?: number | null;
+  platformRevenueUsdCents?: number | null;
+  remainingTotalPaidBrlCents?: number | null;
+  remainingTotalPaidUsdCents?: number | null;
+  remainingTeacherShareBrlCents?: number | null;
+  remainingTeacherShareUsdCents?: number | null;
+  remainingPlatformRevenueBrlCents?: number | null;
+  remainingPlatformRevenueUsdCents?: number | null;
+  consumedTotalPaidBrlCents?: number | null;
+  consumedTotalPaidUsdCents?: number | null;
+  consumedTeacherShareBrlCents?: number | null;
+  consumedTeacherShareUsdCents?: number | null;
+  consumedPlatformRevenueBrlCents?: number | null;
+  consumedPlatformRevenueUsdCents?: number | null;
+  unitCentsSchedule?: CreditLotUnitLedgerEntry[] | null;
+  availableUnitIndices?: number[];
+  consumedUnitIndices?: number[];
   gatewayProvider?: string | null;
   gatewayTransactionId?: string | null;
   reason?: string | null;
   performedByUid?: string | null;
   performedByEmail?: string | null;
   performedByRole?: string | null;
+  // NF.SWITCH.2B: Immutable traceability between legacy source lot and reconciled target lots
+  reconciledFromLotId?: string | null;
+  reconciliationAuditId?: string | null;
+  reconciledAt?: string | null;
+  reconciledLessonsCount?: number | null;
+  lastReconciledAt?: string | null;
+  lastReconciliationAuditId?: string | null;
+}
+
+export interface LegacyReconciliationAllocationInput {
+  origin: 'paid' | 'courtesy';
+  lessonsCount: number;
+  sourceTransactionId?: string;
+  teacherUid?: string;
+  expectedTotalPaidBrl?: number;
+  expectedEvidenceLessons?: number;
+}
+
+export interface HistoricalFinancialEvidenceSummary {
+  transactionId: string;
+  type: string;
+  category: string | null;
+  status: string;
+  createdAt: string;
+  studentUid: string | null;
+  studentEmail: string | null;
+  teacherUid: string | null;
+  teacherEmail: string | null;
+  teacherName: string | null;
+  packageName: string | null;
+  lessonsCount: number;
+  totalPaidBrl: number | null;
+  totalPaidUsd: number | null;
+  unitPriceBrl: number | null;
+  basePriceUsd: number | null;
+  adminCommissionPercent: number | null;
+  commissionModel: string | null;
+  ptaxRate: number | null;
+  teacherShareBrl: number | null;
+  platformRevenueBrl: number | null;
+  gatewayProvider: string | null;
+  gatewayTransactionId: string | null;
+  gatewayVerified: boolean;
+  isPaidPurchase: boolean;
+  countsAsRevenue: boolean;
+  alreadyBackedLessons: number;
+  remainingBackableLessons: number;
+  alreadyBackedBrl: number;
+  remainingBackableBrl: number;
+  isEligibleForPaidReconciliation: boolean;
+  ineligibilityReason: string | null;
+}
+
+export interface PendingLegacyStudentSummary {
+  studentUid: string;
+  studentName: string;
+  studentEmail: string;
+  availableLessons: number;
+  contractedLessons: number;
+  creditLotsInitializedAt: string | null;
+  hasLedgerDivergence: boolean;
+  divergenceDetails: string | null;
+  legacyLotId: string | null;
+  legacyLotUpdatedAt: string | null;
+  legacyInitialLessons: number;
+  legacyRemainingLessons: number;
+  legacyConsumedLessons: number;
+  requiresInitialHydration: boolean;
+  lotsBreakdown: {
+    courtesyRemaining: number;
+    paidRemaining: number;
+    legacyRemaining: number;
+    totalLotsRemaining: number;
+  };
+  assignedTeacherUid: string | null;
+  assignedTeacherName: string | null;
+  evidences: HistoricalFinancialEvidenceSummary[];
+}
+
+export interface CreditReconciliationAuditAllocation {
+  targetLotId: string;
+  origin: 'paid' | 'courtesy';
+  sourceType: 'LEGACY_RECONCILIATION_PAID' | 'LEGACY_RECONCILIATION_COURTESY';
+  lessonsCount: number;
+  sourceTransactionId: string | null;
+  teacherUid: string | null;
+  teacherEmail: string | null;
+  teacherName: string | null;
+  financialAttributionStatus: CreditLotFinancialAttributionStatus;
+  totalPaidBrl: number | null;
+  totalPaidUsd: number | null;
+  teacherShareBrl: number | null;
+  platformRevenueBrl: number | null;
+}
+
+export interface CreditReconciliationAuditRecord {
+  id: string;
+  idempotencyKey: string;
+  studentUid: string;
+  studentEmail: string;
+  studentName: string;
+  sourceLotId: string;
+  wasFirstInitialization: boolean;
+  legacyBefore: {
+    initialLessons: number;
+    remainingLessons: number;
+    consumedLessons: number;
+    status: CreditLotStatus;
+  };
+  legacyAfter: {
+    initialLessons: number;
+    remainingLessons: number;
+    consumedLessons: number;
+    status: CreditLotStatus;
+  };
+  availableLessonsBefore: number;
+  availableLessonsAfter: number;
+  reconciledTotalLessons: number;
+  targetLotIds: string[];
+  allocations: CreditReconciliationAuditAllocation[];
+  justification: string;
+  performedByUid: string;
+  performedByEmail: string;
+  performedByRole: 'admin';
+  createdAt: string;
+  immutable: true;
 }
 

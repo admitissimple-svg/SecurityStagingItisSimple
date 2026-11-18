@@ -17,9 +17,17 @@ import {
   calculateFinancialPricingQuote,
   LessonPackageCalculation,
 } from './utils/financialEngine';
-import type { CreditLot } from './types';
+import type {
+  CreditLot,
+  CreditReconciliationAuditAllocation,
+  CreditReconciliationAuditRecord,
+  HistoricalFinancialEvidenceSummary,
+  LegacyReconciliationAllocationInput,
+  PendingLegacyStudentSummary,
+} from './types';
 import {
   CreditLedgerError,
+  CREDIT_LEDGER_DIVERGENCE_CODE,
   computeActiveCreditLotIds,
   reconcileStudentCreditLedger,
   consumeUnitsFromLots,
@@ -27,7 +35,17 @@ import {
   buildPaidPackageLotData,
   buildCourtesyGrantLotData,
   buildCourtesyAdjustmentLotData,
+  sumLotRemainingLessons,
+  validateCreditLotsForStudent,
+  toBrlCents,
+  fromBrlCents,
+  evaluateHistoricalTransactionEvidence,
+  allocateProportionalCents,
+  buildReconciledPaidLotData,
+  buildReconciledCourtesyLotData,
+  reconcileLegacyLotUnitIndices,
 } from './utils/creditLots';
+import type { LotConsumptionAllocation } from './utils/creditLots';
 
 /**
  * Active identifiers for staging persistence.
@@ -8515,7 +8533,7 @@ export async function scheduleLessonAtomicServer(
       // D. VALIDATE BALANCE AND ELIGIBILITY INSIDE TRANSACTION
       let newAvailable: number;
       let newContracted: number;
-      let consumedAllocation: { lotId: string; origin: CreditLot['origin']; sourceType: CreditLot['sourceType'] } | null = null;
+      let consumedAllocation: { lotId: string; origin: CreditLot['origin']; sourceType: CreditLot['sourceType']; unitIndex: number } | null = null;
       let creditLotsToWrite: CreditLot[] = [];
       let nextCreditLotsInitializedAt: string | undefined;
       let nextActiveCreditLotIds: string[] | undefined;
@@ -8548,7 +8566,13 @@ export async function scheduleLessonAtomicServer(
         }
 
         // Authoritative zero balance is strictly preserved and blocks scheduling
-        if (studentData.availableLessons <= 0) {
+        // NF.SWITCH.2A: If creditLotsInitializedAt is already persisted, validate ledger sum
+        // BEFORE returning 402 so any 0-vs->0 divergence triggers CREDIT_LEDGER_DIVERGENCE (409).
+        const hasInitializedCreditLots =
+          typeof studentData.creditLotsInitializedAt === 'string' &&
+          studentData.creditLotsInitializedAt.trim() !== '';
+
+        if (studentData.availableLessons <= 0 && !hasInitializedCreditLots) {
           throw new SchedulingTransactionError(
             'Saldo de aulas insuficiente. Por favor, adquira créditos de aulas antes de agendar.',
             402
@@ -8571,6 +8595,13 @@ export async function scheduleLessonAtomicServer(
           beforeAvailable: studentData.availableLessons,
           nowIso,
         });
+
+        if (studentData.availableLessons <= 0) {
+          throw new SchedulingTransactionError(
+            'Saldo de aulas insuficiente. Por favor, adquira créditos de aulas antes de agendar.',
+            402
+          );
+        }
         const consumed = consumeUnitsFromLots({
           lots: reconciled.lots,
           units: 1,
@@ -8582,6 +8613,7 @@ export async function scheduleLessonAtomicServer(
           lotId: firstAlloc.lotId,
           origin: firstAlloc.origin,
           sourceType: firstAlloc.sourceType,
+          unitIndex: firstAlloc.unitIndices[0],
         };
 
         const lotsWriteMap = new Map<string, CreditLot>();
@@ -8625,6 +8657,7 @@ export async function scheduleLessonAtomicServer(
               creditLotId: consumedAllocation.lotId,
               creditOrigin: consumedAllocation.origin,
               creditSourceType: consumedAllocation.sourceType,
+              creditUnitIndex: consumedAllocation.unitIndex,
             }
           : {}),
         createdAt: nowIso,
@@ -9389,12 +9422,21 @@ export async function markLessonNotCompletedAtomicServer(
       let nextAvailable = typeof studentData?.availableLessons === 'number' ? studentData.availableLessons : undefined;
       let actuallyRefunded = false;
       let creditLotsToWrite: CreditLot[] = [];
-      let refundedLotMeta: { lotId: string; origin: CreditLot['origin'] } | null = null;
+      let refundedLotMeta: { lotId: string; origin: CreditLot['origin']; unitIndex: number } | null = null;
       let nextCreditLotsInitializedAt: string | undefined;
       let nextActiveCreditLotIds: string[] | undefined;
       let nextCreditLotSequence: number | undefined;
 
-      if (shouldRefund && refs.studentRef && refs.validStudentUid && studentData && typeof studentData.availableLessons === 'number') {
+      if (shouldRefund && refs.studentRef && refs.validStudentUid && studentData) {
+        if (typeof studentData.availableLessons !== 'number') {
+          if (typeof studentData.creditLotsInitializedAt === 'string' && studentData.creditLotsInitializedAt.trim()) {
+            throw new CreditLedgerError(
+              'Divergência detectada no razão de créditos (CREDIT_LEDGER_DIVERGENCE): availableLessons ausente após inicialização.',
+              409,
+              CREDIT_LEDGER_DIVERGENCE_CODE
+            );
+          }
+        } else {
         const extraLotIds = typeof latest.creditLotId === 'string' && latest.creditLotId.trim()
           ? [latest.creditLotId.trim()]
           : [];
@@ -9418,6 +9460,10 @@ export async function markLessonNotCompletedAtomicServer(
           studentEmail: studentData.email || latest.studentEmail || '',
           lots: reconciled.lots,
           targetLotId: typeof latest.creditLotId === 'string' ? latest.creditLotId : null,
+          targetUnitIndex:
+            typeof latest.creditUnitIndex === 'number' && Number.isInteger(latest.creditUnitIndex)
+              ? latest.creditUnitIndex
+              : null,
           wasFirstInitialization: reconciled.wasFirstInitialization,
           nextLotSequence: reconciled.nextLotSequence,
           nowIso,
@@ -9433,12 +9479,14 @@ export async function markLessonNotCompletedAtomicServer(
         refundedLotMeta = {
           lotId: refundRes.refundedLot.id,
           origin: refundRes.refundedLot.origin,
+          unitIndex: refundRes.refundedUnitIndex,
         };
         nextCreditLotsInitializedAt = reconciled.creditLotsInitializedAt;
         nextActiveCreditLotIds = computeActiveCreditLotIds(refundRes.lots);
         nextCreditLotSequence = refundRes.nextLotSequence;
         nextAvailable = studentData.availableLessons + 1;
         actuallyRefunded = true;
+        }
       }
 
       const updates: Record<string, any> = {
@@ -9455,6 +9503,7 @@ export async function markLessonNotCompletedAtomicServer(
         if (refundedLotMeta) {
           updates.refundedCreditLotId = refundedLotMeta.lotId;
           updates.refundedCreditOrigin = refundedLotMeta.origin;
+          updates.refundedCreditUnitIndex = refundedLotMeta.unitIndex;
         }
       }
 
@@ -10092,12 +10141,21 @@ export async function cancelLessonAtomicServer(
       let nextAvailable = typeof studentData?.availableLessons === 'number' ? studentData.availableLessons : undefined;
       let actuallyRefunded = false;
       let creditLotsToWrite: CreditLot[] = [];
-      let refundedLotMeta: { lotId: string; origin: CreditLot['origin'] } | null = null;
+      let refundedLotMeta: { lotId: string; origin: CreditLot['origin']; unitIndex: number } | null = null;
       let nextCreditLotsInitializedAt: string | undefined;
       let nextActiveCreditLotIds: string[] | undefined;
       let nextCreditLotSequence: number | undefined;
 
-      if (shouldRefund && refs.studentRef && refs.validStudentUid && studentData && typeof studentData.availableLessons === 'number') {
+      if (shouldRefund && refs.studentRef && refs.validStudentUid && studentData) {
+        if (typeof studentData.availableLessons !== 'number') {
+          if (typeof studentData.creditLotsInitializedAt === 'string' && studentData.creditLotsInitializedAt.trim()) {
+            throw new CreditLedgerError(
+              'Divergência detectada no razão de créditos (CREDIT_LEDGER_DIVERGENCE): availableLessons ausente após inicialização.',
+              409,
+              CREDIT_LEDGER_DIVERGENCE_CODE
+            );
+          }
+        } else {
         const extraLotIds = typeof latest.creditLotId === 'string' && latest.creditLotId.trim()
           ? [latest.creditLotId.trim()]
           : [];
@@ -10121,6 +10179,10 @@ export async function cancelLessonAtomicServer(
           studentEmail: studentData.email || latest.studentEmail || '',
           lots: reconciled.lots,
           targetLotId: typeof latest.creditLotId === 'string' ? latest.creditLotId : null,
+          targetUnitIndex:
+            typeof latest.creditUnitIndex === 'number' && Number.isInteger(latest.creditUnitIndex)
+              ? latest.creditUnitIndex
+              : null,
           wasFirstInitialization: reconciled.wasFirstInitialization,
           nextLotSequence: reconciled.nextLotSequence,
           nowIso,
@@ -10136,12 +10198,14 @@ export async function cancelLessonAtomicServer(
         refundedLotMeta = {
           lotId: refundRes.refundedLot.id,
           origin: refundRes.refundedLot.origin,
+          unitIndex: refundRes.refundedUnitIndex,
         };
         nextCreditLotsInitializedAt = reconciled.creditLotsInitializedAt;
         nextActiveCreditLotIds = computeActiveCreditLotIds(refundRes.lots);
         nextCreditLotSequence = refundRes.nextLotSequence;
         nextAvailable = studentData.availableLessons + 1;
         actuallyRefunded = true;
+        }
       }
 
       const cancelUpdates: Record<string, any> = {
@@ -10160,6 +10224,7 @@ export async function cancelLessonAtomicServer(
         if (refundedLotMeta) {
           cancelUpdates.refundedCreditLotId = refundedLotMeta.lotId;
           cancelUpdates.refundedCreditOrigin = refundedLotMeta.origin;
+          cancelUpdates.refundedCreditUnitIndex = refundedLotMeta.unitIndex;
         }
       }
 
@@ -10315,7 +10380,16 @@ export async function deleteLessonAtomicServer(
       let nextActiveCreditLotIds: string[] | undefined;
       let nextCreditLotSequence: number | undefined;
 
-      if (shouldRefund && refs.studentRef && refs.validStudentUid && studentData && typeof studentData.availableLessons === 'number') {
+      if (shouldRefund && refs.studentRef && refs.validStudentUid && studentData) {
+        if (typeof studentData.availableLessons !== 'number') {
+          if (typeof studentData.creditLotsInitializedAt === 'string' && studentData.creditLotsInitializedAt.trim()) {
+            throw new CreditLedgerError(
+              'Divergência detectada no razão de créditos (CREDIT_LEDGER_DIVERGENCE): availableLessons ausente após inicialização.',
+              409,
+              CREDIT_LEDGER_DIVERGENCE_CODE
+            );
+          }
+        } else {
         const extraLotIds = typeof latest.creditLotId === 'string' && latest.creditLotId.trim()
           ? [latest.creditLotId.trim()]
           : [];
@@ -10339,6 +10413,10 @@ export async function deleteLessonAtomicServer(
           studentEmail: studentData.email || latest.studentEmail || '',
           lots: reconciled.lots,
           targetLotId: typeof latest.creditLotId === 'string' ? latest.creditLotId : null,
+          targetUnitIndex:
+            typeof latest.creditUnitIndex === 'number' && Number.isInteger(latest.creditUnitIndex)
+              ? latest.creditUnitIndex
+              : null,
           wasFirstInitialization: reconciled.wasFirstInitialization,
           nextLotSequence: reconciled.nextLotSequence,
           nowIso,
@@ -10356,6 +10434,7 @@ export async function deleteLessonAtomicServer(
         nextCreditLotSequence = refundRes.nextLotSequence;
         nextAvailable = studentData.availableLessons + 1;
         actuallyRefunded = true;
+        }
       }
 
       for (const lotToWrite of creditLotsToWrite) {
@@ -13604,6 +13683,18 @@ export async function adjustStudentCreditsAtomicServer(
         );
       }
 
+      if (
+        typeof studentData.creditLotsInitializedAt === 'string' &&
+        studentData.creditLotsInitializedAt.trim() &&
+        (typeof studentData.availableLessons !== 'number' || !Number.isFinite(studentData.availableLessons))
+      ) {
+        throw new CreditLedgerError(
+          'Divergência detectada no razão de créditos (CREDIT_LEDGER_DIVERGENCE): availableLessons ausente após inicialização.',
+          409,
+          CREDIT_LEDGER_DIVERGENCE_CODE
+        );
+      }
+
       const beforeAvailable =
         typeof studentData.availableLessons === 'number' && Number.isFinite(studentData.availableLessons)
           ? studentData.availableLessons
@@ -13649,7 +13740,7 @@ export async function adjustStudentCreditsAtomicServer(
       }
 
       let createdCourtesyLot: CreditLot | null = null;
-      let lotConsumptions: Array<{ lotId: string; origin: string; sourceType: string; units: number }> | undefined;
+      let lotConsumptions: LotConsumptionAllocation[] | undefined;
 
       if (delta > 0) {
         nextSeq += 1;
@@ -14351,6 +14442,18 @@ export async function executePackageCreditOperationAtomicServer(
         );
       }
 
+      if (
+        typeof studentData.creditLotsInitializedAt === 'string' &&
+        studentData.creditLotsInitializedAt.trim() &&
+        (typeof studentData.availableLessons !== 'number' || !Number.isFinite(studentData.availableLessons))
+      ) {
+        throw new CreditLedgerError(
+          'Divergência detectada no razão de créditos (CREDIT_LEDGER_DIVERGENCE): availableLessons ausente após inicialização.',
+          409,
+          CREDIT_LEDGER_DIVERGENCE_CODE
+        );
+      }
+
       const beforeAvailable =
         typeof studentData.availableLessons === 'number' && Number.isFinite(studentData.availableLessons)
           ? studentData.availableLessons
@@ -14545,6 +14648,12 @@ export async function executePackageCreditOperationAtomicServer(
         effectiveLessonPriceBrl: pkgCalc!.effectiveLessonPriceBrl,
         teacherShareBrl: pkgCalc!.teacherShareBrl,
         platformRevenueBrl: pkgCalc!.platformRevenueBrl,
+        totalPaidBrlCents: newLot.totalPaidBrlCents,
+        totalPaidUsdCents: newLot.totalPaidUsdCents,
+        teacherShareBrlCents: newLot.teacherShareBrlCents,
+        teacherShareUsdCents: newLot.teacherShareUsdCents,
+        platformRevenueBrlCents: newLot.platformRevenueBrlCents,
+        platformRevenueUsdCents: newLot.platformRevenueUsdCents,
         invariants: pkgCalc!.invariants,
         beforeAvailableLessons: beforeAvailable,
         afterAvailableLessons: afterAvailable,
@@ -14853,3 +14962,1624 @@ export async function fetchAdminOperationsSourceDataFromFirestore(): Promise<{
     };
   }
 }
+
+// ============================================================================
+// NF.SWITCH.2B — CONTROLLED ADMINISTRATIVE RECONCILIATION OF LEGACY CREDITS
+// ============================================================================
+
+export class LegacyReconciliationError extends Error {
+  public statusCode: number;
+  public code: string;
+  public details?: Record<string, any>;
+
+  constructor(
+    message: string,
+    statusCode: number = 400,
+    code: string = 'LEGACY_RECONCILIATION_ERROR',
+    details?: Record<string, any>
+  ) {
+    super(message);
+    this.name = 'LegacyReconciliationError';
+    this.statusCode = statusCode;
+    this.code = code;
+    this.details = details;
+  }
+}
+
+function buildEvidenceAllocationDocId(sourceTransactionId: string): string {
+  const hash = crypto
+    .createHash('sha256')
+    .update(`tx:${sourceTransactionId}`)
+    .digest('hex')
+    .slice(0, 32);
+  return `tx_${hash}`;
+}
+
+function buildGatewayEvidenceAllocationDocId(
+  gatewayProvider: string,
+  gatewayTransactionId: string
+): string {
+  const normalized = `${gatewayProvider.toLowerCase().trim()}:${gatewayTransactionId.trim()}`;
+  const hash = crypto.createHash('sha256').update(`gw:${normalized}`).digest('hex').slice(0, 32);
+  return `gw_${hash}`;
+}
+
+function buildReconciliationAuditDocId(idempotencyKey: string): string {
+  const hash = crypto.createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 32);
+  return `recon_${hash}`;
+}
+
+const FORBIDDEN_RECONCILIATION_OVERRIDE_KEYS = [
+  'ptaxRate',
+  'ptaxQuoteDate',
+  'ptaxPricingDate',
+  'ptaxSource',
+  'basePriceUsd',
+  'adminCommissionPercent',
+  'commissionModel',
+  'commissionVersion',
+  'teacherShareBrl',
+  'teacherShareUsd',
+  'platformRevenueBrl',
+  'platformRevenueUsd',
+  'totalPaidBrl',
+  'totalPaidUsd',
+  'unitPriceBrl',
+  'unitPriceUsd',
+  'countsAsRevenue',
+  'isPaidPurchase',
+  'availableLessons',
+  'contractedLessons',
+  'discountPercent',
+  'currency',
+] as const;
+
+function hasForbiddenFinancialOverrideKey(obj: Record<string, any> | null | undefined): string | null {
+  if (!obj || typeof obj !== 'object') return null;
+  for (const key of FORBIDDEN_RECONCILIATION_OVERRIDE_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(obj, key) && (obj as any)[key] !== undefined) {
+      return key;
+    }
+  }
+  return null;
+}
+
+export interface ApprovedTeacherDirectoryEntry {
+  uid: string;
+  name: string;
+  email: string;
+  country: string | null;
+}
+
+/**
+ * NF.SWITCH.2B: Read-only admin query returning students with pending `legacy_unreconciled`
+ * credits (either already hydrated in `credit_lots` or pre-2A `availableLessons > 0` awaiting
+ * first hydration), along with verifiable historical `financial_transactions` evidence and
+ * remaining backable capacity per transaction. Never mutates Firestore or invents pricing.
+ */
+export async function listPendingLegacyCreditStudentsForAdmin(): Promise<{
+  success: boolean;
+  statusCode: number;
+  code?: string;
+  error?: string;
+  students: PendingLegacyStudentSummary[];
+  teachers: ApprovedTeacherDirectoryEntry[];
+}> {
+  const db = getFirestoreDb();
+  if (!db) {
+    return {
+      success: false,
+      statusCode: 503,
+      code: 'FIRESTORE_UNAVAILABLE',
+      error: 'Firestore (default) indisponível para consulta de conciliação de créditos legados.',
+      students: [],
+      teachers: [],
+    };
+  }
+
+  const snapToArray = (snap: any): Record<string, any>[] => {
+    const out: Record<string, any>[] = [];
+    if (!snap || typeof snap.forEach !== 'function') return out;
+    snap.forEach((doc: any) => {
+      const data = typeof doc.data === 'function' ? doc.data() : doc;
+      if (data && typeof data === 'object') {
+        out.push({ id: doc.id || data.id, ...data });
+      }
+    });
+    return out;
+  };
+
+  try {
+    const [usersSnap, lotsSnap, txSnap, tutorsSnap, evidenceSnap, assignmentsSnap] = await Promise.all([
+      db.collection('users').get(),
+      db.collection('credit_lots').get(),
+      db.collection('financial_transactions').get(),
+      db.collection('tutors').get(),
+      db.collection('financial_evidence_allocations').get(),
+      db.collection('student_assignments').get(),
+    ]);
+
+    const users = snapToArray(usersSnap);
+    const allLots = snapToArray(lotsSnap) as CreditLot[];
+    const allTxs = snapToArray(txSnap);
+    const allTutors = snapToArray(tutorsSnap);
+    const allEvidenceDocs = snapToArray(evidenceSnap);
+    const allAssignments = snapToArray(assignmentsSnap);
+
+    const evidenceByDocId = new Map<string, Record<string, any>>();
+    for (const evDoc of allEvidenceDocs) {
+      if (evDoc.id) evidenceByDocId.set(String(evDoc.id), evDoc);
+    }
+
+    // Aggregate existing non-legacy credit_lots per sourceTransactionId (covers pre-2B 2A PACKAGE_PURCHASE lots)
+    const lotUsageByTxId = new Map<string, { lessons: number; brlCents: number }>();
+    const lotsByStudentUid = new Map<string, CreditLot[]>();
+
+    for (const lot of allLots) {
+      const sUid = String(lot.studentUid || '').trim();
+      if (sUid) {
+        const list = lotsByStudentUid.get(sUid) || [];
+        list.push(lot);
+        lotsByStudentUid.set(sUid, list);
+      }
+      if (lot.origin !== 'legacy_unreconciled' && typeof lot.sourceTransactionId === 'string' && lot.sourceTransactionId.trim()) {
+        const txId = lot.sourceTransactionId.trim();
+        const prev = lotUsageByTxId.get(txId) || { lessons: 0, brlCents: 0 };
+        prev.lessons += Number.isFinite(lot.initialLessons) ? lot.initialLessons : 0;
+        prev.brlCents += typeof lot.totalPaidBrl === 'number' && Number.isFinite(lot.totalPaidBrl) ? toBrlCents(lot.totalPaidBrl) : 0;
+        lotUsageByTxId.set(txId, prev);
+      }
+    }
+
+    // Build teacher directory (users + tutors)
+    const teacherMap = new Map<string, ApprovedTeacherDirectoryEntry>();
+    for (const t of [...users, ...allTutors]) {
+      if (t.deleted === true) continue;
+      const role = String(t.role || '').toLowerCase().trim();
+      const isTutorRecord = role === 'teacher' || (t.isApproved === true && t.approvalStatus === 'approved');
+      if (!isTutorRecord) continue;
+      if (t.isApproved !== true || t.approvalStatus !== 'approved') continue;
+      const uid = String(t.uid || t.authUid || t.id || '').trim();
+      if (!uid || !isValidCanonicalUid(uid)) continue;
+      const existing = teacherMap.get(uid);
+      teacherMap.set(uid, {
+        uid,
+        name: String(t.name || existing?.name || t.email || 'Native Friend').trim(),
+        email: String(t.email || existing?.email || '').toLowerCase().trim(),
+        country: typeof t.country === 'string' && t.country.trim() ? t.country.trim() : existing?.country || null,
+      });
+    }
+
+    const assignmentByStudentUid = new Map<string, Record<string, any>>();
+    for (const a of allAssignments) {
+      const sUid = String(a.studentUid || a.id || '').trim();
+      if (sUid) assignmentByStudentUid.set(sUid, a);
+    }
+
+    // Group transactions by studentUid and fallback studentEmail
+    const txsByStudentUid = new Map<string, Record<string, any>[]>();
+    const txsByStudentEmail = new Map<string, Record<string, any>[]>();
+    for (const tx of allTxs) {
+      const sUid = typeof tx.studentUid === 'string' ? tx.studentUid.trim() : '';
+      const sEmail = typeof tx.studentEmail === 'string' ? tx.studentEmail.toLowerCase().trim() : '';
+      if (sUid) {
+        const list = txsByStudentUid.get(sUid) || [];
+        list.push(tx);
+        txsByStudentUid.set(sUid, list);
+      }
+      if (sEmail) {
+        const list = txsByStudentEmail.get(sEmail) || [];
+        list.push(tx);
+        txsByStudentEmail.set(sEmail, list);
+      }
+    }
+
+    const pendingStudents: PendingLegacyStudentSummary[] = [];
+
+    for (const userDoc of users) {
+      if (!userDoc || userDoc.deleted === true) continue;
+      if (userDoc.canonicalUid && userDoc.canonicalUid !== userDoc.id) continue;
+      const roleLower = String(userDoc.role || 'student').toLowerCase().trim();
+      if (roleLower === 'admin' || roleLower === 'teacher') continue;
+
+      const studentUid = String(userDoc.uid || userDoc.id || '').trim();
+      if (!studentUid || !isValidCanonicalUid(studentUid)) continue;
+
+      const studentEmail = String(userDoc.email || '').toLowerCase().trim();
+      const studentName = String(userDoc.name || (studentEmail ? studentEmail.split('@')[0] : studentUid)).trim();
+      const availableLessons =
+        typeof userDoc.availableLessons === 'number' && Number.isFinite(userDoc.availableLessons)
+          ? userDoc.availableLessons
+          : 0;
+      const contractedLessons =
+        typeof userDoc.contractedLessons === 'number' && Number.isFinite(userDoc.contractedLessons)
+          ? userDoc.contractedLessons
+          : availableLessons;
+
+      const creditLotsInitializedAt =
+        typeof userDoc.creditLotsInitializedAt === 'string' && userDoc.creditLotsInitializedAt.trim()
+          ? userDoc.creditLotsInitializedAt.trim()
+          : null;
+
+      const studentLots = lotsByStudentUid.get(studentUid) || [];
+      let courtesyRemaining = 0;
+      let paidRemaining = 0;
+      let legacyRemaining = 0;
+      let legacyInitial = 0;
+      let legacyConsumed = 0;
+      let primaryLegacyLot: CreditLot | null = null;
+
+      for (const lot of studentLots) {
+        const rem = Number.isFinite(lot.remainingLessons) ? lot.remainingLessons : 0;
+        if (lot.origin === 'courtesy') courtesyRemaining += rem;
+        else if (lot.origin === 'paid') paidRemaining += rem;
+        else if (lot.origin === 'legacy_unreconciled') {
+          legacyRemaining += rem;
+          legacyInitial += Number.isFinite(lot.initialLessons) ? lot.initialLessons : 0;
+          legacyConsumed += Number.isFinite(lot.consumedLessons) ? lot.consumedLessons : 0;
+          if (!primaryLegacyLot || lot.remainingLessons > primaryLegacyLot.remainingLessons) {
+            primaryLegacyLot = lot;
+          }
+        }
+      }
+
+      const totalLotsRemaining = courtesyRemaining + paidRemaining + legacyRemaining;
+      let hasLedgerDivergence = false;
+      let divergenceDetails: string | null = null;
+
+      try {
+        validateCreditLotsForStudent(studentUid, studentLots);
+      } catch (valErr: any) {
+        hasLedgerDivergence = true;
+        divergenceDetails = valErr?.message || 'Inconsistência detectada nos lotes do estudante.';
+      }
+
+      if (creditLotsInitializedAt) {
+        if (!hasLedgerDivergence && availableLessons !== totalLotsRemaining) {
+          hasLedgerDivergence = true;
+          divergenceDetails = `CREDIT_LEDGER_DIVERGENCE: availableLessons=${availableLessons} difere da soma dos lotes=${totalLotsRemaining}.`;
+        }
+      } else {
+        if (!hasLedgerDivergence && totalLotsRemaining > availableLessons) {
+          hasLedgerDivergence = true;
+          divergenceDetails = `CREDIT_LEDGER_DIVERGENCE: soma dos lotes (${totalLotsRemaining}) excede availableLessons (${availableLessons}).`;
+        }
+      }
+
+      const unhydratedLegacyDelta =
+        !creditLotsInitializedAt && !hasLedgerDivergence && availableLessons > totalLotsRemaining
+          ? availableLessons - totalLotsRemaining
+          : 0;
+
+      const hasPendingLegacy =
+        legacyRemaining > 0 ||
+        unhydratedLegacyDelta > 0 ||
+        (hasLedgerDivergence && (studentLots.some((l) => l.origin === 'legacy_unreconciled') || availableLessons > 0));
+
+      if (!hasPendingLegacy) continue;
+
+      const requiresInitialHydration = !creditLotsInitializedAt && unhydratedLegacyDelta > 0 && !primaryLegacyLot;
+      const effectiveLegacyRemaining = primaryLegacyLot
+        ? legacyRemaining
+        : unhydratedLegacyDelta;
+      const effectiveLegacyInitial = primaryLegacyLot ? legacyInitial : unhydratedLegacyDelta;
+
+      // Collect candidate historical transactions for this student
+      const candidateTxMap = new Map<string, Record<string, any>>();
+      for (const tx of txsByStudentUid.get(studentUid) || []) {
+        const id = String(tx.id || '').trim();
+        if (id) candidateTxMap.set(id, tx);
+      }
+      if (studentEmail) {
+        for (const tx of txsByStudentEmail.get(studentEmail) || []) {
+          const id = String(tx.id || '').trim();
+          if (id && !candidateTxMap.has(id)) {
+            candidateTxMap.set(id, tx);
+          }
+        }
+      }
+
+      const evidences: HistoricalFinancialEvidenceSummary[] = [];
+      for (const [txId, tx] of candidateTxMap.entries()) {
+        const evDoc = evidenceByDocId.get(buildEvidenceAllocationDocId(txId));
+        const lotUsage = lotUsageByTxId.get(txId) || { lessons: 0, brlCents: 0 };
+        const backedLessons = Math.max(Number(evDoc?.allocatedLessons || 0), lotUsage.lessons);
+        const backedBrlCents = Math.max(Number(evDoc?.allocatedTotalPaidBrlCents || 0), lotUsage.brlCents);
+
+        const evaluated = evaluateHistoricalTransactionEvidence({
+          tx,
+          transactionId: txId,
+          targetStudentUid: studentUid,
+          targetStudentEmail: studentEmail,
+          alreadyBackedLessons: backedLessons,
+          alreadyBackedBrlCents: backedBrlCents,
+        });
+
+        let eligible = evaluated.eligible;
+        let ineligibilityReason = evaluated.ineligibilityReason;
+
+        if (eligible && evaluated.gatewayProvider && evaluated.gatewayTransactionId) {
+          const gwDocId = buildGatewayEvidenceAllocationDocId(
+            evaluated.gatewayProvider,
+            evaluated.gatewayTransactionId
+          );
+          const gwDoc = evidenceByDocId.get(gwDocId);
+          if (gwDoc && gwDoc.sourceTransactionId && gwDoc.sourceTransactionId !== txId) {
+            eligible = false;
+            ineligibilityReason =
+              'Comprovante de gateway já vinculado a outra transação financeira (proteção contra dupla atribuição).';
+          }
+        }
+
+        const resolvedTeacherInfo = evaluated.teacherUid ? teacherMap.get(evaluated.teacherUid) : undefined;
+
+        evidences.push({
+          transactionId: txId,
+          type: String(tx.type || 'UNKNOWN'),
+          category: typeof tx.category === 'string' ? tx.category : null,
+          status: String(tx.status || 'completed'),
+          createdAt: String(tx.createdAt || tx.timestamp || ''),
+          studentUid: evaluated.studentUid,
+          studentEmail: evaluated.studentEmail,
+          teacherUid: evaluated.teacherUid,
+          teacherEmail: evaluated.teacherEmail || resolvedTeacherInfo?.email || null,
+          teacherName: evaluated.teacherName || resolvedTeacherInfo?.name || null,
+          packageName: evaluated.packageName,
+          lessonsCount: evaluated.lessonsCount,
+          totalPaidBrl: evaluated.totalPaidBrl,
+          totalPaidUsd: evaluated.totalPaidUsd,
+          unitPriceBrl: evaluated.unitPriceBrl,
+          basePriceUsd: evaluated.basePriceUsd,
+          adminCommissionPercent: evaluated.adminCommissionPercent,
+          commissionModel: evaluated.commissionModel,
+          ptaxRate: evaluated.ptaxRate,
+          teacherShareBrl: evaluated.teacherShareBrl,
+          platformRevenueBrl: evaluated.platformRevenueBrl,
+          gatewayProvider: evaluated.gatewayProvider,
+          gatewayTransactionId: evaluated.gatewayTransactionId,
+          gatewayVerified: evaluated.gatewayVerified,
+          isPaidPurchase: tx.isPaidPurchase === true,
+          countsAsRevenue: tx.countsAsRevenue === true,
+          alreadyBackedLessons: evaluated.alreadyBackedLessons,
+          remainingBackableLessons: evaluated.remainingBackableLessons,
+          alreadyBackedBrl: fromBrlCents(evaluated.alreadyBackedBrlCents),
+          remainingBackableBrl: fromBrlCents(evaluated.remainingBackableBrlCents),
+          isEligibleForPaidReconciliation: eligible,
+          ineligibilityReason,
+        });
+      }
+
+      evidences.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+
+      const assignDoc = assignmentByStudentUid.get(studentUid);
+      const assignedTeacherUid =
+        [
+          userDoc.teacherUid,
+          userDoc.assignedNativeFriendUID,
+          userDoc.nativeFriendUID,
+          assignDoc?.teacherUid,
+          assignDoc?.assignedNativeFriendUID,
+        ].find((v) => typeof v === 'string' && v.trim() !== '') || null;
+      const assignedTeacherInfo = assignedTeacherUid ? teacherMap.get(assignedTeacherUid) : undefined;
+      const assignedTeacherName =
+        assignedTeacherInfo?.name ||
+        (typeof userDoc.teacherName === 'string' && userDoc.teacherName.trim() ? userDoc.teacherName.trim() : null) ||
+        (typeof assignDoc?.teacherName === 'string' && assignDoc.teacherName.trim() ? assignDoc.teacherName.trim() : null);
+
+      pendingStudents.push({
+        studentUid,
+        studentName,
+        studentEmail,
+        availableLessons,
+        contractedLessons,
+        creditLotsInitializedAt,
+        hasLedgerDivergence,
+        divergenceDetails,
+        legacyLotId: primaryLegacyLot?.id || null,
+        legacyLotUpdatedAt: primaryLegacyLot?.updatedAt || null,
+        legacyInitialLessons: effectiveLegacyInitial,
+        legacyRemainingLessons: effectiveLegacyRemaining,
+        legacyConsumedLessons: legacyConsumed,
+        requiresInitialHydration,
+        lotsBreakdown: {
+          courtesyRemaining,
+          paidRemaining,
+          legacyRemaining: effectiveLegacyRemaining,
+          totalLotsRemaining: primaryLegacyLot ? totalLotsRemaining : totalLotsRemaining + unhydratedLegacyDelta,
+        },
+        assignedTeacherUid,
+        assignedTeacherName,
+        evidences,
+      });
+    }
+
+    pendingStudents.sort((a, b) => {
+      if (b.legacyRemainingLessons !== a.legacyRemainingLessons) {
+        return b.legacyRemainingLessons - a.legacyRemainingLessons;
+      }
+      return a.studentName.localeCompare(b.studentName, 'en', { sensitivity: 'base' });
+    });
+
+    const teachers = Array.from(teacherMap.values()).sort((a, b) =>
+      a.name.localeCompare(b.name, 'en', { sensitivity: 'base' })
+    );
+
+    return {
+      success: true,
+      statusCode: 200,
+      students: pendingStudents,
+      teachers,
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      statusCode: isPermissionError(err) ? 500 : 503,
+      code: 'FIRESTORE_QUERY_FAILED',
+      error: err?.message || 'Falha ao consultar créditos legados pendentes no Firestore (default).',
+      students: [],
+      teachers: [],
+    };
+  }
+}
+
+/**
+ * NF.SWITCH.2B: Admin-only read-only listing of immutable reconciliation audits.
+ */
+export async function listCreditReconciliationAuditsForAdmin(filters: {
+  studentUid?: string;
+  limit?: number;
+} = {}): Promise<{
+  success: boolean;
+  statusCode: number;
+  code?: string;
+  error?: string;
+  audits: CreditReconciliationAuditRecord[];
+}> {
+  const db = getFirestoreDb();
+  if (!db) {
+    return {
+      success: false,
+      statusCode: 503,
+      code: 'FIRESTORE_UNAVAILABLE',
+      error: 'Firestore (default) indisponível para consultar auditoria de conciliações.',
+      audits: [],
+    };
+  }
+
+  try {
+    const snap = await db.collection('credit_reconciliation_audits').get();
+    let items: CreditReconciliationAuditRecord[] = [];
+    snap.forEach((doc: any) => {
+      const data = typeof doc.data === 'function' ? doc.data() : doc;
+      if (data && typeof data === 'object') {
+        items.push({ id: doc.id || data.id, ...data } as CreditReconciliationAuditRecord);
+      }
+    });
+
+    if (filters.studentUid && filters.studentUid.trim()) {
+      const target = filters.studentUid.trim();
+      items = items.filter((a) => a.studentUid === target);
+    }
+
+    items.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+
+    const maxLimit =
+      typeof filters.limit === 'number' && Number.isFinite(filters.limit) && filters.limit > 0
+        ? Math.min(Math.floor(filters.limit), 200)
+        : 50;
+
+    return {
+      success: true,
+      statusCode: 200,
+      audits: items.slice(0, maxLimit),
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      statusCode: isPermissionError(err) ? 500 : 503,
+      code: 'FIRESTORE_QUERY_FAILED',
+      error: err?.message || 'Falha ao consultar auditoria de conciliação no Firestore (default).',
+      audits: [],
+    };
+  }
+}
+
+export interface ReconcileStudentLegacyCreditsParams {
+  adminUid: string;
+  adminEmail?: string;
+  studentUid: string;
+  idempotencyKey: string;
+  justification: string;
+  allocations: LegacyReconciliationAllocationInput[];
+  expectedLegacyRemainingLessons?: number;
+  expectedLegacyLotUpdatedAt?: string | null;
+  rawPayload?: Record<string, any>;
+}
+
+export interface ReconcileStudentLegacyCreditsResult {
+  success: boolean;
+  statusCode: number;
+  code?: string;
+  error?: string;
+  isIdempotent?: boolean;
+  studentUid?: string;
+  availableLessonsBefore?: number;
+  availableLessonsAfter?: number;
+  legacyLot?: CreditLot;
+  createdLots?: CreditLot[];
+  audit?: CreditReconciliationAuditRecord;
+}
+
+/**
+ * NF.SWITCH.2B: Controlled, atomic, idempotent, and immutable administrative reconciliation
+ * of `legacy_unreconciled` credit lots in Firestore `(default)`.
+ */
+export async function reconcileStudentLegacyCreditsAtomicServer(
+  params: ReconcileStudentLegacyCreditsParams
+): Promise<ReconcileStudentLegacyCreditsResult> {
+  const cleanAdminUid = String(params.adminUid || '').trim();
+  const cleanAdminEmail = String(params.adminEmail || '').toLowerCase().trim();
+  if (!cleanAdminUid) {
+    return {
+      success: false,
+      statusCode: 401,
+      code: 'UNAUTHORIZED',
+      error: 'Autenticação administrativa obrigatória.',
+    };
+  }
+
+  // Reject any client attempt to invent/override PTAX, price, commission, revenue, or balances
+  const topOverrideKey = hasForbiddenFinancialOverrideKey(params.rawPayload);
+  if (topOverrideKey) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'CLIENT_FINANCIAL_OVERRIDE_FORBIDDEN',
+      error: `Campo financeiro/saldo não permitido na requisição (${topOverrideKey}). Valores pagos devem vir exclusivamente de evidência histórica verificável.`,
+    };
+  }
+
+  const cleanStudentUid = String(params.studentUid || '').trim();
+  if (!cleanStudentUid || !isValidCanonicalUid(cleanStudentUid)) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'CANONICAL_UID_REQUIRED',
+      error: 'UID canônico do aluno é obrigatório e deve ser válido.',
+    };
+  }
+
+  const cleanIdempotencyKey =
+    typeof params.idempotencyKey === 'string' ? params.idempotencyKey.trim() : '';
+  if (!cleanIdempotencyKey || cleanIdempotencyKey.length > 200) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'IDEMPOTENCY_KEY_REQUIRED',
+      error: 'idempotencyKey é obrigatória para conciliação administrativa.',
+    };
+  }
+
+  const cleanJustification =
+    typeof params.justification === 'string' ? params.justification.trim() : '';
+  if (!cleanJustification || cleanJustification.length < 3 || cleanJustification.length > 1000) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'JUSTIFICATION_REQUIRED',
+      error: 'Justificativa administrativa (3 a 1000 caracteres) é obrigatória.',
+    };
+  }
+
+  if (!Array.isArray(params.allocations) || params.allocations.length === 0 || params.allocations.length > 25) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'INVALID_ALLOCATIONS',
+      error: 'Informe ao menos uma alocação válida para conciliação.',
+    };
+  }
+
+  const normalizedAllocations: LegacyReconciliationAllocationInput[] = [];
+  let totalRequestedLessons = 0;
+
+  for (let i = 0; i < params.allocations.length; i++) {
+    const rawAlloc = params.allocations[i] as any;
+    if (!rawAlloc || typeof rawAlloc !== 'object') {
+      return {
+        success: false,
+        statusCode: 400,
+        code: 'INVALID_ALLOCATIONS',
+        error: `Alocação #${i + 1} inválida.`,
+      };
+    }
+
+    const allocOverrideKey = hasForbiddenFinancialOverrideKey(rawAlloc);
+    if (allocOverrideKey) {
+      return {
+        success: false,
+        statusCode: 400,
+        code: 'CLIENT_FINANCIAL_OVERRIDE_FORBIDDEN',
+        error: `Campo financeiro/saldo não permitido na alocação (${allocOverrideKey}).`,
+      };
+    }
+
+    const origin = rawAlloc.origin;
+    if (origin !== 'paid' && origin !== 'courtesy') {
+      return {
+        success: false,
+        statusCode: 400,
+        code: 'INVALID_CLASSIFICATION_ORIGIN',
+        error: "Classificação deve ser estritamente 'paid' ou 'courtesy'.",
+      };
+    }
+
+    const lessonsCount = rawAlloc.lessonsCount;
+    if (typeof lessonsCount !== 'number' || !Number.isInteger(lessonsCount) || lessonsCount <= 0) {
+      return {
+        success: false,
+        statusCode: 400,
+        code: 'INVALID_LESSONS_COUNT',
+        error: 'Quantidade de aulas por alocação deve ser um número inteiro positivo.',
+      };
+    }
+
+    const cleanTxId = typeof rawAlloc.sourceTransactionId === 'string' ? rawAlloc.sourceTransactionId.trim() : '';
+    const cleanTeacherUid = typeof rawAlloc.teacherUid === 'string' ? rawAlloc.teacherUid.trim() : '';
+
+    if (origin === 'paid') {
+      if (!cleanTxId) {
+        return {
+          success: false,
+          statusCode: 400,
+          code: 'FINANCIAL_EVIDENCE_REQUIRED',
+          error: "Classificação 'paid' exige sourceTransactionId de evidência financeira verificável.",
+        };
+      }
+      if (!cleanTeacherUid || !isValidCanonicalUid(cleanTeacherUid)) {
+        return {
+          success: false,
+          statusCode: 400,
+          code: 'TEACHER_REQUIRED',
+          error: "Classificação 'paid' exige confirmação do teacherUid responsável correspondente à evidência.",
+        };
+      }
+      normalizedAllocations.push({
+        origin: 'paid',
+        lessonsCount,
+        sourceTransactionId: cleanTxId,
+        teacherUid: cleanTeacherUid,
+        ...(typeof rawAlloc.expectedTotalPaidBrl === 'number'
+          ? { expectedTotalPaidBrl: rawAlloc.expectedTotalPaidBrl }
+          : {}),
+        ...(typeof rawAlloc.expectedEvidenceLessons === 'number'
+          ? { expectedEvidenceLessons: rawAlloc.expectedEvidenceLessons }
+          : {}),
+      });
+    } else {
+      if (cleanTxId || (typeof rawAlloc.gatewayTransactionId === 'string' && rawAlloc.gatewayTransactionId.trim())) {
+        return {
+          success: false,
+          statusCode: 400,
+          code: 'COURTESY_CANNOT_BIND_PAYMENT_EVIDENCE',
+          error: "Classificação 'courtesy' não gera valor financeiro e não deve vincular transação de pagamento.",
+        };
+      }
+      normalizedAllocations.push({
+        origin: 'courtesy',
+        lessonsCount,
+      });
+    }
+
+    totalRequestedLessons += lessonsCount;
+  }
+
+  if (
+    params.expectedLegacyRemainingLessons !== undefined &&
+    (!Number.isInteger(params.expectedLegacyRemainingLessons) || params.expectedLegacyRemainingLessons < 0)
+  ) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'INVALID_CONCURRENCY_CHECK',
+      error: 'expectedLegacyRemainingLessons inválido.',
+    };
+  }
+
+  const db = getFirestoreDb();
+  if (!db || isCloudWriteDisabled) {
+    return {
+      success: false,
+      statusCode: 503,
+      code: 'FIRESTORE_UNAVAILABLE',
+      error: 'Serviço de persistência Firestore (default) indisponível.',
+    };
+  }
+
+  const requestFingerprint = crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify({
+        studentUid: cleanStudentUid,
+        justification: cleanJustification,
+        allocations: normalizedAllocations,
+      })
+    )
+    .digest('hex');
+
+  const auditId = buildReconciliationAuditDocId(cleanIdempotencyKey);
+  const uniquePaidTxIds = Array.from(
+    new Set(
+      normalizedAllocations
+        .filter((a) => a.origin === 'paid' && a.sourceTransactionId)
+        .map((a) => a.sourceTransactionId!)
+    )
+  ).sort();
+
+  // Pre-discover any existing credit_lots referencing those sourceTransactionIds so they can be
+  // transactionally read (READ-BEFORE-WRITE) to prevent double attribution across 2A & 2B lots.
+  const preDiscoveredLotsByTxId = new Map<string, string[]>();
+  try {
+    await Promise.all(
+      uniquePaidTxIds.map(async (txId) => {
+        const creditLotsCol = db.collection('credit_lots');
+        const discovered: string[] = [];
+        if (typeof (creditLotsCol as any).where === 'function') {
+          const snap = await creditLotsCol.where('sourceTransactionId', '==', txId).get();
+          snap.forEach((d: any) => {
+            if (d?.id) discovered.push(d.id);
+          });
+        }
+        preDiscoveredLotsByTxId.set(txId, discovered.sort());
+      })
+    );
+  } catch (err: any) {
+    return {
+      success: false,
+      statusCode: 503,
+      code: 'FIRESTORE_QUERY_FAILED',
+      error: err?.message || 'Falha ao consultar lotes associados às evidências financeiras.',
+    };
+  }
+
+  const nowIso = new Date().toISOString();
+
+  try {
+    const outcome = await db.runTransaction(async (transaction) => {
+      const auditRef = db.collection('credit_reconciliation_audits').doc(auditId);
+      const studentRef = db.collection('users').doc(cleanStudentUid);
+
+      // PHASE 1: READ ALL DOCUMENTS BEFORE ANY WRITE
+      const [auditSnap, studentSnap] = await Promise.all([
+        transaction.get(auditRef),
+        transaction.get(studentRef),
+      ]);
+
+      if (auditSnap.exists) {
+        const existingAudit = (auditSnap.data() || {}) as CreditReconciliationAuditRecord & {
+          requestFingerprint?: string;
+        };
+        if (existingAudit.requestFingerprint !== requestFingerprint) {
+          throw new LegacyReconciliationError(
+            'Chave de idempotência já utilizada para outra conciliação administrativa.',
+            409,
+            'IDEMPOTENCY_KEY_CONFLICT'
+          );
+        }
+
+        const existingStudentData = studentSnap.exists ? (studentSnap.data() || {}) : {};
+        return {
+          isIdempotent: true,
+          studentUid: cleanStudentUid,
+          availableLessonsBefore: existingAudit.availableLessonsBefore,
+          availableLessonsAfter:
+            typeof existingStudentData.availableLessons === 'number'
+              ? existingStudentData.availableLessons
+              : existingAudit.availableLessonsAfter,
+          audit: existingAudit,
+        };
+      }
+
+      if (!studentSnap.exists) {
+        throw new LegacyReconciliationError(
+          'Aluno não encontrado no Firestore (default).',
+          404,
+          'STUDENT_NOT_FOUND'
+        );
+      }
+
+      const studentData = studentSnap.data() || {};
+      if (studentData.deleted === true) {
+        throw new LegacyReconciliationError(
+          'Conta de aluno marcada como excluída.',
+          404,
+          'STUDENT_NOT_FOUND'
+        );
+      }
+
+      const targetRole = String(studentData.role || 'student').toLowerCase().trim();
+      if (targetRole === 'admin' || targetRole === 'teacher') {
+        throw new LegacyReconciliationError(
+          'Conciliação permitida apenas para contas de alunos.',
+          400,
+          'INVALID_TARGET_ROLE'
+        );
+      }
+
+      if (
+        typeof studentData.availableLessons !== 'number' ||
+        !Number.isFinite(studentData.availableLessons) ||
+        !Number.isInteger(studentData.availableLessons) ||
+        studentData.availableLessons < 0
+      ) {
+        throw new CreditLedgerError(
+          `Divergência detectada no saldo do aluno (CREDIT_LEDGER_DIVERGENCE): availableLessons inválido (${studentData.availableLessons}).`,
+          409,
+          CREDIT_LEDGER_DIVERGENCE_CODE
+        );
+      }
+
+      const beforeAvailable = studentData.availableLessons;
+      const cleanStudentEmail = String(studentData.email || '').toLowerCase().trim();
+      const cleanStudentName = String(
+        studentData.name || (cleanStudentEmail ? cleanStudentEmail.split('@')[0] : cleanStudentUid)
+      ).trim();
+
+      // Load student's credit lots transactionally and enforce NF.SWITCH.2A ledger invariants
+      const existingLots = await loadStudentCreditLotsInTransaction(
+        db,
+        transaction,
+        cleanStudentUid,
+        studentData
+      );
+
+      const hydrated = reconcileStudentCreditLedger({
+        studentUid: cleanStudentUid,
+        studentEmail: cleanStudentEmail,
+        studentData,
+        existingLots,
+        beforeAvailable,
+        nowIso,
+      });
+
+      const legacyLots = hydrated.lots.filter((l) => l.origin === 'legacy_unreconciled');
+      if (legacyLots.length > 1) {
+        throw new CreditLedgerError(
+          'Divergência estrutural: múltiplos lotes legacy_unreconciled detectados para o estudante.',
+          409,
+          CREDIT_LEDGER_DIVERGENCE_CODE
+        );
+      }
+
+      const legacyLot = legacyLots[0];
+      if (!legacyLot || legacyLot.remainingLessons <= 0) {
+        throw new LegacyReconciliationError(
+          'Aluno não possui créditos legados (legacy_unreconciled) pendentes de conciliação.',
+          409,
+          'NO_UNRECONCILED_LEGACY_CREDITS'
+        );
+      }
+
+      // Concurrency checks on source legacy lot
+      if (
+        params.expectedLegacyRemainingLessons !== undefined &&
+        legacyLot.remainingLessons !== params.expectedLegacyRemainingLessons
+      ) {
+        throw new LegacyReconciliationError(
+          `Conflito de concorrência: saldo legado atual (${legacyLot.remainingLessons}) difere do esperado (${params.expectedLegacyRemainingLessons}). Atualize os dados e tente novamente.`,
+          409,
+          'CONCURRENCY_CONFLICT',
+          {
+            actualRemainingLessons: legacyLot.remainingLessons,
+            expectedRemainingLessons: params.expectedLegacyRemainingLessons,
+          }
+        );
+      }
+
+      if (
+        typeof params.expectedLegacyLotUpdatedAt === 'string' &&
+        params.expectedLegacyLotUpdatedAt.trim() !== '' &&
+        legacyLot.updatedAt !== params.expectedLegacyLotUpdatedAt.trim()
+      ) {
+        throw new LegacyReconciliationError(
+          'Conflito de concorrência: o lote legado foi modificado por outra operação. Atualize e tente novamente.',
+          409,
+          'CONCURRENCY_CONFLICT',
+          {
+            actualUpdatedAt: legacyLot.updatedAt,
+            expectedUpdatedAt: params.expectedLegacyLotUpdatedAt.trim(),
+          }
+        );
+      }
+
+      if (totalRequestedLessons > legacyLot.remainingLessons) {
+        throw new LegacyReconciliationError(
+          `Quantidade solicitada (${totalRequestedLessons}) excede os créditos legados pendentes (${legacyLot.remainingLessons}).`,
+          409,
+          'INSUFFICIENT_LEGACY_CREDITS',
+          {
+            requestedLessons: totalRequestedLessons,
+            availableLegacyLessons: legacyLot.remainingLessons,
+          }
+        );
+      }
+
+      // Read all referenced financial_transactions, evidence lock docs, related lots, and teacher docs
+      const txSnapshots = new Map<string, Record<string, any> | null>();
+      const txEvidenceSnapshots = new Map<string, Record<string, any> | null>();
+      const relatedNonLegacyLotUsageByTxId = new Map<string, { lessons: number; brlCents: number }>();
+
+      for (const txId of uniquePaidTxIds) {
+        const txRef = db.collection('financial_transactions').doc(txId);
+        const evDocId = buildEvidenceAllocationDocId(txId);
+        const evRef = db.collection('financial_evidence_allocations').doc(evDocId);
+        const discoveredLotIds = preDiscoveredLotsByTxId.get(txId) || [];
+
+        const [txSnap, evSnap, ...lotSnaps] = await Promise.all([
+          transaction.get(txRef),
+          transaction.get(evRef),
+          ...discoveredLotIds.map((lId) => transaction.get(db.collection('credit_lots').doc(lId))),
+        ]);
+
+        txSnapshots.set(txId, txSnap.exists ? ({ id: txSnap.id, ...(txSnap.data() || {}) } as Record<string, any>) : null);
+        txEvidenceSnapshots.set(txId, evSnap.exists ? ({ id: evSnap.id, ...(evSnap.data() || {}) } as Record<string, any>) : null);
+
+        let nonLegacyLessons = 0;
+        let nonLegacyBrlCents = 0;
+        for (const lSnap of lotSnaps) {
+          if (!lSnap.exists) continue;
+          const lData = lSnap.data() || {};
+          if (lData.origin !== 'legacy_unreconciled') {
+            nonLegacyLessons += Number.isFinite(lData.initialLessons) ? lData.initialLessons : 0;
+            nonLegacyBrlCents +=
+              typeof lData.totalPaidBrl === 'number' && Number.isFinite(lData.totalPaidBrl)
+                ? toBrlCents(lData.totalPaidBrl)
+                : 0;
+          }
+        }
+        relatedNonLegacyLotUsageByTxId.set(txId, {
+          lessons: nonLegacyLessons,
+          brlCents: nonLegacyBrlCents,
+        });
+      }
+
+      // Also read gateway evidence locks for any transactions carrying gatewayProvider + gatewayTransactionId
+      const gwEvidenceByKey = new Map<string, { docId: string; data: Record<string, any> | null }>();
+      for (const txId of uniquePaidTxIds) {
+        const txData = txSnapshots.get(txId);
+        const gwProv =
+          typeof txData?.gatewayProvider === 'string' && txData.gatewayProvider.trim()
+            ? txData.gatewayProvider.trim()
+            : '';
+        const gwTxId =
+          typeof txData?.gatewayTransactionId === 'string' && txData.gatewayTransactionId.trim()
+            ? txData.gatewayTransactionId.trim()
+            : '';
+        if (gwProv && gwTxId) {
+          const gwKey = `${gwProv.toLowerCase()}:${gwTxId}`;
+          if (!gwEvidenceByKey.has(gwKey)) {
+            const gwDocId = buildGatewayEvidenceAllocationDocId(gwProv, gwTxId);
+            const gwSnap = await transaction.get(db.collection('financial_evidence_allocations').doc(gwDocId));
+            gwEvidenceByKey.set(gwKey, {
+              docId: gwDocId,
+              data: gwSnap.exists ? ({ id: gwSnap.id, ...(gwSnap.data() || {}) } as Record<string, any>) : null,
+            });
+          }
+        }
+      }
+
+      // Read referenced teacher docs (for canonical email/name verification)
+      const uniquePaidTeacherUids = Array.from(
+        new Set(
+          normalizedAllocations
+            .filter((a) => a.origin === 'paid' && a.teacherUid)
+            .map((a) => a.teacherUid!)
+        )
+      ).sort();
+      const teacherDocMap = new Map<string, { tutorDoc: Record<string, any> | null; userDoc: Record<string, any> | null }>();
+      for (const tUid of uniquePaidTeacherUids) {
+        const [tSnap, uSnap] = await Promise.all([
+          transaction.get(db.collection('tutors').doc(tUid)),
+          transaction.get(db.collection('users').doc(tUid)),
+        ]);
+        teacherDocMap.set(tUid, {
+          tutorDoc: tSnap.exists ? (tSnap.data() || {}) : null,
+          userDoc: uSnap.exists ? (uSnap.data() || {}) : null,
+        });
+      }
+
+      // PHASE 2: VALIDATE AND COMPUTE ALL ALLOCATIONS IN-MEMORY (NO WRITES YET)
+      interface AccumulatedTxUsage {
+        lessons: number;
+        totalPaidBrlCents: number;
+        totalPaidUsdCents: number;
+        teacherShareBrlCents: number;
+        teacherShareUsdCents: number;
+        platformRevenueBrlCents: number;
+        platformRevenueUsdCents: number;
+      }
+
+      const txRunningUsage = new Map<string, AccumulatedTxUsage>();
+      for (const txId of uniquePaidTxIds) {
+        const evDoc = txEvidenceSnapshots.get(txId);
+        const lotUsage = relatedNonLegacyLotUsageByTxId.get(txId) || { lessons: 0, brlCents: 0 };
+        txRunningUsage.set(txId, {
+          lessons: Math.max(Number(evDoc?.allocatedLessons || 0), lotUsage.lessons),
+          totalPaidBrlCents: Math.max(Number(evDoc?.allocatedTotalPaidBrlCents || 0), lotUsage.brlCents),
+          totalPaidUsdCents: Number(evDoc?.allocatedTotalPaidUsdCents || 0),
+          teacherShareBrlCents: Number(evDoc?.allocatedTeacherShareBrlCents || 0),
+          teacherShareUsdCents: Number(evDoc?.allocatedTeacherShareUsdCents || 0),
+          platformRevenueBrlCents: Number(evDoc?.allocatedPlatformRevenueBrlCents || 0),
+          platformRevenueUsdCents: Number(evDoc?.allocatedPlatformRevenueUsdCents || 0),
+        });
+      }
+
+      const gwClaimedTxByKey = new Map<string, { txId: string; docId: string; lessons: number; brlCents: number }>();
+      for (const [gwKey, gwEntry] of gwEvidenceByKey.entries()) {
+        if (gwEntry.data?.sourceTransactionId) {
+          gwClaimedTxByKey.set(gwKey, {
+            txId: String(gwEntry.data.sourceTransactionId),
+            docId: gwEntry.docId,
+            lessons: Number(gwEntry.data.allocatedLessons || 0),
+            brlCents: Number(gwEntry.data.allocatedTotalPaidBrlCents || 0),
+          });
+        }
+      }
+
+      let nextSeq = hydrated.nextLotSequence;
+      const createdLots: CreditLot[] = [];
+      const auditAllocations: CreditReconciliationAuditAllocation[] = [];
+      const touchedEvidenceTxIds = new Set<string>();
+      const touchedGatewayKeys = new Set<string>();
+
+      for (let i = 0; i < normalizedAllocations.length; i++) {
+        const alloc = normalizedAllocations[i];
+        nextSeq += 1;
+
+        if (alloc.origin === 'courtesy') {
+          const courtesyLot = buildReconciledCourtesyLotData({
+            studentUid: cleanStudentUid,
+            studentEmail: cleanStudentEmail,
+            lessonsCount: alloc.lessonsCount,
+            lotSequence: nextSeq,
+            nowIso,
+            idempotencyKey: cleanIdempotencyKey,
+            allocationIndex: i,
+            reconciledFromLotId: legacyLot.id,
+            reconciliationAuditId: auditId,
+            justification: cleanJustification,
+            performedByUid: cleanAdminUid,
+            performedByEmail: cleanAdminEmail,
+          });
+          createdLots.push(courtesyLot);
+          auditAllocations.push({
+            targetLotId: courtesyLot.id,
+            origin: 'courtesy',
+            sourceType: 'LEGACY_RECONCILIATION_COURTESY',
+            lessonsCount: alloc.lessonsCount,
+            sourceTransactionId: null,
+            teacherUid: null,
+            teacherEmail: null,
+            teacherName: null,
+            financialAttributionStatus: 'courtesy_non_revenue',
+            totalPaidBrl: 0,
+            totalPaidUsd: 0,
+            teacherShareBrl: 0,
+            platformRevenueBrl: 0,
+          });
+          continue;
+        }
+
+        // Paid allocation: strict evidence verification
+        const txId = alloc.sourceTransactionId!;
+        const txData = txSnapshots.get(txId);
+        const usage = txRunningUsage.get(txId)!;
+
+        const evaluated = evaluateHistoricalTransactionEvidence({
+          tx: txData,
+          transactionId: txId,
+          targetStudentUid: cleanStudentUid,
+          targetStudentEmail: cleanStudentEmail,
+          alreadyBackedLessons: usage.lessons,
+          alreadyBackedBrlCents: usage.totalPaidBrlCents,
+        });
+
+        if (!evaluated.eligible) {
+          const code = evaluated.ineligibilityCode || 'INSUFFICIENT_FINANCIAL_EVIDENCE';
+          const status =
+            code === 'EVIDENCE_NOT_FOUND'
+              ? 404
+              : code === 'FINANCIAL_EVIDENCE_EXHAUSTED'
+              ? 409
+              : 422;
+          throw new LegacyReconciliationError(
+            evaluated.ineligibilityReason || 'Evidência financeira inelegível.',
+            status,
+            code,
+            { transactionId: txId }
+          );
+        }
+
+        // Prevent same gateway receipt ID backing distinct transaction docs
+        let gwKey: string | null = null;
+        if (evaluated.gatewayProvider && evaluated.gatewayTransactionId) {
+          gwKey = `${evaluated.gatewayProvider.toLowerCase()}:${evaluated.gatewayTransactionId}`;
+          const existingClaim = gwClaimedTxByKey.get(gwKey);
+          if (existingClaim && existingClaim.txId !== txId) {
+            throw new LegacyReconciliationError(
+              `Conflito de dupla atribuição: comprovante de gateway (${evaluated.gatewayProvider}/${evaluated.gatewayTransactionId}) já lastreia a transação '${existingClaim.txId}'.`,
+              409,
+              'DOUBLE_ATTRIBUTION_PREVENTED',
+              { transactionId: txId, conflictingTransactionId: existingClaim.txId }
+            );
+          }
+          if (existingClaim && existingClaim.lessons + alloc.lessonsCount > evaluated.lessonsCount) {
+            throw new LegacyReconciliationError(
+              'Conflito de dupla atribuição: capacidade do comprovante de gateway seria excedida.',
+              409,
+              'DOUBLE_ATTRIBUTION_PREVENTED',
+              { transactionId: txId }
+            );
+          }
+        }
+
+        // Validate teacher matches historical evidence
+        if (alloc.teacherUid !== evaluated.teacherUid) {
+          throw new LegacyReconciliationError(
+            `Professor informado (${alloc.teacherUid}) diverge do professor comprovado na evidência financeira (${evaluated.teacherUid}).`,
+            422,
+            'EVIDENCE_TEACHER_MISMATCH',
+            { expectedTeacherUid: evaluated.teacherUid, providedTeacherUid: alloc.teacherUid }
+          );
+        }
+
+        const tDocs = teacherDocMap.get(alloc.teacherUid!);
+        const teacherProfile = tDocs?.tutorDoc || tDocs?.userDoc;
+        if (tDocs?.userDoc?.role === 'student' || teacherProfile?.deleted === true) {
+          throw new LegacyReconciliationError(
+            'Professor vinculado à evidência encontra-se inválido ou excluído.',
+            422,
+            'TEACHER_INVALID'
+          );
+        }
+
+        if (
+          typeof alloc.expectedTotalPaidBrl === 'number' &&
+          Math.abs(toBrlCents(alloc.expectedTotalPaidBrl) - toBrlCents(evaluated.totalPaidBrl!)) > 1
+        ) {
+          throw new LegacyReconciliationError(
+            `Valor em BRL informado (${alloc.expectedTotalPaidBrl}) diverge do comprovado na evidência (${evaluated.totalPaidBrl}).`,
+            422,
+            'EVIDENCE_AMOUNT_MISMATCH'
+          );
+        }
+
+        if (
+          typeof alloc.expectedEvidenceLessons === 'number' &&
+          alloc.expectedEvidenceLessons !== evaluated.lessonsCount
+        ) {
+          throw new LegacyReconciliationError(
+            `Quantidade de aulas informada (${alloc.expectedEvidenceLessons}) diverge da comprovada na evidência (${evaluated.lessonsCount}).`,
+            422,
+            'EVIDENCE_QUANTITY_MISMATCH'
+          );
+        }
+
+        if (alloc.lessonsCount > evaluated.remainingBackableLessons) {
+          throw new LegacyReconciliationError(
+            `Quantidade solicitada (${alloc.lessonsCount}) excede o saldo disponível de aulas comprovadas na evidência '${txId}' (${evaluated.remainingBackableLessons} restantes de ${evaluated.lessonsCount}).`,
+            409,
+            'FINANCIAL_EVIDENCE_EXHAUSTED',
+            {
+              transactionId: txId,
+              requestedLessons: alloc.lessonsCount,
+              remainingBackableLessons: evaluated.remainingBackableLessons,
+              totalEvidenceLessons: evaluated.lessonsCount,
+            }
+          );
+        }
+
+        const totalEvBrlCents = toBrlCents(evaluated.totalPaidBrl!);
+        const allocBrlCents = allocateProportionalCents({
+          totalEvidenceCents: totalEvBrlCents,
+          alreadyAllocatedCents: usage.totalPaidBrlCents,
+          remainingEvidenceLessonsBefore: evaluated.remainingBackableLessons,
+          unitsToAllocate: alloc.lessonsCount,
+        });
+
+        if (allocBrlCents <= 0) {
+          throw new LegacyReconciliationError(
+            `Valor em BRL disponível na evidência '${txId}' já foi totalmente atribuído.`,
+            409,
+            'FINANCIAL_EVIDENCE_EXHAUSTED'
+          );
+        }
+
+        const allocTotalPaidBrl = fromBrlCents(allocBrlCents);
+        const allocUnitPriceBrl =
+          evaluated.unitPriceBrl !== null
+            ? evaluated.unitPriceBrl
+            : fromBrlCents(Math.round(allocBrlCents / alloc.lessonsCount));
+
+        let allocTotalPaidUsd: number | null = null;
+        let allocUsdCents = 0;
+        if (evaluated.totalPaidUsd !== null) {
+          allocUsdCents = allocateProportionalCents({
+            totalEvidenceCents: toBrlCents(evaluated.totalPaidUsd),
+            alreadyAllocatedCents: usage.totalPaidUsdCents,
+            remainingEvidenceLessonsBefore: evaluated.remainingBackableLessons,
+            unitsToAllocate: alloc.lessonsCount,
+          });
+          allocTotalPaidUsd = fromBrlCents(allocUsdCents);
+        }
+
+        let allocTeacherShareBrl: number | null = null;
+        let allocTeacherShareBrlCents = 0;
+        if (evaluated.teacherShareBrl !== null) {
+          allocTeacherShareBrlCents = allocateProportionalCents({
+            totalEvidenceCents: toBrlCents(evaluated.teacherShareBrl),
+            alreadyAllocatedCents: usage.teacherShareBrlCents,
+            remainingEvidenceLessonsBefore: evaluated.remainingBackableLessons,
+            unitsToAllocate: alloc.lessonsCount,
+          });
+          allocTeacherShareBrl = fromBrlCents(allocTeacherShareBrlCents);
+        }
+
+        let allocTeacherShareUsd: number | null = null;
+        let allocTeacherShareUsdCents = 0;
+        if (evaluated.teacherShareUsd !== null) {
+          allocTeacherShareUsdCents = allocateProportionalCents({
+            totalEvidenceCents: toBrlCents(evaluated.teacherShareUsd),
+            alreadyAllocatedCents: usage.teacherShareUsdCents,
+            remainingEvidenceLessonsBefore: evaluated.remainingBackableLessons,
+            unitsToAllocate: alloc.lessonsCount,
+          });
+          allocTeacherShareUsd = fromBrlCents(allocTeacherShareUsdCents);
+        }
+
+        let allocPlatformRevBrl: number | null = null;
+        let allocPlatformRevBrlCents = 0;
+        if (evaluated.platformRevenueBrl !== null) {
+          allocPlatformRevBrlCents = allocateProportionalCents({
+            totalEvidenceCents: toBrlCents(evaluated.platformRevenueBrl),
+            alreadyAllocatedCents: usage.platformRevenueBrlCents,
+            remainingEvidenceLessonsBefore: evaluated.remainingBackableLessons,
+            unitsToAllocate: alloc.lessonsCount,
+          });
+          allocPlatformRevBrl = fromBrlCents(allocPlatformRevBrlCents);
+        }
+
+        let allocPlatformRevUsd: number | null = null;
+        let allocPlatformRevUsdCents = 0;
+        if (evaluated.platformRevenueUsd !== null) {
+          allocPlatformRevUsdCents = allocateProportionalCents({
+            totalEvidenceCents: toBrlCents(evaluated.platformRevenueUsd),
+            alreadyAllocatedCents: usage.platformRevenueUsdCents,
+            remainingEvidenceLessonsBefore: evaluated.remainingBackableLessons,
+            unitsToAllocate: alloc.lessonsCount,
+          });
+          allocPlatformRevUsd = fromBrlCents(allocPlatformRevUsdCents);
+        }
+
+        const resolvedTeacherEmail = String(
+          evaluated.teacherEmail || teacherProfile?.email || ''
+        )
+          .toLowerCase()
+          .trim();
+        const resolvedTeacherName = String(
+          evaluated.teacherName || teacherProfile?.name || resolvedTeacherEmail || 'Native Friend'
+        ).trim();
+
+        const paidLot = buildReconciledPaidLotData({
+          studentUid: cleanStudentUid,
+          studentEmail: cleanStudentEmail,
+          lessonsCount: alloc.lessonsCount,
+          lotSequence: nextSeq,
+          nowIso,
+          idempotencyKey: cleanIdempotencyKey,
+          allocationIndex: i,
+          reconciledFromLotId: legacyLot.id,
+          reconciliationAuditId: auditId,
+          sourceTransactionId: txId,
+          pricedTeacherUid: alloc.teacherUid!,
+          teacherEmail: resolvedTeacherEmail,
+          teacherName: resolvedTeacherName,
+          packageName: evaluated.packageName,
+          packageLessons: evaluated.lessonsCount,
+          basePriceUsd: evaluated.basePriceUsd,
+          adminCommissionPercent: evaluated.adminCommissionPercent,
+          commissionModel: evaluated.commissionModel,
+          commissionVersion: evaluated.commissionVersion,
+          ptaxRate: evaluated.ptaxRate,
+          ptaxQuoteDate: evaluated.ptaxQuoteDate,
+          ptaxPricingDate: evaluated.ptaxPricingDate,
+          ptaxSource: evaluated.ptaxSource,
+          discountPercent: evaluated.discountPercent,
+          totalPaidBrl: allocTotalPaidBrl,
+          totalPaidUsd: allocTotalPaidUsd,
+          unitPriceBrl: allocUnitPriceBrl,
+          unitPriceUsd: evaluated.unitPriceUsd,
+          teacherShareBrl: allocTeacherShareBrl,
+          teacherShareUsd: allocTeacherShareUsd,
+          platformRevenueBrl: allocPlatformRevBrl,
+          platformRevenueUsd: allocPlatformRevUsd,
+          gatewayProvider: evaluated.gatewayProvider,
+          gatewayTransactionId: evaluated.gatewayTransactionId,
+          justification: cleanJustification,
+          performedByUid: cleanAdminUid,
+          performedByEmail: cleanAdminEmail,
+        });
+
+        createdLots.push(paidLot);
+        auditAllocations.push({
+          targetLotId: paidLot.id,
+          origin: 'paid',
+          sourceType: 'LEGACY_RECONCILIATION_PAID',
+          lessonsCount: alloc.lessonsCount,
+          sourceTransactionId: txId,
+          teacherUid: alloc.teacherUid!,
+          teacherEmail: resolvedTeacherEmail || null,
+          teacherName: resolvedTeacherName || null,
+          financialAttributionStatus: 'paid_verified',
+          totalPaidBrl: allocTotalPaidBrl,
+          totalPaidUsd: allocTotalPaidUsd,
+          teacherShareBrl: allocTeacherShareBrl,
+          platformRevenueBrl: allocPlatformRevBrl,
+        });
+
+        // Accumulate evidence usage for intra-request double-attribution guard & persistence
+        usage.lessons += alloc.lessonsCount;
+        usage.totalPaidBrlCents += allocBrlCents;
+        usage.totalPaidUsdCents += allocUsdCents;
+        usage.teacherShareBrlCents += allocTeacherShareBrlCents;
+        usage.teacherShareUsdCents += allocTeacherShareUsdCents;
+        usage.platformRevenueBrlCents += allocPlatformRevBrlCents;
+        usage.platformRevenueUsdCents += allocPlatformRevUsdCents;
+        touchedEvidenceTxIds.add(txId);
+
+        if (gwKey) {
+          const prevGw = gwClaimedTxByKey.get(gwKey) || {
+            txId,
+            docId: buildGatewayEvidenceAllocationDocId(
+              evaluated.gatewayProvider!,
+              evaluated.gatewayTransactionId!
+            ),
+            lessons: 0,
+            brlCents: 0,
+          };
+          prevGw.lessons += alloc.lessonsCount;
+          prevGw.brlCents += allocBrlCents;
+          gwClaimedTxByKey.set(gwKey, prevGw);
+          touchedGatewayKeys.add(gwKey);
+        }
+      }
+
+      // Update source legacy_unreconciled lot: subtract reconciled units from initialLessons and remainingLessons,
+      // keeping consumedLessons intact so initialLessons === remainingLessons + consumedLessons holds strictly
+      // and prior consumed legacy lessons remain exact-lot refundable.
+      const legacyBefore = {
+        initialLessons: legacyLot.initialLessons,
+        remainingLessons: legacyLot.remainingLessons,
+        consumedLessons: legacyLot.consumedLessons,
+        status: legacyLot.status,
+      };
+      const nextLegacyInitial = legacyLot.initialLessons - totalRequestedLessons;
+      const nextLegacyRemaining = legacyLot.remainingLessons - totalRequestedLessons;
+      const updatedLegacyLot: CreditLot = {
+        ...legacyLot,
+        ...reconcileLegacyLotUnitIndices(legacyLot, totalRequestedLessons),
+        initialLessons: nextLegacyInitial,
+        remainingLessons: nextLegacyRemaining,
+        status: nextLegacyRemaining === 0 ? 'exhausted' : 'active',
+        exhaustedAt: nextLegacyRemaining === 0 ? nowIso : null,
+        updatedAt: nowIso,
+        reconciledLessonsCount: Number(legacyLot.reconciledLessonsCount || 0) + totalRequestedLessons,
+        lastReconciledAt: nowIso,
+        lastReconciliationAuditId: auditId,
+      };
+
+      const finalLots = hydrated.lots
+        .map((l) => (l.id === updatedLegacyLot.id ? updatedLegacyLot : l))
+        .concat(createdLots);
+
+      validateCreditLotsForStudent(cleanStudentUid, finalLots);
+      const sumAfter = sumLotRemainingLessons(finalLots);
+      if (sumAfter !== beforeAvailable) {
+        throw new CreditLedgerError(
+          `Invariante violada na conciliação: soma dos lotes (${sumAfter}) divergiu de availableLessons (${beforeAvailable}).`,
+          409,
+          CREDIT_LEDGER_DIVERGENCE_CODE
+        );
+      }
+
+      const nextActiveCreditLotIds = computeActiveCreditLotIds(finalLots);
+
+      const auditRecord: CreditReconciliationAuditRecord & { requestFingerprint: string } = {
+        id: auditId,
+        idempotencyKey: cleanIdempotencyKey,
+        requestFingerprint,
+        studentUid: cleanStudentUid,
+        studentEmail: cleanStudentEmail,
+        studentName: cleanStudentName,
+        sourceLotId: updatedLegacyLot.id,
+        wasFirstInitialization: hydrated.wasFirstInitialization,
+        legacyBefore,
+        legacyAfter: {
+          initialLessons: updatedLegacyLot.initialLessons,
+          remainingLessons: updatedLegacyLot.remainingLessons,
+          consumedLessons: updatedLegacyLot.consumedLessons,
+          status: updatedLegacyLot.status,
+        },
+        availableLessonsBefore: beforeAvailable,
+        availableLessonsAfter: beforeAvailable, // Strictly preserved
+        reconciledTotalLessons: totalRequestedLessons,
+        targetLotIds: createdLots.map((l) => l.id),
+        allocations: auditAllocations,
+        justification: cleanJustification,
+        performedByUid: cleanAdminUid,
+        performedByEmail: cleanAdminEmail,
+        performedByRole: 'admin',
+        createdAt: nowIso,
+        immutable: true,
+      };
+
+      // PHASE 3: ATOMIC WRITES (NEVER writes to financial_transactions; NEVER mutates availableLessons/contractedLessons)
+      transaction.set(db.collection('credit_lots').doc(updatedLegacyLot.id), updatedLegacyLot, { merge: true });
+      for (const lot of createdLots) {
+        transaction.set(db.collection('credit_lots').doc(lot.id), lot);
+      }
+
+      transaction.set(
+        studentRef,
+        {
+          creditLotsInitializedAt: hydrated.creditLotsInitializedAt,
+          activeCreditLotIds: nextActiveCreditLotIds,
+          creditLotSequence: nextSeq,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+
+      for (const txId of touchedEvidenceTxIds) {
+        const usage = txRunningUsage.get(txId)!;
+        const txData = txSnapshots.get(txId)!;
+        const evDocId = buildEvidenceAllocationDocId(txId);
+        const totalEvLessons = Number(
+          txData.lessonsAdded ?? txData.packageLessons ?? txData.delta ?? 0
+        );
+        const totalEvBrl = Number(
+          txData.finalPriceBrl ?? txData.revenueBrl ?? txData.packagePriceBrl ?? txData.amountBrl ?? 0
+        );
+        transaction.set(
+          db.collection('financial_evidence_allocations').doc(evDocId),
+          {
+            id: evDocId,
+            kind: 'transaction',
+            sourceTransactionId: txId,
+            studentUid: cleanStudentUid,
+            gatewayProvider: txData.gatewayProvider || null,
+            gatewayTransactionId: txData.gatewayTransactionId || null,
+            totalEvidenceLessons: totalEvLessons,
+            totalEvidenceBrlCents: toBrlCents(totalEvBrl),
+            allocatedLessons: usage.lessons,
+            allocatedTotalPaidBrlCents: usage.totalPaidBrlCents,
+            allocatedTotalPaidUsdCents: usage.totalPaidUsdCents,
+            allocatedTeacherShareBrlCents: usage.teacherShareBrlCents,
+            allocatedTeacherShareUsdCents: usage.teacherShareUsdCents,
+            allocatedPlatformRevenueBrlCents: usage.platformRevenueBrlCents,
+            allocatedPlatformRevenueUsdCents: usage.platformRevenueUsdCents,
+            lastAuditId: auditId,
+            updatedAt: nowIso,
+          },
+          { merge: true }
+        );
+      }
+
+      for (const gwKey of touchedGatewayKeys) {
+        const claim = gwClaimedTxByKey.get(gwKey)!;
+        const txData = txSnapshots.get(claim.txId)!;
+        const totalEvLessons = Number(
+          txData.lessonsAdded ?? txData.packageLessons ?? txData.delta ?? 0
+        );
+        const totalEvBrl = Number(
+          txData.finalPriceBrl ?? txData.revenueBrl ?? txData.packagePriceBrl ?? txData.amountBrl ?? 0
+        );
+        transaction.set(
+          db.collection('financial_evidence_allocations').doc(claim.docId),
+          {
+            id: claim.docId,
+            kind: 'gateway_receipt',
+            sourceTransactionId: claim.txId,
+            studentUid: cleanStudentUid,
+            gatewayProvider: txData.gatewayProvider || null,
+            gatewayTransactionId: txData.gatewayTransactionId || null,
+            totalEvidenceLessons: totalEvLessons,
+            totalEvidenceBrlCents: toBrlCents(totalEvBrl),
+            allocatedLessons: claim.lessons,
+            allocatedTotalPaidBrlCents: claim.brlCents,
+            lastAuditId: auditId,
+            updatedAt: nowIso,
+          },
+          { merge: true }
+        );
+      }
+
+      transaction.set(auditRef, auditRecord);
+
+      return {
+        isIdempotent: false,
+        studentUid: cleanStudentUid,
+        availableLessonsBefore: beforeAvailable,
+        availableLessonsAfter: beforeAvailable,
+        legacyLot: updatedLegacyLot,
+        createdLots,
+        audit: auditRecord,
+      };
+    });
+
+    return {
+      success: true,
+      statusCode: 200,
+      isIdempotent: outcome.isIdempotent,
+      studentUid: outcome.studentUid,
+      availableLessonsBefore: outcome.availableLessonsBefore,
+      availableLessonsAfter: outcome.availableLessonsAfter,
+      legacyLot: outcome.legacyLot,
+      createdLots: outcome.createdLots,
+      audit: outcome.audit,
+    };
+  } catch (err: any) {
+    if (err instanceof CreditLedgerError) {
+      return {
+        success: false,
+        statusCode: err.statusCode,
+        code: err.code,
+        error: err.message,
+      };
+    }
+
+    if (err instanceof LegacyReconciliationError) {
+      return {
+        success: false,
+        statusCode: err.statusCode,
+        code: err.code,
+        error: err.message,
+      };
+    }
+
+    const msg = String(err?.message || '');
+    const code = err?.code;
+
+    if (isPermissionError(err)) {
+      return {
+        success: false,
+        statusCode: 500,
+        code: 'FIRESTORE_INFRASTRUCTURE_ERROR',
+        error: 'Erro de permissão ao persistir conciliação administrativa no Firestore.',
+      };
+    }
+
+    const isTimeout =
+      code === 4 ||
+      code === 'deadline-exceeded' ||
+      msg.includes('DEADLINE_EXCEEDED') ||
+      msg.includes('timeout') ||
+      msg.includes('ETIMEDOUT');
+    if (isTimeout) {
+      return {
+        success: false,
+        statusCode: 504,
+        code: 'FIRESTORE_TIMEOUT',
+        error: 'Tempo limite esgotado ao persistir conciliação administrativa. Tente novamente.',
+      };
+    }
+
+    return {
+      success: false,
+      statusCode: 500,
+      code: 'FIRESTORE_TRANSACTION_FAILED',
+      error: msg || 'Falha ao processar conciliação administrativa no Firestore.',
+    };
+  }
+}
+
