@@ -22,37 +22,48 @@ const isPlaceholder = (val: string | undefined): boolean => {
 /**
  * Detects whether the current runtime is an AI Studio Preview or development environment,
  * even when running inside Google Cloud Run (which injects K_SERVICE / K_REVISION).
+ *
+ * CRITICAL DISTINCTION:
+ * - `ais-dev-*` = AI Studio Preview (Nginx listens on 8080 and proxies to Node on 3000; Vite dev middleware)
+ * - `ais-pre-*` = Published / Shared AI Studio Cloud Run (Cloud Run routes directly to PORT=8080; production static bundle)
  */
 export function isCloudRunPreviewEnvironment(): boolean {
-  if (process.env.APP_ENV === 'production') {
+  if (process.env.APP_ENV === 'production' || process.env.NODE_ENV === 'production') {
     return false;
-  }
-  if (process.env.NODE_ENV === 'development' || process.env.APP_ENV === 'development' || process.env.APP_ENV === 'preview') {
-    return true;
-  }
-  if (process.env.IS_PREVIEW === 'true' || process.env.PREVIEW === 'true') {
-    return true;
   }
 
   const kService = (process.env.K_SERVICE || '').toLowerCase();
   const kRevision = (process.env.K_REVISION || '').toLowerCase();
+  const appUrl = (process.env.APP_URL || '').toLowerCase();
+
+  if (process.env.APP_ENV === 'preview' || process.env.IS_PREVIEW === 'true' || process.env.PREVIEW === 'true') {
+    return true;
+  }
+
+  // Published / Shared AI Studio Cloud Run (`ais-pre-*`) is NEVER a Preview environment,
+  // even if APPLET_ID is present in the container environment.
+  if (kService.startsWith('ais-pre-') || kRevision.startsWith('ais-pre-') || appUrl.includes('ais-pre-')) {
+    return false;
+  }
 
   if (kService || kRevision) {
     return (
-      kService.startsWith('ais-') ||
+      kService.startsWith('ais-dev-') ||
       kService.includes('preview') ||
       kService.includes('dev') ||
-      kRevision.startsWith('ais-') ||
+      kRevision.startsWith('ais-dev-') ||
       kRevision.includes('preview') ||
       kRevision.includes('dev')
     );
   }
 
+  if (process.env.NODE_ENV === 'development' || process.env.APP_ENV === 'development') {
+    return true;
+  }
   if (Boolean(process.env.APPLET_ID)) {
     return true;
   }
-  const appUrl = (process.env.APP_URL || '').toLowerCase();
-  return appUrl.includes('ais-') || appUrl.includes('preview');
+  return appUrl.includes('ais-dev-') || appUrl.includes('preview');
 }
 
 // If --port is provided in command line arguments (e.g. npm run dev --port 3000), prioritize it

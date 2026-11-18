@@ -59,16 +59,32 @@ async function main() {
   assert.strictEqual(isProductionMode(), false, 'Caso 7 isProductionMode deve ser false');
   console.log('  ✅ PASS: Caso 7 (Cloud Run Preview ais-dev detectado como dev)');
 
-  // Caso 8: Cloud Run Preview (ais-pre) mesmo sem NODE_ENV
+  // Caso 8: Cloud Run Publicado (ais-pre) mesmo sem NODE_ENV deve ser produção e preservar PORT=8080
   delete process.env.NODE_ENV;
   process.env.K_SERVICE = 'ais-pre-4gl2mvotjfzqppuk46htpv';
   process.env.K_REVISION = 'ais-pre-4gl2mvotjfzqppuk46htpv-00001';
-  assert.strictEqual(isCloudRunPreviewEnvironment(), true, 'Caso 8 isPreview');
-  assert.strictEqual(isProductionMode(), false, 'Caso 8 isProductionMode deve ser false');
-  console.log('  ✅ PASS: Caso 8 (Cloud Run Preview ais-pre detectado como dev)');
+  process.env.APPLET_ID = '82447e17-0a01-4d71-b6f9-a8880c9fcea9';
+  process.env.PORT = '8080';
+  assert.strictEqual(isCloudRunPreviewEnvironment(), false, 'Caso 8 isPreview deve ser false para ais-pre');
+  assert.strictEqual(isProductionMode(), true, 'Caso 8 isProductionMode deve ser true para ais-pre');
+  const { resolveEffectivePort } = await import('../serverApp');
+  assert.strictEqual(resolveEffectivePort(), 8080, 'Caso 8 PORT=8080 deve ser preservado em ais-pre');
+  console.log('  ✅ PASS: Caso 8 (Cloud Run Publicado ais-pre detectado como produção e preserva PORT=8080)');
+
+  // Caso 8b: Cloud Run Preview (ais-dev) com PORT=8080 deve normalizar para 3000 (atrás do Nginx)
+  delete process.env.NODE_ENV;
+  process.env.K_SERVICE = 'ais-dev-4gl2mvotjfzqppuk46htpv';
+  process.env.K_REVISION = 'ais-dev-4gl2mvotjfzqppuk46htpv-00004-tmb';
+  process.env.PORT = '8080';
+  assert.strictEqual(isCloudRunPreviewEnvironment(), true, 'Caso 8b isPreview deve ser true para ais-dev');
+  assert.strictEqual(isProductionMode(), false, 'Caso 8b isProductionMode deve ser false para ais-dev');
+  assert.strictEqual(resolveEffectivePort(), 3000, 'Caso 8b PORT=8080 em ais-dev deve normalizar para 3000');
+  console.log('  ✅ PASS: Caso 8b (Cloud Run Preview ais-dev normaliza PORT=8080 para 3000)');
 
   // Caso 9: Cloud Run com 'preview' no nome do serviço
   delete process.env.NODE_ENV;
+  delete process.env.APPLET_ID;
+  delete process.env.PORT;
   process.env.K_SERVICE = 'my-feature-preview';
   delete process.env.K_REVISION;
   assert.strictEqual(isCloudRunPreviewEnvironment(), true, 'Caso 9 isPreview');

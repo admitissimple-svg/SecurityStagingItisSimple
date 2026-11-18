@@ -357,37 +357,48 @@ export function parsePort(val?: string | number): number | null {
 /**
  * Detects whether the current runtime is an AI Studio Preview or development environment,
  * even when running inside Google Cloud Run (which injects K_SERVICE / K_REVISION).
+ *
+ * CRITICAL DISTINCTION:
+ * - `ais-dev-*` = AI Studio Preview (Nginx listens on 8080 and proxies to Node on 3000; Vite dev middleware)
+ * - `ais-pre-*` = Published / Shared AI Studio Cloud Run (Cloud Run routes directly to PORT=8080; production static bundle)
  */
 export function isCloudRunPreviewEnvironment(): boolean {
-  if (process.env.APP_ENV === 'production') {
+  if (process.env.APP_ENV === 'production' || process.env.NODE_ENV === 'production') {
     return false;
-  }
-  if (process.env.NODE_ENV === 'development' || process.env.APP_ENV === 'development' || process.env.APP_ENV === 'preview') {
-    return true;
-  }
-  if (process.env.IS_PREVIEW === 'true' || process.env.PREVIEW === 'true') {
-    return true;
   }
 
   const kService = (process.env.K_SERVICE || '').toLowerCase();
   const kRevision = (process.env.K_REVISION || '').toLowerCase();
+  const appUrl = (process.env.APP_URL || '').toLowerCase();
+
+  if (process.env.APP_ENV === 'preview' || process.env.IS_PREVIEW === 'true' || process.env.PREVIEW === 'true') {
+    return true;
+  }
+
+  // Published / Shared AI Studio Cloud Run (`ais-pre-*`) is NEVER a Preview environment,
+  // even if APPLET_ID is present in the container environment.
+  if (kService.startsWith('ais-pre-') || kRevision.startsWith('ais-pre-') || appUrl.includes('ais-pre-')) {
+    return false;
+  }
 
   if (kService || kRevision) {
     return (
-      kService.startsWith('ais-') ||
+      kService.startsWith('ais-dev-') ||
       kService.includes('preview') ||
       kService.includes('dev') ||
-      kRevision.startsWith('ais-') ||
+      kRevision.startsWith('ais-dev-') ||
       kRevision.includes('preview') ||
       kRevision.includes('dev')
     );
   }
 
+  if (process.env.NODE_ENV === 'development' || process.env.APP_ENV === 'development') {
+    return true;
+  }
   if (Boolean(process.env.APPLET_ID)) {
     return true;
   }
-  const appUrl = (process.env.APP_URL || '').toLowerCase();
-  return appUrl.includes('ais-') || appUrl.includes('preview');
+  return appUrl.includes('ais-dev-') || appUrl.includes('preview');
 }
 
 export function parseCliPort(): number | null {
@@ -25995,17 +26006,21 @@ export async function startServer() {
       const kService = (process.env.K_SERVICE || '').toLowerCase();
       const kRevision = (process.env.K_REVISION || '').toLowerCase();
       const appUrl = (process.env.APP_URL || '').toLowerCase();
+      const isPublishedCloudRun =
+        kService.startsWith('ais-pre-') ||
+        kRevision.startsWith('ais-pre-') ||
+        appUrl.includes('ais-pre-');
       const disableHmr =
         process.env.DISABLE_HMR === 'true' ||
         process.env.APP_ENV === 'preview' ||
         process.env.IS_PREVIEW === 'true' ||
         process.env.PREVIEW === 'true' ||
-        Boolean(process.env.APPLET_ID) ||
-        kService.startsWith('ais-') ||
+        (!isPublishedCloudRun && Boolean(process.env.APPLET_ID)) ||
+        kService.startsWith('ais-dev-') ||
         kService.includes('preview') ||
-        kRevision.startsWith('ais-') ||
+        kRevision.startsWith('ais-dev-') ||
         kRevision.includes('preview') ||
-        appUrl.includes('ais-') ||
+        appUrl.includes('ais-dev-') ||
         appUrl.includes('preview');
 
       return createViteServer({
@@ -26023,10 +26038,26 @@ export async function startServer() {
           ? {
               plugins: [
                 {
-                  name: 'disable-watch-in-preview',
+                  name: 'disable-watch-and-hmr-ws-in-preview',
+                  enforce: 'post' as const,
                   config(config) {
                     if (config.server) {
+                      config.server.hmr = false;
+                      config.server.ws = false;
                       config.server.watch = null;
+                    }
+                  },
+                  transform(code, id) {
+                    if (id.includes('/client/client.mjs') || id.includes('\\client\\client.mjs')) {
+                      return code
+                        .replace(
+                          /transport\.connect\(createHMRHandler\(handleMessage\)\);/g,
+                          '/* HMR WebSocket disabled in AI Studio Preview */'
+                        )
+                        .replace(
+                          /new WebSocket\(/g,
+                          '(function(){return {readyState:3,close(){},send(){},addEventListener(){},removeEventListener(){}};})('
+                        );
                     }
                   },
                 },

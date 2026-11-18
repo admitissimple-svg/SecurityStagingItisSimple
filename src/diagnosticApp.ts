@@ -61,11 +61,37 @@ export function resolveEffectiveDiagnosticPort(): number {
   const appPort = parsePort(process.env.APP_PORT);
   if (appPort) return appPort;
 
-  const rawPort = parsePort(process.env.PORT);
-  if (rawPort && rawPort !== 8080) {
-    return rawPort;
+  // Only normalize 8080 -> 3000 inside AI Studio Preview (ais-dev-*), where Nginx owns 8080.
+  // In Cloud Run (including Dockerfile ENV PORT=8080 and ais-pre-*), preserve PORT=8080.
+  const kService = (process.env.K_SERVICE || '').toLowerCase();
+  const kRevision = (process.env.K_REVISION || '').toLowerCase();
+  const appUrl = (process.env.APP_URL || '').toLowerCase();
+  const isPublishedCloudRun =
+    kService.startsWith('ais-pre-') ||
+    kRevision.startsWith('ais-pre-') ||
+    appUrl.includes('ais-pre-');
+  const isAiStudioPreview =
+    !isPublishedCloudRun &&
+    (process.env.APP_ENV === 'preview' ||
+      process.env.IS_PREVIEW === 'true' ||
+      process.env.PREVIEW === 'true' ||
+      Boolean(process.env.APPLET_ID) ||
+      kService.startsWith('ais-dev-') ||
+      kService.includes('preview') ||
+      kRevision.startsWith('ais-dev-') ||
+      kRevision.includes('preview') ||
+      appUrl.includes('ais-dev-') ||
+      appUrl.includes('preview'));
+
+  if (isAiStudioPreview) {
+    const rawPort = parsePort(process.env.PORT);
+    if (rawPort && rawPort !== 8080) {
+      return rawPort;
+    }
+    return 3000;
   }
-  return 3000;
+
+  return resolvePort(process.env.PORT, process.env.APP_PORT, 3000);
 }
 
 export const PORT = resolveEffectiveDiagnosticPort();
