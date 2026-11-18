@@ -178,7 +178,11 @@ import {
   adjustStudentCreditsAtomicServer,
   executePackageCreditOperationAtomicServer,
   listFinancialTransactionsForAdmin,
+  fetchAdminOperationsSourceDataFromFirestore,
 } from './src/serverFirestore';
+import {
+  buildAdminOperationsDashboard,
+} from './src/utils/adminOperationsAnalytics';
 import {
   validateAdminCommissionPercent,
   validateCommissionModel,
@@ -8445,6 +8449,80 @@ app.get('/api/admin/financial-transactions', firebaseAuthMiddleware, requireAdmi
     success: true,
     count: result.transactions.length,
     transactions: result.transactions,
+  });
+});
+
+// ADM.OPS.1: Monthly Platform Operations Dashboard (strictly ADM RBAC, strictly Firestore (default))
+app.get('/api/admin/operations-dashboard', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+
+  const verifiedAdmin = req.user;
+  if (!verifiedAdmin || !verifiedAdmin.uid || verifiedAdmin.role !== 'admin') {
+    return res.status(403).json({
+      success: false,
+      error: 'Forbidden',
+      message: 'Acesso negado: privilégios de administrador obrigatórios.',
+    });
+  }
+
+  let parsedYear: number | 'all' = 'all';
+  if (typeof req.query?.year === 'string' && req.query.year.trim() !== '' && req.query.year.trim() !== 'all') {
+    const numYear = Number(req.query.year.trim());
+    if (!Number.isInteger(numYear) || numYear < 2000 || numYear > 2100) {
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_YEAR_FILTER',
+        message: 'Filtro de ano inválido.',
+      });
+    }
+    parsedYear = numYear;
+  }
+
+  let parsedMonth: number | 'all' = 'all';
+  if (typeof req.query?.month === 'string' && req.query.month.trim() !== '' && req.query.month.trim() !== 'all') {
+    const numMonth = Number(req.query.month.trim());
+    if (!Number.isInteger(numMonth) || numMonth < 1 || numMonth > 12) {
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_MONTH_FILTER',
+        message: 'Filtro de mês inválido (1 a 12).',
+      });
+    }
+    parsedMonth = numMonth;
+  }
+
+  const parsedTeacherUid =
+    typeof req.query?.teacherUid === 'string' && req.query.teacherUid.trim() !== '' && req.query.teacherUid.trim() !== 'all'
+      ? req.query.teacherUid.trim()
+      : 'all';
+
+  const source = await fetchAdminOperationsSourceDataFromFirestore();
+  if (!source.success) {
+    return res.status(source.statusCode || 503).json({
+      success: false,
+      error: source.code || 'OPERATIONS_DASHBOARD_QUERY_FAILED',
+      message: source.error || 'Falha ao consultar dados operacionais no Firestore (default).',
+    });
+  }
+
+  const dashboard = buildAdminOperationsDashboard({
+    transactions: source.transactions,
+    lessons: source.lessons,
+    tutors: source.tutors,
+    users: source.users,
+    studentAssignments: source.studentAssignments,
+    filters: {
+      year: parsedYear,
+      month: parsedMonth,
+      teacherUid: parsedTeacherUid,
+    },
+  });
+
+  return res.json({
+    success: true,
+    ...dashboard,
   });
 });
 

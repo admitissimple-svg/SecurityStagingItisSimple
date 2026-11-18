@@ -14281,7 +14281,77 @@ export async function listFinancialTransactionsForAdmin(
   }
 }
 
+/**
+ * ADM.OPS.1: Exclusively queries Firestore (default) collections for the monthly operations dashboard.
+ * Never falls back to app_db.json or synthetic records.
+ */
+export async function fetchAdminOperationsSourceDataFromFirestore(): Promise<{
+  success: boolean;
+  statusCode: number;
+  code?: string;
+  error?: string;
+  transactions: Record<string, any>[];
+  lessons: Record<string, any>[];
+  tutors: Record<string, any>[];
+  users: Record<string, any>[];
+  studentAssignments: Record<string, any>[];
+}> {
+  const db = getFirestoreDb();
+  if (!db) {
+    return {
+      success: false,
+      statusCode: 503,
+      code: 'FIRESTORE_UNAVAILABLE',
+      error: 'Firestore (default) indisponível para consulta do dashboard operacional.',
+      transactions: [],
+      lessons: [],
+      tutors: [],
+      users: [],
+      studentAssignments: [],
+    };
+  }
 
+  const snapToArray = (snap: any): Record<string, any>[] => {
+    const out: Record<string, any>[] = [];
+    if (!snap || typeof snap.forEach !== 'function') return out;
+    snap.forEach((doc: any) => {
+      const data = typeof doc.data === 'function' ? doc.data() : doc;
+      if (data && typeof data === 'object') {
+        out.push({ id: doc.id || data.id, ...data });
+      }
+    });
+    return out;
+  };
 
+  try {
+    const [txSnap, lessonsSnap, tutorsSnap, usersSnap, assignmentsSnap] = await Promise.all([
+      db.collection('financial_transactions').get(),
+      db.collection('lessons').get(),
+      db.collection('tutors').get(),
+      db.collection('users').get(),
+      db.collection('student_assignments').get(),
+    ]);
 
-
+    return {
+      success: true,
+      statusCode: 200,
+      transactions: snapToArray(txSnap),
+      lessons: snapToArray(lessonsSnap),
+      tutors: snapToArray(tutorsSnap),
+      users: snapToArray(usersSnap),
+      studentAssignments: snapToArray(assignmentsSnap),
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      statusCode: isPermissionError(err) ? 500 : 503,
+      code: 'FIRESTORE_QUERY_FAILED',
+      error: err?.message || 'Falha ao consultar registros operacionais no Firestore (default).',
+      transactions: [],
+      lessons: [],
+      tutors: [],
+      users: [],
+      studentAssignments: [],
+    };
+  }
+}

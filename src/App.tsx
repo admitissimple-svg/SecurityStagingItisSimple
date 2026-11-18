@@ -73,6 +73,7 @@ import { VideoLearningWorkspace } from './components/VideoLearningWorkspace';
 import { DailySentenceSection } from './components/DailySentenceSection';
 import { WeeklyHomeworkSection } from './components/WeeklyHomeworkSection';
 import { TeacherScheduleControlTable } from './components/TeacherScheduleControlTable';
+import { AdminOperationsDashboard } from './components/AdminOperationsDashboard';
 import { LiveMeetLessonsPanel } from './components/LiveMeetLessonsPanel';
 import { TeacherLiveLessonNotesPanel } from './components/TeacherLiveLessonNotesPanel';
 import { NativeFriendLessonInsights } from './components/NativeFriendLessonInsights';
@@ -7843,40 +7844,44 @@ export default function App() {
                   </div>
                 )}
 
-                {/* 1. Teacher Master Schedule Control */}
-                <TeacherScheduleControlTable
-                  lessons={lessons}
-                  teachers={teachersList}
-                  students={studentsList}
-                  teacherMeetSettings={teacherMeetSettings}
-                  currentAccount={currentAccount}
-                  tutorProfile={currentTutorProfile}
-                  selectedStudentFilter={selectedStudentFilter}
-                  onSelectStudentFilter={handleSelectStudentFilter}
-                  activeStudentActivity={activeStudentActivity}
-                  onSelectStudentActivity={(act) => handleToggleStudentActivity(act)}
-                  onOpenScheduleModal={() => setIsScheduleModalOpen(true)}
-                  onOpenTeacherMeetConfig={(email) => {
-                    setTeacherEmailForConfig(email);
-                    setIsMeetConfigModalOpen(true);
-                  }}
-                  onOpenEditProfile={() => setIsEditTutorProfileOpen(true)}
-                  onCompleteLesson={handleCompleteLesson}
-                  onMarkNotCompleted={(lesson) => {
-                    setActiveLessonForAction(lesson);
-                    setIsNotCompletedModalOpen(true);
-                  }}
-                  onRescheduleLesson={(lesson) => {
-                    setActiveLessonForAction(lesson);
-                    setIsRescheduleModalOpen(true);
-                  }}
-                  onCancelLesson={handleCancelLesson}
-                  onAcceptReschedule={handleAcceptReschedule}
-                  onDeclineReschedule={handleDeclineReschedule}
-                  currentLanguage="en"
-                  t={getTranslations('en')}
-                  timeZone={DEFAULT_TEACHER_TIMEZONE}
-                />
+                {/* 1. ADM.OPS.1: Platform Operations Dashboard for Admin / Teacher Master Schedule Control for Teachers */}
+                {currentAccount?.role === 'admin' ? (
+                  <AdminOperationsDashboard />
+                ) : (
+                  <TeacherScheduleControlTable
+                    lessons={lessons}
+                    teachers={teachersList}
+                    students={studentsList}
+                    teacherMeetSettings={teacherMeetSettings}
+                    currentAccount={currentAccount}
+                    tutorProfile={currentTutorProfile}
+                    selectedStudentFilter={selectedStudentFilter}
+                    onSelectStudentFilter={handleSelectStudentFilter}
+                    activeStudentActivity={activeStudentActivity}
+                    onSelectStudentActivity={(act) => handleToggleStudentActivity(act)}
+                    onOpenScheduleModal={() => setIsScheduleModalOpen(true)}
+                    onOpenTeacherMeetConfig={(email) => {
+                      setTeacherEmailForConfig(email);
+                      setIsMeetConfigModalOpen(true);
+                    }}
+                    onOpenEditProfile={() => setIsEditTutorProfileOpen(true)}
+                    onCompleteLesson={handleCompleteLesson}
+                    onMarkNotCompleted={(lesson) => {
+                      setActiveLessonForAction(lesson);
+                      setIsNotCompletedModalOpen(true);
+                    }}
+                    onRescheduleLesson={(lesson) => {
+                      setActiveLessonForAction(lesson);
+                      setIsRescheduleModalOpen(true);
+                    }}
+                    onCancelLesson={handleCancelLesson}
+                    onAcceptReschedule={handleAcceptReschedule}
+                    onDeclineReschedule={handleDeclineReschedule}
+                    currentLanguage="en"
+                    t={getTranslations('en')}
+                    timeZone={DEFAULT_TEACHER_TIMEZONE}
+                  />
+                )}
 
                 {/* Minimalist & Practical Student Workspace: Displayed when a specific student is filtered */}
                 {selectedStudentFilter && selectedStudentFilter !== 'all' ? (() => {
