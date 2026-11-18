@@ -26,6 +26,10 @@ import type {
   NativeFriendSwitchAuditRecord,
   NativeFriendSwitchPlannedPackageSummary,
   PendingLegacyStudentSummary,
+  SwitchPreviewCancelledLessonItem,
+  SwitchPreviewPackageLine,
+  SwitchPreviewResponseDto,
+  SwitchPreviewTargetPackageTableItem,
 } from './types';
 import {
   CreditLedgerError,
@@ -16707,12 +16711,229 @@ function buildSwitchAuditDocId(studentUid: string, idempotencyKey: string): stri
   return `switch_${uidPart}_${hash}`;
 }
 
+export const SWITCH_PREVIEW_TTL_MS = 10 * 60 * 1000;
+
+interface BoundSwitchPreviewPayload {
+  v: 1;
+  studentUid: string;
+  sourceTeacherUid: string;
+  targetTeacherUid: string;
+  snapshotHash: string;
+  issuedAtMs: number;
+  expiresAtMs: number;
+  availableLessonsBefore: number;
+  residualBrlCentsBefore: number;
+  lotsFingerprint: string;
+  lessonsFingerprint: string;
+  q2CancelledLessonIds: string[];
+  lockedStartedLessonsCount: number;
+  budgetBrlCents: number;
+  convertedPaidLessonsCount: number;
+  courtesyTransferredLessonsCount: number;
+  convertedTotalBrlCents: number;
+  switchResidualBrlCents: number;
+  residualBrlCentsAfter: number;
+  targetBasePriceUsd: number;
+  targetAdminCommissionPercent: number;
+  targetCommissionVersion: number;
+  targetUnitFinalPriceBrlCents: number;
+  ptaxRate: number;
+  ptaxQuoteDate: string | null;
+  ptaxPricingDate: string | null;
+}
+
+function getSwitchPreviewSigningSecret(): string {
+  const configured =
+    process.env.SWITCH_PREVIEW_SECRET ||
+    process.env.SESSION_SECRET ||
+    process.env.APP_SESSION_SECRET ||
+    '';
+  if (configured.trim()) {
+    return configured.trim();
+  }
+  const projectSeed =
+    process.env.FIREBASE_PROJECT_ID ||
+    process.env.GOOGLE_CLOUD_PROJECT ||
+    ALLOWED_STAGING_PROJECT_ID;
+  return crypto
+    .createHash('sha256')
+    .update(`nf_switch_preview_hmac_key_v1:${projectSeed}`)
+    .digest('hex');
+}
+
+function computeSwitchLotsFingerprint(existingLots: CreditLot[]): string {
+  const normalizedLots = [...existingLots]
+    .sort((a, b) => String(a.id).localeCompare(String(b.id)))
+    .map((lot) => ({
+      id: lot.id,
+      origin: lot.origin,
+      sourceType: lot.sourceType,
+      status: lot.status,
+      initialLessons: Number(lot.initialLessons || 0),
+      remainingLessons: Number(lot.remainingLessons || 0),
+      consumedLessons: Number(lot.consumedLessons || 0),
+      availableUnitIndices: Array.isArray(lot.availableUnitIndices) ? [...lot.availableUnitIndices].sort((x, y) => x - y) : null,
+      totalPaidBrlCents: lot.totalPaidBrlCents ?? null,
+      remainingTotalPaidBrlCents: lot.remainingTotalPaidBrlCents ?? null,
+      totalPaidUsdCents: lot.totalPaidUsdCents ?? null,
+      pricedTeacherUid: lot.pricedTeacherUid ?? null,
+      unitCentsScheduleLen: Array.isArray(lot.unitCentsSchedule) ? lot.unitCentsSchedule.length : 0,
+      unitCentsScheduleSum: Array.isArray(lot.unitCentsSchedule)
+        ? lot.unitCentsSchedule.reduce(
+            (s, u) => s + Number((u as any)?.totalPaidBrlCents ?? (u as any)?.paidBrlCents ?? 0),
+            0
+          )
+        : 0,
+    }));
+
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify(normalizedLots))
+    .digest('hex');
+}
+
+function computeSwitchLessonsFingerprint(studentLessons: any[]): string {
+  const normalizedLessons = [...studentLessons]
+    .sort((a, b) => String(a.id).localeCompare(String(b.id)))
+    .map((l) => ({
+      id: String(l.id || ''),
+      status: String(l.status || '').toLowerCase().trim(),
+      cancelledAt: l.cancelledAt || null,
+      startDateTime: l.startDateTime || null,
+      endDateTime: l.endDateTime || null,
+      isTrialLesson: Boolean(l.isTrialLesson),
+      creditLotId: l.creditLotId || null,
+      creditUnitIndex: typeof l.creditUnitIndex === 'number' ? l.creditUnitIndex : null,
+      creditRefunded: Boolean(l.creditRefunded),
+      teacherUid: l.teacherUid || l.teacherAuthUid || null,
+    }));
+
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify(normalizedLessons))
+    .digest('hex');
+}
+
+function buildSwitchSnapshotFingerprints(params: {
+  studentUid: string;
+  sourceTeacherUid: string;
+  targetTeacherUid: string;
+  existingLots: CreditLot[];
+  studentLessons: any[];
+  availableLessonsBefore: number;
+  residualBrlCentsBefore: number;
+  q2CancelledLessonIds: string[];
+  lockedStartedLessonsCount: number;
+  budgetBrlCents: number;
+  convertedPaidLessonsCount: number;
+  courtesyTransferredLessonsCount: number;
+  convertedTotalBrlCents: number;
+  switchResidualBrlCents: number;
+  residualBrlCentsAfter: number;
+  targetBasePriceUsd: number;
+  targetAdminCommissionPercent: number;
+  targetCommissionVersion: number;
+  targetUnitFinalPriceBrlCents: number;
+  ptaxRate: number;
+  ptaxQuoteDate: string | null;
+  ptaxPricingDate: string | null;
+}): {
+  lotsFingerprint: string;
+  lessonsFingerprint: string;
+  snapshotHash: string;
+} {
+  const lotsFingerprint = computeSwitchLotsFingerprint(params.existingLots);
+  const lessonsFingerprint = computeSwitchLessonsFingerprint(params.studentLessons);
+
+  const canonicalSnapshot = {
+    v: 1,
+    studentUid: params.studentUid,
+    sourceTeacherUid: params.sourceTeacherUid,
+    targetTeacherUid: params.targetTeacherUid,
+    availableLessonsBefore: params.availableLessonsBefore,
+    residualBrlCentsBefore: params.residualBrlCentsBefore,
+    lotsFingerprint,
+    lessonsFingerprint,
+    q2CancelledLessonIds: [...params.q2CancelledLessonIds].sort(),
+    lockedStartedLessonsCount: params.lockedStartedLessonsCount,
+    budgetBrlCents: params.budgetBrlCents,
+    convertedPaidLessonsCount: params.convertedPaidLessonsCount,
+    courtesyTransferredLessonsCount: params.courtesyTransferredLessonsCount,
+    convertedTotalBrlCents: params.convertedTotalBrlCents,
+    switchResidualBrlCents: params.switchResidualBrlCents,
+    residualBrlCentsAfter: params.residualBrlCentsAfter,
+    targetBasePriceUsd: params.targetBasePriceUsd,
+    targetAdminCommissionPercent: params.targetAdminCommissionPercent,
+    targetCommissionVersion: params.targetCommissionVersion,
+    targetUnitFinalPriceBrlCents: params.targetUnitFinalPriceBrlCents,
+    ptaxRate: params.ptaxRate,
+    ptaxQuoteDate: params.ptaxQuoteDate || null,
+    ptaxPricingDate: params.ptaxPricingDate || null,
+  };
+
+  const snapshotHash = crypto
+    .createHash('sha256')
+    .update(JSON.stringify(canonicalSnapshot))
+    .digest('hex');
+
+  return { lotsFingerprint, lessonsFingerprint, snapshotHash };
+}
+
+function signSwitchPreviewToken(payload: BoundSwitchPreviewPayload): string {
+  const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  const sig = crypto
+    .createHmac('sha256', getSwitchPreviewSigningSecret())
+    .update(payloadB64)
+    .digest('hex');
+  return `${payloadB64}.${sig}`;
+}
+
+function verifyAndDecodeSwitchPreviewToken(token: string): BoundSwitchPreviewPayload | null {
+  if (typeof token !== 'string' || !token.includes('.')) return null;
+  const parts = token.trim().split('.');
+  if (parts.length !== 2) return null;
+  const [payloadB64, sigHex] = parts;
+  if (!payloadB64 || !sigHex || !/^[a-f0-9]{64}$/i.test(sigHex)) return null;
+
+  const expectedSigHex = crypto
+    .createHmac('sha256', getSwitchPreviewSigningSecret())
+    .update(payloadB64)
+    .digest('hex');
+
+  const sigBuf = Buffer.from(sigHex, 'hex');
+  const expectedBuf = Buffer.from(expectedSigHex, 'hex');
+  if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+    if (
+      !parsed ||
+      parsed.v !== 1 ||
+      typeof parsed.studentUid !== 'string' ||
+      typeof parsed.sourceTeacherUid !== 'string' ||
+      typeof parsed.targetTeacherUid !== 'string' ||
+      typeof parsed.snapshotHash !== 'string' ||
+      typeof parsed.issuedAtMs !== 'number' ||
+      typeof parsed.expiresAtMs !== 'number'
+    ) {
+      return null;
+    }
+    return parsed as BoundSwitchPreviewPayload;
+  } catch {
+    return null;
+  }
+}
+
 export interface SwitchNativeFriendParams {
   studentAuthUid: string;
   studentEmail?: string;
   targetTeacherId: string;
   idempotencyKey: string;
   expectedCurrentTeacherUid?: string;
+  previewToken?: string;
+  previewSnapshotHash?: string;
   nowOverrideIso?: string;
   ptaxOverride?: {
     success: boolean;
@@ -16808,6 +17029,38 @@ export async function switchNativeFriendAtomicServer(
       ? params.expectedCurrentTeacherUid.trim()
       : '';
 
+  const cleanPreviewToken =
+    typeof params.previewToken === 'string' && params.previewToken.trim()
+      ? params.previewToken.trim()
+      : '';
+  const cleanPreviewSnapshotHash =
+    typeof params.previewSnapshotHash === 'string' && params.previewSnapshotHash.trim()
+      ? params.previewSnapshotHash.trim()
+      : '';
+
+  if ((cleanPreviewToken && !cleanPreviewSnapshotHash) || (!cleanPreviewToken && cleanPreviewSnapshotHash)) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'PREVIEW_BINDING_INCOMPLETE',
+      error: 'previewToken e previewSnapshotHash devem ser enviados juntos para confirmação vinculada à prévia.',
+    };
+  }
+
+  let boundPreview: BoundSwitchPreviewPayload | null = null;
+  if (cleanPreviewToken && cleanPreviewSnapshotHash) {
+    const decoded = verifyAndDecodeSwitchPreviewToken(cleanPreviewToken);
+    if (!decoded || decoded.snapshotHash !== cleanPreviewSnapshotHash || decoded.studentUid !== cleanStudentUid) {
+      return {
+        success: false,
+        statusCode: 409,
+        code: 'PREVIEW_BINDING_INVALID',
+        error: 'A prévia financeira selecionada é inválida ou foi adulterada. Atualize a prévia antes de confirmar.',
+      };
+    }
+    boundPreview = decoded;
+  }
+
   const db = getFirestoreDb();
   if (!db || isCloudWriteDisabled) {
     return {
@@ -16881,6 +17134,15 @@ export async function switchNativeFriendAtomicServer(
     };
   }
 
+  if (boundPreview && boundPreview.targetTeacherUid !== targetTeacherUid) {
+    return {
+      success: false,
+      statusCode: 409,
+      code: 'PREVIEW_TARGET_MISMATCH',
+      error: 'A prévia financeira gerada pertence a outro Amigo Nativo de destino. Atualize a prévia.',
+    };
+  }
+
   const switchAuditId = buildSwitchAuditDocId(cleanStudentUid, cleanIdempotencyKey);
   const requestFingerprint = crypto
     .createHash('sha256')
@@ -16889,6 +17151,7 @@ export async function switchNativeFriendAtomicServer(
         studentUid: cleanStudentUid,
         targetTeacherUid,
         ...(expectedCurrentTeacherUid ? { expectedCurrentTeacherUid } : {}),
+        ...(boundPreview ? { previewSnapshotHash: boundPreview.snapshotHash } : {}),
       })
     )
     .digest('hex');
@@ -17093,7 +17356,7 @@ export async function switchNativeFriendAtomicServer(
       const teacherUserSnapOffset = lessonSnapOffset + discovered.lessonIds.length;
       const teacherTutorSnapOffset = teacherUserSnapOffset + extraTeacherUids.length;
 
-      // Idempotency check inside transaction
+      // Idempotency check inside transaction (executed BEFORE preview expiry/stale checks so safe retries succeed)
       if (auditSnap.exists) {
         const existingAudit = (auditSnap.data() || {}) as NativeFriendSwitchAuditRecord;
         if (existingAudit.requestFingerprint !== requestFingerprint || existingAudit.studentUid !== cleanStudentUid) {
@@ -17111,6 +17374,15 @@ export async function switchNativeFriendAtomicServer(
           retiredSourceLots: [] as CreditLot[],
           profile: curStudent,
         };
+      }
+
+      if (boundPreview && switchNowMs > boundPreview.expiresAtMs) {
+        throw new NativeFriendSwitchError(
+          'A prévia financeira expirou antes da confirmação. Gere uma nova prévia para confirmar a troca.',
+          409,
+          'PREVIEW_EXPIRED',
+          { issuedAtMs: boundPreview.issuedAtMs, expiresAtMs: boundPreview.expiresAtMs }
+        );
       }
 
       if (!studentSnap.exists) {
@@ -17452,6 +17724,65 @@ export async function switchNativeFriendAtomicServer(
         return String(a.id).localeCompare(String(b.id));
       });
 
+      // NF.SWITCH.2E: Validate pre-Q2 boundPreview invariants BEFORE executing Q2 refund mutations
+      if (boundPreview) {
+        if (sourceTeacherUid !== boundPreview.sourceTeacherUid) {
+          throw new NativeFriendSwitchError(
+            'Seu Amigo Nativo atual mudou desde a emissão da prévia. Atualize a prévia antes de confirmar.',
+            409,
+            'CONCURRENCY_CONFLICT',
+            { expectedSourceTeacherUid: boundPreview.sourceTeacherUid, actualSourceTeacherUid: sourceTeacherUid }
+          );
+        }
+        const preLotsFp = computeSwitchLotsFingerprint(existingLots);
+        if (
+          beforeRefundAvailable !== boundPreview.availableLessonsBefore ||
+          residualBrlCentsBefore !== boundPreview.residualBrlCentsBefore ||
+          preLotsFp !== boundPreview.lotsFingerprint
+        ) {
+          throw new NativeFriendSwitchError(
+            'Seu saldo de aulas ou lotes de crédito foi alterado após a emissão da prévia. Atualize a prévia para prosseguir.',
+            409,
+            'PREVIEW_STALE_BALANCE_CHANGED'
+          );
+        }
+        const preLessonsFp = computeSwitchLessonsFingerprint(studentLessons);
+        const preQ2IdsSorted = unstartedFutureLessons.map((l) => String(l.id)).sort();
+        if (
+          preLessonsFp !== boundPreview.lessonsFingerprint ||
+          lockedStartedLessonsCount !== boundPreview.lockedStartedLessonsCount ||
+          JSON.stringify(preQ2IdsSorted) !== JSON.stringify([...boundPreview.q2CancelledLessonIds].sort())
+        ) {
+          throw new NativeFriendSwitchError(
+            'Suas aulas agendadas ou elegíveis para cancelamento Q2 foram alteradas após a prévia. Atualize a prévia para prosseguir.',
+            409,
+            'PREVIEW_STALE_LESSONS_CHANGED'
+          );
+        }
+        if (
+          targetBasePriceUsd !== boundPreview.targetBasePriceUsd ||
+          targetAdminCommissionPercent !== boundPreview.targetAdminCommissionPercent ||
+          targetCommissionVersion !== boundPreview.targetCommissionVersion
+        ) {
+          throw new NativeFriendSwitchError(
+            'A precificação do Amigo Nativo de destino foi alterada após a emissão da prévia. Atualize a prévia.',
+            409,
+            'PREVIEW_STALE_PRICE_CHANGED'
+          );
+        }
+        if (
+          ptaxResult.ptaxRate !== boundPreview.ptaxRate ||
+          (ptaxResult.quoteDate || null) !== (boundPreview.ptaxQuoteDate || null) ||
+          (ptaxResult.pricingDate || null) !== (boundPreview.ptaxPricingDate || null)
+        ) {
+          throw new NativeFriendSwitchError(
+            'A cotação oficial BACEN PTAX D-1 foi atualizada após a emissão da prévia. Atualize a prévia.',
+            409,
+            'PREVIEW_STALE_PTAX_CHANGED'
+          );
+        }
+      }
+
       // Apply Q2 full cancel & exact-lot refunds in memory (zero forfeiture for student switch)
       let workingLots = hydrated.lots.map((l) => ({ ...l }));
       let workingAvailable = beforeRefundAvailable;
@@ -17673,21 +18004,119 @@ export async function switchNativeFriendAtomicServer(
           });
         }
 
-        // Transfer courtesy credits 1:1 with zero financial value
-        if (courtesyTransferredLessonsCount > 0) {
-          nextSeq += 1;
-          createdCourtesyLot = buildSwitchedCourtesyLotData({
-            studentUid: cleanStudentUid,
-            studentEmail: cleanStudentEmail,
-            lessonsCount: courtesyTransferredLessonsCount,
-            lotSequence: nextSeq,
-            nowIso,
-            idempotencyKey: cleanIdempotencyKey,
-            switchAuditId,
-            sourceTeacherUid,
-            targetTeacherUid,
-            sourceCourtesyLotIds,
-          });
+          // Transfer courtesy credits 1:1 with zero financial value
+          if (courtesyTransferredLessonsCount > 0) {
+            nextSeq += 1;
+            createdCourtesyLot = buildSwitchedCourtesyLotData({
+              studentUid: cleanStudentUid,
+              studentEmail: cleanStudentEmail,
+              lessonsCount: courtesyTransferredLessonsCount,
+              lotSequence: nextSeq,
+              nowIso,
+              idempotencyKey: cleanIdempotencyKey,
+              switchAuditId,
+              sourceTeacherUid,
+              targetTeacherUid,
+              sourceCourtesyLotIds,
+            });
+          }
+        }
+
+      // Compute target quote unit BRL cents cleanly even when workingAvailable === 0 for snapshot binding
+      const liveTargetQuote = calculateFinancialPricingQuote({
+        basePriceUsd: targetBasePriceUsd,
+        adminCommissionPercent: targetAdminCommissionPercent,
+        ptaxRate: ptaxResult.ptaxRate,
+        commissionModel: ALLOWED_COMMISSION_MODEL,
+        conversionBase: 'UNIT_PRICE_BRL',
+      });
+      const liveTargetUnitFinalPriceBrlCents = toBrlCents(liveTargetQuote.unit.finalPriceBrl);
+      const q2CancelledLessonIdsSorted = unstartedFutureLessons.map((l) => String(l.id)).sort();
+      const liveResidualBrlCentsAfter = residualBrlCentsBefore + switchResidualBrlCents;
+      const liveFingerprints = buildSwitchSnapshotFingerprints({
+        studentUid: cleanStudentUid,
+        sourceTeacherUid,
+        targetTeacherUid,
+        existingLots,
+        studentLessons,
+        availableLessonsBefore: beforeRefundAvailable,
+        residualBrlCentsBefore,
+        q2CancelledLessonIds: q2CancelledLessonIdsSorted,
+        lockedStartedLessonsCount,
+        budgetBrlCents,
+        convertedPaidLessonsCount,
+        courtesyTransferredLessonsCount,
+        convertedTotalBrlCents,
+        switchResidualBrlCents,
+        residualBrlCentsAfter: liveResidualBrlCentsAfter,
+        targetBasePriceUsd,
+        targetAdminCommissionPercent,
+        targetCommissionVersion,
+        targetUnitFinalPriceBrlCents: liveTargetUnitFinalPriceBrlCents,
+        ptaxRate: ptaxResult.ptaxRate,
+        ptaxQuoteDate: ptaxResult.quoteDate || null,
+        ptaxPricingDate: ptaxResult.pricingDate || null,
+      });
+
+      if (boundPreview) {
+        if (sourceTeacherUid !== boundPreview.sourceTeacherUid) {
+          throw new NativeFriendSwitchError(
+            'Seu Amigo Nativo atual mudou desde a emissão da prévia. Atualize a prévia antes de confirmar.',
+            409,
+            'CONCURRENCY_CONFLICT',
+            { expectedSourceTeacherUid: boundPreview.sourceTeacherUid, actualSourceTeacherUid: sourceTeacherUid }
+          );
+        }
+        if (
+          beforeRefundAvailable !== boundPreview.availableLessonsBefore ||
+          residualBrlCentsBefore !== boundPreview.residualBrlCentsBefore ||
+          liveFingerprints.lotsFingerprint !== boundPreview.lotsFingerprint
+        ) {
+          throw new NativeFriendSwitchError(
+            'Seu saldo de aulas ou lotes de crédito foi alterado após a emissão da prévia. Atualize a prévia para prosseguir.',
+            409,
+            'PREVIEW_STALE_BALANCE_CHANGED'
+          );
+        }
+        if (
+          liveFingerprints.lessonsFingerprint !== boundPreview.lessonsFingerprint ||
+          lockedStartedLessonsCount !== boundPreview.lockedStartedLessonsCount ||
+          JSON.stringify(q2CancelledLessonIdsSorted) !== JSON.stringify([...boundPreview.q2CancelledLessonIds].sort())
+        ) {
+          throw new NativeFriendSwitchError(
+            'Suas aulas agendadas ou elegíveis para cancelamento Q2 foram alteradas após a prévia. Atualize a prévia para prosseguir.',
+            409,
+            'PREVIEW_STALE_LESSONS_CHANGED'
+          );
+        }
+        if (
+          targetBasePriceUsd !== boundPreview.targetBasePriceUsd ||
+          targetAdminCommissionPercent !== boundPreview.targetAdminCommissionPercent ||
+          targetCommissionVersion !== boundPreview.targetCommissionVersion
+        ) {
+          throw new NativeFriendSwitchError(
+            'A precificação do Amigo Nativo de destino foi alterada após a emissão da prévia. Atualize a prévia.',
+            409,
+            'PREVIEW_STALE_PRICE_CHANGED'
+          );
+        }
+        if (
+          ptaxResult.ptaxRate !== boundPreview.ptaxRate ||
+          (ptaxResult.quoteDate || null) !== (boundPreview.ptaxQuoteDate || null) ||
+          (ptaxResult.pricingDate || null) !== (boundPreview.ptaxPricingDate || null)
+        ) {
+          throw new NativeFriendSwitchError(
+            'A cotação oficial BACEN PTAX D-1 foi atualizada após a emissão da prévia. Atualize a prévia.',
+            409,
+            'PREVIEW_STALE_PTAX_CHANGED'
+          );
+        }
+        if (liveFingerprints.snapshotHash !== boundPreview.snapshotHash) {
+          throw new NativeFriendSwitchError(
+            'Os valores da conversão mudaram em relação à prévia confirmada. Atualize a prévia antes de confirmar.',
+            409,
+            'PREVIEW_STALE_CONVERSION_CHANGED'
+          );
         }
       }
 
@@ -17820,6 +18249,7 @@ export async function switchNativeFriendAtomicServer(
         id: switchAuditId,
         idempotencyKey: cleanIdempotencyKey,
         requestFingerprint,
+        previewSnapshotHash: boundPreview ? boundPreview.snapshotHash : null,
         studentUid: cleanStudentUid,
         studentEmail: cleanStudentEmail,
         studentName: cleanStudentName,
@@ -18051,5 +18481,978 @@ export async function switchNativeFriendAtomicServer(
     };
   }
 }
+
+export interface PreviewNativeFriendSwitchParams {
+  studentAuthUid: string;
+  studentEmail?: string;
+  targetTeacherId: string;
+  expectedCurrentTeacherUid?: string;
+  nowOverrideIso?: string;
+  ptaxOverride?: {
+    success: boolean;
+    ptaxRate: number;
+    quoteDate?: string;
+    pricingDate?: string;
+    source?: string;
+  };
+  rawPayload?: Record<string, any>;
+  dbState?: any;
+}
+
+export interface PreviewNativeFriendSwitchResult {
+  success: boolean;
+  statusCode: number;
+  code?: string;
+  error?: string;
+  details?: Record<string, any>;
+  preview?: SwitchPreviewResponseDto;
+}
+
+/**
+ * NF.SWITCH.2E — Prévia 100% read-only e vinculada criptograficamente (HMAC + SHA-256 snapshotHash)
+ * da troca de Native Friend. Reutiliza o motor 2C e as regras Q1/Q2/Q3 exclusivamente no servidor.
+ * Zero escritas no Firestore e zero exposição de comissão/receita da plataforma ao estudante.
+ */
+export async function previewNativeFriendSwitchServer(
+  params: PreviewNativeFriendSwitchParams
+): Promise<PreviewNativeFriendSwitchResult> {
+  const cleanStudentUid = String(params.studentAuthUid || '').trim();
+  if (!cleanStudentUid || !isValidCanonicalUid(cleanStudentUid)) {
+    return {
+      success: false,
+      statusCode: 401,
+      code: 'UNAUTHORIZED',
+      error: 'Autenticação de estudante com UID canônico válido é obrigatória.',
+    };
+  }
+
+  const forbiddenKey = hasForbiddenSwitchOverrideKey(params.rawPayload);
+  if (forbiddenKey) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'CLIENT_SWITCH_OVERRIDE_FORBIDDEN',
+      error: `Campo financeiro/comercial não permitido na requisição (${forbiddenKey}). Todos os cálculos são exclusivos do servidor.`,
+    };
+  }
+
+  const cleanTargetTeacherInput = String(params.targetTeacherId || '').trim();
+  if (!cleanTargetTeacherInput) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'TARGET_TEACHER_REQUIRED',
+      error: 'Identificador do Amigo Nativo de destino é obrigatório.',
+    };
+  }
+
+  const db = getFirestoreDb();
+  if (!db) {
+    return {
+      success: false,
+      statusCode: 503,
+      code: 'FIRESTORE_UNAVAILABLE',
+      error: 'Serviço de persistência Firestore (default) indisponível.',
+    };
+  }
+
+  // 1. Resolve target teacher canonical identity (supports uid, publicTutorId, or email)
+  const isTargetUid = isValidCanonicalUid(cleanTargetTeacherInput);
+  const isTargetEmail = cleanTargetTeacherInput.includes('@');
+  const targetTeacherIdentity = await resolveTeacherCanonicalIdentity({
+    teacherId: cleanTargetTeacherInput,
+    teacherUid: isTargetUid ? cleanTargetTeacherInput : undefined,
+    teacherEmail: isTargetEmail ? cleanTargetTeacherInput.toLowerCase() : undefined,
+    publicTutorId: !isTargetUid && !isTargetEmail ? cleanTargetTeacherInput : undefined,
+    dbState: params.dbState,
+  });
+
+  if (!targetTeacherIdentity) {
+    if (isTargetUid) {
+      const [uDoc, tDoc] = await Promise.all([
+        fetchUserDocumentFromFirestore(cleanTargetTeacherInput).catch(() => null),
+        fetchTutorDocumentFromFirestore(cleanTargetTeacherInput).catch(() => null),
+      ]);
+      if (uDoc && String(uDoc.role || '').toLowerCase().trim() === 'student') {
+        return {
+          success: false,
+          statusCode: 403,
+          code: 'TUTOR_NOT_APPROVED',
+          error: 'O identificador de destino não pertence a um Amigo Nativo aprovado.',
+        };
+      }
+      const rawDoc = tDoc || uDoc;
+      if (rawDoc && rawDoc.deleted !== true && !(rawDoc.approvalStatus === 'approved' && rawDoc.isApproved === true)) {
+        return {
+          success: false,
+          statusCode: 403,
+          code: 'TUTOR_NOT_APPROVED',
+          error: 'O Amigo Nativo de destino ainda não está aprovado para comercialização.',
+        };
+      }
+    }
+    return {
+      success: false,
+      statusCode: 404,
+      code: 'TUTOR_NOT_FOUND',
+      error: 'Amigo Nativo de destino não encontrado no sistema.',
+    };
+  }
+
+  const targetTeacherUid = targetTeacherIdentity.canonicalUid;
+  if (!targetTeacherUid || !isValidCanonicalUid(targetTeacherUid)) {
+    return {
+      success: false,
+      statusCode: 409,
+      code: 'TUTOR_CANONICAL_IDENTITY_REQUIRED',
+      error: 'Cadastro do Amigo Nativo de destino sem UID canônico válido.',
+    };
+  }
+
+  if (targetTeacherUid === cleanStudentUid) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'SELF_SWITCH_FORBIDDEN',
+      error: 'Não é possível trocar para a sua própria conta.',
+    };
+  }
+
+  // 2. Fetch official BACEN PTAX D-1 (zero fallback)
+  let ptaxResult: any = params.ptaxOverride;
+  if (!ptaxResult) {
+    try {
+      const ptaxModule = await import('./serverPtax');
+      ptaxResult = await ptaxModule.getPtaxClosingD1();
+    } catch {
+      ptaxResult = null;
+    }
+  }
+
+  if (
+    !ptaxResult?.success ||
+    typeof ptaxResult.ptaxRate !== 'number' ||
+    !Number.isFinite(ptaxResult.ptaxRate) ||
+    ptaxResult.ptaxRate <= 0
+  ) {
+    return {
+      success: false,
+      statusCode: 503,
+      code: 'PTAX_UNAVAILABLE',
+      error: ptaxResult?.details || 'Cotação oficial PTAX D-1 indisponível no momento. Prévia recusada sem fallback.',
+    };
+  }
+
+  const nowIso =
+    typeof params.nowOverrideIso === 'string' && !Number.isNaN(Date.parse(params.nowOverrideIso))
+      ? new Date(params.nowOverrideIso).toISOString()
+      : new Date().toISOString();
+  const previewNowMs = Date.parse(nowIso);
+  const cleanCallerEmail = (params.studentEmail || '').toLowerCase().trim();
+
+  try {
+    // Pure read-only discovery (0 writes)
+    const lotIds = new Set<string>();
+    const lessonIds = new Set<string>();
+    const lessonTeacherUids = new Set<string>();
+
+    const lotsCol = db.collection('credit_lots');
+    if (typeof (lotsCol as any).where === 'function') {
+      const lSnap = await lotsCol.where('studentUid', '==', cleanStudentUid).get().catch(() => null);
+      lSnap?.forEach?.((d: any) => {
+        if (d?.id) lotIds.add(String(d.id).trim());
+      });
+    }
+
+    const lessonsCol = db.collection('lessons');
+    if (typeof (lessonsCol as any).where === 'function') {
+      const [byUidSnap, byEmailSnap] = await Promise.all([
+        lessonsCol.where('studentUid', '==', cleanStudentUid).get().catch(() => null),
+        cleanCallerEmail ? lessonsCol.where('studentEmail', '==', cleanCallerEmail).get().catch(() => null) : Promise.resolve(null),
+      ]);
+      const collectLessonDoc = (d: any) => {
+        if (!d?.id) return;
+        const data = typeof d.data === 'function' ? (d.data() || {}) : {};
+        if (data.studentUid && data.studentUid !== cleanStudentUid) return;
+        lessonIds.add(String(d.id).trim());
+        const tUids = [data.teacherUid, data.teacherAuthUid, data.tutorUid].filter(
+          (v): v is string => typeof v === 'string' && v.trim() !== ''
+        );
+        for (const t of tUids) lessonTeacherUids.add(t.trim());
+        if (typeof data.creditLotId === 'string' && data.creditLotId.trim()) {
+          lotIds.add(data.creditLotId.trim());
+        }
+      };
+      byUidSnap?.forEach?.(collectLessonDoc);
+      byEmailSnap?.forEach?.(collectLessonDoc);
+    }
+
+    const studentRef = db.collection('users').doc(cleanStudentUid);
+    const assignmentRef = db.collection('student_assignments').doc(cleanStudentUid);
+    const targetTutorRef = db.collection('tutors').doc(targetTeacherUid);
+    const targetTutorUserRef = db.collection('users').doc(targetTeacherUid);
+
+    const [studentSnap, assignmentSnap, targetTutorSnap, targetTutorUserSnap] = await Promise.all([
+      studentRef.get(),
+      assignmentRef.get(),
+      targetTutorRef.get(),
+      targetTutorUserRef.get(),
+    ]);
+
+    if (!studentSnap.exists) {
+      return {
+        success: false,
+        statusCode: 404,
+        code: 'STUDENT_NOT_FOUND',
+        error: 'Registro do aluno não encontrado no Firestore.',
+      };
+    }
+
+    const studentData = studentSnap.data() || {};
+    if (studentData.deleted === true) {
+      return {
+        success: false,
+        statusCode: 404,
+        code: 'STUDENT_NOT_FOUND',
+        error: 'Conta do aluno encontra-se desativada ou excluída.',
+      };
+    }
+
+    const studentRole = String(studentData.role || 'student').toLowerCase().trim();
+    if (studentRole !== 'student' && studentRole !== '') {
+      return {
+        success: false,
+        statusCode: 403,
+        code: 'FORBIDDEN_ROLE',
+        error: 'Apenas contas de estudantes podem gerar prévia de troca de Amigo Nativo.',
+      };
+    }
+
+    if (Array.isArray(studentData.activeCreditLotIds)) {
+      for (const id of studentData.activeCreditLotIds) {
+        if (typeof id === 'string' && id.trim()) lotIds.add(id.trim());
+      }
+    }
+    if (typeof studentData.lastScheduledLessonId === 'string' && studentData.lastScheduledLessonId.trim()) {
+      lessonIds.add(studentData.lastScheduledLessonId.trim());
+    }
+    if (Array.isArray(studentData.scheduledLessons)) {
+      for (const sl of studentData.scheduledLessons) {
+        if (sl && typeof sl.id === 'string' && sl.id.trim()) {
+          lessonIds.add(sl.id.trim());
+        }
+      }
+    }
+    const sTeacherHint = [studentData.teacherUid, studentData.assignedNativeFriendUID, studentData.nativeFriendUID].find(
+      (v) => typeof v === 'string' && isValidCanonicalUid(v)
+    );
+    if (typeof sTeacherHint === 'string' && sTeacherHint.trim()) {
+      lessonTeacherUids.add(sTeacherHint.trim());
+    }
+
+    const sortedLotIds = Array.from(lotIds).sort();
+    const sortedLessonIds = Array.from(lessonIds).sort();
+
+    if (sortedLotIds.length > SWITCH_MAX_CREDIT_LOTS) {
+      return {
+        success: false,
+        statusCode: 422,
+        code: 'SWITCH_TRANSACTION_LIMIT_EXCEEDED',
+        error: `Limite conservador de lotes por transação excedido (${sortedLotIds.length} > ${SWITCH_MAX_CREDIT_LOTS}). Contate o suporte.`,
+        details: { lotsCount: sortedLotIds.length, limit: SWITCH_MAX_CREDIT_LOTS },
+      };
+    }
+    if (sortedLessonIds.length > SWITCH_MAX_STUDENT_LESSONS) {
+      return {
+        success: false,
+        statusCode: 422,
+        code: 'SWITCH_TRANSACTION_LIMIT_EXCEEDED',
+        error: `Limite conservador de aulas por transação excedido (${sortedLessonIds.length} > ${SWITCH_MAX_STUDENT_LESSONS}). Contate o suporte.`,
+        details: { lessonsCount: sortedLessonIds.length, limit: SWITCH_MAX_STUDENT_LESSONS },
+      };
+    }
+
+    const cleanStudentEmail = String(studentData.email || cleanCallerEmail || '').toLowerCase().trim();
+    const assignmentData = assignmentSnap.exists ? (assignmentSnap.data() || {}) : null;
+
+    const studentLinkCandidates = [
+      studentData.teacherUid,
+      studentData.assignedNativeFriendUID,
+      studentData.nativeFriendUID,
+    ]
+      .filter((v): v is string => typeof v === 'string' && v.trim() !== '')
+      .map((v) => v.trim());
+    const assignLinkCandidates = assignmentData
+      ? [
+          assignmentData.teacherUid,
+          assignmentData.assignedNativeFriendUID,
+          assignmentData.nativeFriendUID,
+        ]
+          .filter((v): v is string => typeof v === 'string' && v.trim() !== '')
+          .map((v) => v.trim())
+      : [];
+
+    const uniqueStudentLinks = Array.from(new Set(studentLinkCandidates));
+    const uniqueAssignLinks = Array.from(new Set(assignLinkCandidates));
+
+    if (uniqueStudentLinks.length > 1 || uniqueAssignLinks.length > 1) {
+      return {
+        success: false,
+        statusCode: 409,
+        code: 'STUDENT_TEACHER_LINK_CONFLICT',
+        error: 'Inconsistência detectada nos identificadores de vínculo do aluno.',
+      };
+    }
+
+    const studentLinkedUid = uniqueStudentLinks[0] || '';
+    const assignLinkedUid = uniqueAssignLinks[0] || '';
+    if (studentLinkedUid && assignLinkedUid && studentLinkedUid !== assignLinkedUid) {
+      return {
+        success: false,
+        statusCode: 409,
+        code: 'STUDENT_TEACHER_LINK_CONFLICT',
+        error: 'Divergência entre vínculo do perfil e student_assignments detectada.',
+        details: { studentLinkedUid, assignLinkedUid },
+      };
+    }
+
+    const sourceTeacherUid = studentLinkedUid || assignLinkedUid;
+    if (!sourceTeacherUid || studentData.enrollmentStatus === 'cancelled') {
+      return {
+        success: false,
+        statusCode: 409,
+        code: 'NO_ACTIVE_NATIVE_FRIEND_LINK',
+        error: 'O aluno não possui um vínculo ativo com um Amigo Nativo para realizar troca.',
+      };
+    }
+
+    if (params.expectedCurrentTeacherUid && params.expectedCurrentTeacherUid.trim() !== sourceTeacherUid) {
+      return {
+        success: false,
+        statusCode: 409,
+        code: 'CONCURRENCY_CONFLICT',
+        error: 'O Amigo Nativo atual foi alterado por outra operação.',
+      };
+    }
+
+    if (sourceTeacherUid === targetTeacherUid) {
+      return {
+        success: false,
+        statusCode: 400,
+        code: 'SAME_TEACHER_SWITCH_FORBIDDEN',
+        error: 'O Amigo Nativo de destino já é o seu Amigo Nativo atual.',
+      };
+    }
+
+    // Read source teacher, lots, and lessons
+    const [sourceTeacherUserSnap, sourceTeacherTutorSnap, ...entitySnaps] = await Promise.all([
+      db.collection('users').doc(sourceTeacherUid).get(),
+      db.collection('tutors').doc(sourceTeacherUid).get(),
+      ...sortedLotIds.map((id) => db.collection('credit_lots').doc(id).get()),
+      ...sortedLessonIds.map((id) => db.collection('lessons').doc(id).get()),
+    ]);
+
+    const sourceTeacherUserDoc = sourceTeacherUserSnap.exists ? (sourceTeacherUserSnap.data() || {}) : null;
+    const sourceTeacherTutorDoc = sourceTeacherTutorSnap.exists ? (sourceTeacherTutorSnap.data() || {}) : null;
+    const sourceTeacherDoc = sourceTeacherTutorDoc || sourceTeacherUserDoc;
+    if (!sourceTeacherDoc) {
+      return {
+        success: false,
+        statusCode: 404,
+        code: 'SOURCE_TEACHER_NOT_FOUND',
+        error: 'Registro do Amigo Nativo atual não encontrado para prévia da troca.',
+      };
+    }
+    if (sourceTeacherUserDoc && String(sourceTeacherUserDoc.role || '').toLowerCase().trim() === 'student') {
+      return {
+        success: false,
+        statusCode: 409,
+        code: 'SOURCE_TEACHER_INVALID',
+        error: 'Vínculo de origem inválido: identificador atual não pertence a um professor.',
+      };
+    }
+
+    // Validate target teacher commercial eligibility
+    const fsTargetTutor: Record<string, any> | null = targetTutorSnap.exists
+      ? { id: targetTutorSnap.id, ...(targetTutorSnap.data() || {}) }
+      : null;
+    const fsTargetUser: Record<string, any> | null = targetTutorUserSnap.exists
+      ? { id: targetTutorUserSnap.id, ...(targetTutorUserSnap.data() || {}) }
+      : null;
+
+    if (fsTargetUser && String(fsTargetUser.role || '').toLowerCase().trim() === 'student') {
+      return {
+        success: false,
+        statusCode: 403,
+        code: 'TUTOR_NOT_APPROVED',
+        error: 'O identificador de destino pertence a uma conta de estudante, não a um Amigo Nativo aprovado.',
+      };
+    }
+
+    let authoritativeTarget = mergeFresherTutorPricingRecord(fsTargetUser, fsTargetTutor);
+    if (!authoritativeTarget) {
+      authoritativeTarget = targetTeacherIdentity.rawDoc || {
+        uid: targetTeacherUid,
+        email: targetTeacherIdentity.email,
+        name: targetTeacherIdentity.name,
+        isApproved: targetTeacherIdentity.isApproved,
+        approvalStatus: targetTeacherIdentity.isApproved ? 'approved' : 'pending',
+      };
+    }
+
+    if (authoritativeTarget.deleted === true) {
+      return {
+        success: false,
+        statusCode: 404,
+        code: 'TUTOR_NOT_FOUND',
+        error: 'Amigo Nativo de destino foi excluído ou desativado.',
+      };
+    }
+
+    const isTargetApproved =
+      authoritativeTarget.approvalStatus === 'approved' && authoritativeTarget.isApproved === true;
+    if (!isTargetApproved) {
+      return {
+        success: false,
+        statusCode: 403,
+        code: 'TUTOR_NOT_APPROVED',
+        error: 'Este Amigo Nativo de destino não está aprovado para comercialização.',
+      };
+    }
+
+    const targetBasePriceUsd = extractValidBasePriceUsdServer(authoritativeTarget);
+    if (targetBasePriceUsd === null) {
+      return {
+        success: false,
+        statusCode: 422,
+        code: 'TUTOR_BASE_PRICE_UNAVAILABLE',
+        error: 'O preço-base em USD do Amigo Nativo de destino não está configurado.',
+      };
+    }
+
+    if (!hasValidPersistedCommission(authoritativeTarget) || !isTutorCommercializable(authoritativeTarget)) {
+      return {
+        success: false,
+        statusCode: 422,
+        code: 'TUTOR_COMMISSION_NOT_CONFIGURED',
+        error: 'A comissão administrativa do Amigo Nativo de destino não está configurada para comercialização.',
+      };
+    }
+
+    const targetAdminCommissionPercent = Number(authoritativeTarget.adminCommissionPercent);
+    const targetCommissionVersion =
+      typeof authoritativeTarget.commissionVersion === 'number' &&
+      Number.isInteger(authoritativeTarget.commissionVersion)
+        ? authoritativeTarget.commissionVersion
+        : 1;
+    const targetTeacherEmail =
+      String(authoritativeTarget.email || targetTeacherIdentity.email || '')
+        .toLowerCase()
+        .trim() || null;
+    const targetTeacherName = String(
+      authoritativeTarget.name ||
+        targetTeacherIdentity.name ||
+        (targetTeacherEmail ? targetTeacherEmail.split('@')[0] : 'Native Friend')
+    ).trim();
+    const targetPublicTutorId =
+      String(authoritativeTarget.publicTutorId || targetTeacherIdentity.publicTutorId || targetTeacherUid);
+
+    if (
+      typeof studentData.availableLessons !== 'number' ||
+      !Number.isFinite(studentData.availableLessons) ||
+      !Number.isInteger(studentData.availableLessons) ||
+      studentData.availableLessons < 0
+    ) {
+      return {
+        success: false,
+        statusCode: 409,
+        code: CREDIT_LEDGER_DIVERGENCE_CODE,
+        error: `Divergência no saldo do aluno (${CREDIT_LEDGER_DIVERGENCE_CODE}): availableLessons inválido (${studentData.availableLessons}).`,
+      };
+    }
+
+    let residualBrlCentsBefore = 0;
+    if (studentData.residualBrlCents !== undefined && studentData.residualBrlCents !== null) {
+      if (
+        typeof studentData.residualBrlCents !== 'number' ||
+        !Number.isInteger(studentData.residualBrlCents) ||
+        studentData.residualBrlCents < 0
+      ) {
+        return {
+          success: false,
+          statusCode: 409,
+          code: 'RESIDUAL_LEDGER_CORRUPTED',
+          error: 'Saldo de resíduo financeiro (residualBrlCents) corrompido no documento do aluno.',
+        };
+      }
+      residualBrlCentsBefore = studentData.residualBrlCents;
+    }
+
+    const existingLots: CreditLot[] = [];
+    for (let i = 0; i < sortedLotIds.length; i++) {
+      const snap = entitySnaps[i];
+      if (snap && snap.exists) {
+        existingLots.push({ ...(snap.data() || {}), id: snap.id || sortedLotIds[i] } as CreditLot);
+      }
+    }
+
+    const beforeRefundAvailable = studentData.availableLessons;
+    const hydrated = reconcileStudentCreditLedger({
+      studentUid: cleanStudentUid,
+      studentEmail: cleanStudentEmail,
+      studentData,
+      existingLots,
+      beforeAvailable: beforeRefundAvailable,
+      nowIso,
+    });
+
+    const studentLessons: any[] = [];
+    for (let i = 0; i < sortedLessonIds.length; i++) {
+      const snap = entitySnaps[sortedLotIds.length + i];
+      if (!snap || !snap.exists) continue;
+      const lData = snap.data() || {};
+      const belongsToStudent =
+        lData.studentUid === cleanStudentUid ||
+        (!lData.studentUid &&
+          cleanStudentEmail &&
+          String(lData.studentEmail || '').toLowerCase().trim() === cleanStudentEmail);
+      if (belongsToStudent) {
+        studentLessons.push({ ...lData, id: snap.id || sortedLessonIds[i] });
+      }
+    }
+
+    // Partition lessons per Q2
+    const unstartedFutureLessons: any[] = [];
+    let lockedStartedLessonsCount = 0;
+    for (const lesson of studentLessons) {
+      const lStatus = String(lesson.status || '').toLowerCase();
+      const isCancelled = lStatus === 'cancelled' || lStatus === 'canceled' || Boolean(lesson.cancelledAt);
+      if (isCancelled || lStatus === 'completed' || lStatus === 'not_completed') {
+        continue;
+      }
+      if (lStatus !== 'scheduled' && lStatus !== 'confirmed') {
+        continue;
+      }
+      const startMs = Date.parse(String(lesson.startDateTime || ''));
+      if (!Number.isFinite(startMs)) {
+        return {
+          success: false,
+          statusCode: 409,
+          code: 'INVALID_LESSON_SCHEDULE_TIMESTAMP',
+          error: `Aula '${lesson.id}' possui data/hora de início inválida para classificação Q2.`,
+        };
+      }
+      if (startMs > previewNowMs) {
+        unstartedFutureLessons.push(lesson);
+      } else {
+        lockedStartedLessonsCount += 1;
+      }
+    }
+
+    unstartedFutureLessons.sort((a, b) => {
+      const ta = Date.parse(String(a.startDateTime || ''));
+      const tb = Date.parse(String(b.startDateTime || ''));
+      if (ta !== tb) return ta - tb;
+      return String(a.id).localeCompare(String(b.id));
+    });
+
+    // Simulate Q2 full cancel & exact-lot refunds purely in memory
+    let workingLots = hydrated.lots.map((l) => ({ ...l }));
+    let workingAvailable = beforeRefundAvailable;
+    let nextSeq = hydrated.nextLotSequence;
+    const simulatedUpdatesByLessonId = new Map<string, any>();
+    const cancelledLessonItems: SwitchPreviewCancelledLessonItem[] = [];
+    let q2RefundedCreditsCount = 0;
+    let q2CancelledTrialLessonsCount = 0;
+
+    for (const lesson of unstartedFutureLessons) {
+      const isTrial = Boolean(lesson.isTrialLesson);
+      if (isTrial) {
+        q2CancelledTrialLessonsCount += 1;
+        cancelledLessonItems.push({
+          id: String(lesson.id),
+          startDateTime: String(lesson.startDateTime || ''),
+          endDateTime: lesson.endDateTime ? String(lesson.endDateTime) : null,
+          isTrialLesson: true,
+          creditOrigin: null,
+          creditRefundedToLot: false,
+        });
+        simulatedUpdatesByLessonId.set(lesson.id, {
+          ...lesson,
+          status: 'cancelled',
+          cancelledAt: nowIso,
+          cancelledBy: 'student',
+          creditRefunded: false,
+        });
+      } else {
+        if (lesson.creditRefunded === true) {
+          return {
+            success: false,
+            statusCode: 409,
+            code: 'DOUBLE_REFUND_PREVENTED',
+            error: `Aula '${lesson.id}' já possui marcação de crédito estornado.`,
+          };
+        }
+        const refundRes = refundUnitToExactLot({
+          studentUid: cleanStudentUid,
+          studentEmail: cleanStudentEmail,
+          lots: workingLots,
+          targetLotId: typeof lesson.creditLotId === 'string' ? lesson.creditLotId : null,
+          targetUnitIndex:
+            typeof lesson.creditUnitIndex === 'number' && Number.isInteger(lesson.creditUnitIndex)
+              ? lesson.creditUnitIndex
+              : null,
+          wasFirstInitialization: hydrated.wasFirstInitialization,
+          nextLotSequence: nextSeq,
+          nowIso,
+        });
+
+        workingLots = refundRes.lots;
+        nextSeq = refundRes.nextLotSequence;
+        workingAvailable += 1;
+        q2RefundedCreditsCount += 1;
+
+        cancelledLessonItems.push({
+          id: String(lesson.id),
+          startDateTime: String(lesson.startDateTime || ''),
+          endDateTime: lesson.endDateTime ? String(lesson.endDateTime) : null,
+          isTrialLesson: false,
+          creditOrigin: refundRes.refundedLot.origin,
+          creditRefundedToLot: true,
+        });
+        simulatedUpdatesByLessonId.set(lesson.id, {
+          ...lesson,
+          status: 'cancelled',
+          cancelledAt: nowIso,
+          cancelledBy: 'student',
+          creditRefunded: true,
+          refundedCreditLotId: refundRes.refundedLot.id,
+          refundedCreditOrigin: refundRes.refundedLot.origin,
+          refundedCreditUnitIndex: refundRes.refundedUnitIndex,
+        });
+      }
+    }
+
+    const postCancelLessons = studentLessons.map((l) => simulatedUpdatesByLessonId.get(l.id) || l);
+    const remainingLegacyUnits = workingLots
+      .filter((l) => l.origin === 'legacy_unreconciled')
+      .reduce((sum, l) => sum + Number(l.remainingLessons || 0), 0);
+
+    // Always compute authoritative FIN.2C target quote in BRL (strictly stripped of commission/teacherShare/platformRevenue)
+    const targetQuote = calculateFinancialPricingQuote({
+      basePriceUsd: targetBasePriceUsd,
+      adminCommissionPercent: targetAdminCommissionPercent,
+      ptaxRate: ptaxResult.ptaxRate,
+      commissionModel: ALLOWED_COMMISSION_MODEL,
+      conversionBase: 'UNIT_PRICE_BRL',
+    });
+
+    const targetUnitFinalPriceBrlCents = toBrlCents(targetQuote.unit.finalPriceBrl);
+    const targetPackagesTable: SwitchPreviewTargetPackageTableItem[] = targetQuote.packages.list.map((pkg) => ({
+      lessonsCount: pkg.lessonsCount as 1 | 4 | 8 | 12,
+      discountPercent: pkg.discountPercent,
+      finalPriceBrlCents: toBrlCents(pkg.finalPriceBrl),
+      effectiveLessonPriceBrlCents: toBrlCents(pkg.effectiveLessonPriceBrl),
+    }));
+    const lowestEffectiveLessonPriceBrlCents = targetPackagesTable.reduce(
+      (minCents, pkg) => (pkg.effectiveLessonPriceBrlCents < minCents ? pkg.effectiveLessonPriceBrlCents : minCents),
+      targetUnitFinalPriceBrlCents
+    );
+
+    let status: 'READY' | 'BLOCKED' = 'READY';
+    let canConfirm = true;
+    const blockingCodes: string[] = [];
+    const blockingReasons: Array<{ code: string; message: string; details?: Record<string, any> }> = [];
+    const warnings: Array<{ code: string; message: string }> = [];
+
+    let budgetBrlCents = 0;
+    let availablePaidLessons = 0;
+    let availableCourtesyLessons = 0;
+    let convertedPaidLessonsCount = 0;
+    let courtesyTransferredLessonsCount = 0;
+    let convertedTotalBrlCents = 0;
+    let switchResidualBrlCents = 0;
+    let paidConversionOutcome: SwitchPreviewResponseDto['paidConversionOutcome'] = 'NO_PAID_CREDITS';
+    let packageComposition: SwitchPreviewPackageLine[] = [];
+
+    if (remainingLegacyUnits > 0) {
+      status = 'BLOCKED';
+      canConfirm = false;
+      blockingCodes.push('LEGACY_UNRECONCILED_PRESENT');
+      blockingReasons.push({
+        code: 'LEGACY_UNRECONCILED_PRESENT',
+        message:
+          'Troca bloqueada: existem créditos legados não conciliados (legacy_unreconciled) na sua conta. Solicite a conciliação administrativa antes da troca.',
+        details: { availableLegacyUnitsCount: remainingLegacyUnits },
+      });
+      availableCourtesyLessons = workingLots
+        .filter((l) => l.origin === 'courtesy')
+        .reduce((s, l) => s + Number(l.remainingLessons || 0), 0);
+      availablePaidLessons = workingLots
+        .filter((l) => l.origin === 'paid')
+        .reduce((s, l) => s + Number(l.remainingLessons || 0), 0);
+      paidConversionOutcome = 'BLOCKED';
+    } else if (workingAvailable > 0) {
+      const conversionRes = evaluateSwitchConversion({
+        studentUid: cleanStudentUid,
+        studentAvailableLessons: workingAvailable,
+        creditLots: workingLots,
+        lessons: postCancelLessons,
+        targetTeacher: {
+          teacherUid: targetTeacherUid,
+          teacherEmail: targetTeacherEmail,
+          teacherName: targetTeacherName,
+          basePriceUsd: targetBasePriceUsd,
+          adminCommissionPercent: targetAdminCommissionPercent,
+          commissionModel: ALLOWED_COMMISSION_MODEL,
+          commissionVersion: targetCommissionVersion,
+          approvalStatus: 'approved',
+          isApproved: true,
+          isCommercializable: true,
+        },
+        ptax: {
+          ptaxRate: ptaxResult.ptaxRate,
+          quoteDate: ptaxResult.quoteDate || null,
+          pricingDate: ptaxResult.pricingDate || null,
+          source: ptaxResult.source || 'BACEN_PTAX_D1',
+        },
+      });
+
+      availablePaidLessons = conversionRes.sourceAnalysis.availablePaidUnitsCount;
+      availableCourtesyLessons = conversionRes.sourceAnalysis.availableCourtesyUnitsCount;
+      budgetBrlCents = conversionRes.sourceAnalysis.budgetBrlCents;
+      for (const w of conversionRes.warnings || []) {
+        warnings.push({ code: w.code, message: w.message });
+      }
+
+      if (!conversionRes.canConvert || !conversionRes.conversionPlan || !conversionRes.accounting) {
+        status = 'BLOCKED';
+        canConfirm = false;
+        paidConversionOutcome = 'BLOCKED';
+        for (const c of conversionRes.blockingCodes) blockingCodes.push(c);
+        for (const r of conversionRes.blockingReasons) {
+          blockingReasons.push({
+            code: r.code,
+            message: r.message,
+            ...(r.details ? { details: r.details } : {}),
+          });
+        }
+      } else {
+        const plan = conversionRes.conversionPlan;
+        const acct = conversionRes.accounting;
+        convertedPaidLessonsCount = acct.convertedValue.convertedPaidLessonsCount;
+        courtesyTransferredLessonsCount = acct.convertedValue.preservedCourtesyLessonsCount;
+        convertedTotalBrlCents = acct.convertedValue.convertedTotalBrlCents;
+        switchResidualBrlCents = acct.convertedValue.residualBrlCents;
+        paidConversionOutcome = plan.paidConversionOutcome;
+        // Sanitize package composition: expose ONLY student-facing price & quantity (NEVER teacherShare or platformRevenue)
+        packageComposition = plan.packageComposition.map((line) => ({
+          packageSize: line.packageSize,
+          quantity: line.quantity,
+          lessonsSubtotal: line.lessonsSubtotal,
+          discountPercent: line.discountPercent,
+          unitPackagePriceBrlCents: line.unitPackagePriceBrlCents,
+          totalPriceBrlCents: line.totalPriceBrlCents,
+        }));
+      }
+    }
+
+    const residualBrlCentsAfter = residualBrlCentsBefore + switchResidualBrlCents;
+    const availableLessonsAfterSwitch = convertedPaidLessonsCount + courtesyTransferredLessonsCount;
+    const q2CancelledLessonIdsSorted = unstartedFutureLessons.map((l) => String(l.id)).sort();
+
+    let previewToken: string | null = null;
+    let previewSnapshotHash: string | null = null;
+    const expiresAtMs = previewNowMs + SWITCH_PREVIEW_TTL_MS;
+
+    if (canConfirm && status === 'READY') {
+      const fingerprints = buildSwitchSnapshotFingerprints({
+        studentUid: cleanStudentUid,
+        sourceTeacherUid,
+        targetTeacherUid,
+        existingLots,
+        studentLessons,
+        availableLessonsBefore: beforeRefundAvailable,
+        residualBrlCentsBefore,
+        q2CancelledLessonIds: q2CancelledLessonIdsSorted,
+        lockedStartedLessonsCount,
+        budgetBrlCents,
+        convertedPaidLessonsCount,
+        courtesyTransferredLessonsCount,
+        convertedTotalBrlCents,
+        switchResidualBrlCents,
+        residualBrlCentsAfter,
+        targetBasePriceUsd,
+        targetAdminCommissionPercent,
+        targetCommissionVersion,
+        targetUnitFinalPriceBrlCents,
+        ptaxRate: ptaxResult.ptaxRate,
+        ptaxQuoteDate: ptaxResult.quoteDate || null,
+        ptaxPricingDate: ptaxResult.pricingDate || null,
+      });
+
+      previewSnapshotHash = fingerprints.snapshotHash;
+      previewToken = signSwitchPreviewToken({
+        v: 1,
+        studentUid: cleanStudentUid,
+        sourceTeacherUid,
+        targetTeacherUid,
+        snapshotHash: fingerprints.snapshotHash,
+        issuedAtMs: previewNowMs,
+        expiresAtMs,
+        availableLessonsBefore: beforeRefundAvailable,
+        residualBrlCentsBefore,
+        lotsFingerprint: fingerprints.lotsFingerprint,
+        lessonsFingerprint: fingerprints.lessonsFingerprint,
+        q2CancelledLessonIds: q2CancelledLessonIdsSorted,
+        lockedStartedLessonsCount,
+        budgetBrlCents,
+        convertedPaidLessonsCount,
+        courtesyTransferredLessonsCount,
+        convertedTotalBrlCents,
+        switchResidualBrlCents,
+        residualBrlCentsAfter,
+        targetBasePriceUsd,
+        targetAdminCommissionPercent,
+        targetCommissionVersion,
+        targetUnitFinalPriceBrlCents,
+        ptaxRate: ptaxResult.ptaxRate,
+        ptaxQuoteDate: ptaxResult.quoteDate || null,
+        ptaxPricingDate: ptaxResult.pricingDate || null,
+      });
+    }
+
+    const sourceTeacherEmailResolved =
+      typeof sourceTeacherDoc.email === 'string' && sourceTeacherDoc.email.trim()
+        ? sourceTeacherDoc.email.toLowerCase().trim()
+        : typeof studentData.teacherEmail === 'string' && studentData.teacherEmail.trim()
+        ? studentData.teacherEmail.toLowerCase().trim()
+        : null;
+    const sourceTeacherNameResolved =
+      typeof sourceTeacherDoc.name === 'string' && sourceTeacherDoc.name.trim()
+        ? sourceTeacherDoc.name.trim()
+        : typeof studentData.teacherName === 'string' && studentData.teacherName.trim()
+        ? studentData.teacherName.trim()
+        : null;
+
+    const previewDto: SwitchPreviewResponseDto = {
+      success: true,
+      readOnly: true,
+      status,
+      canConfirm,
+      previewToken,
+      previewSnapshotHash,
+      issuedAt: nowIso,
+      expiresAt: new Date(expiresAtMs).toISOString(),
+      studentUid: cleanStudentUid,
+      sourceTeacher: {
+        uid: sourceTeacherUid,
+        email: sourceTeacherEmailResolved,
+        name: sourceTeacherNameResolved,
+      },
+      targetTeacher: {
+        uid: targetTeacherUid,
+        publicTutorId: targetPublicTutorId,
+        email: targetTeacherEmail,
+        name: targetTeacherName,
+        unitFinalPriceBrlCents: targetUnitFinalPriceBrlCents,
+        lowestEffectiveLessonPriceBrlCents,
+      },
+      ptax: {
+        rate: ptaxResult.ptaxRate,
+        quoteDate: ptaxResult.quoteDate || null,
+        pricingDate: ptaxResult.pricingDate || null,
+        source: ptaxResult.source || 'BACEN_PTAX_D1',
+      },
+      q2: {
+        cancelledLessons: cancelledLessonItems,
+        cancelledLessonsCount: unstartedFutureLessons.length,
+        refundedCreditsCount: q2RefundedCreditsCount,
+        cancelledTrialLessonsCount: q2CancelledTrialLessonsCount,
+        lockedStartedLessonsCount,
+      },
+      balances: {
+        availableLessonsBefore: beforeRefundAvailable,
+        availableLessonsAfterRefunds: workingAvailable,
+        availablePaidLessonsAvailableForConversion: availablePaidLessons,
+        availableCourtesyLessonsAvailableForTransfer: availableCourtesyLessons,
+        remainingLegacyUnitsCount: remainingLegacyUnits,
+        budgetBrlCents,
+        convertedPaidLessonsCount,
+        courtesyTransferredLessonsCount,
+        availableLessonsAfterSwitch,
+        convertedTotalBrlCents,
+        residualBrlCentsBefore,
+        switchResidualBrlCents,
+        residualBrlCentsAfter,
+        additionalCostBrlCents: 0,
+        courtesyFinancialValueBrlCents: 0,
+      },
+      packageComposition,
+      targetPackagesTable,
+      paidConversionOutcome,
+      blockingCodes,
+      blockingReasons,
+      warnings,
+    };
+
+    return {
+      success: true,
+      statusCode: 200,
+      preview: previewDto,
+    };
+  } catch (err: any) {
+    if (err instanceof CreditLedgerError) {
+      return {
+        success: false,
+        statusCode: err.statusCode,
+        code: err.code,
+        error: err.message,
+        details: err.details,
+      };
+    }
+
+    if (err instanceof SwitchConversionError) {
+      const mappedStatus =
+        err.code === 'LEGACY_UNRECONCILED_PRESENT'
+          ? 409
+          : err.code === 'TARGET_TEACHER_NOT_APPROVED'
+          ? 403
+          : err.statusCode;
+      return {
+        success: false,
+        statusCode: mappedStatus,
+        code: err.code,
+        error: err.message,
+        details: err.details,
+      };
+    }
+
+    const msg = String(err?.message || '');
+    const code = err?.code;
+    const isTimeout =
+      code === 4 ||
+      code === 'deadline-exceeded' ||
+      msg.includes('DEADLINE_EXCEEDED') ||
+      msg.includes('timeout') ||
+      msg.includes('ETIMEDOUT');
+    if (isTimeout) {
+      return {
+        success: false,
+        statusCode: 504,
+        code: 'FIRESTORE_TIMEOUT',
+        error: 'Tempo limite esgotado ao calcular a prévia da troca. Tente novamente.',
+      };
+    }
+
+    return {
+      success: false,
+      statusCode: 500,
+      code: 'PREVIEW_FAILED',
+      error: msg || 'Falha ao gerar prévia da troca de Amigo Nativo.',
+    };
+  }
+}
+
 
 

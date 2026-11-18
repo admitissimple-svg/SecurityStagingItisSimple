@@ -170,6 +170,8 @@ import {
 import { FirestoreSchemaAlertBanner } from './components/FirestoreSchemaAlertBanner';
 import { StudentJournalEntry } from './types';
 import { ManageSubscriptionModal } from './components/ManageSubscriptionModal';
+import { SwitchNativeFriendModal } from './components/SwitchNativeFriendModal';
+import { formatBrlFromCents } from './utils/nativeFriendSwitchClient';
 import { RoutineRemindersManager } from './components/RoutineRemindersManager';
 import { OnboardingWizardModal, OnboardingResultData } from './components/OnboardingWizardModal';
 import { StartLivingEmailModal } from './components/StartLivingEmailModal';
@@ -588,6 +590,9 @@ export default function App() {
                 assignedNativeFriendUID: teacherUid,
                 contractedLessons: typeof firestoreDoc?.contractedLessons === 'number' ? firestoreDoc.contractedLessons : (firestoreDoc?.hasCompletedTrialLesson ? 1 : 0),
                 availableLessons: typeof firestoreDoc?.availableLessons === 'number' ? firestoreDoc.availableLessons : undefined,
+                residualBrlCents: typeof firestoreDoc?.residualBrlCents === 'number' ? firestoreDoc.residualBrlCents : 0,
+                ...(firestoreDoc?.lastSwitchAuditId ? { lastSwitchAuditId: firestoreDoc.lastSwitchAuditId } : {}),
+                ...(firestoreDoc?.lastSwitchedAt ? { lastSwitchedAt: firestoreDoc.lastSwitchedAt } : {}),
                 completedLessonsCount: typeof firestoreDoc?.completedLessonsCount === 'number' ? firestoreDoc.completedLessonsCount : 0,
                 hasCompletedTrialLesson: Boolean(firestoreDoc?.hasCompletedTrialLesson),
                 onboardingCompleted: typeof firestoreDoc?.onboardingCompleted === "boolean"
@@ -750,6 +755,8 @@ export default function App() {
   const [isJournalModalOpen, setIsJournalModalOpen] = useState<boolean>(false);
   const [isManageSubscriptionOpen, setIsManageSubscriptionOpen] = useState<boolean>(false);
   const [subscriptionTargetTutor, setSubscriptionTargetTutor] = useState<NativeFriendTutor | null>(null);
+  const [isSwitchNativeFriendOpen, setIsSwitchNativeFriendOpen] = useState<boolean>(false);
+  const [switchTargetTutor, setSwitchTargetTutor] = useState<NativeFriendTutor | null>(null);
   const [isOnboardingModalOpen, setIsOnboardingModalOpen] = useState<boolean>(false);
   const [isOnboardingCompleting, setIsOnboardingCompleting] = useState<boolean>(false);
   const [isStartLivingModalOpen, setIsStartLivingModalOpen] = useState<boolean>(false);
@@ -2805,6 +2812,28 @@ export default function App() {
     const resolvedTeacherUid =
       (matchedTutor?.uid && isValidCanonicalUid(matchedTutor.uid) ? matchedTutor.uid : null) ||
       (matchedTutor?.id && isValidCanonicalUid(matchedTutor.id) ? matchedTutor.id : null);
+
+    // If student already has an active Native Friend link and tries to change to another tutor,
+    // strictly open the server-previewed & confirmed NF.SWITCH.2E modal instead of legacy silent update.
+    const existingTeacherUid =
+      userProfile?.teacherUid || userProfile?.assignedNativeFriendUID || userProfile?.nativeFriendUID || '';
+    const existingTeacherEmail = (userProfile?.teacherEmail || '').toLowerCase().trim();
+    const hasExistingActiveLink = Boolean(
+      (existingTeacherUid || existingTeacherEmail) &&
+      userProfile?.enrollmentStatus !== 'cancelled' &&
+      userProfile?.enrollmentStatus !== 'not_enrolled'
+    );
+    const isTargetingDifferentTutor = Boolean(
+      (resolvedTeacherUid && existingTeacherUid && resolvedTeacherUid !== existingTeacherUid) ||
+      (cleanTeacherEmail && existingTeacherEmail && cleanTeacherEmail !== existingTeacherEmail)
+    );
+    if (hasExistingActiveLink && isTargetingDifferentTutor) {
+      setIsManageSubscriptionOpen(false);
+      setSwitchTargetTutor(matchedTutor || null);
+      setIsSwitchNativeFriendOpen(true);
+      return;
+    }
+
     const newEnrollmentStatus: 'active' | 'not_enrolled' | 'cancelled' = cleanTeacherEmail && resolvedTeacherUid ? 'active' : 'not_enrolled';
 
     setUserProfile((prev) => ({
@@ -7674,6 +7703,24 @@ export default function App() {
               return;
             }
             if (currentAccount?.role === 'student') {
+              const curTeacherUid = userProfile?.teacherUid || userProfile?.assignedNativeFriendUID || '';
+              const curTeacherEmail = (userProfile?.teacherEmail || '').toLowerCase().trim();
+              const hasActiveLink = Boolean(
+                (curTeacherUid || curTeacherEmail) &&
+                userProfile?.enrollmentStatus !== 'cancelled' &&
+                userProfile?.enrollmentStatus !== 'not_enrolled'
+              );
+              const tutorCanonUid = tutor.uid || tutor.authUid || tutor.id || '';
+              const tutorCleanEmail = (tutor.email || '').toLowerCase().trim();
+              const isDifferentTutor = Boolean(
+                (curTeacherUid && tutorCanonUid && curTeacherUid !== tutorCanonUid) ||
+                (curTeacherEmail && tutorCleanEmail && curTeacherEmail !== tutorCleanEmail)
+              );
+              if (hasActiveLink && isDifferentTutor) {
+                setSwitchTargetTutor(tutor);
+                setIsSwitchNativeFriendOpen(true);
+                return;
+              }
               handleUpdateSubscription(targetIdentifier, tutor.name);
             }
             setIsScheduleModalOpen(true);
@@ -7762,6 +7809,24 @@ export default function App() {
                   return;
                 }
                 if (currentAccount?.role === 'student') {
+                  const curTeacherUid = userProfile?.teacherUid || userProfile?.assignedNativeFriendUID || '';
+                  const curTeacherEmail = (userProfile?.teacherEmail || '').toLowerCase().trim();
+                  const hasActiveLink = Boolean(
+                    (curTeacherUid || curTeacherEmail) &&
+                    userProfile?.enrollmentStatus !== 'cancelled' &&
+                    userProfile?.enrollmentStatus !== 'not_enrolled'
+                  );
+                  const tutorCanonUid = tutor.uid || tutor.authUid || tutor.id || '';
+                  const tutorCleanEmail = (tutor.email || '').toLowerCase().trim();
+                  const isDifferentTutor = Boolean(
+                    (curTeacherUid && tutorCanonUid && curTeacherUid !== tutorCanonUid) ||
+                    (curTeacherEmail && tutorCleanEmail && curTeacherEmail !== tutorCleanEmail)
+                  );
+                  if (hasActiveLink && isDifferentTutor) {
+                    setSwitchTargetTutor(tutor);
+                    setIsSwitchNativeFriendOpen(true);
+                    return;
+                  }
                   handleUpdateSubscription(targetIdentifier, tutor.name);
                 }
                 setIsScheduleModalOpen(true);
@@ -8453,6 +8518,10 @@ export default function App() {
                   onUpdateContractedLessons={handleUpdateContractedLessons}
                   onOpenScheduleModal={() => setIsScheduleModalOpen(true)}
                   onOpenManageSubscription={() => setIsManageSubscriptionOpen(true)}
+                  onOpenSwitchNativeFriend={() => {
+                    setSwitchTargetTutor(null);
+                    setIsSwitchNativeFriendOpen(true);
+                  }}
                   onCancelLesson={handleCancelLesson}
                   onAcceptReschedule={handleAcceptReschedule}
                   onDeclineReschedule={handleDeclineReschedule}
@@ -9044,6 +9113,11 @@ export default function App() {
         onUpdateSubscription={handleUpdateSubscription}
         onPurchasePackage={handlePurchasePackage}
         initialSelectedTutor={subscriptionTargetTutor}
+        onRequestSwitchNativeFriend={(targetTutor) => {
+          setIsManageSubscriptionOpen(false);
+          setSwitchTargetTutor(targetTutor || null);
+          setIsSwitchNativeFriendOpen(true);
+        }}
         onScheduleTrialLessonWithTutor={(tutor) => {
           setTeacherEmailForConfig(tutor.email || tutor.id);
           setScheduleStudentInfo({
@@ -9057,6 +9131,85 @@ export default function App() {
           });
           setIsManageSubscriptionOpen(false);
           setIsScheduleModalOpen(true);
+        }}
+      />
+
+      <SwitchNativeFriendModal
+        isOpen={isSwitchNativeFriendOpen}
+        onClose={() => {
+          setIsSwitchNativeFriendOpen(false);
+          setSwitchTargetTutor(null);
+        }}
+        userProfile={userProfile}
+        tutorsList={tutors}
+        currentLanguage={currentLanguage}
+        timeZone={DEFAULT_STUDENT_TIMEZONE}
+        initialTargetTutor={switchTargetTutor}
+        onScheduleWithNewTutor={() => setIsScheduleModalOpen(true)}
+        onSwitchSuccess={async (result) => {
+          const cleanEmail = (userProfile?.email || currentAccount?.email || '').toLowerCase().trim();
+          const switchedAtIso = new Date().toISOString();
+
+          setUserProfile((prev) => ({
+            ...prev,
+            teacherUid: result.targetTeacherUid,
+            assignedNativeFriendUID: result.targetTeacherUid,
+            nativeFriendUID: result.targetTeacherUid,
+            teacherEmail: result.targetTeacherEmail || prev.teacherEmail,
+            teacherName: result.targetTeacherName || prev.teacherName,
+            teacherMeetUrl: result.targetTeacherMeetUrl || prev.teacherMeetUrl,
+            enrollmentStatus: 'active',
+            availableLessons: result.availableLessonsAfterSwitch,
+            residualBrlCents: result.residualBrlCentsAfter,
+            lastSwitchAuditId: result.switchAuditId,
+            lastSwitchedAt: switchedAtIso,
+          }));
+
+          if (cleanEmail || result.studentUid) {
+            setStudents((prev) =>
+              prev.map((s) => {
+                const sEmail = (s.email || s.studentEmail || '').toLowerCase().trim();
+                const sUid = s.uid || s.id || '';
+                if ((result.studentUid && sUid === result.studentUid) || (cleanEmail && sEmail === cleanEmail)) {
+                  return {
+                    ...s,
+                    teacherUid: result.targetTeacherUid,
+                    assignedNativeFriendUID: result.targetTeacherUid,
+                    nativeFriendUID: result.targetTeacherUid,
+                    teacherEmail: result.targetTeacherEmail || s.teacherEmail,
+                    teacherName: result.targetTeacherName || s.teacherName,
+                    status: 'active',
+                  };
+                }
+                return s;
+              })
+            );
+          }
+
+          await revalidateLessons().catch(() => {});
+
+          setNotifications((prev) => [
+            {
+              id: `switch-${Date.now()}`,
+              title: currentLanguage === 'en' ? 'Native Friend Updated' : 'Amigo Nativo Alterado',
+              message:
+                currentLanguage === 'en'
+                  ? `Switched to ${result.targetTeacherName}. Available credits: ${result.availableLessonsAfterSwitch}${
+                      result.residualBrlCentsAfter > 0
+                        ? ` · Residual credit: ${formatBrlFromCents(result.residualBrlCentsAfter)}`
+                        : ''
+                    }.`
+                  : `Troca concluída para ${result.targetTeacherName}. Créditos disponíveis: ${result.availableLessonsAfterSwitch}${
+                      result.residualBrlCentsAfter > 0
+                        ? ` · Crédito residual: ${formatBrlFromCents(result.residualBrlCentsAfter)}`
+                        : ''
+                    }.`,
+              type: 'success',
+              timestamp: switchedAtIso,
+              read: false,
+            },
+            ...prev,
+          ]);
         }}
       />
 

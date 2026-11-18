@@ -370,6 +370,7 @@ interface ManageSubscriptionModalProps {
     monthlyFrequency?: string;
   }) => Promise<any>;
   onScheduleTrialLessonWithTutor?: (tutor: NativeFriendTutor) => void;
+  onRequestSwitchNativeFriend?: (targetTutor?: NativeFriendTutor | null) => void;
   initialSelectedTutor?: NativeFriendTutor | null;
 }
 
@@ -383,6 +384,7 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
   onUpdateSubscription,
   onPurchasePackage,
   onScheduleTrialLessonWithTutor,
+  onRequestSwitchNativeFriend,
   initialSelectedTutor,
 }) => {
   const isEn = currentLanguage === 'en';
@@ -1135,14 +1137,22 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
                       {/* Action button: Substituir Amigo Nativo */}
                       <button
                         type="button"
-                        onClick={() => setShowAvailableTutors((prev) => !prev)}
+                        onClick={() => {
+                          if (onRequestSwitchNativeFriend) {
+                            onRequestSwitchNativeFriend(null);
+                          } else {
+                            setShowAvailableTutors((prev) => !prev);
+                          }
+                        }}
                         className={`px-3 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer shadow-2xs ${
                           showAvailableTutors
                             ? 'bg-[#1C4C96]/15 text-[#062863] border border-[#1C4C96]/40 hover:bg-[#1C4C96]/25'
                             : 'bg-white hover:bg-slate-50 text-[#062863] border border-[#607EC9]/40'
                         }`}
                         title={
-                          showAvailableTutors
+                          onRequestSwitchNativeFriend
+                            ? (isEn ? 'Preview and switch Native Friend' : 'Visualizar prévia e trocar Amigo Nativo')
+                            : showAvailableTutors
                             ? (isEn ? 'Hide available Native Friends list' : 'Ocultar lista de Amigos Nativos disponíveis')
                             : (isEn ? 'Change current Native Friend' : 'Substituir Amigo Nativo atual')
                         }
@@ -1367,6 +1377,10 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
                                   type="button"
                                   disabled={isProcessing}
                                   onClick={async () => {
+                                    if (hasActiveSubscription && onRequestSwitchNativeFriend) {
+                                      onRequestSwitchNativeFriend(tutor);
+                                      return;
+                                    }
                                     await handleSelectTutorDirectly(tutor.email || tutor.id, tutor.name);
                                     if (onScheduleTrialLessonWithTutor) {
                                       onScheduleTrialLessonWithTutor(tutor);
@@ -1375,7 +1389,11 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
                                   className="px-3.5 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer shadow-xs active:scale-98 disabled:opacity-50"
                                 >
                                   <CalendarCheck className="w-3.5 h-3.5" />
-                                  <span>{isEn ? 'Schedule Trial with This Friend' : 'Agendar Aula Teste com este Tutor'}</span>
+                                  <span>
+                                    {hasActiveSubscription && onRequestSwitchNativeFriend
+                                      ? (isEn ? 'Switch & Schedule Trial' : 'Trocar e Agendar Aula Teste')
+                                      : (isEn ? 'Schedule Trial with This Friend' : 'Agendar Aula Teste com este Tutor')}
+                                  </span>
                                 </button>
                               ) : (
                                 <>
@@ -1415,14 +1433,20 @@ export const ManageSubscriptionModal: React.FC<ManageSubscriptionModalProps> = (
                                     </span>
                                   </button>
 
-                                  {/* Secondary: Switch tutor directly without purchase (if desired) */}
+                                  {/* Secondary: Open preview-bound Native Friend switch flow */}
                                   {!isSelected && hasActiveSubscription && (
                                     <button
                                       type="button"
                                       disabled={isProcessing}
-                                      onClick={() => handleSelectTutorDirectly(tutor.email || tutor.id, tutor.name)}
+                                      onClick={() => {
+                                        if (onRequestSwitchNativeFriend) {
+                                          onRequestSwitchNativeFriend(tutor);
+                                        } else {
+                                          handleSelectTutorDirectly(tutor.email || tutor.id, tutor.name);
+                                        }
+                                      }}
                                       className="px-2.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-semibold transition cursor-pointer disabled:opacity-50"
-                                      title={isEn ? 'Switch to this tutor directly' : 'Substituir para este tutor diretamente'}
+                                      title={isEn ? 'Preview and switch to this Native Friend' : 'Simular prévia e trocar para este Amigo Nativo'}
                                     >
                                       {isEn ? 'Switch' : 'Substituir'}
                                     </button>

@@ -16,6 +16,7 @@ import {
   CheckCircle2,
   X,
   ExternalLink,
+  ArrowLeftRight,
 } from 'lucide-react';
 import {
   LiveLesson,
@@ -31,6 +32,7 @@ import { NativeFriendsNotesModal } from './NativeFriendsNotesModal';
 import { useNativeFriendsNotesReminder } from '../hooks/useNativeFriendsNotesReminder';
 import { auth } from '../firebase';
 import { isValidCanonicalUid } from '../utils/studentPersistence';
+import { formatBrlFromCents } from '../utils/nativeFriendSwitchClient';
 
 // Pure in-memory tracking for review opened/completed state during active session (ZERO sessionStorage)
 const inMemorySessionReviewKeys = new Set<string>();
@@ -66,6 +68,7 @@ interface StudentHeaderSectionProps {
   ) => void | Promise<boolean | AdminCreditAdjustmentResponse | void>;
   onOpenScheduleModal: () => void;
   onOpenManageSubscription?: () => void;
+  onOpenSwitchNativeFriend?: () => void;
   onCancelLesson?: (
     lessonId: string,
     reason?: string,
@@ -93,6 +96,7 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
   onUpdateContractedLessons,
   onOpenScheduleModal,
   onOpenManageSubscription,
+  onOpenSwitchNativeFriend,
   onCancelLesson,
   onAcceptReschedule,
   onDeclineReschedule,
@@ -362,6 +366,11 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
               <span className="text-[9px] text-[#062863] font-semibold bg-[#9AB4FF]/15 px-2 py-0.2 rounded-full border border-[#9AB4FF]/40 truncate">
                 {studentEmail}
               </span>
+              {typeof userProfile?.residualBrlCents === 'number' && userProfile.residualBrlCents > 0 && (
+                <span className="text-[10px] font-bold text-[#062863] tabular-nums shrink-0" data-testid="student-residual-balance">
+                  · {isEn ? 'Residual credit:' : 'Crédito residual:'} {formatBrlFromCents(userProfile.residualBrlCents)}
+                </span>
+              )}
             </div>
 
             {currentAccount?.role === 'admin' && onUpdateContractedLessons && (
@@ -557,26 +566,41 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
             </div>
           </div>
 
-          {/* Gerenciar Inscrição / Escolher Amigo Button */}
-          {onOpenManageSubscription && (
-            <button
-              type="button"
-              onClick={onOpenManageSubscription}
-              className={`px-3 py-1.5 rounded-xl text-[10px] font-bold transition flex items-center gap-1 cursor-pointer shrink-0 shadow-2xs active:scale-98 ${
-                assignedTeacher
-                  ? 'bg-[#1C4C96] hover:bg-[#062863] text-white border border-[#9AB4FF]/40'
-                  : 'bg-emerald-600 hover:bg-emerald-500 text-white border border-emerald-400/60 shadow-xs'
-              }`}
-              title={isEn ? 'Manage Native Friend subscription & packages' : 'Gerenciar Amigo Nativo e pacotes de aulas'}
-            >
-              <UserCheck className={`w-3 h-3 ${assignedTeacher ? 'text-[#9AB4FF]' : 'text-emerald-200'}`} />
-              <span className="whitespace-nowrap">
-                {assignedTeacher
-                  ? (isEn ? 'Manage' : 'Gerenciar Inscrição')
-                  : (isEn ? 'Choose Friend & Package' : 'Escolher Amigo & Aulas')}
-              </span>
-            </button>
-          )}
+          {/* Gerenciar Inscrição / Escolher Amigo + Trocar Amigo Nativo */}
+          <div className="flex items-center gap-1.5 shrink-0">
+            {assignedTeacher && !isCancelledOrUnenrolled && onOpenSwitchNativeFriend && currentAccount?.role === 'student' && (
+              <button
+                type="button"
+                onClick={onOpenSwitchNativeFriend}
+                data-testid="student-header-switch-btn"
+                className="px-2.5 py-1.5 rounded-xl text-[10px] font-bold bg-slate-100 hover:bg-slate-200 text-[#062863] border border-[#607EC9]/30 transition flex items-center gap-1 cursor-pointer shrink-0 whitespace-nowrap"
+                title={isEn ? 'Switch Native Friend with server conversion preview' : 'Trocar de Amigo Nativo com prévia de conversão'}
+              >
+                <ArrowLeftRight className="w-3 h-3 text-[#1C4C96]" />
+                <span>{isEn ? 'Switch' : 'Trocar'}</span>
+              </button>
+            )}
+
+            {onOpenManageSubscription && (
+              <button
+                type="button"
+                onClick={onOpenManageSubscription}
+                className={`px-3 py-1.5 rounded-xl text-[10px] font-bold transition flex items-center gap-1 cursor-pointer shrink-0 shadow-2xs active:scale-98 ${
+                  assignedTeacher
+                    ? 'bg-[#1C4C96] hover:bg-[#062863] text-white border border-[#9AB4FF]/40'
+                    : 'bg-emerald-600 hover:bg-emerald-500 text-white border border-emerald-400/60 shadow-xs'
+                }`}
+                title={isEn ? 'Manage Native Friend subscription & packages' : 'Gerenciar Amigo Nativo e pacotes de aulas'}
+              >
+                <UserCheck className={`w-3 h-3 ${assignedTeacher ? 'text-[#9AB4FF]' : 'text-emerald-200'}`} />
+                <span className="whitespace-nowrap">
+                  {assignedTeacher
+                    ? (isEn ? 'Manage' : 'Gerenciar Inscrição')
+                    : (isEn ? 'Choose Friend & Package' : 'Escolher Amigo & Aulas')}
+                </span>
+              </button>
+            )}
+          </div>
         </div>
       </div>
 

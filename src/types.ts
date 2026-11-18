@@ -1302,6 +1302,7 @@ export interface NativeFriendSwitchAuditRecord {
   id: string;
   idempotencyKey: string;
   requestFingerprint: string;
+  previewSnapshotHash?: string | null;
   studentUid: string;
   studentEmail: string;
   studentName: string;
@@ -1354,4 +1355,124 @@ export interface NativeFriendSwitchAuditRecord {
   createdAt: string;
   immutable: true;
 }
+
+export interface SwitchPreviewCancelledLessonItem {
+  id: string;
+  startDateTime: string;
+  endDateTime?: string | null;
+  isTrialLesson: boolean;
+  creditOrigin?: CreditLotOrigin | null;
+  creditRefundedToLot: boolean;
+}
+
+export interface SwitchPreviewPackageLine {
+  packageSize: 1 | 4 | 8 | 12;
+  quantity: number;
+  lessonsSubtotal: number;
+  discountPercent: number;
+  unitPackagePriceBrlCents: number;
+  totalPriceBrlCents: number;
+}
+
+export interface SwitchPreviewTargetPackageTableItem {
+  lessonsCount: 1 | 4 | 8 | 12;
+  discountPercent: number;
+  finalPriceBrlCents: number;
+  effectiveLessonPriceBrlCents: number;
+}
+
+export interface SwitchPreviewBlockingReason {
+  code: string;
+  message: string;
+  details?: Record<string, any>;
+}
+
+export interface SwitchPreviewWarning {
+  code: string;
+  message: string;
+}
+
+export interface SwitchPreviewResponseDto {
+  success: true;
+  readOnly: true;
+  status: 'READY' | 'BLOCKED';
+  canConfirm: boolean;
+  previewToken: string | null;
+  previewSnapshotHash: string | null;
+  issuedAt: string;
+  expiresAt: string;
+  studentUid: string;
+  sourceTeacher: {
+    uid: string;
+    email: string | null;
+    name: string | null;
+  };
+  targetTeacher: {
+    uid: string;
+    publicTutorId: string;
+    email: string | null;
+    name: string;
+    unitFinalPriceBrlCents: number;
+    lowestEffectiveLessonPriceBrlCents: number;
+  };
+  ptax: {
+    rate: number;
+    quoteDate: string | null;
+    pricingDate: string | null;
+    source: string | null;
+  };
+  q2: {
+    cancelledLessons: SwitchPreviewCancelledLessonItem[];
+    cancelledLessonsCount: number;
+    refundedCreditsCount: number;
+    cancelledTrialLessonsCount: number;
+    lockedStartedLessonsCount: number;
+  };
+  balances: {
+    availableLessonsBefore: number;
+    availableLessonsAfterRefunds: number;
+    availablePaidLessonsAvailableForConversion: number;
+    availableCourtesyLessonsAvailableForTransfer: number;
+    remainingLegacyUnitsCount: number;
+    budgetBrlCents: number;
+    convertedPaidLessonsCount: number;
+    courtesyTransferredLessonsCount: number;
+    availableLessonsAfterSwitch: number;
+    convertedTotalBrlCents: number;
+    residualBrlCentsBefore: number;
+    switchResidualBrlCents: number;
+    residualBrlCentsAfter: number;
+    additionalCostBrlCents: 0;
+    courtesyFinancialValueBrlCents: 0;
+  };
+  packageComposition: SwitchPreviewPackageLine[];
+  targetPackagesTable: SwitchPreviewTargetPackageTableItem[];
+  paidConversionOutcome: 'CONVERTED' | 'NO_PAID_CREDITS' | 'INSUFFICIENT_FOR_ONE_LESSON' | 'BLOCKED';
+  blockingCodes: string[];
+  blockingReasons: SwitchPreviewBlockingReason[];
+  warnings: SwitchPreviewWarning[];
+}
+
+export interface SwitchExecuteResponseDto {
+  success: true;
+  isIdempotent: boolean;
+  switchAuditId: string;
+  studentUid: string;
+  sourceTeacherUid: string;
+  targetTeacherUid: string;
+  targetTeacherEmail: string;
+  targetTeacherName: string;
+  targetTeacherMeetUrl: string;
+  availableLessonsBefore: number;
+  availableLessonsAfterRefunds: number;
+  availableLessonsAfterSwitch: number;
+  residualBrlCentsBefore: number;
+  switchResidualBrlCents: number;
+  residualBrlCentsAfter: number;
+  q2CancelledLessonsCount: number;
+  q2RefundedCreditsCount: number;
+  q2CancelledTrialLessonsCount: number;
+  lockedStartedLessonsCount: number;
+}
+
 
