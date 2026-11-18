@@ -343,6 +343,10 @@ export default function App() {
           setLessons([]);
           setStudents([]);
           setNotifications([]);
+          setSelectedStudentFilter('all');
+          setActiveStudentActivity(null);
+          setAdminCreditEditOpen(false);
+          setAdminCreditFeedback(null);
         }
         previousAuthUidRef.current = null;
         setCurrentAccount(null);
@@ -360,6 +364,10 @@ export default function App() {
         setLessons([]);
         setStudents([]);
         setNotifications([]);
+        setSelectedStudentFilter('all');
+        setActiveStudentActivity(null);
+        setAdminCreditEditOpen(false);
+        setAdminCreditFeedback(null);
       }
       previousAuthUidRef.current = nextUid;
 
@@ -483,6 +491,10 @@ export default function App() {
         } else if (resolvedRole === 'admin') {
           setViewMode('dashboard');
           setIsAdminApprovalsOpen(true);
+          setSelectedStudentFilter('all');
+          setActiveStudentActivity(null);
+          setAdminCreditEditOpen(false);
+          setAdminCreditFeedback(null);
           if (typeof window !== 'undefined') {
             try {
               window.history.replaceState({ page: 'admin' }, '', '/admin');
@@ -1081,6 +1093,31 @@ export default function App() {
       }
     }
   }, [currentAccount, isAdminApprovalsOpen, isAdminLandingEditorOpen, isEditTutorProfileOpen]);
+
+  // ADM.UI.1: Ensure teacher/student transient filter and modal states are cleared in Admin view
+  useEffect(() => {
+    if (currentAccount?.role === 'admin') {
+      setSelectedStudentFilter('all');
+      setActiveStudentActivity(null);
+      setAdminCreditEditOpen(false);
+      setAdminCreditFeedback(null);
+      setIsStudentMgmtModalOpen(false);
+      setIsMeetConfigModalOpen(false);
+      setIsEditTutorProfileOpen(false);
+      setIsStudentProfileOpen(false);
+      setIsPersonalDictionaryOpen(false);
+      setIsJournalModalOpen(false);
+      setIsHomeworkModalOpen(false);
+      setIsDailySentenceModalOpen(false);
+      setIsEmailModalOpen(false);
+      setIsManageSubscriptionOpen(false);
+      setIsOnboardingModalOpen(false);
+      setIsStartLivingModalOpen(false);
+      setIsScheduleModalOpen(false);
+      setIsRescheduleModalOpen(false);
+      setIsNotCompletedModalOpen(false);
+    }
+  }, [currentAccount?.role]);
 
   // Compute current day's routine items
   const currentDayRoutines = useMemo(() => {
@@ -3542,6 +3579,10 @@ export default function App() {
       (currentAccount && currentAccount.email.toLowerCase() !== account.email.toLowerCase())
     ) {
       clearAllClientSessionCaches({ preserveFirebaseAuth: true });
+      setSelectedStudentFilter('all');
+      setActiveStudentActivity(null);
+      setAdminCreditEditOpen(false);
+      setAdminCreditFeedback(null);
     }
     const safeAccount: GoogleAccount = {
       ...account,
@@ -3662,6 +3703,10 @@ export default function App() {
     } else if (account.role === 'admin') {
       setViewMode('dashboard');
       setIsAdminApprovalsOpen(true);
+      setSelectedStudentFilter('all');
+      setActiveStudentActivity(null);
+      setAdminCreditEditOpen(false);
+      setAdminCreditFeedback(null);
       if (typeof window !== 'undefined') {
         try {
           window.history.replaceState({ page: 'admin' }, '', '/admin');
@@ -3689,6 +3734,10 @@ export default function App() {
     setLessons([]);
     setStudents([]);
     setNotifications([]);
+    setSelectedStudentFilter('all');
+    setActiveStudentActivity(null);
+    setAdminCreditEditOpen(false);
+    setAdminCreditFeedback(null);
     setIsTutorPreselected(false);
     setOnboardingInitialTutorId('');
     setViewMode('landing');
@@ -7883,8 +7932,8 @@ export default function App() {
                   />
                 )}
 
-                {/* Minimalist & Practical Student Workspace: Displayed when a specific student is filtered */}
-                {selectedStudentFilter && selectedStudentFilter !== 'all' ? (() => {
+                {/* Minimalist & Practical Student Workspace: Strictly for Teacher view when a specific student is filtered */}
+                {currentAccount?.role === 'teacher' && selectedStudentFilter && selectedStudentFilter !== 'all' ? (() => {
                   const filterClean = (selectedStudentFilter || '').toLowerCase().trim();
                   const found = studentsList.find(
                     (s) =>
@@ -7968,7 +8017,7 @@ export default function App() {
                         </div>
 
                         {/* FIN.2D.2A: Admin-only Manual Credit Adjustment Bar */}
-                        {currentAccount?.role === 'admin' && (() => {
+                        {(currentAccount?.role as UserRole) === 'admin' && (() => {
                           const stContracted =
                             typeof (found as any)?.contractedLessons === 'number'
                               ? (found as any).contractedLessons
@@ -8646,6 +8695,8 @@ export default function App() {
     />
   )}
 
+  {currentAccount?.role !== 'admin' && (
+    <>
   <BecomeTutorModal
     isOpen={isBecomeTutorModalOpen}
     onClose={() => setIsBecomeTutorModalOpen(false)}
@@ -9133,6 +9184,8 @@ export default function App() {
         dictionaryEntries={consolidatedActiveDictionary}
         excludedWords={excludedDictionaryWords}
       />
+    </>
+  )}
 
       {/* Admin Landing Content Editor Modal */}
       <AdminLandingEditorModal
@@ -9159,6 +9212,8 @@ export default function App() {
       />
 
       {/* Native Friend Edit Profile Modal */}
+      {currentAccount?.role !== 'admin' && (
+        <>
       {isEditTutorProfileOpen && currentTutorProfile && (
         <EditTutorProfileModal
           isOpen={isEditTutorProfileOpen}
@@ -9210,6 +9265,8 @@ export default function App() {
         onDeleteEntry={handleDeleteJournalEntry}
         onOpenDailySentenceSection={() => setIsDailySentenceModalOpen(true)}
       />
+        </>
+      )}
 
       {/* Developer & Admin Real-time Firestore Schema Protection & Migration Alert Banner */}
       <FirestoreSchemaAlertBanner isAdmin={currentAccount?.role === 'admin'} />

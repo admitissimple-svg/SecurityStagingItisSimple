@@ -209,50 +209,52 @@ export const Navbar: React.FC<NavbarProps> = ({
 
           {/* 3. Right: Clean User Card & Logout Button */}
           <div className="flex items-center gap-2 sm:gap-3 shrink-0">
-            {/* Discrete Minimalist Direct Messages & Notices Button */}
-            <div className="relative" ref={messagesMenuRef}>
-              <button
-                type="button"
-                onClick={() => setIsMessagesOpen((prev) => !prev)}
-                className={`relative p-2 sm:p-2.5 rounded-2xl border transition shadow-2xs cursor-pointer flex items-center justify-center group ${
-                  isMessagesOpen
-                    ? 'bg-[#062863] text-white border-[#062863]'
-                    : 'bg-white hover:bg-[#9AB4FF]/15 border-[#607EC9]/30 text-[#000035] hover:text-[#062863]'
-                }`}
-                title={isEn ? 'Direct Messages & Notices' : 'Recados e Mensagens com Amigo Nativo'}
-                aria-label={isEn ? 'Direct Messages & Notices' : 'Recados e Mensagens'}
-                id="header-direct-messages-btn"
-              >
-                <MessageSquare
-                  className={`w-4 h-4 sm:w-4.5 sm:h-4.5 group-hover:scale-105 transition-transform ${
-                    isMessagesOpen ? 'text-white' : 'text-[#062863]'
+            {/* Discrete Minimalist Direct Messages & Notices Button (Students & Native Friends only) */}
+            {!isAdmin && (
+              <div className="relative" ref={messagesMenuRef}>
+                <button
+                  type="button"
+                  onClick={() => setIsMessagesOpen((prev) => !prev)}
+                  className={`relative p-2 sm:p-2.5 rounded-2xl border transition shadow-2xs cursor-pointer flex items-center justify-center group ${
+                    isMessagesOpen
+                      ? 'bg-[#062863] text-white border-[#062863]'
+                      : 'bg-white hover:bg-[#9AB4FF]/15 border-[#607EC9]/30 text-[#000035] hover:text-[#062863]'
                   }`}
-                />
+                  title={isEn ? 'Direct Messages & Notices' : 'Recados e Mensagens com Amigo Nativo'}
+                  aria-label={isEn ? 'Direct Messages & Notices' : 'Recados e Mensagens'}
+                  id="header-direct-messages-btn"
+                >
+                  <MessageSquare
+                    className={`w-4 h-4 sm:w-4.5 sm:h-4.5 group-hover:scale-105 transition-transform ${
+                      isMessagesOpen ? 'text-white' : 'text-[#062863]'
+                    }`}
+                  />
 
-                {/* Discrete Unread Indicator (Badge / Dot) */}
-                {unreadMessagesCount > 0 && (
-                  <span className="absolute -top-1 -right-1 flex h-3.5 w-3.5">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
-                    <span className="relative inline-flex rounded-full h-3.5 w-3.5 bg-[#1C4C96] text-white text-[8px] font-black items-center justify-center border border-white shadow-2xs">
-                      {unreadMessagesCount > 9 ? '9+' : unreadMessagesCount}
+                  {/* Discrete Unread Indicator (Badge / Dot) */}
+                  {unreadMessagesCount > 0 && (
+                    <span className="absolute -top-1 -right-1 flex h-3.5 w-3.5">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
+                      <span className="relative inline-flex rounded-full h-3.5 w-3.5 bg-[#1C4C96] text-white text-[8px] font-black items-center justify-center border border-white shadow-2xs">
+                        {unreadMessagesCount > 9 ? '9+' : unreadMessagesCount}
+                      </span>
                     </span>
-                  </span>
-                )}
-              </button>
+                  )}
+                </button>
 
-              {/* Direct Messages & Notices Dropdown / Popover */}
-              <HeaderMessagesPopover
-                isOpen={isMessagesOpen}
-                onClose={() => setIsMessagesOpen(false)}
-                currentAccount={currentAccount}
-                userProfile={userProfile}
-                tutors={tutors}
-                lessons={lessons}
-                students={students}
-                currentLanguage={navLanguage}
-                onUnreadChange={setUnreadMessagesCount}
-              />
-            </div>
+                {/* Direct Messages & Notices Dropdown / Popover */}
+                <HeaderMessagesPopover
+                  isOpen={isMessagesOpen}
+                  onClose={() => setIsMessagesOpen(false)}
+                  currentAccount={currentAccount}
+                  userProfile={userProfile}
+                  tutors={tutors}
+                  lessons={lessons}
+                  students={students}
+                  currentLanguage={navLanguage}
+                  onUnreadChange={setUnreadMessagesCount}
+                />
+              </div>
+            )}
 
             {currentAccount ? (
               <div className="relative" ref={userMenuRef}>
@@ -447,7 +449,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                     )}
 
                     {/* Find Native Friends / Tutors */}
-                    {onFindTutors && !isTeacher && (
+                    {onFindTutors && !isTeacher && !isAdmin && (
                       <button
                         type="button"
                         onClick={() => {
