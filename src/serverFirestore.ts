@@ -17,6 +17,17 @@ import {
   calculateFinancialPricingQuote,
   LessonPackageCalculation,
 } from './utils/financialEngine';
+import type { CreditLot } from './types';
+import {
+  CreditLedgerError,
+  computeActiveCreditLotIds,
+  reconcileStudentCreditLedger,
+  consumeUnitsFromLots,
+  refundUnitToExactLot,
+  buildPaidPackageLotData,
+  buildCourtesyGrantLotData,
+  buildCourtesyAdjustmentLotData,
+} from './utils/creditLots';
 
 /**
  * Active identifiers for staging persistence.
@@ -8071,16 +8082,91 @@ export interface ScheduleLessonServerResult {
   isTrialLesson?: boolean;
   onboardingCompleted?: boolean;
   error?: string;
+  code?: string;
   statusCode: number;
 }
 
 export class SchedulingTransactionError extends Error {
   statusCode: number;
-  constructor(message: string, statusCode: number = 500) {
+  code?: string;
+  constructor(message: string, statusCode: number = 500, code?: string) {
     super(message);
     this.name = 'SchedulingTransactionError';
     this.statusCode = statusCode;
+    if (code) {
+      this.code = code;
+    }
   }
+}
+
+/**
+ * NF.SWITCH.2A: Discovers and transactionally reads all credit_lots belonging to `studentUid`
+ * using the union of root query `where('studentUid', '==', studentUid)`, `studentData.activeCreditLotIds`,
+ * and any `extraLotIds` (e.g., `lesson.creditLotId`) so an incomplete index never hides active lots.
+ */
+async function loadStudentCreditLotsInTransaction(
+  db: Firestore,
+  transaction: any,
+  studentUid: string,
+  studentData: Record<string, any> | null,
+  extraLotIds: string[] = []
+): Promise<CreditLot[]> {
+  const creditLotsCol = db.collection('credit_lots');
+  const discoveredIds = new Set<string>();
+
+  if (typeof (creditLotsCol as any).where === 'function') {
+    const querySnap = await creditLotsCol.where('studentUid', '==', studentUid).get();
+    if (querySnap && typeof querySnap.forEach === 'function') {
+      querySnap.forEach((doc: any) => {
+        if (doc && typeof doc.id === 'string' && doc.id.trim()) {
+          discoveredIds.add(doc.id.trim());
+        }
+      });
+    } else if (querySnap && Array.isArray((querySnap as any).docs)) {
+      for (const doc of (querySnap as any).docs) {
+        if (doc && typeof doc.id === 'string' && doc.id.trim()) {
+          discoveredIds.add(doc.id.trim());
+        }
+      }
+    }
+  }
+
+  if (Array.isArray(studentData?.activeCreditLotIds)) {
+    for (const lotId of studentData.activeCreditLotIds) {
+      if (typeof lotId === 'string' && lotId.trim()) {
+        discoveredIds.add(lotId.trim());
+      }
+    }
+  }
+
+  for (const extraId of extraLotIds) {
+    if (typeof extraId === 'string' && extraId.trim()) {
+      discoveredIds.add(extraId.trim());
+    }
+  }
+
+  const orderedIds = Array.from(discoveredIds).sort();
+  if (orderedIds.length === 0) {
+    return [];
+  }
+
+  const lotSnaps = await Promise.all(
+    orderedIds.map((lotId) => transaction.get(creditLotsCol.doc(lotId)))
+  );
+
+  const lots: CreditLot[] = [];
+  for (let i = 0; i < lotSnaps.length; i++) {
+    const snap = lotSnaps[i];
+    if (snap && snap.exists) {
+      const data = snap.data() || {};
+      lots.push({
+        ...data,
+        id: snap.id || orderedIds[i],
+      } as CreditLot);
+    }
+  }
+
+  return lots;
 }
 
 /**
@@ -8429,6 +8515,11 @@ export async function scheduleLessonAtomicServer(
       // D. VALIDATE BALANCE AND ELIGIBILITY INSIDE TRANSACTION
       let newAvailable: number;
       let newContracted: number;
+      let consumedAllocation: { lotId: string; origin: CreditLot['origin']; sourceType: CreditLot['sourceType'] } | null = null;
+      let creditLotsToWrite: CreditLot[] = [];
+      let nextCreditLotsInitializedAt: string | undefined;
+      let nextActiveCreditLotIds: string[] | undefined;
+      let nextCreditLotSequence: number | undefined;
 
       if (isTrialLesson) {
         if (studentData.hasCompletedTrialLesson === true) {
@@ -8464,6 +8555,47 @@ export async function scheduleLessonAtomicServer(
           );
         }
 
+        // NF.SWITCH.2A: Load all student credit lots, enforce single-time hydration / divergence check,
+        // and consume 1 unit strictly following Q1 priority (courtesy -> paid -> legacy_unreconciled).
+        const existingLots = await loadStudentCreditLotsInTransaction(
+          db,
+          transaction,
+          studentAuthUid,
+          studentData
+        );
+        const reconciled = reconcileStudentCreditLedger({
+          studentUid: studentAuthUid,
+          studentEmail: cleanStudentEmail || studentData.email || '',
+          studentData,
+          existingLots,
+          beforeAvailable: studentData.availableLessons,
+          nowIso,
+        });
+        const consumed = consumeUnitsFromLots({
+          lots: reconciled.lots,
+          units: 1,
+          nowIso,
+        });
+
+        const firstAlloc = consumed.allocations[0];
+        consumedAllocation = {
+          lotId: firstAlloc.lotId,
+          origin: firstAlloc.origin,
+          sourceType: firstAlloc.sourceType,
+        };
+
+        const lotsWriteMap = new Map<string, CreditLot>();
+        if (reconciled.createdLegacyLot) {
+          lotsWriteMap.set(reconciled.createdLegacyLot.id, reconciled.createdLegacyLot);
+        }
+        for (const mutated of consumed.mutatedLots) {
+          lotsWriteMap.set(mutated.id, mutated);
+        }
+        creditLotsToWrite = Array.from(lotsWriteMap.values());
+        nextCreditLotsInitializedAt = reconciled.creditLotsInitializedAt;
+        nextActiveCreditLotIds = computeActiveCreditLotIds(consumed.lots);
+        nextCreditLotSequence = reconciled.nextLotSequence;
+
         newAvailable = studentData.availableLessons - 1;
         newContracted = typeof studentData.contractedLessons === 'number'
           ? studentData.contractedLessons
@@ -8488,11 +8620,21 @@ export async function scheduleLessonAtomicServer(
         meetLink: resolvedMeetLink,
         status: 'scheduled',
         isTrialLesson: Boolean(isTrialLesson),
+        ...(consumedAllocation
+          ? {
+              creditLotId: consumedAllocation.lotId,
+              creditOrigin: consumedAllocation.origin,
+              creditSourceType: consumedAllocation.sourceType,
+            }
+          : {}),
         createdAt: nowIso,
         updatedAt: nowIso,
       };
 
       // F. ATOMIC WRITES
+      for (const lotToWrite of creditLotsToWrite) {
+        transaction.set(db.collection('credit_lots').doc(lotToWrite.id), lotToWrite, { merge: true });
+      }
       transaction.set(lessonRef, sanitizedLesson, { merge: true });
       transaction.set(studentSubLessonRef, sanitizedLesson, { merge: true });
       transaction.set(teacherUserSubLessonRef, sanitizedLesson, { merge: true });
@@ -8530,6 +8672,13 @@ export async function scheduleLessonAtomicServer(
           onboardingCompleted: isTrialLesson ? true : Boolean(studentData.onboardingCompleted ?? true),
           contractedLessons: newContracted,
           availableLessons: newAvailable,
+          ...(nextCreditLotsInitializedAt !== undefined
+            ? {
+                creditLotsInitializedAt: nextCreditLotsInitializedAt,
+                activeCreditLotIds: nextActiveCreditLotIds,
+                creditLotSequence: nextCreditLotSequence,
+              }
+            : {}),
           updatedAt: nowIso,
         },
         { merge: true }
@@ -8551,10 +8700,20 @@ export async function scheduleLessonAtomicServer(
       };
     });
   } catch (txErr: any) {
+    if (txErr instanceof CreditLedgerError) {
+      return {
+        success: false,
+        error: txErr.message,
+        code: txErr.code,
+        statusCode: txErr.statusCode,
+      };
+    }
+
     if (txErr instanceof SchedulingTransactionError) {
       return {
         success: false,
         error: txErr.message,
+        ...(txErr.code ? { code: txErr.code } : {}),
         statusCode: txErr.statusCode,
       };
     }
@@ -8917,10 +9076,20 @@ async function hasFirestoreLessonConflict(params: {
 }
 
 function mapLessonTxError(err: any, actionLabel: string): LessonLifecycleResult {
+  if (err instanceof CreditLedgerError) {
+    return {
+      success: false,
+      error: err.message,
+      code: err.code,
+      statusCode: err.statusCode,
+    };
+  }
+
   if (err instanceof SchedulingTransactionError) {
     return {
       success: false,
       error: err.message,
+      ...(err.code ? { code: err.code } : {}),
       statusCode: err.statusCode,
     };
   }
@@ -9219,8 +9388,55 @@ export async function markLessonNotCompletedAtomicServer(
 
       let nextAvailable = typeof studentData?.availableLessons === 'number' ? studentData.availableLessons : undefined;
       let actuallyRefunded = false;
+      let creditLotsToWrite: CreditLot[] = [];
+      let refundedLotMeta: { lotId: string; origin: CreditLot['origin'] } | null = null;
+      let nextCreditLotsInitializedAt: string | undefined;
+      let nextActiveCreditLotIds: string[] | undefined;
+      let nextCreditLotSequence: number | undefined;
 
-      if (shouldRefund && refs.studentRef && studentData && typeof studentData.availableLessons === 'number') {
+      if (shouldRefund && refs.studentRef && refs.validStudentUid && studentData && typeof studentData.availableLessons === 'number') {
+        const extraLotIds = typeof latest.creditLotId === 'string' && latest.creditLotId.trim()
+          ? [latest.creditLotId.trim()]
+          : [];
+        const existingLots = await loadStudentCreditLotsInTransaction(
+          db,
+          transaction,
+          refs.validStudentUid,
+          studentData,
+          extraLotIds
+        );
+        const reconciled = reconcileStudentCreditLedger({
+          studentUid: refs.validStudentUid,
+          studentEmail: studentData.email || latest.studentEmail || '',
+          studentData,
+          existingLots,
+          beforeAvailable: studentData.availableLessons,
+          nowIso,
+        });
+        const refundRes = refundUnitToExactLot({
+          studentUid: refs.validStudentUid,
+          studentEmail: studentData.email || latest.studentEmail || '',
+          lots: reconciled.lots,
+          targetLotId: typeof latest.creditLotId === 'string' ? latest.creditLotId : null,
+          wasFirstInitialization: reconciled.wasFirstInitialization,
+          nextLotSequence: reconciled.nextLotSequence,
+          nowIso,
+        });
+
+        const lotsWriteMap = new Map<string, CreditLot>();
+        if (reconciled.createdLegacyLot) {
+          lotsWriteMap.set(reconciled.createdLegacyLot.id, reconciled.createdLegacyLot);
+        }
+        lotsWriteMap.set(refundRes.refundedLot.id, refundRes.refundedLot);
+        creditLotsToWrite = Array.from(lotsWriteMap.values());
+
+        refundedLotMeta = {
+          lotId: refundRes.refundedLot.id,
+          origin: refundRes.refundedLot.origin,
+        };
+        nextCreditLotsInitializedAt = reconciled.creditLotsInitializedAt;
+        nextActiveCreditLotIds = computeActiveCreditLotIds(refundRes.lots);
+        nextCreditLotSequence = refundRes.nextLotSequence;
         nextAvailable = studentData.availableLessons + 1;
         actuallyRefunded = true;
       }
@@ -9236,9 +9452,16 @@ export async function markLessonNotCompletedAtomicServer(
       if (actuallyRefunded) {
         updates.creditRefunded = true;
         updates.creditRefundedAt = nowIso;
+        if (refundedLotMeta) {
+          updates.refundedCreditLotId = refundedLotMeta.lotId;
+          updates.refundedCreditOrigin = refundedLotMeta.origin;
+        }
       }
 
       const mergedLesson = { ...latest, ...updates, id: lessonId };
+      for (const lotToWrite of creditLotsToWrite) {
+        transaction.set(db.collection('credit_lots').doc(lotToWrite.id), lotToWrite, { merge: true });
+      }
       transaction.set(lessonRef, updates, { merge: true });
       if (refs.studentSubLessonRef) {
         transaction.set(refs.studentSubLessonRef, mergedLesson, { merge: true });
@@ -9254,6 +9477,11 @@ export async function markLessonNotCompletedAtomicServer(
         const studentPatch: Record<string, any> = { updatedAt: nowIso };
         if (actuallyRefunded && nextAvailable !== undefined) {
           studentPatch.availableLessons = nextAvailable;
+          if (nextCreditLotsInitializedAt !== undefined) {
+            studentPatch.creditLotsInitializedAt = nextCreditLotsInitializedAt;
+            studentPatch.activeCreditLotIds = nextActiveCreditLotIds;
+            studentPatch.creditLotSequence = nextCreditLotSequence;
+          }
         }
         const nextScheduled = updateUserScheduledLessonsArray(studentData, lessonId, updates, true);
         if (nextScheduled !== undefined) {
@@ -9863,8 +10091,55 @@ export async function cancelLessonAtomicServer(
 
       let nextAvailable = typeof studentData?.availableLessons === 'number' ? studentData.availableLessons : undefined;
       let actuallyRefunded = false;
+      let creditLotsToWrite: CreditLot[] = [];
+      let refundedLotMeta: { lotId: string; origin: CreditLot['origin'] } | null = null;
+      let nextCreditLotsInitializedAt: string | undefined;
+      let nextActiveCreditLotIds: string[] | undefined;
+      let nextCreditLotSequence: number | undefined;
 
-      if (shouldRefund && refs.studentRef && studentData && typeof studentData.availableLessons === 'number') {
+      if (shouldRefund && refs.studentRef && refs.validStudentUid && studentData && typeof studentData.availableLessons === 'number') {
+        const extraLotIds = typeof latest.creditLotId === 'string' && latest.creditLotId.trim()
+          ? [latest.creditLotId.trim()]
+          : [];
+        const existingLots = await loadStudentCreditLotsInTransaction(
+          db,
+          transaction,
+          refs.validStudentUid,
+          studentData,
+          extraLotIds
+        );
+        const reconciled = reconcileStudentCreditLedger({
+          studentUid: refs.validStudentUid,
+          studentEmail: studentData.email || latest.studentEmail || '',
+          studentData,
+          existingLots,
+          beforeAvailable: studentData.availableLessons,
+          nowIso,
+        });
+        const refundRes = refundUnitToExactLot({
+          studentUid: refs.validStudentUid,
+          studentEmail: studentData.email || latest.studentEmail || '',
+          lots: reconciled.lots,
+          targetLotId: typeof latest.creditLotId === 'string' ? latest.creditLotId : null,
+          wasFirstInitialization: reconciled.wasFirstInitialization,
+          nextLotSequence: reconciled.nextLotSequence,
+          nowIso,
+        });
+
+        const lotsWriteMap = new Map<string, CreditLot>();
+        if (reconciled.createdLegacyLot) {
+          lotsWriteMap.set(reconciled.createdLegacyLot.id, reconciled.createdLegacyLot);
+        }
+        lotsWriteMap.set(refundRes.refundedLot.id, refundRes.refundedLot);
+        creditLotsToWrite = Array.from(lotsWriteMap.values());
+
+        refundedLotMeta = {
+          lotId: refundRes.refundedLot.id,
+          origin: refundRes.refundedLot.origin,
+        };
+        nextCreditLotsInitializedAt = reconciled.creditLotsInitializedAt;
+        nextActiveCreditLotIds = computeActiveCreditLotIds(refundRes.lots);
+        nextCreditLotSequence = refundRes.nextLotSequence;
         nextAvailable = studentData.availableLessons + 1;
         actuallyRefunded = true;
       }
@@ -9882,9 +10157,16 @@ export async function cancelLessonAtomicServer(
       if (actuallyRefunded) {
         cancelUpdates.creditRefunded = true;
         cancelUpdates.creditRefundedAt = nowIso;
+        if (refundedLotMeta) {
+          cancelUpdates.refundedCreditLotId = refundedLotMeta.lotId;
+          cancelUpdates.refundedCreditOrigin = refundedLotMeta.origin;
+        }
       }
 
       const mergedLesson = { ...latest, ...cancelUpdates, id: lessonId };
+      for (const lotToWrite of creditLotsToWrite) {
+        transaction.set(db.collection('credit_lots').doc(lotToWrite.id), lotToWrite, { merge: true });
+      }
       transaction.set(lessonRef, cancelUpdates, { merge: true });
       if (refs.studentSubLessonRef) {
         transaction.set(refs.studentSubLessonRef, mergedLesson, { merge: true });
@@ -9900,6 +10182,11 @@ export async function cancelLessonAtomicServer(
         const studentPatch: Record<string, any> = { updatedAt: nowIso };
         if (actuallyRefunded && nextAvailable !== undefined) {
           studentPatch.availableLessons = nextAvailable;
+          if (nextCreditLotsInitializedAt !== undefined) {
+            studentPatch.creditLotsInitializedAt = nextCreditLotsInitializedAt;
+            studentPatch.activeCreditLotIds = nextActiveCreditLotIds;
+            studentPatch.creditLotSequence = nextCreditLotSequence;
+          }
         }
         const nextScheduled = updateUserScheduledLessonsArray(studentData, lessonId, cancelUpdates, true);
         if (nextScheduled !== undefined) {
@@ -10023,12 +10310,57 @@ export async function deleteLessonAtomicServer(
 
       let nextAvailable = typeof studentData?.availableLessons === 'number' ? studentData.availableLessons : undefined;
       let actuallyRefunded = false;
+      let creditLotsToWrite: CreditLot[] = [];
+      let nextCreditLotsInitializedAt: string | undefined;
+      let nextActiveCreditLotIds: string[] | undefined;
+      let nextCreditLotSequence: number | undefined;
 
-      if (shouldRefund && refs.studentRef && studentData && typeof studentData.availableLessons === 'number') {
+      if (shouldRefund && refs.studentRef && refs.validStudentUid && studentData && typeof studentData.availableLessons === 'number') {
+        const extraLotIds = typeof latest.creditLotId === 'string' && latest.creditLotId.trim()
+          ? [latest.creditLotId.trim()]
+          : [];
+        const existingLots = await loadStudentCreditLotsInTransaction(
+          db,
+          transaction,
+          refs.validStudentUid,
+          studentData,
+          extraLotIds
+        );
+        const reconciled = reconcileStudentCreditLedger({
+          studentUid: refs.validStudentUid,
+          studentEmail: studentData.email || latest.studentEmail || '',
+          studentData,
+          existingLots,
+          beforeAvailable: studentData.availableLessons,
+          nowIso,
+        });
+        const refundRes = refundUnitToExactLot({
+          studentUid: refs.validStudentUid,
+          studentEmail: studentData.email || latest.studentEmail || '',
+          lots: reconciled.lots,
+          targetLotId: typeof latest.creditLotId === 'string' ? latest.creditLotId : null,
+          wasFirstInitialization: reconciled.wasFirstInitialization,
+          nextLotSequence: reconciled.nextLotSequence,
+          nowIso,
+        });
+
+        const lotsWriteMap = new Map<string, CreditLot>();
+        if (reconciled.createdLegacyLot) {
+          lotsWriteMap.set(reconciled.createdLegacyLot.id, reconciled.createdLegacyLot);
+        }
+        lotsWriteMap.set(refundRes.refundedLot.id, refundRes.refundedLot);
+        creditLotsToWrite = Array.from(lotsWriteMap.values());
+
+        nextCreditLotsInitializedAt = reconciled.creditLotsInitializedAt;
+        nextActiveCreditLotIds = computeActiveCreditLotIds(refundRes.lots);
+        nextCreditLotSequence = refundRes.nextLotSequence;
         nextAvailable = studentData.availableLessons + 1;
         actuallyRefunded = true;
       }
 
+      for (const lotToWrite of creditLotsToWrite) {
+        transaction.set(db.collection('credit_lots').doc(lotToWrite.id), lotToWrite, { merge: true });
+      }
       transaction.delete(lessonRef);
       if (refs.studentSubLessonRef) {
         transaction.delete(refs.studentSubLessonRef);
@@ -10044,6 +10376,11 @@ export async function deleteLessonAtomicServer(
         const studentPatch: Record<string, any> = { updatedAt: nowIso };
         if (actuallyRefunded && nextAvailable !== undefined) {
           studentPatch.availableLessons = nextAvailable;
+          if (nextCreditLotsInitializedAt !== undefined) {
+            studentPatch.creditLotsInitializedAt = nextCreditLotsInitializedAt;
+            studentPatch.activeCreditLotIds = nextActiveCreditLotIds;
+            studentPatch.creditLotSequence = nextCreditLotSequence;
+          }
         }
         const nextScheduled = updateUserScheduledLessonsArray(studentData, lessonId, null, true);
         if (nextScheduled !== undefined) {
@@ -13288,6 +13625,61 @@ export async function adjustStudentCreditsAtomicServer(
       const afterContracted = Math.max(0, beforeContracted + delta);
       const cleanStudentEmail = String(studentData.email || '').toLowerCase().trim();
 
+      // NF.SWITCH.2A: Reconcile credit lots (single-time hydration or strict divergence check)
+      const existingLots = await loadStudentCreditLotsInTransaction(
+        db,
+        transaction,
+        cleanStudentUid,
+        studentData
+      );
+      const reconciled = reconcileStudentCreditLedger({
+        studentUid: cleanStudentUid,
+        studentEmail: cleanStudentEmail,
+        studentData,
+        existingLots,
+        beforeAvailable,
+        nowIso,
+      });
+
+      let nextSeq = reconciled.nextLotSequence;
+      let nextActiveCreditLotIds: string[];
+      const lotsWriteMap = new Map<string, CreditLot>();
+      if (reconciled.createdLegacyLot) {
+        lotsWriteMap.set(reconciled.createdLegacyLot.id, reconciled.createdLegacyLot);
+      }
+
+      let createdCourtesyLot: CreditLot | null = null;
+      let lotConsumptions: Array<{ lotId: string; origin: string; sourceType: string; units: number }> | undefined;
+
+      if (delta > 0) {
+        nextSeq += 1;
+        createdCourtesyLot = buildCourtesyAdjustmentLotData({
+          studentUid: cleanStudentUid,
+          studentEmail: cleanStudentEmail,
+          lessonsCount: delta,
+          lotSequence: nextSeq,
+          nowIso,
+          sourceTransactionId: txDocId,
+          idempotencyKey: cleanIdempotencyKey,
+          reason: cleanReason,
+          performedByUid: cleanAdminUid,
+          performedByEmail: cleanAdminEmail,
+        });
+        lotsWriteMap.set(createdCourtesyLot.id, createdCourtesyLot);
+        nextActiveCreditLotIds = computeActiveCreditLotIds([...reconciled.lots, createdCourtesyLot]);
+      } else {
+        const consumed = consumeUnitsFromLots({
+          lots: reconciled.lots,
+          units: Math.abs(delta),
+          nowIso,
+        });
+        for (const mutated of consumed.mutatedLots) {
+          lotsWriteMap.set(mutated.id, mutated);
+        }
+        lotConsumptions = consumed.allocations;
+        nextActiveCreditLotIds = computeActiveCreditLotIds(consumed.lots);
+      }
+
       const txRecord: Record<string, any> = {
         id: txDocId,
         type: 'ADMIN_CREDIT_ADJUSTMENT',
@@ -13301,6 +13693,13 @@ export async function adjustStudentCreditsAtomicServer(
         afterAvailableLessons: afterAvailable,
         beforeContractedLessons: beforeContracted,
         afterContractedLessons: afterContracted,
+        ...(createdCourtesyLot
+          ? {
+              creditLotId: createdCourtesyLot.id,
+              creditLotOrigin: createdCourtesyLot.origin,
+            }
+          : {}),
+        ...(lotConsumptions ? { lotConsumptions } : {}),
         performedByUid: cleanAdminUid,
         performedByEmail: cleanAdminEmail,
         performedByRole: 'admin',
@@ -13313,12 +13712,19 @@ export async function adjustStudentCreditsAtomicServer(
         createdAt: nowIso,
       };
 
-      // Update ONLY credit balance fields + updatedAt, preserving all links, trial flags, RBAC, and pedagogical fields
+      for (const lotToWrite of lotsWriteMap.values()) {
+        transaction.set(db.collection('credit_lots').doc(lotToWrite.id), lotToWrite, { merge: true });
+      }
+
+      // Update ONLY credit balance & credit lots ledger fields + updatedAt, preserving all links, trial flags, RBAC, and pedagogical fields
       transaction.set(
         studentRef,
         {
           availableLessons: afterAvailable,
           contractedLessons: afterContracted,
+          creditLotsInitializedAt: reconciled.creditLotsInitializedAt,
+          activeCreditLotIds: nextActiveCreditLotIds,
+          creditLotSequence: nextSeq,
           updatedAt: nowIso,
         },
         { merge: true }
@@ -13353,6 +13759,15 @@ export async function adjustStudentCreditsAtomicServer(
       transaction: txOutcome.transaction,
     };
   } catch (err: any) {
+    if (err instanceof CreditLedgerError) {
+      return {
+        success: false,
+        statusCode: err.statusCode,
+        code: err.code,
+        error: err.message,
+      };
+    }
+
     if (err instanceof AdminCreditAdjustmentError) {
       return {
         success: false,
@@ -13949,6 +14364,70 @@ export async function executePackageCreditOperationAtomicServer(
       const afterContracted = beforeContracted + lessonsCount;
       const cleanStudentEmail = String(studentData.email || params.studentEmail || '').toLowerCase().trim();
 
+      // NF.SWITCH.2A: Reconcile student credit ledger (single-time hydration or strict divergence check)
+      const existingLots = await loadStudentCreditLotsInTransaction(
+        db,
+        transaction,
+        cleanStudentUid,
+        studentData
+      );
+      const reconciled = reconcileStudentCreditLedger({
+        studentUid: cleanStudentUid,
+        studentEmail: cleanStudentEmail,
+        studentData,
+        existingLots,
+        beforeAvailable,
+        nowIso,
+      });
+
+      const nextSeq = reconciled.nextLotSequence + 1;
+      const newLot: CreditLot = wantsPaidPurchase
+        ? buildPaidPackageLotData({
+            studentUid: cleanStudentUid,
+            studentEmail: cleanStudentEmail,
+            lessonsCount,
+            lotSequence: nextSeq,
+            nowIso,
+            sourceTransactionId: txDocId,
+            idempotencyKey: cleanIdempotencyKey,
+            pricedTeacherUid: canonicalTeacherUid,
+            teacherEmail: finalTeacherEmail,
+            teacherName: finalTeacherName,
+            packageName: cleanPackageName,
+            basePriceUsd,
+            adminCommissionPercent,
+            commissionModel: ALLOWED_COMMISSION_MODEL,
+            commissionVersion,
+            ptaxRate: ptaxResult.ptaxRate,
+            ptaxQuoteDate: ptaxResult.quoteDate || '',
+            ptaxPricingDate: ptaxResult.pricingDate || '',
+            ptaxSource: ptaxResult.source || 'BACEN_PTAX_D1',
+            pkgCalc: pkgCalc!,
+            gatewayProvider: params.gatewayConfirmation!.gatewayProvider,
+            gatewayTransactionId: params.gatewayConfirmation!.gatewayTransactionId,
+            performedByUid: cleanActorUid,
+            performedByEmail: cleanActorEmail,
+            performedByRole: cleanActorRole,
+          })
+        : buildCourtesyGrantLotData({
+            studentUid: cleanStudentUid,
+            studentEmail: cleanStudentEmail,
+            lessonsCount,
+            lotSequence: nextSeq,
+            nowIso,
+            sourceTransactionId: txDocId,
+            idempotencyKey: cleanIdempotencyKey,
+            pricedTeacherUid: canonicalTeacherUid,
+            teacherEmail: finalTeacherEmail,
+            teacherName: finalTeacherName,
+            packageName: cleanPackageName,
+            performedByUid: cleanActorUid,
+            performedByEmail: cleanActorEmail,
+            performedByRole: cleanActorRole,
+          });
+
+      const nextActiveCreditLotIds = computeActiveCreditLotIds([...reconciled.lots, newLot]);
+
       // Check existing pedagogical links on users/{uid} and student_assignments/{uid}
       const existingStudentTeacherUid =
         [
@@ -13973,6 +14452,7 @@ export async function executePackageCreditOperationAtomicServer(
         ...processedPurchases,
         [cleanIdempotencyKey]: {
           transactionId: txDocId,
+          creditLotId: newLot.id,
           lessonsAdded: lessonsCount,
           contractedLessons: afterContracted,
           availableLessons: afterAvailable,
@@ -13988,6 +14468,9 @@ export async function executePackageCreditOperationAtomicServer(
         enrollmentStatus: 'active',
         subscriptionType: 'package',
         processedPurchases: updatedProcessedPurchases,
+        creditLotsInitializedAt: reconciled.creditLotsInitializedAt,
+        activeCreditLotIds: nextActiveCreditLotIds,
+        creditLotSequence: nextSeq,
         updatedAt: nowIso,
       };
 
@@ -14022,6 +14505,8 @@ export async function executePackageCreditOperationAtomicServer(
         type: wantsPaidPurchase ? 'PACKAGE_PURCHASE' : 'ADMIN_PACKAGE_GRANT',
         category: wantsPaidPurchase ? 'paid_package_purchase' : 'administrative_package_grant',
         origin: wantsPaidPurchase ? 'gateway_verified_purchase' : 'admin_grant',
+        creditLotId: newLot.id,
+        creditLotOrigin: newLot.origin,
         idempotencyKey: cleanIdempotencyKey,
         studentUid: cleanStudentUid,
         studentEmail: cleanStudentEmail,
@@ -14087,6 +14572,10 @@ export async function executePackageCreditOperationAtomicServer(
         createdAt: nowIso,
       };
 
+      if (reconciled.createdLegacyLot) {
+        transaction.set(db.collection('credit_lots').doc(reconciled.createdLegacyLot.id), reconciled.createdLegacyLot, { merge: true });
+      }
+      transaction.set(db.collection('credit_lots').doc(newLot.id), newLot, { merge: true });
       transaction.set(studentRef, studentUpdate, { merge: true });
       transaction.set(txRef, txRecord);
 
@@ -14147,6 +14636,15 @@ export async function executePackageCreditOperationAtomicServer(
       transaction: txOutcome.transaction,
     };
   } catch (err: any) {
+    if (err instanceof CreditLedgerError) {
+      return {
+        success: false,
+        statusCode: err.statusCode,
+        code: err.code,
+        error: err.message,
+      };
+    }
+
     if (err instanceof PackageCreditOperationError) {
       return {
         success: false,

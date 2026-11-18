@@ -405,6 +405,10 @@ export interface UserProfile {
   studentJournal?: StudentJournalEntry[];
   watchedVideosHistory?: any[];
   listenedTracksHistory?: any[];
+  // NF.SWITCH.2A: Credit lots atomic ledger state
+  creditLotsInitializedAt?: string;
+  activeCreditLotIds?: string[];
+  creditLotSequence?: number;
 }
 
 export interface StudentProfile {
@@ -641,6 +645,10 @@ export interface LiveLesson {
   driveLastSyncedAt?: string;
   contentRevision?: number;
   revisionToken?: string;
+  // NF.SWITCH.2A: Exact credit lot provenance for atomic consumption and exact-lot refund
+  creditLotId?: string;
+  creditOrigin?: CreditLotOrigin;
+  creditSourceType?: CreditLotSourceType | string;
 }
 
 export interface TeacherOriginalNotes {
@@ -1021,3 +1029,75 @@ export interface WritingEvaluationResult {
   isAiUnavailable?: boolean;
   improvements?: WordFeedback[];
 }
+
+export type CreditLotOrigin = 'courtesy' | 'paid' | 'legacy_unreconciled';
+
+export type CreditLotSourceType =
+  | 'PACKAGE_PURCHASE'
+  | 'ADMIN_PACKAGE_GRANT'
+  | 'ADMIN_CREDIT_ADJUSTMENT'
+  | 'LEGACY_INITIAL_HYDRATION';
+
+export type CreditLotStatus = 'active' | 'exhausted';
+
+export type CreditLotFinancialAttributionStatus =
+  | 'paid_verified'
+  | 'courtesy_non_revenue'
+  | 'unreconciled_no_presumed_value';
+
+export interface CreditLot {
+  id: string;
+  studentUid: string;
+  studentEmail?: string;
+  origin: CreditLotOrigin;
+  sourceType: CreditLotSourceType;
+  status: CreditLotStatus;
+  initialLessons: number;
+  remainingLessons: number;
+  consumedLessons: number;
+  lotSequence: number;
+  createdAt: string;
+  updatedAt: string;
+  exhaustedAt?: string | null;
+  lastConsumedAt?: string | null;
+  lastRefundedAt?: string | null;
+  sourceTransactionId?: string | null;
+  idempotencyKey?: string | null;
+  pricedTeacherUid?: string | null;
+  teacherEmail?: string | null;
+  teacherName?: string | null;
+  packageName?: string | null;
+  packageLessons?: number | null;
+  isPaidPurchase: boolean;
+  countsAsRevenue: boolean;
+  financialAttributionStatus: CreditLotFinancialAttributionStatus;
+  currency: string | null;
+  basePriceUsd: number | null;
+  adminCommissionPercent: number | null;
+  commissionModel: string | null;
+  commissionVersion: number | null;
+  ptaxRate: number | null;
+  ptaxQuoteDate?: string | null;
+  ptaxPricingDate?: string | null;
+  ptaxSource?: string | null;
+  discountPercent: number | null;
+  totalPaidBrl: number | null;
+  totalPaidUsd: number | null;
+  unitPriceBrl: number | null;
+  unitPriceUsd: number | null;
+  teacherShareBrl: number | null;
+  teacherShareUsd: number | null;
+  teacherLessonShareBrl: number | null;
+  teacherLessonShareUsd: number | null;
+  platformRevenueBrl: number | null;
+  platformRevenueUsd: number | null;
+  platformLessonRevenueBrl: number | null;
+  platformLessonRevenueUsd: number | null;
+  gatewayProvider?: string | null;
+  gatewayTransactionId?: string | null;
+  reason?: string | null;
+  performedByUid?: string | null;
+  performedByEmail?: string | null;
+  performedByRole?: string | null;
+}
+

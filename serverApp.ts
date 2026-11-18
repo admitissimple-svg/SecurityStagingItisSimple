@@ -11106,6 +11106,7 @@ app.post('/api/lessons/schedule', firebaseAuthMiddleware, async (req, res) => {
       return res.status(result.statusCode || 400).json({
         error: result.error,
         message: result.error,
+        ...(result.code ? { code: result.code } : {}),
       });
     }
 
@@ -11249,6 +11250,7 @@ app.post(['/api/lessons', '/api/live-lessons'], firebaseAuthMiddleware, async (r
       return res.status(result.statusCode || 400).json({
         error: result.error,
         message: result.error,
+        ...(result.code ? { code: result.code } : {}),
       });
     }
 
@@ -11275,7 +11277,11 @@ app.post('/api/lessons/:id/complete', firebaseAuthMiddleware, async (req, res) =
     callerEmailVerified: req.user.email_verified,
   });
   if (!result.success) {
-    return res.status(result.statusCode).json({ error: result.error, message: result.error });
+    return res.status(result.statusCode).json({
+      error: result.error,
+      message: result.error,
+      ...(result.code ? { code: result.code } : {}),
+    });
   }
   return res.status(200).json({
     success: true,
@@ -11300,7 +11306,11 @@ app.post('/api/lessons/:id/not-completed', firebaseAuthMiddleware, async (req, r
     reason,
   });
   if (!result.success) {
-    return res.status(result.statusCode).json({ error: result.error, message: result.error });
+    return res.status(result.statusCode).json({
+      error: result.error,
+      message: result.error,
+      ...(result.code ? { code: result.code } : {}),
+    });
   }
   return res.status(200).json({
     success: true,
@@ -11396,7 +11406,11 @@ app.post('/api/lessons/:id/cancel', firebaseAuthMiddleware, async (req, res) => 
     reason,
   });
   if (!result.success) {
-    return res.status(result.statusCode).json({ error: result.error, message: result.error });
+    return res.status(result.statusCode).json({
+      error: result.error,
+      message: result.error,
+      ...(result.code ? { code: result.code } : {}),
+    });
   }
   return res.status(200).json({
     success: true,
@@ -18618,7 +18632,11 @@ app.delete(['/api/lessons/:id', '/api/live-lessons/:id'], firebaseAuthMiddleware
     callerEmailVerified: req.user.email_verified,
   });
   if (!result.success) {
-    return res.status(result.statusCode).json({ error: result.error, message: result.error });
+    return res.status(result.statusCode).json({
+      error: result.error,
+      message: result.error,
+      ...(result.code ? { code: result.code } : {}),
+    });
   }
   return res.status(200).json({
     success: true,
