@@ -4,6 +4,11 @@ import path from 'path';
 import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
+  const isAiStudioPreview =
+    process.env.DISABLE_HMR === 'true' ||
+    Boolean(process.env.K_SERVICE?.startsWith('ais-')) ||
+    Boolean(process.env.APP_URL?.includes('ais-'));
+
   return {
     plugins: [react(), tailwindcss()],
     resolve: {
@@ -12,11 +17,10 @@ export default defineConfig(() => {
       },
     },
     server: {
-      // HMR is disabled in AI Studio via DISABLE_HMR env var.
-      // Do not modify—file watching is disabled to prevent flickering during agent edits.
-      hmr: process.env.DISABLE_HMR !== 'true',
-      // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
-      watch: process.env.DISABLE_HMR === 'true' ? null : {},
+      // HMR is disabled in AI Studio preview environments to avoid port 24678 WS collisions and watcher overhead.
+      hmr: isAiStudioPreview ? false : process.env.DISABLE_HMR !== 'true',
+      ws: isAiStudioPreview ? (false as const) : undefined,
+      watch: isAiStudioPreview ? null : {},
     },
   };
 });

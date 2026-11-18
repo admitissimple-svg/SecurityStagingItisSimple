@@ -80,7 +80,11 @@ import { TeacherSpotifyRoutineTracker } from './components/TeacherSpotifyRoutine
 import { TeacherMediaAssignmentPanel } from './components/TeacherMediaAssignmentPanel';
 import { SFluencyTracker } from './components/SFluencyTracker';
 import { NotificationBanner } from './components/NotificationBanner';
-import { StudentHeaderSection } from './components/StudentHeaderSection';
+import {
+  StudentHeaderSection,
+  AdminCreditAdjustmentOptions,
+  AdminCreditAdjustmentResponse,
+} from './components/StudentHeaderSection';
 import { StudentRoutineGuideSection } from './components/StudentRoutineGuideSection';
 import { StudentWeeklyActivitySection } from './components/StudentWeeklyActivitySection';
 
@@ -784,9 +788,25 @@ export default function App() {
   const [activeStudentActivity, setActiveStudentActivity] = useState<'insights' | 'notes' | 'videos_songs' | null>(null);
   const [videosAndSongsSubTab, setVideosAndSongsSubTab] = useState<'videos' | 'songs'>('videos');
 
+  // FIN.2D.2A: Admin-only manual credit adjustment UI state in filtered student workspace
+  const [adminCreditEditOpen, setAdminCreditEditOpen] = useState<boolean>(false);
+  const [adminCreditInputVal, setAdminCreditInputVal] = useState<number>(0);
+  const [adminCreditReason, setAdminCreditReason] = useState<string>('');
+  const [adminCreditSaving, setAdminCreditSaving] = useState<boolean>(false);
+  const [adminCreditFeedback, setAdminCreditFeedback] = useState<{
+    type: 'success' | 'error';
+    message: string;
+  } | null>(null);
+  const adminCreditSubmittingRef = useRef<boolean>(false);
+  const adminCreditIdempKeyRef = useRef<string | null>(null);
+
   const handleSelectStudentFilter = (studentEmail: string) => {
     setSelectedStudentFilter(studentEmail);
     setActiveStudentActivity(null);
+    setAdminCreditEditOpen(false);
+    setAdminCreditReason('');
+    setAdminCreditFeedback(null);
+    adminCreditIdempKeyRef.current = null;
     if (studentEmail !== 'all') {
       setTimeout(() => {
         const el = document.getElementById('filtered-student-workspace');
@@ -3382,32 +3402,34 @@ export default function App() {
         ? Number(txResult.availableLessons)
         : (txResult.profile?.availableLessons !== undefined ? Number(txResult.profile.availableLessons) : newCount);
 
-      // Align weekly live lesson target with purchased frequency (4 -> 1x, 8 -> 2x, 12 -> 3x)
-      let newWeeklyTarget = userProfile.weeklyNativeLessonsTarget || 1;
-      if (params.packageLessons === 4) newWeeklyTarget = 1;
-      else if (params.packageLessons === 8) newWeeklyTarget = 2;
-      else if (params.packageLessons === 12) newWeeklyTarget = 3;
-
       const authoritativeTeacherUid =
         txResult.teacherUid ||
         txResult.profile?.teacherUid ||
         canonicalTeacherUid ||
         '';
 
-      // Update userProfile with fixed teacher, package subscription, and updated lesson balances
-      setUserProfile((prev) => ({
-        ...prev,
-        subscriptionType: 'package',
-        contractedLessons: newCount,
-        availableLessons: authoritativeAvailable,
-        teacherEmail: cleanTeacherEmail || txResult.profile?.teacherEmail || prev.teacherEmail,
-        teacherName: cleanTeacherName || txResult.profile?.teacherName || prev.teacherName,
-        teacherUid: authoritativeTeacherUid || prev.teacherUid,
-        assignedNativeFriendUID: authoritativeTeacherUid || prev.assignedNativeFriendUID,
-        nativeFriendUID: authoritativeTeacherUid || prev.nativeFriendUID,
-        enrollmentStatus: 'active',
-        weeklyNativeLessonsTarget: newWeeklyTarget,
-      }));
+      // Update userProfile preserving existing pedagogical links and weeklyNativeLessonsTarget
+      setUserProfile((prev) => {
+        const hasExistingLink = Boolean(
+          prev.teacherUid || prev.assignedNativeFriendUID || prev.nativeFriendUID
+        );
+        return {
+          ...prev,
+          subscriptionType: 'package',
+          contractedLessons: newCount,
+          availableLessons: authoritativeAvailable,
+          ...(hasExistingLink
+            ? {}
+            : {
+                teacherEmail: cleanTeacherEmail || txResult.profile?.teacherEmail || prev.teacherEmail,
+                teacherName: cleanTeacherName || txResult.profile?.teacherName || prev.teacherName,
+                teacherUid: authoritativeTeacherUid || prev.teacherUid,
+                assignedNativeFriendUID: authoritativeTeacherUid || prev.assignedNativeFriendUID,
+                nativeFriendUID: authoritativeTeacherUid || prev.nativeFriendUID,
+              }),
+          enrollmentStatus: 'active',
+        };
+      });
 
       // Clear any pending trial intent on package purchase
       setScheduleStudentInfo(null);
@@ -3418,24 +3440,29 @@ export default function App() {
         [currentAccount.email.toLowerCase()]: newCount,
       }));
 
-      // Update students state list
+      // Update students state list without overwriting existing pedagogical links or weeklyNativeLessonsTarget
       setStudents((prev) => {
         const cleanEmail = currentAccount.email.toLowerCase().trim();
         const exists = prev.some((st) => (st.email || st.studentEmail || '').toLowerCase().trim() === cleanEmail);
         if (exists) {
-          return prev.map((st) =>
-            (st.email || st.studentEmail || '').toLowerCase().trim() === cleanEmail
-              ? {
-                  ...st,
-                  teacherEmail: cleanTeacherEmail || txResult.profile?.teacherEmail || (st as any).teacherEmail,
-                  teacherName: cleanTeacherName || txResult.profile?.teacherName || st.teacherName,
-                  teacherUid: authoritativeTeacherUid || (st as any).teacherUid,
-                  contractedLessons: newCount,
-                  weeklyNativeLessonsTarget: newWeeklyTarget,
-                  status: 'active',
-                }
-              : st
-          );
+          return prev.map((st) => {
+            if ((st.email || st.studentEmail || '').toLowerCase().trim() !== cleanEmail) return st;
+            const stHasLink = Boolean(
+              (st as any).teacherUid || (st as any).assignedNativeFriendUID || (st as any).nativeFriendUID
+            );
+            return {
+              ...st,
+              ...(stHasLink
+                ? {}
+                : {
+                    teacherEmail: cleanTeacherEmail || txResult.profile?.teacherEmail || (st as any).teacherEmail,
+                    teacherName: cleanTeacherName || txResult.profile?.teacherName || st.teacherName,
+                    teacherUid: authoritativeTeacherUid || (st as any).teacherUid,
+                  }),
+              contractedLessons: newCount,
+              status: 'active',
+            };
+          });
         }
         return [
           ...prev,
@@ -3449,7 +3476,7 @@ export default function App() {
             teacherName: cleanTeacherName || txResult.profile?.teacherName || '',
             teacherUid: authoritativeTeacherUid,
             contractedLessons: newCount,
-            weeklyNativeLessonsTarget: newWeeklyTarget,
+            weeklyNativeLessonsTarget: userProfile.weeklyNativeLessonsTarget,
             status: 'active',
             level: userProfile.level || EnglishLevel.BEGINNER,
           },
@@ -3681,44 +3708,120 @@ export default function App() {
     }));
   };
 
-  // Handler: Update contracted lessons (Admin-only authoritative Firestore mutation)
-  const handleUpdateContractedLessons = async (studentEmail: string, count: number): Promise<boolean> => {
+  // Handler: Update contracted lessons (Admin-only authoritative Firestore atomic adjustment)
+  const handleUpdateContractedLessons = async (
+    studentEmail: string,
+    count: number,
+    options?: AdminCreditAdjustmentOptions
+  ): Promise<AdminCreditAdjustmentResponse> => {
     if (!currentAccount || currentAccount.role !== 'admin') {
       console.warn('[RBAC] Somente administradores podem alterar saldos contratuais.');
-      return false;
+      return {
+        success: false,
+        error: 'FORBIDDEN',
+        message: 'Somente administradores podem realizar ajuste manual de créditos.',
+      };
     }
 
     const cleanEmail = (studentEmail || '').toLowerCase().trim();
-    const matchedStudent = students.find(
-      (s) => (s.email || s.studentEmail || '').toLowerCase().trim() === cleanEmail
-    );
+    const matchedStudent =
+      studentsList.find(
+        (s) =>
+          (cleanEmail && (s.email || (s as any).studentEmail || '').toLowerCase().trim() === cleanEmail) ||
+          (options?.studentUid && (s.uid === options.studentUid || s.id === options.studentUid))
+      ) ||
+      students.find(
+        (s) =>
+          (cleanEmail && (s.email || s.studentEmail || '').toLowerCase().trim() === cleanEmail) ||
+          (options?.studentUid && (s.uid === options.studentUid || s.id === options.studentUid))
+      );
+
     const targetStudentUid =
+      (options?.studentUid && isValidCanonicalUid(options.studentUid) ? options.studentUid : undefined) ||
       (matchedStudent?.uid && isValidCanonicalUid(matchedStudent.uid) ? matchedStudent.uid : undefined) ||
+      ((matchedStudent as any)?.studentUid && isValidCanonicalUid((matchedStudent as any).studentUid)
+        ? (matchedStudent as any).studentUid
+        : undefined) ||
       (matchedStudent?.id && isValidCanonicalUid(matchedStudent.id) ? matchedStudent.id : undefined);
+
+    if (!targetStudentUid || !isValidCanonicalUid(targetStudentUid)) {
+      const msg =
+        currentLanguage === 'en'
+          ? 'Valid canonical student UID is required to adjust credits.'
+          : 'UID canônico válido do aluno é obrigatório para ajustar créditos.';
+      setNotifications((prev) => [
+        {
+          id: `contract-err-${Date.now()}`,
+          title: currentLanguage === 'en' ? 'Invalid Student UID' : 'UID do Aluno Inválido',
+          message: msg,
+          type: 'error',
+          timestamp: new Date().toISOString(),
+          read: false,
+        },
+        ...prev,
+      ]);
+      return { success: false, error: 'CANONICAL_UID_REQUIRED', message: msg };
+    }
+
+    const currentContracted =
+      typeof (matchedStudent as any)?.contractedLessons === 'number'
+        ? (matchedStudent as any).contractedLessons
+        : typeof contractedLessons[cleanEmail] === 'number'
+        ? contractedLessons[cleanEmail]
+        : 0;
+    const delta =
+      typeof options?.delta === 'number' && Number.isInteger(options.delta)
+        ? options.delta
+        : Math.trunc(count) - currentContracted;
+
+    if (!Number.isInteger(delta) || delta === 0) {
+      const msg =
+        currentLanguage === 'en'
+          ? 'Adjustment delta must be a non-zero integer.'
+          : 'O ajuste (delta) deve ser um número inteiro diferente de zero.';
+      return { success: false, error: 'INVALID_DELTA', message: msg };
+    }
+
+    const cleanReason = typeof options?.reason === 'string' ? options.reason.trim() : '';
+    if (!cleanReason) {
+      const msg =
+        currentLanguage === 'en'
+          ? 'Reason is required for administrative credit adjustment.'
+          : 'Motivo é obrigatório para o ajuste administrativo de créditos.';
+      return { success: false, error: 'REASON_REQUIRED', message: msg };
+    }
+
+    const idempotencyKey =
+      typeof options?.idempotencyKey === 'string' && options.idempotencyKey.trim()
+        ? options.idempotencyKey.trim()
+        : typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? `adm-adj-${crypto.randomUUID()}`
+        : `adm-adj-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
     try {
       const idToken =
         (await auth.currentUser?.getIdToken().catch(() => null)) ||
         (await getAccessToken().catch(() => null));
       if (!idToken) {
+        const msg =
+          currentLanguage === 'en'
+            ? 'Could not verify administrator session to update credits.'
+            : 'Não foi possível verificar a sessão de administrador para alterar créditos.';
         setNotifications((prev) => [
           {
             id: `contract-auth-err-${Date.now()}`,
             title: currentLanguage === 'en' ? 'Authentication Required' : 'Autenticação Necessária',
-            message:
-              currentLanguage === 'en'
-                ? 'Could not verify administrator session to update credits.'
-                : 'Não foi possível verificar a sessão de administrador para alterar créditos.',
+            message: msg,
             type: 'warning',
             timestamp: new Date().toISOString(),
             read: false,
           },
           ...prev,
         ]);
-        return false;
+        return { success: false, error: 'UNAUTHORIZED', message: msg };
       }
 
-      const res = await fetch('/api/students/contract', {
+      const res = await fetch('/api/admin/credits/adjust', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -3726,79 +3829,116 @@ export default function App() {
         },
         body: JSON.stringify({
           studentUid: targetStudentUid,
-          email: cleanEmail,
-          count,
+          delta,
+          reason: cleanReason,
+          idempotencyKey,
         }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok || !data.success) {
         console.error('[handleUpdateContractedLessons] Rejected by server:', data);
         const isLegacyBlocked = res.status === 501 || data?.error === 'LEGACY_CREDIT_MUTATION_BLOCKED';
+        const errMsg =
+          data?.message ||
+          (isLegacyBlocked
+            ? (currentLanguage === 'en'
+                ? 'Direct credit adjustment via legacy route is temporarily blocked for security.'
+                : 'Ajuste direto de créditos via rota legada está temporariamente bloqueado por segurança.')
+            : (currentLanguage === 'en'
+                ? 'Could not adjust student credits.'
+                : 'Não foi possível ajustar os créditos do aluno.'));
         setNotifications((prev) => [
           {
             id: `contract-err-${Date.now()}`,
             title: isLegacyBlocked
               ? (currentLanguage === 'en' ? 'Credit Adjustment Temporarily Disabled' : 'Ajuste de Créditos Bloqueado')
-              : (currentLanguage === 'en' ? 'Could Not Update Credits' : 'Falha ao Atualizar Créditos'),
-            message:
-              data?.message ||
-              (isLegacyBlocked
-                ? (currentLanguage === 'en'
-                    ? 'Direct credit adjustment via legacy route is temporarily blocked for security.'
-                    : 'Ajuste direto de créditos via rota legada está temporariamente bloqueado por segurança.')
-                : (currentLanguage === 'en'
-                    ? 'Could not update contracted lessons.'
-                    : 'Não foi possível atualizar as aulas contratadas.')),
+              : (currentLanguage === 'en' ? 'Credit Adjustment Failed' : 'Falha ao Ajustar Créditos'),
+            message: errMsg,
             type: isLegacyBlocked ? 'warning' : 'error',
             timestamp: new Date().toISOString(),
             read: false,
           },
           ...prev,
         ]);
-        return false;
+        return {
+          success: false,
+          error: data?.error || 'ADMIN_CREDIT_ADJUSTMENT_FAILED',
+          message: errMsg,
+        };
       }
 
       const authContracted = Number(data.contractedLessons ?? count);
       const authAvailable = typeof data.availableLessons === 'number' ? data.availableLessons : undefined;
       const resolvedEmail = (data.studentEmail || cleanEmail).toLowerCase().trim();
 
-      setContractedLessons((prev) => ({ ...prev, [resolvedEmail]: authContracted }));
+      if (resolvedEmail) {
+        setContractedLessons((prev) => ({ ...prev, [resolvedEmail]: authContracted }));
+      }
       setStudents((prev) =>
-        prev.map((s) =>
-          (s.email || s.studentEmail || '').toLowerCase().trim() === resolvedEmail
-            ? {
-                ...s,
-                contractedLessons: authContracted,
-                ...(authAvailable !== undefined ? { availableLessons: authAvailable } : {}),
-              }
-            : s
-        )
+        prev.map((s) => {
+          const sEmail = (s.email || s.studentEmail || '').toLowerCase().trim();
+          const sUid = (s.uid || s.id || '').trim();
+          if ((targetStudentUid && sUid === targetStudentUid) || (resolvedEmail && sEmail === resolvedEmail)) {
+            return {
+              ...s,
+              contractedLessons: authContracted,
+              ...(authAvailable !== undefined ? { availableLessons: authAvailable } : {}),
+            };
+          }
+          return s;
+        })
       );
-      if (userProfile?.email?.toLowerCase().trim() === resolvedEmail) {
+      if (
+        (resolvedEmail && userProfile?.email?.toLowerCase().trim() === resolvedEmail) ||
+        (targetStudentUid && (userProfile?.uid === targetStudentUid || userProfile?.id === targetStudentUid))
+      ) {
         setUserProfile((prev) => ({
           ...prev,
           contractedLessons: authContracted,
           ...(authAvailable !== undefined ? { availableLessons: authAvailable } : {}),
         }));
       }
-      return true;
+
+      setNotifications((prev) => [
+        {
+          id: `contract-ok-${Date.now()}`,
+          title: currentLanguage === 'en' ? 'Credits Adjusted' : 'Créditos Ajustados',
+          message:
+            currentLanguage === 'en'
+              ? `Adjusted ${delta > 0 ? `+${delta}` : delta} lesson(s) for ${resolvedEmail || targetStudentUid}. Available balance: ${authAvailable ?? '—'}.`
+              : `Ajuste de ${delta > 0 ? `+${delta}` : delta} aula(s) aplicado para ${resolvedEmail || targetStudentUid}. Saldo disponível: ${authAvailable ?? '—'}.`,
+          type: 'success',
+          timestamp: new Date().toISOString(),
+          read: false,
+        },
+        ...prev,
+      ]);
+
+      return {
+        success: true,
+        isIdempotent: Boolean(data.isIdempotent),
+        contractedLessons: authContracted,
+        availableLessons: authAvailable,
+        delta: data.delta,
+      };
     } catch (err) {
       console.error('[handleUpdateContractedLessons] Network error:', err);
+      const msg =
+        currentLanguage === 'en'
+          ? 'Unable to reach server to adjust student credits.'
+          : 'Não foi possível conectar ao servidor para ajustar os créditos.';
       setNotifications((prev) => [
         {
           id: `contract-net-err-${Date.now()}`,
           title: currentLanguage === 'en' ? 'Connection Error' : 'Erro de Conexão',
-          message:
-            currentLanguage === 'en'
-              ? 'Unable to reach server to update contracted lessons.'
-              : 'Não foi possível conectar ao servidor para atualizar as aulas contratadas.',
+          message: msg,
           type: 'error',
           timestamp: new Date().toISOString(),
           read: false,
         },
         ...prev,
       ]);
-      return false;
+      return { success: false, error: 'NETWORK_ERROR', message: msg };
     }
   };
 
@@ -7821,6 +7961,205 @@ export default function App() {
                             </button>
                           </div>
                         </div>
+
+                        {/* FIN.2D.2A: Admin-only Manual Credit Adjustment Bar */}
+                        {currentAccount?.role === 'admin' && (() => {
+                          const stContracted =
+                            typeof (found as any)?.contractedLessons === 'number'
+                              ? (found as any).contractedLessons
+                              : typeof contractedLessons[stCleanEmail] === 'number'
+                              ? contractedLessons[stCleanEmail]
+                              : 0;
+                          const hasAvail = typeof (found as any)?.availableLessons === 'number';
+                          const stAvailable: number | null = hasAvail ? (found as any).availableLessons : null;
+
+                          const handleAdminCreditSubmit = async (e: React.FormEvent) => {
+                            e.preventDefault();
+                            if (adminCreditSubmittingRef.current || adminCreditSaving) return;
+                            setAdminCreditFeedback(null);
+
+                            if (!stUid || !isValidCanonicalUid(stUid)) {
+                              setAdminCreditFeedback({
+                                type: 'error',
+                                message: 'Valid canonical student UID is required to adjust credits.',
+                              });
+                              return;
+                            }
+
+                            const targetTotal = Math.max(0, Math.trunc(Number(adminCreditInputVal) || 0));
+                            const delta = targetTotal - stContracted;
+                            if (!Number.isInteger(delta) || delta === 0) {
+                              setAdminCreditFeedback({
+                                type: 'error',
+                                message: 'Enter a new total different from the current value (delta cannot be 0).',
+                              });
+                              return;
+                            }
+
+                            if (stAvailable !== null && stAvailable + delta < 0) {
+                              setAdminCreditFeedback({
+                                type: 'error',
+                                message: `Available balance cannot become negative (current: ${stAvailable}, delta: ${delta}).`,
+                              });
+                              return;
+                            }
+
+                            const cleanReason = adminCreditReason.trim();
+                            if (!cleanReason) {
+                              setAdminCreditFeedback({
+                                type: 'error',
+                                message: 'Adjustment reason is required.',
+                              });
+                              return;
+                            }
+
+                            if (!adminCreditIdempKeyRef.current) {
+                              adminCreditIdempKeyRef.current =
+                                typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+                                  ? `adm-adj-${crypto.randomUUID()}`
+                                  : `adm-adj-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+                            }
+
+                            adminCreditSubmittingRef.current = true;
+                            setAdminCreditSaving(true);
+                            try {
+                              const res = await handleUpdateContractedLessons(stCleanEmail, targetTotal, {
+                                studentUid: stUid,
+                                delta,
+                                reason: cleanReason,
+                                idempotencyKey: adminCreditIdempKeyRef.current,
+                              });
+                              if (!res.success) {
+                                setAdminCreditFeedback({
+                                  type: 'error',
+                                  message: res.message || 'Could not adjust student credits.',
+                                });
+                                return;
+                              }
+                              adminCreditIdempKeyRef.current = null;
+                              setAdminCreditEditOpen(false);
+                              setAdminCreditReason('');
+                              setAdminCreditFeedback({
+                                type: 'success',
+                                message: `Adjusted ${delta > 0 ? `+${delta}` : delta} lesson(s). New available balance: ${res.availableLessons ?? '—'}.`,
+                              });
+                            } finally {
+                              adminCreditSubmittingRef.current = false;
+                              setAdminCreditSaving(false);
+                            }
+                          };
+
+                          const previewDelta = Math.trunc(Number(adminCreditInputVal) || 0) - stContracted;
+                          const previewAvailable = stAvailable !== null ? stAvailable + previewDelta : null;
+
+                          return (
+                            <div className="px-4 py-3 bg-white border-t border-slate-200/80 flex flex-col gap-2" id="admin-credit-adjustment-bar">
+                              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                                <div className="flex flex-wrap items-center gap-3 text-xs">
+                                  <span className="font-black text-[#000035] uppercase tracking-wider text-[11px]">
+                                    Student Credits (ADM):
+                                  </span>
+                                  <span className="px-2.5 py-1 rounded-lg bg-slate-100 border border-slate-200 font-bold text-[#000035]">
+                                    Contracted: {stContracted}
+                                  </span>
+                                  <span className="px-2.5 py-1 rounded-lg bg-[#000035] text-white font-bold">
+                                    Available: {stAvailable !== null ? stAvailable : '—'}
+                                  </span>
+                                </div>
+
+                                {!adminCreditEditOpen ? (
+                                  <button
+                                    type="button"
+                                    disabled={!stUid}
+                                    onClick={() => {
+                                      setAdminCreditFeedback(null);
+                                      setAdminCreditInputVal(stContracted);
+                                      setAdminCreditReason('');
+                                      adminCreditIdempKeyRef.current = null;
+                                      setAdminCreditEditOpen(true);
+                                    }}
+                                    className="px-3 py-1.5 bg-[#9AB4FF]/15 hover:bg-[#9AB4FF]/30 disabled:opacity-50 border border-[#607EC9]/40 rounded-xl text-xs font-bold text-[#062863] inline-flex items-center gap-1.5 transition cursor-pointer self-start sm:self-auto"
+                                    title="Editar Total / Manual Credit Adjustment"
+                                  >
+                                    <Edit3 className="w-3.5 h-3.5 text-[#1C4C96]" />
+                                    <span>Editar Total</span>
+                                  </button>
+                                ) : (
+                                  <form onSubmit={handleAdminCreditSubmit} className="flex flex-wrap items-center gap-2">
+                                    <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">
+                                      <span>Total:</span>
+                                      <input
+                                        type="number"
+                                        min="0"
+                                        max="500"
+                                        value={adminCreditInputVal}
+                                        onChange={(e) => {
+                                          adminCreditIdempKeyRef.current = null;
+                                          setAdminCreditInputVal(Math.max(0, parseInt(e.target.value, 10) || 0));
+                                        }}
+                                        disabled={adminCreditSaving}
+                                        className="w-16 px-2 py-1 bg-white border border-[#1C4C96] rounded-lg text-xs font-black text-center text-[#000035] focus:outline-none"
+                                        autoFocus
+                                      />
+                                    </label>
+                                    <input
+                                      type="text"
+                                      maxLength={200}
+                                      value={adminCreditReason}
+                                      onChange={(e) => {
+                                        adminCreditIdempKeyRef.current = null;
+                                        setAdminCreditReason(e.target.value);
+                                      }}
+                                      placeholder="Reason (required)"
+                                      disabled={adminCreditSaving}
+                                      className="w-48 sm:w-56 px-2.5 py-1 bg-white border border-slate-300 rounded-lg text-xs text-[#000035] focus:outline-none focus:border-[#1C4C96]"
+                                    />
+                                    <span
+                                      className={`text-[11px] font-bold px-2 py-1 rounded-lg border ${
+                                        previewAvailable !== null && previewAvailable < 0
+                                          ? 'bg-rose-50 text-rose-700 border-rose-200'
+                                          : 'bg-slate-100 text-slate-700 border-slate-200'
+                                      }`}
+                                    >
+                                      Delta: {previewDelta >= 0 ? `+${previewDelta}` : previewDelta}
+                                      {previewAvailable !== null ? ` → Avail: ${previewAvailable}` : ''}
+                                    </span>
+                                    <button
+                                      type="submit"
+                                      disabled={adminCreditSaving}
+                                      className="px-3 py-1 bg-[#1C4C96] hover:bg-[#062863] disabled:opacity-50 text-white rounded-lg text-xs font-bold cursor-pointer"
+                                    >
+                                      {adminCreditSaving ? 'Saving...' : 'Confirm'}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      disabled={adminCreditSaving}
+                                      onClick={() => {
+                                        adminCreditIdempKeyRef.current = null;
+                                        setAdminCreditEditOpen(false);
+                                        setAdminCreditReason('');
+                                      }}
+                                      className="px-2.5 py-1 bg-slate-200 hover:bg-slate-300 disabled:opacity-50 text-slate-700 rounded-lg text-xs font-bold cursor-pointer"
+                                    >
+                                      Cancel
+                                    </button>
+                                  </form>
+                                )}
+                              </div>
+                              {adminCreditFeedback && (
+                                <div
+                                  className={`text-xs font-semibold px-3 py-1.5 rounded-xl border ${
+                                    adminCreditFeedback.type === 'success'
+                                      ? 'text-emerald-800 bg-emerald-50 border-emerald-200'
+                                      : 'text-rose-800 bg-rose-50 border-rose-200'
+                                  }`}
+                                >
+                                  {adminCreditFeedback.message}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
 
                         {/* Minimalist 3 Activity Buttons */}
                         <div className="p-3 sm:p-4 bg-slate-50 border-t border-slate-200/80">

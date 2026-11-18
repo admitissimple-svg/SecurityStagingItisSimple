@@ -35,6 +35,23 @@ import { isValidCanonicalUid } from '../utils/studentPersistence';
 // Pure in-memory tracking for review opened/completed state during active session (ZERO sessionStorage)
 const inMemorySessionReviewKeys = new Set<string>();
 
+export interface AdminCreditAdjustmentOptions {
+  studentUid?: string;
+  delta?: number;
+  reason?: string;
+  idempotencyKey?: string;
+}
+
+export interface AdminCreditAdjustmentResponse {
+  success: boolean;
+  error?: string;
+  message?: string;
+  isIdempotent?: boolean;
+  contractedLessons?: number;
+  availableLessons?: number;
+  delta?: number;
+}
+
 interface StudentHeaderSectionProps {
   lessons: LiveLesson[];
   currentAccount: GoogleAccount | null;
@@ -42,7 +59,11 @@ interface StudentHeaderSectionProps {
   teachers?: GoogleAccount[];
   teacherMeetSettings?: Record<string, TeacherMeetSettings>;
   contractedLessons?: Record<string, number>;
-  onUpdateContractedLessons?: (studentEmail: string, totalContracted: number) => void | Promise<boolean | void>;
+  onUpdateContractedLessons?: (
+    studentEmail: string,
+    totalContracted: number,
+    options?: AdminCreditAdjustmentOptions
+  ) => void | Promise<boolean | AdminCreditAdjustmentResponse | void>;
   onOpenScheduleModal: () => void;
   onOpenManageSubscription?: () => void;
   onCancelLesson?: (
@@ -232,29 +253,97 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
   const studentScheduledCount = activeScheduledLessons.length;
 
   const [isSavingContract, setIsSavingContract] = useState<boolean>(false);
-  const [contractEditFeedback, setContractEditFeedback] = useState<string | null>(null);
+  const [contractReason, setContractReason] = useState<string>('');
+  const [contractEditFeedback, setContractEditFeedback] = useState<{
+    type: 'success' | 'error';
+    message: string;
+  } | null>(null);
+  const isSubmittingContractRef = useRef<boolean>(false);
+  const pendingIdempotencyKeyRef = useRef<string | null>(null);
+
+  const createCreditIdempotencyKey = () =>
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? `adm-adj-${crypto.randomUUID()}`
+      : `adm-adj-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
   const handleSaveContract = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmittingContractRef.current || isSavingContract) return;
     setContractEditFeedback(null);
-    if (onUpdateContractedLessons) {
-      setIsSavingContract(true);
-      try {
-        const result = await onUpdateContractedLessons(studentEmail, Math.max(0, contractInputVal));
-        if (result === false) {
-          setContractEditFeedback(
-            isEn
-              ? 'Direct credit editing is temporarily disabled for security.'
-              : 'Ajuste direto de créditos temporariamente bloqueado por segurança.'
-          );
-          setIsEditingContract(false);
-          return;
-        }
-      } finally {
-        setIsSavingContract(false);
-      }
+
+    const targetTotal = Math.max(0, Math.trunc(Number(contractInputVal) || 0));
+    const delta = targetTotal - totalContractedCount;
+
+    if (!Number.isInteger(delta) || delta === 0) {
+      setContractEditFeedback({
+        type: 'error',
+        message: isEn
+          ? 'Enter a new total different from the current value (delta cannot be 0).'
+          : 'Informe um novo total diferente do atual (o ajuste não pode ser 0).',
+      });
+      return;
     }
-    setIsEditingContract(false);
+
+    if (studentRemainingBalance !== null && studentRemainingBalance + delta < 0) {
+      setContractEditFeedback({
+        type: 'error',
+        message: isEn
+          ? `Available balance cannot become negative (current: ${studentRemainingBalance}, delta: ${delta}).`
+          : `O saldo disponível não pode ficar negativo (atual: ${studentRemainingBalance}, ajuste: ${delta}).`,
+      });
+      return;
+    }
+
+    const cleanReason = contractReason.trim();
+    if (!cleanReason) {
+      setContractEditFeedback({
+        type: 'error',
+        message: isEn
+          ? 'Reason is required for administrative credit adjustments.'
+          : 'Informe o motivo do ajuste administrativo.',
+      });
+      return;
+    }
+
+    if (!onUpdateContractedLessons) return;
+
+    if (!pendingIdempotencyKeyRef.current) {
+      pendingIdempotencyKeyRef.current = createCreditIdempotencyKey();
+    }
+
+    isSubmittingContractRef.current = true;
+    setIsSavingContract(true);
+    try {
+      const result = await onUpdateContractedLessons(studentEmail, targetTotal, {
+        studentUid: studentUid || undefined,
+        delta,
+        reason: cleanReason,
+        idempotencyKey: pendingIdempotencyKeyRef.current,
+      });
+
+      if (result === false || (typeof result === 'object' && result !== null && result.success === false)) {
+        const errMsg =
+          (typeof result === 'object' && result !== null && result.message) ||
+          (isEn
+            ? 'Could not apply administrative credit adjustment.'
+            : 'Não foi possível aplicar o ajuste administrativo de créditos.');
+        setContractEditFeedback({ type: 'error', message: errMsg });
+        return;
+      }
+
+      pendingIdempotencyKeyRef.current = null;
+      setIsEditingContract(false);
+      setContractReason('');
+      setContractEditFeedback({
+        type: 'success',
+        message: isEn
+          ? `Credits adjusted (${delta > 0 ? `+${delta}` : delta}).`
+          : `Créditos ajustados (${delta > 0 ? `+${delta}` : delta}) com sucesso.`,
+      });
+    } finally {
+      isSubmittingContractRef.current = false;
+      setIsSavingContract(false);
+    }
   };
 
   return (
@@ -283,6 +372,8 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
                     onClick={() => {
                       setContractEditFeedback(null);
                       setContractInputVal(totalContractedCount);
+                      setContractReason('');
+                      pendingIdempotencyKeyRef.current = null;
                       setIsEditingContract(true);
                     }}
                     className="px-2 py-0.5 bg-[#9AB4FF]/10 hover:bg-[#9AB4FF]/25 border border-[#607EC9]/30 rounded-lg text-[10px] font-bold text-[#062863] flex items-center gap-1 transition cursor-pointer"
@@ -292,37 +383,81 @@ export const StudentHeaderSection: React.FC<StudentHeaderSectionProps> = ({
                     <span>{isEn ? 'Edit Total' : 'Editar Total'}</span>
                   </button>
                 ) : (
-                  <form onSubmit={handleSaveContract} className="flex items-center gap-1">
+                  <form onSubmit={handleSaveContract} className="flex flex-wrap items-center justify-end gap-1.5">
                     <input
                       type="number"
                       min="0"
                       max="500"
                       value={contractInputVal}
-                      onChange={(e) => setContractInputVal(parseInt(e.target.value, 10) || 0)}
-                      className="w-12 px-1 py-0.2 bg-white border border-[#1C4C96] rounded text-[10px] font-black text-center text-[#000035] focus:outline-none"
+                      onChange={(e) => {
+                        pendingIdempotencyKeyRef.current = null;
+                        setContractInputVal(Math.max(0, parseInt(e.target.value, 10) || 0));
+                      }}
+                      className="w-14 px-1.5 py-0.5 bg-white border border-[#1C4C96] rounded text-[10px] font-black text-center text-[#000035] focus:outline-none"
                       autoFocus
                       disabled={isSavingContract}
+                      aria-label={isEn ? 'New total contracted lessons' : 'Novo total contratado'}
                     />
+                    <input
+                      type="text"
+                      maxLength={200}
+                      value={contractReason}
+                      onChange={(e) => {
+                        pendingIdempotencyKeyRef.current = null;
+                        setContractReason(e.target.value);
+                      }}
+                      placeholder={isEn ? 'Reason (required)' : 'Motivo (obrigatório)'}
+                      className="w-36 sm:w-44 px-2 py-0.5 bg-white border border-[#1C4C96]/60 rounded text-[10px] font-medium text-[#000035] focus:outline-none focus:border-[#1C4C96]"
+                      disabled={isSavingContract}
+                      aria-label={isEn ? 'Adjustment reason' : 'Motivo do ajuste'}
+                    />
+                    {(() => {
+                      const previewDelta = Math.trunc(Number(contractInputVal) || 0) - totalContractedCount;
+                      const previewAvail =
+                        studentRemainingBalance !== null ? studentRemainingBalance + previewDelta : null;
+                      return (
+                        <span
+                          className={`text-[9.5px] font-bold px-1.5 py-0.5 rounded border ${
+                            previewAvail !== null && previewAvail < 0
+                              ? 'bg-rose-50 text-rose-700 border-rose-200'
+                              : 'bg-slate-100 text-slate-700 border-slate-200'
+                          }`}
+                        >
+                          {previewDelta >= 0 ? `+${previewDelta}` : previewDelta}
+                          {previewAvail !== null ? ` (${isEn ? 'Bal' : 'Saldo'}: ${previewAvail})` : ''}
+                        </span>
+                      );
+                    })()}
                     <button
                       type="submit"
                       disabled={isSavingContract}
-                      className="px-2 py-0.2 bg-[#1C4C96] hover:bg-[#062863] disabled:opacity-50 text-white rounded text-[10px] font-bold cursor-pointer"
+                      className="px-2 py-0.5 bg-[#1C4C96] hover:bg-[#062863] disabled:opacity-50 text-white rounded text-[10px] font-bold cursor-pointer"
                     >
                       {isSavingContract ? '...' : isEn ? 'Save' : 'Salvar'}
                     </button>
                     <button
                       type="button"
                       disabled={isSavingContract}
-                      onClick={() => setIsEditingContract(false)}
-                      className="px-1.5 py-0.2 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded text-[10px] cursor-pointer"
+                      onClick={() => {
+                        pendingIdempotencyKeyRef.current = null;
+                        setIsEditingContract(false);
+                        setContractReason('');
+                      }}
+                      className="px-1.5 py-0.5 bg-slate-200 hover:bg-slate-300 disabled:opacity-50 text-slate-700 rounded text-[10px] cursor-pointer"
                     >
                       ✕
                     </button>
                   </form>
                 )}
                 {contractEditFeedback && (
-                  <span className="text-[10px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-md">
-                    {contractEditFeedback}
+                  <span
+                    className={`text-[10px] font-semibold px-2 py-0.5 rounded-md border ${
+                      contractEditFeedback.type === 'success'
+                        ? 'text-emerald-800 bg-emerald-50 border-emerald-200'
+                        : 'text-rose-800 bg-rose-50 border-rose-200'
+                    }`}
+                  >
+                    {contractEditFeedback.message}
                   </span>
                 )}
               </div>

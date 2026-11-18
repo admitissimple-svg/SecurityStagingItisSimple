@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { getFirestore, Firestore, FieldValue } from 'firebase-admin/firestore';
 import { getFirebaseAdminApp, ALLOWED_STAGING_PROJECT_ID } from './serverFirebaseAdmin';
 import { normalizeDictionaryWord } from './utils/studentDictionaryLibrary';
@@ -8,8 +9,14 @@ import { deriveLegacyRevisionToken, mintSessionNoteRevisionToken } from './utils
 import {
   buildVersionedCommissionFields,
   hasValidPersistedCommission,
+  isTutorCommercializable,
   ALLOWED_COMMISSION_MODEL,
 } from './utils/tutorCommission';
+import {
+  APPROVED_PACKAGES,
+  calculateFinancialPricingQuote,
+  LessonPackageCalculation,
+} from './utils/financialEngine';
 
 /**
  * Active identifiers for staging persistence.
@@ -13078,6 +13085,1203 @@ export async function approveAndSaveTutorCommissionTransactionally(params: {
     };
   }
 }
+
+export interface AdminCreditAdjustmentParams {
+  studentUid: string;
+  delta: number;
+  reason: string;
+  idempotencyKey: string;
+  adminUid: string;
+  adminEmail?: string;
+}
+
+export interface AdminCreditAdjustmentResult {
+  success: boolean;
+  statusCode: number;
+  code?: string;
+  error?: string;
+  isIdempotent?: boolean;
+  studentUid?: string;
+  studentEmail?: string;
+  delta?: number;
+  reason?: string;
+  idempotencyKey?: string;
+  previousContractedLessons?: number;
+  contractedLessons?: number;
+  previousAvailableLessons?: number;
+  availableLessons?: number;
+  transaction?: Record<string, any>;
+}
+
+class AdminCreditAdjustmentError extends Error {
+  public statusCode: number;
+  public code: string;
+  constructor(message: string, statusCode: number, code: string) {
+    super(message);
+    this.statusCode = statusCode;
+    this.code = code;
+  }
+}
+
+/**
+ * FIN.2D.2A: Atomic administrative credit adjustment in Firestore (default).
+ * Updates users/{uid} (availableLessons & contractedLessons) and records an immutable
+ * ledger entry in financial_transactions as ADMIN_CREDIT_ADJUSTMENT without counting revenue.
+ */
+export async function adjustStudentCreditsAtomicServer(
+  params: AdminCreditAdjustmentParams
+): Promise<AdminCreditAdjustmentResult> {
+  const cleanAdminUid = String(params.adminUid || '').trim();
+  const cleanAdminEmail = String(params.adminEmail || '').toLowerCase().trim();
+  const cleanStudentUid = String(params.studentUid || '').trim();
+  const cleanReason = typeof params.reason === 'string' ? params.reason.trim() : '';
+  const cleanIdempotencyKey = typeof params.idempotencyKey === 'string' ? params.idempotencyKey.trim() : '';
+  const delta = params.delta;
+
+  if (!cleanAdminUid) {
+    return {
+      success: false,
+      statusCode: 401,
+      code: 'UNAUTHORIZED',
+      error: 'Autenticação administrativa obrigatória.',
+    };
+  }
+
+  if (!cleanStudentUid || !isValidCanonicalUid(cleanStudentUid)) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'CANONICAL_UID_REQUIRED',
+      error: 'UID canônico do aluno é obrigatório e deve ser válido.',
+    };
+  }
+
+  if (
+    typeof delta !== 'number' ||
+    !Number.isFinite(delta) ||
+    !Number.isInteger(delta) ||
+    !Number.isSafeInteger(delta) ||
+    delta === 0
+  ) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'INVALID_DELTA',
+      error: 'O ajuste (delta) deve ser um número inteiro diferente de zero.',
+    };
+  }
+
+  if (!cleanReason || cleanReason.length > 500) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'REASON_REQUIRED',
+      error: 'Motivo do ajuste administrativo é obrigatório (máximo 500 caracteres).',
+    };
+  }
+
+  if (!cleanIdempotencyKey || cleanIdempotencyKey.length > 200) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'IDEMPOTENCY_KEY_REQUIRED',
+      error: 'idempotencyKey é obrigatória para o ajuste administrativo de créditos.',
+    };
+  }
+
+  const db = getFirestoreDb();
+  if (!db || isCloudWriteDisabled) {
+    return {
+      success: false,
+      statusCode: 503,
+      code: 'FIRESTORE_UNAVAILABLE',
+      error: 'Serviço de persistência Firestore (default) indisponível.',
+    };
+  }
+
+  const idempHash = crypto
+    .createHash('sha256')
+    .update(cleanIdempotencyKey)
+    .digest('hex')
+    .slice(0, 32);
+  const txDocId = `admin_adj_${idempHash}`;
+  const nowIso = new Date().toISOString();
+
+  try {
+    const txOutcome = await db.runTransaction(async (transaction) => {
+      const studentRef = db.collection('users').doc(cleanStudentUid);
+      const txRef = db.collection('financial_transactions').doc(txDocId);
+
+      const [studentSnap, txSnap] = await Promise.all([
+        transaction.get(studentRef),
+        transaction.get(txRef),
+      ]);
+
+      const studentData = studentSnap.exists ? (studentSnap.data() || {}) : null;
+
+      // Idempotency check strictly inside the Firestore transaction
+      if (txSnap.exists) {
+        const existingTx = txSnap.data() || {};
+        if (existingTx.studentUid !== cleanStudentUid || existingTx.delta !== delta) {
+          throw new AdminCreditAdjustmentError(
+            'Chave de idempotência já utilizada para outro ajuste de créditos.',
+            409,
+            'IDEMPOTENCY_KEY_CONFLICT'
+          );
+        }
+
+        const authoritativeAvailable =
+          studentData && typeof studentData.availableLessons === 'number'
+            ? studentData.availableLessons
+            : Number(existingTx.afterAvailableLessons ?? 0);
+        const authoritativeContracted =
+          studentData && typeof studentData.contractedLessons === 'number'
+            ? studentData.contractedLessons
+            : Number(existingTx.afterContractedLessons ?? 0);
+
+        return {
+          isIdempotent: true,
+          studentEmail: String(studentData?.email || existingTx.studentEmail || '').toLowerCase().trim(),
+          previousContractedLessons: Number(existingTx.beforeContractedLessons ?? authoritativeContracted),
+          contractedLessons: authoritativeContracted,
+          previousAvailableLessons: Number(existingTx.beforeAvailableLessons ?? authoritativeAvailable),
+          availableLessons: authoritativeAvailable,
+          transaction: existingTx,
+        };
+      }
+
+      if (!studentSnap.exists || !studentData || studentData.deleted === true) {
+        throw new AdminCreditAdjustmentError(
+          'Aluno não encontrado no Firestore (default).',
+          404,
+          'STUDENT_NOT_FOUND'
+        );
+      }
+
+      const targetRole = String(studentData.role || '').toLowerCase().trim();
+      if (targetRole === 'admin' || targetRole === 'teacher') {
+        throw new AdminCreditAdjustmentError(
+          'Ajuste administrativo de créditos é permitido apenas para contas de alunos.',
+          400,
+          'INVALID_TARGET_ROLE'
+        );
+      }
+
+      const beforeAvailable =
+        typeof studentData.availableLessons === 'number' && Number.isFinite(studentData.availableLessons)
+          ? studentData.availableLessons
+          : 0;
+      const beforeContracted =
+        typeof studentData.contractedLessons === 'number' && Number.isFinite(studentData.contractedLessons)
+          ? studentData.contractedLessons
+          : beforeAvailable;
+
+      const afterAvailable = beforeAvailable + delta;
+      if (afterAvailable < 0) {
+        throw new AdminCreditAdjustmentError(
+          `Ajuste recusado: o saldo disponível não pode ficar negativo (atual: ${beforeAvailable}, delta: ${delta}).`,
+          400,
+          'NEGATIVE_AVAILABLE_BALANCE'
+        );
+      }
+
+      const afterContracted = Math.max(0, beforeContracted + delta);
+      const cleanStudentEmail = String(studentData.email || '').toLowerCase().trim();
+
+      const txRecord: Record<string, any> = {
+        id: txDocId,
+        type: 'ADMIN_CREDIT_ADJUSTMENT',
+        category: 'administrative_adjustment',
+        idempotencyKey: cleanIdempotencyKey,
+        studentUid: cleanStudentUid,
+        studentEmail: cleanStudentEmail,
+        delta,
+        reason: cleanReason,
+        beforeAvailableLessons: beforeAvailable,
+        afterAvailableLessons: afterAvailable,
+        beforeContractedLessons: beforeContracted,
+        afterContractedLessons: afterContracted,
+        performedByUid: cleanAdminUid,
+        performedByEmail: cleanAdminEmail,
+        performedByRole: 'admin',
+        countsAsRevenue: false,
+        revenueBrl: 0,
+        revenueUsd: 0,
+        amountBrl: 0,
+        amountUsd: 0,
+        status: 'completed',
+        createdAt: nowIso,
+      };
+
+      // Update ONLY credit balance fields + updatedAt, preserving all links, trial flags, RBAC, and pedagogical fields
+      transaction.set(
+        studentRef,
+        {
+          availableLessons: afterAvailable,
+          contractedLessons: afterContracted,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+
+      transaction.set(txRef, txRecord);
+
+      return {
+        isIdempotent: false,
+        studentEmail: cleanStudentEmail,
+        previousContractedLessons: beforeContracted,
+        contractedLessons: afterContracted,
+        previousAvailableLessons: beforeAvailable,
+        availableLessons: afterAvailable,
+        transaction: txRecord,
+      };
+    });
+
+    return {
+      success: true,
+      statusCode: 200,
+      isIdempotent: txOutcome.isIdempotent,
+      studentUid: cleanStudentUid,
+      studentEmail: txOutcome.studentEmail,
+      delta,
+      reason: cleanReason,
+      idempotencyKey: cleanIdempotencyKey,
+      previousContractedLessons: txOutcome.previousContractedLessons,
+      contractedLessons: txOutcome.contractedLessons,
+      previousAvailableLessons: txOutcome.previousAvailableLessons,
+      availableLessons: txOutcome.availableLessons,
+      transaction: txOutcome.transaction,
+    };
+  } catch (err: any) {
+    if (err instanceof AdminCreditAdjustmentError) {
+      return {
+        success: false,
+        statusCode: err.statusCode,
+        code: err.code,
+        error: err.message,
+      };
+    }
+
+    const msg = String(err?.message || '');
+    const code = err?.code;
+
+    if (isPermissionError(err)) {
+      return {
+        success: false,
+        statusCode: 500,
+        code: 'FIRESTORE_INFRASTRUCTURE_ERROR',
+        error: 'Erro de permissão ao persistir ajuste administrativo de créditos no Firestore.',
+      };
+    }
+
+    const isTimeout =
+      code === 4 ||
+      code === 'deadline-exceeded' ||
+      msg.includes('DEADLINE_EXCEEDED') ||
+      msg.includes('timeout') ||
+      msg.includes('ETIMEDOUT');
+    if (isTimeout) {
+      return {
+        success: false,
+        statusCode: 504,
+        code: 'FIRESTORE_TIMEOUT',
+        error: 'Tempo limite esgotado ao persistir ajuste administrativo de créditos. Tente novamente.',
+      };
+    }
+
+    return {
+      success: false,
+      statusCode: 500,
+      code: 'FIRESTORE_TRANSACTION_FAILED',
+      error: msg || 'Falha ao processar ajuste administrativo de créditos no Firestore.',
+    };
+  }
+}
+
+export interface PackageGatewayConfirmation {
+  verifiedByServer: boolean;
+  gatewayProvider: string;
+  gatewayTransactionId: string;
+  confirmedAt?: string;
+}
+
+export interface PackageCreditOperationParams {
+  actorUid: string;
+  actorEmail?: string;
+  actorRole: 'admin' | 'student';
+  studentUid: string;
+  studentEmail?: string;
+  teacherUid?: string;
+  teacherId?: string;
+  publicTutorId?: string;
+  teacherEmail?: string;
+  teacherName?: string;
+  packageLessons: unknown;
+  packageName?: string;
+  paymentMethod?: string;
+  idempotencyKey: string;
+  isPaidPurchase?: boolean;
+  gatewayConfirmation?: PackageGatewayConfirmation | null;
+  dbState?: any;
+  ptaxOverride?: any;
+}
+
+export interface PackageCreditOperationResult {
+  success: boolean;
+  statusCode: number;
+  code?: string;
+  error?: string;
+  isIdempotent?: boolean;
+  studentUid?: string;
+  studentEmail?: string;
+  pricedTeacherUid?: string;
+  teacherUid?: string;
+  teacherEmail?: string;
+  teacherName?: string;
+  preservedExistingTeacherLink?: boolean;
+  preservedWeeklyNativeLessonsTarget?: number | null;
+  packageLessons?: number;
+  discountPercent?: number;
+  idempotencyKey?: string;
+  previousContractedLessons?: number;
+  contractedLessons?: number;
+  previousAvailableLessons?: number;
+  availableLessons?: number;
+  profile?: Record<string, any>;
+  transaction?: Record<string, any>;
+}
+
+class PackageCreditOperationError extends Error {
+  public statusCode: number;
+  public code: string;
+  constructor(message: string, statusCode: number, code: string) {
+    super(message);
+    this.statusCode = statusCode;
+    this.code = code;
+  }
+}
+
+function mergeFresherTutorPricingRecord(baseRecord: any, directDoc: any): any {
+  if (!directDoc) return baseRecord;
+  if (!baseRecord) return directDoc;
+  const localVer = typeof baseRecord.commissionVersion === 'number' ? baseRecord.commissionVersion : 0;
+  const remoteVer = typeof directDoc.commissionVersion === 'number' ? directDoc.commissionVersion : 0;
+  if (localVer > remoteVer) {
+    return { ...directDoc, ...baseRecord };
+  }
+  return { ...baseRecord, ...directDoc };
+}
+
+function extractValidBasePriceUsdServer(tutor: any): number | null {
+  if (!tutor || typeof tutor !== 'object') return null;
+  const raw = tutor.pricePerSessionUsd;
+  const num = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isFinite(num) || num <= 0) return null;
+  return num;
+}
+
+/**
+ * FIN.2D.2B: Consolidated atomic package operation in Firestore (default).
+ * - Restricts packages strictly to 1 / 4 / 8 / 12 lessons with FIN.2C discounts (0%, 5%, 10%, 15%).
+ * - Computes all monetary amounts strictly server-side using tutor basePriceUsd, MARKUP commission, and BACEN PTAX D-1.
+ * - Strictly separates administrative grants (ADMIN_PACKAGE_GRANT, countsAsRevenue: false)
+ *   from verifiable gateway-paid purchases (PACKAGE_PURCHASE, countsAsRevenue: true).
+ * - Preserves weeklyNativeLessonsTarget and any existing pedagogical links.
+ * - Guarantees deterministic idempotency and atomic credit updates in Firestore (default).
+ */
+export async function executePackageCreditOperationAtomicServer(
+  params: PackageCreditOperationParams
+): Promise<PackageCreditOperationResult> {
+  const cleanActorUid = String(params.actorUid || '').trim();
+  const cleanActorEmail = String(params.actorEmail || '').toLowerCase().trim();
+  const cleanActorRole = params.actorRole;
+
+  if (!cleanActorUid) {
+    return {
+      success: false,
+      statusCode: 401,
+      code: 'UNAUTHORIZED',
+      error: 'Autenticação obrigatória para operação de pacote.',
+    };
+  }
+
+  const wantsPaidPurchase = params.isPaidPurchase === true;
+  if (wantsPaidPurchase) {
+    const gw = params.gatewayConfirmation;
+    if (
+      !gw ||
+      gw.verifiedByServer !== true ||
+      typeof gw.gatewayProvider !== 'string' ||
+      !gw.gatewayProvider.trim() ||
+      typeof gw.gatewayTransactionId !== 'string' ||
+      !gw.gatewayTransactionId.trim()
+    ) {
+      return {
+        success: false,
+        statusCode: 403,
+        code: 'PAYMENT_GATEWAY_NOT_CONFIGURED',
+        error: 'Compra paga recusada: confirmação verificável do gateway de pagamento ausente.',
+      };
+    }
+  } else if (cleanActorRole !== 'admin') {
+    return {
+      success: false,
+      statusCode: 403,
+      code: 'FORBIDDEN',
+      error: 'Concessão administrativa de pacote exige privilégios de administrador.',
+    };
+  }
+
+  // 1. Validate package size strictly in {1, 4, 8, 12}
+  const rawPkg = params.packageLessons;
+  if (
+    typeof rawPkg !== 'number' ||
+    !Number.isFinite(rawPkg) ||
+    !Number.isInteger(rawPkg) ||
+    ![1, 4, 8, 12].includes(rawPkg)
+  ) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'INVALID_PACKAGE',
+      error: 'Pacote inválido. Os pacotes comerciais aprovados são estritamente de 1, 4, 8 ou 12 aulas.',
+    };
+  }
+  const lessonsCount = rawPkg;
+  const approvedPkgDef = APPROVED_PACKAGES.find((p) => p.lessonsCount === lessonsCount)!;
+
+  // 2. Validate canonical student UID
+  const cleanStudentUid = String(params.studentUid || '').trim();
+  if (!cleanStudentUid || !isValidCanonicalUid(cleanStudentUid)) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'CANONICAL_UID_REQUIRED',
+      error: 'UID canônico do aluno é obrigatório e deve ser válido.',
+    };
+  }
+
+  // 3. Validate idempotency key
+  const cleanIdempotencyKey =
+    typeof params.idempotencyKey === 'string' ? params.idempotencyKey.trim() : '';
+  if (!cleanIdempotencyKey || cleanIdempotencyKey.length > 200) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'IDEMPOTENCY_KEY_REQUIRED',
+      error: 'idempotencyKey é obrigatória para garantir idempotência na operação de pacote.',
+    };
+  }
+
+  const db = getFirestoreDb();
+  if (!db || isCloudWriteDisabled) {
+    return {
+      success: false,
+      statusCode: 503,
+      code: 'FIRESTORE_UNAVAILABLE',
+      error: 'Serviço de persistência Firestore (default) indisponível.',
+    };
+  }
+
+  // 4. Resolve tutor reference (explicitly provided or student's existing pedagogical link)
+  let incomingTeacherUid = typeof params.teacherUid === 'string' ? params.teacherUid.trim() : '';
+  let incomingTeacherId = typeof params.teacherId === 'string' ? params.teacherId.trim() : '';
+  let incomingPublicTutorId =
+    typeof params.publicTutorId === 'string' ? params.publicTutorId.trim() : '';
+  let incomingTeacherEmail =
+    typeof params.teacherEmail === 'string' ? params.teacherEmail.toLowerCase().trim() : '';
+
+  const hasExplicitTutorRef = Boolean(
+    incomingTeacherUid || incomingTeacherId || incomingPublicTutorId || incomingTeacherEmail
+  );
+
+  if (!hasExplicitTutorRef) {
+    try {
+      const preStudentSnap = await db.collection('users').doc(cleanStudentUid).get();
+      if (preStudentSnap.exists) {
+        const preStudent = preStudentSnap.data() || {};
+        const fallbackExistingTutor = [
+          preStudent.teacherUid,
+          preStudent.assignedNativeFriendUID,
+          preStudent.nativeFriendUID,
+        ].find((v) => typeof v === 'string' && isValidCanonicalUid(v));
+        if (fallbackExistingTutor) {
+          incomingTeacherUid = fallbackExistingTutor.trim();
+        } else if (typeof preStudent.teacherEmail === 'string' && preStudent.teacherEmail.includes('@')) {
+          incomingTeacherEmail = preStudent.teacherEmail.toLowerCase().trim();
+        }
+      }
+    } catch {}
+  }
+
+  if (!incomingTeacherUid && !incomingTeacherId && !incomingPublicTutorId && !incomingTeacherEmail) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'TEACHER_REQUIRED',
+      error: 'Identificador do Amigo Nativo é obrigatório para precificação do pacote.',
+    };
+  }
+
+  // Resolve canonical teacher UID
+  const teacherIdentity = await resolveTeacherCanonicalIdentity({
+    teacherUid: incomingTeacherUid || undefined,
+    teacherId:
+      incomingTeacherId ||
+      incomingPublicTutorId ||
+      (incomingTeacherUid && !isValidCanonicalUid(incomingTeacherUid) ? incomingTeacherUid : undefined),
+    publicTutorId: incomingPublicTutorId || incomingTeacherId || undefined,
+    teacherEmail: incomingTeacherEmail || undefined,
+    dbState: params.dbState,
+  });
+
+  if (!teacherIdentity) {
+    // Check if the supplied UID actually belongs to a student or unapproved tutor
+    const candidateUid = [incomingTeacherUid, incomingTeacherId].find((v) => isValidCanonicalUid(v));
+    if (candidateUid) {
+      const [uDoc, tDoc] = await Promise.all([
+        fetchUserDocumentFromFirestore(candidateUid).catch(() => null),
+        fetchTutorDocumentFromFirestore(candidateUid).catch(() => null),
+      ]);
+      if (uDoc && String(uDoc.role || '').toLowerCase().trim() === 'student') {
+        return {
+          success: false,
+          statusCode: 403,
+          code: 'TUTOR_NOT_APPROVED',
+          error: 'Identificador não pertence a um Amigo Nativo aprovado.',
+        };
+      }
+      const unapprovedDoc = tDoc || uDoc;
+      if (unapprovedDoc && unapprovedDoc.deleted !== true && !(unapprovedDoc.approvalStatus === 'approved' && unapprovedDoc.isApproved === true)) {
+        return {
+          success: false,
+          statusCode: 403,
+          code: 'TUTOR_NOT_APPROVED',
+          error: 'Este Amigo Nativo não está aprovado para comercialização.',
+        };
+      }
+    }
+    return {
+      success: false,
+      statusCode: 404,
+      code: 'TUTOR_NOT_FOUND',
+      error: 'Amigo Nativo selecionado não encontrado no sistema.',
+    };
+  }
+
+  const canonicalTeacherUid = teacherIdentity.canonicalUid;
+  if (!canonicalTeacherUid || !isValidCanonicalUid(canonicalTeacherUid)) {
+    return {
+      success: false,
+      statusCode: 409,
+      code: 'TUTOR_CANONICAL_IDENTITY_REQUIRED',
+      error: 'Cadastro do Amigo Nativo sem UID canônico válido.',
+    };
+  }
+
+  // Load authoritative tutor document (users/{uid}, tutors/{uid}, and local dbState)
+  const [fsTutorDoc, fsTeacherUserDoc]: [Record<string, any> | null, Record<string, any> | null] = await Promise.all([
+    db.collection('tutors').doc(canonicalTeacherUid).get().then((s) => (s.exists ? ({ id: s.id, ...(s.data() || {}) } as Record<string, any>) : null)).catch(() => null),
+    db.collection('users').doc(canonicalTeacherUid).get().then((s) => (s.exists ? ({ id: s.id, ...(s.data() || {}) } as Record<string, any>) : null)).catch(() => null),
+  ]);
+
+  if (fsTeacherUserDoc && String(fsTeacherUserDoc.role || '').toLowerCase().trim() === 'student') {
+    return {
+      success: false,
+      statusCode: 403,
+      code: 'TUTOR_NOT_APPROVED',
+      error: 'Identificador não pertence a um Amigo Nativo aprovado.',
+    };
+  }
+
+  const localTutorMatch = Array.isArray(params.dbState?.tutorsList)
+    ? params.dbState.tutorsList.find(
+        (t: any) =>
+          t?.uid === canonicalTeacherUid ||
+          t?.authUid === canonicalTeacherUid ||
+          t?.id === canonicalTeacherUid
+      )
+    : null;
+
+  let authoritativeTutor = mergeFresherTutorPricingRecord(localTutorMatch, fsTeacherUserDoc);
+  authoritativeTutor = mergeFresherTutorPricingRecord(authoritativeTutor, fsTutorDoc);
+
+  if (!authoritativeTutor) {
+    authoritativeTutor = {
+      uid: canonicalTeacherUid,
+      email: teacherIdentity.email,
+      name: teacherIdentity.name,
+      isApproved: teacherIdentity.isApproved,
+      approvalStatus: teacherIdentity.isApproved ? 'approved' : 'pending',
+    };
+  }
+
+  if (authoritativeTutor.deleted === true) {
+    return {
+      success: false,
+      statusCode: 404,
+      code: 'TUTOR_NOT_FOUND',
+      error: 'Amigo Nativo não encontrado.',
+    };
+  }
+
+  const isTutorApproved =
+    authoritativeTutor.approvalStatus === 'approved' && authoritativeTutor.isApproved === true;
+  if (!isTutorApproved) {
+    return {
+      success: false,
+      statusCode: 403,
+      code: 'TUTOR_NOT_APPROVED',
+      error: 'Este Amigo Nativo não está aprovado para comercialização.',
+    };
+  }
+
+  const basePriceUsd = extractValidBasePriceUsdServer(authoritativeTutor);
+  if (basePriceUsd === null) {
+    return {
+      success: false,
+      statusCode: 422,
+      code: 'TUTOR_BASE_PRICE_UNAVAILABLE',
+      error: 'O preço-base em USD por aula deste Amigo Nativo não está configurado.',
+    };
+  }
+
+  if (!hasValidPersistedCommission(authoritativeTutor) || !isTutorCommercializable(authoritativeTutor)) {
+    return {
+      success: false,
+      statusCode: 422,
+      code: 'TUTOR_COMMISSION_NOT_CONFIGURED',
+      error: 'A comissão comercial deste Amigo Nativo ainda não foi configurada pela administração.',
+    };
+  }
+
+  const adminCommissionPercent = Number(authoritativeTutor.adminCommissionPercent);
+  const commissionVersion =
+    typeof authoritativeTutor.commissionVersion === 'number' && Number.isInteger(authoritativeTutor.commissionVersion)
+      ? authoritativeTutor.commissionVersion
+      : 1;
+
+  // 5. Fetch official BACEN PTAX D-1 rate (zero fallback)
+  let ptaxResult: any = params.ptaxOverride;
+  if (!ptaxResult) {
+    try {
+      const ptaxModule = await import('./serverPtax');
+      ptaxResult = await ptaxModule.getPtaxClosingD1();
+    } catch {
+      ptaxResult = null;
+    }
+  }
+
+  if (
+    !ptaxResult?.success ||
+    typeof ptaxResult.ptaxRate !== 'number' ||
+    !Number.isFinite(ptaxResult.ptaxRate) ||
+    ptaxResult.ptaxRate <= 0
+  ) {
+    return {
+      success: false,
+      statusCode: 503,
+      code: 'PTAX_UNAVAILABLE',
+      error: ptaxResult?.details || 'Cotação oficial PTAX D-1 indisponível no momento. Operação recusada sem fallback.',
+    };
+  }
+
+  // 6. Compute full FIN.2C quote strictly server-side
+  let pkgCalc: LessonPackageCalculation | undefined;
+  let quoteUnit: { finalPriceUsd: number; finalPriceBrl: number; teacherShareBrl: number; platformRevenueBrl: number };
+  try {
+    const quote = calculateFinancialPricingQuote({
+      basePriceUsd,
+      adminCommissionPercent,
+      ptaxRate: ptaxResult.ptaxRate,
+      commissionModel: ALLOWED_COMMISSION_MODEL,
+      conversionBase: 'UNIT_PRICE_BRL',
+    });
+    pkgCalc = quote.packages.list.find((p) => p.lessonsCount === lessonsCount);
+    quoteUnit = quote.unit;
+    if (
+      !quote.allInvariantsPassed ||
+      !pkgCalc ||
+      !pkgCalc.invariants.usdSumMatchesTotal ||
+      !pkgCalc.invariants.brlSumMatchesTotal
+    ) {
+      return {
+        success: false,
+        statusCode: 500,
+        code: 'PRICING_CALCULATION_FAILED',
+        error: 'Falha na invariante de cálculo financeiro do pacote.',
+      };
+    }
+  } catch (err: any) {
+    return {
+      success: false,
+      statusCode: 500,
+      code: 'PRICING_CALCULATION_FAILED',
+      error: err?.message || 'Falha ao calcular valores financeiros do pacote no servidor.',
+    };
+  }
+
+  const finalTeacherEmail = String(authoritativeTutor.email || teacherIdentity.email || incomingTeacherEmail || '')
+    .toLowerCase()
+    .trim();
+  const finalTeacherName = String(
+    authoritativeTutor.name || teacherIdentity.name || params.teacherName || finalTeacherEmail.split('@')[0] || 'Native Friend'
+  ).trim();
+  const cleanPackageName =
+    typeof params.packageName === 'string' && params.packageName.trim()
+      ? params.packageName.trim().slice(0, 120)
+      : approvedPkgDef.labelPt;
+  const cleanPaymentMethod =
+    typeof params.paymentMethod === 'string' && params.paymentMethod.trim()
+      ? params.paymentMethod.trim().slice(0, 60)
+      : wantsPaidPurchase
+      ? 'gateway'
+      : 'admin_grant';
+
+  const idempHash = crypto
+    .createHash('sha256')
+    .update(cleanIdempotencyKey)
+    .digest('hex')
+    .slice(0, 32);
+  const txDocId = `pkg_${idempHash}`;
+  const nowIso = new Date().toISOString();
+
+  try {
+    const txOutcome = await db.runTransaction(async (transaction) => {
+      const studentRef = db.collection('users').doc(cleanStudentUid);
+      const assignmentRef = db.collection('student_assignments').doc(cleanStudentUid);
+      const txRef = db.collection('financial_transactions').doc(txDocId);
+
+      const [studentSnap, assignmentSnap, txSnap] = await Promise.all([
+        transaction.get(studentRef),
+        transaction.get(assignmentRef),
+        transaction.get(txRef),
+      ]);
+
+      const studentData = studentSnap.exists ? (studentSnap.data() || {}) : null;
+
+      // Strict idempotency inside Firestore transaction
+      if (txSnap.exists) {
+        const existingTx = txSnap.data() || {};
+        if (
+          existingTx.studentUid !== cleanStudentUid ||
+          existingTx.packageLessons !== lessonsCount ||
+          existingTx.teacherUid !== canonicalTeacherUid ||
+          Boolean(existingTx.isPaidPurchase) !== wantsPaidPurchase
+        ) {
+          throw new PackageCreditOperationError(
+            'Chave de idempotência já utilizada para outra operação de pacote.',
+            409,
+            'IDEMPOTENCY_KEY_CONFLICT'
+          );
+        }
+
+        const authoritativeAvailable =
+          studentData && typeof studentData.availableLessons === 'number'
+            ? studentData.availableLessons
+            : Number(existingTx.afterAvailableLessons ?? 0);
+        const authoritativeContracted =
+          studentData && typeof studentData.contractedLessons === 'number'
+            ? studentData.contractedLessons
+            : Number(existingTx.afterContractedLessons ?? 0);
+
+        const existingLinkUid =
+          [
+            studentData?.teacherUid,
+            studentData?.assignedNativeFriendUID,
+            studentData?.nativeFriendUID,
+          ].find((v) => typeof v === 'string' && v.trim() !== '') || '';
+
+        return {
+          isIdempotent: true,
+          studentEmail: String(studentData?.email || existingTx.studentEmail || '').toLowerCase().trim(),
+          previousContractedLessons: Number(existingTx.beforeContractedLessons ?? authoritativeContracted),
+          contractedLessons: authoritativeContracted,
+          previousAvailableLessons: Number(existingTx.beforeAvailableLessons ?? authoritativeAvailable),
+          availableLessons: authoritativeAvailable,
+          effectiveProfileTeacherUid: existingLinkUid,
+          effectiveProfileTeacherEmail: String(studentData?.teacherEmail || ''),
+          effectiveProfileTeacherName: String(studentData?.teacherName || ''),
+          preservedExistingTeacherLink: Boolean(existingTx.preservedExistingTeacherLink),
+          preservedWeeklyNativeLessonsTarget:
+            typeof studentData?.weeklyNativeLessonsTarget === 'number'
+              ? studentData.weeklyNativeLessonsTarget
+              : null,
+          profile: studentData
+            ? {
+                ...studentData,
+                uid: cleanStudentUid,
+                availableLessons: authoritativeAvailable,
+                contractedLessons: authoritativeContracted,
+              }
+            : null,
+          transaction: existingTx,
+        };
+      }
+
+      if (!studentSnap.exists || !studentData || studentData.deleted === true) {
+        throw new PackageCreditOperationError(
+          'Aluno não encontrado no Firestore (default).',
+          404,
+          'STUDENT_NOT_FOUND'
+        );
+      }
+
+      const targetRole = String(studentData.role || '').toLowerCase().trim();
+      if (targetRole === 'admin' || targetRole === 'teacher') {
+        throw new PackageCreditOperationError(
+          'Operação de pacote permitida apenas para contas de alunos.',
+          400,
+          'INVALID_TARGET_ROLE'
+        );
+      }
+
+      const beforeAvailable =
+        typeof studentData.availableLessons === 'number' && Number.isFinite(studentData.availableLessons)
+          ? studentData.availableLessons
+          : 0;
+      const beforeContracted =
+        typeof studentData.contractedLessons === 'number' && Number.isFinite(studentData.contractedLessons)
+          ? studentData.contractedLessons
+          : beforeAvailable;
+
+      const afterAvailable = beforeAvailable + lessonsCount;
+      const afterContracted = beforeContracted + lessonsCount;
+      const cleanStudentEmail = String(studentData.email || params.studentEmail || '').toLowerCase().trim();
+
+      // Check existing pedagogical links on users/{uid} and student_assignments/{uid}
+      const existingStudentTeacherUid =
+        [
+          studentData.teacherUid,
+          studentData.assignedNativeFriendUID,
+          studentData.nativeFriendUID,
+        ].find((v) => typeof v === 'string' && v.trim() !== '') || '';
+
+      const assignmentData = assignmentSnap.exists ? (assignmentSnap.data() || {}) : null;
+      const existingAssignmentTeacherUid = assignmentData
+        ? [
+            assignmentData.teacherUid,
+            assignmentData.assignedNativeFriendUID,
+            assignmentData.nativeFriendUID,
+          ].find((v) => typeof v === 'string' && v.trim() !== '') || ''
+        : '';
+
+      const hasExistingTeacherLink = Boolean(existingStudentTeacherUid || existingAssignmentTeacherUid);
+
+      const processedPurchases = studentData.processedPurchases || {};
+      const updatedProcessedPurchases = {
+        ...processedPurchases,
+        [cleanIdempotencyKey]: {
+          transactionId: txDocId,
+          lessonsAdded: lessonsCount,
+          contractedLessons: afterContracted,
+          availableLessons: afterAvailable,
+          teacherUid: canonicalTeacherUid,
+          isPaidPurchase: wantsPaidPurchase,
+          timestamp: nowIso,
+        },
+      };
+
+      const studentUpdate: Record<string, any> = {
+        contractedLessons: afterContracted,
+        availableLessons: afterAvailable,
+        enrollmentStatus: 'active',
+        subscriptionType: 'package',
+        processedPurchases: updatedProcessedPurchases,
+        updatedAt: nowIso,
+      };
+
+      // Strictly preserve existing pedagogical links; only set if student had no prior teacher link
+      if (!hasExistingTeacherLink) {
+        studentUpdate.teacherUid = canonicalTeacherUid;
+        studentUpdate.assignedNativeFriendUID = canonicalTeacherUid;
+        studentUpdate.nativeFriendUID = canonicalTeacherUid;
+        studentUpdate.teacherEmail = finalTeacherEmail;
+        studentUpdate.teacherName = finalTeacherName;
+
+        transaction.set(
+          assignmentRef,
+          {
+            studentUid: cleanStudentUid,
+            teacherUid: canonicalTeacherUid,
+            teacherAuthUid: canonicalTeacherUid,
+            assignedNativeFriendUID: canonicalTeacherUid,
+            nativeFriendUID: canonicalTeacherUid,
+            teacherEmail: finalTeacherEmail,
+            teacherName: finalTeacherName,
+            updatedAt: nowIso,
+          },
+          { merge: true }
+        );
+      }
+
+      // NEVER alter weeklyNativeLessonsTarget automatically
+
+      const txRecord: Record<string, any> = {
+        id: txDocId,
+        type: wantsPaidPurchase ? 'PACKAGE_PURCHASE' : 'ADMIN_PACKAGE_GRANT',
+        category: wantsPaidPurchase ? 'paid_package_purchase' : 'administrative_package_grant',
+        origin: wantsPaidPurchase ? 'gateway_verified_purchase' : 'admin_grant',
+        idempotencyKey: cleanIdempotencyKey,
+        studentUid: cleanStudentUid,
+        studentEmail: cleanStudentEmail,
+        teacherUid: canonicalTeacherUid,
+        teacherEmail: finalTeacherEmail,
+        teacherName: finalTeacherName,
+        packageLessons: lessonsCount,
+        lessonsAdded: lessonsCount,
+        delta: lessonsCount,
+        packageName: cleanPackageName,
+        paymentMethod: cleanPaymentMethod,
+        pricingSource: 'server_fin2c',
+        currency: 'BRL',
+        basePriceUsd,
+        adminCommissionPercent,
+        commissionModel: ALLOWED_COMMISSION_MODEL,
+        commissionVersion,
+        ptaxRate: ptaxResult.ptaxRate,
+        ptaxQuoteDate: ptaxResult.quoteDate || '',
+        ptaxPricingDate: ptaxResult.pricingDate || '',
+        ptaxSource: ptaxResult.source || 'BACEN_PTAX_D1',
+        discountPercent: pkgCalc!.discountPercent,
+        unitFinalPriceUsd: quoteUnit.finalPriceUsd,
+        unitFinalPriceBrl: quoteUnit.finalPriceBrl,
+        grossTotalUsd: pkgCalc!.grossTotalUsd,
+        discountAmountUsd: pkgCalc!.discountAmountUsd,
+        packagePriceUsd: pkgCalc!.finalPriceUsd,
+        finalPriceUsd: pkgCalc!.finalPriceUsd,
+        effectiveLessonPriceUsd: pkgCalc!.effectiveLessonPriceUsd,
+        teacherShareUsd: pkgCalc!.teacherShareUsd,
+        platformRevenueUsd: pkgCalc!.platformRevenueUsd,
+        grossTotalBrl: pkgCalc!.grossTotalBrl,
+        discountAmountBrl: pkgCalc!.discountAmountBrl,
+        packagePriceBrl: pkgCalc!.finalPriceBrl,
+        finalPriceBrl: pkgCalc!.finalPriceBrl,
+        effectiveLessonPriceBrl: pkgCalc!.effectiveLessonPriceBrl,
+        teacherShareBrl: pkgCalc!.teacherShareBrl,
+        platformRevenueBrl: pkgCalc!.platformRevenueBrl,
+        invariants: pkgCalc!.invariants,
+        beforeAvailableLessons: beforeAvailable,
+        afterAvailableLessons: afterAvailable,
+        beforeContractedLessons: beforeContracted,
+        afterContractedLessons: afterContracted,
+        preservedExistingTeacherLink: hasExistingTeacherLink,
+        isAdministrativeOperation: !wantsPaidPurchase,
+        isPaidPurchase: wantsPaidPurchase,
+        countsAsRevenue: wantsPaidPurchase,
+        paymentStatus: wantsPaidPurchase ? 'paid' : 'admin_grant',
+        gatewayVerified: wantsPaidPurchase,
+        gatewayProvider: wantsPaidPurchase ? params.gatewayConfirmation!.gatewayProvider : null,
+        gatewayTransactionId: wantsPaidPurchase ? params.gatewayConfirmation!.gatewayTransactionId : null,
+        ...(wantsPaidPurchase
+          ? { gatewayConfirmedAt: params.gatewayConfirmation!.confirmedAt || nowIso }
+          : {}),
+        revenueBrl: wantsPaidPurchase ? pkgCalc!.finalPriceBrl : 0,
+        revenueUsd: wantsPaidPurchase ? pkgCalc!.finalPriceUsd : 0,
+        amountBrl: wantsPaidPurchase ? pkgCalc!.finalPriceBrl : 0,
+        amountUsd: wantsPaidPurchase ? pkgCalc!.finalPriceUsd : 0,
+        performedByUid: cleanActorUid,
+        performedByEmail: cleanActorEmail,
+        performedByRole: cleanActorRole,
+        status: 'completed',
+        createdAt: nowIso,
+      };
+
+      transaction.set(studentRef, studentUpdate, { merge: true });
+      transaction.set(txRef, txRecord);
+
+      const mergedStudentProfile = {
+        ...studentData,
+        ...studentUpdate,
+        uid: cleanStudentUid,
+      };
+
+      const effectiveProfileTeacherUid = hasExistingTeacherLink
+        ? existingStudentTeacherUid || existingAssignmentTeacherUid
+        : canonicalTeacherUid;
+
+      return {
+        isIdempotent: false,
+        studentEmail: cleanStudentEmail,
+        previousContractedLessons: beforeContracted,
+        contractedLessons: afterContracted,
+        previousAvailableLessons: beforeAvailable,
+        availableLessons: afterAvailable,
+        effectiveProfileTeacherUid,
+        effectiveProfileTeacherEmail: hasExistingTeacherLink
+          ? String(studentData.teacherEmail || '')
+          : finalTeacherEmail,
+        effectiveProfileTeacherName: hasExistingTeacherLink
+          ? String(studentData.teacherName || '')
+          : finalTeacherName,
+        preservedExistingTeacherLink: hasExistingTeacherLink,
+        preservedWeeklyNativeLessonsTarget:
+          typeof studentData.weeklyNativeLessonsTarget === 'number'
+            ? studentData.weeklyNativeLessonsTarget
+            : null,
+        profile: mergedStudentProfile,
+        transaction: txRecord,
+      };
+    });
+
+    return {
+      success: true,
+      statusCode: 200,
+      isIdempotent: txOutcome.isIdempotent,
+      studentUid: cleanStudentUid,
+      studentEmail: txOutcome.studentEmail,
+      pricedTeacherUid: canonicalTeacherUid,
+      teacherUid: txOutcome.effectiveProfileTeacherUid || canonicalTeacherUid,
+      teacherEmail: txOutcome.effectiveProfileTeacherEmail,
+      teacherName: txOutcome.effectiveProfileTeacherName,
+      preservedExistingTeacherLink: txOutcome.preservedExistingTeacherLink,
+      preservedWeeklyNativeLessonsTarget: txOutcome.preservedWeeklyNativeLessonsTarget,
+      packageLessons: lessonsCount,
+      discountPercent: pkgCalc.discountPercent,
+      idempotencyKey: cleanIdempotencyKey,
+      previousContractedLessons: txOutcome.previousContractedLessons,
+      contractedLessons: txOutcome.contractedLessons,
+      previousAvailableLessons: txOutcome.previousAvailableLessons,
+      availableLessons: txOutcome.availableLessons,
+      profile: txOutcome.profile || undefined,
+      transaction: txOutcome.transaction,
+    };
+  } catch (err: any) {
+    if (err instanceof PackageCreditOperationError) {
+      return {
+        success: false,
+        statusCode: err.statusCode,
+        code: err.code,
+        error: err.message,
+      };
+    }
+
+    const msg = String(err?.message || '');
+    const code = err?.code;
+
+    if (isPermissionError(err)) {
+      return {
+        success: false,
+        statusCode: 500,
+        code: 'FIRESTORE_INFRASTRUCTURE_ERROR',
+        error: 'Erro de permissão ao persistir operação de pacote no Firestore.',
+      };
+    }
+
+    const isTimeout =
+      code === 4 ||
+      code === 'deadline-exceeded' ||
+      msg.includes('DEADLINE_EXCEEDED') ||
+      msg.includes('timeout') ||
+      msg.includes('ETIMEDOUT');
+    if (isTimeout) {
+      return {
+        success: false,
+        statusCode: 504,
+        code: 'FIRESTORE_TIMEOUT',
+        error: 'Tempo limite esgotado ao persistir operação de pacote no Firestore. Tente novamente.',
+      };
+    }
+
+    return {
+      success: false,
+      statusCode: 500,
+      code: 'FIRESTORE_TRANSACTION_FAILED',
+      error: msg || 'Falha ao processar operação de pacote no Firestore.',
+    };
+  }
+}
+
+export interface ListFinancialTransactionsFilters {
+  studentUid?: string;
+  teacherUid?: string;
+  type?: string;
+  category?: string;
+  isPaidPurchase?: boolean;
+  countsAsRevenue?: boolean;
+  limit?: number;
+}
+
+/**
+ * FIN.2D.2B: Admin-only audit query over financial_transactions in Firestore (default).
+ */
+export async function listFinancialTransactionsForAdmin(
+  filters: ListFinancialTransactionsFilters = {}
+): Promise<{
+  success: boolean;
+  statusCode: number;
+  code?: string;
+  error?: string;
+  transactions: Record<string, any>[];
+}> {
+  const db = getFirestoreDb();
+  if (!db) {
+    return {
+      success: false,
+      statusCode: 503,
+      code: 'FIRESTORE_UNAVAILABLE',
+      error: 'Firestore (default) indisponível para consulta financeira.',
+      transactions: [],
+    };
+  }
+
+  try {
+    const snap = await db.collection('financial_transactions').get();
+    let items: Record<string, any>[] = [];
+    snap.forEach((doc: any) => {
+      const data = typeof doc.data === 'function' ? doc.data() : doc;
+      if (data && typeof data === 'object') {
+        items.push({ id: doc.id || data.id, ...data });
+      }
+    });
+
+    if (filters.studentUid) {
+      items = items.filter((t) => t.studentUid === filters.studentUid);
+    }
+    if (filters.teacherUid) {
+      items = items.filter((t) => t.teacherUid === filters.teacherUid);
+    }
+    if (filters.type) {
+      items = items.filter((t) => t.type === filters.type);
+    }
+    if (filters.category) {
+      items = items.filter((t) => t.category === filters.category);
+    }
+    if (typeof filters.isPaidPurchase === 'boolean') {
+      items = items.filter((t) => Boolean(t.isPaidPurchase) === filters.isPaidPurchase);
+    }
+    if (typeof filters.countsAsRevenue === 'boolean') {
+      items = items.filter((t) => Boolean(t.countsAsRevenue) === filters.countsAsRevenue);
+    }
+
+    items.sort((a, b) => {
+      const ta = String(a.createdAt || a.timestamp || '');
+      const tb = String(b.createdAt || b.timestamp || '');
+      return tb.localeCompare(ta);
+    });
+
+    const maxLimit =
+      typeof filters.limit === 'number' && Number.isFinite(filters.limit) && filters.limit > 0
+        ? Math.min(Math.floor(filters.limit), 500)
+        : 100;
+
+    return {
+      success: true,
+      statusCode: 200,
+      transactions: items.slice(0, maxLimit),
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      statusCode: isPermissionError(err) ? 500 : 503,
+      code: 'FIRESTORE_QUERY_FAILED',
+      error: err?.message || 'Falha ao consultar financial_transactions no Firestore.',
+      transactions: [],
+    };
+  }
+}
+
+
 
 
 

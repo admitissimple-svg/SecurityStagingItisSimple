@@ -1433,18 +1433,29 @@ export async function purchasePackageWithTransaction(params: PurchasePackageTran
     }
   } else {
     // NODE.JS TEST ENVIRONMENT: Execute atomic transaction via Firebase Admin SDK
-    // FASE FIN.2A.2B: Em modo pré-comercialização, somente concessão administrativa auditada é permitida
-    if (process.env.PAYMENTS_ENABLED !== 'true' && !params.isAdminAuditGrant) {
+    // FASE FIN.2A.2B + FIN.2D.2B: Sem gateway real, somente concessão administrativa auditada é permitida
+    if (!params.isAdminAuditGrant) {
+      if (process.env.PAYMENTS_ENABLED !== 'true') {
+        return {
+          success: false,
+          error: 'A contratação de pacotes está temporariamente indisponível (modo pré-comercialização). Nenhum crédito gerado.',
+        };
+      }
       return {
         success: false,
-        error: 'A contratação de pacotes está temporariamente indisponível (modo pré-comercialização). Nenhum crédito gerado.',
+        error: 'Gateway de pagamento não integrado. Nenhuma compra paga autorizada sem confirmação verificável do gateway.',
       };
     }
 
-    if (![1, 4, 8, 12].includes(Number(params.packageLessons))) {
+    if (
+      typeof params.packageLessons !== 'number' ||
+      !Number.isFinite(params.packageLessons) ||
+      !Number.isInteger(params.packageLessons) ||
+      ![1, 4, 8, 12].includes(params.packageLessons)
+    ) {
       return {
         success: false,
-        error: 'Pacote inválido. Os pacotes comerciais aprovados são de 1, 4, 8 ou 12 aulas.',
+        error: 'Pacote inválido. Os pacotes comerciais aprovados são estritamente de 1, 4, 8 ou 12 aulas.',
       };
     }
 
@@ -1469,29 +1480,37 @@ export async function purchasePackageWithTransaction(params: PurchasePackageTran
 
         const canonicalTeacherUid = teacherRes.canonicalUid;
         const studentDocRef = adminDb.collection('users').doc(studentUid);
-        const teacherDocRef = adminDb.collection('users').doc(canonicalTeacherUid);
         const idempKey = params.idempotencyKey ? String(params.idempotencyKey).trim() : '';
-        const txDocId = idempKey ? `pkg_${studentUid}_${idempKey.replace(/[^a-zA-Z0-9_-]/g, '_')}` : `pkg_${studentUid}_${Date.now()}`;
+        if (!idempKey) {
+          return { success: false, error: 'idempotencyKey é obrigatória.' };
+        }
+        const txDocId = `pkg_${studentUid}_${idempKey.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
         const txDocRef = adminDb.collection('financial_transactions').doc(txDocId);
 
         let finalContracted = params.packageLessons;
         let finalAvailable = params.packageLessons;
+        let finalTeacherUid = canonicalTeacherUid;
 
         await adminDb.runTransaction(async (transaction: any) => {
           const [studentSnap, txSnap] = await Promise.all([
             transaction.get(studentDocRef),
-            idempKey ? transaction.get(txDocRef) : Promise.resolve(null),
+            transaction.get(txDocRef),
           ]);
           const studentData = studentSnap.exists ? (studentSnap.data() || {}) : {};
           const processedPurchases = studentData.processedPurchases || {};
 
-          if (idempKey && ((txSnap && txSnap.exists) || processedPurchases[idempKey])) {
+          if ((txSnap && txSnap.exists) || processedPurchases[idempKey]) {
             finalContracted = typeof studentData.contractedLessons === 'number'
               ? studentData.contractedLessons
               : Number(processedPurchases[idempKey]?.contractedLessons ?? 0);
             finalAvailable = typeof studentData.availableLessons === 'number'
               ? studentData.availableLessons
               : Number(processedPurchases[idempKey]?.availableLessons ?? 0);
+            finalTeacherUid =
+              studentData.teacherUid ||
+              studentData.assignedNativeFriendUID ||
+              studentData.nativeFriendUID ||
+              canonicalTeacherUid;
             return;
           }
 
@@ -1502,42 +1521,62 @@ export async function purchasePackageWithTransaction(params: PurchasePackageTran
           finalContracted = currentContracted + params.packageLessons;
           finalAvailable = currentAvailable + params.packageLessons;
 
+          const existingTeacherUid =
+            [studentData.teacherUid, studentData.assignedNativeFriendUID, studentData.nativeFriendUID]
+              .find((v) => typeof v === 'string' && v.trim() !== '') || '';
+          const hasExistingLink = Boolean(existingTeacherUid);
+          if (hasExistingLink) {
+            finalTeacherUid = existingTeacherUid;
+          }
+
           const nowIso = new Date().toISOString();
           const updatedProcessed = { ...processedPurchases };
-          if (idempKey) {
-            updatedProcessed[idempKey] = {
-              transactionId: txDocId,
-              lessonsAdded: params.packageLessons,
-              contractedLessons: finalContracted,
-              availableLessons: finalAvailable,
-              teacherUid: canonicalTeacherUid,
-              timestamp: nowIso,
-            };
-          }
+          updatedProcessed[idempKey] = {
+            transactionId: txDocId,
+            lessonsAdded: params.packageLessons,
+            contractedLessons: finalContracted,
+            availableLessons: finalAvailable,
+            teacherUid: canonicalTeacherUid,
+            isPaidPurchase: false,
+            timestamp: nowIso,
+          };
 
           transaction.set(studentDocRef, {
             contractedLessons: finalContracted,
             availableLessons: finalAvailable,
-            teacherUid: canonicalTeacherUid,
-            assignedNativeFriendUID: canonicalTeacherUid,
-            nativeFriendUID: canonicalTeacherUid,
-            teacherEmail: teacherRes.email || cleanTeacherEmail,
-            teacherName: teacherRes.name || params.teacherName || '',
+            ...(!hasExistingLink
+              ? {
+                  teacherUid: canonicalTeacherUid,
+                  assignedNativeFriendUID: canonicalTeacherUid,
+                  nativeFriendUID: canonicalTeacherUid,
+                  teacherEmail: teacherRes.email || cleanTeacherEmail,
+                  teacherName: teacherRes.name || params.teacherName || '',
+                }
+              : {}),
             enrollmentStatus: 'active',
             subscriptionType: 'package',
             processedPurchases: updatedProcessed,
             updatedAt: nowIso,
           }, { merge: true });
 
-          transaction.set(teacherDocRef, { updatedAt: nowIso }, { merge: true });
           transaction.set(txDocRef, {
             id: txDocId,
-            type: 'package_purchase',
-            idempotencyKey: idempKey || null,
+            type: 'ADMIN_PACKAGE_GRANT',
+            category: 'administrative_package_grant',
+            origin: 'admin_grant',
+            idempotencyKey: idempKey,
             studentUid,
             studentEmail: cleanStudentEmail,
             teacherUid: canonicalTeacherUid,
             packageLessons: params.packageLessons,
+            isAdministrativeOperation: true,
+            isPaidPurchase: false,
+            countsAsRevenue: false,
+            gatewayVerified: false,
+            revenueBrl: 0,
+            revenueUsd: 0,
+            amountBrl: 0,
+            amountUsd: 0,
             status: 'completed',
             createdAt: nowIso,
           });
@@ -1547,9 +1586,9 @@ export async function purchasePackageWithTransaction(params: PurchasePackageTran
           success: true,
           contractedLessons: finalContracted,
           availableLessons: finalAvailable,
-          teacherUid: canonicalTeacherUid,
+          teacherUid: finalTeacherUid,
           profile: {
-            teacherUid: canonicalTeacherUid,
+            teacherUid: finalTeacherUid,
             contractedLessons: finalContracted,
             availableLessons: finalAvailable,
             teacherEmail: teacherRes.email || cleanTeacherEmail,

@@ -175,6 +175,9 @@ import {
   clearLocalInsightsCache,
   resolveCanonicalUidForTutorModeration,
   approveAndSaveTutorCommissionTransactionally,
+  adjustStudentCreditsAtomicServer,
+  executePackageCreditOperationAtomicServer,
+  listFinancialTransactionsForAdmin,
 } from './src/serverFirestore';
 import {
   validateAdminCommissionPercent,
@@ -7996,24 +7999,120 @@ app.get('/api/financial/pricing-quotes', async (req, res) => {
 });
 
 
-// Purchase Lesson Package with a specific Native Friend (binds tutor as fixed + adds lessons)
-app.post('/api/students/purchase-package', async (req, res) => {
-  // 1. Authenticate caller strictly via server-verified Firebase ID token
-  const verifiedCaller = await getVerifiedUserFromRequest(req);
-  if (!verifiedCaller) {
-    return res.status(401).json({
-      error: 'Unauthorized',
-      message: 'Token de autenticação obrigatório para contratação de pacote.',
-    });
-  }
+const FORBIDDEN_PACKAGE_CLIENT_PRICING_KEYS = new Set([
+  'price',
+  'baseprice',
+  'basepriceusd',
+  'pricepersessionusd',
+  'pricepersessionbrl',
+  'packagepricebrl',
+  'packagepriceusd',
+  'finalpricebrl',
+  'finalpriceusd',
+  'unitfinalpriceusd',
+  'unitfinalpricebrl',
+  'grosstotalbrl',
+  'grosstotalusd',
+  'effectivelessonpricebrl',
+  'effectivelessonpriceusd',
+  'commission',
+  'admincommissionpercent',
+  'commissionmodel',
+  'commissionversion',
+  'ptax',
+  'ptaxrate',
+  'discount',
+  'discountpercent',
+  'discountamountbrl',
+  'discountamountusd',
+  'rate',
+  'markup',
+  'total',
+  'amount',
+  'amountbrl',
+  'amountusd',
+  'revenuebrl',
+  'revenueusd',
+  'teachersharebrl',
+  'teachershareusd',
+  'platformrevenuebrl',
+  'platformrevenueusd',
+  'platformmarkupusd',
+  'teachershareratio',
+  'platformshareratio',
+]);
 
-  const isAdminCaller = verifiedCaller.role === 'admin';
+function hasClientSuppliedPricingParams(body: Record<string, any>): boolean {
+  if (!body || typeof body !== 'object') return false;
+  return Object.keys(body).some((key) =>
+    FORBIDDEN_PACKAGE_CLIENT_PRICING_KEYS.has(key.toLowerCase())
+  );
+}
 
-  // FASE FIN.2A.2B: Modo pré-comercialização — Proteção da rota de compra
+function hasForgedPaidPurchaseFlags(body: Record<string, any>): boolean {
+  if (!body || typeof body !== 'object') return false;
+  const normalizedPayStatus =
+    typeof body.paymentStatus === 'string' ? body.paymentStatus.trim().toLowerCase() : '';
+  const normalizedStatus =
+    typeof body.status === 'string' ? body.status.trim().toLowerCase() : '';
+  return Boolean(
+    body.paid === true ||
+      body.isPaidPurchase === true ||
+      body.countsAsRevenue === true ||
+      body.gatewayConfirmed === true ||
+      body.gatewayVerified === true ||
+      normalizedPayStatus === 'paid' ||
+      normalizedStatus === 'paid' ||
+      body.gatewayConfirmation !== undefined ||
+      (typeof body.gatewayTransactionId === 'string' && body.gatewayTransactionId.trim() !== '') ||
+      (typeof body.gatewayProvider === 'string' && body.gatewayProvider.trim() !== '')
+  );
+}
+
+function sanitizePackageTransactionForCaller(
+  tx: Record<string, any> | undefined,
+  isAdminCaller: boolean
+): Record<string, any> | undefined {
+  if (!tx) return undefined;
+  if (isAdminCaller) return tx;
+  const {
+    adminCommissionPercent: _c,
+    commissionModel: _cm,
+    commissionVersion: _cv,
+    basePriceUsd: _bp,
+    teacherShareUsd: _tsu,
+    teacherShareBrl: _tsb,
+    platformRevenueUsd: _pru,
+    platformRevenueBrl: _prb,
+    teacherEmail: _te,
+    performedByEmail: _pe,
+    ...publicSafeTx
+  } = tx;
+  return publicSafeTx;
+}
+
+async function handleConsolidatedPackageOperation(
+  req: express.Request,
+  res: express.Response,
+  options: { verifiedCaller: any; adminOnlyRoute?: boolean }
+) {
+  const verifiedCaller = options.verifiedCaller;
+  const isAdminCaller = verifiedCaller?.role === 'admin';
+  const rawBody = req.body && typeof req.body === 'object' ? req.body : {};
+
+  // FASE FIN.2A.2B + FIN.2D.2B: Modo pré-comercialização — Proteção da rota de compra
   // 1. Alunos comuns são estritamente impedidos de adquirir pacotes sem gateway de pagamento ativo.
   // 2. PAYMENTS_ENABLED possui padrão seguro false.
-  // 3. Mesmo com PAYMENTS_ENABLED=true, a concessão de créditos exige confirmação real do provedor (não implementada).
+  // 3. Mesmo com PAYMENTS_ENABLED=true, a concessão de créditos pagos exige confirmação real do gateway.
   if (!isAdminCaller) {
+    if (options.adminOnlyRoute) {
+      return res.status(403).json({
+        success: false,
+        error: 'Forbidden',
+        message: 'Acesso negado: privilégios de administrador obrigatórios.',
+      });
+    }
+
     if (!isPaymentsEnabled()) {
       return res.status(403).json({
         success: false,
@@ -8030,327 +8129,311 @@ app.post('/api/students/purchase-package', async (req, res) => {
       });
     }
   } else {
-    console.warn(`[AUDIT - ADMIN PACKAGE ALLOCATION] Admin ${verifiedCaller.email || verifiedCaller.uid} executing manual package credit assignment.`);
+    console.warn(`[AUDIT - ADMIN PACKAGE GRANT] Admin ${verifiedCaller.email || verifiedCaller.uid} executing server-priced package credit grant.`);
   }
 
-  const db = readDb();
-  const { studentEmail, teacherEmail, teacherName, packageLessons, packageName, packagePriceBrl, packagePriceUsd, paymentMethod } = req.body;
-  const requestedEmail = (studentEmail || '').toLowerCase().trim();
-
-  // 2. Strict authorization: students can ONLY purchase packages for their own account
-  if (verifiedCaller.role !== 'admin' && requestedEmail && requestedEmail !== (verifiedCaller.email || '').toLowerCase().trim()) {
+  // Never allow client flags to register a paid purchase without a real gateway confirmation
+  if (hasForgedPaidPurchaseFlags(rawBody) && !hasRealPaymentGatewayIntegrated()) {
     return res.status(403).json({
+      success: false,
+      error: 'PAYMENT_GATEWAY_NOT_CONFIGURED',
+      message: 'Gateway de pagamento não integrado. Não é permitido registrar compra como paga sem confirmação real verificada no servidor.',
+    });
+  }
+
+  // Strictly reject client-supplied pricing, discount, commission, PTAX or share parameters
+  if (hasClientSuppliedPricingParams(rawBody)) {
+    return res.status(400).json({
+      success: false,
+      error: 'CLIENT_PRICING_PARAMS_FORBIDDEN',
+      message: 'Os preços, descontos, comissões e cotação PTAX são calculados exclusivamente no servidor. Valores financeiros enviados pelo cliente são rejeitados.',
+    });
+  }
+
+  // Restrict packages strictly to 1, 4, 8, or 12 lessons
+  const rawPackageLessons = rawBody.packageLessons;
+  if (
+    typeof rawPackageLessons !== 'number' ||
+    !Number.isFinite(rawPackageLessons) ||
+    !Number.isInteger(rawPackageLessons) ||
+    ![1, 4, 8, 12].includes(rawPackageLessons)
+  ) {
+    return res.status(400).json({
+      success: false,
+      error: 'INVALID_PACKAGE',
+      message: 'Pacote inválido. Os pacotes comerciais aprovados são estritamente de 1, 4, 8 ou 12 aulas.',
+    });
+  }
+
+  const requestedEmail = typeof rawBody.studentEmail === 'string' ? rawBody.studentEmail.toLowerCase().trim() : '';
+
+  // Strict authorization: non-admin callers can only act on their own account
+  if (!isAdminCaller && requestedEmail && requestedEmail !== (verifiedCaller.email || '').toLowerCase().trim()) {
+    return res.status(403).json({
+      success: false,
       error: 'Forbidden',
       message: 'Não é permitido contratar pacote para outro usuário.',
     });
   }
 
-  const cleanStudentEmail = (
-    verifiedCaller.role === 'admin' && requestedEmail
-      ? requestedEmail
-      : (verifiedCaller.email?.toLowerCase().trim() || requestedEmail)
-  );
-  const targetStudentUid = (verifiedCaller.role === 'admin' && req.body.studentUid ? req.body.studentUid : verifiedCaller.uid)?.trim();
+  const targetStudentUid = isAdminCaller
+    ? (typeof rawBody.studentUid === 'string' ? rawBody.studentUid.trim() : '')
+    : (typeof rawBody.studentUid === 'string' && rawBody.studentUid.trim()
+        ? rawBody.studentUid.trim()
+        : String(verifiedCaller.uid || '').trim());
+
+  if (!isAdminCaller && targetStudentUid !== verifiedCaller.uid) {
+    return res.status(403).json({
+      success: false,
+      error: 'Forbidden',
+      message: 'Não é permitido contratar pacote para outro usuário.',
+    });
+  }
 
   if (!targetStudentUid || !isValidCanonicalUid(targetStudentUid)) {
-    return res.status(400).json({ error: 'Identificador canônico do aluno inválido ou ausente.' });
+    return res.status(400).json({
+      success: false,
+      error: 'CANONICAL_UID_REQUIRED',
+      message: 'UID canônico do aluno é obrigatório e deve ser válido.',
+    });
   }
 
-  // 3. Idempotency protection to prevent duplicate purchases on retry
-  const idempotencyKey = String(req.body.idempotencyKey || req.body.requestId || req.headers['idempotency-key'] || '').trim();
-
-  const cleanTeacherEmail = (teacherEmail || '').toLowerCase().trim();
-  const incomingTeacherRef = req.body.teacherId || req.body.publicTutorId || req.body.tutorId || req.body.teacherUid || cleanTeacherEmail;
-
-  if (!incomingTeacherRef && !cleanTeacherEmail) {
-    return res.status(400).json({ error: 'Identificador do Amigo Nativo é obrigatório.' });
+  const headerIdempKey = typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'] : '';
+  const idempotencyKey = String(rawBody.idempotencyKey || rawBody.requestId || headerIdempKey || '').trim();
+  if (!idempotencyKey) {
+    return res.status(400).json({
+      success: false,
+      error: 'IDEMPOTENCY_KEY_REQUIRED',
+      message: 'idempotencyKey é obrigatória para operação de pacote.',
+    });
   }
 
-  // 4. Resolve canonical Native Friend UID strictly via resolveTeacherCanonicalIdentity
-  const teacherRes = await resolveTeacherCanonicalIdentity({
-    teacherId: req.body.teacherId || req.body.publicTutorId || (typeof incomingTeacherRef === 'string' && !incomingTeacherRef.includes('@') ? incomingTeacherRef : undefined),
-    teacherUid: req.body.teacherUid,
-    teacherEmail: cleanTeacherEmail || (typeof incomingTeacherRef === 'string' && incomingTeacherRef.includes('@') ? incomingTeacherRef : undefined),
-    publicTutorId: req.body.publicTutorId || req.body.teacherId,
+  const db = readDb();
+
+  const result = await executePackageCreditOperationAtomicServer({
+    actorUid: verifiedCaller.uid,
+    actorEmail: verifiedCaller.email,
+    actorRole: isAdminCaller ? 'admin' : 'student',
+    studentUid: targetStudentUid,
+    studentEmail: requestedEmail,
+    teacherUid: typeof rawBody.teacherUid === 'string' ? rawBody.teacherUid : undefined,
+    teacherId: typeof rawBody.teacherId === 'string' ? rawBody.teacherId : undefined,
+    publicTutorId: typeof rawBody.publicTutorId === 'string' ? rawBody.publicTutorId : undefined,
+    teacherEmail: typeof rawBody.teacherEmail === 'string' ? rawBody.teacherEmail : undefined,
+    teacherName: typeof rawBody.teacherName === 'string' ? rawBody.teacherName : undefined,
+    packageLessons: rawPackageLessons,
+    packageName: typeof rawBody.packageName === 'string' ? rawBody.packageName : undefined,
+    paymentMethod: typeof rawBody.paymentMethod === 'string' ? rawBody.paymentMethod : undefined,
+    idempotencyKey,
+    isPaidPurchase: false,
+    gatewayConfirmation: null,
     dbState: db,
   });
 
-  if (!teacherRes) {
-    return res.status(404).json({ error: 'Amigo Nativo selecionado não encontrado no sistema.' });
-  }
-  if (!teacherRes.isApproved) {
-    return res.status(400).json({ error: 'O Amigo Nativo selecionado ainda não foi aprovado para receber agendamentos.' });
-  }
-  if (!isValidCanonicalUid(teacherRes.canonicalUid)) {
-    return res.status(400).json({ error: 'Não foi possível comprovar a identidade canônica do Amigo Nativo.' });
-  }
-
-  const canonicalTeacherUid = teacherRes.canonicalUid;
-  const finalTeacherEmail = teacherRes.email || cleanTeacherEmail;
-  const finalTeacherName = teacherRes.name || teacherName || finalTeacherEmail.split('@')[0];
-
-  const lessonsToAdd = Number(packageLessons) > 0 ? Number(packageLessons) : 4;
-  let newWeeklyTarget = 1;
-  if (lessonsToAdd === 4) newWeeklyTarget = 1;
-  else if (lessonsToAdd === 8) newWeeklyTarget = 2;
-  else if (lessonsToAdd === 12) newWeeklyTarget = 3;
-  else if (lessonsToAdd > 0) newWeeklyTarget = Math.min(7, Math.ceil(lessonsToAdd / 4));
-
-  const nowIso = new Date().toISOString();
-
-  // 5. ATOMIC TRANSACTION IN FIRESTORE VIA FIREBASE ADMIN SDK
-  const firestoreDb = getFirestoreDb();
-  if (!firestoreDb) {
-    return res.status(503).json({
+  if (!result.success) {
+    return res.status(result.statusCode || 400).json({
       success: false,
-      error: 'Serviço de persistência Firestore indisponível para contratação de pacotes.',
+      error: result.code || 'PACKAGE_OPERATION_FAILED',
+      message: result.error || 'Falha ao processar operação de pacote.',
     });
   }
 
-  let atomicContractedTotal: number | null = null;
-  let atomicAvailableTotal: number | null = null;
-  let isIdempotentReplay = false;
-  let recordedStudentData: any = null;
+  // Strictly synchronize local in-RAM state after atomic Firestore commit
+  const cleanStudentEmail = String(result.studentEmail || requestedEmail || '').toLowerCase().trim();
+  const updatedAtIso = String(result.transaction?.createdAt || new Date().toISOString());
+  const preservedExistingLink = Boolean(result.preservedExistingTeacherLink);
+  const effectiveTeacherUid = result.teacherUid || '';
+  const effectiveTeacherEmail = result.teacherEmail || '';
+  const effectiveTeacherName = result.teacherName || '';
 
-  try {
-    await firestoreDb.runTransaction(async (transaction) => {
-      const studentRef = firestoreDb.collection('users').doc(targetStudentUid);
-      const teacherRef = firestoreDb.collection('users').doc(canonicalTeacherUid);
+  if (cleanStudentEmail) {
+    if (!db.contractedLessons) db.contractedLessons = {};
+    db.contractedLessons[cleanStudentEmail] = result.contractedLessons!;
 
-      const [studentSnap, teacherSnap] = await Promise.all([
-        transaction.get(studentRef),
-        transaction.get(teacherRef).catch(() => null),
-      ]);
+    if (!db.userProfiles) db.userProfiles = {};
+    const existingProfile = db.userProfiles[cleanStudentEmail] || {};
 
-      if (!studentSnap.exists) {
-        const notFoundErr = new Error('Aluno não encontrado no Firestore.');
-        (notFoundErr as any).statusCode = 404;
-        throw notFoundErr;
-      }
-
-      const studentData = studentSnap.data() || {};
-      recordedStudentData = studentData;
-
-      // Check idempotency strictly inside the transaction
-      const processedPurchases = studentData.processedPurchases || {};
-      if (idempotencyKey && processedPurchases[idempotencyKey]) {
-        const prevTx = processedPurchases[idempotencyKey];
-        atomicContractedTotal = typeof studentData.contractedLessons === 'number'
-          ? studentData.contractedLessons
-          : prevTx.contractedLessons;
-        atomicAvailableTotal = typeof studentData.availableLessons === 'number'
-          ? studentData.availableLessons
-          : prevTx.availableLessons;
-        isIdempotentReplay = true;
-        return;
-      }
-
-      // Read authoritative balances directly from canonical Firestore student document
-      const currentAvailable = typeof studentData.availableLessons === 'number'
-        ? studentData.availableLessons
-        : 0;
-
-      const currentContracted = typeof studentData.contractedLessons === 'number'
-        ? studentData.contractedLessons
-        : currentAvailable;
-
-      const txContracted = currentContracted + lessonsToAdd;
-      const txAvailable = currentAvailable + lessonsToAdd;
-
-      atomicContractedTotal = txContracted;
-      atomicAvailableTotal = txAvailable;
-
-      const updatedProcessedPurchases = { ...processedPurchases };
-      if (idempotencyKey) {
-        updatedProcessedPurchases[idempotencyKey] = {
-          lessonsAdded: lessonsToAdd,
-          contractedLessons: txContracted,
-          availableLessons: txAvailable,
-          teacherUid: canonicalTeacherUid,
-          timestamp: nowIso,
-        };
-      }
-
-      const studentUpdate: Record<string, any> = {
-        contractedLessons: txContracted,
-        availableLessons: txAvailable,
-        teacherUid: canonicalTeacherUid,
-        assignedNativeFriendUID: canonicalTeacherUid,
-        nativeFriendUID: canonicalTeacherUid,
-        teacherEmail: finalTeacherEmail,
-        teacherName: finalTeacherName,
-        enrollmentStatus: 'active',
-        weeklyNativeLessonsTarget: newWeeklyTarget,
-        subscriptionType: 'package',
-        processedPurchases: updatedProcessedPurchases,
-        updatedAt: nowIso,
-      };
-
-      transaction.set(studentRef, studentUpdate, { merge: true });
-      if (teacherSnap && teacherSnap.exists) {
-        transaction.set(teacherRef, { updatedAt: nowIso }, { merge: true });
-      }
-    });
-  } catch (fsErr: any) {
-    console.error('[purchase-package] Failed to persist package credits in Firestore transaction:', fsErr);
-    if (fsErr?.statusCode === 404) {
-      return res.status(404).json({
-        success: false,
-        error: fsErr.message || 'Aluno não encontrado no Firestore.',
-      });
-    }
-    if (isPermissionError(fsErr)) {
-      return res.status(500).json({
-        success: false,
-        error: 'Erro de infraestrutura ao persistir créditos de aulas no banco de dados Firestore.',
-        code: 'FIRESTORE_INFRASTRUCTURE_ERROR',
-      });
-    }
-    const msg = String(fsErr?.message || '');
-    const code = fsErr?.code;
-    const isTimeout =
-      code === 4 ||
-      code === 'deadline-exceeded' ||
-      msg.includes('DEADLINE_EXCEEDED') ||
-      msg.includes('timeout') ||
-      msg.includes('ETIMEDOUT');
-    if (isTimeout) {
-      return res.status(504).json({
-        success: false,
-        error: 'Tempo limite esgotado ao persistir créditos no banco de dados Firestore. Tente novamente.',
-        code: 'FIRESTORE_TIMEOUT',
-      });
-    }
-    return res.status(500).json({
-      success: false,
-      error: 'Falha ao processar e persistir compra de créditos no Firestore.',
-      message: msg,
-    });
-  }
-
-  // Update student assignments doc in background
-  firestoreDb.collection('student_assignments').doc(targetStudentUid).set({
-    studentUid: targetStudentUid,
-    teacherUid: canonicalTeacherUid,
-    teacherAuthUid: canonicalTeacherUid,
-    assignedNativeFriendUID: canonicalTeacherUid,
-    nativeFriendUID: canonicalTeacherUid,
-    teacherEmail: finalTeacherEmail,
-    teacherName: finalTeacherName,
-    updatedAt: nowIso,
-  }, { merge: true }).catch(() => {});
-
-  // 6. Update local synchronized state strictly after transaction commit
-  if (!db.contractedLessons) db.contractedLessons = {};
-  db.contractedLessons[cleanStudentEmail] = atomicContractedTotal!;
-
-  if (!db.userProfiles) db.userProfiles = {};
-  const existingProfile = db.userProfiles[cleanStudentEmail] || {};
-
-  // Update student in db.students
-  let studentFound = false;
-  db.students = (db.students || []).map((s: any) => {
-    if ((s.email || s.studentEmail || '').toLowerCase() === cleanStudentEmail || (targetStudentUid && (s.uid === targetStudentUid || s.id === targetStudentUid))) {
-      studentFound = true;
-      return {
-        ...s,
-        teacherEmail: finalTeacherEmail,
-        teacherName: finalTeacherName,
-        teacherUid: canonicalTeacherUid,
-        assignedNativeFriendUID: canonicalTeacherUid,
-        nativeFriendUID: canonicalTeacherUid,
-        contractedLessons: atomicContractedTotal!,
-        availableLessons: atomicAvailableTotal!,
-        status: 'active',
-      };
-    }
-    return s;
-  });
-
-  if (!studentFound) {
-    db.students.push({
+    db.userProfiles[cleanStudentEmail] = {
+      ...existingProfile,
       id: targetStudentUid,
       uid: targetStudentUid,
-      name: cleanStudentEmail.split('@')[0],
-      studentName: cleanStudentEmail.split('@')[0],
       email: cleanStudentEmail,
-      studentEmail: cleanStudentEmail,
-      level: 'iniciante',
-      studentLevel: 'iniciante',
-      goal: 'English for everyday life & work',
-      learningGoal: 'English for everyday life & work',
-      contractedLessons: atomicContractedTotal!,
-      availableLessons: atomicAvailableTotal!,
-      completedLessonsCount: 0,
-      teacherEmail: finalTeacherEmail,
-      teacherName: finalTeacherName,
-      teacherUid: canonicalTeacherUid,
-      assignedNativeFriendUID: canonicalTeacherUid,
-      nativeFriendUID: canonicalTeacherUid,
-      routineVideoTime: '09:00',
-      routineAudioTime: '14:00',
-      dailyPhraseTime: '20:00',
-      status: 'active',
-      activeSince: new Date().toISOString().split('T')[0],
-      createdAt: nowIso,
-    });
+      name: existingProfile.name || cleanStudentEmail.split('@')[0],
+      level: existingProfile.level || 'iniciante',
+      ...(!preservedExistingLink && effectiveTeacherUid
+        ? {
+            teacherEmail: effectiveTeacherEmail || existingProfile.teacherEmail,
+            teacherName: effectiveTeacherName || existingProfile.teacherName,
+            teacherUid: effectiveTeacherUid,
+            assignedNativeFriendUID: effectiveTeacherUid,
+            nativeFriendUID: effectiveTeacherUid,
+          }
+        : {}),
+      enrollmentStatus: 'active',
+      contractedLessons: result.contractedLessons!,
+      availableLessons: result.availableLessons!,
+      subscriptionType: 'package',
+      completedLessonsCount: existingProfile.completedLessonsCount || 0,
+      updatedAt: updatedAtIso,
+    };
   }
 
-  // Update db.userProfiles
-  db.userProfiles[cleanStudentEmail] = {
-    ...existingProfile,
-    id: targetStudentUid,
-    uid: targetStudentUid,
-    email: cleanStudentEmail,
-    name: existingProfile.name || cleanStudentEmail.split('@')[0],
-    level: existingProfile.level || 'iniciante',
-    teacherEmail: finalTeacherEmail,
-    teacherName: finalTeacherName,
-    teacherUid: canonicalTeacherUid,
-    assignedNativeFriendUID: canonicalTeacherUid,
-    nativeFriendUID: canonicalTeacherUid,
-    enrollmentStatus: 'active',
-    contractedLessons: atomicContractedTotal!,
-    availableLessons: atomicAvailableTotal!,
-    weeklyNativeLessonsTarget: newWeeklyTarget,
-    subscriptionType: 'package',
-    completedLessonsCount: existingProfile.completedLessonsCount || 0,
-    updatedAt: nowIso,
-  };
+  if (Array.isArray(db.students)) {
+    let studentFound = false;
+    db.students = db.students.map((s: any) => {
+      const sEmail = String(s?.email || s?.studentEmail || '').toLowerCase().trim();
+      const sUid = String(s?.uid || s?.id || '').trim();
+      if ((targetStudentUid && sUid === targetStudentUid) || (cleanStudentEmail && sEmail === cleanStudentEmail)) {
+        studentFound = true;
+        return {
+          ...s,
+          ...(!preservedExistingLink && effectiveTeacherUid
+            ? {
+                teacherEmail: effectiveTeacherEmail || s.teacherEmail,
+                teacherName: effectiveTeacherName || s.teacherName,
+                teacherUid: effectiveTeacherUid,
+                assignedNativeFriendUID: effectiveTeacherUid,
+                nativeFriendUID: effectiveTeacherUid,
+              }
+            : {}),
+          contractedLessons: result.contractedLessons!,
+          availableLessons: result.availableLessons!,
+          status: 'active',
+          updatedAt: updatedAtIso,
+        };
+      }
+      return s;
+    });
 
-  // Record transaction
-  if (!db.transactions) db.transactions = [];
-  const transaction = {
-    id: `tx-${Date.now()}`,
-    idempotencyKey: idempotencyKey || undefined,
-    studentUid: targetStudentUid,
-    studentEmail: cleanStudentEmail,
-    teacherUid: canonicalTeacherUid,
-    teacherEmail: finalTeacherEmail,
-    teacherName: finalTeacherName,
-    packageLessons: lessonsToAdd,
-    packageName: packageName || `${lessonsToAdd} Aulas`,
-    packagePriceBrl: packagePriceBrl || lessonsToAdd * 90,
-    packagePriceUsd: packagePriceUsd || lessonsToAdd * 16,
-    paymentMethod: paymentMethod || 'credit_card',
-    timestamp: nowIso,
-    status: 'completed',
-    ...(isAdminCaller ? { adminGrantBy: verifiedCaller.email || verifiedCaller.uid, isAdministrativeOperation: true } : {}),
-  };
-  if (!isIdempotentReplay) {
-    db.transactions.unshift(transaction);
+    if (!studentFound && cleanStudentEmail) {
+      db.students.push({
+        id: targetStudentUid,
+        uid: targetStudentUid,
+        name: cleanStudentEmail.split('@')[0],
+        studentName: cleanStudentEmail.split('@')[0],
+        email: cleanStudentEmail,
+        studentEmail: cleanStudentEmail,
+        level: 'iniciante',
+        studentLevel: 'iniciante',
+        goal: 'English for everyday life & work',
+        learningGoal: 'English for everyday life & work',
+        contractedLessons: result.contractedLessons!,
+        availableLessons: result.availableLessons!,
+        completedLessonsCount: 0,
+        teacherEmail: effectiveTeacherEmail,
+        teacherName: effectiveTeacherName,
+        teacherUid: effectiveTeacherUid,
+        assignedNativeFriendUID: effectiveTeacherUid,
+        nativeFriendUID: effectiveTeacherUid,
+        routineVideoTime: '09:00',
+        routineAudioTime: '14:00',
+        dailyPhraseTime: '20:00',
+        status: 'active',
+        activeSince: new Date().toISOString().split('T')[0],
+        createdAt: updatedAtIso,
+      });
+    }
+  }
+
+  // Only verified paid gateway purchases enter revenue/RAM db.transactions;
+  // unpaid administrative grants live exclusively in Firestore financial_transactions with countsAsRevenue: false.
+  if (!result.isIdempotent && result.transaction?.isPaidPurchase === true) {
+    if (!db.transactions) db.transactions = [];
+    db.transactions.unshift(result.transaction);
   }
 
   await writeDbSync(db);
 
-  res.json({
+  const responseProfile = result.profile || (cleanStudentEmail ? db.userProfiles[cleanStudentEmail] : undefined);
+  const safeTx = sanitizePackageTransactionForCaller(result.transaction, isAdminCaller);
+
+  return res.json({
     success: true,
-    message: isIdempotentReplay ? 'Package already purchased (idempotent)' : 'Package purchased successfully and Native Friend assigned',
-    contractedLessons: atomicContractedTotal,
-    availableLessons: atomicAvailableTotal,
-    teacherUid: canonicalTeacherUid,
-    profile: db.userProfiles[cleanStudentEmail],
-    transaction,
+    isIdempotent: Boolean(result.isIdempotent),
+    message: result.isIdempotent
+      ? 'Package operation already processed (idempotent)'
+      : 'Package credits processed successfully in Firestore',
+    studentUid: result.studentUid,
+    packageLessons: result.packageLessons,
+    discountPercent: result.discountPercent,
+    previousContractedLessons: result.previousContractedLessons,
+    contractedLessons: result.contractedLessons,
+    previousAvailableLessons: result.previousAvailableLessons,
+    availableLessons: result.availableLessons,
+    pricedTeacherUid: result.pricedTeacherUid,
+    teacherUid: result.teacherUid,
+    preservedExistingTeacherLink: preservedExistingLink,
+    preservedWeeklyNativeLessonsTarget: result.preservedWeeklyNativeLessonsTarget,
+    profile: responseProfile,
+    transaction: safeTx,
+  });
+}
+
+// Purchase Lesson Package / Admin Package Grant (FIN.2D.2B consolidated)
+app.post('/api/students/purchase-package', async (req, res) => {
+  const verifiedCaller = await getVerifiedUserFromRequest(req);
+  if (!verifiedCaller) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Token de autenticação obrigatório para contratação de pacote.',
+    });
+  }
+  return handleConsolidatedPackageOperation(req, res, { verifiedCaller, adminOnlyRoute: false });
+});
+
+// FIN.2D.2B: Dedicated ADM-only package grant route (same server pricing & atomic ledger)
+app.post('/api/admin/packages/grant', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
+  const verifiedAdmin = req.user;
+  if (!verifiedAdmin || !verifiedAdmin.uid || verifiedAdmin.role !== 'admin') {
+    return res.status(403).json({
+      success: false,
+      error: 'Forbidden',
+      message: 'Acesso negado: privilégios de administrador obrigatórios.',
+    });
+  }
+  return handleConsolidatedPackageOperation(req, res, { verifiedCaller: verifiedAdmin, adminOnlyRoute: true });
+});
+
+// FIN.2D.2B: ADM-only audit listing of financial_transactions
+app.get('/api/admin/financial-transactions', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
+  const verifiedAdmin = req.user;
+  if (!verifiedAdmin || !verifiedAdmin.uid || verifiedAdmin.role !== 'admin') {
+    return res.status(403).json({
+      success: false,
+      error: 'Forbidden',
+      message: 'Acesso negado: privilégios de administrador obrigatórios.',
+    });
+  }
+
+  const rawLimit = typeof req.query?.limit === 'string' ? Number(req.query.limit) : undefined;
+  const parseBoolQuery = (val: unknown): boolean | undefined => {
+    if (val === 'true') return true;
+    if (val === 'false') return false;
+    return undefined;
+  };
+
+  const result = await listFinancialTransactionsForAdmin({
+    studentUid: typeof req.query?.studentUid === 'string' ? req.query.studentUid.trim() : undefined,
+    teacherUid: typeof req.query?.teacherUid === 'string' ? req.query.teacherUid.trim() : undefined,
+    type: typeof req.query?.type === 'string' ? req.query.type.trim() : undefined,
+    category: typeof req.query?.category === 'string' ? req.query.category.trim() : undefined,
+    isPaidPurchase: parseBoolQuery(req.query?.isPaidPurchase),
+    countsAsRevenue: parseBoolQuery(req.query?.countsAsRevenue),
+    limit: rawLimit,
+  });
+
+  if (!result.success) {
+    return res.status(result.statusCode || 500).json({
+      success: false,
+      error: result.code || 'FINANCIAL_TRANSACTIONS_QUERY_FAILED',
+      message: result.error || 'Falha ao consultar transações financeiras.',
+    });
+  }
+
+  return res.json({
+    success: true,
+    count: result.transactions.length,
+    transactions: result.transactions,
   });
 });
 
@@ -8375,6 +8458,97 @@ app.post('/api/students/contract', async (req, res) => {
     success: false,
     error: 'LEGACY_CREDIT_MUTATION_BLOCKED',
     message: 'Ajuste direto de créditos via rota legada em RAM está temporariamente bloqueado por segurança. Requer transação auditada em Firestore.',
+  });
+});
+
+// FIN.2D.2A: Authenticated, ADM-only atomic manual credit adjustment
+app.post('/api/admin/credits/adjust', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
+  const verifiedAdmin = req.user;
+  if (!verifiedAdmin || !verifiedAdmin.uid || verifiedAdmin.role !== 'admin') {
+    return res.status(403).json({
+      success: false,
+      error: 'Forbidden',
+      message: 'Acesso negado: privilégios de administrador obrigatórios.',
+    });
+  }
+
+  const rawBody = req.body && typeof req.body === 'object' ? req.body : {};
+  const studentUid = typeof rawBody.studentUid === 'string' ? rawBody.studentUid : '';
+  const delta = rawBody.delta;
+  const reason = typeof rawBody.reason === 'string' ? rawBody.reason : '';
+  const headerIdempKey = typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'] : '';
+  const idempotencyKey =
+    typeof rawBody.idempotencyKey === 'string' && rawBody.idempotencyKey.trim()
+      ? rawBody.idempotencyKey
+      : headerIdempKey;
+
+  const result = await adjustStudentCreditsAtomicServer({
+    studentUid,
+    delta,
+    reason,
+    idempotencyKey,
+    adminUid: verifiedAdmin.uid,
+    adminEmail: verifiedAdmin.email,
+  });
+
+  if (!result.success) {
+    return res.status(result.statusCode || 400).json({
+      success: false,
+      error: result.code || 'ADMIN_CREDIT_ADJUSTMENT_FAILED',
+      message: result.error || 'Falha ao processar ajuste administrativo de créditos.',
+    });
+  }
+
+  // Strictly synchronize local in-RAM cache after atomic Firestore commit (no revenue tracking, no link changes)
+  const db = readDb();
+  const cleanEmail = String(result.studentEmail || '').toLowerCase().trim();
+  const updatedAtIso = String(result.transaction?.createdAt || new Date().toISOString());
+
+  if (cleanEmail) {
+    if (!db.contractedLessons) db.contractedLessons = {};
+    db.contractedLessons[cleanEmail] = result.contractedLessons!;
+
+    if (db.userProfiles?.[cleanEmail]) {
+      db.userProfiles[cleanEmail] = {
+        ...db.userProfiles[cleanEmail],
+        contractedLessons: result.contractedLessons!,
+        availableLessons: result.availableLessons!,
+        updatedAt: updatedAtIso,
+      };
+    }
+  }
+
+  if (Array.isArray(db.students)) {
+    db.students = db.students.map((s: any) => {
+      const sEmail = String(s?.email || s?.studentEmail || '').toLowerCase().trim();
+      const sUid = String(s?.uid || s?.id || '').trim();
+      if ((result.studentUid && sUid === result.studentUid) || (cleanEmail && sEmail === cleanEmail)) {
+        return {
+          ...s,
+          contractedLessons: result.contractedLessons!,
+          availableLessons: result.availableLessons!,
+          updatedAt: updatedAtIso,
+        };
+      }
+      return s;
+    });
+  }
+
+  await writeDbSync(db);
+
+  return res.status(200).json({
+    success: true,
+    isIdempotent: Boolean(result.isIdempotent),
+    studentUid: result.studentUid,
+    studentEmail: result.studentEmail,
+    delta: result.delta,
+    reason: result.reason,
+    idempotencyKey: result.idempotencyKey,
+    previousContractedLessons: result.previousContractedLessons,
+    contractedLessons: result.contractedLessons,
+    previousAvailableLessons: result.previousAvailableLessons,
+    availableLessons: result.availableLessons,
+    transaction: result.transaction,
   });
 });
 
@@ -25815,15 +25989,30 @@ export async function startServer() {
     });
   } else if (!isProductionMode()) {
     console.log(`[Server] Running in DEVELOPMENT mode with Vite dev middleware on port ${PORT}`);
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: {
-        middlewareMode: true,
-        hmr: false,
-      },
-      appType: 'spa',
+    // Preserve dynamic import('vite') isolation while binding the HTTP port immediately
+    const vitePromise = (async () => {
+      const { createServer: createViteServer } = await import('vite');
+      return createViteServer({
+        server: {
+          middlewareMode: true,
+          hmr: false,
+          ws: false,
+          watch: null,
+        },
+        appType: 'spa',
+      });
+    })();
+    vitePromise.catch((err) => {
+      console.error('[Server] Error initializing Vite dev middleware:', err);
     });
-    app.use(vite.middlewares);
+    app.use((req, res, next) => {
+      if (req.path.startsWith('/api/')) {
+        return next();
+      }
+      vitePromise
+        .then((vite) => vite.middlewares(req, res, next))
+        .catch(next);
+    });
   } else {
     console.log(`[Server] Running in PRODUCTION mode serving compiled static bundle on port ${PORT}`);
     const distPath = path.join(process.cwd(), 'dist');
@@ -25860,8 +26049,11 @@ export async function startServer() {
         try {
           server.close();
         } catch {}
-        app.listen(PORT, '0.0.0.0', () => {
+        const retryServer = app.listen(PORT, '0.0.0.0', () => {
           console.log(`It's Simple Server re-bound and running on http://0.0.0.0:${PORT} (PORT=${PORT})`);
+        });
+        retryServer.on('error', (retryErr: any) => {
+          console.error('Server retry listen error:', retryErr?.message || retryErr);
         });
       }, 1000);
     } else {
