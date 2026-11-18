@@ -103,7 +103,7 @@ const DASHBOARD_COPY: Record<SupportedDashboardLang, DashboardCopy> = {
     kpiAttended: 'Atendidas',
     kpiAttendedSub: 'Realizadas (não-trial)',
     kpiBalance: 'Saldo',
-    kpiBalanceSub: 'Contratadas − Atendidas',
+    kpiBalanceSub: 'Créditos disponíveis por aluno',
     kpiRevenue: 'Faturamento',
     kpiRevenueSub: 'Apenas compras pagas',
     kpiProfit: 'Lucro',
@@ -158,7 +158,7 @@ const DASHBOARD_COPY: Record<SupportedDashboardLang, DashboardCopy> = {
     kpiAttended: 'Attended',
     kpiAttendedSub: 'Completed (non-trial)',
     kpiBalance: 'Balance',
-    kpiBalanceSub: 'Contracted − Attended',
+    kpiBalanceSub: 'Available credits per student',
     kpiRevenue: 'Revenue',
     kpiRevenueSub: 'Paid purchases only',
     kpiProfit: 'Profit',
@@ -220,6 +220,15 @@ function formatMarkupOrNd(val: number | null | undefined, lang: SupportedDashboa
 }
 
 function formatInteger(val: number, lang: SupportedDashboardLang): string {
+  return val.toLocaleString(lang === 'pt' ? 'pt-BR' : 'en-US');
+}
+
+function formatIntegerOrNd(
+  val: number | null | undefined,
+  lang: SupportedDashboardLang,
+  ndLabel: string
+): string {
+  if (typeof val !== 'number' || !Number.isFinite(val)) return ndLabel;
   return val.toLocaleString(lang === 'pt' ? 'pt-BR' : 'en-US');
 }
 
@@ -508,10 +517,14 @@ export const AdminOperationsDashboard: React.FC<AdminOperationsDashboardProps> =
               <span
                 data-testid="kpi-saldo"
                 className={`mt-1 block text-xl font-extrabold font-mono tabular-nums ${
-                  kpis && kpis.saldo < 0 ? 'text-amber-700' : 'text-[#000035]'
+                  kpis && typeof kpis.saldo === 'number'
+                    ? kpis.saldo < 0
+                      ? 'text-amber-700'
+                      : 'text-[#000035]'
+                    : 'text-slate-500'
                 }`}
               >
-                {kpis ? formatInteger(kpis.saldo, lang) : copy.nd}
+                {kpis ? formatIntegerOrNd(kpis.saldo, lang, copy.nd) : copy.nd}
               </span>
               <span className="mt-0.5 block text-[11px] text-slate-500">{copy.kpiBalanceSub}</span>
             </div>
@@ -755,12 +768,14 @@ export const AdminOperationsDashboard: React.FC<AdminOperationsDashboardProps> =
                         <td className="py-3 px-3 text-right font-mono tabular-nums text-[#1C4C96] font-semibold whitespace-nowrap">
                           {formatInteger(row.atendidas, lang)}
                         </td>
-                        <td
-                          className={`py-3 px-3 text-right font-mono tabular-nums font-semibold whitespace-nowrap ${
-                            row.saldo < 0 ? 'text-amber-700' : 'text-slate-900'
-                          }`}
-                        >
-                          {formatInteger(row.saldo, lang)}
+                        <td className="py-3 px-3 text-right font-mono tabular-nums whitespace-nowrap">
+                          {renderValueOrNd(
+                            formatIntegerOrNd(row.saldo, lang, copy.nd),
+                            copy.nd,
+                            row.saldo !== null && row.saldo < 0
+                              ? 'text-amber-700 font-semibold'
+                              : 'text-slate-900 font-semibold'
+                          )}
                         </td>
                         <td className="py-3 px-3 text-right font-mono tabular-nums whitespace-nowrap">
                           {renderValueOrNd(
@@ -836,7 +851,13 @@ export const AdminOperationsDashboard: React.FC<AdminOperationsDashboardProps> =
                         {formatInteger(kpis.atendidas, lang)}
                       </td>
                       <td className="py-3 px-3 text-right font-mono tabular-nums whitespace-nowrap">
-                        {formatInteger(kpis.saldo, lang)}
+                        {renderValueOrNd(
+                          formatIntegerOrNd(kpis.saldo, lang, copy.nd),
+                          copy.nd,
+                          kpis.saldo !== null && kpis.saldo < 0
+                            ? 'text-amber-700 font-bold'
+                            : 'text-slate-900 font-bold'
+                        )}
                       </td>
                       <td className="py-3 px-3 text-right text-slate-400 whitespace-nowrap">—</td>
                       <td className="py-3 px-3 text-right text-slate-400 whitespace-nowrap">—</td>

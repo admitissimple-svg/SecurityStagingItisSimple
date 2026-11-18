@@ -29,7 +29,7 @@ export interface OperationsRow {
   adminGrantedLessons: number;
   atendidas: number;
   trialAtendidas: number;
-  saldo: number;
+  saldo: number | null;
   aulaUsd: number | null;
   comissaoMarkupPercent: number | null;
   aulaBrl: number | null;
@@ -49,7 +49,7 @@ export interface OperationsKpis {
   paidContractedLessons: number;
   adminGrantedLessons: number;
   atendidas: number;
-  saldo: number;
+  saldo: number | null;
   faturamentoBrl: number | null;
   custoPlataformaBrl: number | null;
   custoNativeFriendBrl: number | null;
@@ -466,8 +466,126 @@ export function buildAdminOperationsDashboard(
     return synthesized;
   };
 
-  // 2. Build read-only student -> teacher assignment lookup (used for ADMIN_CREDIT_ADJUSTMENT without teacherUid)
+  // 2. Build canonical student balance registry & read-only student -> teacher lookup
+  const currentYm = extractBrazilYearMonth(input.generatedAt || new Date().toISOString());
+  const studentAliasToCanonicalKey = new Map<string, string>();
+  const studentPersistedBalance = new Map<string, number | null>();
+  const studentDocIsCanonical = new Map<string, boolean>();
+  const studentAssociatedTeachers = new Map<string, Set<string>>();
+  const studentHadCreditActivity = new Set<string>();
   const studentAssignedTeacherMap = new Map<string, CanonicalTeacherProfile>();
+
+  const registerStudentCanonicalBalance = (rec: Record<string, any>) => {
+    if (!rec || typeof rec !== 'object') return;
+    const role = String(rec.role || '').toLowerCase().trim();
+    if (role === 'admin' || role === 'teacher') return;
+    if (rec.deleted === true) return;
+
+    const rawCanonical = cleanString(rec.canonicalUid);
+    const rawAuthUid = cleanString(rec.authUid);
+    const rawUid = cleanString(rec.uid);
+    const rawId = cleanString(rec.id);
+    const email = normalizeEmail(rec.email) || normalizeEmail(rec.studentEmail);
+
+    const canonicalKey =
+      rawCanonical ||
+      rawAuthUid ||
+      rawUid ||
+      (rawId && !rawId.includes('@') ? rawId : '') ||
+      email;
+    if (!canonicalKey) return;
+
+    const isCanonicalDoc =
+      (!rawCanonical || rawCanonical === canonicalKey) &&
+      (!rawCanonical || rawId === canonicalKey || rawUid === canonicalKey || rawAuthUid === canonicalKey);
+
+    const rawBal = toFiniteNumber(rec.availableLessons);
+    if (!studentPersistedBalance.has(canonicalKey)) {
+      studentPersistedBalance.set(canonicalKey, rawBal);
+      studentDocIsCanonical.set(canonicalKey, isCanonicalDoc);
+    } else {
+      const prevCanonical = Boolean(studentDocIsCanonical.get(canonicalKey));
+      const prevBal = studentPersistedBalance.get(canonicalKey) ?? null;
+      if (
+        (isCanonicalDoc && !prevCanonical) ||
+        (isCanonicalDoc === prevCanonical && prevBal === null && rawBal !== null)
+      ) {
+        studentPersistedBalance.set(canonicalKey, rawBal);
+        studentDocIsCanonical.set(canonicalKey, isCanonicalDoc);
+      }
+    }
+
+    const aliases = [canonicalKey, rawAuthUid, rawUid, rawId, email].filter(Boolean);
+    for (const a of aliases) {
+      if (a.includes('@')) {
+        const lowerEmail = a.toLowerCase();
+        if (!studentAliasToCanonicalKey.has(lowerEmail) || !canonicalKey.includes('@')) {
+          studentAliasToCanonicalKey.set(lowerEmail, canonicalKey);
+        }
+      } else {
+        studentAliasToCanonicalKey.set(a, canonicalKey);
+      }
+    }
+  };
+
+  for (const u of users) {
+    if (!u || typeof u !== 'object') continue;
+    const hasNonEmailUid = Boolean(
+      cleanString(u.canonicalUid) ||
+        cleanString(u.authUid) ||
+        cleanString(u.uid) ||
+        (cleanString(u.id) && !cleanString(u.id).includes('@'))
+    );
+    if (hasNonEmailUid) registerStudentCanonicalBalance(u);
+  }
+  for (const u of users) {
+    if (!u || typeof u !== 'object') continue;
+    const email = normalizeEmail(u.email) || normalizeEmail(u.studentEmail);
+    const hasNonEmailUid = Boolean(
+      cleanString(u.canonicalUid) ||
+        cleanString(u.authUid) ||
+        cleanString(u.uid) ||
+        (cleanString(u.id) && !cleanString(u.id).includes('@'))
+    );
+    if (!hasNonEmailUid && (!email || !studentAliasToCanonicalKey.has(email))) {
+      registerStudentCanonicalBalance(u);
+    }
+  }
+
+  const resolveStudentKey = (rec: {
+    studentUid?: unknown;
+    studentEmail?: unknown;
+    uid?: unknown;
+    id?: unknown;
+    email?: unknown;
+  }): string => {
+    const sUid = cleanString(rec.studentUid) || cleanString(rec.uid) || cleanString(rec.id);
+    const sEmail = normalizeEmail(rec.studentEmail) || normalizeEmail(rec.email);
+    if (sUid) {
+      const mapped = studentAliasToCanonicalKey.get(sUid);
+      if (mapped) return mapped;
+    }
+    if (sEmail) {
+      const mapped = studentAliasToCanonicalKey.get(sEmail);
+      if (mapped) return mapped;
+    }
+    return sUid || sEmail || 'unknown_student';
+  };
+
+  const addStudentTeacherAssociation = (
+    studentKey: string,
+    teacher: CanonicalTeacherProfile | null | undefined
+  ) => {
+    if (!studentKey || studentKey === 'unknown_student') return;
+    if (!teacher || teacher.teacherKey === '__unassigned__') return;
+    let set = studentAssociatedTeachers.get(studentKey);
+    if (!set) {
+      set = new Set<string>();
+      studentAssociatedTeachers.set(studentKey, set);
+    }
+    set.add(teacher.teacherKey);
+  };
+
   const registerStudentLink = (rec: Record<string, any>) => {
     if (!rec || typeof rec !== 'object') return;
     const role = String(rec.role || '').toLowerCase().trim();
@@ -487,16 +605,19 @@ export function buildAdminOperationsDashboard(
     const sEmail = normalizeEmail(rec.email) || normalizeEmail(rec.studentEmail);
     if (sUid) studentAssignedTeacherMap.set(sUid, tProfile);
     if (sEmail) studentAssignedTeacherMap.set(sEmail, tProfile);
+
+    const canonicalStudentKey = resolveStudentKey({
+      studentUid: rec.studentUid,
+      studentEmail: rec.studentEmail,
+      uid: rec.uid,
+      id: rec.id,
+      email: rec.email,
+    });
+    addStudentTeacherAssociation(canonicalStudentKey, tProfile);
   };
 
   for (const sa of studentAssignments) registerStudentLink(sa);
   for (const u of users) registerStudentLink(u);
-
-  const resolveStudentKey = (rec: { studentUid?: unknown; studentEmail?: unknown }): string => {
-    const sUid = cleanString(rec.studentUid);
-    const sEmail = normalizeEmail(rec.studentEmail);
-    return sUid || sEmail || 'unknown_student';
-  };
 
   // 3. Bucket accumulator keyed by `${year}-${month}::${teacherKey}`
   const buckets = new Map<string, BucketAccumulator>();
@@ -561,7 +682,7 @@ export function buildAdminOperationsDashboard(
     const competence = extractBrazilYearMonth(tx.gatewayConfirmedAt || tx.createdAt || tx.timestamp);
     if (!competence) continue;
 
-    let teacher = resolveTeacherFromFields({
+    const explicitTeacher = resolveTeacherFromFields({
       teacherUid: tx.teacherUid || tx.tutorUid,
       teacherAuthUid: tx.teacherAuthUid,
       teacherPublicId: tx.teacherPublicId,
@@ -569,6 +690,7 @@ export function buildAdminOperationsDashboard(
       teacherName: tx.teacherName,
     });
 
+    let teacher = explicitTeacher;
     if (!teacher) {
       const sUid = cleanString(tx.studentUid);
       const sEmail = normalizeEmail(tx.studentEmail);
@@ -578,8 +700,14 @@ export function buildAdminOperationsDashboard(
         UNASSIGNED_TEACHER;
     }
 
+    const studentKey = resolveStudentKey({ studentUid: tx.studentUid, studentEmail: tx.studentEmail });
+    studentHadCreditActivity.add(studentKey);
+    if (explicitTeacher) {
+      addStudentTeacherAssociation(studentKey, explicitTeacher);
+    }
+
     const bucket = getOrCreateBucket(competence.year, competence.month, teacher);
-    bucket.studentKeys.add(resolveStudentKey({ studentUid: tx.studentUid, studentEmail: tx.studentEmail }));
+    bucket.studentKeys.add(studentKey);
 
     const lessonsCount = extractTransactionLessonsCount(tx);
     bucket.aulasContratadas += lessonsCount;
@@ -630,24 +758,38 @@ export function buildAdminOperationsDashboard(
   // 5. Process lessons (Realization competence = completedAt || startDateTime)
   for (const lesson of lessons) {
     if (!lesson || typeof lesson !== 'object') continue;
+    if (lesson.status === 'cancelled' || lesson.status === 'void') continue;
+
+    const lessonTeacher = resolveTeacherFromFields({
+      teacherUid: lesson.teacherUid || lesson.tutorUid,
+      teacherAuthUid: lesson.teacherAuthUid,
+      teacherPublicId: lesson.teacherPublicId,
+      teacherEmail: lesson.teacherEmail || lesson.tutorEmail,
+      teacherName: lesson.teacherName,
+    });
+    const studentKey = resolveStudentKey({
+      studentUid: lesson.studentUid,
+      studentEmail: lesson.studentEmail,
+    });
+
+    if (lessonTeacher) {
+      addStudentTeacherAssociation(studentKey, lessonTeacher);
+    }
+
     if (lesson.status !== 'completed') continue;
+
+    if (!lesson.isTrialLesson) {
+      studentHadCreditActivity.add(studentKey);
+    }
 
     const competence = extractBrazilYearMonth(
       lesson.completedAt || lesson.startDateTime || lesson.updatedAt
     );
     if (!competence) continue;
 
-    const teacher =
-      resolveTeacherFromFields({
-        teacherUid: lesson.teacherUid || lesson.tutorUid,
-        teacherAuthUid: lesson.teacherAuthUid,
-        teacherPublicId: lesson.teacherPublicId,
-        teacherEmail: lesson.teacherEmail || lesson.tutorEmail,
-        teacherName: lesson.teacherName,
-      }) || UNASSIGNED_TEACHER;
-
+    const teacher = lessonTeacher || UNASSIGNED_TEACHER;
     const bucket = getOrCreateBucket(competence.year, competence.month, teacher);
-    bucket.studentKeys.add(resolveStudentKey({ studentUid: lesson.studentUid, studentEmail: lesson.studentEmail }));
+    bucket.studentKeys.add(studentKey);
 
     if (Boolean(lesson.isTrialLesson)) {
       bucket.trialAtendidas += 1;
@@ -722,6 +864,39 @@ export function buildAdminOperationsDashboard(
         ? fromCents(b.grossPlatformShareCents)
         : null;
 
+    // ADM.OPS.3: Row Saldo rules:
+    // - Never show current balance as historical balance of previous/non-current months.
+    // - Show per-teacher balance ONLY when every student in the row has a persisted canonical balance
+    //   in Firestore and is unequivocally attributed to this single Native Friend; otherwise null (N/D).
+    const isCurrentMonthRow = Boolean(
+      currentYm && b.year === currentYm.year && b.month === currentYm.month
+    );
+    let rowSaldo: number | null = null;
+    if (isCurrentMonthRow && b.teacherKey !== '__unassigned__' && b.studentKeys.size > 0) {
+      let allUnequivocal = true;
+      let sumSaldo = 0;
+      for (const sk of b.studentKeys) {
+        if (sk === 'unknown_student') {
+          allUnequivocal = false;
+          break;
+        }
+        const persistedBal = studentPersistedBalance.get(sk) ?? null;
+        if (persistedBal === null) {
+          allUnequivocal = false;
+          break;
+        }
+        const assocTeachers = studentAssociatedTeachers.get(sk);
+        if (!assocTeachers || assocTeachers.size !== 1 || !assocTeachers.has(b.teacherKey)) {
+          allUnequivocal = false;
+          break;
+        }
+        sumSaldo += persistedBal;
+      }
+      if (allUnequivocal) {
+        rowSaldo = sumSaldo;
+      }
+    }
+
     const row: OperationsRow = {
       rowKey: b.rowKey,
       year: b.year,
@@ -736,7 +911,7 @@ export function buildAdminOperationsDashboard(
       adminGrantedLessons: b.adminGrantedLessons,
       atendidas: b.atendidas,
       trialAtendidas: b.trialAtendidas,
-      saldo: b.aulasContratadas - b.atendidas,
+      saldo: rowSaldo,
       aulaUsd,
       comissaoMarkupPercent,
       aulaBrl,
@@ -895,13 +1070,90 @@ export function buildAdminOperationsDashboard(
     }
   }
 
+  // ADM.OPS.3: Compute consolidated distinct student Saldo KPI
+  // - Never present current balance as historical balance of previous/non-current months.
+  // - When filtered by teacherUid or country, show balance only if every student in the slice
+  //   is unequivocally attributed to that teacher/country; otherwise null (N/D).
+  // - Across multiple/all teachers, sum each distinct student's canonical persisted balance once.
+  const isNonCurrentPeriodFilter = Boolean(
+    currentYm &&
+      ((filterYear !== 'all' && filterYear !== currentYm.year) ||
+        (filterMonth !== 'all' && filterMonth !== currentYm.month))
+  );
+
+  let kpiSaldo: number | null = null;
+  if (!isNonCurrentPeriodFilter) {
+    if (distinctStudents.size === 0) {
+      kpiSaldo = 0;
+    } else if (resolvedFilterTeacherKey === '__unassigned__') {
+      kpiSaldo = null;
+    } else {
+      let validSaldo = true;
+      let hasAnyPersisted = false;
+      let sumDistinctSaldo = 0;
+
+      for (const sk of distinctStudents) {
+        if (sk === 'unknown_student') {
+          validSaldo = false;
+          break;
+        }
+        const persistedBal = studentPersistedBalance.get(sk) ?? null;
+        if (persistedBal === null) {
+          if (studentHadCreditActivity.has(sk)) {
+            validSaldo = false;
+            break;
+          }
+          continue;
+        }
+        hasAnyPersisted = true;
+
+        if (resolvedFilterTeacherKey !== 'all') {
+          const assocTeachers = studentAssociatedTeachers.get(sk);
+          if (!assocTeachers || assocTeachers.size !== 1 || !assocTeachers.has(resolvedFilterTeacherKey)) {
+            validSaldo = false;
+            break;
+          }
+        } else if (rawCountryFilter !== 'all') {
+          const assocTeachers = studentAssociatedTeachers.get(sk);
+          if (!assocTeachers || assocTeachers.size === 0) {
+            validSaldo = false;
+            break;
+          }
+          let allTeachersMatchCountry = true;
+          for (const tKey of assocTeachers) {
+            const tCountry = (teachersByKey.get(tKey)?.country || '').trim();
+            if (rawCountryFilter === '__nd__') {
+              if (tCountry !== '') {
+                allTeachersMatchCountry = false;
+                break;
+              }
+            } else if (tCountry.toLowerCase() !== rawCountryFilter.toLowerCase()) {
+              allTeachersMatchCountry = false;
+              break;
+            }
+          }
+          if (!allTeachersMatchCountry) {
+            validSaldo = false;
+            break;
+          }
+        }
+
+        sumDistinctSaldo += persistedBal;
+      }
+
+      if (validSaldo && hasAnyPersisted) {
+        kpiSaldo = sumDistinctSaldo;
+      }
+    }
+  }
+
   const kpis: OperationsKpis = {
     alunosCount: distinctStudents.size,
     aulasContratadas,
     paidContractedLessons,
     adminGrantedLessons,
     atendidas,
-    saldo: aulasContratadas - atendidas,
+    saldo: kpiSaldo,
     faturamentoBrl: missingRevenueRow ? null : fromCents(faturamentoCents),
     custoPlataformaBrl:
       paidRowCount > 0 && allPlatformCostsPresent ? fromCents(custoPlataformaCents) : null,

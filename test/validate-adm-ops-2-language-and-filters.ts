@@ -276,7 +276,7 @@ async function runTests() {
     check(usOnly.kpis.alunosCount === 1, 'KPI Alunos distintos reconcilia para 1 aluno no recorte United States');
     check(usOnly.kpis.aulasContratadas === 1, 'KPI Aulas Contratadas = 1');
     check(usOnly.kpis.atendidas === 1, 'KPI Atendidas = 1');
-    check(usOnly.kpis.saldo === 0, 'KPI Saldo = 0 (1 contratada em 2025 - 1 atendida em 2026)');
+    check(usOnly.kpis.saldo === null, 'KPI Saldo = null (N/D quando availableLessons não está persistido no aluno)');
     check(usOnly.kpis.faturamentoBrl === pkg1Us.finalPriceBrl, 'KPI Faturamento = pacote US sem recalcular');
     check(
       usOnly.filterOptions.countries.includes('Canada') &&
@@ -293,8 +293,8 @@ async function runTests() {
       filters: { year: 2026, month: 11, country: 'United States', teacherUid: 'tutor_us_1' },
     });
     check(us2026Nov.rows.length === 1, 'Filtro combinado (Ano+Mês+País+Native Friend) retorna 1 linha exata');
-    check(us2026Nov.rows[0]?.saldo === -1, 'Linha de competência apenas de realização preserva saldo -1');
-    check(us2026Nov.kpis.saldo === -1 && us2026Nov.kpis.faturamentoBrl === 0, 'KPIs atualizam para o recorte combinado');
+    check(us2026Nov.rows[0]?.saldo === null, 'Linha sem availableLessons persistido retorna saldo null (N/D)');
+    check(us2026Nov.kpis.saldo === null && us2026Nov.kpis.faturamentoBrl === 0, 'KPIs atualizam para o recorte combinado');
 
     const missingCountryOnly = buildAdminOperationsDashboard({
       transactions,

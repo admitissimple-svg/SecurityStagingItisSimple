@@ -399,7 +399,7 @@ async function runTests() {
     check(septAna?.aulasContratadas === 6, `Sept Ana Aulas Contratadas = 6 (4 pagas + 2 admin), obtido=${septAna?.aulasContratadas}`);
     check(septAna?.paidContractedLessons === 4 && septAna?.adminGrantedLessons === 2, 'Separação paga/admin em Aulas Contratadas');
     check(septAna?.atendidas === 1 && septAna?.trialAtendidas === 1, 'Sept Ana Atendidas = 1 (trial excluída do saldo pago)');
-    check(septAna?.saldo === 5, 'Sept Ana Saldo = 6 - 1 = 5');
+    check(septAna?.saldo === null, 'Sept Ana Saldo = null (N/D em mês anterior / sem saldo canônico persistido)');
     check(septAna?.aulaUsd === 20, `Snapshot histórico preserva Aula USD = 20 (não 50 atual), obtido=${septAna?.aulaUsd}`);
     check(septAna?.comissaoMarkupPercent === 25, `Snapshot histórico preserva MARKUP = 25% (não 50% atual), obtido=${septAna?.comissaoMarkupPercent}`);
     check(septAna?.aulaBrl === pkg4Sept.effectiveLessonPriceBrl, 'Snapshot histórico preserva Aula BRL sem recalcular PTAX');
@@ -411,7 +411,7 @@ async function runTests() {
     // Oct Ana checks (realization competence only -> no transactions in Oct!)
     check(octAna?.aulasContratadas === 0, 'Oct Ana Aulas Contratadas = 0 (compra foi em Sept)');
     check(octAna?.atendidas === 2, 'Oct Ana Atendidas = 2 (competência de realização em Oct)');
-    check(octAna?.saldo === -2, 'Oct Ana Saldo do período = -2');
+    check(octAna?.saldo === null, 'Oct Ana Saldo = null (N/D em mês anterior)');
     check(octAna?.faturamentoBrl === 0, 'Oct Ana Faturamento = 0');
     check(octAna?.aulaUsd === null && octAna?.comissaoMarkupPercent === null && octAna?.aulaBrl === null, 'Mês apenas de realização não inventa snapshot usando preço/comissão atual (retorna null/N/D)');
 
@@ -430,7 +430,7 @@ async function runTests() {
     check(dash.kpis.alunosCount === 2, `KPI Alunos distintos = 2 (não duplica Student 1 entre Sept e Oct), obtido=${dash.kpis.alunosCount}`);
     check(dash.kpis.aulasContratadas === 11, `KPI Aulas Contratadas = 11 (6 + 0 + 4 + 1), obtido=${dash.kpis.aulasContratadas}`);
     check(dash.kpis.atendidas === 3, `KPI Atendidas = 3, obtido=${dash.kpis.atendidas}`);
-    check(dash.kpis.saldo === 8, `KPI Saldo = 11 - 3 = 8, obtido=${dash.kpis.saldo}`);
+    check(dash.kpis.saldo === null, `KPI Saldo = null (N/D quando alunos não possuem availableLessons persistido), obtido=${dash.kpis.saldo}`);
     const expectedTotalRevenue = Number((pkg4Sept.finalPriceBrl + pkg1Oct.finalPriceBrl).toFixed(2));
     check(dash.kpis.faturamentoBrl === expectedTotalRevenue, `KPI Faturamento = ${expectedTotalRevenue}`);
     check(dash.kpis.lucroBrl === null, 'KPI Lucro = N/D quando parte das linhas pagas não possui Custo Plataforma registrado');
