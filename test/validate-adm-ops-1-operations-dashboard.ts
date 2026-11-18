@@ -577,7 +577,7 @@ async function runTests() {
     const appSource = fs.readFileSync(path.join(process.cwd(), 'src/App.tsx'), 'utf8');
     check(
       appSource.includes("currentAccount?.role === 'admin' ? (") &&
-        appSource.includes('<AdminOperationsDashboard />') &&
+        appSource.includes('<AdminOperationsDashboard') &&
         appSource.includes('<TeacherScheduleControlTable'),
       'App.tsx substitui exclusivamente Master Schedule Control no painel ADM e preserva TeacherScheduleControlTable para professores'
     );

@@ -5,6 +5,7 @@ export const OPERATIONS_TIMEZONE = 'America/Sao_Paulo';
 export interface OperationsQueryFilters {
   year?: number | 'all';
   month?: number | 'all';
+  country?: string | 'all';
   teacherUid?: string | 'all';
 }
 
@@ -59,6 +60,8 @@ export interface OperationsKpis {
 export interface OperationsFilterOptions {
   years: number[];
   months: number[];
+  countries: string[];
+  hasMissingCountry?: boolean;
   teachers: OperationsTeacherOption[];
 }
 
@@ -69,6 +72,7 @@ export interface AdminOperationsDashboardData {
   filtersApplied: {
     year: number | 'all';
     month: number | 'all';
+    country: string | 'all';
     teacherUid: string | 'all';
   };
   filterOptions: OperationsFilterOptions;
@@ -655,6 +659,8 @@ export function buildAdminOperationsDashboard(
   // 6. Build all finalized rows & collect filter options across unfiltered dataset
   const allYearSet = new Set<number>();
   const allMonthSet = new Set<number>();
+  const allCountrySet = new Set<string>();
+  let hasMissingCountry = false;
   const allTeachersMap = new Map<string, OperationsTeacherOption>();
 
   const allEntries: Array<{ row: OperationsRow; studentKeys: Set<string>; aliases: Set<string> }> = [];
@@ -662,6 +668,11 @@ export function buildAdminOperationsDashboard(
   for (const b of buckets.values()) {
     allYearSet.add(b.year);
     allMonthSet.add(b.month);
+    if (b.country && b.country.trim() !== '') {
+      allCountrySet.add(b.country.trim());
+    } else {
+      hasMissingCountry = true;
+    }
     if (!allTeachersMap.has(b.teacherKey)) {
       allTeachersMap.set(b.teacherKey, {
         teacherKey: b.teacherKey,
@@ -758,6 +769,9 @@ export function buildAdminOperationsDashboard(
         country: prof.country,
       });
     }
+    if (prof?.country && prof.country.trim() !== '') {
+      allCountrySet.add(prof.country.trim());
+    }
   }
 
   // 7. Apply filters
@@ -771,6 +785,10 @@ export function buildAdminOperationsDashboard(
     input.filters.month >= 1 &&
     input.filters.month <= 12
       ? input.filters.month
+      : 'all';
+  const rawCountryFilter =
+    typeof input.filters?.country === 'string' && input.filters.country.trim() !== ''
+      ? input.filters.country.trim()
       : 'all';
   const rawTeacherFilter =
     typeof input.filters?.teacherUid === 'string' && input.filters.teacherUid.trim() !== ''
@@ -787,6 +805,15 @@ export function buildAdminOperationsDashboard(
   const filteredEntries = allEntries.filter(({ row, aliases }) => {
     if (filterYear !== 'all' && row.year !== filterYear) return false;
     if (filterMonth !== 'all' && row.month !== filterMonth) return false;
+    if (rawCountryFilter !== 'all') {
+      if (rawCountryFilter === '__nd__') {
+        if (row.country && row.country.trim() !== '') return false;
+      } else {
+        if ((row.country || '').trim().toLowerCase() !== rawCountryFilter.toLowerCase()) {
+          return false;
+        }
+      }
+    }
     if (resolvedFilterTeacherKey !== 'all') {
       const matches =
         row.teacherKey === resolvedFilterTeacherKey ||
@@ -891,11 +918,16 @@ export function buildAdminOperationsDashboard(
     filtersApplied: {
       year: filterYear,
       month: filterMonth,
+      country: rawCountryFilter,
       teacherUid: resolvedFilterTeacherKey,
     },
     filterOptions: {
       years: Array.from(allYearSet).sort((a, b) => b - a),
       months: Array.from(allMonthSet).sort((a, b) => a - b),
+      countries: Array.from(allCountrySet).sort((a, b) =>
+        a.localeCompare(b, 'en', { sensitivity: 'base' })
+      ),
+      hasMissingCountry,
       teachers: Array.from(allTeachersMap.values()).sort((a, b) =>
         a.name.localeCompare(b.name, 'pt-BR', { sensitivity: 'base' })
       ),

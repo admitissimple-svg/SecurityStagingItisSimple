@@ -7844,9 +7844,9 @@ export default function App() {
                   </div>
                 )}
 
-                {/* 1. ADM.OPS.1: Platform Operations Dashboard for Admin / Teacher Master Schedule Control for Teachers */}
+                {/* 1. ADM.OPS.1 / ADM.OPS.2: Platform Operations Dashboard for Admin / Teacher Master Schedule Control for Teachers */}
                 {currentAccount?.role === 'admin' ? (
-                  <AdminOperationsDashboard />
+                  <AdminOperationsDashboard currentLanguage={currentLanguage} />
                 ) : (
                   <TeacherScheduleControlTable
                     lessons={lessons}

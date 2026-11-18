@@ -8493,6 +8493,11 @@ app.get('/api/admin/operations-dashboard', firebaseAuthMiddleware, requireAdmin,
     parsedMonth = numMonth;
   }
 
+  const parsedCountry =
+    typeof req.query?.country === 'string' && req.query.country.trim() !== '' && req.query.country.trim() !== 'all'
+      ? req.query.country.trim()
+      : 'all';
+
   const parsedTeacherUid =
     typeof req.query?.teacherUid === 'string' && req.query.teacherUid.trim() !== '' && req.query.teacherUid.trim() !== 'all'
       ? req.query.teacherUid.trim()
@@ -8516,6 +8521,7 @@ app.get('/api/admin/operations-dashboard', firebaseAuthMiddleware, requireAdmin,
     filters: {
       year: parsedYear,
       month: parsedMonth,
+      country: parsedCountry,
       teacherUid: parsedTeacherUid,
     },
   });
