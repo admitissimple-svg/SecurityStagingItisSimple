@@ -80,7 +80,15 @@ export function isValidCreditLotOrigin(origin: unknown): origin is CreditLotOrig
  */
 export function buildCreditLotId(params: {
   studentUid: string;
-  kind: 'paid' | 'grant' | 'adj' | 'legacy' | 'recon_paid' | 'recon_courtesy';
+  kind:
+    | 'paid'
+    | 'grant'
+    | 'adj'
+    | 'legacy'
+    | 'recon_paid'
+    | 'recon_courtesy'
+    | 'switch_paid'
+    | 'switch_courtesy';
   idempotencyKey: string;
 }): string {
   const uidPart = sanitizeIdFragment(params.studentUid, 28);
@@ -2322,5 +2330,295 @@ export function buildReconciledCourtesyLotData(params: {
     reconciledAt: params.nowIso,
   };
 }
+
+/**
+ * NF.SWITCH.2D: Retires all currently available units on an active paid or courtesy
+ * source lot into the switch without reducing `initialLessons` or breaking any
+ * unit-cents schedule conservation invariants.
+ */
+export function retireSourceLotUnitsForSwitch(params: {
+  lot: CreditLot;
+  switchAuditId: string;
+  targetTeacherUid: string;
+  nowIso: string;
+}): {
+  retiredLot: CreditLot;
+  retiredUnitIndices: number[];
+} {
+  const { lot, switchAuditId, targetTeacherUid, nowIso } = params;
+  if (lot.origin === 'legacy_unreconciled') {
+    throw new CreditLedgerError(
+      `Lote '${lot.id}' tem origem legacy_unreconciled e não pode ser convertido automaticamente sem conciliação administrativa.`,
+      409,
+      CREDIT_LEDGER_DIVERGENCE_CODE,
+      { lotId: lot.id }
+    );
+  }
+  const { availableUnitIndices, consumedUnitIndices } = normalizeLotUnitIndices(lot);
+  if (availableUnitIndices.length !== lot.remainingLessons) {
+    throw new CreditLedgerError(
+      `Divergência nos índices disponíveis do lote '${lot.id}' durante encerramento de troca.`,
+      409,
+      CREDIT_LEDGER_DIVERGENCE_CODE,
+      { lotId: lot.id, availableCount: availableUnitIndices.length, remainingLessons: lot.remainingLessons }
+    );
+  }
+
+  const allConsumedIndices = [...consumedUnitIndices, ...availableUnitIndices].sort((a, b) => a - b);
+  const centsSnapshot = computeLotCentsSnapshot(lot, [], allConsumedIndices);
+
+  const retiredLot: CreditLot = {
+    ...lot,
+    ...centsSnapshot,
+    remainingLessons: 0,
+    consumedLessons: lot.initialLessons,
+    status: 'exhausted',
+    exhaustedAt: lot.exhaustedAt || nowIso,
+    updatedAt: nowIso,
+    switchedOutAt: nowIso,
+    switchedOutAuditId: switchAuditId,
+    switchedOutUnitIndices: [...availableUnitIndices],
+    switchedOutLessonsCount: availableUnitIndices.length,
+    switchedOutTargetTeacherUid: targetTeacherUid,
+  };
+
+  return {
+    retiredLot,
+    retiredUnitIndices: [...availableUnitIndices],
+  };
+}
+
+export function buildSwitchedPaidLotData(params: {
+  studentUid: string;
+  studentEmail?: string;
+  lessonsCount: 1 | 4 | 8 | 12;
+  discountPercent: number;
+  lotSequence: number;
+  packageIndex: number;
+  nowIso: string;
+  idempotencyKey: string;
+  switchAuditId: string;
+  sourceTeacherUid: string;
+  sourcePaidLotIds: string[];
+  pricedTeacherUid: string;
+  teacherEmail: string;
+  teacherName: string;
+  basePriceUsd: number;
+  adminCommissionPercent: number;
+  commissionModel: string;
+  commissionVersion: number;
+  ptaxRate: number;
+  ptaxQuoteDate?: string | null;
+  ptaxPricingDate?: string | null;
+  ptaxSource?: string | null;
+  totalPaidBrlCents: number;
+  totalPaidUsdCents: number;
+  teacherShareBrlCents: number;
+  teacherShareUsdCents: number;
+  platformRevenueBrlCents: number;
+  platformRevenueUsdCents: number;
+  unitCentsSchedule: CreditLotUnitLedgerEntry[];
+}): CreditLot {
+  const { lessonsCount, totalPaidBrlCents, totalPaidUsdCents, teacherShareBrlCents, teacherShareUsdCents, platformRevenueBrlCents, platformRevenueUsdCents } = params;
+  const availableUnitIndices = makeSequentialIndices(lessonsCount, 0);
+  const unitCentsSchedule = params.unitCentsSchedule.map((entry, idx) => ({
+    unitIndex: typeof entry.unitIndex === 'number' ? entry.unitIndex : idx,
+    totalPaidBrlCents: entry.totalPaidBrlCents,
+    totalPaidUsdCents: entry.totalPaidUsdCents,
+    teacherShareBrlCents: entry.teacherShareBrlCents,
+    teacherShareUsdCents: entry.teacherShareUsdCents,
+    platformRevenueBrlCents: entry.platformRevenueBrlCents,
+    platformRevenueUsdCents: entry.platformRevenueUsdCents,
+  }));
+
+  const centsToBrl = (c: number) => round2(c / 100);
+
+  return {
+    id: buildCreditLotId({
+      studentUid: params.studentUid,
+      kind: 'switch_paid',
+      idempotencyKey: `${params.idempotencyKey}:pkg:${params.packageIndex}`,
+    }),
+    studentUid: params.studentUid,
+    studentEmail: (params.studentEmail || '').toLowerCase().trim(),
+    origin: 'paid',
+    sourceType: 'NATIVE_FRIEND_SWITCH_PAID',
+    status: 'active',
+    initialLessons: lessonsCount,
+    remainingLessons: lessonsCount,
+    consumedLessons: 0,
+    lotSequence: params.lotSequence,
+    createdAt: params.nowIso,
+    updatedAt: params.nowIso,
+    exhaustedAt: null,
+    lastConsumedAt: null,
+    lastRefundedAt: null,
+    sourceTransactionId: null,
+    idempotencyKey: params.idempotencyKey,
+    pricedTeacherUid: params.pricedTeacherUid,
+    teacherEmail: params.teacherEmail || null,
+    teacherName: params.teacherName || null,
+    packageName: `Conversão Troca Native Friend (${lessonsCount} ${lessonsCount === 1 ? 'aula' : 'aulas'})`,
+    packageLessons: lessonsCount,
+    isPaidPurchase: true,
+    countsAsRevenue: true,
+    financialAttributionStatus: 'paid_verified',
+    currency: 'BRL',
+    basePriceUsd: params.basePriceUsd,
+    adminCommissionPercent: params.adminCommissionPercent,
+    commissionModel: params.commissionModel,
+    commissionVersion: params.commissionVersion,
+    ptaxRate: params.ptaxRate,
+    ptaxQuoteDate: params.ptaxQuoteDate ?? null,
+    ptaxPricingDate: params.ptaxPricingDate ?? null,
+    ptaxSource: params.ptaxSource ?? null,
+    discountPercent: params.discountPercent,
+    totalPaidBrl: centsToBrl(totalPaidBrlCents),
+    totalPaidUsd: centsToBrl(totalPaidUsdCents),
+    unitPriceBrl: round2(centsToBrl(totalPaidBrlCents) / lessonsCount),
+    unitPriceUsd: round2(centsToBrl(totalPaidUsdCents) / lessonsCount),
+    teacherShareBrl: centsToBrl(teacherShareBrlCents),
+    teacherShareUsd: centsToBrl(teacherShareUsdCents),
+    teacherLessonShareBrl: round2(centsToBrl(teacherShareBrlCents) / lessonsCount),
+    teacherLessonShareUsd: round2(centsToBrl(teacherShareUsdCents) / lessonsCount),
+    platformRevenueBrl: centsToBrl(platformRevenueBrlCents),
+    platformRevenueUsd: centsToBrl(platformRevenueUsdCents),
+    platformLessonRevenueBrl: round2(centsToBrl(platformRevenueBrlCents) / lessonsCount),
+    platformLessonRevenueUsd: round2(centsToBrl(platformRevenueUsdCents) / lessonsCount),
+    totalPaidBrlCents,
+    totalPaidUsdCents,
+    teacherShareBrlCents,
+    teacherShareUsdCents,
+    platformRevenueBrlCents,
+    platformRevenueUsdCents,
+    remainingTotalPaidBrlCents: totalPaidBrlCents,
+    remainingTotalPaidUsdCents: totalPaidUsdCents,
+    remainingTeacherShareBrlCents: teacherShareBrlCents,
+    remainingTeacherShareUsdCents: teacherShareUsdCents,
+    remainingPlatformRevenueBrlCents: platformRevenueBrlCents,
+    remainingPlatformRevenueUsdCents: platformRevenueUsdCents,
+    consumedTotalPaidBrlCents: 0,
+    consumedTotalPaidUsdCents: 0,
+    consumedTeacherShareBrlCents: 0,
+    consumedTeacherShareUsdCents: 0,
+    consumedPlatformRevenueBrlCents: 0,
+    consumedPlatformRevenueUsdCents: 0,
+    unitCentsSchedule,
+    availableUnitIndices,
+    consumedUnitIndices: [],
+    gatewayProvider: null,
+    gatewayTransactionId: null,
+    reason: `Conversão de créditos na troca de Native Friend (${params.sourceTeacherUid} -> ${params.pricedTeacherUid})`,
+    performedByUid: params.studentUid,
+    performedByEmail: (params.studentEmail || '').toLowerCase().trim(),
+    performedByRole: 'student',
+    switchedFromAuditId: params.switchAuditId,
+    switchedFromSourceTeacherUid: params.sourceTeacherUid,
+    switchedFromLotIds: [...params.sourcePaidLotIds],
+    switchedPackageIndex: params.packageIndex,
+  };
+}
+
+export function buildSwitchedCourtesyLotData(params: {
+  studentUid: string;
+  studentEmail?: string;
+  lessonsCount: number;
+  lotSequence: number;
+  nowIso: string;
+  idempotencyKey: string;
+  switchAuditId: string;
+  sourceTeacherUid: string;
+  targetTeacherUid: string;
+  sourceCourtesyLotIds: string[];
+}): CreditLot {
+  const unitCentsSchedule = buildZeroUnitCentsSchedule(params.lessonsCount);
+  const availableUnitIndices = makeSequentialIndices(params.lessonsCount, 0);
+
+  return {
+    id: buildCreditLotId({
+      studentUid: params.studentUid,
+      kind: 'switch_courtesy',
+      idempotencyKey: params.idempotencyKey,
+    }),
+    studentUid: params.studentUid,
+    studentEmail: (params.studentEmail || '').toLowerCase().trim(),
+    origin: 'courtesy',
+    sourceType: 'NATIVE_FRIEND_SWITCH_COURTESY',
+    status: 'active',
+    initialLessons: params.lessonsCount,
+    remainingLessons: params.lessonsCount,
+    consumedLessons: 0,
+    lotSequence: params.lotSequence,
+    createdAt: params.nowIso,
+    updatedAt: params.nowIso,
+    exhaustedAt: null,
+    lastConsumedAt: null,
+    lastRefundedAt: null,
+    sourceTransactionId: null,
+    idempotencyKey: params.idempotencyKey,
+    pricedTeacherUid: null,
+    teacherEmail: null,
+    teacherName: null,
+    packageName: null,
+    packageLessons: null,
+    isPaidPurchase: false,
+    countsAsRevenue: false,
+    financialAttributionStatus: 'courtesy_non_revenue',
+    currency: 'BRL',
+    basePriceUsd: null,
+    adminCommissionPercent: null,
+    commissionModel: null,
+    commissionVersion: null,
+    ptaxRate: null,
+    ptaxQuoteDate: null,
+    ptaxPricingDate: null,
+    ptaxSource: null,
+    discountPercent: null,
+    totalPaidBrl: 0,
+    totalPaidUsd: 0,
+    unitPriceBrl: 0,
+    unitPriceUsd: 0,
+    teacherShareBrl: 0,
+    teacherShareUsd: 0,
+    teacherLessonShareBrl: 0,
+    teacherLessonShareUsd: 0,
+    platformRevenueBrl: 0,
+    platformRevenueUsd: 0,
+    platformLessonRevenueBrl: 0,
+    platformLessonRevenueUsd: 0,
+    totalPaidBrlCents: 0,
+    totalPaidUsdCents: 0,
+    teacherShareBrlCents: 0,
+    teacherShareUsdCents: 0,
+    platformRevenueBrlCents: 0,
+    platformRevenueUsdCents: 0,
+    remainingTotalPaidBrlCents: 0,
+    remainingTotalPaidUsdCents: 0,
+    remainingTeacherShareBrlCents: 0,
+    remainingTeacherShareUsdCents: 0,
+    remainingPlatformRevenueBrlCents: 0,
+    remainingPlatformRevenueUsdCents: 0,
+    consumedTotalPaidBrlCents: 0,
+    consumedTotalPaidUsdCents: 0,
+    consumedTeacherShareBrlCents: 0,
+    consumedTeacherShareUsdCents: 0,
+    consumedPlatformRevenueBrlCents: 0,
+    consumedPlatformRevenueUsdCents: 0,
+    unitCentsSchedule,
+    availableUnitIndices,
+    consumedUnitIndices: [],
+    gatewayProvider: null,
+    gatewayTransactionId: null,
+    reason: `Transferência 1:1 de cortesias na troca de Native Friend (${params.sourceTeacherUid} -> ${params.targetTeacherUid})`,
+    performedByUid: params.studentUid,
+    performedByEmail: (params.studentEmail || '').toLowerCase().trim(),
+    performedByRole: 'student',
+    switchedFromAuditId: params.switchAuditId,
+    switchedFromSourceTeacherUid: params.sourceTeacherUid,
+    switchedFromLotIds: [...params.sourceCourtesyLotIds],
+    switchedPackageIndex: null,
+  };
+}
+
 
 

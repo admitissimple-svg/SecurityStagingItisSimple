@@ -182,6 +182,7 @@ import {
   listPendingLegacyCreditStudentsForAdmin,
   listCreditReconciliationAuditsForAdmin,
   reconcileStudentLegacyCreditsAtomicServer,
+  switchNativeFriendAtomicServer,
 } from './src/serverFirestore';
 import {
   buildAdminOperationsDashboard,
@@ -6888,49 +6889,62 @@ app.post('/api/user-profile', async (req, res) => {
     ? { ...(memExisting && (!memExisting.uid || memExisting.uid === targetUid) ? memExisting : {}), ...fsUser }
     : (memExisting || {});
 
-  const updatedTeacherEmail =
-    rawProfile.teacherEmail !== undefined ? (rawProfile.teacherEmail || null) : (existing.teacherEmail ?? null);
-  const updatedTeacherName =
-    rawProfile.teacherName !== undefined ? (rawProfile.teacherName || null) : (existing.teacherName ?? null);
+  const existingLinkedUid = [
+    existing.teacherUid,
+    existing.assignedNativeFriendUID,
+    existing.nativeFriendUID,
+  ].find((v): v is string => typeof v === 'string' && isValidCanonicalUid(v.trim()));
+  const hasActiveCanonicalLink = Boolean(
+    existingLinkedUid && existing.enrollmentStatus !== 'cancelled'
+  );
 
   let resolvedTeacherUid = existing.teacherUid || null;
-  let finalTeacherEmail = updatedTeacherEmail;
-  let finalTeacherName = updatedTeacherName;
+  let finalTeacherEmail =
+    rawProfile.teacherEmail !== undefined ? (rawProfile.teacherEmail || null) : (existing.teacherEmail ?? null);
+  let finalTeacherName =
+    rawProfile.teacherName !== undefined ? (rawProfile.teacherName || null) : (existing.teacherName ?? null);
 
-  const incomingTeacherQuery =
-    rawProfile.teacherUid ||
-    rawProfile.assignedNativeFriendUID ||
-    rawProfile.teacherId ||
-    rawProfile.publicTutorId ||
-    rawProfile.teacherEmail;
+  if (hasActiveCanonicalLink && verifiedUser.role !== 'admin') {
+    // NF.SWITCH.2D: Preserve active canonical student-teacher link; profile updates cannot silently switch Native Friend.
+    resolvedTeacherUid = existingLinkedUid!.trim();
+    finalTeacherEmail = existing.teacherEmail ?? finalTeacherEmail;
+    finalTeacherName = existing.teacherName ?? finalTeacherName;
+  } else {
+    const incomingTeacherQuery =
+      rawProfile.teacherUid ||
+      rawProfile.assignedNativeFriendUID ||
+      rawProfile.teacherId ||
+      rawProfile.publicTutorId ||
+      rawProfile.teacherEmail;
 
-  if (incomingTeacherQuery) {
-    const teacherRes = await resolveTeacherCanonicalIdentity({
-      teacherId: rawProfile.teacherId || rawProfile.publicTutorId || (typeof incomingTeacherQuery === 'string' ? incomingTeacherQuery : undefined),
-      teacherUid: rawProfile.teacherUid || rawProfile.assignedNativeFriendUID,
-      teacherEmail: rawProfile.teacherEmail || updatedTeacherEmail,
-      publicTutorId: rawProfile.publicTutorId || rawProfile.teacherId,
-      dbState: db,
-    });
-
-    if (teacherRes) {
-      if (!teacherRes.isApproved) {
-        return res.status(400).json({
-          error: 'O Amigo Nativo selecionado ainda não foi aprovado para receber alunos.',
-        });
-      }
-      if (!isValidCanonicalUid(teacherRes.canonicalUid)) {
-        return res.status(400).json({
-          error: 'Não foi possível comprovar a identidade canônica do Amigo Nativo.',
-        });
-      }
-      resolvedTeacherUid = teacherRes.canonicalUid;
-      finalTeacherEmail = teacherRes.email || finalTeacherEmail;
-      finalTeacherName = teacherRes.name || finalTeacherName;
-    } else {
-      return res.status(400).json({
-        error: 'Amigo Nativo selecionado não encontrado ou inválido.',
+    if (incomingTeacherQuery) {
+      const teacherRes = await resolveTeacherCanonicalIdentity({
+        teacherId: rawProfile.teacherId || rawProfile.publicTutorId || (typeof incomingTeacherQuery === 'string' ? incomingTeacherQuery : undefined),
+        teacherUid: rawProfile.teacherUid || rawProfile.assignedNativeFriendUID,
+        teacherEmail: rawProfile.teacherEmail || finalTeacherEmail,
+        publicTutorId: rawProfile.publicTutorId || rawProfile.teacherId,
+        dbState: db,
       });
+
+      if (teacherRes) {
+        if (!teacherRes.isApproved) {
+          return res.status(400).json({
+            error: 'O Amigo Nativo selecionado ainda não foi aprovado para receber alunos.',
+          });
+        }
+        if (!isValidCanonicalUid(teacherRes.canonicalUid)) {
+          return res.status(400).json({
+            error: 'Não foi possível comprovar a identidade canônica do Amigo Nativo.',
+          });
+        }
+        resolvedTeacherUid = teacherRes.canonicalUid;
+        finalTeacherEmail = teacherRes.email || finalTeacherEmail;
+        finalTeacherName = teacherRes.name || finalTeacherName;
+      } else {
+        return res.status(400).json({
+          error: 'Amigo Nativo selecionado não encontrado ou inválido.',
+        });
+      }
     }
   }
 
@@ -7010,9 +7024,11 @@ app.post('/api/user-profile', async (req, res) => {
   const resolvedStudyDays = safeStudentFields.weeklyStudyDays || safeStudentFields.selectedStudyDays || safeStudentFields.routineActivities || existing.weeklyStudyDays || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
 
   const safeEnrollmentStatus =
-    rawProfile.enrollmentStatus === 'active' || rawProfile.enrollmentStatus === 'not_enrolled'
-      ? rawProfile.enrollmentStatus
-      : (existing.enrollmentStatus || (updatedTeacherEmail ? 'active' : 'not_enrolled'));
+    hasActiveCanonicalLink && verifiedUser.role !== 'admin'
+      ? (existing.enrollmentStatus || 'active')
+      : (rawProfile.enrollmentStatus === 'active' || rawProfile.enrollmentStatus === 'not_enrolled'
+          ? rawProfile.enrollmentStatus
+          : (existing.enrollmentStatus || (finalTeacherEmail ? 'active' : 'not_enrolled')));
 
   // Authoritative server role & privileged flags (cannot be escalated or reset via profile endpoint)
   const authoritativeRole = fsRole === 'admin' && verifiedUser.role === 'admin' ? 'admin' : 'student';
@@ -8941,6 +8957,177 @@ app.post('/api/students/cancel', async (req, res) => {
     cancelledBy: derivedCancelledBy,
     ...(preservedContracted !== undefined ? { contractedLessons: preservedContracted } : {}),
     ...(preservedAvailable !== undefined ? { availableLessons: preservedAvailable } : {}),
+  });
+});
+
+// NF.SWITCH.2D: Troca atômica, idempotente e auditável de Native Friend (somente estudante autenticado para si próprio)
+app.post('/api/students/switch-native-friend', firebaseAuthMiddleware, async (req, res) => {
+  const verifiedCaller = req.user;
+  if (!verifiedCaller || !verifiedCaller.uid || !isValidCanonicalUid(verifiedCaller.uid)) {
+    return res.status(401).json({
+      success: false,
+      error: 'Unauthorized',
+      message: 'Valid Firebase ID token with canonical UID is required.',
+    });
+  }
+
+  const rawBody = req.body && typeof req.body === 'object' ? req.body : {};
+  const callerEmail = (verifiedCaller.email || '').toLowerCase().trim();
+  const requestedUid = String(rawBody.studentUid || rawBody.uid || '').trim();
+  const requestedEmail = String(rawBody.studentEmail || rawBody.email || '').toLowerCase().trim();
+
+  if (requestedUid && requestedUid !== verifiedCaller.uid) {
+    return res.status(403).json({
+      success: false,
+      error: 'Forbidden',
+      message: 'Estudantes só podem executar troca de Amigo Nativo na própria conta.',
+    });
+  }
+  if (requestedEmail && callerEmail && requestedEmail !== callerEmail) {
+    return res.status(403).json({
+      success: false,
+      error: 'Forbidden',
+      message: 'Estudantes só podem executar troca de Amigo Nativo na própria conta.',
+    });
+  }
+
+  const db = readDb();
+  const callerIdentity = await resolveCanonicalUserRoleAndIdentity({
+    uid: verifiedCaller.uid,
+    email: callerEmail,
+    tokenRole: verifiedCaller.role,
+    dbState: db,
+  });
+
+  if (
+    verifiedCaller.role === 'admin' ||
+    callerIdentity.role === 'admin' ||
+    callerIdentity.role === 'teacher' ||
+    callerIdentity.role === 'pending_teacher' ||
+    callerIdentity.role === 'conflict'
+  ) {
+    return res.status(403).json({
+      success: false,
+      error: 'Forbidden',
+      message: 'Apenas contas de estudantes autenticados podem solicitar troca de Amigo Nativo.',
+    });
+  }
+
+  const targetTeacherInput = String(
+    rawBody.targetTeacherUid ||
+      rawBody.targetTeacherId ||
+      rawBody.teacherUid ||
+      rawBody.teacherId ||
+      rawBody.teacherEmail ||
+      ''
+  ).trim();
+
+  const headerIdempKey =
+    typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'] : '';
+  const idempotencyKey =
+    typeof rawBody.idempotencyKey === 'string' && rawBody.idempotencyKey.trim()
+      ? rawBody.idempotencyKey
+      : headerIdempKey;
+
+  const expectedCurrentTeacherUid =
+    typeof rawBody.expectedCurrentTeacherUid === 'string' && rawBody.expectedCurrentTeacherUid.trim()
+      ? rawBody.expectedCurrentTeacherUid.trim()
+      : undefined;
+
+  const result = await switchNativeFriendAtomicServer({
+    studentAuthUid: verifiedCaller.uid,
+    studentEmail: callerEmail || callerIdentity.email,
+    targetTeacherId: targetTeacherInput,
+    idempotencyKey,
+    expectedCurrentTeacherUid,
+    rawPayload: rawBody,
+    dbState: db,
+  });
+
+  if (!result.success) {
+    return res.status(result.statusCode || 400).json({
+      success: false,
+      error: result.code || 'NATIVE_FRIEND_SWITCH_FAILED',
+      message: result.error || 'Falha ao executar troca atômica de Amigo Nativo.',
+      ...(result.details ? { details: result.details } : {}),
+    });
+  }
+
+  // Sync RAM cache strictly AFTER confirmed Firestore transaction commit
+  const cleanEmail = String(result.profile?.email || callerEmail || '').toLowerCase().trim();
+  const nowUpdatedAt = String(result.audit?.createdAt || new Date().toISOString());
+
+  if (cleanEmail) {
+    if (!db.userProfiles) db.userProfiles = {};
+    const existingMemProfile = db.userProfiles[cleanEmail] || {};
+    db.userProfiles[cleanEmail] = {
+      ...existingMemProfile,
+      uid: verifiedCaller.uid,
+      id: verifiedCaller.uid,
+      email: cleanEmail,
+      teacherUid: result.targetTeacherUid,
+      assignedNativeFriendUID: result.targetTeacherUid,
+      nativeFriendUID: result.targetTeacherUid,
+      teacherEmail: result.targetTeacherEmail || null,
+      teacherName: result.targetTeacherName || null,
+      teacherMeetUrl: result.targetTeacherMeetUrl || existingMemProfile.teacherMeetUrl || null,
+      enrollmentStatus: 'active',
+      availableLessons: result.availableLessonsAfterSwitch,
+      residualBrlCents: result.residualBrlCentsAfter,
+      lastSwitchAuditId: result.switchAuditId,
+      lastSwitchedAt: nowUpdatedAt,
+      updatedAt: nowUpdatedAt,
+    };
+  }
+
+  if (Array.isArray(db.students)) {
+    db.students = db.students.map((s: any) => {
+      const sEmail = String(s?.email || s?.studentEmail || '').toLowerCase().trim();
+      const sUid = String(s?.uid || s?.id || '').trim();
+      if ((result.studentUid && sUid === result.studentUid) || (cleanEmail && sEmail === cleanEmail)) {
+        return {
+          ...s,
+          teacherUid: result.targetTeacherUid,
+          assignedNativeFriendUID: result.targetTeacherUid,
+          nativeFriendUID: result.targetTeacherUid,
+          teacherEmail: result.targetTeacherEmail || s.teacherEmail || null,
+          teacherName: result.targetTeacherName || s.teacherName || null,
+          enrollmentStatus: 'active',
+          status: 'active',
+          availableLessons: result.availableLessonsAfterSwitch,
+          residualBrlCents: result.residualBrlCentsAfter,
+          lastSwitchAuditId: result.switchAuditId,
+          lastSwitchedAt: nowUpdatedAt,
+          updatedAt: nowUpdatedAt,
+        };
+      }
+      return s;
+    });
+  }
+
+  await writeDbSync(db);
+
+  return res.status(200).json({
+    success: true,
+    isIdempotent: Boolean(result.isIdempotent),
+    switchAuditId: result.switchAuditId,
+    studentUid: result.studentUid,
+    sourceTeacherUid: result.sourceTeacherUid,
+    targetTeacherUid: result.targetTeacherUid,
+    targetTeacherEmail: result.targetTeacherEmail,
+    targetTeacherName: result.targetTeacherName,
+    targetTeacherMeetUrl: result.targetTeacherMeetUrl,
+    availableLessonsBefore: result.availableLessonsBefore,
+    availableLessonsAfterRefunds: result.availableLessonsAfterRefunds,
+    availableLessonsAfterSwitch: result.availableLessonsAfterSwitch,
+    residualBrlCentsBefore: result.residualBrlCentsBefore,
+    switchResidualBrlCents: result.switchResidualBrlCents,
+    residualBrlCentsAfter: result.residualBrlCentsAfter,
+    q2CancelledLessonsCount: result.q2CancelledLessonsCount,
+    q2RefundedCreditsCount: result.q2RefundedCreditsCount,
+    q2CancelledTrialLessonsCount: result.q2CancelledTrialLessonsCount,
+    lockedStartedLessonsCount: result.lockedStartedLessonsCount,
+    audit: result.audit,
   });
 });
 

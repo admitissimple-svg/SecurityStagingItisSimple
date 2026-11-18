@@ -23,6 +23,8 @@ import type {
   CreditReconciliationAuditRecord,
   HistoricalFinancialEvidenceSummary,
   LegacyReconciliationAllocationInput,
+  NativeFriendSwitchAuditRecord,
+  NativeFriendSwitchPlannedPackageSummary,
   PendingLegacyStudentSummary,
 } from './types';
 import {
@@ -44,8 +46,16 @@ import {
   buildReconciledPaidLotData,
   buildReconciledCourtesyLotData,
   reconcileLegacyLotUnitIndices,
+  retireSourceLotUnitsForSwitch,
+  buildSwitchedPaidLotData,
+  buildSwitchedCourtesyLotData,
 } from './utils/creditLots';
 import type { LotConsumptionAllocation } from './utils/creditLots';
+import {
+  evaluateSwitchConversion,
+  assertSwitchConversionReady,
+  SwitchConversionError,
+} from './utils/switchConversionEngine';
 
 /**
  * Active identifiers for staging persistence.
@@ -8492,9 +8502,10 @@ export async function scheduleLessonAtomicServer(
       const assignmentRef = db.collection('student_assignments').doc(studentAuthUid);
 
       // A. ALL READS OCCUR BEFORE WRITES
-      const [studentSnap, lessonSnap] = await Promise.all([
+      const [studentSnap, lessonSnap, assignmentSnap] = await Promise.all([
         transaction.get(studentRef),
         transaction.get(lessonRef),
+        transaction.get(assignmentRef),
       ]);
 
       // B. IDEMPOTENCY CHECK INSIDE TRANSACTION
@@ -8529,6 +8540,31 @@ export async function scheduleLessonAtomicServer(
       }
 
       const studentData = studentSnap.data() || {};
+      const assignmentData = assignmentSnap && assignmentSnap.exists ? (assignmentSnap.data() || {}) : null;
+
+      // NF.SWITCH.2D: Enforce active student-teacher pedagogical link for ALL lessons
+      // (including isTrialLesson) and serialize safely against concurrent Native Friend switches.
+      if (studentData.enrollmentStatus !== 'cancelled') {
+        const linkedCandidates = [
+          studentData.teacherUid,
+          studentData.assignedNativeFriendUID,
+          studentData.nativeFriendUID,
+          assignmentData?.teacherUid,
+          assignmentData?.assignedNativeFriendUID,
+          assignmentData?.nativeFriendUID,
+        ]
+          .filter((v): v is string => typeof v === 'string' && v.trim() !== '')
+          .map((v) => v.trim());
+
+        const activeLinkedTeacherUid = linkedCandidates[0] || '';
+        if (activeLinkedTeacherUid && activeLinkedTeacherUid !== canonicalTeacherUid) {
+          throw new SchedulingTransactionError(
+            'Aluno já possui vínculo ativo com outro Amigo Nativo. Utilize a troca oficial de Amigo Nativo antes de agendar com outro professor.',
+            409,
+            'TEACHER_LINK_MISMATCH'
+          );
+        }
+      }
 
       // D. VALIDATE BALANCE AND ELIGIBILITY INSIDE TRANSACTION
       let newAvailable: number;
@@ -14549,6 +14585,19 @@ export async function executePackageCreditOperationAtomicServer(
         : '';
 
       const hasExistingTeacherLink = Boolean(existingStudentTeacherUid || existingAssignmentTeacherUid);
+      const effectiveExistingTeacherUid = existingStudentTeacherUid || existingAssignmentTeacherUid;
+
+      if (
+        !hasExplicitTutorRef &&
+        hasExistingTeacherLink &&
+        effectiveExistingTeacherUid !== canonicalTeacherUid
+      ) {
+        throw new PackageCreditOperationError(
+          'O Amigo Nativo vinculado ao aluno foi alterado concorrentemente. Atualize os dados e tente novamente.',
+          409,
+          'CONCURRENCY_CONFLICT'
+        );
+      }
 
       const processedPurchases = studentData.processedPurchases || {};
       const updatedProcessedPurchases = {
@@ -16582,4 +16631,1425 @@ export async function reconcileStudentLegacyCreditsAtomicServer(
     };
   }
 }
+
+// ============================================================================
+// NF.SWITCH.2D — TROCA ATÔMICA, IDEMPOTENTE E AUDITÁVEL DE NATIVE FRIEND
+// ============================================================================
+
+export const SWITCH_MAX_CREDIT_LOTS = 60;
+export const SWITCH_MAX_STUDENT_LESSONS = 80;
+export const SWITCH_MAX_FIRESTORE_WRITES = 350;
+
+export class NativeFriendSwitchError extends Error {
+  public statusCode: number;
+  public code: string;
+  public details?: Record<string, any>;
+
+  constructor(
+    message: string,
+    statusCode: number = 400,
+    code: string = 'NATIVE_FRIEND_SWITCH_ERROR',
+    details?: Record<string, any>
+  ) {
+    super(message);
+    this.name = 'NativeFriendSwitchError';
+    this.statusCode = statusCode;
+    this.code = code;
+    this.details = details;
+  }
+}
+
+const FORBIDDEN_SWITCH_OVERRIDE_KEYS = [
+  'ptaxRate',
+  'ptaxQuoteDate',
+  'ptaxPricingDate',
+  'ptaxSource',
+  'basePriceUsd',
+  'pricePerSessionUsd',
+  'adminCommissionPercent',
+  'commissionModel',
+  'commissionVersion',
+  'budgetBrlCents',
+  'residualBrlCents',
+  'availableLessons',
+  'contractedLessons',
+  'discountPercent',
+  'teacherShareBrl',
+  'teacherShareUsd',
+  'platformRevenueBrl',
+  'platformRevenueUsd',
+  'totalPaidBrl',
+  'totalPaidUsd',
+  'isPaidPurchase',
+  'countsAsRevenue',
+  'creditLots',
+  'skipQ2Refund',
+  'applyForfeiture',
+] as const;
+
+function hasForbiddenSwitchOverrideKey(obj: Record<string, any> | null | undefined): string | null {
+  if (!obj || typeof obj !== 'object') return null;
+  for (const key of FORBIDDEN_SWITCH_OVERRIDE_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(obj, key) && (obj as any)[key] !== undefined) {
+      return key;
+    }
+  }
+  return null;
+}
+
+function buildSwitchAuditDocId(studentUid: string, idempotencyKey: string): string {
+  const uidPart = studentUid.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 24) || 'std';
+  const hash = crypto
+    .createHash('sha256')
+    .update(`nf_switch:${studentUid}:${idempotencyKey}`)
+    .digest('hex')
+    .slice(0, 28);
+  return `switch_${uidPart}_${hash}`;
+}
+
+export interface SwitchNativeFriendParams {
+  studentAuthUid: string;
+  studentEmail?: string;
+  targetTeacherId: string;
+  idempotencyKey: string;
+  expectedCurrentTeacherUid?: string;
+  nowOverrideIso?: string;
+  ptaxOverride?: {
+    success: boolean;
+    ptaxRate: number;
+    quoteDate?: string;
+    pricingDate?: string;
+    source?: string;
+  };
+  rawPayload?: Record<string, any>;
+  dbState?: any;
+}
+
+export interface SwitchNativeFriendResult {
+  success: boolean;
+  statusCode: number;
+  isIdempotent?: boolean;
+  code?: string;
+  error?: string;
+  details?: Record<string, any>;
+  switchAuditId?: string;
+  studentUid?: string;
+  sourceTeacherUid?: string;
+  targetTeacherUid?: string;
+  targetTeacherEmail?: string;
+  targetTeacherName?: string;
+  targetTeacherMeetUrl?: string;
+  availableLessonsBefore?: number;
+  availableLessonsAfterRefunds?: number;
+  availableLessonsAfterSwitch?: number;
+  residualBrlCentsBefore?: number;
+  switchResidualBrlCents?: number;
+  residualBrlCentsAfter?: number;
+  q2CancelledLessonsCount?: number;
+  q2RefundedCreditsCount?: number;
+  q2CancelledTrialLessonsCount?: number;
+  lockedStartedLessonsCount?: number;
+  createdLots?: CreditLot[];
+  retiredSourceLots?: CreditLot[];
+  audit?: NativeFriendSwitchAuditRecord;
+  profile?: Record<string, any>;
+}
+
+/**
+ * NF.SWITCH.2D — Single atomic, idempotent, auditable Firestore transaction for
+ * switching a student's Native Friend respecting NF.SWITCH.1A, Q1, Q2, and Q3.
+ */
+export async function switchNativeFriendAtomicServer(
+  params: SwitchNativeFriendParams
+): Promise<SwitchNativeFriendResult> {
+  const cleanStudentUid = String(params.studentAuthUid || '').trim();
+  if (!cleanStudentUid || !isValidCanonicalUid(cleanStudentUid)) {
+    return {
+      success: false,
+      statusCode: 401,
+      code: 'UNAUTHORIZED',
+      error: 'Autenticação de estudante com UID canônico válido é obrigatória para trocar de Amigo Nativo.',
+    };
+  }
+
+  const forbiddenKey = hasForbiddenSwitchOverrideKey(params.rawPayload);
+  if (forbiddenKey) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'CLIENT_SWITCH_OVERRIDE_FORBIDDEN',
+      error: `Campo financeiro/comercial não permitido na requisição (${forbiddenKey}). Todos os cálculos são exclusivos do servidor.`,
+    };
+  }
+
+  const cleanTargetTeacherInput = String(params.targetTeacherId || '').trim();
+  if (!cleanTargetTeacherInput) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'TARGET_TEACHER_REQUIRED',
+      error: 'Identificador do Amigo Nativo de destino é obrigatório.',
+    };
+  }
+
+  const cleanIdempotencyKey =
+    typeof params.idempotencyKey === 'string' ? params.idempotencyKey.trim() : '';
+  if (!cleanIdempotencyKey || cleanIdempotencyKey.length > 200) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'IDEMPOTENCY_KEY_REQUIRED',
+      error: 'idempotencyKey é obrigatória para garantir troca idempotente de Amigo Nativo.',
+    };
+  }
+
+  const expectedCurrentTeacherUid =
+    typeof params.expectedCurrentTeacherUid === 'string' && params.expectedCurrentTeacherUid.trim()
+      ? params.expectedCurrentTeacherUid.trim()
+      : '';
+
+  const db = getFirestoreDb();
+  if (!db || isCloudWriteDisabled) {
+    return {
+      success: false,
+      statusCode: 503,
+      code: 'FIRESTORE_UNAVAILABLE',
+      error: 'Serviço de persistência Firestore (default) indisponível.',
+    };
+  }
+
+  // 1. Resolve target teacher canonical identity (supports uid, publicTutorId, or email)
+  const isTargetUid = isValidCanonicalUid(cleanTargetTeacherInput);
+  const isTargetEmail = cleanTargetTeacherInput.includes('@');
+  const targetTeacherIdentity = await resolveTeacherCanonicalIdentity({
+    teacherId: cleanTargetTeacherInput,
+    teacherUid: isTargetUid ? cleanTargetTeacherInput : undefined,
+    teacherEmail: isTargetEmail ? cleanTargetTeacherInput.toLowerCase() : undefined,
+    publicTutorId: !isTargetUid && !isTargetEmail ? cleanTargetTeacherInput : undefined,
+    dbState: params.dbState,
+  });
+
+  if (!targetTeacherIdentity) {
+    // Check if an unapproved tutor doc exists for clearer status code
+    if (isTargetUid) {
+      const [uDoc, tDoc] = await Promise.all([
+        fetchUserDocumentFromFirestore(cleanTargetTeacherInput).catch(() => null),
+        fetchTutorDocumentFromFirestore(cleanTargetTeacherInput).catch(() => null),
+      ]);
+      if (uDoc && String(uDoc.role || '').toLowerCase().trim() === 'student') {
+        return {
+          success: false,
+          statusCode: 403,
+          code: 'TUTOR_NOT_APPROVED',
+          error: 'O identificador de destino não pertence a um Amigo Nativo aprovado.',
+        };
+      }
+      const rawDoc = tDoc || uDoc;
+      if (rawDoc && rawDoc.deleted !== true && !(rawDoc.approvalStatus === 'approved' && rawDoc.isApproved === true)) {
+        return {
+          success: false,
+          statusCode: 403,
+          code: 'TUTOR_NOT_APPROVED',
+          error: 'O Amigo Nativo de destino ainda não está aprovado para comercialização.',
+        };
+      }
+    }
+    return {
+      success: false,
+      statusCode: 404,
+      code: 'TUTOR_NOT_FOUND',
+      error: 'Amigo Nativo de destino não encontrado no sistema.',
+    };
+  }
+
+  const targetTeacherUid = targetTeacherIdentity.canonicalUid;
+  if (!targetTeacherUid || !isValidCanonicalUid(targetTeacherUid)) {
+    return {
+      success: false,
+      statusCode: 409,
+      code: 'TUTOR_CANONICAL_IDENTITY_REQUIRED',
+      error: 'Cadastro do Amigo Nativo de destino sem UID canônico válido.',
+    };
+  }
+
+  if (targetTeacherUid === cleanStudentUid) {
+    return {
+      success: false,
+      statusCode: 400,
+      code: 'SELF_SWITCH_FORBIDDEN',
+      error: 'Não é possível trocar para a sua própria conta.',
+    };
+  }
+
+  const switchAuditId = buildSwitchAuditDocId(cleanStudentUid, cleanIdempotencyKey);
+  const requestFingerprint = crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify({
+        studentUid: cleanStudentUid,
+        targetTeacherUid,
+        ...(expectedCurrentTeacherUid ? { expectedCurrentTeacherUid } : {}),
+      })
+    )
+    .digest('hex');
+
+  // 2. Fast idempotent replay / conflict pre-check (verified authoritatively again inside tx)
+  const preAuditSnap = await db.collection('native_friend_switches').doc(switchAuditId).get().catch(() => null);
+  if (preAuditSnap && preAuditSnap.exists) {
+    const existingAudit = (preAuditSnap.data() || {}) as NativeFriendSwitchAuditRecord;
+    if (existingAudit.requestFingerprint !== requestFingerprint || existingAudit.studentUid !== cleanStudentUid) {
+      return {
+        success: false,
+        statusCode: 409,
+        code: 'IDEMPOTENCY_KEY_CONFLICT',
+        error: 'idempotencyKey já utilizada para outra solicitação de troca de Amigo Nativo.',
+      };
+    }
+    const curStudentSnap = await db.collection('users').doc(cleanStudentUid).get().catch(() => null);
+    const curStudentData = curStudentSnap && curStudentSnap.exists ? (curStudentSnap.data() || {}) : {};
+    return {
+      success: true,
+      statusCode: 200,
+      isIdempotent: true,
+      switchAuditId: existingAudit.id,
+      studentUid: cleanStudentUid,
+      sourceTeacherUid: existingAudit.sourceTeacherUid,
+      targetTeacherUid: existingAudit.targetTeacherUid,
+      targetTeacherEmail: existingAudit.targetTeacherEmail,
+      targetTeacherName: existingAudit.targetTeacherName,
+      targetTeacherMeetUrl: existingAudit.targetTeacherMeetUrl,
+      availableLessonsBefore: existingAudit.availableLessonsBefore,
+      availableLessonsAfterRefunds: existingAudit.availableLessonsAfterRefunds,
+      availableLessonsAfterSwitch: existingAudit.availableLessonsAfterSwitch,
+      residualBrlCentsBefore: existingAudit.residualBrlCentsBefore,
+      switchResidualBrlCents: existingAudit.switchResidualBrlCents,
+      residualBrlCentsAfter: existingAudit.residualBrlCentsAfter,
+      q2CancelledLessonsCount: existingAudit.q2CancelledLessonsCount,
+      q2RefundedCreditsCount: existingAudit.q2RefundedCreditsCount,
+      q2CancelledTrialLessonsCount: existingAudit.q2CancelledTrialLessonsCount,
+      lockedStartedLessonsCount: existingAudit.lockedStartedLessonsCount,
+      audit: existingAudit,
+      profile: curStudentData,
+    };
+  }
+
+  // 3. Fetch official BACEN PTAX D-1 (strictly zero fallback)
+  let ptaxResult: any = params.ptaxOverride;
+  if (!ptaxResult) {
+    try {
+      const ptaxModule = await import('./serverPtax');
+      ptaxResult = await ptaxModule.getPtaxClosingD1();
+    } catch {
+      ptaxResult = null;
+    }
+  }
+
+  if (
+    !ptaxResult?.success ||
+    typeof ptaxResult.ptaxRate !== 'number' ||
+    !Number.isFinite(ptaxResult.ptaxRate) ||
+    ptaxResult.ptaxRate <= 0
+  ) {
+    return {
+      success: false,
+      statusCode: 503,
+      code: 'PTAX_UNAVAILABLE',
+      error: ptaxResult?.details || 'Cotação oficial PTAX D-1 indisponível no momento. Troca recusada sem fallback.',
+    };
+  }
+
+  const nowIso =
+    typeof params.nowOverrideIso === 'string' && !Number.isNaN(Date.parse(params.nowOverrideIso))
+      ? new Date(params.nowOverrideIso).toISOString()
+      : new Date().toISOString();
+  const switchNowMs = Date.parse(nowIso);
+
+  const cleanCallerEmail = (params.studentEmail || '').toLowerCase().trim();
+
+  // Helper to pre-discover student credit lots, student lessons, and participant teacher docs
+  // prior to Phase 1 transaction.get reads (safe across OCC retries & mock transactions).
+  const discoverStudentGraph = async (emailHint: string) => {
+    const lotIds = new Set<string>();
+    const lessonIds = new Set<string>();
+    const lessonTeacherUids = new Set<string>();
+
+    const lotsCol = db.collection('credit_lots');
+    if (typeof (lotsCol as any).where === 'function') {
+      const lSnap = await lotsCol.where('studentUid', '==', cleanStudentUid).get().catch(() => null);
+      lSnap?.forEach?.((d: any) => {
+        if (d?.id) lotIds.add(String(d.id).trim());
+      });
+    }
+
+    const lessonsCol = db.collection('lessons');
+    if (typeof (lessonsCol as any).where === 'function') {
+      const [byUidSnap, byEmailSnap] = await Promise.all([
+        lessonsCol.where('studentUid', '==', cleanStudentUid).get().catch(() => null),
+        emailHint ? lessonsCol.where('studentEmail', '==', emailHint).get().catch(() => null) : Promise.resolve(null),
+      ]);
+      const collectLessonDoc = (d: any) => {
+        if (!d?.id) return;
+        const data = typeof d.data === 'function' ? (d.data() || {}) : {};
+        if (data.studentUid && data.studentUid !== cleanStudentUid) return;
+        lessonIds.add(String(d.id).trim());
+        const tUids = [data.teacherUid, data.teacherAuthUid, data.tutorUid]
+          .filter((v): v is string => typeof v === 'string' && v.trim() !== '');
+        for (const t of tUids) lessonTeacherUids.add(t.trim());
+        if (typeof data.creditLotId === 'string' && data.creditLotId.trim()) {
+          lotIds.add(data.creditLotId.trim());
+        }
+      };
+      byUidSnap?.forEach?.(collectLessonDoc);
+      byEmailSnap?.forEach?.(collectLessonDoc);
+    }
+
+    // Also include activeCreditLotIds / sourceTeacher hint from latest non-tx student snapshot
+    const sSnap = await db.collection('users').doc(cleanStudentUid).get().catch(() => null);
+    if (sSnap && sSnap.exists) {
+      const sData = sSnap.data() || {};
+      if (Array.isArray(sData.activeCreditLotIds)) {
+        for (const id of sData.activeCreditLotIds) {
+          if (typeof id === 'string' && id.trim()) lotIds.add(id.trim());
+        }
+      }
+      if (typeof sData.lastScheduledLessonId === 'string' && sData.lastScheduledLessonId.trim()) {
+        lessonIds.add(sData.lastScheduledLessonId.trim());
+      }
+      if (Array.isArray(sData.scheduledLessons)) {
+        for (const sl of sData.scheduledLessons) {
+          if (sl && typeof sl.id === 'string' && sl.id.trim()) {
+            lessonIds.add(sl.id.trim());
+          }
+        }
+      }
+      const sTeacher = [sData.teacherUid, sData.assignedNativeFriendUID, sData.nativeFriendUID].find(
+        (v) => typeof v === 'string' && isValidCanonicalUid(v)
+      );
+      if (typeof sTeacher === 'string' && sTeacher.trim()) {
+        lessonTeacherUids.add(sTeacher.trim());
+      }
+    }
+
+    return {
+      lotIds: Array.from(lotIds).sort(),
+      lessonIds: Array.from(lessonIds).sort(),
+      teacherUids: Array.from(lessonTeacherUids).sort(),
+    };
+  };
+
+  try {
+    const outcome = await db.runTransaction(async (transaction) => {
+      // Discover latest candidate IDs at start of each OCC attempt BEFORE transaction reads/writes
+      const discovered = await discoverStudentGraph(cleanCallerEmail);
+
+      if (discovered.lotIds.length > SWITCH_MAX_CREDIT_LOTS) {
+        throw new NativeFriendSwitchError(
+          `Limite conservador de lotes por transação excedido (${discovered.lotIds.length} > ${SWITCH_MAX_CREDIT_LOTS}). Contate o suporte para fracionamento seguro.`,
+          422,
+          'SWITCH_TRANSACTION_LIMIT_EXCEEDED',
+          { lotsCount: discovered.lotIds.length, limit: SWITCH_MAX_CREDIT_LOTS }
+        );
+      }
+
+      if (discovered.lessonIds.length > SWITCH_MAX_STUDENT_LESSONS) {
+        throw new NativeFriendSwitchError(
+          `Limite conservador de aulas por transação excedido (${discovered.lessonIds.length} > ${SWITCH_MAX_STUDENT_LESSONS}). Contate o suporte.`,
+          422,
+          'SWITCH_TRANSACTION_LIMIT_EXCEEDED',
+          { lessonsCount: discovered.lessonIds.length, limit: SWITCH_MAX_STUDENT_LESSONS }
+        );
+      }
+
+      const switchAuditRef = db.collection('native_friend_switches').doc(switchAuditId);
+      const studentRef = db.collection('users').doc(cleanStudentUid);
+      const assignmentRef = db.collection('student_assignments').doc(cleanStudentUid);
+      const targetTutorRef = db.collection('tutors').doc(targetTeacherUid);
+      const targetTutorUserRef = db.collection('users').doc(targetTeacherUid);
+
+      const extraTeacherUids = discovered.teacherUids.filter((id) => id !== targetTeacherUid);
+
+      // PHASE 1: READ ALL DOCUMENTS BEFORE ANY WRITE
+      const [
+        auditSnap,
+        studentSnap,
+        assignmentSnap,
+        targetTutorSnap,
+        targetTutorUserSnap,
+        ...remainingSnaps
+      ] = await Promise.all([
+        transaction.get(switchAuditRef),
+        transaction.get(studentRef),
+        transaction.get(assignmentRef),
+        transaction.get(targetTutorRef),
+        transaction.get(targetTutorUserRef),
+        ...discovered.lotIds.map((id) => transaction.get(db.collection('credit_lots').doc(id))),
+        ...discovered.lessonIds.map((id) => transaction.get(db.collection('lessons').doc(id))),
+        ...extraTeacherUids.map((id) => transaction.get(db.collection('users').doc(id))),
+        ...extraTeacherUids.map((id) => transaction.get(db.collection('tutors').doc(id))),
+      ]);
+
+      const lotSnapOffset = 0;
+      const lessonSnapOffset = discovered.lotIds.length;
+      const teacherUserSnapOffset = lessonSnapOffset + discovered.lessonIds.length;
+      const teacherTutorSnapOffset = teacherUserSnapOffset + extraTeacherUids.length;
+
+      // Idempotency check inside transaction
+      if (auditSnap.exists) {
+        const existingAudit = (auditSnap.data() || {}) as NativeFriendSwitchAuditRecord;
+        if (existingAudit.requestFingerprint !== requestFingerprint || existingAudit.studentUid !== cleanStudentUid) {
+          throw new NativeFriendSwitchError(
+            'idempotencyKey já utilizada para outra solicitação de troca de Amigo Nativo.',
+            409,
+            'IDEMPOTENCY_KEY_CONFLICT'
+          );
+        }
+        const curStudent = studentSnap.exists ? (studentSnap.data() || {}) : {};
+        return {
+          isIdempotent: true,
+          audit: existingAudit,
+          createdLots: [] as CreditLot[],
+          retiredSourceLots: [] as CreditLot[],
+          profile: curStudent,
+        };
+      }
+
+      if (!studentSnap.exists) {
+        throw new NativeFriendSwitchError(
+          'Registro do aluno não encontrado no Firestore.',
+          404,
+          'STUDENT_NOT_FOUND'
+        );
+      }
+
+      const studentData = studentSnap.data() || {};
+      if (studentData.deleted === true) {
+        throw new NativeFriendSwitchError(
+          'Conta do aluno encontra-se desativada ou excluída.',
+          404,
+          'STUDENT_NOT_FOUND'
+        );
+      }
+
+      const studentRole = String(studentData.role || 'student').toLowerCase().trim();
+      if (studentRole !== 'student' && studentRole !== '') {
+        throw new NativeFriendSwitchError(
+          'Apenas contas de estudantes podem executar a troca de Amigo Nativo.',
+          403,
+          'FORBIDDEN_ROLE'
+        );
+      }
+
+      const cleanStudentEmail = String(studentData.email || cleanCallerEmail || '').toLowerCase().trim();
+      const cleanStudentName = String(
+        studentData.name || (cleanStudentEmail ? cleanStudentEmail.split('@')[0] : cleanStudentUid)
+      ).trim();
+
+      // Validate active pedagogical link and forbid same-teacher switch
+      const assignmentData = assignmentSnap.exists ? (assignmentSnap.data() || {}) : null;
+      const studentLinkCandidates = [
+        studentData.teacherUid,
+        studentData.assignedNativeFriendUID,
+        studentData.nativeFriendUID,
+      ]
+        .filter((v): v is string => typeof v === 'string' && v.trim() !== '')
+        .map((v) => v.trim());
+
+      const assignLinkCandidates = assignmentData
+        ? [
+            assignmentData.teacherUid,
+            assignmentData.assignedNativeFriendUID,
+            assignmentData.nativeFriendUID,
+          ]
+            .filter((v): v is string => typeof v === 'string' && v.trim() !== '')
+            .map((v) => v.trim())
+        : [];
+
+      const uniqueStudentLinks = Array.from(new Set(studentLinkCandidates));
+      const uniqueAssignLinks = Array.from(new Set(assignLinkCandidates));
+
+      if (uniqueStudentLinks.length > 1 || uniqueAssignLinks.length > 1) {
+        throw new NativeFriendSwitchError(
+          'Inconsistência detectada nos identificadores de vínculo do aluno.',
+          409,
+          'STUDENT_TEACHER_LINK_CONFLICT'
+        );
+      }
+
+      const studentLinkedUid = uniqueStudentLinks[0] || '';
+      const assignLinkedUid = uniqueAssignLinks[0] || '';
+
+      if (studentLinkedUid && assignLinkedUid && studentLinkedUid !== assignLinkedUid) {
+        throw new NativeFriendSwitchError(
+          'Divergência entre vínculo do perfil e student_assignments detectada.',
+          409,
+          'STUDENT_TEACHER_LINK_CONFLICT',
+          { studentLinkedUid, assignLinkedUid }
+        );
+      }
+
+      const sourceTeacherUid = studentLinkedUid || assignLinkedUid;
+      if (!sourceTeacherUid || studentData.enrollmentStatus === 'cancelled') {
+        throw new NativeFriendSwitchError(
+          'O aluno não possui um vínculo ativo com um Amigo Nativo para realizar troca.',
+          409,
+          'NO_ACTIVE_NATIVE_FRIEND_LINK'
+        );
+      }
+
+      if (expectedCurrentTeacherUid && expectedCurrentTeacherUid !== sourceTeacherUid) {
+        throw new NativeFriendSwitchError(
+          'Conflito de concorrência: o Amigo Nativo atual foi alterado por outra operação.',
+          409,
+          'CONCURRENCY_CONFLICT',
+          { expectedCurrentTeacherUid, actualCurrentTeacherUid: sourceTeacherUid }
+        );
+      }
+
+      if (sourceTeacherUid === targetTeacherUid) {
+        throw new NativeFriendSwitchError(
+          'O Amigo Nativo de destino já é o seu Amigo Nativo atual.',
+          400,
+          'SAME_TEACHER_SWITCH_FORBIDDEN'
+        );
+      }
+
+      // Validate source teacher identity inside transaction
+      const sourceTeacherIdx = extraTeacherUids.indexOf(sourceTeacherUid);
+      const sourceTeacherUserDoc =
+        sourceTeacherIdx >= 0 && remainingSnaps[teacherUserSnapOffset + sourceTeacherIdx]?.exists
+          ? (remainingSnaps[teacherUserSnapOffset + sourceTeacherIdx].data() || {})
+          : null;
+      const sourceTeacherTutorDoc =
+        sourceTeacherIdx >= 0 && remainingSnaps[teacherTutorSnapOffset + sourceTeacherIdx]?.exists
+          ? (remainingSnaps[teacherTutorSnapOffset + sourceTeacherIdx].data() || {})
+          : null;
+      const sourceTeacherDoc = sourceTeacherTutorDoc || sourceTeacherUserDoc;
+      if (!sourceTeacherDoc) {
+        throw new NativeFriendSwitchError(
+          'Registro do Amigo Nativo atual não encontrado para auditoria da troca.',
+          404,
+          'SOURCE_TEACHER_NOT_FOUND'
+        );
+      }
+      if (sourceTeacherUserDoc && String(sourceTeacherUserDoc.role || '').toLowerCase().trim() === 'student') {
+        throw new NativeFriendSwitchError(
+          'Vínculo de origem inválido: identificador atual não pertence a um professor.',
+          409,
+          'SOURCE_TEACHER_INVALID'
+        );
+      }
+
+      // Validate target teacher live snapshot inside transaction (approval & commercializability)
+      const fsTargetTutor: Record<string, any> | null = targetTutorSnap.exists
+        ? { id: targetTutorSnap.id, ...(targetTutorSnap.data() || {}) }
+        : null;
+      const fsTargetUser: Record<string, any> | null = targetTutorUserSnap.exists
+        ? { id: targetTutorUserSnap.id, ...(targetTutorUserSnap.data() || {}) }
+        : null;
+
+      if (fsTargetUser && String(fsTargetUser.role || '').toLowerCase().trim() === 'student') {
+        throw new NativeFriendSwitchError(
+          'O identificador de destino pertence a uma conta de estudante, não a um Amigo Nativo aprovado.',
+          403,
+          'TUTOR_NOT_APPROVED'
+        );
+      }
+
+      let authoritativeTarget = mergeFresherTutorPricingRecord(fsTargetUser, fsTargetTutor);
+      if (!authoritativeTarget) {
+        authoritativeTarget = targetTeacherIdentity.rawDoc || {
+          uid: targetTeacherUid,
+          email: targetTeacherIdentity.email,
+          name: targetTeacherIdentity.name,
+          isApproved: targetTeacherIdentity.isApproved,
+          approvalStatus: targetTeacherIdentity.isApproved ? 'approved' : 'pending',
+        };
+      }
+
+      if (authoritativeTarget.deleted === true) {
+        throw new NativeFriendSwitchError(
+          'Amigo Nativo de destino foi excluído ou desativado.',
+          404,
+          'TUTOR_NOT_FOUND'
+        );
+      }
+
+      const isTargetApproved =
+        authoritativeTarget.approvalStatus === 'approved' && authoritativeTarget.isApproved === true;
+      if (!isTargetApproved) {
+        throw new NativeFriendSwitchError(
+          'Este Amigo Nativo de destino não está aprovado para comercialização.',
+          403,
+          'TUTOR_NOT_APPROVED'
+        );
+      }
+
+      const targetBasePriceUsd = extractValidBasePriceUsdServer(authoritativeTarget);
+      if (targetBasePriceUsd === null) {
+        throw new NativeFriendSwitchError(
+          'O preço-base em USD do Amigo Nativo de destino não está configurado.',
+          422,
+          'TUTOR_BASE_PRICE_UNAVAILABLE'
+        );
+      }
+
+      if (!hasValidPersistedCommission(authoritativeTarget) || !isTutorCommercializable(authoritativeTarget)) {
+        throw new NativeFriendSwitchError(
+          'A comissão administrativa do Amigo Nativo de destino não está configurada para comercialização.',
+          422,
+          'TUTOR_COMMISSION_NOT_CONFIGURED'
+        );
+      }
+
+      const targetAdminCommissionPercent = Number(authoritativeTarget.adminCommissionPercent);
+      const targetCommissionVersion =
+        typeof authoritativeTarget.commissionVersion === 'number' &&
+        Number.isInteger(authoritativeTarget.commissionVersion)
+          ? authoritativeTarget.commissionVersion
+          : 1;
+      const targetTeacherEmail = String(
+        authoritativeTarget.email || targetTeacherIdentity.email || ''
+      )
+        .toLowerCase()
+        .trim();
+      const targetTeacherName = String(
+        authoritativeTarget.name ||
+          targetTeacherIdentity.name ||
+          (targetTeacherEmail ? targetTeacherEmail.split('@')[0] : 'Native Friend')
+      ).trim();
+      const targetPublicTutorId =
+        authoritativeTarget.publicTutorId || targetTeacherIdentity.publicTutorId || targetTeacherUid;
+      const targetMeetUrl = String(
+        authoritativeTarget.meetUrl || authoritativeTarget.meetLink || ''
+      ).trim();
+
+      // Validate residual & availableLessons integrity
+      if (
+        typeof studentData.availableLessons !== 'number' ||
+        !Number.isFinite(studentData.availableLessons) ||
+        !Number.isInteger(studentData.availableLessons) ||
+        studentData.availableLessons < 0
+      ) {
+        throw new CreditLedgerError(
+          `Divergência no saldo do aluno (CREDIT_LEDGER_DIVERGENCE): availableLessons inválido (${studentData.availableLessons}).`,
+          409,
+          CREDIT_LEDGER_DIVERGENCE_CODE
+        );
+      }
+
+      let residualBrlCentsBefore = 0;
+      if (studentData.residualBrlCents !== undefined && studentData.residualBrlCents !== null) {
+        if (
+          typeof studentData.residualBrlCents !== 'number' ||
+          !Number.isInteger(studentData.residualBrlCents) ||
+          studentData.residualBrlCents < 0
+        ) {
+          throw new NativeFriendSwitchError(
+            'Saldo de resíduo financeiro (residualBrlCents) corrompido no documento do aluno.',
+            409,
+            'RESIDUAL_LEDGER_CORRUPTED'
+          );
+        }
+        residualBrlCentsBefore = studentData.residualBrlCents;
+      }
+
+      // Verify all studentData.activeCreditLotIds were included in Phase 1 reads
+      if (Array.isArray(studentData.activeCreditLotIds)) {
+        for (const activeId of studentData.activeCreditLotIds) {
+          if (typeof activeId === 'string' && activeId.trim() && !discovered.lotIds.includes(activeId.trim())) {
+            throw new NativeFriendSwitchError(
+              'Conflito de concorrência nos lotes ativos do aluno. Tente novamente.',
+              409,
+              'CONCURRENCY_CONFLICT'
+            );
+          }
+        }
+      }
+
+      const existingLots: CreditLot[] = [];
+      for (let i = 0; i < discovered.lotIds.length; i++) {
+        const snap = remainingSnaps[lotSnapOffset + i];
+        if (snap && snap.exists) {
+          existingLots.push({ ...(snap.data() || {}), id: snap.id || discovered.lotIds[i] } as CreditLot);
+        }
+      }
+
+      const beforeRefundAvailable = studentData.availableLessons;
+      const hydrated = reconcileStudentCreditLedger({
+        studentUid: cleanStudentUid,
+        studentEmail: cleanStudentEmail,
+        studentData,
+        existingLots,
+        beforeAvailable: beforeRefundAvailable,
+        nowIso,
+      });
+
+      // Collect authoritative student lessons from Phase 1 snapshots
+      const studentLessons: any[] = [];
+      for (let i = 0; i < discovered.lessonIds.length; i++) {
+        const snap = remainingSnaps[lessonSnapOffset + i];
+        if (!snap || !snap.exists) continue;
+        const lData = snap.data() || {};
+        const belongsToStudent =
+          lData.studentUid === cleanStudentUid ||
+          (!lData.studentUid &&
+            cleanStudentEmail &&
+            String(lData.studentEmail || '').toLowerCase().trim() === cleanStudentEmail);
+        if (belongsToStudent) {
+          studentLessons.push({ ...lData, id: snap.id || discovered.lessonIds[i] });
+        }
+      }
+
+      // Check that no un-read teacherUserUid exists on any active future lesson
+      for (const lesson of studentLessons) {
+        const lStatus = String(lesson.status || '').toLowerCase();
+        const isCancelled = lStatus === 'cancelled' || lStatus === 'canceled' || Boolean(lesson.cancelledAt);
+        if (!isCancelled && (lStatus === 'scheduled' || lStatus === 'confirmed')) {
+          const tUid = typeof lesson.teacherUid === 'string' ? lesson.teacherUid.trim() : '';
+          if (tUid && tUid !== targetTeacherUid && !extraTeacherUids.includes(tUid)) {
+            throw new NativeFriendSwitchError(
+              'Conflito de concorrência em aula agendada. Tente novamente.',
+              409,
+              'CONCURRENCY_CONFLICT'
+            );
+          }
+        }
+      }
+
+      // Partition lessons per Q2: unstarted future scheduled lessons are cancelled & refunded integrally;
+      // already started (startDateTime <= now) or completed / not_completed / cancelled remain untouched.
+      const unstartedFutureLessons: any[] = [];
+      let lockedStartedLessonsCount = 0;
+
+      for (const lesson of studentLessons) {
+        const lStatus = String(lesson.status || '').toLowerCase();
+        const isCancelled = lStatus === 'cancelled' || lStatus === 'canceled' || Boolean(lesson.cancelledAt);
+        if (isCancelled || lStatus === 'completed' || lStatus === 'not_completed') {
+          continue;
+        }
+        if (lStatus !== 'scheduled' && lStatus !== 'confirmed') {
+          continue;
+        }
+        const startMs = Date.parse(String(lesson.startDateTime || ''));
+        if (!Number.isFinite(startMs)) {
+          throw new NativeFriendSwitchError(
+            `Aula '${lesson.id}' possui data/hora de início inválida para classificação Q2.`,
+            409,
+            'INVALID_LESSON_SCHEDULE_TIMESTAMP'
+          );
+        }
+        if (startMs > switchNowMs) {
+          unstartedFutureLessons.push(lesson);
+        } else {
+          lockedStartedLessonsCount += 1;
+        }
+      }
+
+      unstartedFutureLessons.sort((a, b) => {
+        const ta = Date.parse(String(a.startDateTime || ''));
+        const tb = Date.parse(String(b.startDateTime || ''));
+        if (ta !== tb) return ta - tb;
+        return String(a.id).localeCompare(String(b.id));
+      });
+
+      // Apply Q2 full cancel & exact-lot refunds in memory (zero forfeiture for student switch)
+      let workingLots = hydrated.lots.map((l) => ({ ...l }));
+      let workingAvailable = beforeRefundAvailable;
+      let nextSeq = hydrated.nextLotSequence;
+      const q2RefundedTouchedLotIds = new Set<string>();
+      const q2CancelledUpdatesByLessonId = new Map<
+        string,
+        { latest: any; updates: Record<string, any>; mergedLesson: any }
+      >();
+      let q2RefundedCreditsCount = 0;
+      let q2CancelledTrialLessonsCount = 0;
+
+      for (const lesson of unstartedFutureLessons) {
+        const isTrial = Boolean(lesson.isTrialLesson);
+        const cancelUpdates: Record<string, any> = {
+          status: 'cancelled',
+          cancelledAt: nowIso,
+          cancelledBy: 'student',
+          cancellationReason: 'Troca de Native Friend (Q2 — cancelamento e estorno integral de aula futura não iniciada)',
+          cancelledBySwitch: true,
+          switchAuditId,
+          proposalStatus: null,
+          proposedNewStartDateTime: null,
+          proposedNewEndDateTime: null,
+          updatedAt: nowIso,
+        };
+
+        if (isTrial) {
+          cancelUpdates.creditRefunded = false;
+          q2CancelledTrialLessonsCount += 1;
+        } else {
+          if (lesson.creditRefunded === true) {
+            throw new NativeFriendSwitchError(
+              `Aula '${lesson.id}' já possui marcação de crédito estornado; bloqueando devolução duplicada.`,
+              409,
+              'DOUBLE_REFUND_PREVENTED'
+            );
+          }
+
+          const refundRes = refundUnitToExactLot({
+            studentUid: cleanStudentUid,
+            studentEmail: cleanStudentEmail,
+            lots: workingLots,
+            targetLotId: typeof lesson.creditLotId === 'string' ? lesson.creditLotId : null,
+            targetUnitIndex:
+              typeof lesson.creditUnitIndex === 'number' && Number.isInteger(lesson.creditUnitIndex)
+                ? lesson.creditUnitIndex
+                : null,
+            wasFirstInitialization: hydrated.wasFirstInitialization,
+            nextLotSequence: nextSeq,
+            nowIso,
+          });
+
+          workingLots = refundRes.lots;
+          nextSeq = refundRes.nextLotSequence;
+          workingAvailable += 1;
+          q2RefundedCreditsCount += 1;
+          q2RefundedTouchedLotIds.add(refundRes.refundedLot.id);
+
+          cancelUpdates.creditRefunded = true;
+          cancelUpdates.creditRefundedAt = nowIso;
+          cancelUpdates.refundedCreditLotId = refundRes.refundedLot.id;
+          cancelUpdates.refundedCreditOrigin = refundRes.refundedLot.origin;
+          cancelUpdates.refundedCreditUnitIndex = refundRes.refundedUnitIndex;
+        }
+
+        const mergedLesson = { ...lesson, ...cancelUpdates, id: lesson.id };
+        q2CancelledUpdatesByLessonId.set(lesson.id, {
+          latest: lesson,
+          updates: cancelUpdates,
+          mergedLesson,
+        });
+      }
+
+      // Build post-refund lesson view for NF.SWITCH.2C engine
+      const postCancelLessons = studentLessons.map((l) => {
+        const entry = q2CancelledUpdatesByLessonId.get(l.id);
+        return entry ? entry.mergedLesson : l;
+      });
+
+      const postRefundLotsSum = sumLotRemainingLessons(workingLots);
+      if (postRefundLotsSum !== workingAvailable) {
+        throw new CreditLedgerError(
+          `Divergência após estornos Q2: availableLessons=${workingAvailable} difere da soma dos lotes=${postRefundLotsSum}.`,
+          409,
+          CREDIT_LEDGER_DIVERGENCE_CODE
+        );
+      }
+
+      // Block legacy_unreconciled credits unconditionally before switching
+      const remainingLegacyUnits = workingLots
+        .filter((l) => l.origin === 'legacy_unreconciled')
+        .reduce((sum, l) => sum + Number(l.remainingLessons || 0), 0);
+
+      if (remainingLegacyUnits > 0) {
+        throw new NativeFriendSwitchError(
+          'Troca bloqueada: o aluno possui créditos legados não conciliados (legacy_unreconciled). Realize a conciliação administrativa (NF.SWITCH.2B) antes da troca.',
+          409,
+          'LEGACY_UNRECONCILED_PRESENT',
+          { availableLegacyUnitsCount: remainingLegacyUnits }
+        );
+      }
+
+      // Run pure NF.SWITCH.2C conversion engine if student has any remaining credits post-refund
+      let budgetBrlCents = 0;
+      let convertedPaidLessonsCount = 0;
+      let courtesyTransferredLessonsCount = 0;
+      let convertedTotalBrlCents = 0;
+      let switchResidualBrlCents = 0;
+      let retiredSourceLots: CreditLot[] = [];
+      const sourcePaidLotIds: string[] = [];
+      const sourceCourtesyLotIds: string[] = [];
+      const createdPaidLots: CreditLot[] = [];
+      let createdCourtesyLot: CreditLot | null = null;
+      const plannedPackageSummaries: NativeFriendSwitchPlannedPackageSummary[] = [];
+
+      if (workingAvailable > 0) {
+        const conversionRes = evaluateSwitchConversion({
+          studentUid: cleanStudentUid,
+          studentAvailableLessons: workingAvailable,
+          creditLots: workingLots,
+          lessons: postCancelLessons,
+          targetTeacher: {
+            teacherUid: targetTeacherUid,
+            teacherEmail: targetTeacherEmail,
+            teacherName: targetTeacherName,
+            basePriceUsd: targetBasePriceUsd,
+            adminCommissionPercent: targetAdminCommissionPercent,
+            commissionModel: ALLOWED_COMMISSION_MODEL,
+            commissionVersion: targetCommissionVersion,
+            approvalStatus: 'approved',
+            isApproved: true,
+            isCommercializable: true,
+          },
+          ptax: {
+            ptaxRate: ptaxResult.ptaxRate,
+            quoteDate: ptaxResult.quoteDate || null,
+            pricingDate: ptaxResult.pricingDate || null,
+            source: ptaxResult.source || 'BACEN_PTAX_D1',
+          },
+        });
+
+        assertSwitchConversionReady(conversionRes);
+
+        const plan = conversionRes.conversionPlan!;
+        const acct = conversionRes.accounting!;
+
+        budgetBrlCents = acct.convertedValue.budgetBrlCents;
+        convertedPaidLessonsCount = acct.convertedValue.convertedPaidLessonsCount;
+        courtesyTransferredLessonsCount = acct.convertedValue.preservedCourtesyLessonsCount;
+        convertedTotalBrlCents = acct.convertedValue.convertedTotalBrlCents;
+        switchResidualBrlCents = acct.convertedValue.residualBrlCents;
+
+        // Retire all active source lots (paid and courtesy) without reducing initialLessons
+        const retiredById = new Map<string, CreditLot>();
+        workingLots = workingLots.map((lot) => {
+          if (lot.remainingLessons <= 0) return lot;
+          if (lot.origin === 'paid') {
+            sourcePaidLotIds.push(lot.id);
+          } else if (lot.origin === 'courtesy') {
+            sourceCourtesyLotIds.push(lot.id);
+          }
+          const { retiredLot } = retireSourceLotUnitsForSwitch({
+            lot,
+            switchAuditId,
+            targetTeacherUid,
+            nowIso,
+          });
+          retiredById.set(retiredLot.id, retiredLot);
+          return retiredLot;
+        });
+        retiredSourceLots = Array.from(retiredById.values());
+
+        // Mint new destination paid lots from pure conversion plan
+        for (const pkgSpec of plan.plannedPaidLots) {
+          nextSeq += 1;
+          const destLot = buildSwitchedPaidLotData({
+            studentUid: cleanStudentUid,
+            studentEmail: cleanStudentEmail,
+            lessonsCount: pkgSpec.packageSize,
+            discountPercent: pkgSpec.discountPercent,
+            lotSequence: nextSeq,
+            packageIndex: pkgSpec.lotIndex,
+            nowIso,
+            idempotencyKey: cleanIdempotencyKey,
+            switchAuditId,
+            sourceTeacherUid,
+            sourcePaidLotIds,
+            pricedTeacherUid: targetTeacherUid,
+            teacherEmail: targetTeacherEmail,
+            teacherName: targetTeacherName,
+            basePriceUsd: targetBasePriceUsd,
+            adminCommissionPercent: targetAdminCommissionPercent,
+            commissionModel: ALLOWED_COMMISSION_MODEL,
+            commissionVersion: targetCommissionVersion,
+            ptaxRate: ptaxResult.ptaxRate,
+            ptaxQuoteDate: ptaxResult.quoteDate || null,
+            ptaxPricingDate: ptaxResult.pricingDate || null,
+            ptaxSource: ptaxResult.source || 'BACEN_PTAX_D1',
+            totalPaidBrlCents: pkgSpec.totalPaidBrlCents,
+            totalPaidUsdCents: pkgSpec.totalPaidUsdCents,
+            teacherShareBrlCents: pkgSpec.teacherShareBrlCents,
+            teacherShareUsdCents: pkgSpec.teacherShareUsdCents,
+            platformRevenueBrlCents: pkgSpec.platformRevenueBrlCents,
+            platformRevenueUsdCents: pkgSpec.platformRevenueUsdCents,
+            unitCentsSchedule: pkgSpec.unitCentsSchedule,
+          });
+          createdPaidLots.push(destLot);
+          plannedPackageSummaries.push({
+            lotId: destLot.id,
+            packageSize: pkgSpec.packageSize,
+            discountPercent: pkgSpec.discountPercent,
+            totalPaidBrlCents: pkgSpec.totalPaidBrlCents,
+            teacherShareBrlCents: pkgSpec.teacherShareBrlCents,
+            platformRevenueBrlCents: pkgSpec.platformRevenueBrlCents,
+            totalPaidUsdCents: pkgSpec.totalPaidUsdCents,
+            teacherShareUsdCents: pkgSpec.teacherShareUsdCents,
+            platformRevenueUsdCents: pkgSpec.platformRevenueUsdCents,
+          });
+        }
+
+        // Transfer courtesy credits 1:1 with zero financial value
+        if (courtesyTransferredLessonsCount > 0) {
+          nextSeq += 1;
+          createdCourtesyLot = buildSwitchedCourtesyLotData({
+            studentUid: cleanStudentUid,
+            studentEmail: cleanStudentEmail,
+            lessonsCount: courtesyTransferredLessonsCount,
+            lotSequence: nextSeq,
+            nowIso,
+            idempotencyKey: cleanIdempotencyKey,
+            switchAuditId,
+            sourceTeacherUid,
+            targetTeacherUid,
+            sourceCourtesyLotIds,
+          });
+        }
+      }
+
+      const finalCreatedLots: CreditLot[] = [
+        ...createdPaidLots,
+        ...(createdCourtesyLot ? [createdCourtesyLot] : []),
+      ];
+
+      // Include any exhausted historical lots touched only by Q2 (none expected since remainingLessons>0 lots get retired,
+      // unless remaining === 0 check skipped, which won't happen after +1 refund) + all workingLots + finalCreatedLots.
+      const finalAllLots = [...workingLots, ...finalCreatedLots];
+      validateCreditLotsForStudent(cleanStudentUid, finalAllLots);
+
+      const afterSwitchAvailable = sumLotRemainingLessons(finalAllLots);
+      const expectedAfterSwitch = convertedPaidLessonsCount + courtesyTransferredLessonsCount;
+      if (afterSwitchAvailable !== expectedAfterSwitch) {
+        throw new CreditLedgerError(
+          `Invariante de saldo pós-troca violada (${afterSwitchAvailable} !== ${expectedAfterSwitch}).`,
+          500,
+          CREDIT_LEDGER_DIVERGENCE_CODE
+        );
+      }
+
+      const nextActiveCreditLotIds = computeActiveCreditLotIds(finalAllLots);
+      const residualBrlCentsAfter = residualBrlCentsBefore + switchResidualBrlCents;
+
+      // Consolidate exact set of credit lots that must be persisted (deduplicated)
+      const lotsToWriteMap = new Map<string, CreditLot>();
+      for (const lotId of q2RefundedTouchedLotIds) {
+        const found = finalAllLots.find((l) => l.id === lotId);
+        if (found) lotsToWriteMap.set(found.id, found);
+      }
+      for (const retired of retiredSourceLots) {
+        lotsToWriteMap.set(retired.id, retired);
+      }
+      for (const created of finalCreatedLots) {
+        lotsToWriteMap.set(created.id, created);
+      }
+      const lotsToWrite = Array.from(lotsToWriteMap.values());
+
+      // Prepare student & teacher scheduledLessons mirror updates
+      let updatedStudentScheduledLessons: any[] | undefined = undefined;
+      if (Array.isArray(studentData.scheduledLessons)) {
+        let curArr = studentData.scheduledLessons;
+        for (const [lId, entry] of q2CancelledUpdatesByLessonId.entries()) {
+          const res = updateUserScheduledLessonsArray({ scheduledLessons: curArr }, lId, entry.updates, true);
+          if (res !== undefined) curArr = res;
+        }
+        updatedStudentScheduledLessons = curArr;
+      }
+
+      const teacherScheduledWrites: Array<{ ref: any; scheduledLessons: any[] }> = [];
+      for (let i = 0; i < extraTeacherUids.length; i++) {
+        const tUid = extraTeacherUids[i];
+        const tSnap = remainingSnaps[teacherUserSnapOffset + i];
+        if (!tSnap || !tSnap.exists) continue;
+        const tData = tSnap.data() || {};
+        if (!Array.isArray(tData.scheduledLessons)) continue;
+        let curArr = tData.scheduledLessons;
+        let changed = false;
+        for (const [lId, entry] of q2CancelledUpdatesByLessonId.entries()) {
+          if (entry.latest.teacherUid === tUid || entry.latest.teacherAuthUid === tUid) {
+            const res = updateUserScheduledLessonsArray({ scheduledLessons: curArr }, lId, entry.updates, true);
+            if (res !== undefined) {
+              curArr = res;
+              changed = true;
+            }
+          }
+        }
+        if (changed) {
+          teacherScheduledWrites.push({
+            ref: db.collection('users').doc(tUid),
+            scheduledLessons: curArr,
+          });
+        }
+      }
+
+      // Compute exact write operations count BEFORE executing any write
+      const lessonWriteBundles: Array<{
+        lessonId: string;
+        updates: Record<string, any>;
+        mergedLesson: any;
+        refs: ReturnType<typeof collectLessonParticipantRefs>;
+      }> = [];
+      let lessonOpsCount = 0;
+      for (const [lId, entry] of q2CancelledUpdatesByLessonId.entries()) {
+        const refs = collectLessonParticipantRefs(db, entry.latest, lId);
+        lessonOpsCount +=
+          1 +
+          (refs.studentSubLessonRef ? 1 : 0) +
+          refs.teacherUserRefs.length +
+          refs.tutorSubRefs.length;
+        lessonWriteBundles.push({
+          lessonId: lId,
+          updates: entry.updates,
+          mergedLesson: entry.mergedLesson,
+          refs,
+        });
+      }
+
+      const totalWriteOps =
+        lotsToWrite.length +
+        lessonOpsCount +
+        teacherScheduledWrites.length +
+        3; // users/{uid} + student_assignments/{uid} + native_friend_switches/{id}
+
+      if (totalWriteOps > SWITCH_MAX_FIRESTORE_WRITES) {
+        throw new NativeFriendSwitchError(
+          `Quantidade de escritas na transação (${totalWriteOps}) excede o limite seguro (${SWITCH_MAX_FIRESTORE_WRITES}). Nenhuma alteração foi persistida.`,
+          422,
+          'SWITCH_TRANSACTION_LIMIT_EXCEEDED',
+          { totalWriteOps, limit: SWITCH_MAX_FIRESTORE_WRITES }
+        );
+      }
+
+      const sourceTeacherEmailResolved =
+        typeof sourceTeacherDoc.email === 'string' && sourceTeacherDoc.email.trim()
+          ? sourceTeacherDoc.email.toLowerCase().trim()
+          : typeof studentData.teacherEmail === 'string' && studentData.teacherEmail.trim()
+          ? studentData.teacherEmail.toLowerCase().trim()
+          : null;
+      const sourceTeacherNameResolved =
+        typeof sourceTeacherDoc.name === 'string' && sourceTeacherDoc.name.trim()
+          ? sourceTeacherDoc.name.trim()
+          : typeof studentData.teacherName === 'string' && studentData.teacherName.trim()
+          ? studentData.teacherName.trim()
+          : null;
+
+      const auditRecord: NativeFriendSwitchAuditRecord = {
+        id: switchAuditId,
+        idempotencyKey: cleanIdempotencyKey,
+        requestFingerprint,
+        studentUid: cleanStudentUid,
+        studentEmail: cleanStudentEmail,
+        studentName: cleanStudentName,
+        sourceTeacherUid,
+        sourceTeacherEmail: sourceTeacherEmailResolved,
+        sourceTeacherName: sourceTeacherNameResolved,
+        targetTeacherUid,
+        targetTeacherEmail,
+        targetTeacherName,
+        targetTeacherMeetUrl: targetMeetUrl,
+        q2CancelledLessonIds: unstartedFutureLessons.map((l) => l.id),
+        q2CancelledLessonsCount: unstartedFutureLessons.length,
+        q2RefundedCreditsCount,
+        q2CancelledTrialLessonsCount,
+        lockedStartedLessonsCount,
+        availableLessonsBefore: beforeRefundAvailable,
+        availableLessonsAfterRefunds: workingAvailable,
+        availableLessonsAfterSwitch: afterSwitchAvailable,
+        budgetBrlCents,
+        convertedPaidLessonsCount,
+        courtesyTransferredLessonsCount,
+        convertedTotalBrlCents,
+        residualBrlCentsBefore,
+        switchResidualBrlCents,
+        residualBrlCentsAfter,
+        ptaxRate: ptaxResult.ptaxRate,
+        ptaxQuoteDate: ptaxResult.quoteDate || null,
+        ptaxPricingDate: ptaxResult.pricingDate || null,
+        ptaxSource: ptaxResult.source || 'BACEN_PTAX_D1',
+        targetBasePriceUsd,
+        targetAdminCommissionPercent,
+        targetCommissionModel: ALLOWED_COMMISSION_MODEL,
+        targetCommissionVersion,
+        retiredSourceLotIds: retiredSourceLots.map((l) => l.id),
+        sourcePaidLotIds,
+        sourceCourtesyLotIds,
+        createdDestinationLotIds: finalCreatedLots.map((l) => l.id),
+        createdCourtesyLotId: createdCourtesyLot ? createdCourtesyLot.id : null,
+        plannedPackages: plannedPackageSummaries,
+        accountingInvariants: {
+          newCashCollectedBrlCents: 0,
+          artificialRevenueCreatedBrlCents: 0,
+          immediateTargetTeacherPayoutDueBrlCents: 0,
+          courtesyFinancialValueBrlCents: 0,
+          centsConservedExactly: convertedTotalBrlCents + switchResidualBrlCents === budgetBrlCents,
+        },
+        performedByUid: cleanStudentUid,
+        performedByEmail: cleanStudentEmail,
+        performedByRole: 'student',
+        createdAt: nowIso,
+        immutable: true,
+      };
+
+      const studentUpdatePayload: Record<string, any> = {
+        uid: cleanStudentUid,
+        id: cleanStudentUid,
+        email: cleanStudentEmail,
+        teacherUid: targetTeacherUid,
+        assignedNativeFriendUID: targetTeacherUid,
+        nativeFriendUID: targetTeacherUid,
+        teacherEmail: targetTeacherEmail,
+        teacherName: targetTeacherName,
+        teacherMeetUrl: targetMeetUrl || null,
+        publicTutorId: targetPublicTutorId,
+        enrollmentStatus: 'active',
+        availableLessons: afterSwitchAvailable,
+        creditLotsInitializedAt: hydrated.creditLotsInitializedAt,
+        activeCreditLotIds: nextActiveCreditLotIds,
+        creditLotSequence: nextSeq,
+        residualBrlCents: residualBrlCentsAfter,
+        residualUpdatedAt: nowIso,
+        lastSwitchAuditId: switchAuditId,
+        lastSwitchedAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      if (updatedStudentScheduledLessons !== undefined) {
+        studentUpdatePayload.scheduledLessons = updatedStudentScheduledLessons;
+      }
+
+      const assignmentUpdatePayload: Record<string, any> = {
+        studentUid: cleanStudentUid,
+        teacherUid: targetTeacherUid,
+        teacherAuthUid: targetTeacherUid,
+        teacherPublicId: targetPublicTutorId,
+        assignedNativeFriendUID: targetTeacherUid,
+        nativeFriendUID: targetTeacherUid,
+        teacherEmail: targetTeacherEmail,
+        teacherName: targetTeacherName,
+        enrollmentStatus: 'active',
+        lastSwitchAuditId: switchAuditId,
+        updatedAt: nowIso,
+      };
+
+      // PHASE 3: ATOMIC WRITES ONLY (NEVER writes revenue to financial_transactions)
+      for (const lot of lotsToWrite) {
+        transaction.set(db.collection('credit_lots').doc(lot.id), lot, { merge: true });
+      }
+
+      for (const bundle of lessonWriteBundles) {
+        transaction.set(db.collection('lessons').doc(bundle.lessonId), bundle.updates, { merge: true });
+        if (bundle.refs.studentSubLessonRef) {
+          transaction.set(bundle.refs.studentSubLessonRef, bundle.mergedLesson, { merge: true });
+        }
+        for (const tRef of bundle.refs.teacherUserRefs) {
+          transaction.set(tRef.subLessonRef, bundle.mergedLesson, { merge: true });
+        }
+        for (const tuRef of bundle.refs.tutorSubRefs) {
+          transaction.set(tuRef.subLessonRef, bundle.mergedLesson, { merge: true });
+        }
+      }
+
+      for (const tw of teacherScheduledWrites) {
+        transaction.set(tw.ref, { scheduledLessons: tw.scheduledLessons, updatedAt: nowIso }, { merge: true });
+      }
+
+      transaction.set(assignmentRef, assignmentUpdatePayload, { merge: true });
+      transaction.set(studentRef, studentUpdatePayload, { merge: true });
+      transaction.set(switchAuditRef, auditRecord);
+
+      return {
+        isIdempotent: false,
+        audit: auditRecord,
+        createdLots: finalCreatedLots,
+        retiredSourceLots,
+        profile: {
+          ...studentData,
+          ...studentUpdatePayload,
+        },
+      };
+    });
+
+    const audit = outcome.audit;
+    return {
+      success: true,
+      statusCode: 200,
+      isIdempotent: outcome.isIdempotent,
+      switchAuditId: audit.id,
+      studentUid: audit.studentUid,
+      sourceTeacherUid: audit.sourceTeacherUid,
+      targetTeacherUid: audit.targetTeacherUid,
+      targetTeacherEmail: audit.targetTeacherEmail,
+      targetTeacherName: audit.targetTeacherName,
+      targetTeacherMeetUrl: audit.targetTeacherMeetUrl,
+      availableLessonsBefore: audit.availableLessonsBefore,
+      availableLessonsAfterRefunds: audit.availableLessonsAfterRefunds,
+      availableLessonsAfterSwitch: audit.availableLessonsAfterSwitch,
+      residualBrlCentsBefore: audit.residualBrlCentsBefore,
+      switchResidualBrlCents: audit.switchResidualBrlCents,
+      residualBrlCentsAfter: audit.residualBrlCentsAfter,
+      q2CancelledLessonsCount: audit.q2CancelledLessonsCount,
+      q2RefundedCreditsCount: audit.q2RefundedCreditsCount,
+      q2CancelledTrialLessonsCount: audit.q2CancelledTrialLessonsCount,
+      lockedStartedLessonsCount: audit.lockedStartedLessonsCount,
+      createdLots: outcome.createdLots,
+      retiredSourceLots: outcome.retiredSourceLots,
+      audit,
+      profile: outcome.profile,
+    };
+  } catch (err: any) {
+    if (err instanceof CreditLedgerError) {
+      return {
+        success: false,
+        statusCode: err.statusCode,
+        code: err.code,
+        error: err.message,
+        details: err.details,
+      };
+    }
+
+    if (err instanceof SwitchConversionError) {
+      const mappedStatus =
+        err.code === 'LEGACY_UNRECONCILED_PRESENT'
+          ? 409
+          : err.code === 'TARGET_TEACHER_NOT_APPROVED'
+          ? 403
+          : err.statusCode;
+      return {
+        success: false,
+        statusCode: mappedStatus,
+        code: err.code,
+        error: err.message,
+        details: err.details,
+      };
+    }
+
+    if (err instanceof NativeFriendSwitchError) {
+      return {
+        success: false,
+        statusCode: err.statusCode,
+        code: err.code,
+        error: err.message,
+        details: err.details,
+      };
+    }
+
+    const msg = String(err?.message || '');
+    const code = err?.code;
+
+    if (isPermissionError(err)) {
+      return {
+        success: false,
+        statusCode: 500,
+        code: 'FIRESTORE_INFRASTRUCTURE_ERROR',
+        error: 'Erro de permissão ao persistir troca de Amigo Nativo no Firestore.',
+      };
+    }
+
+    const isTimeout =
+      code === 4 ||
+      code === 'deadline-exceeded' ||
+      msg.includes('DEADLINE_EXCEEDED') ||
+      msg.includes('timeout') ||
+      msg.includes('ETIMEDOUT');
+    if (isTimeout) {
+      return {
+        success: false,
+        statusCode: 504,
+        code: 'FIRESTORE_TIMEOUT',
+        error: 'Tempo limite esgotado ao executar troca atômica de Amigo Nativo. Tente novamente.',
+      };
+    }
+
+    return {
+      success: false,
+      statusCode: 500,
+      code: 'FIRESTORE_TRANSACTION_FAILED',
+      error: msg || 'Falha ao executar troca atômica de Amigo Nativo no Firestore.',
+    };
+  }
+}
+
 

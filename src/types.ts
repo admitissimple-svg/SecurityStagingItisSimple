@@ -409,6 +409,11 @@ export interface UserProfile {
   creditLotsInitializedAt?: string;
   activeCreditLotIds?: string[];
   creditLotSequence?: number;
+  // NF.SWITCH.2D: Canonical BRL residual cents balance (strictly separated from availableLessons)
+  residualBrlCents?: number;
+  residualUpdatedAt?: string;
+  lastSwitchAuditId?: string;
+  lastSwitchedAt?: string;
 }
 
 export interface StudentProfile {
@@ -655,6 +660,8 @@ export interface LiveLesson {
   refundedCreditLotId?: string;
   refundedCreditOrigin?: CreditLotOrigin;
   refundedCreditUnitIndex?: number;
+  cancelledBySwitch?: boolean;
+  switchAuditId?: string;
 }
 
 export interface TeacherOriginalNotes {
@@ -1044,7 +1051,9 @@ export type CreditLotSourceType =
   | 'ADMIN_CREDIT_ADJUSTMENT'
   | 'LEGACY_INITIAL_HYDRATION'
   | 'LEGACY_RECONCILIATION_PAID'
-  | 'LEGACY_RECONCILIATION_COURTESY';
+  | 'LEGACY_RECONCILIATION_COURTESY'
+  | 'NATIVE_FRIEND_SWITCH_PAID'
+  | 'NATIVE_FRIEND_SWITCH_COURTESY';
 
 export type CreditLotStatus = 'active' | 'exhausted';
 
@@ -1146,6 +1155,16 @@ export interface CreditLot {
   reconciledLessonsCount?: number | null;
   lastReconciledAt?: string | null;
   lastReconciliationAuditId?: string | null;
+  // NF.SWITCH.2D: Immutable traceability between switched source lots and destination lots
+  switchedOutAt?: string | null;
+  switchedOutAuditId?: string | null;
+  switchedOutUnitIndices?: number[] | null;
+  switchedOutLessonsCount?: number | null;
+  switchedOutTargetTeacherUid?: string | null;
+  switchedFromAuditId?: string | null;
+  switchedFromSourceTeacherUid?: string | null;
+  switchedFromLotIds?: string[] | null;
+  switchedPackageIndex?: number | null;
 }
 
 export interface LegacyReconciliationAllocationInput {
@@ -1263,6 +1282,75 @@ export interface CreditReconciliationAuditRecord {
   performedByUid: string;
   performedByEmail: string;
   performedByRole: 'admin';
+  createdAt: string;
+  immutable: true;
+}
+
+export interface NativeFriendSwitchPlannedPackageSummary {
+  lotId: string;
+  packageSize: 1 | 4 | 8 | 12;
+  discountPercent: number;
+  totalPaidBrlCents: number;
+  teacherShareBrlCents: number;
+  platformRevenueBrlCents: number;
+  totalPaidUsdCents: number;
+  teacherShareUsdCents: number;
+  platformRevenueUsdCents: number;
+}
+
+export interface NativeFriendSwitchAuditRecord {
+  id: string;
+  idempotencyKey: string;
+  requestFingerprint: string;
+  studentUid: string;
+  studentEmail: string;
+  studentName: string;
+  sourceTeacherUid: string;
+  sourceTeacherEmail: string | null;
+  sourceTeacherName: string | null;
+  targetTeacherUid: string;
+  targetTeacherEmail: string;
+  targetTeacherName: string;
+  targetTeacherMeetUrl: string;
+  q2CancelledLessonIds: string[];
+  q2CancelledLessonsCount: number;
+  q2RefundedCreditsCount: number;
+  q2CancelledTrialLessonsCount: number;
+  lockedStartedLessonsCount: number;
+  availableLessonsBefore: number;
+  availableLessonsAfterRefunds: number;
+  availableLessonsAfterSwitch: number;
+  budgetBrlCents: number;
+  convertedPaidLessonsCount: number;
+  courtesyTransferredLessonsCount: number;
+  convertedTotalBrlCents: number;
+  residualBrlCentsBefore: number;
+  switchResidualBrlCents: number;
+  residualBrlCentsAfter: number;
+  ptaxRate: number | null;
+  ptaxQuoteDate: string | null;
+  ptaxPricingDate: string | null;
+  ptaxSource: string | null;
+  targetBasePriceUsd: number;
+  targetAdminCommissionPercent: number;
+  targetCommissionModel: string;
+  targetCommissionVersion: number;
+  retiredSourceLotIds: string[];
+  sourcePaidLotIds: string[];
+  sourceCourtesyLotIds: string[];
+  createdDestinationLotIds: string[];
+  createdCourtesyLotId: string | null;
+  plannedPackages: NativeFriendSwitchPlannedPackageSummary[];
+  accountingInvariants: {
+    newCashCollectedBrlCents: 0;
+    artificialRevenueCreatedBrlCents: 0;
+    immediateTargetTeacherPayoutDueBrlCents: 0;
+    courtesyFinancialValueBrlCents: 0;
+    centsConservedExactly: boolean;
+  };
+  performedByUid: string;
+  performedByEmail: string;
+  performedByRole: 'student';
   createdAt: string;
   immutable: true;
 }
