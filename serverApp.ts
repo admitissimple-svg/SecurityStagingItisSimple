@@ -25992,13 +25992,47 @@ export async function startServer() {
     // Preserve dynamic import('vite') isolation while binding the HTTP port immediately
     const vitePromise = (async () => {
       const { createServer: createViteServer } = await import('vite');
+      const kService = (process.env.K_SERVICE || '').toLowerCase();
+      const kRevision = (process.env.K_REVISION || '').toLowerCase();
+      const appUrl = (process.env.APP_URL || '').toLowerCase();
+      const disableHmr =
+        process.env.DISABLE_HMR === 'true' ||
+        process.env.APP_ENV === 'preview' ||
+        process.env.IS_PREVIEW === 'true' ||
+        process.env.PREVIEW === 'true' ||
+        Boolean(process.env.APPLET_ID) ||
+        kService.startsWith('ais-') ||
+        kService.includes('preview') ||
+        kRevision.startsWith('ais-') ||
+        kRevision.includes('preview') ||
+        appUrl.includes('ais-') ||
+        appUrl.includes('preview');
+
       return createViteServer({
-        server: {
-          middlewareMode: true,
-          hmr: false,
-          ws: false,
-          watch: null,
-        },
+        server: disableHmr
+          ? {
+              middlewareMode: true,
+              hmr: false,
+              ws: false,
+              watch: null,
+            }
+          : {
+              middlewareMode: true,
+            },
+        ...(disableHmr
+          ? {
+              plugins: [
+                {
+                  name: 'disable-watch-in-preview',
+                  config(config) {
+                    if (config.server) {
+                      config.server.watch = null;
+                    }
+                  },
+                },
+              ],
+            }
+          : {}),
         appType: 'spa',
       });
     })();
