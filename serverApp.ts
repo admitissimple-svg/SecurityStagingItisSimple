@@ -1495,7 +1495,7 @@ app.post('/api/auth/sync-admin-claims', firebaseAuthMiddleware, async (req, res)
   }
 });
 
-// 1.1 Auth Endpoints: Admin status check (never inspects or exposes credentials)
+// 1.1 Auth Endpoints: Admin status check (never inspects or exposes credentials or PII)
 app.get('/api/auth/admin-status', (req, res) => {
   const db = readDb();
   const adminAccount =
@@ -1504,8 +1504,6 @@ app.get('/api/auth/admin-status', (req, res) => {
   res.json({
     hasAdmin: !!adminAccount,
     hasAdminRegistered: !!adminAccount,
-    adminEmail: adminAccount ? (adminAccount as any).email : null,
-    adminName: adminAccount ? (adminAccount as any).name : null,
   });
 });
 
@@ -1874,11 +1872,6 @@ app.get('/api/auth/check-user', async (req, res) => {
 
   let emailExists = false;
   let nameExists = false;
-  let existingRole: string | null = null;
-  let existingName: string | null = null;
-  let profileDoc: any = null;
-  let studentDoc: any = null;
-  let tutorDoc: any = null;
 
   // 1. Authoritative email existence check strictly via Firebase Auth (strictly read-only)
   if (email) {
@@ -1921,11 +1914,6 @@ app.get('/api/auth/check-user', async (req, res) => {
         exists: null,
         emailExists: null,
         nameExists: null,
-        role: null,
-        name: null,
-        profile: null,
-        student: null,
-        tutor: null,
         error: 'AUTHORITATIVE_VERIFICATION_UNAVAILABLE',
         message: 'Verificação autoritativa de conta no Firebase Auth indisponível no momento.',
       });
@@ -1933,67 +1921,6 @@ app.get('/api/auth/check-user', async (req, res) => {
 
     if (authLookupStatus === 'found' && authUserRecord) {
       emailExists = true;
-      const authUid = authUserRecord.uid;
-      const claimRole =
-        authUserRecord.customClaims?.role === 'admin' ||
-        authUserRecord.customClaims?.role === 'teacher' ||
-        authUserRecord.customClaims?.role === 'student'
-          ? authUserRecord.customClaims.role
-          : null;
-
-      // Read-only enrichment from canonical Firestore collections (/users and /tutors)
-      try {
-        const [fsUser, fsTutor] = await Promise.all([
-          fetchUserFromFirestore(email, authUid).catch(() => null),
-          fetchTutorDocumentFromFirestore(authUid, 3000).catch(() => null),
-        ]);
-
-        const fsUserRole = (fsUser?.role || fsUser?.userRole || '').toLowerCase().trim();
-        const isFsTutorApproved = Boolean(
-          fsTutor &&
-          (fsTutor.role || '').toLowerCase().trim() !== 'student' &&
-          (fsTutor.approvalStatus === 'approved' || fsTutor.status === 'approved') &&
-          (fsTutor.isApproved === true || fsTutor.approved === true)
-        );
-        const isFsTutorPending = Boolean(
-          fsTutor &&
-          !isFsTutorApproved &&
-          (fsTutor.approvalStatus === 'pending' || fsTutor.status === 'pending' || fsTutor.isApproved === false)
-        );
-        const isFsUserApprovedTeacher = Boolean(
-          fsUser &&
-          (fsUserRole === 'teacher' || fsUserRole === 'tutor' || fsUserRole === 'native_friend') &&
-          (fsUser.approvalStatus === 'approved' || fsUser.status === 'approved') &&
-          (fsUser.isApproved === true || fsUser.approved === true)
-        );
-        const isFsUserPendingTeacher = Boolean(
-          fsUser &&
-          !isFsUserApprovedTeacher &&
-          (fsUserRole === 'teacher' || fsUserRole === 'tutor' || fsUserRole === 'native_friend') &&
-          (fsUser.approvalStatus === 'pending' || fsUser.status === 'pending' || fsUser.isApproved === false)
-        );
-
-        if (fsUserRole === 'admin' || claimRole === 'admin') {
-          existingRole = 'admin';
-        } else if (isFsUserApprovedTeacher || isFsTutorApproved) {
-          existingRole = 'teacher';
-          tutorDoc = fsTutor || fsUser;
-        } else if (isFsTutorPending || isFsUserPendingTeacher) {
-          existingRole = 'pending_teacher';
-          tutorDoc = fsTutor || fsUser;
-        } else if (fsUser && (!fsUserRole || fsUserRole === 'student')) {
-          existingRole = 'student';
-          profileDoc = fsUser;
-          studentDoc = fsUser;
-        } else {
-          existingRole = null;
-        }
-
-        existingName = fsUser?.name || fsTutor?.name || authUserRecord.displayName || null;
-      } catch {
-        existingRole = claimRole === 'admin' ? 'admin' : null;
-        existingName = authUserRecord.displayName || null;
-      }
     }
   }
 
@@ -2022,11 +1949,6 @@ app.get('/api/auth/check-user', async (req, res) => {
         exists: null,
         emailExists: email ? emailExists : null,
         nameExists: null,
-        role: null,
-        name: null,
-        profile: null,
-        student: null,
-        tutor: null,
         error: 'AUTHORITATIVE_VERIFICATION_UNAVAILABLE',
         message: 'Verificação autoritativa de nome no Firestore indisponível no momento.',
       });
@@ -2065,11 +1987,6 @@ app.get('/api/auth/check-user', async (req, res) => {
     exists: emailExists || nameExists,
     emailExists,
     nameExists,
-    role: existingRole,
-    name: existingName,
-    profile: profileDoc,
-    student: studentDoc,
-    tutor: tutorDoc,
   });
 });
 
@@ -17403,21 +17320,51 @@ app.post('/api/session-notes/reminder/claim', firebaseAuthMiddleware, async (req
       day: '2-digit',
     }).format(new Date());
 
-  if (!getFirestoreDb()) {
+  if (!getFirestoreDb() || getIsCloudWriteDisabled()) {
     return res.status(503).json({
+      success: false,
       error: 'FirestoreUnavailable',
+      code: 'FIRESTORE_UNAVAILABLE',
       message: 'Canonical Firestore (default) database is unavailable.',
     });
   }
 
-  const result = await recordDailyReminderShownServer(effectiveUid, todayInTz);
+  try {
+    const result = await recordDailyReminderShownServer(effectiveUid, todayInTz);
 
-  return res.json({
-    success: true,
-    canShow: result.canShow,
-    alreadyShown: result.alreadyShown,
-    lastReminderShownDate: result.lastReminderShownDate,
-  });
+    return res.json({
+      success: true,
+      canShow: result.canShow,
+      alreadyShown: result.alreadyShown,
+      lastReminderShownDate: result.lastReminderShownDate,
+    });
+  } catch (err: any) {
+    console.error('POST /api/session-notes/reminder/claim Firestore error:', err);
+    const errMsg = String(err?.message || '').toLowerCase();
+    const isUnavailable =
+      !getFirestoreDb() ||
+      getIsCloudWriteDisabled() ||
+      err?.code === 14 ||
+      err?.code === 'unavailable' ||
+      errMsg.includes('unavailable') ||
+      errMsg.includes('cloud writes are disabled');
+
+    if (isUnavailable) {
+      return res.status(503).json({
+        success: false,
+        error: 'FirestoreUnavailable',
+        code: 'FIRESTORE_UNAVAILABLE',
+        message: 'Canonical Firestore (default) database is unavailable.',
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      error: 'FIRESTORE_SAVE_FAILED',
+      code: 'FIRESTORE_SAVE_FAILED',
+      message: 'Failed to persist daily reminder claim to Firestore.',
+    });
+  }
 });
 
 export type GeminiFailureCategory =
@@ -19085,7 +19032,9 @@ app.post('/api/student-dictionary', async (req, res) => {
 
   if (!getFirestoreDb()) {
     return res.status(503).json({
+      success: false,
       error: 'FirestoreUnavailable',
+      code: 'FIRESTORE_UNAVAILABLE',
       message: 'Canonical Firestore (default) database is unavailable.',
     });
   }
@@ -19179,9 +19128,27 @@ app.post('/api/student-dictionary', async (req, res) => {
   }
 
   if (itemsToAdd.length === 0) {
-    const existing = await fetchStudentVocabularyFromFirestoreServer(canonicalStudentUid, verifiedStudentEmail);
-    const existingExclusions = await fetchExcludedDictionaryWordsServer(canonicalStudentUid);
-    return res.json({ success: true, studentUid: canonicalStudentUid, dictionary: existing, excludedWords: existingExclusions });
+    try {
+      const existing = await fetchStudentVocabularyFromFirestoreServer(canonicalStudentUid, verifiedStudentEmail);
+      const existingExclusions = await fetchExcludedDictionaryWordsServer(canonicalStudentUid);
+      return res.json({ success: true, studentUid: canonicalStudentUid, dictionary: existing, excludedWords: existingExclusions });
+    } catch (readErr: any) {
+      console.error('POST /api/student-dictionary Firestore read error:', readErr);
+      const errMsg = String(readErr?.message || '').toLowerCase();
+      const isUnavailable =
+        !getFirestoreDb() ||
+        readErr?.code === 14 ||
+        readErr?.code === 'unavailable' ||
+        errMsg.includes('unavailable');
+      return res.status(isUnavailable ? 503 : 500).json({
+        success: false,
+        error: isUnavailable ? 'FirestoreUnavailable' : 'Internal Server Error',
+        code: isUnavailable ? 'FIRESTORE_UNAVAILABLE' : 'FIRESTORE_READ_FAILED',
+        message: isUnavailable
+          ? 'Canonical Firestore (default) database is unavailable.'
+          : 'Failed to read student vocabulary from canonical Cloud Firestore.',
+      });
+    }
   }
 
   // Distinguish automatic sync vs explicit intentional addition
@@ -19195,53 +19162,92 @@ app.post('/api/student-dictionary', async (req, res) => {
 
   let finalItemsToAdd = itemsToAdd;
 
-  if (isAutomaticSync) {
-    // Automatic syncs must never remove tombstones or resurrect excluded words
-    const currentExclusions = await fetchExcludedDictionaryWordsServer(canonicalStudentUid);
-    const exSet = new Set(currentExclusions.map(normalizeDictionaryWord).filter(Boolean));
-    finalItemsToAdd = itemsToAdd.filter((e: any) => {
-      const norm = normalizeDictionaryWord(e?.normalizedWord || e?.word);
-      return Boolean(norm && !exSet.has(norm));
-    });
-  } else {
-    // Explicit inclusion reintroduces words by removing tombstones atomically
-    const wordsToReintroduce = itemsToAdd
-      .map((e: any) => normalizeDictionaryWord(e?.normalizedWord || e?.word))
-      .filter(Boolean);
-    if (wordsToReintroduce.length > 0) {
-      await removeExcludedDictionaryWordsServer(canonicalStudentUid, wordsToReintroduce);
+  try {
+    if (isAutomaticSync) {
+      // Automatic syncs must never remove tombstones or resurrect excluded words
+      const currentExclusions = await fetchExcludedDictionaryWordsServer(canonicalStudentUid);
+      const exSet = new Set(currentExclusions.map(normalizeDictionaryWord).filter(Boolean));
+      finalItemsToAdd = itemsToAdd.filter((e: any) => {
+        const norm = normalizeDictionaryWord(e?.normalizedWord || e?.word);
+        return Boolean(norm && !exSet.has(norm));
+      });
+    } else {
+      // Explicit inclusion reintroduces words by removing tombstones atomically
+      const wordsToReintroduce = itemsToAdd
+        .map((e: any) => normalizeDictionaryWord(e?.normalizedWord || e?.word))
+        .filter(Boolean);
+      if (wordsToReintroduce.length > 0) {
+        if (!getFirestoreDb() || getIsCloudWriteDisabled()) {
+          return res.status(503).json({
+            success: false,
+            error: 'FirestoreUnavailable',
+            code: 'FIRESTORE_UNAVAILABLE',
+            message: 'Canonical Firestore (default) database is unavailable.',
+          });
+        }
+        await removeExcludedDictionaryWordsServer(canonicalStudentUid, wordsToReintroduce);
+      }
     }
-  }
 
-  if (finalItemsToAdd.length > 0) {
-    try {
+    if (finalItemsToAdd.length > 0) {
+      if (!getFirestoreDb() || getIsCloudWriteDisabled()) {
+        return res.status(503).json({
+          success: false,
+          error: 'FirestoreUnavailable',
+          code: 'FIRESTORE_UNAVAILABLE',
+          message: 'Canonical Firestore (default) database is unavailable.',
+        });
+      }
       const persisted = await saveStudentVocabularyToFirestoreServer(canonicalStudentUid, finalItemsToAdd, verifiedStudentEmail);
       if (!persisted) {
         console.error('[serverApp] saveStudentVocabularyToFirestoreServer unconfirmed for canonicalStudentUid:', canonicalStudentUid);
-        return res.status(500).json({
-          error: 'Internal Server Error',
-          message: 'Failed to confirm canonical persistence in Firestore.',
+        const isUnavailable = !getFirestoreDb() || getIsCloudWriteDisabled();
+        return res.status(isUnavailable ? 503 : 500).json({
+          success: false,
+          error: isUnavailable ? 'FirestoreUnavailable' : 'Internal Server Error',
+          code: isUnavailable ? 'FIRESTORE_UNAVAILABLE' : 'FIRESTORE_SAVE_FAILED',
+          message: isUnavailable
+            ? 'Canonical Firestore (default) database is unavailable.'
+            : 'Failed to confirm canonical persistence in Firestore.',
         });
       }
-    } catch (saveErr: any) {
-      console.error('Failed to persist student vocabulary in Firestore:', saveErr);
-      return res.status(500).json({
-        error: 'Internal Server Error',
-        message: 'Failed to persist student vocabulary to canonical Cloud Firestore.',
+    }
+
+    const updatedList = await fetchStudentVocabularyFromFirestoreServer(canonicalStudentUid, verifiedStudentEmail);
+    const remainingExclusions = await fetchExcludedDictionaryWordsServer(canonicalStudentUid);
+
+    return res.json({
+      success: true,
+      studentUid: canonicalStudentUid,
+      studentEmail: verifiedStudentEmail,
+      dictionary: updatedList,
+      excludedWords: remainingExclusions,
+    });
+  } catch (saveErr: any) {
+    console.error('Failed to persist student vocabulary in Firestore:', saveErr);
+    const errMsg = String(saveErr?.message || '').toLowerCase();
+    const isUnavailable =
+      !getFirestoreDb() ||
+      getIsCloudWriteDisabled() ||
+      saveErr?.code === 14 ||
+      saveErr?.code === 'unavailable' ||
+      errMsg.includes('unavailable') ||
+      errMsg.includes('cloud writes are disabled');
+    if (isUnavailable) {
+      return res.status(503).json({
+        success: false,
+        error: 'FirestoreUnavailable',
+        code: 'FIRESTORE_UNAVAILABLE',
+        message: 'Canonical Firestore (default) database is unavailable.',
       });
     }
+    return res.status(500).json({
+      success: false,
+      error: 'Internal Server Error',
+      code: 'FIRESTORE_SAVE_FAILED',
+      message: 'Failed to persist student vocabulary to canonical Cloud Firestore.',
+    });
   }
-
-  const updatedList = await fetchStudentVocabularyFromFirestoreServer(canonicalStudentUid, verifiedStudentEmail);
-  const remainingExclusions = await fetchExcludedDictionaryWordsServer(canonicalStudentUid);
-
-  return res.json({
-    success: true,
-    studentUid: canonicalStudentUid,
-    studentEmail: verifiedStudentEmail,
-    dictionary: updatedList,
-    excludedWords: remainingExclusions,
-  });
 });
 
 // Endpoint: Atomically increment practiceCount & append practiceHistory for practiced words

@@ -179,27 +179,26 @@ export const KNOWN_ADMIN_EMAILS = new Set([
   'admin@itissimple.com',
 ]);
 
-let cachedAdminEmailFromServer: string | null = null;
-let lastAdminCheckTime = 0;
+let cachedServerAdminCheck: { uid: string; isAdmin: boolean; timestamp: number } | null = null;
 
 export function clearAuthClientMemoryCache(): void {
   inMemoryToken = null;
   inMemoryGoogleAccessToken = null;
-  cachedAdminEmailFromServer = null;
-  lastAdminCheckTime = 0;
+  cachedServerAdminCheck = null;
 }
 
 /**
  * Checks whether an authenticated user is an authorized administrator candidate.
- * Combines token claims, email verification, known bootstrap emails, and /api/auth/admin-status.
- * Does not depend exclusively on unhydrated user profile records.
+ * Combines token claims, email verification, known bootstrap emails, and authenticated /api/auth/verify-session.
+ * Does not depend on unhydrated user profile records or public admin PII exposure.
  */
 export async function isAuthorizedAdminUser(user: User | null): Promise<boolean> {
   if (!user) return false;
 
   // 1. If token already carries custom admin claims, user is confirmed administrator
+  let token: string | null = null;
   try {
-    const token = await user.getIdToken();
+    token = await user.getIdToken();
     const claims = parseJwtClaims(token);
     if (claims?.role === 'admin' || claims?.admin === true) {
       return true;
@@ -221,24 +220,33 @@ export async function isAuthorizedAdminUser(user: User | null): Promise<boolean>
     return true;
   }
 
-  // 4. Server-configured administrator email from /api/auth/admin-status
+  // 4. Authenticated server-side role verification via /api/auth/verify-session (no public PII exposure)
   const now = Date.now();
-  if (cachedAdminEmailFromServer && now - lastAdminCheckTime < 60000) {
-    if (cleanEmail === cachedAdminEmailFromServer) {
-      return true;
-    }
-  } else {
+  const uid = user.uid || '';
+  if (
+    uid &&
+    cachedServerAdminCheck &&
+    cachedServerAdminCheck.uid === uid &&
+    now - cachedServerAdminCheck.timestamp < 60000
+  ) {
+    return cachedServerAdminCheck.isAdmin;
+  }
+
+  if (token) {
     try {
-      const res = await fetch('/api/auth/admin-status');
+      const res = await fetch('/api/auth/verify-session', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
       if (res.ok) {
         const data = await res.json();
-        if (data && typeof data.adminEmail === 'string' && data.adminEmail.trim()) {
-          cachedAdminEmailFromServer = data.adminEmail.trim().toLowerCase();
-          lastAdminCheckTime = now;
-          if (cleanEmail === cachedAdminEmailFromServer) {
-            return true;
-          }
+        const isAdmin = data?.role === 'admin';
+        if (uid) {
+          cachedServerAdminCheck = { uid, isAdmin, timestamp: now };
         }
+        return isAdmin;
+      }
+      if (uid) {
+        cachedServerAdminCheck = { uid, isAdmin: false, timestamp: now };
       }
     } catch {}
   }

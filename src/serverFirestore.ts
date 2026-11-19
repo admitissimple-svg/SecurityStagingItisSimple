@@ -1131,14 +1131,8 @@ export async function saveTutorToFirestore(tutor: any, _legacyDocId?: string): P
     const result = await withTimeout(savePromise, 8000);
     return !!result;
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote tutor save restricted by cloud IAM credentials, continuing with local state.');
-      return false;
-    } else {
-      console.warn('Firestore saveTutor error:', err);
-      throw err;
-    }
+    console.warn('Firestore saveTutor error:', err);
+    throw err;
   }
 }
 
@@ -1199,20 +1193,16 @@ export async function fetchTutorsFromFirestore(): Promise<any[]> {
  * Delete a tutor profile from /users/{tutorId} and /tutors/{tutorId}
  */
 export async function deleteTutorFromFirestore(tutorId: string): Promise<boolean> {
+  if (isCloudWriteDisabled) return false;
   const db = getFirestoreDb();
   if (!db || !tutorId) return false;
   try {
-    const delFromUsers = db.collection('users').doc(tutorId).delete().catch(() => null);
-    const delFromTutors = db.collection('tutors').doc(tutorId).delete().catch(() => null);
+    const delFromUsers = db.collection('users').doc(tutorId).delete();
+    const delFromTutors = db.collection('tutors').doc(tutorId).delete();
     const delPromise = Promise.all([delFromUsers, delFromTutors]).then(() => true);
     const result = await withTimeout(delPromise, 6000);
     return !!result;
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote tutor delete restricted by cloud IAM credentials, continuing with local state.');
-      return false;
-    }
     console.warn('Firestore deleteTutor error:', err);
     return false;
   }
@@ -1549,12 +1539,7 @@ export async function saveYouTubePlaylistsToFirestore(playlists: any[]): Promise
     const result = await withTimeout(savePromise, 4000);
     return !!result;
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote YouTube playlists cloud write restricted by environment IAM credentials. Playlists saved to local server storage.');
-    } else {
-      console.warn('Firestore saveYouTubePlaylists error:', err);
-    }
+    console.warn('Firestore saveYouTubePlaylists error:', err);
     return false;
   }
 }
@@ -1566,7 +1551,6 @@ export async function fetchYouTubePlaylistsDocFromFirestore(): Promise<{
   updatedAt?: string;
   lastSyncSuccess?: string;
 } | null> {
-  if (isCloudWriteDisabled) return null;
   const db = getFirestoreDb();
   if (!db) return null;
   try {
@@ -1588,11 +1572,6 @@ export async function fetchYouTubePlaylistsDocFromFirestore(): Promise<{
     };
     return await withTimeout(fetchPromise(), 4000);
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote YouTube playlists access restricted by cloud IAM credentials, continuing with local state.');
-      return null;
-    }
     console.warn('Firestore fetchYouTubePlaylistsDoc error:', err);
     return null;
   }
@@ -1619,9 +1598,7 @@ export async function saveYouTubeAuthToFirestore(authData: { token: string; upda
     const result = await withTimeout(savePromise, 3000);
     return !!result;
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-    }
+    console.warn('Firestore saveYouTubeAuthToFirestore error:', err);
     return false;
   }
 }
@@ -1738,12 +1715,7 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
     const result = await withTimeout(savePromises, 15000);
     return !!result;
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote app_state cloud write restricted by environment IAM credentials. App state safely preserved in local disk storage.');
-    } else {
-      console.warn('Firestore saveAppState error:', err);
-    }
+    console.warn('Firestore saveAppState error:', err);
     return false;
   }
 }
@@ -1791,12 +1763,7 @@ export async function saveUserToFirestore(user: any): Promise<boolean> {
     const result = await withTimeout(savePromise.then(() => true), 10000);
     return !!result;
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote user cloud save restricted by environment IAM credentials, continuing with local state.');
-    } else {
-      console.warn('Firestore saveUser error:', err);
-    }
+    console.warn('Firestore saveUser error:', err);
     return false;
   }
 }
@@ -2021,12 +1988,7 @@ export async function saveStudentAssignmentsByUid(
     const result = await withTimeout(savePromise, 2000);
     return !!result;
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote student assignments write restricted by IAM, continuing with local state.');
-    } else {
-      console.warn('Firestore saveStudentAssignmentsByUid error:', err);
-    }
+    console.warn('Firestore saveStudentAssignmentsByUid error:', err);
     return false;
   }
 }
@@ -2091,12 +2053,7 @@ export async function saveTeacherAvailabilityToFirestore(
     const result = await withTimeout(savePromise, 2000);
     return !!result;
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote teacher availability write restricted by IAM, continuing with local state.');
-    } else {
-      console.warn('Firestore saveTeacherAvailabilityToFirestore error:', err);
-    }
+    console.warn('Firestore saveTeacherAvailabilityToFirestore error:', err);
     return false;
   }
 }
@@ -2292,12 +2249,7 @@ export async function saveRoutineVideoSubcollection(
 
     return Boolean(saveResult && rootResult);
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote routine video write restricted by IAM, continuing with local state.');
-    } else {
-      console.warn('Firestore saveRoutineVideoSubcollection error:', err);
-    }
+    console.warn('Firestore saveRoutineVideoSubcollection error:', err);
     return false;
   }
 }
@@ -2742,11 +2694,7 @@ export async function saveStudentRoutineDayFieldsServer(
 
     return { success: true, activeCycle };
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-    } else {
-      console.warn('[serverFirestore] saveStudentRoutineDayFieldsServer error:', err);
-    }
+    console.warn('[serverFirestore] saveStudentRoutineDayFieldsServer error:', err);
     return { success: false, activeCycle: 1, error: err?.message || 'Firestore write failed', code: 'WRITE_FAILED' };
   }
 }
@@ -2771,12 +2719,7 @@ export async function saveStudentAssignmentsCanonicalServer(
     const result = await withTimeout(savePromise, 4500);
     return Boolean(result);
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote student assignments write restricted by IAM.');
-    } else {
-      console.warn('[serverFirestore] saveStudentAssignmentsCanonicalServer error:', err);
-    }
+    console.warn('[serverFirestore] saveStudentAssignmentsCanonicalServer error:', err);
     return false;
   }
 }
@@ -2859,11 +2802,7 @@ export async function addWatchedVideoCanonicalServer(
 
     return { success: true, watchedVideos: mergedWatchedIds };
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-    } else {
-      console.warn('[serverFirestore] addWatchedVideoCanonicalServer error:', err);
-    }
+    console.warn('[serverFirestore] addWatchedVideoCanonicalServer error:', err);
     return { success: false, watchedVideos: [], error: err?.message || 'Firestore write failed' };
   }
 }
@@ -2964,11 +2903,7 @@ export async function addListenedTrackCanonicalServer(
       alreadyRecorded: alreadyInHistory && alreadyInAssign,
     };
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-    } else {
-      console.warn('[serverFirestore] addListenedTrackCanonicalServer error:', err);
-    }
+    console.warn('[serverFirestore] addListenedTrackCanonicalServer error:', err);
     return { success: false, listenedTracks: [], error: err?.message || 'Firestore write failed' };
   }
 }
@@ -3194,11 +3129,7 @@ export async function saveStudentCurrentRoutineServer(
 
     return { success: true, routine: payload, activeCycle };
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-    } else {
-      console.warn('[serverFirestore] saveStudentCurrentRoutineServer error:', err);
-    }
+    console.warn('[serverFirestore] saveStudentCurrentRoutineServer error:', err);
     return { success: false, activeCycle: 1, error: err?.message || 'Firestore write failed', code: 'WRITE_FAILED' };
   }
 }
@@ -3296,11 +3227,7 @@ export async function saveCurrentRoutineFeedbackServer(
 
     return { success: true, routine: payload, activeCycle };
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-    } else {
-      console.warn('[serverFirestore] saveCurrentRoutineFeedbackServer error:', err);
-    }
+    console.warn('[serverFirestore] saveCurrentRoutineFeedbackServer error:', err);
     return { success: false, activeCycle: 1, error: err?.message || 'Firestore write failed', code: 'WRITE_FAILED' };
   }
 }
@@ -3382,11 +3309,7 @@ export async function saveTeacherSpotifyOverrideServer(
 
     return { success: true, activeCycle };
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-    } else {
-      console.warn('[serverFirestore] saveTeacherSpotifyOverrideServer error:', err);
-    }
+    console.warn('[serverFirestore] saveTeacherSpotifyOverrideServer error:', err);
     return { success: false, activeCycle: 1, error: err?.message || 'Firestore write failed', code: 'WRITE_FAILED' };
   }
 }
@@ -3742,11 +3665,7 @@ export async function resetDailyRoutinesForNewWeekInFirestoreServer(
 
     return Boolean(rootRes);
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-    } else {
-      console.warn('[serverFirestore] Error in resetDailyRoutinesForNewWeekInFirestoreServer:', err);
-    }
+    console.warn('[serverFirestore] Error in resetDailyRoutinesForNewWeekInFirestoreServer:', err);
     return false;
   }
 }
@@ -3772,12 +3691,7 @@ export async function resetRepeatFlagsSubcollection(
     );
     return true;
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote repeat flags reset restricted by IAM, continuing with local state.');
-    } else {
-      console.warn('Firestore resetRepeatFlagsSubcollection error:', err);
-    }
+    console.warn('Firestore resetRepeatFlagsSubcollection error:', err);
     return false;
   }
 }
@@ -3820,12 +3734,7 @@ export async function addWatchedVideoToUserDoc(
     }
     return true;
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote watched video append restricted by IAM, continuing with local state.');
-    } else {
-      console.warn('Firestore addWatchedVideoToUserDoc error:', err);
-    }
+    console.warn('Firestore addWatchedVideoToUserDoc error:', err);
     return false;
   }
 }
@@ -4943,14 +4852,8 @@ export async function saveStudentVocabularyToFirestoreServer(
 
     return true;
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote vocabulary save restricted by IAM, continuing with local state.');
-      return false;
-    } else {
-      console.warn('Firestore server vocabulary save notice:', err);
-      throw err;
-    }
+    console.warn('Firestore server vocabulary save notice:', err);
+    throw err;
   }
 }
 
@@ -5052,10 +4955,6 @@ export async function fetchStudentVocabularyFromFirestoreServer(
       })
       .sort((a, b) => (a.word || '').localeCompare(b.word || ''));
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      return [];
-    }
     console.warn('fetchStudentVocabularyFromFirestoreServer error:', err);
     return [];
   }
@@ -5087,10 +4986,6 @@ export async function fetchExcludedDictionaryWordsServer(
     }
     return [];
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      return [];
-    }
     console.warn('fetchExcludedDictionaryWordsServer error:', err);
     return [];
   }
@@ -5119,9 +5014,13 @@ export async function addExcludedDictionaryWordsServer(
     return fetchExcludedDictionaryWordsServer(canonicalStudentUid);
   }
 
+  if (isCloudWriteDisabled) {
+    throw new Error('[addExcludedDictionaryWordsServer] Firestore cloud writes are disabled.');
+  }
+
   const db = getFirestoreDb();
   if (!db) {
-    return normalizedWords;
+    throw new Error('[addExcludedDictionaryWordsServer] Canonical Firestore database (default) is unavailable.');
   }
 
   try {
@@ -5167,11 +5066,6 @@ export async function addExcludedDictionaryWordsServer(
 
     return fetchExcludedDictionaryWordsServer(canonicalStudentUid);
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote exclusion save restricted by IAM, continuing with local state.');
-      return normalizedWords;
-    }
     console.warn('Firestore server addExcludedDictionaryWordsServer error:', err);
     throw err;
   }
@@ -5198,8 +5092,14 @@ export async function removeExcludedDictionaryWordsServer(
     return fetchExcludedDictionaryWordsServer(canonicalStudentUid);
   }
 
+  if (isCloudWriteDisabled) {
+    throw new Error('[removeExcludedDictionaryWordsServer] Firestore cloud writes are disabled.');
+  }
+
   const db = getFirestoreDb();
-  if (!db) return [];
+  if (!db) {
+    throw new Error('[removeExcludedDictionaryWordsServer] Canonical Firestore database (default) is unavailable.');
+  }
 
   try {
     const userDocRef = db.collection('users').doc(canonicalStudentUid);
@@ -5246,11 +5146,6 @@ export async function removeExcludedDictionaryWordsServer(
 
     return fetchExcludedDictionaryWordsServer(canonicalStudentUid);
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote exclusion removal restricted by IAM, continuing with local state.');
-      return [];
-    }
     console.warn('Firestore server removeExcludedDictionaryWordsServer error:', err);
     throw err;
   }
@@ -5274,6 +5169,9 @@ export async function markVocabularyWordsPracticedServer(
     );
   }
 
+  if (isCloudWriteDisabled) {
+    return { ok: false, updatedCount: 0, dictionary: [] };
+  }
   const db = getFirestoreDb();
   if (!db) {
     return { ok: false, updatedCount: 0, dictionary: [] };
@@ -5383,7 +5281,6 @@ export async function markVocabularyWordsPracticedServer(
     return { ok: true, updatedCount, dictionary };
   } catch (err: any) {
     if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
       return { ok: false, updatedCount: 0, dictionary: [] };
     }
     console.warn('Firestore server markVocabularyWordsPracticedServer error:', err);
@@ -5711,12 +5608,7 @@ export async function saveSessionNotesToFirestoreServer(
 
     return true;
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote session notes save restricted by IAM.');
-    } else {
-      console.warn('Firestore server session notes save notice:', err);
-    }
+    console.warn('Firestore server session notes save notice:', err);
     return false;
   }
 }
@@ -6377,12 +6269,7 @@ export async function saveSessionNotesProgressToFirestore(key: string, cyclePayl
     await subRef.set(sanitized, { merge: true });
     return true;
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote session notes progress save restricted by IAM.');
-    } else {
-      console.warn('Firestore saveSessionNotesProgress error:', err);
-    }
+    console.warn('Firestore saveSessionNotesProgress error:', err);
     return false;
   }
 }
@@ -6400,74 +6287,79 @@ export async function recordDailyReminderShownServer(
     return { canShow: false, alreadyShown: true, lastReminderShownDate: todayInTz };
   }
 
+  if (isCloudWriteDisabled) {
+    throw new Error('[recordDailyReminderShownServer] Firestore cloud writes are disabled.');
+  }
+
   const cleanUid = studentUid.trim();
   const db = getFirestoreDb();
-  if (db && !isCloudWriteDisabled) {
-    try {
-      const userRef = db.collection('users').doc(cleanUid);
-      const subRef = userRef.collection('session_notes').doc('review_cycle');
+  if (!db) {
+    throw new Error('[recordDailyReminderShownServer] Canonical Firestore database (default) is unavailable.');
+  }
 
-      if (typeof (db as any).runTransaction === 'function') {
-        const result = await (db as any).runTransaction(async (tx: any) => {
-          const snap = await tx.get(subRef);
-          let lastDate = '';
-          if (snap && snap.exists) {
-            const data = snap.data() || {};
-            lastDate = data.lastReminderShownDate || '';
-          } else {
-            // Read-only legacy fallback from root user doc
-            const uSnap = await tx.get(userRef);
-            if (uSnap && uSnap.exists) {
-              const uData = uSnap.data() || {};
-              lastDate = uData.nativeNotesReview?.lastReminderShownDate || uData.lastReminderShownDate || '';
-            }
-          }
+  try {
+    const userRef = db.collection('users').doc(cleanUid);
+    const subRef = userRef.collection('session_notes').doc('review_cycle');
 
-          if (lastDate === todayInTz) {
-            return { canShow: false, alreadyShown: true, lastReminderShownDate: lastDate };
-          }
-
-          const nowIso = new Date().toISOString();
-          tx.set(
-            subRef,
-            {
-              lastReminderShownDate: todayInTz,
-              reminderShownAt: nowIso,
-              updatedAt: nowIso,
-            },
-            { merge: true }
-          );
-
-          return { canShow: true, alreadyShown: false, lastReminderShownDate: todayInTz };
-        });
-        return result;
-      } else {
-        // Mock / non-transactional fallback
-        const snap = await subRef.get();
-        let lastDate = snap && snap.exists ? (snap.data()?.lastReminderShownDate || '') : '';
-        if (!lastDate && !(snap && snap.exists)) {
-          const uSnap = await userRef.get();
+    if (typeof (db as any).runTransaction === 'function') {
+      const result = await (db as any).runTransaction(async (tx: any) => {
+        const snap = await tx.get(subRef);
+        let lastDate = '';
+        if (snap && snap.exists) {
+          const data = snap.data() || {};
+          lastDate = data.lastReminderShownDate || '';
+        } else {
+          // Read-only legacy fallback from root user doc
+          const uSnap = await tx.get(userRef);
           if (uSnap && uSnap.exists) {
             const uData = uSnap.data() || {};
             lastDate = uData.nativeNotesReview?.lastReminderShownDate || uData.lastReminderShownDate || '';
           }
         }
+
         if (lastDate === todayInTz) {
           return { canShow: false, alreadyShown: true, lastReminderShownDate: lastDate };
         }
+
         const nowIso = new Date().toISOString();
-        await subRef.set(
-          { lastReminderShownDate: todayInTz, reminderShownAt: nowIso, updatedAt: nowIso },
+        tx.set(
+          subRef,
+          {
+            lastReminderShownDate: todayInTz,
+            reminderShownAt: nowIso,
+            updatedAt: nowIso,
+          },
           { merge: true }
         );
-        return { canShow: true, alreadyShown: false, lastReminderShownDate: todayInTz };
-      }
-    } catch (err) {
-      console.warn('Firestore recordDailyReminderShownServer notice:', err);
-    }
-  }
 
-  return { canShow: true, alreadyShown: false, lastReminderShownDate: todayInTz };
+        return { canShow: true, alreadyShown: false, lastReminderShownDate: todayInTz };
+      });
+      return result;
+    } else {
+      // Mock / non-transactional fallback
+      const snap = await subRef.get();
+      let lastDate = snap && snap.exists ? (snap.data()?.lastReminderShownDate || '') : '';
+      if (!lastDate && !(snap && snap.exists)) {
+        const uSnap = await userRef.get();
+        if (uSnap && uSnap.exists) {
+          const uData = uSnap.data() || {};
+          lastDate = uData.nativeNotesReview?.lastReminderShownDate || uData.lastReminderShownDate || '';
+        }
+      }
+      if (lastDate === todayInTz) {
+        return { canShow: false, alreadyShown: true, lastReminderShownDate: lastDate };
+      }
+      const nowIso = new Date().toISOString();
+      await subRef.set(
+        { lastReminderShownDate: todayInTz, reminderShownAt: nowIso, updatedAt: nowIso },
+        { merge: true }
+      );
+      return { canShow: true, alreadyShown: false, lastReminderShownDate: todayInTz };
+    }
+  } catch (err) {
+    console.warn('Firestore recordDailyReminderShownServer error:', err);
+    throw err;
+  }
 }
 
 /**
@@ -6547,10 +6439,6 @@ export async function savePedagogicalTransformationToFirestoreServer(
     );
     return true;
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      return false;
-    }
     console.warn('Firestore savePedagogicalTransformation error:', err);
     return false;
   }
@@ -6713,20 +6601,20 @@ export async function recordLessonReviewInStudentJournalServer(params: {
   const sanitized = removeUndefinedFields(journalEntry);
 
   const db = getFirestoreDb();
-  if (db && !isCloudWriteDisabled) {
-    try {
-      const userRef = db.collection('users').doc(cleanUid);
-      const subDocRef = userRef.collection('journal').doc(entryId);
-      // ARCH.2F.2A: Persist exclusively in users/{studentUid}/journal/{entryId} (no root array mirror)
-      await subDocRef.set(sanitized, { merge: true });
-    } catch (fsErr) {
-      if (!isPermissionError(fsErr)) {
-        console.warn('Firestore recordLessonReviewInStudentJournal notice:', fsErr);
-      }
-    }
+  if (!db || isCloudWriteDisabled) {
+    return { success: false };
   }
 
-  return { success: true, entry: sanitized };
+  try {
+    const userRef = db.collection('users').doc(cleanUid);
+    const subDocRef = userRef.collection('journal').doc(entryId);
+    // ARCH.2F.2A: Persist exclusively in users/{studentUid}/journal/{entryId} (no root array mirror)
+    await subDocRef.set(sanitized, { merge: true });
+    return { success: true, entry: sanitized };
+  } catch (fsErr) {
+    console.warn('Firestore recordLessonReviewInStudentJournal error:', fsErr);
+    return { success: false };
+  }
 }
 
 function sanitizeJournalDocId(rawId: string): string {
@@ -6778,7 +6666,6 @@ export async function saveStudentDailyJournalEntryServer(
     return { ok: true, entry: cleanEntry };
   } catch (err: any) {
     if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
       return { ok: false, statusCode: 500, error: 'Firestore write restricted by IAM credentials.' };
     }
     console.warn('[serverFirestore] saveStudentDailyJournalEntryServer error:', err);
@@ -6862,7 +6749,6 @@ export async function fetchStudentActivityJournalFromServerFirestore(
     return { ok: true, entries };
   } catch (err: any) {
     if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
       return { ok: false, entries: [], statusCode: 500, error: 'Firestore read restricted by IAM.' };
     }
     console.warn('[serverFirestore] fetchStudentActivityJournalFromServerFirestore error:', err);
@@ -6982,7 +6868,6 @@ export async function upsertStudentActivityJournalEntryServer(
     };
   } catch (err: any) {
     if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
       return { ok: false, statusCode: 500, error: 'Firestore writes disabled by IAM credentials.' };
     }
     console.warn('[serverFirestore] upsertStudentActivityJournalEntryServer error:', err);
@@ -7113,7 +6998,6 @@ export async function deleteStudentActivityJournalEntryServer(
     };
   } catch (err: any) {
     if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
       return { ok: false, statusCode: 500, error: 'Firestore delete restricted by IAM credentials.' };
     }
     console.warn('[serverFirestore] deleteStudentActivityJournalEntryServer error:', err);
@@ -7125,7 +7009,7 @@ export async function deleteStudentActivityJournalEntryServer(
  * Legacy helper retained only for backwards export compatibility (no-op mirror avoided).
  */
 export async function saveStudentJournalToFirestore(_docId: string, _journal: any[]): Promise<boolean> {
-  return true;
+  return false;
 }
 
 /**
@@ -7328,10 +7212,6 @@ export async function fetchStudentDailyJournalFromServerFirestore(docId: string)
     });
     return list;
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      return [];
-    }
     console.warn('fetchStudentDailyJournalFromServerFirestore error:', err);
     return [];
   }
@@ -7344,6 +7224,7 @@ export async function deleteStudentJournalEntryFromServerFirestore(
   studentUid: string,
   entryId: string
 ): Promise<boolean> {
+  if (isCloudWriteDisabled) return false;
   const db = getFirestoreDb();
   if (!db || !studentUid || !entryId) return false;
   try {
@@ -7371,10 +7252,6 @@ export async function deleteStudentJournalEntryFromServerFirestore(
     }
     return true;
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      return false;
-    }
     console.warn('deleteStudentJournalEntryFromServerFirestore error:', err);
     return false;
   }
@@ -7454,12 +7331,7 @@ export async function saveWeeklyChecksToFirestore(
     await Promise.all(writes);
     return true;
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote weekly checks save restricted by IAM, continuing with local state.');
-    } else {
-      console.warn('Firestore saveWeeklyChecks error:', err);
-    }
+    console.warn('Firestore saveWeeklyChecks error:', err);
     return false;
   }
 }
@@ -7719,12 +7591,7 @@ export async function saveHomeworkToFirestore(
       .set(sanitized, { merge: true });
     return true;
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-      console.info('[serverFirestore] Remote homework save restricted by IAM, continuing with local state.');
-    } else {
-      console.warn('Firestore saveHomework error:', err);
-    }
+    console.warn('Firestore saveHomework error:', err);
     return false;
   }
 }
@@ -7984,9 +7851,6 @@ export async function saveCanonicalWeeklyChecksServer(params: {
           : DEFAULT_STUDY_DAYS),
     };
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-    }
     console.warn('[serverFirestore] saveCanonicalWeeklyChecksServer error:', err);
     return {
       ok: false,
@@ -8080,9 +7944,6 @@ export async function saveCanonicalHomeworkServer(params: {
       weeklyHomework: finalPayload,
     };
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      isCloudWriteDisabled = true;
-    }
     console.warn('[serverFirestore] saveCanonicalHomeworkServer error:', err);
     return {
       ok: false,
@@ -10562,29 +10423,26 @@ export async function fetchLessonInsightsFromFirestoreServer(lessonId: string): 
   if (!cleanId) return null;
 
   const db = getFirestoreDb();
-  if (db && !isCloudWriteDisabled) {
-    try {
-      const snap = await db.collection('lesson_insights').doc(cleanId).get();
-      if (snap.exists) {
-        const data = { id: snap.id, ...snap.data() };
-        if (localInsightsMap.size >= MAX_LOCAL_INSIGHTS_CACHE) {
-          const oldestKey = localInsightsMap.keys().next().value;
-          if (oldestKey) localInsightsMap.delete(oldestKey);
-        }
-        localInsightsMap.set(cleanId, data);
-        return data;
-      }
-      // Canonical Firestore confirms document does not exist: evict any stale local cache
-      localInsightsMap.delete(cleanId);
-      return null;
-    } catch (err: any) {
-      if (!isPermissionError(err)) {
-        console.warn('[serverFirestore] fetchLessonInsights notice:', err);
-      }
-    }
-  }
+  if (!db) return null;
 
-  return localInsightsMap.get(cleanId) || null;
+  try {
+    const snap = await db.collection('lesson_insights').doc(cleanId).get();
+    if (snap.exists) {
+      const data = { id: snap.id, ...snap.data() };
+      if (localInsightsMap.size >= MAX_LOCAL_INSIGHTS_CACHE) {
+        const oldestKey = localInsightsMap.keys().next().value;
+        if (oldestKey) localInsightsMap.delete(oldestKey);
+      }
+      localInsightsMap.set(cleanId, data);
+      return data;
+    }
+    // Canonical Firestore confirms document does not exist: evict any stale local cache
+    localInsightsMap.delete(cleanId);
+    return null;
+  } catch (err: any) {
+    console.warn('[serverFirestore] fetchLessonInsights error:', err);
+    return null;
+  }
 }
 
 /**
@@ -10594,31 +10452,28 @@ export async function saveLessonInsightsToFirestoreServer(lessonId: string, data
   const cleanId = (lessonId || '').trim();
   if (!cleanId) return false;
 
+  if (isCloudWriteDisabled) {
+    throw new Error('[saveLessonInsightsToFirestoreServer] Firestore cloud writes are disabled.');
+  }
+
+  const db = getFirestoreDb();
+  if (!db) {
+    throw new Error('[saveLessonInsightsToFirestoreServer] Canonical Firestore database (default) is unavailable.');
+  }
+
   const payload = removeUndefinedFields({
     ...data,
     lessonId: cleanId,
     updatedAt: new Date().toISOString(),
   });
+
+  await db.collection('lesson_insights').doc(cleanId).set(payload, { merge: true });
+
   if (localInsightsMap.size >= MAX_LOCAL_INSIGHTS_CACHE) {
     const oldestKey = localInsightsMap.keys().next().value;
     if (oldestKey) localInsightsMap.delete(oldestKey);
   }
   localInsightsMap.set(cleanId, payload);
-
-  const db = getFirestoreDb();
-  if (db && !isCloudWriteDisabled) {
-    try {
-      await db.collection('lesson_insights').doc(cleanId).set(payload, { merge: true });
-      return true;
-    } catch (err: any) {
-      if (isPermissionError(err)) {
-        isCloudWriteDisabled = true;
-      } else {
-        console.warn('[serverFirestore] saveLessonInsights notice:', err);
-      }
-    }
-  }
-
   return true;
 }
 
@@ -11396,10 +11251,7 @@ export async function saveLastCycleResultToFirestore(
       4500
     );
     return Boolean(ok);
-  } catch (err: any) {
-    if (isPermissionError(err)) {
-      setIsCloudWriteDisabled(true);
-    }
+  } catch (_err: any) {
     return false;
   }
 }
@@ -11620,9 +11472,6 @@ export async function saveWeeklyHistoryServer(
     }
     return { ok: true, data: payload };
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      setIsCloudWriteDisabled(true);
-    }
     console.warn('[serverFirestore] saveWeeklyHistoryServer error:', err);
     return { ok: false, statusCode: 500, error: err?.message || 'Firestore write failed.' };
   }
@@ -12225,9 +12074,6 @@ export async function closeWeeklyHistorySnapshotServer(params: {
 
     return { ok: true, history: saveRes.data };
   } catch (err: any) {
-    if (isPermissionError(err)) {
-      setIsCloudWriteDisabled(true);
-    }
     console.warn('[serverFirestore] closeWeeklyHistorySnapshotServer error:', err);
     return { ok: false, statusCode: 500, error: err?.message || 'Failed to close weekly history snapshot.' };
   }
@@ -12369,9 +12215,6 @@ export async function advanceWeeklyCycleTransactionServer(
   } catch (err: any) {
     if (err instanceof CycleConflictError) {
       return { success: false, conflict: true, persistedCycle: err.actualCycle, statusCode: 409 };
-    }
-    if (isPermissionError(err)) {
-      setIsCloudWriteDisabled(true);
     }
     console.warn('[serverFirestore] advanceWeeklyCycleTransactionServer error:', err);
     return {
@@ -13050,9 +12893,6 @@ export async function prepareNewWeeklyCycleServer(params: {
       console.warn('[serverFirestore] prepareNewWeeklyCycleServer fenced:', err.message);
       return { ok: false, statusCode: err.statusCode, code: err.code, error: err.message };
     }
-    if (isPermissionError(err)) {
-      setIsCloudWriteDisabled(true);
-    }
 
     // Best-effort lease release ONLY if we still hold the fencingToken, preserving pending_preparation
     if (acquiredFencingToken !== null) {
@@ -13460,76 +13300,67 @@ export async function approveAndSaveTutorCommissionTransactionally(params: {
     return JSON.parse(JSON.stringify(mergedRaw));
   };
 
+  if (isCloudWriteDisabled) {
+    return {
+      ok: false,
+      status: 500,
+      code: 'CLOUD_WRITE_DISABLED',
+      error: 'Firestore cloud writes are disabled.',
+    };
+  }
+
   const db = getFirestoreDb();
+  if (!db) {
+    return {
+      ok: false,
+      status: 503,
+      code: 'FIRESTORE_UNAVAILABLE',
+      error: 'Serviço de persistência Firestore (default) indisponível.',
+    };
+  }
 
-  if (db && !isCloudWriteDisabled) {
-    const tutorRef = db.collection('tutors').doc(canonicalUid);
-    const userRef = db.collection('users').doc(canonicalUid);
+  const tutorRef = db.collection('tutors').doc(canonicalUid);
+  const userRef = db.collection('users').doc(canonicalUid);
 
-    try {
-      if (typeof (db as any).runTransaction === 'function') {
-        const committed = await (db as any).runTransaction(async (tx: any) => {
-          const [tSnap, uSnap] = await Promise.all([
-            tx.get(tutorRef),
-            tx.get(userRef),
-          ]);
-          const tData = tSnap && tSnap.exists ? tSnap.data() : null;
-          const uData = uSnap && uSnap.exists ? uSnap.data() : null;
-
-          const sanitized = buildSanitizedFinalRecord(tData, uData);
-
-          tx.set(tutorRef, sanitized, { merge: true });
-          if (sanitized.isApproved === true || (uData && uData.role === 'teacher')) {
-            tx.set(userRef, sanitized, { merge: true });
-          }
-
-          return sanitized;
-        });
-
-        return { ok: true, savedTutor: committed };
-      } else {
-        // Fallback for simplified test mocks without runTransaction
+  try {
+    if (typeof (db as any).runTransaction === 'function') {
+      const committed = await (db as any).runTransaction(async (tx: any) => {
         const [tSnap, uSnap] = await Promise.all([
-          tutorRef.get().catch(() => null),
-          userRef.get().catch(() => null),
+          tx.get(tutorRef),
+          tx.get(userRef),
         ]);
         const tData = tSnap && tSnap.exists ? tSnap.data() : null;
         const uData = uSnap && uSnap.exists ? uSnap.data() : null;
 
         const sanitized = buildSanitizedFinalRecord(tData, uData);
 
-        await tutorRef.set(sanitized, { merge: true });
+        tx.set(tutorRef, sanitized, { merge: true });
         if (sanitized.isApproved === true || (uData && uData.role === 'teacher')) {
-          await userRef.set(sanitized, { merge: true });
+          tx.set(userRef, sanitized, { merge: true });
         }
 
-        return { ok: true, savedTutor: sanitized };
-      }
-    } catch (err: any) {
-      if (err instanceof CommissionTransactionError) {
-        return {
-          ok: false,
-          status: err.statusCode,
-          code: err.code,
-          error: err.message,
-        };
+        return sanitized;
+      });
+
+      return { ok: true, savedTutor: committed };
+    } else {
+      // Fallback for simplified test mocks without runTransaction
+      const [tSnap, uSnap] = await Promise.all([
+        tutorRef.get().catch(() => null),
+        userRef.get().catch(() => null),
+      ]);
+      const tData = tSnap && tSnap.exists ? tSnap.data() : null;
+      const uData = uSnap && uSnap.exists ? uSnap.data() : null;
+
+      const sanitized = buildSanitizedFinalRecord(tData, uData);
+
+      await tutorRef.set(sanitized, { merge: true });
+      if (sanitized.isApproved === true || (uData && uData.role === 'teacher')) {
+        await userRef.set(sanitized, { merge: true });
       }
 
-      const msg = String(err?.message || err || 'Erro ao persistir comissão no Firestore.');
-      console.error('[approveAndSaveTutorCommissionTransactionally] Firestore transaction failed:', msg);
-      return {
-        ok: false,
-        status: isPermissionError(err) ? 403 : 500,
-        code: 'FIRESTORE_TRANSACTION_FAILED',
-        error: `Falha ao persistir comissão e aprovação no Firestore: ${msg}`,
-      };
+      return { ok: true, savedTutor: sanitized };
     }
-  }
-
-  // Fallback when Firestore client is unavailable (only validates strictly, never bypasses validation)
-  try {
-    const sanitized = buildSanitizedFinalRecord(baseTutor, null);
-    return { ok: true, savedTutor: sanitized };
   } catch (err: any) {
     if (err instanceof CommissionTransactionError) {
       return {
@@ -13539,11 +13370,14 @@ export async function approveAndSaveTutorCommissionTransactionally(params: {
         error: err.message,
       };
     }
+
+    const msg = String(err?.message || err || 'Erro ao persistir comissão no Firestore.');
+    console.error('[approveAndSaveTutorCommissionTransactionally] Firestore transaction failed:', msg);
     return {
       ok: false,
       status: 500,
-      code: 'COMMISSION_PERSISTENCE_ERROR',
-      error: err?.message || 'Erro ao processar comissão do Native Friend.',
+      code: 'FIRESTORE_TRANSACTION_FAILED',
+      error: `Falha ao persistir comissão e aprovação no Firestore: ${msg}`,
     };
   }
 }

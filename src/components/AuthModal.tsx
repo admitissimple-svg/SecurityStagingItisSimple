@@ -263,7 +263,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
   // Admin status check state
   const [hasExistingAdmin, setHasExistingAdmin] = useState(false);
-  const [adminEmail, setAdminEmail] = useState('');
 
   const [errorMsg, setErrorMsg] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
@@ -382,7 +381,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         .then((data) => {
           if (data) {
             setHasExistingAdmin(!!data.hasAdmin);
-            setAdminEmail(data.adminEmail || '');
           }
         })
         .catch(() => {});
@@ -1022,11 +1020,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                     ? 'The platform permits only 1 Administrator account. If you are the administrator, please log in with your administrator email and password.'
                     : 'A plataforma permite apenas 1 único cadastro de Administrador. Se você é o administrador, por favor efetue seu login com e-mail e senha.'}
                 </p>
-                {adminEmail && (
-                  <p className="text-[10px] text-amber-700 mt-1 font-mono">
-                    Admin: {adminEmail}
-                  </p>
-                )}
               </div>
             </div>
             <button
