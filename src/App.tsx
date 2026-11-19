@@ -869,7 +869,7 @@ export default function App() {
         }
 
         const [routinesRes, studentsRes, settingsRes, landingRes, tutorsRes] = await Promise.all([
-          fetch('/api/routines').catch(() => null),
+          tutorToken ? fetch('/api/routines', { headers: tutorHeaders }).catch(() => null) : Promise.resolve(null),
           fetch('/api/students', { headers: tutorHeaders }).catch(() => null),
           tutorToken ? fetch('/api/teacher-settings', { headers: tutorHeaders }).catch(() => null) : Promise.resolve(null),
           fetch('/api/landing-content').catch(() => null),
@@ -878,7 +878,15 @@ export default function App() {
 
         if (routinesRes && routinesRes.ok) {
           const data = await routinesRes.json();
-          if (data && typeof data === 'object' && Object.keys(data).length > 0) {
+          if (
+            !isCancelled &&
+            Boolean(initialAuthUid) &&
+            (auth.currentUser?.uid || null) === initialAuthUid &&
+            activeRoutinesHydrationUidRef.current !== initialAuthUid &&
+            data &&
+            typeof data === 'object' &&
+            Object.keys(data).length > 0
+          ) {
             setRoutinesByDay(data);
           }
         }

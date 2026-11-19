@@ -21993,31 +21993,780 @@ app.delete('/api/chat-messages', firebaseAuthMiddleware, async (req, res) => {
   }
 });
 
-// 7. Routines Endpoints
-app.get('/api/routines', (req, res) => {
-  const db = readDb();
-  if (Object.keys(db.routinesByDay || {}).length === 0) {
-    return res.json({});
+// 7. Routines Endpoints (SEC.FIX.6: Authenticated Firebase + Canonical RBAC & Ownership/Link Authorization)
+const routinePostUpdatedAtMap = new Map<string, number>();
+
+function extractSanitizedRoutinesPayload(body: any): Record<string, any[]> | null {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const candidate =
+    body.routinesByDay && typeof body.routinesByDay === 'object' && !Array.isArray(body.routinesByDay)
+      ? body.routinesByDay
+      : body;
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
+
+  const sanitized: Record<string, any[]> = {};
+  let hasValidDay = false;
+  for (const day of DAYS_SEQUENCE) {
+    if (Object.prototype.hasOwnProperty.call(candidate, day)) {
+      if (!Array.isArray(candidate[day])) {
+        return null;
+      }
+      sanitized[day] = JSON.parse(JSON.stringify(candidate[day]));
+      hasValidDay = true;
+    }
   }
-  res.json(db.routinesByDay);
+  return hasValidDay ? sanitized : null;
+}
+
+async function authorizeRoutinesCaller(
+  req: express.Request,
+  res: express.Response
+): Promise<{
+  callerUid: string;
+  callerEmail: string;
+  isAdmin: boolean;
+  isApprovedTeacher: boolean;
+  isStudent: boolean;
+  callerIdentity: Awaited<ReturnType<typeof resolveCanonicalUserRoleAndIdentity>>;
+  db: AppDb;
+} | null> {
+  const caller = req.user;
+  if (!caller || !caller.uid || !isValidCanonicalUid(caller.uid)) {
+    res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Authentication required: verified Firebase ID token missing or invalid.',
+    });
+    return null;
+  }
+
+  const db = readDb();
+  const callerUid = caller.uid.trim();
+  const callerEmail = (caller.email || '').toLowerCase().trim();
+
+  const callerIdentity = await resolveCanonicalUserRoleAndIdentity({
+    uid: callerUid,
+    email: callerEmail,
+    tokenRole: caller.role,
+    dbState: db,
+  });
+
+  if (callerIdentity.role === 'conflict' || callerIdentity.approvalStatus === 'rejected') {
+    res.status(403).json({
+      error: 'Forbidden',
+      message: callerIdentity.message || 'Access denied: account identity conflict or rejected status.',
+    });
+    return null;
+  }
+
+  if (callerIdentity.role === 'pending_teacher') {
+    res.status(403).json({
+      error: 'Forbidden',
+      message: 'Access denied: Native Friend application is pending administrator approval.',
+    });
+    return null;
+  }
+
+  if (callerIdentity.role === 'unregistered') {
+    res.status(403).json({
+      error: 'Forbidden',
+      message: 'Access denied: account is not registered in the canonical user directory.',
+    });
+    return null;
+  }
+
+  const isAdmin = caller.role === 'admin' && callerIdentity.role === 'admin';
+  const firestore = getFirestoreDb();
+
+  if (!isAdmin) {
+    const deletedTutorEmails = new Set(
+      (db.deletedTutorEmails || []).map((e: string) => String(e || '').toLowerCase().trim()).filter(Boolean)
+    );
+    const deletedTutorIds = new Set(
+      (db.deletedTutorIds || []).map((i: string) => String(i || '').trim()).filter(Boolean)
+    );
+    const deletedStudentEmails = new Set(
+      (db.deletedStudentEmails || []).map((e: string) => String(e || '').toLowerCase().trim()).filter(Boolean)
+    );
+
+    if (
+      deletedTutorIds.has(callerUid) ||
+      (callerEmail && (deletedTutorEmails.has(callerEmail) || deletedStudentEmails.has(callerEmail)))
+    ) {
+      res.status(403).json({
+        error: 'Forbidden',
+        message: 'Access denied: account has been deactivated or deleted.',
+      });
+      return null;
+    }
+
+    if (firestore) {
+      const unapprovedInFs = await isExplicitlyUnapprovedTeacherInFirestore(firestore, callerUid, callerEmail);
+      if (unapprovedInFs) {
+        res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: Native Friend is not approved or active.',
+        });
+        return null;
+      }
+    }
+  }
+
+  if (callerIdentity.role === 'teacher') {
+    const teacherStatus = await verifyActiveApprovedTeacher(
+      callerUid,
+      callerEmail,
+      caller.email_verified,
+      db
+    );
+    if (!callerIdentity.isApproved || !teacherStatus.isTeacher) {
+      res.status(403).json({
+        error: 'Forbidden',
+        message: 'Access denied: Native Friend is not approved or active.',
+      });
+      return null;
+    }
+    return {
+      callerUid,
+      callerEmail,
+      isAdmin: false,
+      isApprovedTeacher: true,
+      isStudent: false,
+      callerIdentity,
+      db,
+    };
+  }
+
+  return {
+    callerUid,
+    callerEmail,
+    isAdmin,
+    isApprovedTeacher: false,
+    isStudent: !isAdmin,
+    callerIdentity,
+    db,
+  };
+}
+
+async function resolveRoutineTargetStudent(params: {
+  rawUid: string;
+  rawEmail: string;
+  dbState: AppDb;
+}): Promise<
+  | { ok: true; studentUid: string; studentEmail: string }
+  | { ok: false; statusCode: number; error: string }
+> {
+  const cleanUid = (params.rawUid || '').trim();
+  const cleanEmail = (params.rawEmail || '').toLowerCase().trim();
+
+  if (cleanUid && !isValidCanonicalUid(cleanUid)) {
+    return {
+      ok: false,
+      statusCode: 422,
+      error: 'Invalid or non-canonical student UID.',
+    };
+  }
+
+  const deletedStudentEmails = new Set(
+    (params.dbState.deletedStudentEmails || []).map((e: string) => String(e || '').toLowerCase().trim()).filter(Boolean)
+  );
+
+  const firestore = getFirestoreDb();
+  let resolvedUid = cleanUid;
+  let resolvedEmail = cleanEmail;
+  let resolvedRole = '';
+
+  if (firestore) {
+    try {
+      if (resolvedUid) {
+        const uSnap = await firestore.collection('users').doc(resolvedUid).get().catch(() => null);
+        if (uSnap && uSnap.exists) {
+          const uData = uSnap.data() || {};
+          resolvedRole = String(uData.role || uData.userRole || '').toLowerCase().trim();
+          const docEmail = String(uData.email || '').toLowerCase().trim();
+          if (cleanEmail && docEmail && docEmail !== cleanEmail) {
+            return { ok: false, statusCode: 403, error: 'Target student UID and email mismatch.' };
+          }
+          if (!resolvedEmail && docEmail) resolvedEmail = docEmail;
+        }
+        if (!resolvedRole) {
+          const tSnap = await firestore.collection('tutors').doc(resolvedUid).get().catch(() => null);
+          if (tSnap && tSnap.exists) {
+            const tData = tSnap.data() || {};
+            const tEmail = String(tData.email || '').toLowerCase().trim();
+            if (!resolvedEmail && tEmail) resolvedEmail = tEmail;
+            resolvedRole = String(tData.role || 'teacher').toLowerCase().trim();
+          }
+        }
+      } else if (resolvedEmail) {
+        const qSnap = await firestore.collection('users').where('email', '==', resolvedEmail).limit(1).get().catch(() => null);
+        if (qSnap && !qSnap.empty) {
+          const docSnap = qSnap.docs[0];
+          const uData = docSnap.data() || {};
+          const candUid = String(uData.uid || docSnap.id || '').trim();
+          if (isValidCanonicalUid(candUid)) {
+            resolvedUid = candUid;
+            resolvedRole = String(uData.role || uData.userRole || '').toLowerCase().trim();
+          }
+        }
+        if (!resolvedRole) {
+          const qtSnap = await firestore.collection('tutors').where('email', '==', resolvedEmail).limit(1).get().catch(() => null);
+          if (qtSnap && !qtSnap.empty) {
+            const tData = qtSnap.docs[0].data() || {};
+            const candUid = String(tData.uid || tData.authUid || qtSnap.docs[0].id || '').trim();
+            if (!resolvedUid && isValidCanonicalUid(candUid)) {
+              resolvedUid = candUid;
+            }
+            resolvedRole = String(tData.role || 'teacher').toLowerCase().trim();
+          }
+        }
+      }
+    } catch {}
+  }
+
+  if (!resolvedRole) {
+    const matchedTeacherOrTutor = [...(params.dbState.tutorsList || []), ...(params.dbState.teachers || [])].find(
+      (t: any) =>
+        (resolvedUid && (t.uid === resolvedUid || t.authUid === resolvedUid || t.id === resolvedUid)) ||
+        (resolvedEmail && String(t.email || '').toLowerCase().trim() === resolvedEmail)
+    );
+    if (matchedTeacherOrTutor) {
+      resolvedRole = String(matchedTeacherOrTutor.role || 'teacher').toLowerCase().trim();
+    }
+  }
+
+  if (!resolvedUid && resolvedEmail) {
+    try {
+      const adminAuth = getFirebaseAdminAuth();
+      const userRec = await adminAuth.getUserByEmail(resolvedEmail);
+      if (userRec?.uid && isValidCanonicalUid(userRec.uid)) {
+        resolvedUid = userRec.uid;
+      }
+    } catch {}
+  } else if (resolvedUid && !resolvedEmail) {
+    try {
+      const adminAuth = getFirebaseAdminAuth();
+      const userRec = await adminAuth.getUser(resolvedUid);
+      if (userRec?.email) {
+        resolvedEmail = userRec.email.toLowerCase().trim();
+      }
+    } catch {}
+  }
+
+  if (!resolvedUid && resolvedEmail) {
+    const memStudent = (params.dbState.students || []).find(
+      (s: any) => (s.email || s.studentEmail || '').toLowerCase().trim() === resolvedEmail
+    );
+    const memProf = params.dbState.userProfiles?.[resolvedEmail];
+    const memUid = String(memStudent?.uid || memStudent?.studentUid || memProf?.uid || '').trim();
+    if (isValidCanonicalUid(memUid)) {
+      resolvedUid = memUid;
+    }
+  } else if (resolvedUid && !resolvedEmail) {
+    const memStudent = (params.dbState.students || []).find(
+      (s: any) => s.uid === resolvedUid || s.studentUid === resolvedUid || s.id === resolvedUid
+    );
+    const memProf = Object.values(params.dbState.userProfiles || {}).find((p: any) => p?.uid === resolvedUid) as any;
+    const memEmail = String(memStudent?.email || memStudent?.studentEmail || memProf?.email || '').toLowerCase().trim();
+    if (memEmail) resolvedEmail = memEmail;
+  }
+
+  if (resolvedRole === 'admin' || resolvedRole === 'teacher' || resolvedRole === 'tutor' || resolvedRole === 'native_friend') {
+    return {
+      ok: false,
+      statusCode: 403,
+      error: 'Target account is not a student.',
+    };
+  }
+
+  if (resolvedEmail && deletedStudentEmails.has(resolvedEmail)) {
+    return {
+      ok: false,
+      statusCode: 403,
+      error: 'Target student account is deleted or inactive.',
+    };
+  }
+
+  if (!resolvedUid || !isValidCanonicalUid(resolvedUid)) {
+    return {
+      ok: false,
+      statusCode: 403,
+      error: 'Cannot resolve canonical target student.',
+    };
+  }
+
+  return {
+    ok: true,
+    studentUid: resolvedUid,
+    studentEmail: resolvedEmail,
+  };
+}
+
+async function resolveStudentRoutinesView(
+  studentUid: string,
+  studentEmail: string,
+  dbState: AppDb,
+  routineVideoTime?: string
+): Promise<Record<string, any[]>> {
+  const memRoutines =
+    dbState.studentRoutinesMap?.[studentUid] ||
+    (studentEmail ? dbState.studentRoutinesMap?.[studentEmail] : null);
+
+  if (routinePostUpdatedAtMap.has(studentUid) && memRoutines && typeof memRoutines === 'object') {
+    return memRoutines;
+  }
+
+  const firestore = getFirestoreDb();
+  if (firestore) {
+    const ctx = await fetchCanonicalRoutineContextServer(studentUid);
+    if (ctx) {
+      const hasFirestoreRoutineData =
+        Object.keys(ctx.routinesByDayRaw || {}).length > 0 ||
+        (ctx.videoAssignments && ctx.videoAssignments.length > 0) ||
+        (ctx.spotifyAssignments && ctx.spotifyAssignments.length > 0);
+
+      if (hasFirestoreRoutineData) {
+        const vidTime = ctx.userProfile?.routineVideoTime || routineVideoTime;
+        const audTime = ctx.userProfile?.routineAudioTime;
+        const merged = createCleanStudentRoutines(vidTime);
+        const dayKeys = Object.keys(merged) as Array<keyof typeof merged>;
+        dayKeys.forEach((day) => {
+          const rawDay = ctx.routinesByDayRaw[day];
+          const dayAssignment = ctx.videoAssignments.find((a: any) => (a.day || a.dayOfWeek) === day);
+          const spotifyAssign = ctx.spotifyAssignments.find((s: any) => (s.day || s.dayOfWeek) === day);
+          merged[day] = (merged[day] || []).map((item: any, idx: number, arr: any[]) => {
+            const nextItem = { ...item };
+            if (idx === 0 || item.id?.endsWith('1')) {
+              if (vidTime) nextItem.time = vidTime;
+              if (rawDay) {
+                if (Array.isArray(rawDay.learnedWords)) nextItem.learnedWords = rawDay.learnedWords;
+                if (rawDay.completedToday !== undefined) {
+                  nextItem.completedToday = Boolean(rawDay.completedToday);
+                  nextItem.completed = Boolean(rawDay.completed ?? rawDay.completedToday);
+                }
+                if (rawDay.completedVideoToday !== undefined) {
+                  nextItem.completedVideoToday = Boolean(rawDay.completedVideoToday);
+                }
+                if (rawDay.time) nextItem.time = rawDay.time;
+                else if (rawDay.activityTimes && nextItem.id && rawDay.activityTimes[nextItem.id]) {
+                  nextItem.time = rawDay.activityTimes[nextItem.id];
+                }
+                if (rawDay.instructions || rawDay.teacherNotes) {
+                  nextItem.teacherNotes = rawDay.teacherNotes || rawDay.instructions;
+                }
+                const rawVidId = rawDay.videoId
+                  ? (extractServerYouTubeId(rawDay.videoId || rawDay.url) || String(rawDay.videoId).trim())
+                  : '';
+                if (rawVidId) {
+                  const cleanUrl = rawDay.url || `https://www.youtube.com/watch?v=${rawVidId}`;
+                  const title = rawDay.title || rawDay.videoTitle || 'Daily Video Practice';
+                  const plTitle = rawDay.playlistTitle || '';
+                  nextItem.activityName = plTitle || title || nextItem.activityName;
+                  nextItem.playlistId = rawDay.playlistId || '';
+                  nextItem.playlistTitle = plTitle;
+                  nextItem.isRepeatVideo = Boolean(rawDay.isRepeatVideo);
+                  nextItem.teacherVideos = [
+                    {
+                      id: rawVidId,
+                      videoId: rawVidId,
+                      title,
+                      url: cleanUrl,
+                      playlistId: rawDay.playlistId || '',
+                      playlistTitle: plTitle,
+                      isRepeatVideo: Boolean(rawDay.isRepeatVideo),
+                      isCustomSuggestion: Boolean(rawDay.isCustomSuggestion || rawDay.playlistId === 'custom_suggestion'),
+                      instructions: rawDay.instructions || '',
+                      duration: rawDay.duration || '5-10 min',
+                      addedAt: rawDay.updatedAt || new Date().toISOString(),
+                    },
+                  ];
+                } else if (dayAssignment && (dayAssignment.videoId || dayAssignment.videoUrl)) {
+                  const aVidId = extractServerYouTubeId(dayAssignment.videoId || dayAssignment.videoUrl) || dayAssignment.videoId;
+                  if (aVidId) {
+                    nextItem.activityName = dayAssignment.playlistTitle || dayAssignment.videoTitle || nextItem.activityName;
+                    nextItem.playlistId = dayAssignment.playlistId || '';
+                    nextItem.playlistTitle = dayAssignment.playlistTitle || '';
+                    nextItem.teacherVideos = [
+                      {
+                        id: aVidId,
+                        videoId: aVidId,
+                        title: dayAssignment.videoTitle || dayAssignment.title || 'Daily Video Practice',
+                        url: dayAssignment.videoUrl || `https://www.youtube.com/watch?v=${aVidId}`,
+                        playlistId: dayAssignment.playlistId || '',
+                        playlistTitle: dayAssignment.playlistTitle || '',
+                        isRepeatVideo: Boolean(dayAssignment.isRepeatVideo),
+                        instructions: dayAssignment.instructions || '',
+                        duration: dayAssignment.duration || '5-10 min',
+                      },
+                    ];
+                  }
+                }
+              } else if (dayAssignment && (dayAssignment.videoId || dayAssignment.videoUrl)) {
+                const aVidId = extractServerYouTubeId(dayAssignment.videoId || dayAssignment.videoUrl) || dayAssignment.videoId;
+                if (aVidId) {
+                  nextItem.activityName = dayAssignment.playlistTitle || dayAssignment.videoTitle || nextItem.activityName;
+                  nextItem.playlistId = dayAssignment.playlistId || '';
+                  nextItem.playlistTitle = dayAssignment.playlistTitle || '';
+                  nextItem.teacherVideos = [
+                    {
+                      id: aVidId,
+                      videoId: aVidId,
+                      title: dayAssignment.videoTitle || dayAssignment.title || 'Daily Video Practice',
+                      url: dayAssignment.videoUrl || `https://www.youtube.com/watch?v=${aVidId}`,
+                      playlistId: dayAssignment.playlistId || '',
+                      playlistTitle: dayAssignment.playlistTitle || '',
+                      isRepeatVideo: Boolean(dayAssignment.isRepeatVideo),
+                      instructions: dayAssignment.instructions || '',
+                      duration: dayAssignment.duration || '5-10 min',
+                    },
+                  ];
+                }
+              }
+            }
+            const isAudioTarget = arr.length === 1 ? idx === 0 : (idx === 1 || Boolean(item.id?.endsWith('2')));
+            if (isAudioTarget) {
+              if (audTime) {
+                if (idx === 1 || item.id?.endsWith('2')) nextItem.time = audTime;
+                else nextItem.audioTime = audTime;
+              }
+              if (rawDay && rawDay.completedAudioToday !== undefined) {
+                nextItem.completedAudioToday = Boolean(rawDay.completedAudioToday);
+              }
+              if (rawDay && rawDay.teacherOverrideTrack !== undefined) {
+                nextItem.teacherOverrideTrack = rawDay.teacherOverrideTrack;
+              }
+              if (rawDay && rawDay.teacherFeedback !== undefined) {
+                nextItem.teacherFeedback = rawDay.teacherFeedback;
+              }
+              const daySpot =
+                rawDay?.teacherSpotify === null
+                  ? null
+                  : rawDay?.teacherSpotify && (rawDay.teacherSpotify.url || rawDay.teacherSpotify.trackUrl)
+                  ? rawDay.teacherSpotify
+                  : spotifyAssign;
+              if (daySpot && (daySpot.url || daySpot.trackUrl)) {
+                nextItem.teacherSpotify = {
+                  id: daySpot.id || daySpot.trackId || `spot-${day}`,
+                  ...(daySpot.trackId ? { trackId: daySpot.trackId } : {}),
+                  url: daySpot.url || daySpot.trackUrl,
+                  title: daySpot.title || daySpot.trackTitle || 'Daily Spotify Audio',
+                  artistOrHost: daySpot.artistOrHost || daySpot.artist || 'Spotify',
+                  instructions: daySpot.instructions || rawDay?.teacherNotes || '',
+                  type: daySpot.type || 'music',
+                };
+              }
+            }
+            return nextItem;
+          });
+        });
+        return merged;
+      }
+    }
+  }
+
+  if (memRoutines && typeof memRoutines === 'object' && Object.keys(memRoutines).length > 0) {
+    return memRoutines;
+  }
+
+  return createCleanStudentRoutines(routineVideoTime);
+}
+
+app.get('/api/routines', firebaseAuthMiddleware, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+
+  const authCtx = await authorizeRoutinesCaller(req, res);
+  if (!authCtx) return;
+
+  const { callerUid, callerEmail, isAdmin, isApprovedTeacher, callerIdentity, db } = authCtx;
+  const rawTargetUid = String(req.query.studentUid || req.query.uid || '').trim();
+  const rawTargetEmail = String(req.query.studentEmail || req.query.email || '').toLowerCase().trim();
+  const hasExplicitTarget = Boolean(rawTargetUid || rawTargetEmail);
+
+  if (isAdmin) {
+    if (!hasExplicitTarget) {
+      const firestoreDb = getFirestoreDb();
+      if (!firestoreDb) {
+        return res.status(503).json({
+          error: 'FIRESTORE_UNAVAILABLE',
+          message: 'Canonical Firestore database (default) is unavailable for global routine template retrieval.',
+        });
+      }
+      try {
+        const routinesSnap = await firestoreDb.collection('app_state').doc('routines').get();
+        const routinesData = routinesSnap && routinesSnap.exists ? routinesSnap.data() : null;
+        const persistedRoutines = routinesData?.routinesByDay;
+        if (
+          persistedRoutines &&
+          typeof persistedRoutines === 'object' &&
+          !Array.isArray(persistedRoutines) &&
+          Object.keys(persistedRoutines).length > 0
+        ) {
+          const clonedPersisted = JSON.parse(JSON.stringify(persistedRoutines));
+          db.routinesByDay = clonedPersisted;
+          return res.json(clonedPersisted);
+        }
+        const fallbackTemplate = JSON.parse(JSON.stringify(defaultRoutinesByDay));
+        db.routinesByDay = fallbackTemplate;
+        return res.json(fallbackTemplate);
+      } catch (fsErr: any) {
+        console.error('[serverFirestore] Failed to read global routinesByDay from app_state/routines:', fsErr);
+        return res.status(isPermissionError(fsErr) ? 503 : 500).json({
+          error: isPermissionError(fsErr) ? 'FIRESTORE_UNAVAILABLE' : 'FIRESTORE_READ_FAILED',
+          message: fsErr?.message || 'Failed to read global routine template from Firestore.',
+        });
+      }
+    }
+
+    const targetRes = await resolveRoutineTargetStudent({
+      rawUid: rawTargetUid,
+      rawEmail: rawTargetEmail,
+      dbState: db,
+    });
+    if (!targetRes.ok) {
+      return res.status(targetRes.statusCode).json({
+        error: targetRes.statusCode === 422 ? 'Unprocessable Entity' : 'Forbidden',
+        message: targetRes.error,
+      });
+    }
+
+    const routines = await resolveStudentRoutinesView(targetRes.studentUid, targetRes.studentEmail, db);
+    return res.json(routines);
+  }
+
+  if (isApprovedTeacher) {
+    if (!hasExplicitTarget) {
+      // Approved teacher initializing app state receives only clean base curriculum template
+      return res.json(JSON.parse(JSON.stringify(defaultRoutinesByDay)));
+    }
+
+    if (rawTargetUid && rawTargetUid === callerUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Access denied: teacher UID cannot be queried as a student routine target.',
+      });
+    }
+
+    const targetRes = await resolveRoutineTargetStudent({
+      rawUid: rawTargetUid,
+      rawEmail: rawTargetEmail,
+      dbState: db,
+    });
+    if (!targetRes.ok) {
+      return res.status(targetRes.statusCode === 422 ? 422 : 403).json({
+        error: targetRes.statusCode === 422 ? 'Unprocessable Entity' : 'Forbidden',
+        message: targetRes.error,
+      });
+    }
+
+    const linked = await isCanonicalChatParticipantLinkServer({
+      studentUid: targetRes.studentUid,
+      teacherUid: callerUid,
+      dbState: db,
+    });
+    if (!linked) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Teacher has no authorized pedagogical link with this student.',
+      });
+    }
+
+    const routines = await resolveStudentRoutinesView(targetRes.studentUid, targetRes.studentEmail, db);
+    return res.json(routines);
+  }
+
+  // Student role: strict self-access only
+  if (rawTargetUid && rawTargetUid !== callerUid) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Cross-student access prohibited. Students may only access their own routines.',
+    });
+  }
+  if (rawTargetEmail && (!callerEmail || rawTargetEmail !== callerEmail)) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Cross-student access prohibited. Students may only access their own routines.',
+    });
+  }
+
+  const routines = await resolveStudentRoutinesView(
+    callerUid,
+    callerEmail,
+    db,
+    callerIdentity.rawDoc?.routineVideoTime
+  );
+  return res.json(routines);
 });
 
-app.post('/api/routines', (req, res) => {
-  const db = readDb();
-  const routinesByDay = req.body.routinesByDay || req.body;
-  const studentEmail = req.body.studentEmail;
-  const studentUid = req.body.studentUid || req.body.uid;
-  if (routinesByDay && typeof routinesByDay === 'object') {
-    db.routinesByDay = routinesByDay;
-    if (studentEmail || studentUid) {
-      if (!db.studentRoutinesMap) db.studentRoutinesMap = {};
-      const { email, uid } = resolveStudentIdentifiers(db, studentEmail, studentUid);
-      if (email) db.studentRoutinesMap[email] = routinesByDay;
-      if (uid) db.studentRoutinesMap[uid] = routinesByDay;
+app.post('/api/routines', firebaseAuthMiddleware, async (req, res) => {
+  const authCtx = await authorizeRoutinesCaller(req, res);
+  if (!authCtx) return;
+
+  const { callerUid, callerEmail, isAdmin, isApprovedTeacher, db } = authCtx;
+  const rawTargetUid = String(req.body?.studentUid || req.body?.uid || req.query?.studentUid || req.query?.uid || '').trim();
+  const rawTargetEmail = String(req.body?.studentEmail || req.body?.email || req.query?.studentEmail || req.query?.email || '').toLowerCase().trim();
+  const hasExplicitTarget = Boolean(rawTargetUid || rawTargetEmail);
+
+  if (isAdmin) {
+    const sanitizedRoutines = extractSanitizedRoutinesPayload(req.body);
+    if (!sanitizedRoutines) {
+      return res.status(400).json({
+        error: 'Bad Request',
+        message: 'Valid routinesByDay object with at least one valid day array is required.',
+      });
     }
+
+    if (!hasExplicitTarget) {
+      const firestoreDb = getFirestoreDb();
+      if (!firestoreDb || getIsCloudWriteDisabled()) {
+        return res.status(503).json({
+          error: 'FIRESTORE_UNAVAILABLE',
+          message: 'Canonical Firestore database (default) is unavailable for global routine template persistence.',
+        });
+      }
+
+      try {
+        const routinesDocRef = firestoreDb.collection('app_state').doc('routines');
+        const existingSnap = await routinesDocRef.get();
+        const updatedAt = new Date().toISOString();
+        if (existingSnap && existingSnap.exists && typeof routinesDocRef.update === 'function') {
+          await routinesDocRef.update({
+            routinesByDay: sanitizedRoutines,
+            updatedAt,
+          });
+        } else {
+          await routinesDocRef.set(
+            {
+              routinesByDay: sanitizedRoutines,
+              updatedAt,
+            },
+            { merge: true }
+          );
+        }
+      } catch (fsErr: any) {
+        console.error('[serverFirestore] Failed to persist global routinesByDay to app_state/routines:', fsErr);
+        return res.status(getIsCloudWriteDisabled() || isPermissionError(fsErr) ? 503 : 500).json({
+          error:
+            getIsCloudWriteDisabled() || isPermissionError(fsErr)
+              ? 'FIRESTORE_UNAVAILABLE'
+              : 'FIRESTORE_WRITE_FAILED',
+          message: fsErr?.message || 'Failed to persist global routine template to Firestore.',
+        });
+      }
+
+      db.routinesByDay = JSON.parse(JSON.stringify(sanitizedRoutines)) as any;
+      return res.json(db.routinesByDay);
+    }
+
+    const targetRes = await resolveRoutineTargetStudent({
+      rawUid: rawTargetUid,
+      rawEmail: rawTargetEmail,
+      dbState: db,
+    });
+    if (!targetRes.ok) {
+      return res.status(targetRes.statusCode).json({
+        error: targetRes.statusCode === 422 ? 'Unprocessable Entity' : 'Forbidden',
+        message: targetRes.error,
+      });
+    }
+
+    if (!db.studentRoutinesMap) db.studentRoutinesMap = {};
+    db.studentRoutinesMap[targetRes.studentUid] = sanitizedRoutines;
+    if (targetRes.studentEmail) {
+      db.studentRoutinesMap[targetRes.studentEmail] = sanitizedRoutines;
+    }
+    routinePostUpdatedAtMap.set(targetRes.studentUid, Date.now());
     writeDb(db);
+    return res.json(sanitizedRoutines);
   }
-  res.json(db.routinesByDay);
+
+  if (isApprovedTeacher) {
+    if (!hasExplicitTarget) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Access denied: teachers cannot modify global routine templates without an authorized student target.',
+      });
+    }
+
+    if (rawTargetUid && rawTargetUid === callerUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Access denied: teacher UID cannot be used as a student routine target.',
+      });
+    }
+
+    const targetRes = await resolveRoutineTargetStudent({
+      rawUid: rawTargetUid,
+      rawEmail: rawTargetEmail,
+      dbState: db,
+    });
+    if (!targetRes.ok) {
+      return res.status(targetRes.statusCode === 422 ? 422 : 403).json({
+        error: targetRes.statusCode === 422 ? 'Unprocessable Entity' : 'Forbidden',
+        message: targetRes.error,
+      });
+    }
+
+    const linked = await isCanonicalChatParticipantLinkServer({
+      studentUid: targetRes.studentUid,
+      teacherUid: callerUid,
+      dbState: db,
+    });
+    if (!linked) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Teacher has no authorized pedagogical link with this student.',
+      });
+    }
+
+    const sanitizedRoutines = extractSanitizedRoutinesPayload(req.body);
+    if (!sanitizedRoutines) {
+      return res.status(400).json({
+        error: 'Bad Request',
+        message: 'Valid routinesByDay object with at least one valid day array is required.',
+      });
+    }
+
+    if (!db.studentRoutinesMap) db.studentRoutinesMap = {};
+    db.studentRoutinesMap[targetRes.studentUid] = sanitizedRoutines;
+    if (targetRes.studentEmail) {
+      db.studentRoutinesMap[targetRes.studentEmail] = sanitizedRoutines;
+    }
+    routinePostUpdatedAtMap.set(targetRes.studentUid, Date.now());
+    writeDb(db);
+    return res.json(sanitizedRoutines);
+  }
+
+  // Student role: strict self-access only (never mutates global db.routinesByDay)
+  if (rawTargetUid && rawTargetUid !== callerUid) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Cross-student access prohibited. Students may only update their own routines.',
+    });
+  }
+  if (rawTargetEmail && (!callerEmail || rawTargetEmail !== callerEmail)) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Cross-student access prohibited. Students may only update their own routines.',
+    });
+  }
+
+  const sanitizedRoutines = extractSanitizedRoutinesPayload(req.body);
+  if (!sanitizedRoutines) {
+    return res.status(400).json({
+      error: 'Bad Request',
+      message: 'Valid routinesByDay object with at least one valid day array is required.',
+    });
+  }
+
+  if (!db.studentRoutinesMap) db.studentRoutinesMap = {};
+  db.studentRoutinesMap[callerUid] = sanitizedRoutines;
+  if (callerEmail) {
+    db.studentRoutinesMap[callerEmail] = sanitizedRoutines;
+  }
+  routinePostUpdatedAtMap.set(callerUid, Date.now());
+  writeDb(db);
+  return res.json(sanitizedRoutines);
 });
 
 app.post('/api/routines/words', firebaseAuthMiddleware, async (req, res) => {
@@ -28610,6 +29359,7 @@ export function resetAllServerMemoryCaches(): void {
   aiMemorizationCache.clear();
   dailySentenceEvaluationCache.clear();
   ptaxRateLimitMap.clear();
+  routinePostUpdatedAtMap.clear();
   institutionalYouTubeToken = null;
   institutionalYouTubeTokenUpdatedAt = 0;
   lastYouTubeSyncTime = 0;
