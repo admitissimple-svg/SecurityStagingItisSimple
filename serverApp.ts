@@ -291,6 +291,7 @@ import {
   requireTeacher,
   isVerifiedAdminRequest,
   getVerifiedUserFromRequest,
+  isVerifiedUser,
   AuthenticatedUser,
   extractTrustedRole,
   markAsVerifiedUser,
@@ -6419,123 +6420,530 @@ async function lookupServerDictionaryWord(cleanWord: string, studentLevel?: stri
   };
 }
 
-// 3. Meet Settings & Teacher Settings Endpoints (Read-only, filtered against deleted tutors)
+// 3. Meet Settings & Teacher Settings Endpoints (Authenticated, Canonical RBAC & Ownership Enforced)
 app.get(['/api/meet-settings', '/api/teacher-settings'], async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
 
+  const verifiedCaller = await getVerifiedUserFromRequest(req);
+  if (!verifiedCaller || !verifiedCaller.uid || !isValidCanonicalUid(verifiedCaller.uid)) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Authentication required: verified Firebase ID token missing or invalid.',
+    });
+  }
+
   const db = readDb();
+  const callerUid = verifiedCaller.uid.trim();
+  const callerEmail = (verifiedCaller.email || '').toLowerCase().trim();
+
+  const callerIdentity = await resolveCanonicalUserRoleAndIdentity({
+    uid: callerUid,
+    email: callerEmail,
+    tokenRole: verifiedCaller.role,
+    dbState: db,
+  });
+
+  if (callerIdentity.role === 'conflict' || callerIdentity.approvalStatus === 'rejected') {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: callerIdentity.message || 'Access denied: account identity conflict or rejected status.',
+    });
+  }
+
+  const isCallerAdmin = verifiedCaller.role === 'admin' && callerIdentity.role === 'admin';
+  const isCallerTeacher = callerIdentity.role === 'teacher' || callerIdentity.role === 'pending_teacher';
+
   const teacherEmail = ((req.query.teacherEmail as string) || (req.query.email as string) || '').toLowerCase().trim();
   const uid = ((req.query.uid as string) || '').trim();
   const deletedEmails = new Set((db.deletedTutorEmails || []).map((e: string) => (e || '').toLowerCase().trim()).filter(Boolean));
   const deletedIds = new Set((db.deletedTutorIds || []).map((i: string) => (i || '').trim()).filter(Boolean));
-  const verifiedCaller = await getVerifiedUserFromRequest(req);
-  const isCallerAdmin = verifiedCaller?.role === 'admin';
 
-  if (isCallerAdmin || (!teacherEmail && !uid)) {
-    const rawSettings = { ...(db.meetSettings || {}), ...(db.teacherSettings || {}) };
-    const filteredSettings: Record<string, any> = {};
-    for (const [k, v] of Object.entries(rawSettings)) {
-      const kLower = k.toLowerCase().trim();
-      const vEmail = ((v as any)?.teacherEmail || '').toLowerCase().trim();
-      const vUid = ((v as any)?.uid || '').trim();
-      if (deletedEmails.has(kLower) || deletedEmails.has(vEmail) || deletedIds.has(k) || deletedIds.has(vUid)) {
-        continue;
-      }
-      filteredSettings[k] = v;
-    }
-    return res.json(filteredSettings);
-  }
-
-  if ((teacherEmail && deletedEmails.has(teacherEmail)) || (uid && deletedIds.has(uid))) {
-    return res.json({ teacherEmail: '', uid: '' });
-  }
-
-  let specific =
-    (teacherEmail ? (db.meetSettings?.[teacherEmail] || db.teacherSettings?.[teacherEmail]) : null) ||
-    (uid ? (db.meetSettings?.[uid] || db.teacherSettings?.[uid]) : null) ||
-    null;
-
-  // Check canonical tutor match from db.tutorsList
-  const tutorMatch = (db.tutorsList || []).find(
-    (t: any) =>
-      (teacherEmail && (t.email || '').toLowerCase().trim() === teacherEmail) ||
-      (uid && (t.uid === uid || t.authUid === uid || t.id === uid))
-  );
-
-  // If specific is not yet found or missing availability, attempt read-only retrieval from Firestore
-  if (!specific || (!specific.availability && !specific.availableHoursByDay)) {
-    try {
-      const firestoreData = await fetchTeacherAvailabilityFromFirestore(uid || teacherEmail);
-      if (firestoreData) {
-        specific = {
-          ...(specific || {}),
-          ...firestoreData,
-        };
-      }
-    } catch (err) {
-      console.warn('Could not read teacher availability from Firestore:', err);
-    }
-  }
-
-  const finalResult = {
-    ...(specific || {}),
-    teacherEmail: teacherEmail || specific?.teacherEmail || tutorMatch?.email || '',
-    uid: uid || specific?.uid || tutorMatch?.uid || '',
+  const isEntryDeleted = (key: string, val: any): boolean => {
+    const kLower = key.toLowerCase().trim();
+    const vEmail = String(val?.teacherEmail || '').toLowerCase().trim();
+    const vUid = String(val?.uid || '').trim();
+    return Boolean(
+      deletedEmails.has(kLower) ||
+      (vEmail && deletedEmails.has(vEmail)) ||
+      deletedIds.has(key) ||
+      (vUid && deletedIds.has(vUid))
+    );
   };
 
-  if (!finalResult.meetLink && tutorMatch) {
-    finalResult.meetLink = tutorMatch.meetUrl || tutorMatch.meetLink || '';
-  }
-  if (!finalResult.availability && tutorMatch?.availability) {
-    finalResult.availability = tutorMatch.availability;
-  }
-  if (!finalResult.availableHoursByDay && tutorMatch?.availableHoursByDay) {
-    finalResult.availableHoursByDay = tutorMatch.availableHoursByDay;
-  }
-  if (!finalResult.availableDays && tutorMatch?.availableDays) {
-    finalResult.availableDays = tutorMatch.availableDays;
+  const resolveSingleTeacherSettings = async (targetEmailInput: string, targetUidInput: string) => {
+    const cleanTargetEmail = targetEmailInput.toLowerCase().trim();
+    const cleanTargetUid = targetUidInput.trim();
+    if ((cleanTargetEmail && deletedEmails.has(cleanTargetEmail)) || (cleanTargetUid && deletedIds.has(cleanTargetUid))) {
+      return { teacherEmail: '', uid: '' };
+    }
+
+    let specific =
+      (cleanTargetEmail ? (db.meetSettings?.[cleanTargetEmail] || db.teacherSettings?.[cleanTargetEmail]) : null) ||
+      (cleanTargetUid ? (db.meetSettings?.[cleanTargetUid] || db.teacherSettings?.[cleanTargetUid]) : null) ||
+      null;
+
+    const tutorMatch = (db.tutorsList || []).find(
+      (t: any) =>
+        (cleanTargetEmail && (t.email || '').toLowerCase().trim() === cleanTargetEmail) ||
+        (cleanTargetUid && (t.uid === cleanTargetUid || t.authUid === cleanTargetUid || t.id === cleanTargetUid))
+    );
+
+    if (!specific || (!specific.availability && !specific.availableHoursByDay)) {
+      try {
+        const firestoreData = await fetchTeacherAvailabilityFromFirestore(cleanTargetUid || cleanTargetEmail);
+        if (firestoreData) {
+          specific = {
+            ...(specific || {}),
+            ...firestoreData,
+          };
+        }
+      } catch (err) {
+        console.warn('Could not read teacher availability from Firestore:', err);
+      }
+    }
+
+    const resolvedEmail = cleanTargetEmail || String(specific?.teacherEmail || tutorMatch?.email || '').toLowerCase().trim();
+    const resolvedUid = cleanTargetUid || String(specific?.uid || tutorMatch?.uid || tutorMatch?.authUid || '').trim();
+    if ((resolvedEmail && deletedEmails.has(resolvedEmail)) || (resolvedUid && deletedIds.has(resolvedUid))) {
+      return { teacherEmail: '', uid: '' };
+    }
+
+    const finalResult: Record<string, any> = {
+      ...(specific || {}),
+      teacherEmail: resolvedEmail,
+      uid: resolvedUid,
+    };
+
+    if (!finalResult.meetLink && tutorMatch) {
+      finalResult.meetLink = tutorMatch.meetUrl || tutorMatch.meetLink || '';
+    }
+    if (!finalResult.availability && tutorMatch?.availability) {
+      finalResult.availability = tutorMatch.availability;
+    }
+    if (!finalResult.availableHoursByDay && tutorMatch?.availableHoursByDay) {
+      finalResult.availableHoursByDay = tutorMatch.availableHoursByDay;
+    }
+    if (!finalResult.availableDays && tutorMatch?.availableDays) {
+      finalResult.availableDays = tutorMatch.availableDays;
+    }
+
+    return finalResult;
+  };
+
+  // 1. Admin: full filtered map or specific teacher
+  if (isCallerAdmin) {
+    if (!teacherEmail && !uid) {
+      const rawSettings = { ...(db.meetSettings || {}), ...(db.teacherSettings || {}) };
+      const filteredSettings: Record<string, any> = {};
+      for (const [k, v] of Object.entries(rawSettings)) {
+        if (isEntryDeleted(k, v)) continue;
+        filteredSettings[k] = v;
+      }
+      return res.json(filteredSettings);
+    }
+
+    const result = await resolveSingleTeacherSettings(teacherEmail, uid);
+    return res.json(result);
   }
 
-  return res.json(finalResult);
+  // 2. Teacher / Pending Teacher: strictly own settings only
+  if (isCallerTeacher) {
+    const ownTutorRecord = (db.tutorsList || []).find(
+      (t: any) => t && (t.uid === callerUid || t.authUid === callerUid || t.id === callerUid)
+    );
+    const ownEmail = (callerIdentity.email || ownTutorRecord?.email || callerEmail || '').toLowerCase().trim();
+
+    if (!teacherEmail && !uid) {
+      const rawSettings = { ...(db.meetSettings || {}), ...(db.teacherSettings || {}) };
+      const scopedSettings: Record<string, any> = {};
+      for (const [k, v] of Object.entries(rawSettings)) {
+        if (isEntryDeleted(k, v)) continue;
+        const kLower = k.toLowerCase().trim();
+        const vEmail = String((v as any)?.teacherEmail || '').toLowerCase().trim();
+        const vUid = String((v as any)?.uid || '').trim();
+        const belongsToCaller =
+          (callerUid && (k === callerUid || vUid === callerUid)) ||
+          (ownEmail && (kLower === ownEmail || vEmail === ownEmail) && (!vUid || vUid === callerUid));
+        if (belongsToCaller) {
+          scopedSettings[k] = v;
+        }
+      }
+
+      if (Object.keys(scopedSettings).length === 0) {
+        const ownSettings = await resolveSingleTeacherSettings(ownEmail, callerUid);
+        const hasMeaningfulSettings = Boolean(
+          ownSettings.meetLink ||
+          ownSettings.availability ||
+          ownSettings.availableHoursByDay ||
+          (Array.isArray(ownSettings.availableDays) && ownSettings.availableDays.length > 0)
+        );
+        if (hasMeaningfulSettings) {
+          if (ownEmail) scopedSettings[ownEmail] = ownSettings;
+          scopedSettings[callerUid] = ownSettings;
+        }
+      }
+
+      return res.json(scopedSettings);
+    }
+
+    if (uid && uid !== callerUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Access denied: You can only view your own meet settings.',
+      });
+    }
+    if (teacherEmail && teacherEmail !== ownEmail && teacherEmail !== callerEmail) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Access denied: You can only view your own meet settings.',
+      });
+    }
+
+    const result = await resolveSingleTeacherSettings(teacherEmail || ownEmail, uid || callerUid);
+    return res.json(result);
+  }
+
+  // 3. Student / Unregistered: strictly canonically linked Native Friend(s) only
+  const getStudentLinkedTeachers = async (): Promise<Array<{ uid: string; email: string }>> => {
+    const firestoreDb = getFirestoreDb();
+    const refs: Array<{ uid?: string; email?: string }> = [];
+    const seenRefs = new Set<string>();
+    const addRef = (tUid?: string | null, tEmail?: string | null) => {
+      const u = String(tUid || '').trim();
+      const e = String(tEmail || '').toLowerCase().trim();
+      if (!u && !e) return;
+      const key = `${u}::${e}`;
+      if (!seenRefs.has(key)) {
+        seenRefs.add(key);
+        refs.push({ ...(u ? { uid: u } : {}), ...(e ? { email: e } : {}) });
+      }
+    };
+
+    let fsUserLoaded = false;
+    if (firestoreDb) {
+      try {
+        const [uSnap, assignSnap] = await Promise.all([
+          firestoreDb.collection('users').doc(callerUid).get().catch(() => null),
+          firestoreDb.collection('student_assignments').doc(callerUid).get().catch(() => null),
+        ]);
+        if (uSnap && uSnap.exists) {
+          fsUserLoaded = true;
+          const uData = uSnap.data() || {};
+          addRef(
+            uData.assignedNativeFriendUID || uData.teacherUid || uData.teacherAuthUid || uData.nativeFriendUID || uData.teacherId,
+            uData.teacherEmail
+          );
+        }
+        if (assignSnap && assignSnap.exists) {
+          const aData = assignSnap.data() || {};
+          addRef(
+            aData.teacherUid || aData.teacherAuthUid || aData.assignedNativeFriendUID || aData.nativeFriendUID || aData.teacherId,
+            aData.teacherEmail
+          );
+        }
+
+        const [liveLessonsSnap, lessonsSnap] = await Promise.all([
+          firestoreDb.collection('live_lessons').where('studentUid', '==', callerUid).get().catch(() => null),
+          firestoreDb.collection('lessons').where('studentUid', '==', callerUid).get().catch(() => null),
+        ]);
+        for (const snap of [liveLessonsSnap, lessonsSnap]) {
+          if (snap && !snap.empty) {
+            snap.forEach((d: any) => {
+              const l = d.data();
+              if (!l || l.status === 'cancelled' || l.status === 'canceled') return;
+              addRef(l.teacherAuthUid || l.teacherUid || l.tutorUid || l.teacherId, l.teacherEmail || l.tutorEmail);
+            });
+          }
+        }
+      } catch {}
+    }
+
+    if (!fsUserLoaded) {
+      const memStudent = (db.students || []).find(
+        (s: any) => s && (s.uid === callerUid || s.id === callerUid || s.studentUid === callerUid)
+      );
+      if (memStudent) {
+        addRef(
+          memStudent.assignedNativeFriendUID || memStudent.teacherUid || memStudent.nativeFriendUID || memStudent.teacherId,
+          memStudent.teacherEmail
+        );
+      }
+      const memProfile =
+        (callerEmail &&
+          db.userProfiles?.[callerEmail] &&
+          (!db.userProfiles[callerEmail].uid || db.userProfiles[callerEmail].uid === callerUid)
+          ? db.userProfiles[callerEmail]
+          : null) ||
+        Object.values(db.userProfiles || {}).find((p: any) => p && p.uid === callerUid);
+      if (memProfile) {
+        addRef(
+          (memProfile as any).assignedNativeFriendUID ||
+            (memProfile as any).teacherUid ||
+            (memProfile as any).nativeFriendUID ||
+            (memProfile as any).teacherId,
+          (memProfile as any).teacherEmail
+        );
+      }
+    }
+
+    for (const l of db.liveLessons || []) {
+      if (!l || l.status === 'cancelled' || l.status === 'canceled') continue;
+      if (l.studentUid === callerUid || (!l.studentUid && callerEmail && (l.studentEmail || '').toLowerCase().trim() === callerEmail)) {
+        addRef(l.teacherAuthUid || l.teacherUid || l.tutorUid || l.teacherId, l.teacherEmail || l.tutorEmail);
+      }
+    }
+
+    const resolvedTeachers: Array<{ uid: string; email: string }> = [];
+    const resolvedKeys = new Set<string>();
+    for (const ref of refs) {
+      let tUid = ref.uid && isValidCanonicalUid(ref.uid) ? ref.uid : '';
+      let tEmail = ref.email || '';
+
+      const resolved = await resolveTeacherCanonicalIdentity({
+        teacherUid: ref.uid,
+        teacherEmail: ref.email,
+        dbState: db,
+      }).catch(() => null);
+
+      if (resolved) {
+        tUid = resolved.canonicalUid || tUid;
+        tEmail = (resolved.email || (!resolved.canonicalUid ? tEmail : '')).toLowerCase().trim();
+      } else {
+        const memTutor = (db.tutorsList || []).find(
+          (t: any) =>
+            (ref.uid && (t.uid === ref.uid || t.authUid === ref.uid || t.id === ref.uid)) ||
+            (ref.email && (t.email || '').toLowerCase().trim() === ref.email)
+        );
+        if (memTutor) {
+          if (memTutor.approvalStatus === 'rejected' || memTutor.status === 'rejected') continue;
+          tUid = memTutor.uid || memTutor.authUid || (isValidCanonicalUid(memTutor.id) ? memTutor.id : tUid);
+          tEmail = (memTutor.email || tEmail).toLowerCase().trim();
+        }
+      }
+
+      if ((tEmail && deletedEmails.has(tEmail)) || (tUid && deletedIds.has(tUid))) {
+        continue;
+      }
+      if (!tUid && !tEmail) continue;
+      const dedupKey = `${tUid}::${tEmail}`;
+      if (!resolvedKeys.has(dedupKey)) {
+        resolvedKeys.add(dedupKey);
+        resolvedTeachers.push({ uid: tUid, email: tEmail });
+      }
+    }
+
+    return resolvedTeachers;
+  };
+
+  const linkedTeachers = await getStudentLinkedTeachers();
+
+  if (!teacherEmail && !uid) {
+    const scopedSettings: Record<string, any> = {};
+    for (const lt of linkedTeachers) {
+      const single = await resolveSingleTeacherSettings(lt.email, lt.uid);
+      const hasContent = Boolean(
+        single.meetLink ||
+        single.availability ||
+        single.availableHoursByDay ||
+        (Array.isArray(single.availableDays) && single.availableDays.length > 0)
+      );
+      if (hasContent) {
+        if (lt.email) scopedSettings[lt.email] = single;
+        if (lt.uid) scopedSettings[lt.uid] = single;
+      }
+    }
+    return res.json(scopedSettings);
+  }
+
+  const matchedLinkedTeacher = linkedTeachers.find((lt) => {
+    const uidMatches = !uid || (lt.uid && lt.uid === uid);
+    const emailMatches = !teacherEmail || (lt.email && lt.email === teacherEmail);
+    return uidMatches && emailMatches;
+  });
+
+  if (!matchedLinkedTeacher) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Access denied: You can only view meet settings for your linked Native Friend.',
+    });
+  }
+
+  const result = await resolveSingleTeacherSettings(matchedLinkedTeacher.email || teacherEmail, matchedLinkedTeacher.uid || uid);
+  return res.json(result);
 });
 
 app.post(['/api/meet-settings', '/api/teacher-settings'], async (req, res) => {
+  const verifiedCaller = await getVerifiedUserFromRequest(req);
+  if (!verifiedCaller || !verifiedCaller.uid || !isValidCanonicalUid(verifiedCaller.uid)) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Authentication required: verified Firebase ID token missing or invalid.',
+    });
+  }
+
   const db = readDb();
-  const settings = req.body.settings || req.body;
-  const teacherEmail = req.body.teacherEmail || settings.teacherEmail;
-  const uid = req.body.uid || settings.uid;
-  if (!teacherEmail || !settings) {
+  const callerUid = verifiedCaller.uid.trim();
+  const callerEmail = (verifiedCaller.email || '').toLowerCase().trim();
+
+  const callerIdentity = await resolveCanonicalUserRoleAndIdentity({
+    uid: callerUid,
+    email: callerEmail,
+    tokenRole: verifiedCaller.role,
+    dbState: db,
+  });
+
+  if (callerIdentity.role === 'conflict' || callerIdentity.approvalStatus === 'rejected') {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: callerIdentity.message || 'Access denied: account identity conflict or rejected status.',
+    });
+  }
+
+  const isCallerAdmin = verifiedCaller.role === 'admin' && callerIdentity.role === 'admin';
+  const isCallerTeacher = callerIdentity.role === 'teacher' || callerIdentity.role === 'pending_teacher';
+
+  if (!isCallerAdmin && !isCallerTeacher) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Access denied: Only verified teachers or administrators can update meet settings.',
+    });
+  }
+
+  const rawBody = req.body && typeof req.body === 'object' ? req.body : {};
+  const rawSettings = rawBody.settings && typeof rawBody.settings === 'object' ? rawBody.settings : rawBody;
+  if (!rawSettings || typeof rawSettings !== 'object') {
+    return res.status(400).json({ error: 'Missing teacherEmail or settings' });
+  }
+
+  const requestedEmail = String(rawBody.teacherEmail || rawSettings.teacherEmail || '').toLowerCase().trim();
+  const requestedUid = String(rawBody.uid || rawSettings.uid || '').trim();
+
+  const ownTutorRecord = !isCallerAdmin
+    ? (db.tutorsList || []).find(
+        (t: any) => t && (t.uid === callerUid || t.authUid === callerUid || t.id === callerUid)
+      )
+    : null;
+  const canonicalOwnEmail = (callerIdentity.email || ownTutorRecord?.email || callerEmail || '').toLowerCase().trim();
+
+  const teacherEmail = requestedEmail || (!isCallerAdmin ? canonicalOwnEmail : '');
+  if (!teacherEmail) {
     return res.status(400).json({ error: 'Missing teacherEmail or settings' });
   }
   const cleanEmail = teacherEmail.toLowerCase().trim();
 
-  // Normalize granular availability maps
-  const availability = settings.availability || settings.availableHoursByDay || {};
-  const availableHoursByDay = settings.availableHoursByDay || settings.availability || {};
+  let effectiveUid = requestedUid;
 
-  const entry = {
-    ...settings,
+  if (!isCallerAdmin) {
+    // Strict ownership enforcement: non-admin teachers can only modify their own canonical settings
+    if (requestedUid && requestedUid !== callerUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Access denied: You cannot modify meet settings for another user.',
+      });
+    }
+
+    const emailBelongsToCaller =
+      (callerEmail && cleanEmail === callerEmail) ||
+      (canonicalOwnEmail && cleanEmail === canonicalOwnEmail);
+
+    if (!emailBelongsToCaller) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Access denied: You can only update your own meet settings.',
+      });
+    }
+
+    // Prevent modifying an administrator account through teacher settings
+    const isTargetAdmin =
+      (db.teachers || []).some((t: any) => (t.email || '').toLowerCase().trim() === cleanEmail && t.role === 'admin') ||
+      (db.authUsers && db.authUsers[cleanEmail]?.role === 'admin');
+    if (isTargetAdmin) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Access denied: Cannot modify administrator settings.',
+      });
+    }
+
+    // Reject if another tutor/user owns this email under a different canonical UID
+    const conflictingTutor = [...(db.tutorsList || []), ...(db.teachers || [])].find((t: any) => {
+      if (!t || (t.email || '').toLowerCase().trim() !== cleanEmail) return false;
+      const tUid = t.uid || t.authUid || (isValidCanonicalUid(t.id) ? t.id : '');
+      return Boolean(tUid && tUid !== callerUid);
+    });
+    if (conflictingTutor) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Access denied: Target tutor belongs to a different canonical UID.',
+      });
+    }
+
+    const existingMemSetting = db.meetSettings?.[cleanEmail] || db.teacherSettings?.[cleanEmail];
+    if (existingMemSetting?.uid && isValidCanonicalUid(existingMemSetting.uid) && existingMemSetting.uid !== callerUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Access denied: Target settings belong to a different canonical UID.',
+      });
+    }
+
+    effectiveUid = callerUid;
+  } else if (!effectiveUid) {
+    const matchedTutor = (db.tutorsList || []).find((t: any) => (t.email || '').toLowerCase().trim() === cleanEmail);
+    const candidateUid = matchedTutor?.uid || matchedTutor?.authUid || (isValidCanonicalUid(matchedTutor?.id) ? matchedTutor.id : '');
+    if (candidateUid && isValidCanonicalUid(candidateUid)) {
+      effectiveUid = candidateUid;
+    }
+  }
+
+  // Strip any privilege-escalation or credential fields from incoming settings
+  const sanitizedSettings: Record<string, any> = { ...rawSettings };
+  delete sanitizedSettings.role;
+  delete sanitizedSettings.userRole;
+  delete sanitizedSettings.isApproved;
+  delete sanitizedSettings.approved;
+  delete sanitizedSettings.approvalStatus;
+  delete sanitizedSettings.status;
+  delete sanitizedSettings.adminCommissionPercent;
+  delete sanitizedSettings.commissionModel;
+  delete sanitizedSettings.password;
+  delete sanitizedSettings.token;
+  delete sanitizedSettings.secret;
+  delete sanitizedSettings.idToken;
+  delete sanitizedSettings.settings;
+
+  // Normalize granular availability maps
+  const availability = sanitizedSettings.availability || sanitizedSettings.availableHoursByDay || {};
+  const availableHoursByDay = sanitizedSettings.availableHoursByDay || sanitizedSettings.availability || {};
+
+  const entry: Record<string, any> = {
+    ...sanitizedSettings,
     teacherEmail: cleanEmail,
-    ...(uid ? { uid } : {}),
+    ...(effectiveUid ? { uid: effectiveUid } : {}),
     availability,
     availableHoursByDay,
     updatedAt: new Date().toISOString(),
   };
 
+  if (!db.meetSettings) db.meetSettings = {};
+  if (!db.teacherSettings) db.teacherSettings = {};
   db.meetSettings[cleanEmail] = entry;
   db.teacherSettings[cleanEmail] = entry;
-  if (uid) {
-    db.meetSettings[uid] = entry;
-    db.teacherSettings[uid] = entry;
+  if (effectiveUid) {
+    db.meetSettings[effectiveUid] = entry;
+    db.teacherSettings[effectiveUid] = entry;
   }
 
-  // Also update corresponding tutor in tutorsList if present
+  // Also update corresponding tutor in tutorsList if present (respecting canonical UID)
   if (db.tutorsList && Array.isArray(db.tutorsList)) {
-    const tutorIdx = db.tutorsList.findIndex(
-      (t: any) => (t.email || '').toLowerCase().trim() === cleanEmail || (uid && t.uid === uid)
-    );
+    const tutorIdx = db.tutorsList.findIndex((t: any) => {
+      if (effectiveUid && (t.uid === effectiveUid || t.authUid === effectiveUid || t.id === effectiveUid)) return true;
+      if ((t.email || '').toLowerCase().trim() === cleanEmail) {
+        const tUid = t.uid || t.authUid;
+        return !effectiveUid || !tUid || tUid === effectiveUid;
+      }
+      return false;
+    });
     if (tutorIdx >= 0) {
       db.tutorsList[tutorIdx] = {
         ...db.tutorsList[tutorIdx],
@@ -6552,18 +6960,32 @@ app.post(['/api/meet-settings', '/api/teacher-settings'], async (req, res) => {
 
   await writeDbSync(db);
 
-  // Directly persist to Firestore linked to teacher UID / Email in teacher_availability collection
-  if (uid || cleanEmail) {
-    saveTeacherAvailabilityToFirestore(uid || cleanEmail, entry).catch((err) => {
-      console.warn('Background Firestore teacher availability save failed:', err);
+  // Persist to Firestore linked to teacher UID / Email in teacher_availability collection
+  if (effectiveUid || cleanEmail) {
+    await saveTeacherAvailabilityToFirestore(effectiveUid || cleanEmail, entry).catch((err) => {
+      console.warn('Firestore teacher availability save failed:', err);
     });
   }
 
-  res.json({
+  if (isCallerAdmin) {
+    return res.json({
+      success: true,
+      settings: entry,
+      meetSettings: db.meetSettings,
+      teacherSettings: db.teacherSettings,
+    });
+  }
+
+  const scopedOwnMap: Record<string, any> = {
+    [cleanEmail]: entry,
+    ...(effectiveUid ? { [effectiveUid]: entry } : {}),
+  };
+
+  return res.json({
     success: true,
     settings: entry,
-    meetSettings: db.meetSettings,
-    teacherSettings: db.teacherSettings,
+    meetSettings: scopedOwnMap,
+    teacherSettings: scopedOwnMap,
   });
 });
 
@@ -20360,34 +20782,1215 @@ app.delete(['/api/lessons/:id', '/api/live-lessons/:id'], firebaseAuthMiddleware
   });
 });
 
-// 6. Chat Messages Endpoints
-app.get('/api/chat-messages', (req, res) => {
-  const db = readDb();
-  res.json({ messages: db.chatMessages || [] });
-});
+// 6. Chat Messages Endpoints (SEC.FIX.5: Authenticated Firebase + Canonical Firestore Participant Authorization)
+async function resolveChatCallerContext(
+  req: express.Request,
+  res: express.Response,
+  options?: { rejectUnregistered?: boolean }
+): Promise<{
+  callerUid: string;
+  callerEmail: string;
+  isAdmin: boolean;
+  isTeacher: boolean;
+  isStudent: boolean;
+  isUnregistered: boolean;
+  db: AppDb;
+} | null> {
+  if (!req.user || !req.user.uid || !isVerifiedUser(req.user) || !isValidCanonicalUid(req.user.uid)) {
+    res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Authentication required: verified Firebase ID token missing or invalid.',
+    });
+    return null;
+  }
 
-app.post('/api/chat-messages', (req, res) => {
   const db = readDb();
-  const { message, messages } = req.body;
-  if (Array.isArray(messages)) {
-    db.chatMessages = messages;
-  } else if (message && message.id) {
-    const idx = db.chatMessages.findIndex((m) => m.id === message.id);
-    if (idx >= 0) {
-      db.chatMessages[idx] = message;
-    } else {
-      db.chatMessages.push(message);
+  const callerUid = req.user.uid.trim();
+  const callerEmail = (req.user.email || '').toLowerCase().trim();
+
+  const callerIdentity = await resolveCanonicalUserRoleAndIdentity({
+    uid: callerUid,
+    email: callerEmail,
+    tokenRole: req.user.role,
+    dbState: db,
+  });
+
+  if (
+    callerIdentity.role === 'conflict' ||
+    callerIdentity.approvalStatus === 'rejected' ||
+    callerIdentity.role === 'pending_teacher'
+  ) {
+    res.status(403).json({
+      error: 'Forbidden',
+      message: callerIdentity.message || 'Access denied: account status or identity conflict.',
+    });
+    return null;
+  }
+
+  const isAdmin = req.user.role === 'admin' && callerIdentity.role === 'admin';
+  const isTeacher = !isAdmin && callerIdentity.role === 'teacher';
+  const isUnregistered = !isAdmin && !isTeacher && callerIdentity.role === 'unregistered';
+
+  if (isUnregistered) {
+    const firestoreDb = getFirestoreDb();
+    const explicitlyUnapprovedTutor = await isExplicitlyUnapprovedTeacherInFirestore(
+      firestoreDb,
+      callerUid,
+      callerEmail
+    ).catch(() => false);
+    if (explicitlyUnapprovedTutor) {
+      res.status(403).json({
+        error: 'Forbidden',
+        message: 'Access denied: Native Friend account is pending or rejected.',
+      });
+      return null;
     }
   }
-  writeDb(db);
-  res.json({ success: true, messages: db.chatMessages });
+
+  if (options?.rejectUnregistered && isUnregistered) {
+    res.status(403).json({
+      error: 'Forbidden',
+      message: 'Access denied: canonical user profile is required for chat operations.',
+    });
+    return null;
+  }
+
+  return {
+    callerUid,
+    callerEmail,
+    isAdmin,
+    isTeacher,
+    isStudent: !isAdmin && !isTeacher && !isUnregistered,
+    isUnregistered,
+    db,
+  };
+}
+
+async function isCanonicalChatParticipantLinkServer(params: {
+  studentUid: string;
+  teacherUid: string;
+  dbState: AppDb;
+  linkCache?: Map<string, boolean>;
+}): Promise<boolean> {
+  const cleanStudentUid = (params.studentUid || '').trim();
+  const cleanTeacherUid = (params.teacherUid || '').trim();
+
+  if (
+    !cleanStudentUid ||
+    !cleanTeacherUid ||
+    !isValidCanonicalUid(cleanStudentUid) ||
+    !isValidCanonicalUid(cleanTeacherUid) ||
+    cleanStudentUid === cleanTeacherUid
+  ) {
+    return false;
+  }
+
+  const cacheKey = `${cleanStudentUid}::${cleanTeacherUid}`;
+  if (params.linkCache?.has(cacheKey)) {
+    return Boolean(params.linkCache.get(cacheKey));
+  }
+
+  const cacheAndReturn = (val: boolean): boolean => {
+    params.linkCache?.set(cacheKey, val);
+    return val;
+  };
+
+  const deletedEmails = new Set(
+    (params.dbState.deletedTutorEmails || []).map((e: string) => String(e || '').toLowerCase().trim()).filter(Boolean)
+  );
+  const deletedIds = new Set(
+    (params.dbState.deletedTutorIds || []).map((i: string) => String(i || '').trim()).filter(Boolean)
+  );
+  const deletedStudentEmails = new Set(
+    (params.dbState.deletedStudentEmails || []).map((e: string) => String(e || '').toLowerCase().trim()).filter(Boolean)
+  );
+
+  if (deletedIds.has(cleanTeacherUid)) {
+    return cacheAndReturn(false);
+  }
+
+  const teacherResolved = await resolveTeacherCanonicalIdentity({
+    teacherUid: cleanTeacherUid,
+    dbState: params.dbState,
+  }).catch(() => null);
+
+  if (!teacherResolved || !teacherResolved.isApproved || teacherResolved.canonicalUid !== cleanTeacherUid) {
+    return cacheAndReturn(false);
+  }
+
+  const resolvedTeacherEmail = (teacherResolved.email || '').toLowerCase().trim();
+  if (resolvedTeacherEmail && deletedEmails.has(resolvedTeacherEmail)) {
+    return cacheAndReturn(false);
+  }
+
+  const allowedTeacherIds = new Set<string>([cleanTeacherUid, `tutor-${cleanTeacherUid}`]);
+  if (teacherResolved.publicTutorId) {
+    allowedTeacherIds.add(teacherResolved.publicTutorId);
+    allowedTeacherIds.add(`tutor-${teacherResolved.publicTutorId}`);
+  }
+
+  const firestoreDb = getFirestoreDb();
+  let fsUserLoaded = false;
+  let fsAssignLoaded = false;
+  let studentCancelled = false;
+
+  const assignedTeacherUids = new Set<string>();
+  const assignedTeacherEmails = new Set<string>();
+  const allAssignedTeacherUids = new Set<string>();
+  const allAssignedTeacherEmails = new Set<string>();
+
+  const collectAssignment = (rawUid?: unknown, rawEmail?: unknown) => {
+    const u = typeof rawUid === 'string' ? rawUid.trim() : '';
+    const e = typeof rawEmail === 'string' ? rawEmail.toLowerCase().trim() : '';
+    if (u) allAssignedTeacherUids.add(u);
+    if (e) allAssignedTeacherEmails.add(e);
+    if (!studentCancelled) {
+      if (u) assignedTeacherUids.add(u);
+      if (e) assignedTeacherEmails.add(e);
+    }
+  };
+
+  let hasScheduledLessonWithTeacher = false;
+  let hasCompletedLessonWithTeacher = false;
+
+  if (firestoreDb) {
+    try {
+      const [uSnap, assignSnap, lessonsSnap, liveLessonsSnap] = await Promise.all([
+        firestoreDb.collection('users').doc(cleanStudentUid).get().catch(() => null),
+        firestoreDb.collection('student_assignments').doc(cleanStudentUid).get().catch(() => null),
+        firestoreDb.collection('lessons').where('studentUid', '==', cleanStudentUid).get().catch(() => null),
+        firestoreDb.collection('live_lessons').where('studentUid', '==', cleanStudentUid).get().catch(() => null),
+      ]);
+
+      if (uSnap && uSnap.exists) {
+        fsUserLoaded = true;
+        const uData = uSnap.data() || {};
+        const uRole = String(uData.role || uData.userRole || '').toLowerCase().trim();
+        const uEmail = String(uData.email || '').toLowerCase().trim();
+        if (uRole === 'admin' || uRole === 'teacher' || uRole === 'tutor' || uRole === 'native_friend') {
+          return cacheAndReturn(false);
+        }
+        if (uEmail && deletedStudentEmails.has(uEmail)) {
+          return cacheAndReturn(false);
+        }
+        if (uData.enrollmentStatus === 'cancelled' || uData.status === 'cancelled') {
+          studentCancelled = true;
+        }
+        collectAssignment(
+          uData.assignedNativeFriendUID || uData.nativeFriendUID || uData.teacherUid || uData.teacherAuthUid || uData.assignedTeacherId || uData.teacherId,
+          uData.teacherEmail || uData.assignedTeacherEmail
+        );
+      }
+
+      if (assignSnap && assignSnap.exists) {
+        fsAssignLoaded = true;
+        const aData = assignSnap.data() || {};
+        collectAssignment(
+          aData.teacherUid || aData.teacherAuthUid || aData.assignedNativeFriendUID || aData.nativeFriendUID || aData.teacherId,
+          aData.teacherEmail
+        );
+      }
+
+      for (const snap of [lessonsSnap, liveLessonsSnap]) {
+        if (!snap || snap.empty) continue;
+        snap.forEach((d: any) => {
+          const l = d.data();
+          if (!l) return;
+          const status = String(l.status || '').toLowerCase().trim();
+          if (status === 'cancelled' || status === 'canceled') return;
+          const lUid = String(l.teacherAuthUid || l.teacherUid || l.tutorUid || l.teacherId || '').trim();
+          const lEmail = String(l.teacherEmail || l.tutorEmail || '').toLowerCase().trim();
+          const matchesUid = Boolean(lUid && allowedTeacherIds.has(lUid));
+          const matchesEmail = Boolean(!lUid && resolvedTeacherEmail && lEmail === resolvedTeacherEmail);
+          const matchesEmailWithMatchingUid = Boolean(
+            resolvedTeacherEmail && lEmail === resolvedTeacherEmail && (!lUid || allowedTeacherIds.has(lUid))
+          );
+          if (matchesUid || matchesEmail || matchesEmailWithMatchingUid) {
+            if (status === 'scheduled' || status === 'pending_reschedule') {
+              hasScheduledLessonWithTeacher = true;
+            } else {
+              hasCompletedLessonWithTeacher = true;
+            }
+          }
+        });
+      }
+    } catch {}
+  }
+
+  // Degraded in-memory fallback strictly when student canonical docs are absent in Firestore
+  if (!fsUserLoaded && !fsAssignLoaded) {
+    const memStudent = (params.dbState.students || []).find(
+      (s: any) => s && (s.uid === cleanStudentUid || s.id === cleanStudentUid || s.studentUid === cleanStudentUid)
+    );
+    if (memStudent) {
+      if (memStudent.enrollmentStatus === 'cancelled' || memStudent.status === 'cancelled') {
+        studentCancelled = true;
+      }
+      collectAssignment(
+        memStudent.assignedNativeFriendUID || memStudent.nativeFriendUID || memStudent.teacherUid || memStudent.teacherId,
+        memStudent.teacherEmail
+      );
+    }
+    const memProfile = Object.values(params.dbState.userProfiles || {}).find(
+      (p: any) => p && p.uid === cleanStudentUid
+    ) as any;
+    if (memProfile) {
+      if (memProfile.enrollmentStatus === 'cancelled' || memProfile.status === 'cancelled') {
+        studentCancelled = true;
+      }
+      collectAssignment(
+        memProfile.assignedNativeFriendUID || memProfile.nativeFriendUID || memProfile.teacherUid || memProfile.teacherId,
+        memProfile.teacherEmail
+      );
+    }
+  }
+
+  for (const l of params.dbState.liveLessons || []) {
+    if (!l) continue;
+    const status = String(l.status || '').toLowerCase().trim();
+    if (status === 'cancelled' || status === 'canceled') continue;
+    if (String(l.studentUid || '').trim() !== cleanStudentUid) continue;
+    const lUid = String(l.teacherAuthUid || l.teacherUid || l.tutorUid || l.teacherId || '').trim();
+    const lEmail = String(l.teacherEmail || l.tutorEmail || '').toLowerCase().trim();
+    if ((lUid && allowedTeacherIds.has(lUid)) || (!lUid && resolvedTeacherEmail && lEmail === resolvedTeacherEmail)) {
+      if (status === 'scheduled' || status === 'pending_reschedule') {
+        hasScheduledLessonWithTeacher = true;
+      } else {
+        hasCompletedLessonWithTeacher = true;
+      }
+    }
+  }
+
+  const directUidMatch = Array.from(assignedTeacherUids).some((u) => allowedTeacherIds.has(u));
+  const directEmailMatch = Boolean(
+    assignedTeacherUids.size === 0 &&
+    resolvedTeacherEmail &&
+    assignedTeacherEmails.has(resolvedTeacherEmail)
+  );
+
+  if (directUidMatch || directEmailMatch) {
+    return cacheAndReturn(true);
+  }
+
+  if (hasScheduledLessonWithTeacher) {
+    return cacheAndReturn(true);
+  }
+
+  const hasConflictingAssignment =
+    studentCancelled ||
+    Array.from(allAssignedTeacherUids).some((u) => !allowedTeacherIds.has(u)) ||
+    (Boolean(resolvedTeacherEmail) &&
+      allAssignedTeacherUids.size === 0 &&
+      Array.from(allAssignedTeacherEmails).some((e) => e !== resolvedTeacherEmail));
+
+  if (!hasConflictingAssignment && hasCompletedLessonWithTeacher) {
+    return cacheAndReturn(true);
+  }
+
+  return cacheAndReturn(false);
+}
+
+const DIRECT_MESSAGES_COLLECTION = 'direct_messages';
+
+function requireChatFirestoreDb(res: express.Response) {
+  const firestoreDb = getFirestoreDb();
+  if (!firestoreDb) {
+    res.status(503).json({
+      error: 'Service Unavailable',
+      message: 'Firestore (default) persistence is unavailable for chat messages.',
+    });
+    return null;
+  }
+  return firestoreDb;
+}
+
+function isValidChatMessageId(msgId: string): boolean {
+  return Boolean(msgId && msgId.length <= 200 && !msgId.includes('/') && msgId !== '.' && msgId !== '..');
+}
+
+function sortChatMessagesChronologically(messages: any[]): any[] {
+  return [...messages].sort((a, b) => {
+    const ta = new Date(a?.createdAt || a?.timestamp || 0).getTime() || 0;
+    const tb = new Date(b?.createdAt || b?.timestamp || 0).getTime() || 0;
+    if (ta !== tb) return ta - tb;
+    return String(a?.id || '').localeCompare(String(b?.id || ''));
+  });
+}
+
+function sanitizeChatMessageForFirestore(msg: Record<string, any>): Record<string, any> {
+  return removeUndefinedFields(JSON.parse(JSON.stringify(msg)));
+}
+
+function extractMessageParticipants(msg: any): { studentUid: string; nativeFriendUid: string } {
+  const studentUid = String(msg?.studentUid || '').trim();
+  const nativeFriendUid = String(msg?.nativeFriendUid || msg?.teacherUid || msg?.tutorUid || '').trim();
+  return { studentUid, nativeFriendUid };
+}
+
+async function fetchRawChatMessagesFromFirestore(params: {
+  firestoreDb: NonNullable<ReturnType<typeof getFirestoreDb>>;
+  callerUid: string;
+  isAdmin: boolean;
+  isTeacher: boolean;
+  filterStudentUid?: string;
+  filterNativeFriendUid?: string;
+}): Promise<any[]> {
+  const { firestoreDb, callerUid, isAdmin, isTeacher, filterStudentUid, filterNativeFriendUid } = params;
+  const col = firestoreDb.collection(DIRECT_MESSAGES_COLLECTION);
+
+  let snap;
+  if (isAdmin) {
+    if (filterStudentUid) {
+      snap = await col.where('studentUid', '==', filterStudentUid).get();
+    } else if (filterNativeFriendUid) {
+      snap = await col.where('nativeFriendUid', '==', filterNativeFriendUid).get();
+    } else {
+      snap = await col.get();
+    }
+  } else if (isTeacher) {
+    snap = await col.where('nativeFriendUid', '==', callerUid).get();
+  } else {
+    snap = await col.where('studentUid', '==', callerUid).get();
+  }
+
+  const docs: any[] = [];
+  if (snap && !snap.empty) {
+    snap.forEach((docSnap: any) => {
+      const data = typeof docSnap.data === 'function' ? docSnap.data() : docSnap;
+      if (data && typeof data === 'object') {
+        docs.push({
+          ...data,
+          id: String(data.id || docSnap.id || '').trim(),
+        });
+      }
+    });
+  }
+  return docs;
+}
+
+async function filterAuthorizedChatMessagesForCaller(params: {
+  messages: any[];
+  callerUid: string;
+  isAdmin: boolean;
+  isTeacher: boolean;
+  isUnregistered: boolean;
+  dbState: AppDb;
+  filterStudentUid?: string;
+  filterNativeFriendUid?: string;
+}): Promise<any[]> {
+  const {
+    messages,
+    callerUid,
+    isAdmin,
+    isTeacher,
+    isUnregistered,
+    dbState,
+    filterStudentUid,
+    filterNativeFriendUid,
+  } = params;
+
+  if (isUnregistered) {
+    return [];
+  }
+
+  const linkCache = new Map<string, boolean>();
+  const result: any[] = [];
+
+  for (const m of messages || []) {
+    if (!m || typeof m !== 'object') continue;
+    const { studentUid, nativeFriendUid } = extractMessageParticipants(m);
+
+    if (filterStudentUid && studentUid !== filterStudentUid) continue;
+    if (filterNativeFriendUid && nativeFriendUid !== filterNativeFriendUid) continue;
+
+    if (isAdmin) {
+      result.push(m);
+      continue;
+    }
+
+    if (!isValidCanonicalUid(studentUid) || !isValidCanonicalUid(nativeFriendUid)) {
+      continue;
+    }
+
+    if (isTeacher) {
+      if (nativeFriendUid !== callerUid) continue;
+      const linked = await isCanonicalChatParticipantLinkServer({
+        studentUid,
+        teacherUid: callerUid,
+        dbState,
+        linkCache,
+      });
+      if (linked) result.push(m);
+    } else {
+      if (studentUid !== callerUid) continue;
+      const linked = await isCanonicalChatParticipantLinkServer({
+        studentUid: callerUid,
+        teacherUid: nativeFriendUid,
+        dbState,
+        linkCache,
+      });
+      if (linked) result.push(m);
+    }
+  }
+
+  return sortChatMessagesChronologically(result);
+}
+
+async function fetchAuthorizedChatMessagesFromFirestore(params: {
+  firestoreDb: NonNullable<ReturnType<typeof getFirestoreDb>>;
+  callerUid: string;
+  isAdmin: boolean;
+  isTeacher: boolean;
+  isUnregistered: boolean;
+  dbState: AppDb;
+  filterStudentUid?: string;
+  filterNativeFriendUid?: string;
+}): Promise<any[]> {
+  if (params.isUnregistered) {
+    return [];
+  }
+  const rawMessages = await fetchRawChatMessagesFromFirestore({
+    firestoreDb: params.firestoreDb,
+    callerUid: params.callerUid,
+    isAdmin: params.isAdmin,
+    isTeacher: params.isTeacher,
+    filterStudentUid: params.filterStudentUid,
+    filterNativeFriendUid: params.filterNativeFriendUid,
+  });
+  return filterAuthorizedChatMessagesForCaller({
+    messages: rawMessages,
+    callerUid: params.callerUid,
+    isAdmin: params.isAdmin,
+    isTeacher: params.isTeacher,
+    isUnregistered: params.isUnregistered,
+    dbState: params.dbState,
+    filterStudentUid: params.filterStudentUid,
+    filterNativeFriendUid: params.filterNativeFriendUid,
+  });
+}
+
+app.get('/api/chat-messages', firebaseAuthMiddleware, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+
+  const ctx = await resolveChatCallerContext(req, res);
+  if (!ctx) return;
+
+  const qStudentUid = String(req.query.studentUid || '').trim();
+  const qNativeFriendUid = String(req.query.nativeFriendUid || req.query.teacherUid || '').trim();
+
+  if (ctx.isUnregistered) {
+    if (qStudentUid || qNativeFriendUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Access denied: unregistered user cannot query conversation history.',
+      });
+    }
+    return res.json({ messages: [] });
+  }
+
+  if (!ctx.isAdmin) {
+    if (ctx.isTeacher) {
+      if (qNativeFriendUid && qNativeFriendUid !== ctx.callerUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: teachers can only read their own conversations.',
+        });
+      }
+      if (qStudentUid) {
+        const linked = await isCanonicalChatParticipantLinkServer({
+          studentUid: qStudentUid,
+          teacherUid: ctx.callerUid,
+          dbState: ctx.db,
+        });
+        if (!linked) {
+          return res.status(403).json({
+            error: 'Forbidden',
+            message: 'Access denied: student is not canonically linked to this Native Friend.',
+          });
+        }
+      }
+    } else {
+      if (qStudentUid && qStudentUid !== ctx.callerUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: students can only read their own conversations.',
+        });
+      }
+      if (qNativeFriendUid) {
+        const linked = await isCanonicalChatParticipantLinkServer({
+          studentUid: ctx.callerUid,
+          teacherUid: qNativeFriendUid,
+          dbState: ctx.db,
+        });
+        if (!linked) {
+          return res.status(403).json({
+            error: 'Forbidden',
+            message: 'Access denied: Native Friend is not canonically linked to this student.',
+          });
+        }
+      }
+    }
+  }
+
+  const firestoreDb = requireChatFirestoreDb(res);
+  if (!firestoreDb) return;
+
+  try {
+    const messages = await fetchAuthorizedChatMessagesFromFirestore({
+      firestoreDb,
+      callerUid: ctx.callerUid,
+      isAdmin: ctx.isAdmin,
+      isTeacher: ctx.isTeacher,
+      isUnregistered: ctx.isUnregistered,
+      dbState: ctx.db,
+      filterStudentUid: qStudentUid || undefined,
+      filterNativeFriendUid: qNativeFriendUid || undefined,
+    });
+
+    return res.json({ messages });
+  } catch (err: any) {
+    console.error('[chat-messages GET] Firestore error:', err);
+    return res.status(500).json({
+      error: 'Internal Server Error',
+      message: 'Failed to load chat messages from Firestore.',
+    });
+  }
 });
 
-app.delete('/api/chat-messages', (req, res) => {
-  const db = readDb();
-  db.chatMessages = [];
-  writeDb(db);
-  res.json({ success: true, messages: [] });
+app.post('/api/chat-messages', firebaseAuthMiddleware, async (req, res) => {
+  const ctx = await resolveChatCallerContext(req, res, { rejectUnregistered: true });
+  if (!ctx) return;
+
+  const { message, messages } = req.body || {};
+
+  if (Array.isArray(messages)) {
+    if (!ctx.isAdmin) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Access denied: bulk replacement of chat messages requires administrator privileges.',
+      });
+    }
+
+    const firestoreDb = requireChatFirestoreDb(res);
+    if (!firestoreDb) return;
+
+    const validMessages = messages
+      .filter((m) => m && typeof m === 'object' && typeof m.id === 'string' && isValidChatMessageId(m.id.trim()))
+      .map((m) =>
+        sanitizeChatMessageForFirestore({
+          ...m,
+          id: m.id.trim(),
+          createdAt: typeof m.createdAt === 'string' && m.createdAt ? m.createdAt : new Date().toISOString(),
+          read: Boolean(m.read),
+          updatedAt: new Date().toISOString(),
+        })
+      );
+
+    try {
+      const col = firestoreDb.collection(DIRECT_MESSAGES_COLLECTION);
+      const existingSnap = await col.get();
+      const targetIds = new Set(validMessages.map((m) => m.id));
+      const deletePromises: Promise<any>[] = [];
+      if (existingSnap && !existingSnap.empty) {
+        existingSnap.forEach((docSnap: any) => {
+          if (!targetIds.has(docSnap.id)) {
+            deletePromises.push(col.doc(docSnap.id).delete());
+          }
+        });
+      }
+      await Promise.all([
+        ...deletePromises,
+        ...validMessages.map((m) => col.doc(m.id).set(m)),
+      ]);
+
+      return res.json({ success: true, messages: sortChatMessagesChronologically(validMessages) });
+    } catch (err: any) {
+      console.error('[chat-messages POST bulk] Firestore error:', err);
+      return res.status(500).json({
+        error: 'Internal Server Error',
+        message: 'Failed to persist chat messages to Firestore.',
+      });
+    }
+  }
+
+  if (!message || typeof message !== 'object') {
+    return res.status(400).json({
+      error: 'Bad Request',
+      message: 'Message payload is required.',
+    });
+  }
+
+  const msgId = typeof message.id === 'string' ? message.id.trim() : '';
+  const cleanText = typeof message.text === 'string' ? message.text.trim().slice(0, 2000) : '';
+  if (!isValidChatMessageId(msgId) || !cleanText) {
+    return res.status(400).json({
+      error: 'Bad Request',
+      message: 'Valid message id and non-empty text are required.',
+    });
+  }
+
+  const studentUid = String(message.studentUid || '').trim();
+  const nativeFriendUid = String(message.nativeFriendUid || message.teacherUid || message.tutorUid || '').trim();
+  const rawSenderUid = typeof message.senderUid === 'string' ? message.senderUid.trim() : '';
+  const rawRecipientUid = typeof message.recipientUid === 'string' ? message.recipientUid.trim() : '';
+  const rawSenderRole = typeof message.senderRole === 'string' ? message.senderRole.trim() : '';
+
+  if (!isValidCanonicalUid(studentUid) || !isValidCanonicalUid(nativeFriendUid)) {
+    if (!ctx.isAdmin) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Access denied: valid canonical studentUid and nativeFriendUid are required.',
+      });
+    }
+    return res.status(400).json({
+      error: 'Bad Request',
+      message: 'Valid canonical studentUid and nativeFriendUid are required.',
+    });
+  }
+
+  if (!ctx.isAdmin) {
+    if (ctx.isTeacher) {
+      if (nativeFriendUid !== ctx.callerUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: teachers can only send messages in their own conversations.',
+        });
+      }
+      if (rawSenderUid && rawSenderUid !== ctx.callerUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: senderUid must match authenticated Native Friend.',
+        });
+      }
+      if (rawRecipientUid && rawRecipientUid !== studentUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: recipientUid must match the conversation student.',
+        });
+      }
+      if (rawSenderRole && rawSenderRole !== 'teacher') {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: invalid senderRole for Native Friend.',
+        });
+      }
+      const linked = await isCanonicalChatParticipantLinkServer({
+        studentUid,
+        teacherUid: ctx.callerUid,
+        dbState: ctx.db,
+      });
+      if (!linked) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: student is not canonically linked to this Native Friend.',
+        });
+      }
+    } else {
+      if (studentUid !== ctx.callerUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: students can only send messages in their own conversations.',
+        });
+      }
+      if (rawSenderUid && rawSenderUid !== ctx.callerUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: senderUid must match authenticated student.',
+        });
+      }
+      if (rawRecipientUid && rawRecipientUid !== nativeFriendUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: recipientUid must match the conversation Native Friend.',
+        });
+      }
+      if (rawSenderRole && rawSenderRole !== 'student') {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: invalid senderRole for student.',
+        });
+      }
+      const linked = await isCanonicalChatParticipantLinkServer({
+        studentUid: ctx.callerUid,
+        teacherUid: nativeFriendUid,
+        dbState: ctx.db,
+      });
+      if (!linked) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: Native Friend is not canonically linked to this student.',
+        });
+      }
+    }
+  } else {
+    if (rawSenderRole && rawSenderRole !== 'admin' && rawSenderRole !== 'system') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Access denied: administrator messages must use admin or system senderRole.',
+      });
+    }
+  }
+
+  const firestoreDb = requireChatFirestoreDb(res);
+  if (!firestoreDb) return;
+
+  try {
+    const col = firestoreDb.collection(DIRECT_MESSAGES_COLLECTION);
+    const docRef = col.doc(msgId);
+    const existingSnap = await docRef.get();
+    const existing = existingSnap && existingSnap.exists ? existingSnap.data() : null;
+
+    if (existing && !ctx.isAdmin) {
+      const existingParts = extractMessageParticipants(existing);
+      if (
+        existingParts.studentUid !== studentUid ||
+        existingParts.nativeFriendUid !== nativeFriendUid ||
+        String(existing.senderUid || '').trim() !== ctx.callerUid
+      ) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: cannot overwrite another user or conversation message.',
+        });
+      }
+    }
+
+    const authoritativeSenderRole = ctx.isAdmin
+      ? (rawSenderRole === 'system' ? 'system' : 'admin')
+      : ctx.isTeacher
+      ? 'teacher'
+      : 'student';
+
+    const nowIso = new Date().toISOString();
+    const {
+      read: _ignoredClientRead,
+      readAt: _ignoredClientReadAt,
+      readByUid: _ignoredClientReadByUid,
+      ...safeClientFields
+    } = message;
+
+    const normalizedMessage = sanitizeChatMessageForFirestore({
+      ...safeClientFields,
+      id: msgId,
+      studentUid,
+      nativeFriendUid,
+      senderUid: ctx.callerUid,
+      senderEmail: ctx.callerEmail || (typeof message.senderEmail === 'string' ? message.senderEmail.toLowerCase().trim() : ''),
+      senderRole: authoritativeSenderRole,
+      recipientUid:
+        ctx.isAdmin
+          ? (rawRecipientUid || studentUid)
+          : ctx.isTeacher
+          ? studentUid
+          : nativeFriendUid,
+      text: cleanText,
+      createdAt: existing?.createdAt || (typeof message.createdAt === 'string' && message.createdAt ? message.createdAt : nowIso),
+      read: existing ? Boolean(existing.read) : false,
+      ...(existing?.readAt ? { readAt: existing.readAt } : {}),
+      ...(existing?.readByUid ? { readByUid: existing.readByUid } : {}),
+      updatedAt: nowIso,
+      _schemaVersion: typeof message._schemaVersion === 'number' ? message._schemaVersion : 1,
+    });
+
+    await docRef.set(normalizedMessage);
+
+    const authorizedMessages = await fetchAuthorizedChatMessagesFromFirestore({
+      firestoreDb,
+      callerUid: ctx.callerUid,
+      isAdmin: ctx.isAdmin,
+      isTeacher: ctx.isTeacher,
+      isUnregistered: ctx.isUnregistered,
+      dbState: ctx.db,
+    });
+
+    return res.json({ success: true, message: normalizedMessage, messages: authorizedMessages });
+  } catch (err: any) {
+    console.error('[chat-messages POST] Firestore error:', err);
+    return res.status(500).json({
+      error: 'Internal Server Error',
+      message: 'Failed to persist chat message to Firestore.',
+    });
+  }
+});
+
+app.patch('/api/chat-messages', firebaseAuthMiddleware, async (req, res) => {
+  const ctx = await resolveChatCallerContext(req, res, { rejectUnregistered: true });
+  if (!ctx) return;
+
+  const rawBody = req.body && typeof req.body === 'object' ? req.body : {};
+  const rawList = Array.isArray(rawBody.messageIds)
+    ? rawBody.messageIds
+    : Array.isArray(rawBody.ids)
+    ? rawBody.ids
+    : [];
+  const singleId = rawBody.id || rawBody.messageId || req.query.id || req.query.messageId;
+  const candidateIds = singleId ? [...rawList, singleId] : rawList;
+
+  const messageIds: string[] = Array.from(
+    new Set(candidateIds.map((id: unknown) => (typeof id === 'string' ? id.trim() : '')).filter(Boolean))
+  );
+
+  if (messageIds.length === 0 || messageIds.length > 200 || messageIds.some((id) => !isValidChatMessageId(id))) {
+    return res.status(400).json({
+      error: 'Bad Request',
+      message: 'A valid non-empty list of messageIds (max 200) is required.',
+    });
+  }
+
+  const firestoreDb = requireChatFirestoreDb(res);
+  if (!firestoreDb) return;
+
+  try {
+    const col = firestoreDb.collection(DIRECT_MESSAGES_COLLECTION);
+    const snaps = await Promise.all(messageIds.map((id) => col.doc(id).get()));
+
+    for (const snap of snaps) {
+      if (!snap || !snap.exists) {
+        return res.status(404).json({
+          error: 'Not Found',
+          message: 'One or more chat messages were not found.',
+        });
+      }
+
+      const msgData = snap.data() || {};
+      if (ctx.isAdmin) {
+        continue;
+      }
+
+      const parts = extractMessageParticipants(msgData);
+      if (!isValidCanonicalUid(parts.studentUid) || !isValidCanonicalUid(parts.nativeFriendUid)) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: message has invalid conversation participants.',
+        });
+      }
+
+      const senderUid = String(msgData.senderUid || '').trim();
+      const senderRole = String(msgData.senderRole || '').trim().toLowerCase();
+
+      if (ctx.isTeacher) {
+        if (parts.nativeFriendUid !== ctx.callerUid) {
+          return res.status(403).json({
+            error: 'Forbidden',
+            message: 'Access denied: teachers can only mark messages in their own conversations as read.',
+          });
+        }
+        const linked = await isCanonicalChatParticipantLinkServer({
+          studentUid: parts.studentUid,
+          teacherUid: ctx.callerUid,
+          dbState: ctx.db,
+        });
+        if (!linked) {
+          return res.status(403).json({
+            error: 'Forbidden',
+            message: 'Access denied: student is not canonically linked to this Native Friend.',
+          });
+        }
+        if (senderUid === ctx.callerUid || senderRole === 'teacher') {
+          return res.status(403).json({
+            error: 'Forbidden',
+            message: 'Access denied: only the recipient can mark incoming messages as read.',
+          });
+        }
+      } else {
+        if (parts.studentUid !== ctx.callerUid) {
+          return res.status(403).json({
+            error: 'Forbidden',
+            message: 'Access denied: students can only mark messages in their own conversations as read.',
+          });
+        }
+        const linked = await isCanonicalChatParticipantLinkServer({
+          studentUid: ctx.callerUid,
+          teacherUid: parts.nativeFriendUid,
+          dbState: ctx.db,
+        });
+        if (!linked) {
+          return res.status(403).json({
+            error: 'Forbidden',
+            message: 'Access denied: Native Friend is not canonically linked to this student.',
+          });
+        }
+        if (senderUid === ctx.callerUid || senderRole === 'student') {
+          return res.status(403).json({
+            error: 'Forbidden',
+            message: 'Access denied: only the recipient can mark incoming messages as read.',
+          });
+        }
+      }
+    }
+
+    const nowIso = new Date().toISOString();
+    await Promise.all(
+      snaps.map((snap) =>
+        col.doc(snap.id).update({
+          read: true,
+          readAt: nowIso,
+          readByUid: ctx.callerUid,
+          updatedAt: nowIso,
+        })
+      )
+    );
+
+    const authorizedMessages = await fetchAuthorizedChatMessagesFromFirestore({
+      firestoreDb,
+      callerUid: ctx.callerUid,
+      isAdmin: ctx.isAdmin,
+      isTeacher: ctx.isTeacher,
+      isUnregistered: ctx.isUnregistered,
+      dbState: ctx.db,
+    });
+
+    return res.json({
+      success: true,
+      markedIds: messageIds,
+      messages: authorizedMessages,
+    });
+  } catch (err: any) {
+    console.error('[chat-messages PATCH] Firestore error:', err);
+    return res.status(500).json({
+      error: 'Internal Server Error',
+      message: 'Failed to mark chat messages as read in Firestore.',
+    });
+  }
+});
+
+app.delete('/api/chat-messages', firebaseAuthMiddleware, async (req, res) => {
+  const ctx = await resolveChatCallerContext(req, res, { rejectUnregistered: true });
+  if (!ctx) return;
+
+  const messageId = String(req.query.messageId || req.query.id || req.body?.messageId || req.body?.id || '').trim();
+  const targetStudentUid = String(req.query.studentUid || req.body?.studentUid || '').trim();
+  const targetNativeFriendUid = String(
+    req.query.nativeFriendUid || req.query.teacherUid || req.body?.nativeFriendUid || req.body?.teacherUid || ''
+  ).trim();
+
+  if (messageId && !isValidChatMessageId(messageId)) {
+    return res.status(400).json({
+      error: 'Bad Request',
+      message: 'Invalid chat message id.',
+    });
+  }
+
+  if (ctx.isAdmin) {
+    const firestoreDb = requireChatFirestoreDb(res);
+    if (!firestoreDb) return;
+
+    try {
+      const col = firestoreDb.collection(DIRECT_MESSAGES_COLLECTION);
+      if (messageId) {
+        await col.doc(messageId).delete();
+      } else if (targetStudentUid || targetNativeFriendUid) {
+        let snap;
+        if (targetStudentUid) {
+          snap = await col.where('studentUid', '==', targetStudentUid).get();
+        } else {
+          snap = await col.where('nativeFriendUid', '==', targetNativeFriendUid).get();
+        }
+        const deletePromises: Promise<any>[] = [];
+        if (snap && !snap.empty) {
+          snap.forEach((docSnap: any) => {
+            const parts = extractMessageParticipants(docSnap.data());
+            const matchesStudent = !targetStudentUid || parts.studentUid === targetStudentUid;
+            const matchesTeacher = !targetNativeFriendUid || parts.nativeFriendUid === targetNativeFriendUid;
+            if (matchesStudent && matchesTeacher) {
+              deletePromises.push(col.doc(docSnap.id).delete());
+            }
+          });
+        }
+        await Promise.all(deletePromises);
+      } else {
+        const snap = await col.get();
+        const deletePromises: Promise<any>[] = [];
+        if (snap && !snap.empty) {
+          snap.forEach((docSnap: any) => {
+            deletePromises.push(col.doc(docSnap.id).delete());
+          });
+        }
+        await Promise.all(deletePromises);
+      }
+
+      const remainingMessages = await fetchAuthorizedChatMessagesFromFirestore({
+        firestoreDb,
+        callerUid: ctx.callerUid,
+        isAdmin: true,
+        isTeacher: false,
+        isUnregistered: false,
+        dbState: ctx.db,
+      });
+
+      return res.json({ success: true, messages: remainingMessages });
+    } catch (err: any) {
+      console.error('[chat-messages DELETE admin] Firestore error:', err);
+      return res.status(500).json({
+        error: 'Internal Server Error',
+        message: 'Failed to delete chat messages from Firestore.',
+      });
+    }
+  }
+
+  // Non-admin callers may never wipe global chat history without a scoped target
+  if (!messageId && !targetStudentUid && !targetNativeFriendUid) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Access denied: clearing all chat history requires administrator privileges.',
+    });
+  }
+
+  // Validate explicit conversation scope filters first if supplied
+  if (ctx.isTeacher) {
+    if (targetNativeFriendUid && targetNativeFriendUid !== ctx.callerUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Access denied: teachers can only delete messages from their own conversations.',
+      });
+    }
+    if (targetStudentUid) {
+      const linked = await isCanonicalChatParticipantLinkServer({
+        studentUid: targetStudentUid,
+        teacherUid: ctx.callerUid,
+        dbState: ctx.db,
+      });
+      if (!linked) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: student is not canonically linked to this Native Friend.',
+        });
+      }
+    }
+  } else {
+    if (targetStudentUid && targetStudentUid !== ctx.callerUid) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Access denied: students can only delete messages from their own conversations.',
+      });
+    }
+    if (targetNativeFriendUid) {
+      const linked = await isCanonicalChatParticipantLinkServer({
+        studentUid: ctx.callerUid,
+        teacherUid: targetNativeFriendUid,
+        dbState: ctx.db,
+      });
+      if (!linked) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: Native Friend is not canonically linked to this student.',
+        });
+      }
+    }
+  }
+
+  const firestoreDb = requireChatFirestoreDb(res);
+  if (!firestoreDb) return;
+
+  try {
+    const col = firestoreDb.collection(DIRECT_MESSAGES_COLLECTION);
+
+    if (messageId) {
+      const msgSnap = await col.doc(messageId).get();
+      if (!msgSnap || !msgSnap.exists) {
+        return res.status(404).json({
+          error: 'Not Found',
+          message: 'Chat message not found.',
+        });
+      }
+      const targetMsg = msgSnap.data();
+      const parts = extractMessageParticipants(targetMsg);
+
+      if (targetStudentUid && parts.studentUid !== targetStudentUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: message does not belong to specified student.',
+        });
+      }
+      if (targetNativeFriendUid && parts.nativeFriendUid !== targetNativeFriendUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: message does not belong to specified Native Friend.',
+        });
+      }
+
+      let isParticipant = false;
+      if (ctx.isTeacher) {
+        isParticipant =
+          parts.nativeFriendUid === ctx.callerUid &&
+          (await isCanonicalChatParticipantLinkServer({
+            studentUid: parts.studentUid,
+            teacherUid: ctx.callerUid,
+            dbState: ctx.db,
+          }));
+      } else {
+        isParticipant =
+          parts.studentUid === ctx.callerUid &&
+          (await isCanonicalChatParticipantLinkServer({
+            studentUid: ctx.callerUid,
+            teacherUid: parts.nativeFriendUid,
+            dbState: ctx.db,
+          }));
+      }
+
+      if (!isParticipant) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: you are not a legitimate participant of this conversation.',
+        });
+      }
+
+      await col.doc(messageId).delete();
+    } else {
+      // Conversation-scoped delete requires both participants explicitly authorized
+      const scopedStudentUid = ctx.isTeacher ? targetStudentUid : ctx.callerUid;
+      const scopedNativeFriendUid = ctx.isTeacher ? ctx.callerUid : targetNativeFriendUid;
+
+      if (!scopedStudentUid || !scopedNativeFriendUid) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: both studentUid and nativeFriendUid are required to clear a conversation.',
+        });
+      }
+
+      const linked = await isCanonicalChatParticipantLinkServer({
+        studentUid: scopedStudentUid,
+        teacherUid: scopedNativeFriendUid,
+        dbState: ctx.db,
+      });
+      if (!linked) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'Access denied: you are not a legitimate participant of this conversation.',
+        });
+      }
+
+      const snap = await col.where('studentUid', '==', scopedStudentUid).get();
+      const deletePromises: Promise<any>[] = [];
+      if (snap && !snap.empty) {
+        snap.forEach((docSnap: any) => {
+          const parts = extractMessageParticipants(docSnap.data());
+          if (parts.studentUid === scopedStudentUid && parts.nativeFriendUid === scopedNativeFriendUid) {
+            deletePromises.push(col.doc(docSnap.id).delete());
+          }
+        });
+      }
+      await Promise.all(deletePromises);
+    }
+
+    const remainingAuthorized = await fetchAuthorizedChatMessagesFromFirestore({
+      firestoreDb,
+      callerUid: ctx.callerUid,
+      isAdmin: ctx.isAdmin,
+      isTeacher: ctx.isTeacher,
+      isUnregistered: ctx.isUnregistered,
+      dbState: ctx.db,
+    });
+
+    return res.json({ success: true, messages: remainingAuthorized });
+  } catch (err: any) {
+    console.error('[chat-messages DELETE] Firestore error:', err);
+    return res.status(500).json({
+      error: 'Internal Server Error',
+      message: 'Failed to delete chat message from Firestore.',
+    });
+  }
 });
 
 // 7. Routines Endpoints

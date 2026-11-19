@@ -350,6 +350,7 @@ export default function App() {
           setAdminCreditEditOpen(false);
           setAdminCreditFeedback(null);
         }
+        resetTeacherMeetSettingsState();
         previousAuthUidRef.current = null;
         setCurrentAccount(null);
         setIsAuthReady(true);
@@ -358,6 +359,7 @@ export default function App() {
 
       if (prevUid && prevUid !== nextUid) {
         clearAllClientSessionCaches({ preserveFirebaseAuth: true });
+        resetTeacherMeetSettingsState();
         activeStudentUidRef.current = '';
         activeJournalLoadUidRef.current = '';
         setDailyJournalEntries([]);
@@ -650,17 +652,16 @@ export default function App() {
     intervalMs: DEFAULT_LESSONS_POLL_INTERVAL_MS,
     enabled: Boolean(currentAccount?.uid),
   });
-  const [teacherMeetSettings, setTeacherMeetSettings] = useState<Record<string, TeacherMeetSettings>>({
-    'itissimple.school@gmail.com': {
-      teacherEmail: 'itissimple.school@gmail.com',
-      meetLink: 'https://meet.google.com/gmt-kxnw-zpq',
-      workingHoursStart: '08:00',
-      workingHoursEnd: '18:00',
-      slotDurationMinutes: 30,
-      availableDays: ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'],
-      timezone: 'America/Toronto',
-    },
-  });
+  const [teacherMeetSettings, setTeacherMeetSettings] = useState<Record<string, TeacherMeetSettings>>({});
+  const activeTeacherSettingsSessionKeyRef = useRef<string>('');
+  const teacherSettingsSessionVersionRef = useRef<number>(0);
+  const teacherSettingsResetCountRef = useRef<number>(0);
+  const resetTeacherMeetSettingsState = useCallback(() => {
+    teacherSettingsResetCountRef.current += 1;
+    teacherSettingsSessionVersionRef.current += 1;
+    activeTeacherSettingsSessionKeyRef.current = '';
+    setTeacherMeetSettings({});
+  }, []);
 
   const [contractedLessons, setContractedLessons] = useState<Record<string, number>>({});
 
@@ -845,9 +846,13 @@ export default function App() {
 
   // 10. Fetch initial data from server on mount
   useEffect(() => {
+    let isCancelled = false;
+    const initialResetCount = teacherSettingsResetCountRef.current;
+
     async function loadInitialData() {
       try {
         const authUser = await waitForAuthUser().catch(() => null);
+        const initialAuthUid = authUser?.uid || null;
         let tutorToken: string | null = null;
         if (authUser) {
           const isAdmin = await isAuthorizedAdminUser(authUser).catch(() => false);
@@ -866,7 +871,7 @@ export default function App() {
         const [routinesRes, studentsRes, settingsRes, landingRes, tutorsRes] = await Promise.all([
           fetch('/api/routines').catch(() => null),
           fetch('/api/students', { headers: tutorHeaders }).catch(() => null),
-          fetch('/api/teacher-settings').catch(() => null),
+          tutorToken ? fetch('/api/teacher-settings', { headers: tutorHeaders }).catch(() => null) : Promise.resolve(null),
           fetch('/api/landing-content').catch(() => null),
           fetch('/api/tutors', { headers: tutorHeaders }).catch(() => null),
         ]);
@@ -885,10 +890,16 @@ export default function App() {
           }
         }
 
+        const isSameInitialSession = () =>
+          !isCancelled &&
+          Boolean(initialAuthUid) &&
+          (auth.currentUser?.uid || null) === initialAuthUid &&
+          teacherSettingsResetCountRef.current === initialResetCount;
+
         if (settingsRes && settingsRes.ok) {
           const data = await settingsRes.json();
-          if (data && typeof data === 'object') {
-            setTeacherMeetSettings((prev) => ({ ...prev, ...data }));
+          if (isSameInitialSession() && data && typeof data === 'object') {
+            setTeacherMeetSettings(data);
           }
         }
 
@@ -903,27 +914,29 @@ export default function App() {
           const data = await tutorsRes.json();
           if (Array.isArray(data) && data.length > 0) {
             setTutors(data);
-            setTeacherMeetSettings((prev) => {
-              const updated = { ...prev };
-              data.forEach((tut: any) => {
-                const email = (tut.email || '').toLowerCase().trim();
-                const mUrl = (tut.meetUrl || tut.meetLink || '').trim();
-                if (email && mUrl) {
-                  updated[email] = {
-                    ...(updated[email] || {
-                      workingHoursStart: '08:00',
-                      workingHoursEnd: '18:00',
-                      slotDurationMinutes: 30,
-                      availableDays: tut.availableDays || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'],
-                      timezone: tut.timezone || 'America/Sao_Paulo',
-                    }),
-                    teacherEmail: email,
-                    meetLink: mUrl,
-                  };
-                }
+            if (isSameInitialSession()) {
+              setTeacherMeetSettings((prev) => {
+                const updated = { ...prev };
+                data.forEach((tut: any) => {
+                  const email = (tut.email || '').toLowerCase().trim();
+                  const mUrl = (tut.meetUrl || tut.meetLink || '').trim();
+                  if (email && mUrl) {
+                    updated[email] = {
+                      ...(updated[email] || {
+                        workingHoursStart: '08:00',
+                        workingHoursEnd: '18:00',
+                        slotDurationMinutes: 30,
+                        availableDays: tut.availableDays || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'],
+                        timezone: tut.timezone || 'America/Sao_Paulo',
+                      }),
+                      teacherEmail: email,
+                      meetLink: mUrl,
+                    };
+                  }
+                });
+                return updated;
               });
-              return updated;
-            });
+            }
           }
         }
         // Authoritative Native Friends hydration from Firestore handled by useNativeFriends hook
@@ -934,6 +947,9 @@ export default function App() {
     }
 
     loadInitialData();
+    return () => {
+      isCancelled = true;
+    };
   }, []);
 
   // Check for direct /admin, #admin, /teacher, or #teacher URL triggers with strict RBAC enforcement
@@ -1635,6 +1651,7 @@ export default function App() {
       setStudentDictionaryEntries([]);
       setUserProfile(createDefaultStudentProfile(null));
       setRoutinesByDay(createCleanStudentRoutines());
+      resetTeacherMeetSettingsState();
       return;
     }
 
@@ -1642,6 +1659,13 @@ export default function App() {
     const role = currentAccount.role;
     const cleanEmail = email.toLowerCase().trim();
     const uid = normalizeUid(currentAccount.uid, cleanEmail);
+    const teacherSettingsSessionKey = `${uid || cleanEmail}::${role}`;
+    if (activeTeacherSettingsSessionKeyRef.current !== teacherSettingsSessionKey) {
+      teacherSettingsSessionVersionRef.current += 1;
+      activeTeacherSettingsSessionKeyRef.current = teacherSettingsSessionKey;
+      setTeacherMeetSettings({});
+    }
+    const expectedTeacherSettingsVersion = teacherSettingsSessionVersionRef.current;
     activeStudentUidRef.current = role === 'student' ? uid : '';
     const queryParams = `email=${encodeURIComponent(email)}&role=${encodeURIComponent(role)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`;
 
@@ -1768,12 +1792,25 @@ export default function App() {
           const profileHeaders: Record<string, string> = {};
           if (studentToken) profileHeaders['Authorization'] = `Bearer ${studentToken}`;
           // A. Fetch directly from Firestore first (master source of truth for assigned Native Friend & profile)
-          const [fsProfile, profileRes] = await Promise.all([
+          const [fsProfile, profileRes, studentMeetRes] = await Promise.all([
             fetchStudentProfileFromFirestore(uid, email).catch(() => null),
             fetch(`/api/user-profile?email=${encodeURIComponent(email)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`, {
               headers: profileHeaders,
             }).catch(() => null),
+            studentToken ? fetch('/api/teacher-settings', { headers: profileHeaders }).catch(() => null) : Promise.resolve(null),
           ]);
+
+          if (studentMeetRes && studentMeetRes.ok) {
+            const meetData = await studentMeetRes.json().catch(() => null);
+            if (
+              !isCancelled &&
+              teacherSettingsSessionVersionRef.current === expectedTeacherSettingsVersion &&
+              meetData &&
+              typeof meetData === 'object'
+            ) {
+              setTeacherMeetSettings(meetData);
+            }
+          }
 
           let loadedProfile: UserProfile | null = null;
           let apiProfileData: any = null;
@@ -2054,14 +2091,36 @@ export default function App() {
       loadStudentData();
     } else if (role === 'teacher') {
       // 4. If teacher, fetch isolated teacher settings and tutor profile
-      fetch(`/api/teacher-settings?teacherEmail=${encodeURIComponent(email)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`)
-        .then((r) => (r.ok ? r.json() : null))
-        .then((settings) => {
-          if (settings && typeof settings === 'object' && Object.keys(settings).length > 0) {
-            setTeacherMeetSettings((prev) => ({ ...prev, ...settings }));
+      (async () => {
+        try {
+          const teacherToken = await getAccessToken().catch(() => null);
+          if (!teacherToken) return;
+          const r = await fetch(
+            `/api/teacher-settings?teacherEmail=${encodeURIComponent(email)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`,
+            { headers: { Authorization: `Bearer ${teacherToken}` } }
+          );
+          if (!r.ok || isCancelled) return;
+          const settings = await r.json();
+          if (
+            !isCancelled &&
+            teacherSettingsSessionVersionRef.current === expectedTeacherSettingsVersion &&
+            settings &&
+            typeof settings === 'object' &&
+            Object.keys(settings).length > 0
+          ) {
+            if ('meetLink' in settings || 'teacherEmail' in settings || 'availability' in settings || 'availableDays' in settings) {
+              setTeacherMeetSettings({
+                [cleanEmail]: settings,
+                ...(uid ? { [uid]: settings } : {}),
+              });
+            } else {
+              setTeacherMeetSettings(settings);
+            }
           }
-        })
-        .catch((err) => console.warn('Could not fetch teacher settings:', err));
+        } catch (err) {
+          console.warn('Could not fetch teacher settings:', err);
+        }
+      })();
 
       async function loadTeacherProfile() {
         try {
@@ -2111,6 +2170,28 @@ export default function App() {
         }
       }
       loadTeacherProfile();
+    } else if (role === 'admin') {
+      (async () => {
+        try {
+          const adminToken = (await getAdminAccessToken().catch(() => null)) || (await getAccessToken().catch(() => null));
+          if (!adminToken) return;
+          const r = await fetch('/api/teacher-settings', {
+            headers: { Authorization: `Bearer ${adminToken}` },
+          });
+          if (!r.ok || isCancelled) return;
+          const data = await r.json();
+          if (
+            !isCancelled &&
+            teacherSettingsSessionVersionRef.current === expectedTeacherSettingsVersion &&
+            data &&
+            typeof data === 'object'
+          ) {
+            setTeacherMeetSettings(data);
+          }
+        } catch (err) {
+          console.warn('Could not fetch admin teacher settings:', err);
+        }
+      })();
     }
 
     // Fetch user-isolated student dictionary entries and journal entries directly from Firestore
@@ -3575,6 +3656,7 @@ export default function App() {
 
   // Handler: Change active account (teacher vs student)
   const handleSwitchAccount = (account: GoogleAccount) => {
+    resetTeacherMeetSettingsState();
     setCurrentAccount(account);
     setRoutinesByDay(defaultRoutinesByDay);
     if (account.role === 'student') {
@@ -3586,6 +3668,7 @@ export default function App() {
 
   // Handler: Add new Google account
   const handleAddAccount = (newAccount: GoogleAccount) => {
+    resetTeacherMeetSettingsState();
     setAvailableAccounts((prev) => [...prev, newAccount]);
     setCurrentAccount(newAccount);
     setRoutinesByDay(defaultRoutinesByDay);
@@ -3608,10 +3691,13 @@ export default function App() {
       (currentAccount && currentAccount.email.toLowerCase() !== account.email.toLowerCase())
     ) {
       clearAllClientSessionCaches({ preserveFirebaseAuth: true });
+      resetTeacherMeetSettingsState();
       setSelectedStudentFilter('all');
       setActiveStudentActivity(null);
       setAdminCreditEditOpen(false);
       setAdminCreditFeedback(null);
+    } else if (!currentAccount || currentAccount.role !== account.role) {
+      resetTeacherMeetSettingsState();
     }
     const safeAccount: GoogleAccount = {
       ...account,
@@ -3755,6 +3841,7 @@ export default function App() {
     activeStudentUidRef.current = '';
     activeJournalLoadUidRef.current = '';
     clearAllClientSessionCaches({ preserveFirebaseAuth: true });
+    resetTeacherMeetSettingsState();
     setCurrentAccount(null);
     setUserProfile(createDefaultStudentProfile(null));
     setDailyJournalEntries([]);

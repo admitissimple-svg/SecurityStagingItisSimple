@@ -1,67 +1,19 @@
-import {
-  collection,
-  doc,
-  setDoc,
-  onSnapshot,
-  query,
-  where,
-} from 'firebase/firestore';
-import { getDb, auth } from '../firebase';
+import { auth } from '../firebase';
 import { DirectMessage } from '../types';
-import { assertSafeFirestoreWrite, stampSchemaVersion } from './firestoreSchemaValidator';
+import { getAccessToken } from './auth';
 
 // Pure in-memory session cache for non-blocking active session rendering
-// ZERO dependency on localStorage: Cloud Firestore is the 100% persistent master
+// ZERO dependency on localStorage or direct client SDK Firestore access:
+// Authenticated backend (/api/chat-messages -> Firestore '(default)' direct_messages) is the single source of truth.
 const inMemoryDmCache = new Map<string, DirectMessage[]>();
+const conversationListeners = new Map<string, Set<(messages: DirectMessage[]) => void>>();
+const inFlightReadIds = new Set<string>();
+
+const POLL_INTERVAL_MS = 10000;
 
 export function clearDirectMessagesMemoryCache(): void {
   inMemoryDmCache.clear();
-}
-
-export enum OperationType {
-  CREATE = 'create',
-  UPDATE = 'update',
-  DELETE = 'delete',
-  LIST = 'list',
-  GET = 'get',
-  WRITE = 'write',
-}
-
-interface FirestoreErrorInfo {
-  error: string;
-  operationType: OperationType;
-  path: string | null;
-  authInfo: {
-    userId?: string | null;
-    email?: string | null;
-    emailVerified?: boolean | null;
-    isAnonymous?: boolean | null;
-    tenantId?: string | null;
-    providerInfo?: {
-      providerId?: string | null;
-      email?: string | null;
-    }[];
-  };
-}
-
-export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
-  const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
-    authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-      emailVerified: auth.currentUser?.emailVerified,
-      isAnonymous: auth.currentUser?.isAnonymous,
-      tenantId: auth.currentUser?.tenantId,
-      providerInfo: auth.currentUser?.providerData?.map((provider) => ({
-        providerId: provider.providerId,
-        email: provider.email,
-      })) || [],
-    },
-    operationType,
-    path,
-  };
-  console.warn('Firestore DirectMessages Notice:', JSON.stringify(errInfo));
+  inFlightReadIds.clear();
 }
 
 export function normalizeUid(id?: string | null): string {
@@ -69,9 +21,89 @@ export function normalizeUid(id?: string | null): string {
   return String(id).trim();
 }
 
+async function resolveBearerToken(): Promise<string | null> {
+  try {
+    const directToken = await auth?.currentUser?.getIdToken().catch(() => null);
+    if (directToken) return directToken;
+  } catch {}
+  try {
+    return (await getAccessToken().catch(() => null)) || null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeServerMessage(
+  m: any,
+  fallbackStudentUid: string,
+  fallbackNativeFriendUid: string
+): DirectMessage {
+  return {
+    id: String(m.id || `msg-${Date.now()}`),
+    studentUid: normalizeUid(m.studentUid) || fallbackStudentUid,
+    studentEmail: m.studentEmail || '',
+    studentName: m.studentName || '',
+    nativeFriendUid: normalizeUid(m.nativeFriendUid || m.teacherUid || m.tutorUid) || fallbackNativeFriendUid,
+    nativeFriendEmail: m.nativeFriendEmail || '',
+    nativeFriendName: m.nativeFriendName || '',
+    nativeFriendAvatar: m.nativeFriendAvatar || '',
+    senderUid: normalizeUid(m.senderUid),
+    senderEmail: m.senderEmail || '',
+    senderName: m.senderName || '',
+    senderRole: m.senderRole || 'student',
+    recipientUid: normalizeUid(m.recipientUid),
+    ...(m.recipientEmail ? { recipientEmail: m.recipientEmail } : {}),
+    ...(m.recipientName ? { recipientName: m.recipientName } : {}),
+    text: m.text || '',
+    createdAt: m.createdAt || m.timestamp || new Date().toISOString(),
+    read: Boolean(m.read),
+    ...(m.lessonRefId ? { lessonRefId: m.lessonRefId } : {}),
+    ...(m.isNotice || m.isSystemNotice ? { isNotice: true } : {}),
+  };
+}
+
+function filterAndSortPairMessages(
+  all: any[],
+  studentUid: string,
+  nativeFriendUid: string
+): DirectMessage[] {
+  const filtered: DirectMessage[] = (all || [])
+    .filter((m) => {
+      if (!m || typeof m !== 'object') return false;
+      const mStudent = normalizeUid(m.studentUid || m.receiverId || m.senderUid);
+      const mTeacher = normalizeUid(m.nativeFriendUid || m.tutorUid || m.teacherUid);
+      return (
+        (mStudent === studentUid && mTeacher === nativeFriendUid) ||
+        (normalizeUid(m.studentUid) === studentUid &&
+          normalizeUid(m.nativeFriendUid || m.teacherUid || m.tutorUid) === nativeFriendUid)
+      );
+    })
+    .map((m) => normalizeServerMessage(m, studentUid, nativeFriendUid));
+
+  filtered.sort((a, b) => {
+    const ta = new Date(a.createdAt).getTime() || 0;
+    const tb = new Date(b.createdAt).getTime() || 0;
+    if (ta !== tb) return ta - tb;
+    return String(a.id || '').localeCompare(String(b.id || ''));
+  });
+  return filtered;
+}
+
+function notifyConversationListeners(cacheKey: string, messages: DirectMessage[]): void {
+  const listeners = conversationListeners.get(cacheKey);
+  if (!listeners || listeners.size === 0) return;
+  listeners.forEach((cb) => {
+    try {
+      cb(messages);
+    } catch (err) {
+      console.warn('[directMessages] Listener error:', err);
+    }
+  });
+}
+
 /**
  * Subscribes to direct messages strictly between the student and their active Native Friend.
- * Enforces complete pair isolation: (studentUid <-> activeNativeFriendUid).
+ * Reads exclusively from the authenticated backend (/api/chat-messages -> Firestore '(default)').
  */
 export function subscribeDirectMessages(
   studentUid: string,
@@ -86,7 +118,18 @@ export function subscribeDirectMessages(
     return () => {};
   }
 
-  const cacheKey = `${cleanStudent}_${cleanNativeFriend}`;
+  const cacheKey = `${cleanStudent}::${cleanNativeFriend}`;
+  let isUnsubscribed = false;
+
+  if (!conversationListeners.has(cacheKey)) {
+    conversationListeners.set(cacheKey, new Set());
+  }
+  const safeListener = (msgs: DirectMessage[]) => {
+    if (!isUnsubscribed) {
+      onUpdate(msgs);
+    }
+  };
+  conversationListeners.get(cacheKey)!.add(safeListener);
 
   // Helper to load initial in-memory cached messages for zero-flicker UI
   if (inMemoryDmCache.has(cacheKey)) {
@@ -96,61 +139,34 @@ export function subscribeDirectMessages(
     }
   }
 
-  let unsubscribeFirestore: (() => void) | null = null;
+  // Initial fetch from authenticated backend API
+  void fetchServerMessages(cleanStudent, cleanNativeFriend, safeListener);
 
-  try {
-    const db = getDb();
-    const messagesCollection = collection(db, 'direct_messages');
-
-    // Query messages partitioned by studentUid to avoid multi-field index requirements
-    const q = query(messagesCollection, where('studentUid', '==', cleanStudent));
-
-    unsubscribeFirestore = onSnapshot(
-      q,
-      (snapshot) => {
-        const msgs: DirectMessage[] = [];
-        snapshot.forEach((docSnap) => {
-          const data = docSnap.data() as DirectMessage;
-          // STRICT EXCLUSIVITY CHECK: Must match the active Native Friend pair
-          if (
-            data &&
-            normalizeUid(data.studentUid) === cleanStudent &&
-            normalizeUid(data.nativeFriendUid) === cleanNativeFriend
-          ) {
-            msgs.push({
-              ...data,
-              id: docSnap.id || data.id,
-            });
-          }
-        });
-
-        // Sort chronologically ascending
-        msgs.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
-
-        // Cache in memory for instant active session access
-        inMemoryDmCache.set(cacheKey, msgs);
-
-        onUpdate(msgs);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'direct_messages');
-        // Fallback: poll server API if Firestore permission or network is restricted
-        fetchServerMessages(cleanStudent, cleanNativeFriend, onUpdate);
+  // Lightweight polling while subscribed so incoming messages arrive without client-side Firestore SDK
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  if (typeof setInterval === 'function') {
+    pollTimer = setInterval(() => {
+      if (!isUnsubscribed) {
+        void fetchServerMessages(cleanStudent, cleanNativeFriend, safeListener);
       }
-    );
-  } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, 'direct_messages');
-    fetchServerMessages(cleanStudent, cleanNativeFriend, onUpdate);
+    }, POLL_INTERVAL_MS);
+    if (typeof (pollTimer as any)?.unref === 'function') {
+      (pollTimer as any).unref();
+    }
   }
 
-  // Also initial fetch from server API to ensure all messages are synchronized
-  fetchServerMessages(cleanStudent, cleanNativeFriend, onUpdate);
-
   return () => {
-    if (unsubscribeFirestore) {
-      try {
-        unsubscribeFirestore();
-      } catch {}
+    isUnsubscribed = true;
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    const set = conversationListeners.get(cacheKey);
+    if (set) {
+      set.delete(safeListener);
+      if (set.size === 0) {
+        conversationListeners.delete(cacheKey);
+      }
     }
   };
 }
@@ -161,49 +177,30 @@ async function fetchServerMessages(
   onUpdate: (messages: DirectMessage[]) => void
 ) {
   try {
-    const res = await fetch('/api/chat-messages');
+    const token = await resolveBearerToken();
+    if (!token) return;
+
+    const res = await fetch('/api/chat-messages', {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
     if (res.ok) {
       const data = await res.json();
       const all: any[] = data.messages || [];
-      const filtered: DirectMessage[] = all
-        .filter((m) => {
-          const mStudent = normalizeUid(m.studentUid || m.receiverId || m.senderUid);
-          const mTeacher = normalizeUid(m.nativeFriendUid || m.tutorUid || m.teacherUid);
-          return (
-            (mStudent === studentUid && mTeacher === nativeFriendUid) ||
-            (normalizeUid(m.studentUid) === studentUid && normalizeUid(m.nativeFriendUid) === nativeFriendUid)
-          );
-        })
-        .map((m) => ({
-          id: m.id || `msg-${Date.now()}`,
-          studentUid: m.studentUid || studentUid,
-          studentEmail: m.studentEmail || '',
-          studentName: m.studentName || '',
-          nativeFriendUid: m.nativeFriendUid || nativeFriendUid,
-          nativeFriendEmail: m.nativeFriendEmail || '',
-          nativeFriendName: m.nativeFriendName || '',
-          nativeFriendAvatar: m.nativeFriendAvatar || '',
-          senderUid: m.senderUid || '',
-          senderEmail: m.senderEmail || '',
-          senderName: m.senderName || '',
-          senderRole: m.senderRole || 'student',
-          recipientUid: m.recipientUid || '',
-          text: m.text || '',
-          createdAt: m.createdAt || m.timestamp || new Date().toISOString(),
-          read: Boolean(m.read),
-          isNotice: Boolean(m.isNotice || m.isSystemNotice),
-        }));
-
-      filtered.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
-      if (filtered.length > 0) {
-        onUpdate(filtered);
-      }
+      const filtered = filterAndSortPairMessages(all, studentUid, nativeFriendUid);
+      const cacheKey = `${studentUid}::${nativeFriendUid}`;
+      inMemoryDmCache.set(cacheKey, filtered);
+      onUpdate(filtered);
     }
-  } catch {}
+  } catch (err) {
+    console.warn('[directMessages] Failed to fetch messages from server:', err);
+  }
 }
 
 /**
  * Sends an asynchronous direct message / notice strictly linked to the student and active Native Friend pair.
+ * Persists exclusively via authenticated backend (/api/chat-messages -> Firestore '(default)').
  */
 export async function sendDirectMessage(params: {
   studentUid: string;
@@ -255,23 +252,19 @@ export async function sendDirectMessage(params: {
     ...(params.isNotice ? { isNotice: true } : {}),
   };
 
-  // 1. Write to Firebase Firestore with schema validation
   try {
-    const db = getDb();
-    const docRef = doc(db, 'direct_messages', msgId);
-    const stampedMessage = stampSchemaVersion(message);
-    assertSafeFirestoreWrite(`direct_messages/${msgId}`, stampedMessage, undefined, true);
-    await setDoc(docRef, stampedMessage, { merge: true });
-  } catch (err) {
-    console.error(`[Firestore Error] Failed to write direct message ${msgId}:`, err);
-    handleFirestoreError(err, OperationType.WRITE, `direct_messages/${msgId}`);
-  }
+    const token = await resolveBearerToken();
+    if (!token) {
+      console.warn('[directMessages] Cannot send message without verified auth token.');
+      return null;
+    }
 
-  // 2. Mirror write to Express Server backend API
-  try {
-    await fetch('/api/chat-messages', {
+    const res = await fetch('/api/chat-messages', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
       body: JSON.stringify({
         message: {
           ...message,
@@ -279,33 +272,103 @@ export async function sendDirectMessage(params: {
         },
       }),
     });
+
+    if (!res.ok) {
+      console.warn(`[directMessages] Server rejected message ${msgId} with HTTP ${res.status}`);
+      return null;
+    }
+
+    const data = await res.json().catch(() => ({}));
+    const cacheKey = `${cleanStudent}::${cleanNativeFriend}`;
+
+    let persistedList: DirectMessage[];
+    if (Array.isArray(data?.messages)) {
+      persistedList = filterAndSortPairMessages(data.messages, cleanStudent, cleanNativeFriend);
+    } else {
+      const existing = inMemoryDmCache.get(cacheKey) || [];
+      persistedList = existing.some((m) => m.id === msgId) ? existing : [...existing, message];
+    }
+
+    const persistedMsg =
+      (data?.message && normalizeServerMessage(data.message, cleanStudent, cleanNativeFriend)) ||
+      persistedList.find((m) => m.id === msgId) ||
+      message;
+
+    inMemoryDmCache.set(cacheKey, persistedList);
+    notifyConversationListeners(cacheKey, persistedList);
+    return persistedMsg;
   } catch (err) {
-    console.warn('Could not mirror message to server:', err);
+    console.warn('[directMessages] Failed to send message to server:', err);
+    return null;
   }
-
-  // 3. Update in-memory session cache
-  const cacheKey = `${cleanStudent}_${cleanNativeFriend}`;
-  const list: DirectMessage[] = inMemoryDmCache.get(cacheKey) || [];
-  if (!list.some((m) => m.id === msgId)) {
-    inMemoryDmCache.set(cacheKey, [...list, message]);
-  }
-
-  return message;
 }
 
 /**
- * Marks messages as read in Firestore and backend.
+ * Marks messages as read exclusively via authenticated backend (/api/chat-messages PATCH -> Firestore '(default)').
  */
 export async function markDirectMessagesAsRead(messageIds: string[]): Promise<void> {
   if (!messageIds || messageIds.length === 0) return;
 
-  const db = getDb();
-  for (const id of messageIds) {
-    try {
-      const docRef = doc(db, 'direct_messages', id);
-      await setDoc(docRef, { read: true }, { merge: true });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `direct_messages/${id}`);
+  const idsToMark = Array.from(
+    new Set(messageIds.map((id) => String(id || '').trim()).filter(Boolean))
+  ).filter((id) => !inFlightReadIds.has(id));
+
+  if (idsToMark.length === 0) return;
+
+  const token = await resolveBearerToken();
+  if (!token) return;
+
+  idsToMark.forEach((id) => inFlightReadIds.add(id));
+
+  try {
+    const res = await fetch('/api/chat-messages', {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        messageIds: idsToMark,
+        read: true,
+      }),
+    });
+
+    if (!res.ok) {
+      console.warn(`[directMessages] Failed to mark messages as read: HTTP ${res.status}`);
+      return;
     }
+
+    const data = await res.json().catch(() => ({}));
+    const markedSet = new Set(idsToMark);
+    const serverMessages: any[] | null = Array.isArray(data?.messages) ? data.messages : null;
+
+    inMemoryDmCache.forEach((list, cacheKey) => {
+      if (serverMessages) {
+        const [studentUid, nativeFriendUid] = cacheKey.split('::');
+        if (studentUid && nativeFriendUid) {
+          const updated = filterAndSortPairMessages(serverMessages, studentUid, nativeFriendUid);
+          inMemoryDmCache.set(cacheKey, updated);
+          notifyConversationListeners(cacheKey, updated);
+          return;
+        }
+      }
+
+      let changed = false;
+      const updated = list.map((m) => {
+        if (markedSet.has(m.id) && !m.read) {
+          changed = true;
+          return { ...m, read: true };
+        }
+        return m;
+      });
+      if (changed) {
+        inMemoryDmCache.set(cacheKey, updated);
+        notifyConversationListeners(cacheKey, updated);
+      }
+    });
+  } catch (err) {
+    console.warn('[directMessages] Failed to mark messages as read on server:', err);
+  } finally {
+    idsToMark.forEach((id) => inFlightReadIds.delete(id));
   }
 }
