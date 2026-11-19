@@ -12,6 +12,7 @@ import {
   RotateCcw,
 } from 'lucide-react';
 import { AdminLandingContent, Language } from '../types';
+import { getAdminAccessToken, getAccessToken } from '../utils/auth';
 
 export const DEFAULT_ADMIN_LANDING_CONTENT: AdminLandingContent = {
   heroBadge: 'Uma Nova Filosofia de Inglês',
@@ -59,6 +60,8 @@ export const AdminLandingEditorModal: React.FC<AdminLandingEditorModalProps> = (
     ...(currentContent || {}),
   }));
   const [savedSuccess, setSavedSuccess] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
   const [activeTab, setActiveTab] = useState<'hero' | 'philosophy' | 'footer'>('hero');
 
   if (!isOpen) return null;
@@ -71,24 +74,71 @@ export const AdminLandingEditorModal: React.FC<AdminLandingEditorModalProps> = (
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (onSave) onSave(formData);
-    else if (onSaveContent) onSaveContent(formData);
+    setSaveError(null);
+    setSavedSuccess(false);
+    setIsSaving(true);
 
     try {
-      await fetch('/api/landing-content', {
+      let token = await getAdminAccessToken().catch(() => null);
+      if (!token) {
+        token = await getAccessToken(true).catch(() => null);
+      }
+      if (!token) {
+        setSaveError(
+          isEn
+            ? 'Administrator session not authenticated in Firebase Auth. Please sign in as Administrator.'
+            : 'Sessão administrativa não autenticada no Firebase Auth. Faça login como Administrador.'
+        );
+        return;
+      }
+
+      const res = await fetch('/api/landing-content', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
         body: JSON.stringify(formData),
       });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        const fallbackMsg =
+          res.status === 401
+            ? isEn
+              ? 'Unauthorized: invalid or missing authentication token.'
+              : 'Não autorizado: token de autenticação ausente ou inválido.'
+            : res.status === 403
+            ? isEn
+              ? 'Forbidden: administrator privileges required.'
+              : 'Acesso negado: privilégios de administrador necessários.'
+            : isEn
+            ? `Failed to save landing content (HTTP ${res.status}).`
+            : `Falha ao salvar conteúdo da página inicial (HTTP ${res.status}).`;
+        setSaveError(errData.message || errData.error || fallbackMsg);
+        return;
+      }
+
+      const data = await res.json().catch(() => ({}));
+      const persistedContent = data.landingContent || formData;
+      if (onSave) onSave(persistedContent);
+      else if (onSaveContent) onSaveContent(persistedContent);
+
+      setSavedSuccess(true);
+      setTimeout(() => {
+        setSavedSuccess(false);
+        onClose();
+      }, 1200);
     } catch (err) {
       console.warn('Error saving landing content:', err);
+      setSaveError(
+        isEn
+          ? 'Network error while saving landing content.'
+          : 'Erro de comunicação ao salvar conteúdo da página inicial.'
+      );
+    } finally {
+      setIsSaving(false);
     }
-
-    setSavedSuccess(true);
-    setTimeout(() => {
-      setSavedSuccess(false);
-      onClose();
-    }, 1200);
   };
 
   const handleResetDefaults = () => {
@@ -198,6 +248,12 @@ export const AdminLandingEditorModal: React.FC<AdminLandingEditorModalProps> = (
 
         {/* Form Body */}
         <form onSubmit={handleSave} className="flex-1 overflow-y-auto p-6 space-y-5">
+          {saveError && (
+            <div className="p-3.5 bg-red-50 border border-red-300 rounded-2xl text-xs font-bold text-red-800 flex items-center gap-2">
+              <span>{saveError}</span>
+            </div>
+          )}
+
           {savedSuccess && (
             <div className="p-3.5 bg-emerald-50 border border-emerald-300 rounded-2xl text-xs font-bold text-emerald-800 flex items-center gap-2">
               <Check className="w-4 h-4 text-emerald-600" />
@@ -430,7 +486,8 @@ export const AdminLandingEditorModal: React.FC<AdminLandingEditorModalProps> = (
 
             <button
               type="submit"
-              className="px-6 py-2.5 bg-[#000035] hover:bg-[#1C4C96] text-white rounded-xl text-xs font-black transition cursor-pointer shadow-md flex items-center gap-2"
+              disabled={isSaving}
+              className="px-6 py-2.5 bg-[#000035] hover:bg-[#1C4C96] disabled:opacity-60 text-white rounded-xl text-xs font-black transition cursor-pointer shadow-md flex items-center gap-2"
             >
               <Save className="w-4 h-4 text-[#F4CA54]" />
               <span>{isEn ? 'Save All Changes' : 'Salvar Alterações'}</span>

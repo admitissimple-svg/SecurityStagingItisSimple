@@ -104,6 +104,81 @@ function createTestFirestoreMock() {
 
   return {
     collection: (col: string) => makeCollectionRef(col),
+    batch: () => {
+      const staged: Array<{ type: 'set' | 'update' | 'delete'; col: string; id: string; data?: Record<string, any>; merge?: boolean }> = [];
+      return {
+        set: (ref: any, data: Record<string, any>, opts?: { merge?: boolean }) => {
+          staged.push({ type: 'set', col: ref._col, id: ref._id, data: JSON.parse(JSON.stringify(data)), merge: Boolean(opts?.merge) });
+        },
+        update: (ref: any, data: Record<string, any>) => {
+          staged.push({ type: 'update', col: ref._col, id: ref._id, data: JSON.parse(JSON.stringify(data)), merge: true });
+        },
+        delete: (ref: any) => {
+          staged.push({ type: 'delete', col: ref._col, id: ref._id });
+        },
+        commit: async () => {
+          for (const op of staged) {
+            if (failOnSetCollection && (op.col === failOnSetCollection || failOnSetCollection === '*')) {
+              throw new Error(`Simulated Firestore batch commit error on ${op.col}/${op.id}`);
+            }
+          }
+          for (const op of staged) {
+            const key = `${op.col}::${op.id}`;
+            if (op.type === 'delete') {
+              store.delete(key);
+            } else {
+              const prev = op.merge ? (store.get(key) || {}) : {};
+              store.set(key, JSON.parse(JSON.stringify({ ...prev, ...(op.data || {}) })));
+            }
+          }
+          return [];
+        },
+      };
+    },
+    runTransaction: async (fn: (tx: any) => Promise<any>) => {
+      const staged: Array<{ type: 'set' | 'update' | 'delete'; col: string; id: string; data?: Record<string, any>; merge?: boolean }> = [];
+      const tx = {
+        get: async (ref: any) => ref.get(),
+        set: (ref: any, data: Record<string, any>, opts?: { merge?: boolean }) => {
+          staged.push({
+            type: 'set',
+            col: ref._col,
+            id: ref._id,
+            data: JSON.parse(JSON.stringify(data)),
+            merge: Boolean(opts?.merge),
+          });
+        },
+        update: (ref: any, data: Record<string, any>) => {
+          staged.push({
+            type: 'update',
+            col: ref._col,
+            id: ref._id,
+            data: JSON.parse(JSON.stringify(data)),
+            merge: true,
+          });
+        },
+        delete: (ref: any) => {
+          staged.push({ type: 'delete', col: ref._col, id: ref._id });
+        },
+      };
+      const result = await fn(tx);
+      // Atomic validation before committing any staged mutation
+      for (const op of staged) {
+        if (failOnSetCollection && (op.col === failOnSetCollection || failOnSetCollection === '*')) {
+          throw new Error(`Simulated Firestore transaction error on ${op.col}/${op.id}`);
+        }
+      }
+      for (const op of staged) {
+        const key = `${op.col}::${op.id}`;
+        if (op.type === 'delete') {
+          store.delete(key);
+        } else {
+          const prev = op.merge ? (store.get(key) || {}) : {};
+          store.set(key, JSON.parse(JSON.stringify({ ...prev, ...(op.data || {}) })));
+        }
+      }
+      return result;
+    },
     _store: store,
     _setDoc: (col: string, id: string, data: Record<string, any>) => {
       store.set(`${col}::${id}`, JSON.parse(JSON.stringify(data)));
@@ -355,6 +430,7 @@ async function runSuite() {
       assert.strictEqual(updateRes.status, 200);
 
       const fsUser = mockFs._getDoc('users', STUDENT_A_UID);
+      assert(fsUser, 'users/{uid} deve existir no Firestore');
       assert.strictEqual(fsUser.name, 'Aluna Atualizada ADM');
       assert.strictEqual(fsUser.level, 'advanced');
       assert.strictEqual(fsUser.contractedLessons, 12);
@@ -413,6 +489,7 @@ async function runSuite() {
       assert.strictEqual(saveRes.data.profile?.teacherUid, TEACHER_UID);
 
       const fsUser = mockFs._getDoc('users', STUDENT_A_UID);
+      assert(fsUser, 'users/{uid} deve existir no Firestore');
       assert.strictEqual(fsUser.name, 'Aluna Perfil Canônico');
       assert.strictEqual(fsUser.level, 'intermediate');
       assert.strictEqual(fsUser.learningGoal, 'Fluency & Travel');
@@ -430,6 +507,7 @@ async function runSuite() {
       assert.strictEqual(fsUser.role, 'student');
 
       const fsAssign = mockFs._getDoc('student_assignments', STUDENT_A_UID);
+      assert(fsAssign, 'student_assignments/{uid} deve existir no Firestore');
       assert.strictEqual(fsAssign.level, 'intermediate');
       assert.deepStrictEqual(fsAssign.weeklyStudyDays, ['monday', 'wednesday', 'friday']);
       assert.strictEqual(fsAssign.weeklyStudyDaysTarget, 3);
@@ -634,6 +712,101 @@ async function runSuite() {
       assert.strictEqual(admProfRes.data.profile?.name, 'Aluna B Editada pelo Admin');
       assert.strictEqual(mockFs._getDoc('users', STUDENT_B_UID)?.name, 'Aluna B Editada pelo Admin');
       assert.strictEqual(mockFs._getDoc('users', ADMIN_UID), undefined, 'Nunca deve gravar perfil do aluno no doc do Admin');
+    });
+
+    await test('8. PERSIST.1A.1 — Falha atômica em student_assignments/{uid} impede gravação parcial em users/{uid} e mutação em RAM (POST /api/students e /profile)', async () => {
+      resetInMemoryDbForTesting();
+
+      const ATOMIC_STU_UID = 'persist1aAtomicStuUid00000005';
+      const ATOMIC_STU_EMAIL = 'atomic.persist1a@itissimple-test.com';
+
+      // 8a. POST /api/students with failure on second write (student_assignments) must NOT persist users/{uid} or mutate RAM
+      mockFs._setFailOnSet('student_assignments');
+      try {
+        const failNewStudentRes = await makeRequest(
+          server,
+          'POST',
+          '/api/students',
+          {
+            uid: ATOMIC_STU_UID,
+            email: ATOMIC_STU_EMAIL,
+            name: 'Aluna Rollback Novo',
+            level: 'intermediate',
+            teacherUid: TEACHER_UID,
+          },
+          { Authorization: 'Bearer tok-admin' }
+        );
+        assert.strictEqual(failNewStudentRes.status, 500);
+        assert.strictEqual(
+          mockFs._getDoc('users', ATOMIC_STU_UID),
+          undefined,
+          'users/{uid} NÃO pode ser gravado parcialmente quando student_assignments/{uid} falha'
+        );
+        assert.strictEqual(
+          mockFs._getDoc('student_assignments', ATOMIC_STU_UID),
+          undefined,
+          'student_assignments/{uid} deve permanecer ausente'
+        );
+        assert.strictEqual(
+          readDb().students.find((s) => s.uid === ATOMIC_STU_UID),
+          undefined,
+          'Cache RAM db.students não pode ser atualizado em falha atômica'
+        );
+      } finally {
+        mockFs._setFailOnSet(null);
+      }
+
+      // 8b. Seed baseline for STUDENT_B and test POST /api/students/profile failure on student_assignments (student self-update)
+      const rawUserBefore = mockFs._getDoc('users', STUDENT_B_UID);
+      const userBefore = rawUserBefore ? JSON.parse(JSON.stringify(rawUserBefore)) : undefined;
+      const rawAssignBefore = mockFs._getDoc('student_assignments', STUDENT_B_UID);
+      const assignBefore = rawAssignBefore ? JSON.parse(JSON.stringify(rawAssignBefore)) : undefined;
+      readDb().userProfiles[STUDENT_B_EMAIL] = {
+        ...(userBefore || {}),
+        name: 'Aluna B Pre-Atomic',
+        learningGoal: 'Pre-Atomic Goal',
+        weeklyNativeLessonsTarget: 2,
+      };
+      readDb().weeklyNativeTargets[STUDENT_B_EMAIL] = 2;
+
+      mockFs._setFailOnSet('student_assignments');
+      try {
+        const failAtomicProfileRes = await makeRequest(
+          server,
+          'POST',
+          '/api/students/profile',
+          {
+            uid: STUDENT_B_UID,
+            profile: {
+              email: STUDENT_B_EMAIL,
+              name: 'Aluna B Parcial Indevido',
+              level: 'advanced',
+              learningGoal: 'Broken Partial Goal',
+              weeklyNativeLessonsTarget: 6,
+              weeklyStudyDays: ['tuesday', 'thursday'],
+              weeklyStudyDaysTarget: 2,
+            },
+          },
+          { Authorization: 'Bearer tok-student-b' }
+        );
+        assert.strictEqual(failAtomicProfileRes.status, 500);
+        assert.deepStrictEqual(
+          mockFs._getDoc('users', STUDENT_B_UID),
+          userBefore,
+          'users/{uid} NÃO pode ser alterado quando student_assignments/{uid} falha em POST /api/students/profile'
+        );
+        assert.deepStrictEqual(
+          mockFs._getDoc('student_assignments', STUDENT_B_UID),
+          assignBefore,
+          'student_assignments/{uid} deve permanecer inalterado'
+        );
+        assert.strictEqual(readDb().userProfiles[STUDENT_B_EMAIL]?.name, 'Aluna B Pre-Atomic');
+        assert.strictEqual(readDb().userProfiles[STUDENT_B_EMAIL]?.learningGoal, 'Pre-Atomic Goal');
+        assert.strictEqual(readDb().weeklyNativeTargets[STUDENT_B_EMAIL], 2);
+        assert.strictEqual(readDb().weeklyStudyDays?.[STUDENT_B_EMAIL], undefined);
+      } finally {
+        mockFs._setFailOnSet(null);
+      }
     });
   } finally {
     resetFirebaseAdminFirestoreForTesting();

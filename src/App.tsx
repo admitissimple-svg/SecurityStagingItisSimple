@@ -6372,15 +6372,28 @@ export default function App() {
 
   // Handler: Save Landing Content from Admin Editor
   const handleSaveLandingContent = async (updatedContent: AdminLandingContent) => {
-    setLandingContent(updatedContent);
     try {
-      await fetch('/api/landing-content', {
+      let token = await getAdminAccessToken().catch(() => null);
+      if (!token) {
+        token = await getAccessToken(true).catch(() => null);
+      }
+      if (!token) {
+        return;
+      }
+      const res = await fetch('/api/landing-content', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
         body: JSON.stringify(updatedContent),
       });
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setLandingContent(data.landingContent || updatedContent);
+      }
     } catch {
-      // local fallback
+      // ignore network failure without mutating state
     }
   };
 

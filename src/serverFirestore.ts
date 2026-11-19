@@ -71,6 +71,7 @@ export const ACTIVE_FIREBASE_DATABASE_ID = '(default)';
 export const ACTIVE_FIRESTORE_DATABASE_ID = '(default)';
 
 let adminFirestoreInstance: Firestore | null = null;
+let adminFirestoreDisabledForTesting = false;
 
 /**
  * Returns a validated Firestore instance from Firebase Admin SDK.
@@ -78,6 +79,9 @@ let adminFirestoreInstance: Firestore | null = null;
  * Uses exclusively the '(default)' database.
  */
 export function getFirestoreDb(): Firestore | null {
+  if (adminFirestoreDisabledForTesting) {
+    return null;
+  }
   if (adminFirestoreInstance) {
     const cachedProjectId = (adminFirestoreInstance as any).projectId;
     if (cachedProjectId && cachedProjectId !== ALLOWED_STAGING_PROJECT_ID) {
@@ -126,6 +130,7 @@ export function getAllServerFirestoreDbs(): Firestore[] {
  */
 export function setFirebaseAdminFirestoreForTesting(mockDb: Firestore | null): void {
   adminFirestoreInstance = mockDb;
+  adminFirestoreDisabledForTesting = mockDb === null;
 }
 
 let isCloudWriteDisabled = false;
@@ -155,6 +160,7 @@ export function setIsCloudWriteDisabled(disabled: boolean): void {
 
 export function resetFirebaseAdminFirestoreForTesting(): void {
   adminFirestoreInstance = null;
+  adminFirestoreDisabledForTesting = false;
   isCloudWriteDisabled = false;
 }
 

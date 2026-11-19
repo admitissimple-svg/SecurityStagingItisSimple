@@ -104,8 +104,6 @@ import {
   fetchYouTubeAuthFromFirestore,
   saveTutorToFirestore,
   fetchTutorsFromFirestore,
-  deleteTutorFromFirestore,
-  deleteUserByEmailFromFirestore,
   saveSessionNotesProgressToFirestore,
   deleteStudentJournalEntryFromServerFirestore,
   fetchUserDocumentFromFirestore,
@@ -2223,6 +2221,32 @@ const handleRegistration = async (req: any, res: any) => {
       meetUrl: req.body.meetUrl || req.body.meetLink || '',
     };
 
+    const firestoreDb = getFirestoreDb();
+    if (!firestoreDb || getIsCloudWriteDisabled()) {
+      return res.status(503).json({
+        error: 'FIRESTORE_UNAVAILABLE',
+        message: 'Canonical Firestore database is unavailable for registration persistence.',
+      });
+    }
+
+    let savedTeacherToFirestore = false;
+    try {
+      savedTeacherToFirestore = await saveUserToFirestore(tutorEntry);
+    } catch (fsErr: any) {
+      console.error(`[serverFirestore] Failed to persist pending teacher registration in users/${tutorId}:`, fsErr);
+      return res.status(500).json({
+        error: 'Failed to persist registration to Firestore',
+        message: fsErr?.message || 'Database write error',
+      });
+    }
+    if (!savedTeacherToFirestore) {
+      return res.status(getIsCloudWriteDisabled() ? 503 : 500).json({
+        error: getIsCloudWriteDisabled() ? 'FIRESTORE_UNAVAILABLE' : 'Failed to persist registration to Firestore',
+        message: 'Não foi possível confirmar a gravação do cadastro de Amigo Nativo no Firestore.',
+      });
+    }
+
+    // Update RAM caches and local sync strictly AFTER canonical Firestore confirmation
     if (!db.tutorsList) db.tutorsList = [];
     const tutorIdx = db.tutorsList.findIndex((t) => t.email.toLowerCase() === cleanEmail);
     if (tutorIdx >= 0) {
@@ -2304,7 +2328,6 @@ const handleRegistration = async (req: any, res: any) => {
     });
 
     await writeDbSync(db);
-    await saveUserToFirestore(tutorEntry);
 
     const account = {
       uid: tutorId,
@@ -2457,17 +2480,6 @@ const handleRegistration = async (req: any, res: any) => {
 
   const userAvatar = req.body.avatar || req.body.picture || '';
 
-  // Save student auth record (NO PASSWORDS)
-  if (!db.authUsers) db.authUsers = {};
-  db.authUsers[cleanEmail] = {
-    uid: userUid,
-    email: cleanEmail,
-    name: cleanName,
-    role: 'student',
-    createdAt: db.authUsers[cleanEmail]?.createdAt || new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  };
-
   let resolvedCanonicalTeacherUid: string | null = null;
   let resolvedCanonicalTeacherEmail: string | null = req.body.teacherEmail ? (req.body.teacherEmail as string).toLowerCase().trim() : null;
   let resolvedCanonicalTeacherName: string | null = req.body.teacherName || null;
@@ -2530,6 +2542,14 @@ const handleRegistration = async (req: any, res: any) => {
     }
   }
 
+  const firestoreDb = getFirestoreDb();
+  if (!firestoreDb || getIsCloudWriteDisabled()) {
+    return res.status(503).json({
+      error: 'FIRESTORE_UNAVAILABLE',
+      message: 'Canonical Firestore database is unavailable for student registration persistence.',
+    });
+  }
+
   const existingIdx = db.students.findIndex(
     (s) => (s.email || s.studentEmail || '').toLowerCase() === cleanEmail
   );
@@ -2537,6 +2557,183 @@ const handleRegistration = async (req: any, res: any) => {
   const routineVideoTime = req.body.routineVideoTime || '09:00';
   const routineAudioTime = req.body.routineAudioTime || '14:00';
   const dailyPhraseTime = req.body.dailyPhraseTime || '20:00';
+  const cleanInitialRoutines = createCleanStudentRoutines(routineVideoTime);
+
+  const initialTeacherEmail = resolvedCanonicalTeacherEmail;
+  const initialTeacherName = resolvedCanonicalTeacherName;
+  const preservedTeacherUid =
+    resolvedCanonicalTeacherUid ||
+    (existingFsUser?.teacherUid && isValidCanonicalUid(existingFsUser.teacherUid) ? existingFsUser.teacherUid : null) ||
+    (existingProfile?.teacherUid && isValidCanonicalUid(existingProfile.teacherUid) ? existingProfile.teacherUid : null);
+  const preservedTeacherEmail = initialTeacherEmail || existingFsUser?.teacherEmail || existingProfile?.teacherEmail || null;
+  const preservedTeacherName = initialTeacherName || existingFsUser?.teacherName || existingProfile?.teacherName || null;
+
+  const resolvedWeeklyStudyDaysTarget = existingProfile
+    ? (existingProfile.weeklyStudyDaysTarget ?? existingFsUser?.weeklyStudyDaysTarget ?? (req.body.weeklyStudyDaysTarget !== undefined ? Number(req.body.weeklyStudyDaysTarget) : 7))
+    : (req.body.weeklyStudyDaysTarget !== undefined ? Number(req.body.weeklyStudyDaysTarget) : 7);
+  const resolvedWeeklyStudyDays = existingProfile
+    ? (existingProfile.weeklyStudyDays || existingFsUser?.weeklyStudyDays || req.body.weeklyStudyDays || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'])
+    : (req.body.weeklyStudyDays || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']);
+
+  let authoritativeContractedLessons = preservedContractedLessons;
+  let authoritativeAvailableLessons = preservedAvailableLessons;
+  let authoritativeCompletedLessonsCount = preservedCompletedLessonsCount;
+  let authoritativeHasCompletedTrial = preservedHasCompletedTrial;
+  let authoritativeSubscriptionType = preservedSubscriptionType;
+
+  try {
+    const userDocRef = firestoreDb.collection('users').doc(userUid);
+    const assignDocRef = firestoreDb.collection('student_assignments').doc(userUid);
+
+    const buildStudentRegistrationPayloads = (txFsUser: Record<string, any> | null, nowIso: string) => {
+      const authoritativeFs = txFsUser || existingFsUser;
+      const txRole = String(txFsUser?.role || txFsUser?.userRole || '').toLowerCase().trim();
+      if (txRole === 'teacher' || txRole === 'admin' || txRole === 'native_friend' || txRole === 'tutor') {
+        return {
+          status: 409 as const,
+          body: {
+            error: 'Esta conta já possui um papel administrativo ou de Amigo Nativo e não pode ser convertida em aluno(a) via cadastro.',
+            code: 'ROLE_MUTATION_FORBIDDEN',
+            isExistingUser: true,
+          },
+        };
+      }
+
+      const txTeacherUid =
+        resolvedCanonicalTeacherUid ||
+        (authoritativeFs?.teacherUid && isValidCanonicalUid(authoritativeFs.teacherUid) ? authoritativeFs.teacherUid : null) ||
+        preservedTeacherUid;
+      const txTeacherEmail = initialTeacherEmail || authoritativeFs?.teacherEmail || preservedTeacherEmail || null;
+      const txTeacherName = initialTeacherName || authoritativeFs?.teacherName || preservedTeacherName || null;
+
+      const txContracted =
+        typeof authoritativeFs?.contractedLessons === 'number'
+          ? authoritativeFs.contractedLessons
+          : preservedContractedLessons;
+      const txAvailable =
+        typeof authoritativeFs?.availableLessons === 'number'
+          ? authoritativeFs.availableLessons
+          : preservedAvailableLessons;
+      const txCompleted = Number(
+        authoritativeFs?.completedLessonsCount ?? preservedCompletedLessonsCount
+      );
+      const txHasTrial = Boolean(
+        authoritativeFs?.hasCompletedTrialLesson ?? preservedHasCompletedTrial
+      );
+      const txSubType =
+        authoritativeFs?.subscriptionType || preservedSubscriptionType;
+
+      const fullProfileToSave: Record<string, any> = {
+        uid: userUid,
+        id: userUid,
+        email: cleanEmail,
+        name: cleanName,
+        role: 'student',
+        picture: userAvatar || authoritativeFs?.picture || existingProfile?.picture || '',
+        avatar: userAvatar || authoritativeFs?.avatar || existingProfile?.avatar || '',
+        level,
+        userLevel: level,
+        englishLevel: level,
+        learningGoal: goal || authoritativeFs?.learningGoal || existingProfile?.learningGoal || 'English for everyday life & work',
+        routineVideoTime: req.body.routineVideoTime || authoritativeFs?.routineVideoTime || existingProfile?.routineVideoTime || routineVideoTime,
+        routineAudioTime: req.body.routineAudioTime || authoritativeFs?.routineAudioTime || existingProfile?.routineAudioTime || routineAudioTime,
+        dailyPhraseTime: req.body.dailyPhraseTime || authoritativeFs?.dailyPhraseTime || existingProfile?.dailyPhraseTime || dailyPhraseTime,
+        weeklyStudyDaysTarget: resolvedWeeklyStudyDaysTarget,
+        weeklyStudyDays: resolvedWeeklyStudyDays,
+        teacherEmail: txTeacherEmail,
+        teacherName: txTeacherName,
+        teacherUid: txTeacherUid,
+        assignedNativeFriendUID: txTeacherUid,
+        nativeFriendUID: txTeacherUid,
+        ...(!authoritativeFs
+          ? {
+              contractedLessons: 0,
+              availableLessons: 0,
+              completedLessonsCount: 0,
+              hasCompletedTrialLesson: false,
+              subscriptionType: 'trial',
+              createdAt: nowIso,
+            }
+          : { updatedAt: nowIso }),
+      };
+
+      const assignmentsPayload: Record<string, any> = {
+        uid: userUid,
+        email: cleanEmail,
+        level,
+        weeklyStudyDaysTarget: resolvedWeeklyStudyDaysTarget,
+        weeklyStudyDays: resolvedWeeklyStudyDays,
+        videoAssignments: [],
+        spotifyAssignments: db.studentSpotifyAssignments?.[cleanEmail] || [],
+        routines: cleanInitialRoutines,
+        updatedAt: nowIso,
+      };
+
+      return {
+        status: 201 as const,
+        fullProfileToSave,
+        assignmentsPayload,
+        txContracted,
+        txAvailable,
+        txCompleted,
+        txHasTrial,
+        txSubType,
+      };
+    };
+
+    let txOutcome: ReturnType<typeof buildStudentRegistrationPayloads>;
+    if (typeof (firestoreDb as any).runTransaction === 'function') {
+      txOutcome = await (firestoreDb as any).runTransaction(async (tx: any) => {
+        const nowIso = new Date().toISOString();
+        const userSnap = await tx.get(userDocRef);
+        const txFsUser = userSnap && userSnap.exists ? (userSnap.data() || null) : null;
+        const built = buildStudentRegistrationPayloads(txFsUser, nowIso);
+        if (built.status !== 201) {
+          return built;
+        }
+        tx.set(userDocRef, removeUndefinedFields(built.fullProfileToSave), { merge: true });
+        tx.set(assignDocRef, removeUndefinedFields(built.assignmentsPayload), { merge: true });
+        return built;
+      });
+    } else {
+      const nowIso = new Date().toISOString();
+      const userSnap = await userDocRef.get();
+      const txFsUser = userSnap && userSnap.exists ? (userSnap.data() || null) : null;
+      const built = buildStudentRegistrationPayloads(txFsUser, nowIso);
+      if (built.status === 201) {
+        await userDocRef.set(removeUndefinedFields(built.fullProfileToSave), { merge: true });
+        await assignDocRef.set(removeUndefinedFields(built.assignmentsPayload), { merge: true });
+      }
+      txOutcome = built;
+    }
+
+    if (txOutcome.status !== 201) {
+      return res.status(txOutcome.status).json(txOutcome.body);
+    }
+
+    authoritativeContractedLessons = txOutcome.txContracted;
+    authoritativeAvailableLessons = txOutcome.txAvailable;
+    authoritativeCompletedLessonsCount = txOutcome.txCompleted;
+    authoritativeHasCompletedTrial = txOutcome.txHasTrial;
+    authoritativeSubscriptionType = txOutcome.txSubType;
+  } catch (fsErr: any) {
+    console.error(`[serverFirestore] Failed to persist student registration in users/${userUid}:`, fsErr);
+    return res.status(500).json({
+      error: 'Failed to persist student registration to Firestore',
+      message: fsErr?.message || 'Database write error',
+    });
+  }
+
+  // Update RAM caches and local sync strictly AFTER canonical Firestore persistence confirmation
+  if (!db.authUsers) db.authUsers = {};
+  db.authUsers[cleanEmail] = {
+    uid: userUid,
+    email: cleanEmail,
+    name: cleanName,
+    role: 'student',
+    createdAt: db.authUsers[cleanEmail]?.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
 
   if (existingIdx >= 0) {
     const existing = db.students[existingIdx];
@@ -2558,9 +2755,9 @@ const handleRegistration = async (req: any, res: any) => {
       routineVideoTime: req.body.routineVideoTime || existing.routineVideoTime || routineVideoTime,
       routineAudioTime: req.body.routineAudioTime || existing.routineAudioTime || routineAudioTime,
       dailyPhraseTime: req.body.dailyPhraseTime || existing.dailyPhraseTime || dailyPhraseTime,
-      contractedLessons: preservedContractedLessons,
-      availableLessons: preservedAvailableLessons,
-      completedLessonsCount: preservedCompletedLessonsCount,
+      contractedLessons: authoritativeContractedLessons,
+      availableLessons: authoritativeAvailableLessons,
+      completedLessonsCount: authoritativeCompletedLessonsCount,
       teacherEmail: resolvedCanonicalTeacherEmail || existing.teacherEmail || null,
       teacherName: resolvedCanonicalTeacherName || existing.teacherName || null,
       teacherUid: resolvedCanonicalTeacherUid || (existing.teacherUid && isValidCanonicalUid(existing.teacherUid) ? existing.teacherUid : null),
@@ -2574,11 +2771,6 @@ const handleRegistration = async (req: any, res: any) => {
     };
   } else {
     // New Student: Ignore any client-supplied credits; initialize at 0 preserving 25-min trial eligibility
-    const initialTeacherEmail = resolvedCanonicalTeacherEmail;
-    const initialTeacherName = resolvedCanonicalTeacherName;
-    const initialContractedLessons = preservedContractedLessons;
-    const initialAvailableLessons = preservedAvailableLessons;
-
     const studentData = {
       id: userUid,
       uid: userUid,
@@ -2590,9 +2782,9 @@ const handleRegistration = async (req: any, res: any) => {
       studentLevel: level,
       goal: goal || 'English for everyday life & work',
       learningGoal: goal || 'English for everyday life & work',
-      contractedLessons: initialContractedLessons,
-      availableLessons: initialAvailableLessons,
-      completedLessonsCount: preservedCompletedLessonsCount,
+      contractedLessons: authoritativeContractedLessons,
+      availableLessons: authoritativeAvailableLessons,
+      completedLessonsCount: authoritativeCompletedLessonsCount,
       teacherEmail: initialTeacherEmail,
       teacherName: initialTeacherName,
       teacherUid: resolvedCanonicalTeacherUid,
@@ -2611,11 +2803,8 @@ const handleRegistration = async (req: any, res: any) => {
   }
 
   if (!db.contractedLessons) db.contractedLessons = {};
-  db.contractedLessons[cleanEmail] = preservedContractedLessons;
+  db.contractedLessons[cleanEmail] = authoritativeContractedLessons;
 
-  const initialTeacherEmail = resolvedCanonicalTeacherEmail;
-  const initialTeacherName = resolvedCanonicalTeacherName;
-  const initialContracted = preservedContractedLessons;
   const initialEnrollment =
     req.body.enrollmentStatus === 'active' || req.body.enrollmentStatus === 'not_enrolled'
       ? req.body.enrollmentStatus
@@ -2645,13 +2834,13 @@ const handleRegistration = async (req: any, res: any) => {
       points: 0,
       dailyGoalMinutes: 30,
       completedTodayMinutes: 0,
-      contractedLessons: initialContracted,
-      availableLessons: preservedAvailableLessons,
-      completedLessonsCount: preservedCompletedLessonsCount,
-      hasCompletedTrialLesson: preservedHasCompletedTrial,
-      subscriptionType: preservedSubscriptionType,
-      weeklyStudyDaysTarget: req.body.weeklyStudyDaysTarget !== undefined ? Number(req.body.weeklyStudyDaysTarget) : 7,
-      weeklyStudyDays: req.body.weeklyStudyDays || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'],
+      contractedLessons: authoritativeContractedLessons,
+      availableLessons: authoritativeAvailableLessons,
+      completedLessonsCount: authoritativeCompletedLessonsCount,
+      hasCompletedTrialLesson: authoritativeHasCompletedTrial,
+      subscriptionType: authoritativeSubscriptionType,
+      weeklyStudyDaysTarget: resolvedWeeklyStudyDaysTarget,
+      weeklyStudyDays: resolvedWeeklyStudyDays,
       onboardingCompleted: req.body.onboardingCompleted ?? false,
       picture: userAvatar,
       avatar: userAvatar,
@@ -2678,11 +2867,11 @@ const handleRegistration = async (req: any, res: any) => {
       teacherUid: resolvedCanonicalTeacherUid || p.teacherUid || null,
       assignedNativeFriendUID: resolvedCanonicalTeacherUid || p.assignedNativeFriendUID || null,
       nativeFriendUID: resolvedCanonicalTeacherUid || p.nativeFriendUID || null,
-      contractedLessons: preservedContractedLessons,
-      availableLessons: preservedAvailableLessons,
-      completedLessonsCount: preservedCompletedLessonsCount,
-      hasCompletedTrialLesson: preservedHasCompletedTrial,
-      subscriptionType: preservedSubscriptionType,
+      contractedLessons: authoritativeContractedLessons,
+      availableLessons: authoritativeAvailableLessons,
+      completedLessonsCount: authoritativeCompletedLessonsCount,
+      hasCompletedTrialLesson: authoritativeHasCompletedTrial,
+      subscriptionType: authoritativeSubscriptionType,
       picture: userAvatar,
       avatar: userAvatar,
     };
@@ -2694,7 +2883,6 @@ const handleRegistration = async (req: any, res: any) => {
   if (!db.studentVideoAssignments) db.studentVideoAssignments = {};
   if (!db.studentWatchedVideos) db.studentWatchedVideos = {};
 
-  const cleanInitialRoutines = createCleanStudentRoutines(routineVideoTime);
   if (!db.studentRoutinesMap[cleanEmail]) db.studentRoutinesMap[cleanEmail] = cleanInitialRoutines;
   if (!db.studentRoutinesMap[userUid]) db.studentRoutinesMap[userUid] = cleanInitialRoutines;
   if (db.studentAwaitingTopicSelection[cleanEmail] === undefined) db.studentAwaitingTopicSelection[cleanEmail] = true;
@@ -2705,60 +2893,6 @@ const handleRegistration = async (req: any, res: any) => {
   if (!db.studentWatchedVideos[userUid]) db.studentWatchedVideos[userUid] = [];
 
   await writeDbSync(db);
-
-  const preservedTeacherUid =
-    resolvedCanonicalTeacherUid ||
-    (existingFsUser?.teacherUid && isValidCanonicalUid(existingFsUser.teacherUid) ? existingFsUser.teacherUid : null) ||
-    (existingProfile?.teacherUid && isValidCanonicalUid(existingProfile.teacherUid) ? existingProfile.teacherUid : null);
-  const preservedTeacherEmail = initialTeacherEmail || existingFsUser?.teacherEmail || existingProfile?.teacherEmail || null;
-  const preservedTeacherName = initialTeacherName || existingFsUser?.teacherName || existingProfile?.teacherName || null;
-
-  // Persist student profile settings to Firestore while strictly preserving existing balances, trial status, and teacher link
-  const fullProfileToSave: Record<string, any> = {
-    uid: userUid,
-    id: userUid,
-    email: cleanEmail,
-    name: cleanName,
-    role: 'student',
-    picture: userAvatar || existingFsUser?.picture || existingProfile?.picture || '',
-    avatar: userAvatar || existingFsUser?.avatar || existingProfile?.avatar || '',
-    level,
-    userLevel: level,
-    englishLevel: level,
-    learningGoal: goal || existingFsUser?.learningGoal || existingProfile?.learningGoal || 'English for everyday life & work',
-    routineVideoTime: req.body.routineVideoTime || existingFsUser?.routineVideoTime || existingProfile?.routineVideoTime || routineVideoTime,
-    routineAudioTime: req.body.routineAudioTime || existingFsUser?.routineAudioTime || existingProfile?.routineAudioTime || routineAudioTime,
-    dailyPhraseTime: req.body.dailyPhraseTime || existingFsUser?.dailyPhraseTime || existingProfile?.dailyPhraseTime || dailyPhraseTime,
-    weeklyStudyDaysTarget: db.userProfiles[cleanEmail].weeklyStudyDaysTarget,
-    weeklyStudyDays: db.userProfiles[cleanEmail].weeklyStudyDays,
-    teacherEmail: preservedTeacherEmail,
-    teacherName: preservedTeacherName,
-    teacherUid: preservedTeacherUid,
-    assignedNativeFriendUID: preservedTeacherUid,
-    nativeFriendUID: preservedTeacherUid,
-    ...(!existingFsUser
-      ? {
-          contractedLessons: 0,
-          availableLessons: 0,
-          completedLessonsCount: 0,
-          hasCompletedTrialLesson: false,
-          subscriptionType: 'trial',
-          createdAt: new Date().toISOString(),
-        }
-      : { updatedAt: new Date().toISOString() }),
-  };
-
-  await saveUserToFirestore(fullProfileToSave).catch(() => {});
-  saveStudentAssignmentsByUid(userUid, {
-    uid: userUid,
-    email: cleanEmail,
-    level,
-    weeklyStudyDaysTarget: db.userProfiles[cleanEmail].weeklyStudyDaysTarget,
-    weeklyStudyDays: db.userProfiles[cleanEmail].weeklyStudyDays,
-    videoAssignments: [],
-    spotifyAssignments: db.studentSpotifyAssignments?.[cleanEmail] || [],
-    routines: cleanInitialRoutines,
-  }).catch(() => {});
 
   const account = {
     uid: userUid,
@@ -3213,12 +3347,44 @@ app.get('/api/landing-content', (req, res) => {
   res.json(db.landingContent || DEFAULT_LANDING_CONTENT);
 });
 
-app.post('/api/landing-content', (req, res) => {
+app.post('/api/landing-content', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
+  const firestoreDb = getFirestoreDb();
+  if (!firestoreDb || getIsCloudWriteDisabled()) {
+    return res.status(503).json({
+      error: 'FIRESTORE_UNAVAILABLE',
+      message: 'Canonical Firestore database is unavailable for landing content persistence.',
+    });
+  }
+
   const db = readDb();
   const content = req.body;
-  db.landingContent = { ...DEFAULT_LANDING_CONTENT, ...(db.landingContent || {}), ...content };
-  writeDb(db);
-  res.json({ success: true, landingContent: db.landingContent });
+  const nextLandingContent = JSON.parse(
+    JSON.stringify({
+      ...DEFAULT_LANDING_CONTENT,
+      ...(db.landingContent || {}),
+      ...(content && typeof content === 'object' && !Array.isArray(content) ? content : {}),
+    })
+  );
+
+  try {
+    await firestoreDb.collection('app_state').doc('main_data').set(
+      {
+        landingContent: nextLandingContent,
+        updatedAt: new Date().toISOString(),
+      },
+      { merge: true }
+    );
+  } catch (fsErr: any) {
+    console.error('[serverFirestore] Failed to persist landingContent to app_state/main_data:', fsErr);
+    return res.status(getIsCloudWriteDisabled() ? 503 : 500).json({
+      error: getIsCloudWriteDisabled() ? 'FIRESTORE_UNAVAILABLE' : 'Failed to persist landing content to Firestore',
+      message: fsErr?.message || 'Database write error',
+    });
+  }
+
+  db.landingContent = nextLandingContent;
+  await writeDbSync(db);
+  return res.json({ success: true, landingContent: db.landingContent });
 });
 
 // 2. Teachers / Native Friends Endpoints
@@ -3768,6 +3934,26 @@ app.post('/api/tutors', async (req, res) => {
 
   let persistedTutorEntry: Record<string, any> = tutorEntry;
 
+  const buildMeetEntryForTutor = (sourceTutor: Record<string, any>): Record<string, any> | null => {
+    const meetLink = (sourceTutor.meetUrl || sourceTutor.meetLink || '').trim();
+    if (!meetLink || meetLink.includes('meet.google.com/new')) return null;
+    return {
+      teacherEmail: cleanEmail,
+      uid: canonicalAuthUid,
+      meetLink,
+      workingHoursStart: '08:00',
+      workingHoursEnd: '18:00',
+      slotDurationMinutes: 30,
+      availableDays: sourceTutor.availableDays || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday'],
+      availability: sourceTutor.availability || sourceTutor.availableHoursByDay || {},
+      availableHoursByDay: sourceTutor.availableHoursByDay || sourceTutor.availability || {},
+      timezone: sourceTutor.timezone || 'America/Toronto',
+      updatedAt: new Date().toISOString(),
+    };
+  };
+
+  let persistedMeetEntry: Record<string, any> | null = null;
+
   // FIN.2B: Validação centralizada obrigatória de comissão antes de criar/aprovar tutor ativo
   if (isAdminCaller && (resolvedIsApproved || rawTutor.adminCommissionPercent !== undefined || rawTutor.commissionModel !== undefined)) {
     const txRes = await approveAndSaveTutorCommissionTransactionally({
@@ -3788,41 +3974,139 @@ app.post('/api/tutors', async (req, res) => {
       });
     }
     persistedTutorEntry = txRes.savedTutor;
+    persistedMeetEntry = buildMeetEntryForTutor(persistedTutorEntry);
+    if (persistedMeetEntry) {
+      const availSaved = await saveTeacherAvailabilityToFirestore(canonicalAuthUid || cleanEmail, persistedMeetEntry);
+      const firestoreDbForAdmin = getFirestoreDb();
+      if (firestoreDbForAdmin && !getIsCloudWriteDisabled() && !availSaved) {
+        return res.status(500).json({
+          error: 'Failed to persist teacher availability to Firestore',
+          message: 'Não foi possível confirmar a gravação da disponibilidade do Amigo Nativo no Firestore.',
+        });
+      }
+    }
   } else {
-    // Cadastro pendente normal (sem aprovação e sem comissão): persiste diretamente no Firestore
-    await saveTutorToFirestore(tutorEntry).catch((err) => {
-      console.warn('Error saving tutor to Firestore collection:', err);
-    });
+    // Cadastro pendente normal (sem aprovação e sem comissão): persiste diretamente no Firestore (default) com confirmação obrigatória
+    const firestoreDb = getFirestoreDb();
+    if (!firestoreDb || getIsCloudWriteDisabled()) {
+      return res.status(503).json({
+        error: 'FIRESTORE_UNAVAILABLE',
+        message: 'Canonical Firestore database is unavailable for tutor persistence.',
+      });
+    }
+
+    persistedMeetEntry = buildMeetEntryForTutor(persistedTutorEntry);
+
+    try {
+      if (typeof (firestoreDb as any).runTransaction === 'function') {
+        const txPendingResult = await (firestoreDb as any).runTransaction(async (tx: any) => {
+          const tutorDocRef = firestoreDb.collection('tutors').doc(canonicalAuthUid);
+          const userDocRef = firestoreDb.collection('users').doc(canonicalAuthUid);
+          const uSnap = await tx.get(userDocRef);
+
+          if (uSnap && uSnap.exists) {
+            const uData = uSnap.data();
+            const currentRole = String(uData?.role || uData?.userRole || '').toLowerCase().trim();
+            if (currentRole === 'student') {
+              return {
+                ok: false as const,
+                status: 409 as const,
+                code: 'ROLE_MUTATION_FORBIDDEN',
+                error: 'Esta conta já está registrada como Aluno. Não é permitido converter contas de alunos em Amigos Nativos.',
+              };
+            }
+          }
+
+          const legacyIds = Array.from(
+            new Set(
+              [
+                ...(Array.isArray(tutorEntry.legacyIds) ? tutorEntry.legacyIds : []),
+                tutorEntry.id && tutorEntry.id !== canonicalAuthUid ? tutorEntry.id : null,
+              ].filter(Boolean)
+            )
+          );
+
+          const sanitizedTutorDoc = JSON.parse(
+            JSON.stringify({
+              ...tutorEntry,
+              id: canonicalAuthUid,
+              uid: canonicalAuthUid,
+              authUid: canonicalAuthUid,
+              publicTutorId,
+              legacyIds,
+              email: cleanEmail,
+              role: 'teacher',
+              approvalStatus: resolvedApprovalStatus,
+              isApproved: false,
+              status: resolvedApprovalStatus,
+              approved: false,
+              updatedAt: new Date().toISOString(),
+            })
+          );
+
+          tx.set(tutorDocRef, sanitizedTutorDoc, { merge: true });
+
+          if (uSnap && uSnap.exists) {
+            const pendingUserUpdate = { ...sanitizedTutorDoc, role: uSnap.data()?.role || 'student' };
+            tx.set(userDocRef, pendingUserUpdate, { merge: true });
+          }
+
+          if (persistedMeetEntry) {
+            const availDocRef = firestoreDb.collection('teacher_availability').doc(canonicalAuthUid);
+            tx.set(availDocRef, JSON.parse(JSON.stringify(persistedMeetEntry)), { merge: true });
+          }
+
+          return { ok: true as const };
+        });
+
+        if (!txPendingResult.ok) {
+          return res.status(txPendingResult.status).json({
+            error: txPendingResult.code,
+            message: txPendingResult.error,
+          });
+        }
+      } else {
+        const savedTutorOk = await saveTutorToFirestore(tutorEntry);
+        if (!savedTutorOk) {
+          throw new Error('Failed to persist pending tutor to Firestore');
+        }
+        if (persistedMeetEntry) {
+          const savedAvailOk = await saveTeacherAvailabilityToFirestore(canonicalAuthUid || cleanEmail, persistedMeetEntry);
+          if (!savedAvailOk) {
+            throw new Error('Failed to persist teacher availability to Firestore');
+          }
+        }
+      }
+    } catch (fsErr: any) {
+      const errMsg = String(fsErr?.message || fsErr || 'Database write error');
+      if (errMsg.includes('canonically registered as student')) {
+        return res.status(409).json({
+          error: 'ROLE_MUTATION_FORBIDDEN',
+          message: 'Esta conta já está registrada como Aluno. Não é permitido converter contas de alunos em Amigos Nativos.',
+        });
+      }
+      console.error(`[serverFirestore] Failed to persist pending tutor in tutors/${canonicalAuthUid}:`, fsErr);
+      return res.status(getIsCloudWriteDisabled() ? 503 : 500).json({
+        error: getIsCloudWriteDisabled() ? 'FIRESTORE_UNAVAILABLE' : 'Failed to persist tutor to Firestore',
+        message: errMsg,
+      });
+    }
   }
 
+  // Update RAM caches strictly AFTER canonical Firestore confirmation
   db.tutorsList = db.tutorsList || [];
   db.tutorsList.push(persistedTutorEntry);
 
-  // Initialize teacher meet settings if configured during registration
-  const tutorMeetLink = (persistedTutorEntry.meetUrl || persistedTutorEntry.meetLink || '').trim();
-  if (tutorMeetLink && !tutorMeetLink.includes('meet.google.com/new')) {
+  // Initialize teacher meet settings in RAM if configured during registration
+  if (persistedMeetEntry) {
     if (!db.meetSettings) db.meetSettings = {};
     if (!db.teacherSettings) db.teacherSettings = {};
-    const meetEntry = {
-      teacherEmail: cleanEmail,
-      uid: canonicalAuthUid,
-      meetLink: tutorMeetLink,
-      workingHoursStart: '08:00',
-      workingHoursEnd: '18:00',
-      slotDurationMinutes: 30,
-      availableDays: persistedTutorEntry.availableDays || ['monday', 'tuesday', 'wednesday', 'thursday', 'friday'],
-      availability: persistedTutorEntry.availability || persistedTutorEntry.availableHoursByDay || {},
-      availableHoursByDay: persistedTutorEntry.availableHoursByDay || persistedTutorEntry.availability || {},
-      timezone: persistedTutorEntry.timezone || 'America/Toronto',
-      updatedAt: new Date().toISOString(),
-    };
-    db.meetSettings[cleanEmail] = meetEntry;
-    db.teacherSettings[cleanEmail] = meetEntry;
+    db.meetSettings[cleanEmail] = persistedMeetEntry;
+    db.teacherSettings[cleanEmail] = persistedMeetEntry;
     if (canonicalAuthUid) {
-      db.meetSettings[canonicalAuthUid] = meetEntry;
-      db.teacherSettings[canonicalAuthUid] = meetEntry;
+      db.meetSettings[canonicalAuthUid] = persistedMeetEntry;
+      db.teacherSettings[canonicalAuthUid] = persistedMeetEntry;
     }
-    saveTeacherAvailabilityToFirestore(canonicalAuthUid || cleanEmail, meetEntry).catch(() => {});
   }
 
   // Also maintain teachers list for auth
@@ -4315,100 +4599,256 @@ app.put('/api/tutors/:id', firebaseAuthMiddleware, async (req, res) => {
 
   // Admin Delete Tutor
 app.delete('/api/tutors/:id', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
+  const firestoreDb = getFirestoreDb();
+  if (!firestoreDb || getIsCloudWriteDisabled()) {
+    return res.status(503).json({
+      error: 'FIRESTORE_UNAVAILABLE',
+      message: 'Canonical Firestore database is unavailable for tutor deletion.',
+    });
+  }
+
   const db = readDb();
   const tutorId = decodeURIComponent(req.params.id);
-  const targetEmailQuery = ((req.query.email as string) || '').toLowerCase();
+  const targetEmailQuery = ((req.query.email as string) || '').toLowerCase().trim();
 
   const targetTutor = (db.tutorsList || []).find(
     (t: any) =>
       t.id === tutorId ||
+      t.uid === tutorId ||
+      t.authUid === tutorId ||
+      (t.publicTutorId && t.publicTutorId.toLowerCase() === tutorId.toLowerCase()) ||
       t.email?.toLowerCase() === tutorId.toLowerCase() ||
       (targetEmailQuery && t.email?.toLowerCase() === targetEmailQuery)
   );
-  const targetEmail = (
+  let targetEmail = (
     targetTutor?.email ||
     targetEmailQuery ||
     (tutorId.includes('@') ? tutorId : '')
-  )?.toLowerCase();
+  )
+    ?.toLowerCase()
+    .trim();
 
-  // Safeguard: Primary administrator account can NEVER be deleted via tutors endpoint
-  const isTargetAdmin = Boolean(
-    targetTutor?.role === 'admin' ||
-    (db.teachers || []).some((t: any) => t.email?.toLowerCase() === targetEmail && t.role === 'admin') ||
-    (db.authUsers && db.authUsers[targetEmail]?.role === 'admin')
-  );
+  try {
+    const tutorDocIdsToDelete = new Set<string>([tutorId]);
+    const userDocIdsToDelete = new Set<string>();
+    let foundAdminInFirestore = false;
 
-  if (isTargetAdmin) {
-    return res.status(403).json({
-      error: 'Forbidden',
-      message: 'Cannot delete primary system administrator account',
+    const inspectDoc = (docSnap: any, col: 'tutors' | 'users') => {
+      if (!docSnap || !docSnap.exists) return;
+      const data = typeof docSnap.data === 'function' ? docSnap.data() : {};
+      const role = String(data?.role || data?.userRole || '').toLowerCase().trim();
+      const docEmail = String(data?.email || '').toLowerCase().trim();
+      if (docEmail && !targetEmail) {
+        targetEmail = docEmail;
+      }
+      if (role === 'admin' || docEmail === 'adm.itissimple@gmail.com') {
+        foundAdminInFirestore = true;
+        return;
+      }
+      if (col === 'tutors') {
+        tutorDocIdsToDelete.add(docSnap.id);
+        const linkedUid = String(data?.authUid || data?.uid || '').trim();
+        if (linkedUid && isValidCanonicalUid(linkedUid)) {
+          tutorDocIdsToDelete.add(linkedUid);
+          userDocIdsToDelete.add(linkedUid);
+        }
+      } else if (role !== 'student') {
+        userDocIdsToDelete.add(docSnap.id);
+      }
+    };
+
+    const [directTutorSnap, directUserSnap] = await Promise.all([
+      firestoreDb.collection('tutors').doc(tutorId).get(),
+      firestoreDb.collection('users').doc(tutorId).get(),
+    ]);
+    inspectDoc(directTutorSnap, 'tutors');
+    inspectDoc(directUserSnap, 'users');
+
+    if (targetTutor?.id && targetTutor.id !== tutorId) {
+      tutorDocIdsToDelete.add(targetTutor.id);
+    }
+    const targetCanonicalUid = String(targetTutor?.authUid || targetTutor?.uid || '').trim();
+    if (targetCanonicalUid && isValidCanonicalUid(targetCanonicalUid)) {
+      tutorDocIdsToDelete.add(targetCanonicalUid);
+      userDocIdsToDelete.add(targetCanonicalUid);
+    }
+
+    if (!tutorId.includes('@')) {
+      const [tPubSnap, uPubSnap] = await Promise.all([
+        firestoreDb.collection('tutors').where('publicTutorId', '==', tutorId).get(),
+        firestoreDb.collection('users').where('publicTutorId', '==', tutorId).get(),
+      ]);
+      for (const d of tPubSnap?.docs || []) inspectDoc(d, 'tutors');
+      for (const d of uPubSnap?.docs || []) inspectDoc(d, 'users');
+    }
+
+    if (targetEmail) {
+      const [tEmailSnap, uEmailSnap] = await Promise.all([
+        firestoreDb.collection('tutors').where('email', '==', targetEmail).get(),
+        firestoreDb.collection('users').where('email', '==', targetEmail).get(),
+      ]);
+      for (const d of tEmailSnap?.docs || []) inspectDoc(d, 'tutors');
+      for (const d of uEmailSnap?.docs || []) inspectDoc(d, 'users');
+    }
+
+    for (const uId of Array.from(userDocIdsToDelete)) {
+      const uSnap = await firestoreDb.collection('users').doc(uId).get();
+      if (uSnap && uSnap.exists) {
+        const uData = uSnap.data() || {};
+        const uRole = String(uData.role || uData.userRole || '').toLowerCase().trim();
+        const uEmail = String(uData.email || '').toLowerCase().trim();
+        if (uRole === 'admin' || uEmail === 'adm.itissimple@gmail.com') {
+          foundAdminInFirestore = true;
+        } else if (uRole === 'student') {
+          userDocIdsToDelete.delete(uId);
+        }
+      }
+    }
+
+    // Safeguard: Primary administrator account can NEVER be deleted via tutors endpoint
+    const isTargetAdmin = Boolean(
+      foundAdminInFirestore ||
+      targetEmail === 'adm.itissimple@gmail.com' ||
+      tutorId.toLowerCase().trim() === 'adm.itissimple@gmail.com' ||
+      targetTutor?.role === 'admin' ||
+      (db.teachers || []).some((t: any) => t.email?.toLowerCase() === targetEmail && t.role === 'admin') ||
+      (db.authUsers && targetEmail && db.authUsers[targetEmail]?.role === 'admin')
+    );
+
+    if (isTargetAdmin) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Cannot delete primary system administrator account',
+      });
+    }
+
+    if (!directUserSnap?.exists) {
+      userDocIdsToDelete.add(tutorId);
+    }
+
+    const nextDeletedTutorIdsBase = Array.from(
+      new Set(
+        [
+          ...(db.deletedTutorIds || []),
+          tutorId.toLowerCase().trim(),
+          ...(targetTutor?.id ? [String(targetTutor.id).toLowerCase().trim()] : []),
+          ...(targetCanonicalUid ? [targetCanonicalUid.toLowerCase().trim()] : []),
+        ].filter(Boolean)
+      )
+    );
+    const nextDeletedTutorEmailsBase = targetEmail
+      ? Array.from(new Set([...(db.deletedTutorEmails || []), targetEmail.toLowerCase().trim()].filter(Boolean)))
+      : [...(db.deletedTutorEmails || [])];
+
+    const matchesDeletedTutor = (t: any) => {
+      if (!t) return false;
+      const tId = String(t.id || '').toLowerCase();
+      const tUid = String(t.uid || '').toLowerCase();
+      const tAuthUid = String(t.authUid || '').toLowerCase();
+      const tPub = String(t.publicTutorId || '').toLowerCase();
+      const tEm = String(t.email || '').toLowerCase().trim();
+      const cleanParam = tutorId.toLowerCase().trim();
+      return (
+        t.id === tutorId ||
+        tId === cleanParam ||
+        tUid === cleanParam ||
+        tAuthUid === cleanParam ||
+        tPub === cleanParam ||
+        tEm === cleanParam ||
+        Boolean(targetEmail && tEm === targetEmail)
+      );
+    };
+
+    const nextTutorsList = (db.tutorsList || []).filter((t: any) => !matchesDeletedTutor(t));
+    const nextTeachers = targetEmail
+      ? (db.teachers || []).filter((t: any) => t.email?.toLowerCase() !== targetEmail || t.role === 'admin')
+      : [...(db.teachers || [])];
+
+    let mergedDeletedTutorIds = nextDeletedTutorIdsBase;
+    let mergedDeletedTutorEmails = nextDeletedTutorEmailsBase;
+
+    const tutorsRef = firestoreDb.collection('app_state').doc('tutors');
+    const applyStateUpdate = (existingData: Record<string, any> | undefined) => {
+      const existingIds = Array.isArray(existingData?.deletedTutorIds) ? existingData!.deletedTutorIds : [];
+      const existingEmails = Array.isArray(existingData?.deletedTutorEmails) ? existingData!.deletedTutorEmails : [];
+      mergedDeletedTutorIds = Array.from(
+        new Set([...existingIds, ...nextDeletedTutorIdsBase].map((v: string) => String(v || '').toLowerCase().trim()).filter(Boolean))
+      );
+      mergedDeletedTutorEmails = Array.from(
+        new Set([...existingEmails, ...nextDeletedTutorEmailsBase].map((v: string) => String(v || '').toLowerCase().trim()).filter(Boolean))
+      );
+      const existingFsTutorsList = Array.isArray(existingData?.tutorsList) ? existingData!.tutorsList : nextTutorsList;
+      const existingFsTeachers = Array.isArray(existingData?.teachers) ? existingData!.teachers : nextTeachers;
+      return {
+        deletedTutorIds: mergedDeletedTutorIds,
+        deletedTutorEmails: mergedDeletedTutorEmails,
+        tutorsList: JSON.parse(JSON.stringify(existingFsTutorsList.filter((t: any) => !matchesDeletedTutor(t)))),
+        teachers: JSON.parse(
+          JSON.stringify(
+            targetEmail
+              ? existingFsTeachers.filter((t: any) => (t?.email || '').toLowerCase().trim() !== targetEmail || t?.role === 'admin')
+              : existingFsTeachers
+          )
+        ),
+        updatedAt: new Date().toISOString(),
+      };
+    };
+
+    if (typeof (firestoreDb as any).runTransaction === 'function') {
+      await (firestoreDb as any).runTransaction(async (tx: any) => {
+        const tutorsSnap = await tx.get(tutorsRef);
+        const statePayload = applyStateUpdate(tutorsSnap?.exists ? tutorsSnap.data() : undefined);
+
+        for (const docId of tutorDocIdsToDelete) {
+          tx.delete(firestoreDb.collection('tutors').doc(docId));
+        }
+        for (const docId of userDocIdsToDelete) {
+          tx.delete(firestoreDb.collection('users').doc(docId));
+        }
+        tx.set(tutorsRef, statePayload, { merge: true });
+      });
+    } else {
+      const tutorsSnap = await tutorsRef.get();
+      const statePayload = applyStateUpdate(tutorsSnap?.exists ? tutorsSnap.data() : undefined);
+      for (const docId of tutorDocIdsToDelete) {
+        await firestoreDb.collection('tutors').doc(docId).delete();
+      }
+      for (const docId of userDocIdsToDelete) {
+        await firestoreDb.collection('users').doc(docId).delete();
+      }
+      await tutorsRef.set(statePayload, { merge: true });
+    }
+
+    // Update RAM caches strictly AFTER confirmed Firestore persistence
+    db.deletedTutorIds = mergedDeletedTutorIds;
+    db.deletedTutorEmails = mergedDeletedTutorEmails;
+    db.tutorsList = nextTutorsList;
+    db.teachers = nextTeachers;
+    if (targetEmail && !isTargetAdmin) {
+      if (db.meetSettings) {
+        delete db.meetSettings[targetEmail];
+      }
+      if (db.teacherSettings) {
+        delete db.teacherSettings[targetEmail];
+      }
+      if (db.authUsers && db.authUsers[targetEmail]?.role === 'teacher') {
+        delete db.authUsers[targetEmail];
+      }
+    }
+    if (targetCanonicalUid && !isTargetAdmin) {
+      if (db.meetSettings) delete db.meetSettings[targetCanonicalUid];
+      if (db.teacherSettings) delete db.teacherSettings[targetCanonicalUid];
+    }
+
+    await writeDbSync(db);
+    return res.json({ success: true, message: 'Amigo Nativo excluído com sucesso.', tutors: db.tutorsList });
+  } catch (fsErr: any) {
+    console.error(`[serverFirestore] Failed to delete tutor "${tutorId}" in Firestore:`, fsErr);
+    return res.status(getIsCloudWriteDisabled() ? 503 : 500).json({
+      error: getIsCloudWriteDisabled() ? 'FIRESTORE_UNAVAILABLE' : 'Failed to delete tutor from Firestore',
+      message: fsErr?.message || 'Database delete error',
     });
   }
-
-  // Track permanently so deleted tutors are NEVER re-added by defaults or sync
-  db.deletedTutorIds = Array.from(
-    new Set([...(db.deletedTutorIds || []), tutorId.toLowerCase()])
-  );
-  if (targetEmail) {
-    db.deletedTutorEmails = Array.from(
-      new Set([...(db.deletedTutorEmails || []), targetEmail.toLowerCase()])
-    );
-  }
-
-  db.tutorsList = (db.tutorsList || []).filter(
-    (t: any) =>
-      t.id !== tutorId &&
-      t.email?.toLowerCase() !== tutorId.toLowerCase() &&
-      (!targetEmail || t.email?.toLowerCase() !== targetEmail)
-  );
-
-  if (targetEmail) {
-    // Only remove from teachers if NOT an admin! Admins must keep admin access
-    db.teachers = (db.teachers || []).filter(
-      (t: any) => t.email?.toLowerCase() !== targetEmail || t.role === 'admin'
-    );
-    if (db.meetSettings && !isTargetAdmin) {
-      delete db.meetSettings[targetEmail];
-    }
-    if (db.teacherSettings && !isTargetAdmin) {
-      delete db.teacherSettings[targetEmail];
-    }
-    // Only delete from authUsers if their role is teacher and not admin!
-    if (db.authUsers && db.authUsers[targetEmail]?.role === 'teacher') {
-      delete db.authUsers[targetEmail];
-    }
-  }
-
-  // Delete directly from Firestore /tutors/{tutorId}
-  await deleteTutorFromFirestore(tutorId).catch((err) => {
-    console.warn('Error deleting tutor from Firestore collection:', err);
-  });
-  if (targetTutor?.id && targetTutor.id !== tutorId) {
-    await deleteTutorFromFirestore(targetTutor.id).catch(() => {});
-  }
-
-  const firestoreDb = getFirestoreDb();
-  if (firestoreDb && !getIsCloudWriteDisabled()) {
-    try {
-      const tutorsRef = firestoreDb.collection('app_state').doc('tutors');
-      const tutorsSnap = await tutorsRef.get().catch(() => null);
-      const existingIds = Array.isArray(tutorsSnap?.data()?.deletedTutorIds) ? tutorsSnap!.data()!.deletedTutorIds : [];
-      const existingEmails = Array.isArray(tutorsSnap?.data()?.deletedTutorEmails) ? tutorsSnap!.data()!.deletedTutorEmails : [];
-      db.deletedTutorIds = Array.from(new Set([...existingIds, ...(db.deletedTutorIds || [])].map((v: string) => String(v || '').toLowerCase().trim()).filter(Boolean)));
-      db.deletedTutorEmails = Array.from(new Set([...existingEmails, ...(db.deletedTutorEmails || [])].map((v: string) => String(v || '').toLowerCase().trim()).filter(Boolean)));
-      await tutorsRef.set(
-        {
-          deletedTutorIds: db.deletedTutorIds,
-          deletedTutorEmails: db.deletedTutorEmails,
-          updatedAt: new Date().toISOString(),
-        },
-        { merge: true }
-      ).catch(() => {});
-    } catch {}
-  }
-
-  await writeDbSync(db);
-  res.json({ success: true, message: 'Amigo Nativo excluído com sucesso.', tutors: db.tutorsList });
 });
 
 app.post('/api/tutors/:id/approve', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
@@ -4778,73 +5218,210 @@ app.get('/api/tutors/:id/commission-history', firebaseAuthMiddleware, requireAdm
 });
 
 app.post('/api/tutors/:id/reject', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
-  const db = readDb();
-  const tutorId = req.params.id;
-  let rejectedEmail = '';
-  let rejectedTutor: any = null;
-  db.tutorsList = (db.tutorsList || []).map((t) => {
-    if (t.id === tutorId || t.email?.toLowerCase() === tutorId.toLowerCase()) {
-      rejectedEmail = (t.email || '').toLowerCase().trim();
-      rejectedTutor = {
-        ...t,
-        approvalStatus: 'rejected',
-        isApproved: false,
-        status: 'rejected',
-        approved: false,
-        updatedAt: new Date().toISOString(),
-      };
-      return rejectedTutor;
-    }
-    return t;
-  });
+  const firestoreDb = getFirestoreDb();
+  if (!firestoreDb || getIsCloudWriteDisabled()) {
+    return res.status(503).json({
+      error: 'FIRESTORE_UNAVAILABLE',
+      message: 'Canonical Firestore database is unavailable for tutor rejection.',
+    });
+  }
 
-  if (!rejectedTutor) {
-    const passedTutor = req.body?.tutor;
-    if (passedTutor) {
-      rejectedEmail = (passedTutor.email || '').toLowerCase().trim();
-      rejectedTutor = {
-        ...passedTutor,
-        id: tutorId,
-        approvalStatus: 'rejected',
-        isApproved: false,
-        status: 'rejected',
-        approved: false,
-        updatedAt: new Date().toISOString(),
-      };
-      db.tutorsList = db.tutorsList || [];
-      db.tutorsList.push(rejectedTutor);
+  const db = readDb();
+  const tutorId = decodeURIComponent(req.params.id || '').trim();
+
+  // 1. Locate candidate without mutating RAM
+  let candidateTutor: any = (db.tutorsList || []).find(
+    (t: any) =>
+      t.id === tutorId ||
+      t.uid === tutorId ||
+      t.authUid === tutorId ||
+      (t.publicTutorId && t.publicTutorId.toLowerCase() === tutorId.toLowerCase()) ||
+      (t.email && t.email.toLowerCase() === tutorId.toLowerCase())
+  );
+
+  if (!candidateTutor) {
+    const teacher = (db.teachers || []).find(
+      (tc: any) =>
+        tc.id === tutorId ||
+        tc.uid === tutorId ||
+        tc.authUid === tutorId ||
+        (tc.email && tc.email.toLowerCase() === tutorId.toLowerCase())
+    );
+    if (teacher) {
+      candidateTutor = { ...teacher, id: teacher.id || tutorId };
     }
   }
 
-  if (!rejectedTutor) {
+  if (!candidateTutor) {
     try {
-      const directTutor = await fetchTutorDocumentFromFirestore(tutorId).catch(() => null);
+      const directTutor = await fetchTutorDocumentFromFirestore(tutorId);
       if (directTutor) {
-        rejectedEmail = (directTutor.email || '').toLowerCase().trim();
-        rejectedTutor = {
-          ...directTutor,
-          id: directTutor.id || tutorId,
-          approvalStatus: 'rejected',
-          isApproved: false,
-          status: 'rejected',
-          approved: false,
-          updatedAt: new Date().toISOString(),
-        };
-        db.tutorsList = db.tutorsList || [];
-        db.tutorsList.push(rejectedTutor);
+        candidateTutor = { ...directTutor, id: directTutor.id || tutorId };
+      } else if (tutorId && !tutorId.includes('@')) {
+        const pubSnap = await firestoreDb.collection('tutors').where('publicTutorId', '==', tutorId).limit(1).get();
+        if (pubSnap && !pubSnap.empty && pubSnap.docs[0]?.exists) {
+          candidateTutor = { id: pubSnap.docs[0].id, ...pubSnap.docs[0].data() };
+        }
       }
-    } catch {}
+    } catch (fsErr: any) {
+      console.warn('Error fetching tutor document from Firestore in POST /api/tutors/:id/reject:', fsErr);
+      return res.status(503).json({
+        error: 'FIRESTORE_QUERY_FAILED',
+        message: 'Falha ao consultar o registro do Native Friend no Firestore.',
+      });
+    }
+  }
+
+  if (!candidateTutor && req.body?.tutor) {
+    candidateTutor = { ...req.body.tutor, id: req.body.tutor.id || tutorId };
+  }
+
+  if (!candidateTutor) {
+    return res.status(404).json({
+      error: 'NotFound',
+      message: `Amigo Nativo "${tutorId}" não foi encontrado para recusa.`,
+    });
+  }
+
+  const uidResolution = await resolveCanonicalUidForTutorModeration({
+    candidateTutor,
+    tutorIdParam: tutorId,
+    dbState: db,
+  });
+  if (!uidResolution.ok) {
+    return res.status(uidResolution.status).json({
+      error: uidResolution.code,
+      message: uidResolution.error,
+    });
+  }
+
+  const canonicalUid = uidResolution.canonicalUid;
+  const mergedSource = {
+    ...(uidResolution.existingTutorDoc || {}),
+    ...candidateTutor,
+  };
+  const rejectedEmail = (mergedSource.email || '').toLowerCase().trim();
+
+  const isTargetAdmin = Boolean(
+    rejectedEmail === 'adm.itissimple@gmail.com' ||
+    String(mergedSource.role || '').toLowerCase() === 'admin' ||
+    String(uidResolution.existingUserDoc?.role || '').toLowerCase() === 'admin' ||
+    (db.teachers || []).some((t: any) => (t.email || '').toLowerCase() === rejectedEmail && t.role === 'admin') ||
+    (db.authUsers && rejectedEmail && db.authUsers[rejectedEmail]?.role === 'admin')
+  );
+  if (isTargetAdmin) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Cannot reject primary system administrator account',
+    });
+  }
+
+  const publicTutorId =
+    (mergedSource.publicTutorId && !isGenericTutorId(mergedSource.publicTutorId) ? mergedSource.publicTutorId : null) ||
+    (!isValidCanonicalUid(tutorId) && !tutorId.includes('@') && !isGenericTutorId(tutorId) ? tutorId : null) ||
+    (rejectedEmail ? `tutor-${rejectedEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : canonicalUid);
+
+  const rejectedTutor = JSON.parse(
+    JSON.stringify({
+      ...mergedSource,
+      id: canonicalUid,
+      uid: canonicalUid,
+      authUid: canonicalUid,
+      publicTutorId,
+      email: rejectedEmail,
+      role: 'teacher',
+      approvalStatus: 'rejected',
+      isApproved: false,
+      status: 'rejected',
+      approved: false,
+      updatedAt: new Date().toISOString(),
+    })
+  );
+
+  try {
+    if (typeof (firestoreDb as any).runTransaction === 'function') {
+      const txRejectRes = await (firestoreDb as any).runTransaction(async (tx: any) => {
+        const tutorDocRef = firestoreDb.collection('tutors').doc(canonicalUid);
+        const userDocRef = firestoreDb.collection('users').doc(canonicalUid);
+        const uSnap = await tx.get(userDocRef);
+
+        if (uSnap && uSnap.exists) {
+          const uRole = String(uSnap.data()?.role || uSnap.data()?.userRole || '').toLowerCase().trim();
+          if (uRole === 'student') {
+            return {
+              ok: false as const,
+              status: 409 as const,
+              code: 'ROLE_MUTATION_FORBIDDEN',
+              error: 'Conta registrada canonicamente como aluno em users/{uid} não pode ser convertida em Native Friend.',
+            };
+          }
+          if (uRole === 'admin') {
+            return {
+              ok: false as const,
+              status: 403 as const,
+              code: 'Forbidden',
+              error: 'Cannot reject primary system administrator account',
+            };
+          }
+        }
+
+        tx.set(tutorDocRef, rejectedTutor, { merge: true });
+        if (uSnap && uSnap.exists) {
+          const existingRole = String(uSnap.data()?.role || 'teacher');
+          tx.set(userDocRef, { ...rejectedTutor, role: existingRole }, { merge: true });
+        }
+        return { ok: true as const };
+      });
+
+      if (!txRejectRes.ok) {
+        return res.status(txRejectRes.status).json({
+          error: txRejectRes.code,
+          message: txRejectRes.error,
+        });
+      }
+    } else {
+      const savedOk = await saveTutorToFirestore(rejectedTutor);
+      if (!savedOk) {
+        throw new Error('Failed to persist rejected tutor to Firestore');
+      }
+    }
+  } catch (fsErr: any) {
+    console.error(`[serverFirestore] Failed to persist rejected tutor in tutors/${canonicalUid}:`, fsErr);
+    return res.status(getIsCloudWriteDisabled() ? 503 : 500).json({
+      error: getIsCloudWriteDisabled() ? 'FIRESTORE_UNAVAILABLE' : 'Failed to persist tutor rejection to Firestore',
+      message: fsErr?.message || 'Database write error',
+    });
+  }
+
+  // Update RAM caches strictly AFTER confirmed Firestore persistence
+  db.tutorsList = db.tutorsList || [];
+  const existingIdx = db.tutorsList.findIndex(
+    (t: any) =>
+      (t.uid && t.uid === canonicalUid) ||
+      (t.authUid && t.authUid === canonicalUid) ||
+      t.id === tutorId ||
+      t.id === canonicalUid ||
+      (rejectedEmail && (t.email || '').toLowerCase() === rejectedEmail)
+  );
+  if (existingIdx >= 0) {
+    db.tutorsList[existingIdx] = rejectedTutor;
+  } else {
+    db.tutorsList.push(rejectedTutor);
   }
 
   if (rejectedEmail) {
-    const tIdx = (db.teachers || []).findIndex((tc: any) => (tc.email || '').toLowerCase() === rejectedEmail);
+    const tIdx = (db.teachers || []).findIndex(
+      (tc: any) => (tc.email || '').toLowerCase() === rejectedEmail || tc.uid === canonicalUid
+    );
     if (tIdx >= 0) {
       db.teachers[tIdx] = {
         ...db.teachers[tIdx],
+        uid: canonicalUid,
         approvalStatus: 'rejected',
         isApproved: false,
         status: 'rejected',
         approved: false,
+        updatedAt: rejectedTutor.updatedAt,
       };
     }
     if (db.userProfiles && db.userProfiles[rejectedEmail]) {
@@ -4854,29 +5431,17 @@ app.post('/api/tutors/:id/reject', firebaseAuthMiddleware, requireAdmin, async (
         isApproved: false,
         status: 'rejected',
         approved: false,
+        updatedAt: rejectedTutor.updatedAt,
       };
     }
   }
 
-  if (rejectedTutor) {
-    const rejectedTeacherRes = await resolveTeacherCanonicalIdentity({
-      teacherId: tutorId,
-      publicTutorId: tutorId,
-      teacherEmail: rejectedEmail,
-      dbState: db,
-    });
-    if (rejectedTeacherRes && isValidCanonicalUid(rejectedTeacherRes.canonicalUid)) {
-      rejectedTutor.authUid = rejectedTeacherRes.canonicalUid;
-      rejectedTutor.uid = rejectedTeacherRes.canonicalUid;
-      rejectedTutor.publicTutorId = tutorId;
-    }
-    await saveTutorToFirestore(rejectedTutor).catch((err) => {
-      console.warn('Error saving rejected tutor to Firestore:', err);
-    });
-  }
-
   await writeDbSync(db);
-  res.json({ success: true, tutors: db.tutorsList });
+  return res.json({
+    success: true,
+    tutors: (db.tutorsList || []).map((t: any) => sanitizePrivateTutorRecord(t, { includeAdminCommission: true })),
+    rejectedTutor: sanitizePrivateTutorRecord(rejectedTutor, { includeAdminCommission: true }),
+  });
 });
 
 app.post('/api/teachers', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
@@ -4995,46 +5560,328 @@ app.post('/api/teachers', firebaseAuthMiddleware, requireAdmin, async (req, res)
   }
 
   // Sem aprovação nem comissão informada: preserva apenas registro pendente e descarta metadados de comissão forjados
-  const cleanedInput = stripAdminCommissionFields({ ...newTeacher });
-  const teacherEntry = {
-    ...cleanedInput,
-    email: cleanEmail,
-    name: cleanedInput.name || existingTeacher?.name || cleanEmail.split('@')[0],
-    role: 'teacher', // strictly enforce teacher role
-    approvalStatus: existingTeacher ? (existingTeacher.approvalStatus || 'pending') : 'pending',
-    isApproved: existingTeacher ? Boolean(existingTeacher.isApproved === true && existingTeacher.approvalStatus === 'approved') : false,
-    status: existingTeacher ? (existingTeacher.status || existingTeacher.approvalStatus || 'pending') : 'pending',
-    approved: existingTeacher ? Boolean(existingTeacher.approved === true && existingTeacher.approvalStatus === 'approved') : false,
-  };
-
-  if (existingIdx >= 0) {
-    db.teachers[existingIdx] = { ...db.teachers[existingIdx], ...teacherEntry };
-  } else {
-    db.teachers.push(teacherEntry);
+  const firestoreDb = getFirestoreDb();
+  if (!firestoreDb || getIsCloudWriteDisabled()) {
+    return res.status(503).json({
+      error: 'FIRESTORE_UNAVAILABLE',
+      message: 'Canonical Firestore database is unavailable for teacher persistence.',
+    });
   }
-  writeDb(db);
+
+  const cleanedInput = stripAdminCommissionFields({ ...newTeacher });
+  const uidResolution = await resolveCanonicalUidForTutorModeration({
+    candidateTutor: { ...existingRecord, ...cleanedInput, email: cleanEmail },
+    tutorIdParam: cleanEmail,
+    dbState: db,
+  });
+
+  if (!uidResolution.ok && uidResolution.code !== 'CANONICAL_UID_REQUIRED') {
+    return res.status(uidResolution.status).json({
+      error: uidResolution.code,
+      message: uidResolution.error,
+    });
+  }
+
+  const canonicalUid = uidResolution.ok ? uidResolution.canonicalUid : '';
+  const mergedExisting = uidResolution.ok
+    ? { ...(uidResolution.existingTutorDoc || {}), ...existingRecord }
+    : existingRecord;
+
+  const isExistingTargetAdmin = Boolean(
+    cleanEmail === 'adm.itissimple@gmail.com' ||
+    String(mergedExisting?.role || '').toLowerCase() === 'admin' ||
+    (uidResolution.ok && String(uidResolution.existingUserDoc?.role || '').toLowerCase() === 'admin')
+  );
+  if (isExistingTargetAdmin) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'System administrator account cannot be modified via teachers endpoint',
+    });
+  }
+
+  const resolvedApprovalStatus = mergedExisting?.approvalStatus || existingTeacher?.approvalStatus || 'pending';
+  const resolvedIsApproved = Boolean(
+    (mergedExisting?.isApproved === true || mergedExisting?.approved === true) &&
+    resolvedApprovalStatus === 'approved'
+  );
+
+  const teacherEntry = JSON.parse(
+    JSON.stringify({
+      ...cleanedInput,
+      ...(canonicalUid ? { id: canonicalUid, uid: canonicalUid, authUid: canonicalUid } : {}),
+      email: cleanEmail,
+      name: cleanedInput.name || existingTeacher?.name || mergedExisting?.name || cleanEmail.split('@')[0],
+      role: 'teacher', // strictly enforce teacher role
+      approvalStatus: resolvedApprovalStatus,
+      isApproved: resolvedIsApproved,
+      status: mergedExisting?.status || resolvedApprovalStatus,
+      approved: resolvedIsApproved,
+      updatedAt: new Date().toISOString(),
+    })
+  ) as AppDb['teachers'][number];
+
+  const nextTeachers = [...(db.teachers || [])];
+  if (existingIdx >= 0) {
+    nextTeachers[existingIdx] = { ...nextTeachers[existingIdx], ...teacherEntry };
+  } else {
+    nextTeachers.push(teacherEntry);
+  }
+
+  try {
+    const tutorsStateRef = firestoreDb.collection('app_state').doc('tutors');
+    if (typeof (firestoreDb as any).runTransaction === 'function') {
+      const txRes = await (firestoreDb as any).runTransaction(async (tx: any) => {
+        const tutorsStateSnap = await tx.get(tutorsStateRef);
+        const existingStateTeachers = Array.isArray(tutorsStateSnap?.data()?.teachers)
+          ? tutorsStateSnap.data().teachers
+          : nextTeachers;
+
+        let uSnap: any = null;
+        if (canonicalUid) {
+          uSnap = await tx.get(firestoreDb.collection('users').doc(canonicalUid));
+          if (uSnap && uSnap.exists) {
+            const uRole = String(uSnap.data()?.role || uSnap.data()?.userRole || '').toLowerCase().trim();
+            if (uRole === 'student') {
+              return {
+                ok: false as const,
+                status: 409 as const,
+                code: 'ROLE_MUTATION_FORBIDDEN',
+                error: 'Conta registrada canonicamente como aluno em users/{uid} não pode ser promovida a Native Friend.',
+              };
+            }
+            if (uRole === 'admin') {
+              return {
+                ok: false as const,
+                status: 403 as const,
+                code: 'Forbidden',
+                error: 'System administrator account cannot be modified via teachers endpoint',
+              };
+            }
+          }
+        }
+
+        const mergedStateTeachers = [...existingStateTeachers];
+        const stIdx = mergedStateTeachers.findIndex((t: any) => (t?.email || '').toLowerCase().trim() === cleanEmail);
+        if (stIdx >= 0) {
+          mergedStateTeachers[stIdx] = { ...mergedStateTeachers[stIdx], ...teacherEntry };
+        } else {
+          mergedStateTeachers.push(teacherEntry);
+        }
+
+        if (canonicalUid) {
+          const tutorDocPayload = JSON.parse(
+            JSON.stringify({
+              ...mergedExisting,
+              ...teacherEntry,
+              id: canonicalUid,
+              uid: canonicalUid,
+              authUid: canonicalUid,
+              publicTutorId:
+                mergedExisting?.publicTutorId ||
+                `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`,
+            })
+          );
+          tx.set(firestoreDb.collection('tutors').doc(canonicalUid), tutorDocPayload, { merge: true });
+          if (uSnap && uSnap.exists) {
+            const existingUserRole = String(uSnap.data()?.role || 'teacher');
+            tx.set(
+              firestoreDb.collection('users').doc(canonicalUid),
+              { ...tutorDocPayload, role: existingUserRole },
+              { merge: true }
+            );
+          }
+        }
+
+        tx.set(
+          tutorsStateRef,
+          {
+            teachers: JSON.parse(JSON.stringify(mergedStateTeachers)),
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        );
+        return { ok: true as const };
+      });
+
+      if (!txRes.ok) {
+        return res.status(txRes.status).json({
+          error: txRes.code,
+          message: txRes.error,
+        });
+      }
+    } else {
+      if (canonicalUid) {
+        const tutorDocPayload = {
+          ...mergedExisting,
+          ...teacherEntry,
+          id: canonicalUid,
+          uid: canonicalUid,
+          authUid: canonicalUid,
+          publicTutorId:
+            mergedExisting?.publicTutorId ||
+            `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`,
+        };
+        const savedOk = await saveTutorToFirestore(tutorDocPayload);
+        if (!savedOk) {
+          throw new Error('Failed to persist pending teacher to Firestore');
+        }
+      }
+      const tutorsStateSnap = await tutorsStateRef.get();
+      const tutorsStateData = tutorsStateSnap?.data();
+      const existingStateTeachers = Array.isArray(tutorsStateData?.teachers)
+        ? tutorsStateData.teachers
+        : nextTeachers;
+      const mergedStateTeachers = [...existingStateTeachers];
+      const stIdx = mergedStateTeachers.findIndex((t: any) => (t?.email || '').toLowerCase().trim() === cleanEmail);
+      if (stIdx >= 0) {
+        mergedStateTeachers[stIdx] = { ...mergedStateTeachers[stIdx], ...teacherEntry };
+      } else {
+        mergedStateTeachers.push(teacherEntry);
+      }
+      await tutorsStateRef.set(
+        {
+          teachers: JSON.parse(JSON.stringify(mergedStateTeachers)),
+          updatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+    }
+  } catch (fsErr: any) {
+    console.error(`[serverFirestore] Failed to persist pending teacher "${cleanEmail}":`, fsErr);
+    return res.status(getIsCloudWriteDisabled() ? 503 : 500).json({
+      error: getIsCloudWriteDisabled() ? 'FIRESTORE_UNAVAILABLE' : 'Failed to persist teacher to Firestore',
+      message: fsErr?.message || 'Database write error',
+    });
+  }
+
+  // Update RAM caches strictly AFTER confirmed Firestore persistence
+  db.teachers = nextTeachers;
+  if (canonicalUid) {
+    db.tutorsList = db.tutorsList || [];
+    const tutorIdx = db.tutorsList.findIndex(
+      (t: any) => t.uid === canonicalUid || t.authUid === canonicalUid || (t.email || '').toLowerCase() === cleanEmail
+    );
+    const updatedTutorCache = { ...mergedExisting, ...teacherEntry, id: canonicalUid, uid: canonicalUid, authUid: canonicalUid };
+    if (tutorIdx >= 0) {
+      db.tutorsList[tutorIdx] = updatedTutorCache;
+    } else {
+      db.tutorsList.push(updatedTutorCache);
+    }
+  }
+
+  await writeDbSync(db);
   return res.json({
     success: true,
     teachers: (db.teachers || []).map((t: any) => sanitizePrivateTutorRecord(t, { includeAdminCommission: true })),
   });
 });
 
-app.delete('/api/teachers/:email', firebaseAuthMiddleware, requireAdmin, (req, res) => {
-  const db = readDb();
-  const email = decodeURIComponent(req.params.email).toLowerCase().trim();
-  const isTargetAdmin =
-    (db.teachers || []).some((t: any) => t.email?.toLowerCase() === email && t.role === 'admin') ||
-    (db.authUsers && db.authUsers[email]?.role === 'admin');
-
-  if (isTargetAdmin) {
-    return res.status(403).json({
-      error: 'Forbidden',
-      message: 'Cannot delete primary system administrator account',
+app.delete('/api/teachers/:email', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
+  const firestoreDb = getFirestoreDb();
+  if (!firestoreDb || getIsCloudWriteDisabled()) {
+    return res.status(503).json({
+      error: 'FIRESTORE_UNAVAILABLE',
+      message: 'Canonical Firestore database is unavailable for teacher deletion.',
     });
   }
-  db.teachers = db.teachers.filter((t) => t.email.toLowerCase() !== email);
-  writeDb(db);
-  res.json({ success: true, teachers: db.teachers });
+
+  const db = readDb();
+  const email = decodeURIComponent(req.params.email).toLowerCase().trim();
+
+  try {
+    const [tEmailSnap, uEmailSnap] = await Promise.all([
+      firestoreDb.collection('tutors').where('email', '==', email).get(),
+      firestoreDb.collection('users').where('email', '==', email).get(),
+    ]);
+
+    let foundAdminInFirestore = false;
+    const tutorDocIdsToDelete = new Set<string>();
+    for (const d of tEmailSnap?.docs || []) {
+      const data = d.data() || {};
+      if (String(data.role || data.userRole || '').toLowerCase().trim() === 'admin') {
+        foundAdminInFirestore = true;
+      } else {
+        tutorDocIdsToDelete.add(d.id);
+      }
+    }
+    for (const d of uEmailSnap?.docs || []) {
+      const data = d.data() || {};
+      if (String(data.role || data.userRole || '').toLowerCase().trim() === 'admin') {
+        foundAdminInFirestore = true;
+      }
+    }
+
+    const isTargetAdmin = Boolean(
+      foundAdminInFirestore ||
+      email === 'adm.itissimple@gmail.com' ||
+      (db.teachers || []).some((t: any) => t.email?.toLowerCase() === email && t.role === 'admin') ||
+      (db.authUsers && db.authUsers[email]?.role === 'admin')
+    );
+
+    if (isTargetAdmin) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Cannot delete primary system administrator account',
+      });
+    }
+
+    const nextTeachers = (db.teachers || []).filter((t: any) => (t.email || '').toLowerCase().trim() !== email);
+    const tutorsStateRef = firestoreDb.collection('app_state').doc('tutors');
+
+    if (typeof (firestoreDb as any).runTransaction === 'function') {
+      await (firestoreDb as any).runTransaction(async (tx: any) => {
+        const tutorsStateSnap = await tx.get(tutorsStateRef);
+        const existingStateTeachers = Array.isArray(tutorsStateSnap?.data()?.teachers)
+          ? tutorsStateSnap.data().teachers
+          : nextTeachers;
+        const filteredStateTeachers = existingStateTeachers.filter(
+          (t: any) => (t?.email || '').toLowerCase().trim() !== email
+        );
+
+        for (const docId of tutorDocIdsToDelete) {
+          tx.delete(firestoreDb.collection('tutors').doc(docId));
+        }
+        tx.set(
+          tutorsStateRef,
+          {
+            teachers: JSON.parse(JSON.stringify(filteredStateTeachers)),
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        );
+      });
+    } else {
+      const tutorsStateSnap = await tutorsStateRef.get();
+      const tutorsStateData = tutorsStateSnap?.data();
+      const existingStateTeachers = Array.isArray(tutorsStateData?.teachers)
+        ? tutorsStateData.teachers
+        : nextTeachers;
+      const filteredStateTeachers = existingStateTeachers.filter(
+        (t: any) => (t?.email || '').toLowerCase().trim() !== email
+      );
+      for (const docId of tutorDocIdsToDelete) {
+        await firestoreDb.collection('tutors').doc(docId).delete();
+      }
+      await tutorsStateRef.set(
+        {
+          teachers: JSON.parse(JSON.stringify(filteredStateTeachers)),
+          updatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+    }
+
+    // Update RAM caches strictly AFTER confirmed Firestore persistence
+    db.teachers = nextTeachers;
+    await writeDbSync(db);
+    return res.json({ success: true, teachers: db.teachers });
+  } catch (fsErr: any) {
+    console.error(`[serverFirestore] Failed to delete teacher "${email}" from Firestore:`, fsErr);
+    return res.status(getIsCloudWriteDisabled() ? 503 : 500).json({
+      error: getIsCloudWriteDisabled() ? 'FIRESTORE_UNAVAILABLE' : 'Failed to delete teacher from Firestore',
+      message: fsErr?.message || 'Database delete error',
+    });
+  }
 });
 
 // 2.1 Native Friend Notes Standard Vocabulary & Pedagogical Helpers
@@ -6172,75 +7019,79 @@ app.post('/api/students', async (req, res) => {
     });
   }
 
-  const nowIso = new Date().toISOString();
-  let existingFsData: Record<string, any> | null = null;
-  let existingFsExists = false;
-
   try {
     const userDocRef = firestoreDb.collection('users').doc(candidateStudentUid);
     const assignDocRef = firestoreDb.collection('student_assignments').doc(candidateStudentUid);
 
-    const existingFsSnap = await userDocRef.get();
-    existingFsExists = Boolean(existingFsSnap && existingFsSnap.exists);
-    existingFsData = existingFsExists ? (existingFsSnap.data() || {}) : null;
+    const { existingFsData, userDocPayload } = await firestoreDb.runTransaction(async (tx) => {
+      const nowIso = new Date().toISOString();
+      const existingFsSnap = await tx.get(userDocRef);
+      const txExistingFsExists = Boolean(existingFsSnap && existingFsSnap.exists);
+      const txExistingFsData = txExistingFsExists ? (existingFsSnap.data() || {}) : null;
 
-    const existingRole = String(existingFsData?.role || '').toLowerCase().trim();
-    const authoritativeRole =
-      existingRole === 'admin' || existingRole === 'teacher' || existingRole === 'native_friend' || existingRole === 'tutor'
-        ? existingFsData!.role
-        : 'student';
+      const existingRole = String(txExistingFsData?.role || '').toLowerCase().trim();
+      const authoritativeRole =
+        existingRole === 'admin' || existingRole === 'teacher' || existingRole === 'native_friend' || existingRole === 'tutor'
+          ? txExistingFsData!.role
+          : 'student';
 
-    const userDocPayload: Record<string, any> = {
-      ...safeEnrollment,
-      role: authoritativeRole,
-      ...(safeEnrollment.teacherUid
-        ? {
-            status: 'active',
-            enrollmentStatus: 'active',
-          }
-        : !existingFsExists
-        ? {
-            contractedLessons: 0,
-            availableLessons: 0,
-            completedLessonsCount: 0,
-            hasCompletedTrialLesson: false,
-            subscriptionType: 'trial',
-            status: 'not_enrolled',
-            enrollmentStatus: 'not_enrolled',
-            createdAt: nowIso,
-          }
-        : !existingFsData?.status && !existingFsData?.enrollmentStatus
-        ? {
-            status: existingFsData?.teacherUid ? 'active' : 'not_enrolled',
-            enrollmentStatus: existingFsData?.teacherUid ? 'active' : 'not_enrolled',
-          }
-        : {}),
-      updatedAt: nowIso,
-    };
+      const txUserDocPayload: Record<string, any> = {
+        ...safeEnrollment,
+        role: authoritativeRole,
+        ...(!txExistingFsExists
+          ? {
+              contractedLessons: 0,
+              availableLessons: 0,
+              completedLessonsCount: 0,
+              hasCompletedTrialLesson: false,
+              subscriptionType: 'trial',
+              status: safeEnrollment.teacherUid ? 'active' : 'not_enrolled',
+              enrollmentStatus: safeEnrollment.teacherUid ? 'active' : 'not_enrolled',
+              createdAt: nowIso,
+            }
+          : safeEnrollment.teacherUid
+          ? {
+              status: 'active',
+              enrollmentStatus: 'active',
+            }
+          : !txExistingFsData?.status && !txExistingFsData?.enrollmentStatus
+          ? {
+              status: txExistingFsData?.teacherUid ? 'active' : 'not_enrolled',
+              enrollmentStatus: txExistingFsData?.teacherUid ? 'active' : 'not_enrolled',
+            }
+          : {}),
+        updatedAt: nowIso,
+      };
 
-    const assignmentPayload: Record<string, any> = {
-      uid: candidateStudentUid,
-      studentUid: candidateStudentUid,
-      email: cleanEmail,
-      ...(safeEnrollment.level !== undefined ? { level: safeEnrollment.level } : {}),
-      ...(safeEnrollment.teacherUid
-        ? {
-            teacherUid: safeEnrollment.teacherUid,
-            teacherAuthUid: safeEnrollment.teacherUid,
-            assignedNativeFriendUID: safeEnrollment.assignedNativeFriendUID,
-            nativeFriendUID: safeEnrollment.nativeFriendUID,
-            teacherEmail: safeEnrollment.teacherEmail,
-            teacherName: safeEnrollment.teacherName,
-            enrollmentStatus: 'active',
-          }
-        : {}),
-      updatedAt: nowIso,
-    };
+      const assignmentPayload: Record<string, any> = {
+        uid: candidateStudentUid,
+        studentUid: candidateStudentUid,
+        email: cleanEmail,
+        ...(safeEnrollment.level !== undefined ? { level: safeEnrollment.level } : {}),
+        ...(safeEnrollment.teacherUid
+          ? {
+              teacherUid: safeEnrollment.teacherUid,
+              teacherAuthUid: safeEnrollment.teacherUid,
+              assignedNativeFriendUID: safeEnrollment.assignedNativeFriendUID,
+              nativeFriendUID: safeEnrollment.nativeFriendUID,
+              teacherEmail: safeEnrollment.teacherEmail,
+              teacherName: safeEnrollment.teacherName,
+              enrollmentStatus: 'active',
+            }
+          : {}),
+        updatedAt: nowIso,
+      };
 
-    await userDocRef.set(removeUndefinedFields(userDocPayload), { merge: true });
-    await assignDocRef.set(removeUndefinedFields(assignmentPayload), { merge: true });
+      tx.set(userDocRef, removeUndefinedFields(txUserDocPayload), { merge: true });
+      tx.set(assignDocRef, removeUndefinedFields(assignmentPayload), { merge: true });
 
-    // Update RAM caches strictly AFTER canonical Firestore write confirmation
+      return {
+        existingFsData: txExistingFsData,
+        userDocPayload: txUserDocPayload,
+      };
+    });
+
+    // Update RAM caches strictly AFTER canonical atomic Firestore transaction confirmation
     const idx = db.students.findIndex(
       (s) => s.uid === candidateStudentUid || (s.email || s.studentEmail || '').toLowerCase() === cleanEmail
     );
@@ -6273,6 +7124,7 @@ app.post('/api/students', async (req, res) => {
     if (db.userProfiles?.[cleanEmail]) {
       db.userProfiles[cleanEmail] = {
         ...db.userProfiles[cleanEmail],
+        ...(existingFsData || {}),
         ...userDocPayload,
       };
     }
@@ -6289,12 +7141,20 @@ app.post('/api/students', async (req, res) => {
 });
 
 app.delete('/api/students/:identifier', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
-  const db = readDb();
   const rawId = req.params.identifier;
   if (!rawId) {
     return res.status(400).json({ error: 'Identifier is required' });
   }
 
+  const firestoreDb = getFirestoreDb();
+  if (!firestoreDb || getIsCloudWriteDisabled()) {
+    return res.status(503).json({
+      error: 'FIRESTORE_UNAVAILABLE',
+      message: 'Canonical Firestore database is unavailable for student deletion.',
+    });
+  }
+
+  const db = readDb();
   const clean = decodeURIComponent(rawId).toLowerCase().trim();
   console.log(`[DELETE /api/students] Request to delete student: ${clean}`);
 
@@ -6315,88 +7175,148 @@ app.delete('/api/students/:identifier', firebaseAuthMiddleware, requireAdmin, as
     }
   }
 
-  const firestoreDb = getFirestoreDb();
-  if (firestoreDb && (!targetEmail || !targetUid)) {
-    try {
-      if (targetUid) {
-        const uSnap = await firestoreDb.collection('users').doc(targetUid).get().catch(() => null);
-        if (uSnap && uSnap.exists) {
-          const uEmail = String(uSnap.data()?.email || '').toLowerCase().trim();
-          if (uEmail && !targetEmail) targetEmail = uEmail;
-        }
-      } else if (targetEmail) {
-        const qSnap = await firestoreDb.collection('users').where('email', '==', targetEmail).limit(1).get().catch(() => null);
-        if (qSnap && !qSnap.empty) {
-          targetUid = qSnap.docs[0].id;
+  try {
+    const userDocIdsToDelete = new Set<string>();
+    const assignmentUidsToDelete = new Set<string>();
+    let foundAdminInFirestore = false;
+
+    const inspectUserSnap = (docSnap: any) => {
+      if (!docSnap || !docSnap.exists) return;
+      const uData = docSnap.data() || {};
+      const uRole = String(uData.role || uData.userRole || '').toLowerCase().trim();
+      const uEmail = String(uData.email || '').toLowerCase().trim();
+      if (uEmail && !targetEmail) {
+        targetEmail = uEmail;
+      }
+      if (!targetUid && isValidCanonicalUid(docSnap.id)) {
+        targetUid = docSnap.id;
+      }
+      if (uRole === 'admin' || uEmail === 'adm.itissimple@gmail.com') {
+        foundAdminInFirestore = true;
+        return;
+      }
+      if (uRole === 'student' || !uRole) {
+        userDocIdsToDelete.add(docSnap.id);
+        if (isValidCanonicalUid(docSnap.id)) {
+          assignmentUidsToDelete.add(docSnap.id);
         }
       }
-    } catch {}
-  }
+    };
 
-  // Remove from students array
-  db.students = (db.students || []).filter((s: any) => {
-    const sEmail = (s.email || s.studentEmail || '').toLowerCase().trim();
-    const sId = (s.id || '').toLowerCase().trim();
-    const sUid = (s.uid || '').toLowerCase().trim();
-    return sEmail !== clean && sId !== clean && sUid !== clean && (!targetEmail || sEmail !== targetEmail);
-  });
+    if (targetUid) {
+      const uSnap = await firestoreDb.collection('users').doc(targetUid).get();
+      inspectUserSnap(uSnap);
+      if (!uSnap?.exists) {
+        userDocIdsToDelete.add(targetUid);
+        assignmentUidsToDelete.add(targetUid);
+      }
+    }
 
-  // Remove from userProfiles
-  if (targetEmail && db.userProfiles?.[targetEmail]) {
-    delete db.userProfiles[targetEmail];
-  }
+    if (targetEmail) {
+      const qSnap = await firestoreDb.collection('users').where('email', '==', targetEmail).get();
+      for (const d of qSnap?.docs || []) {
+        inspectUserSnap(d);
+      }
+    }
 
-  // Remove from contractedLessons
-  if (targetEmail && db.contractedLessons?.[targetEmail] !== undefined) {
-    delete db.contractedLessons[targetEmail];
-  }
+    const isTargetAdmin = Boolean(
+      foundAdminInFirestore ||
+      targetEmail === 'adm.itissimple@gmail.com' ||
+      (db.authUsers && targetEmail && db.authUsers[targetEmail]?.role === 'admin')
+    );
 
-  // Remove from authUsers
-  if (targetEmail && db.authUsers?.[targetEmail]?.role === 'student') {
-    delete db.authUsers[targetEmail];
-  }
+    if (isTargetAdmin) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Cannot delete primary system administrator account',
+      });
+    }
 
-  // Remove from studentRoutinesMap
-  if (targetEmail && db.studentRoutinesMap?.[targetEmail]) {
-    delete db.studentRoutinesMap[targetEmail];
-  }
+    const mainRef = firestoreDb.collection('app_state').doc('main_data');
+    let mergedDeleted = Array.isArray(db.deletedStudentEmails) ? [...db.deletedStudentEmails] : [];
 
-  // Track permanently in deletedStudentEmails
-  if (!Array.isArray(db.deletedStudentEmails)) {
-    db.deletedStudentEmails = [];
-  }
-  if (targetEmail && !db.deletedStudentEmails.includes(targetEmail)) {
-    db.deletedStudentEmails.push(targetEmail);
-  }
-
-  if (firestoreDb && !getIsCloudWriteDisabled() && targetEmail) {
-    try {
-      const mainRef = firestoreDb.collection('app_state').doc('main_data');
-      const mainSnap = await mainRef.get().catch(() => null);
-      const existingDeleted = Array.isArray(mainSnap?.data()?.deletedStudentEmails)
-        ? mainSnap!.data()!.deletedStudentEmails
+    const buildDeletedList = (existingMainData: Record<string, any> | undefined) => {
+      const existingDeleted = Array.isArray(existingMainData?.deletedStudentEmails)
+        ? existingMainData!.deletedStudentEmails
         : [];
-      const mergedDeleted = Array.from(
-        new Set([...existingDeleted, ...db.deletedStudentEmails].map((e: string) => String(e || '').toLowerCase().trim()).filter(Boolean))
+      mergedDeleted = Array.from(
+        new Set(
+          [
+            ...existingDeleted,
+            ...(db.deletedStudentEmails || []),
+            ...(targetEmail ? [targetEmail] : []),
+          ]
+            .map((e: string) => String(e || '').toLowerCase().trim())
+            .filter(Boolean)
+        )
       );
-      db.deletedStudentEmails = mergedDeleted;
-      await mainRef.set({ deletedStudentEmails: mergedDeleted, updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
-    } catch {}
-  }
+      return mergedDeleted;
+    };
 
-  await writeDbSync(db);
+    if (typeof (firestoreDb as any).runTransaction === 'function') {
+      await (firestoreDb as any).runTransaction(async (tx: any) => {
+        const mainSnap = await tx.get(mainRef);
+        const nextDeleted = buildDeletedList(mainSnap?.exists ? mainSnap.data() : undefined);
 
-  // Clean from Firestore users collection if present (both by UID and by email)
-  if (targetUid && firestoreDb && !getIsCloudWriteDisabled()) {
-    await firestoreDb.collection('users').doc(targetUid).delete().catch(() => {});
-  }
-  if (targetEmail) {
-    await deleteUserByEmailFromFirestore(targetEmail).catch((e) => {
-      console.warn('Could not delete user from Firestore users collection:', e);
+        for (const uidToDelete of userDocIdsToDelete) {
+          tx.delete(firestoreDb.collection('users').doc(uidToDelete));
+        }
+        for (const assignUid of assignmentUidsToDelete) {
+          tx.delete(firestoreDb.collection('student_assignments').doc(assignUid));
+        }
+        if (targetEmail || nextDeleted.length > 0) {
+          tx.set(
+            mainRef,
+            { deletedStudentEmails: nextDeleted, updatedAt: new Date().toISOString() },
+            { merge: true }
+          );
+        }
+      });
+    } else {
+      const mainSnap = await mainRef.get();
+      const nextDeleted = buildDeletedList(mainSnap?.exists ? mainSnap.data() : undefined);
+      for (const uidToDelete of userDocIdsToDelete) {
+        await firestoreDb.collection('users').doc(uidToDelete).delete();
+      }
+      for (const assignUid of assignmentUidsToDelete) {
+        await firestoreDb.collection('student_assignments').doc(assignUid).delete();
+      }
+      if (targetEmail || nextDeleted.length > 0) {
+        await mainRef.set({ deletedStudentEmails: nextDeleted, updatedAt: new Date().toISOString() }, { merge: true });
+      }
+    }
+
+    // Update RAM caches strictly AFTER confirmed Firestore persistence
+    db.students = (db.students || []).filter((s: any) => {
+      const sEmail = (s.email || s.studentEmail || '').toLowerCase().trim();
+      const sId = (s.id || '').toLowerCase().trim();
+      const sUid = (s.uid || '').toLowerCase().trim();
+      return sEmail !== clean && sId !== clean && sUid !== clean && (!targetEmail || sEmail !== targetEmail);
+    });
+
+    if (targetEmail && db.userProfiles?.[targetEmail]) {
+      delete db.userProfiles[targetEmail];
+    }
+    if (targetEmail && db.contractedLessons?.[targetEmail] !== undefined) {
+      delete db.contractedLessons[targetEmail];
+    }
+    if (targetEmail && db.authUsers?.[targetEmail]?.role === 'student') {
+      delete db.authUsers[targetEmail];
+    }
+    if (targetEmail && db.studentRoutinesMap?.[targetEmail]) {
+      delete db.studentRoutinesMap[targetEmail];
+    }
+    db.deletedStudentEmails = mergedDeleted;
+
+    await writeDbSync(db);
+    return res.json({ success: true, message: 'Student profile deleted successfully', email: targetEmail });
+  } catch (fsErr: any) {
+    console.error(`[serverFirestore] Failed to delete student "${clean}" from Firestore:`, fsErr);
+    return res.status(getIsCloudWriteDisabled() ? 503 : 500).json({
+      error: getIsCloudWriteDisabled() ? 'FIRESTORE_UNAVAILABLE' : 'Failed to delete student from Firestore',
+      message: fsErr?.message || 'Database delete error',
     });
   }
-
-  res.json({ success: true, message: 'Student profile deleted successfully', email: targetEmail });
 });
 
 app.post('/api/students/profile', async (req, res) => {
@@ -6466,9 +7386,16 @@ app.post('/api/students/profile', async (req, res) => {
   if (verifiedCaller.role === 'admin' && !targetUid) {
     const callerCleanEmail = (verifiedCaller.email || '').toLowerCase().trim();
     if (requestedEmail && requestedEmail !== callerCleanEmail) {
-      const fsByEmail = await fetchUserFromFirestore(requestedEmail).catch(() => null);
-      if (fsByEmail?.uid && isValidCanonicalUid(fsByEmail.uid)) {
-        targetUid = fsByEmail.uid;
+      const fsProfileMatch = await fetchStudentProfileFromFirestoreServer('', requestedEmail).catch(() => null);
+      if (fsProfileMatch?.uid && isValidCanonicalUid(fsProfileMatch.uid)) {
+        targetUid = fsProfileMatch.uid;
+      } else {
+        try {
+          const authRec = await getFirebaseAdminAuth().getUserByEmail(requestedEmail);
+          if (authRec?.uid && isValidCanonicalUid(authRec.uid)) {
+            targetUid = authRec.uid;
+          }
+        } catch {}
       }
     } else {
       targetUid = verifiedCaller.uid;
@@ -6485,227 +7412,268 @@ app.post('/api/students/profile', async (req, res) => {
   try {
     const userDocRef = firestoreDb.collection('users').doc(targetUid);
     const assignDocRef = firestoreDb.collection('student_assignments').doc(targetUid);
-    const currentDocSnap = await userDocRef.get();
-    const fsUser = currentDocSnap && currentDocSnap.exists ? (currentDocSnap.data() || null) : null;
 
-    const fsRole = String(fsUser?.role || fsUser?.userRole || '').toLowerCase().trim();
-    if (fsRole === 'teacher' || fsRole === 'native_friend' || fsRole === 'tutor') {
-      return res.status(403).json({
-        error: 'Forbidden',
-        message: 'Native Friends cannot modify student profile endpoints.',
-      });
-    }
+    const txResult = await firestoreDb.runTransaction(async (tx) => {
+      const currentDocSnap = await tx.get(userDocRef);
+      const fsUser = currentDocSnap && currentDocSnap.exists ? (currentDocSnap.data() || null) : null;
 
-    if (!cleanEmail && fsUser?.email) {
-      cleanEmail = String(fsUser.email).toLowerCase().trim();
-    }
-    if (!cleanEmail) {
-      return res.status(400).json({ error: 'Profile email is required' });
-    }
-
-    const existingProfile = db.userProfiles?.[cleanEmail] || {};
-
-    const safeName = profile.name || fsUser?.name || existingProfile.name;
-    const safeLevel = profile.level || profile.englishLevel || profile.userLevel || fsUser?.level || existingProfile.level;
-    const safeGoal = profile.learningGoal || profile.goal || fsUser?.learningGoal || existingProfile.learningGoal;
-    const safeDailyGoalMinutes = profile.dailyGoalMinutes ?? fsUser?.dailyGoalMinutes ?? existingProfile.dailyGoalMinutes ?? 30;
-    const parsedIncomingNativeTarget =
-      profile.weeklyNativeLessonsTarget !== undefined && profile.weeklyNativeLessonsTarget !== null && profile.weeklyNativeLessonsTarget !== ''
-        ? Number(profile.weeklyNativeLessonsTarget)
-        : NaN;
-    const safeWeeklyNativeLessonsTarget =
-      Number.isInteger(parsedIncomingNativeTarget) && parsedIncomingNativeTarget >= 1 && parsedIncomingNativeTarget <= 7
-        ? parsedIncomingNativeTarget
-        : (typeof fsUser?.weeklyNativeLessonsTarget === 'number' &&
-            Number.isInteger(fsUser.weeklyNativeLessonsTarget) &&
-            fsUser.weeklyNativeLessonsTarget >= 1 &&
-            fsUser.weeklyNativeLessonsTarget <= 7
-            ? fsUser.weeklyNativeLessonsTarget
-            : (typeof existingProfile.weeklyNativeLessonsTarget === 'number' &&
-                Number.isInteger(existingProfile.weeklyNativeLessonsTarget) &&
-                existingProfile.weeklyNativeLessonsTarget >= 1 &&
-                existingProfile.weeklyNativeLessonsTarget <= 7
-                ? existingProfile.weeklyNativeLessonsTarget
-                : 1));
-    const safeAvatar = picture || profile.avatar || fsUser?.avatar || existingProfile.avatar;
-    const safePicture = picture || profile.picture || fsUser?.picture || existingProfile.picture;
-    const safeVideoTime = profile.routineVideoTime || fsUser?.routineVideoTime || existingProfile.routineVideoTime || '09:00';
-    const safeAudioTime = profile.routineAudioTime || fsUser?.routineAudioTime || existingProfile.routineAudioTime || '14:00';
-    const safePhraseTime = profile.dailyPhraseTime || fsUser?.dailyPhraseTime || existingProfile.dailyPhraseTime || '20:00';
-
-    const safeStudyDays = Array.isArray(profile.weeklyStudyDays)
-      ? profile.weeklyStudyDays
-      : Array.isArray(profile.selectedStudyDays)
-      ? profile.selectedStudyDays
-      : (fsUser?.weeklyStudyDays || existingProfile.weeklyStudyDays);
-    const safeStudyDaysTarget =
-      profile.weeklyStudyDaysTarget !== undefined
-        ? Number(profile.weeklyStudyDaysTarget)
-        : (fsUser?.weeklyStudyDaysTarget ?? existingProfile.weeklyStudyDaysTarget);
-    const safeTimezone = profile.timezone || profile.studentTimezone || fsUser?.timezone || existingProfile.timezone;
-    const safePreferredLanguage = profile.preferredLanguage || profile.language || profile.uiLanguage || fsUser?.preferredLanguage || existingProfile.preferredLanguage;
-    const safeOnboardingCompleted =
-      profile.onboardingCompleted !== undefined
-        ? Boolean(profile.onboardingCompleted)
-        : (fsUser?.onboardingCompleted !== undefined ? Boolean(fsUser.onboardingCompleted) : existingProfile.onboardingCompleted);
-
-    const preservedContracted =
-      typeof fsUser?.contractedLessons === 'number'
-        ? fsUser.contractedLessons
-        : typeof existingProfile.contractedLessons === 'number'
-        ? existingProfile.contractedLessons
-        : typeof db.contractedLessons?.[cleanEmail] === 'number'
-        ? db.contractedLessons[cleanEmail]
-        : 0;
-    const preservedAvailable =
-      typeof fsUser?.availableLessons === 'number'
-        ? fsUser.availableLessons
-        : existingProfile.availableLessons;
-    const authoritativeCompletedLessonsCount = Number(fsUser?.completedLessonsCount ?? existingProfile.completedLessonsCount ?? 0);
-    const authoritativeHasCompletedTrial = Boolean(fsUser?.hasCompletedTrialLesson ?? existingProfile.hasCompletedTrialLesson ?? false);
-    const authoritativeSubscriptionType = fsUser?.subscriptionType || existingProfile.subscriptionType || 'trial';
-    const authoritativeRole = fsUser?.role === 'admin' && verifiedCaller.role === 'admin' ? 'admin' : 'student';
-
-    const preservedTeacherUid =
-      [
-        fsUser?.teacherUid,
-        fsUser?.assignedNativeFriendUID,
-        fsUser?.nativeFriendUID,
-        existingProfile.teacherUid,
-        existingProfile.assignedNativeFriendUID,
-        existingProfile.nativeFriendUID,
-      ].find((v): v is string => typeof v === 'string' && isValidCanonicalUid(v.trim())) || null;
-    const preservedTeacherEmail = fsUser?.teacherEmail ?? existingProfile.teacherEmail ?? null;
-    const preservedTeacherName = fsUser?.teacherName ?? existingProfile.teacherName ?? null;
-    const preservedEnrollmentStatus =
-      fsUser?.enrollmentStatus ??
-      existingProfile.enrollmentStatus ??
-      (preservedTeacherUid || preservedTeacherEmail ? 'active' : 'not_enrolled');
-    const preservedStatus = fsUser?.status ?? existingProfile.status ?? preservedEnrollmentStatus;
-
-    const nowIso = new Date().toISOString();
-
-    const firestoreProfilePayload: Record<string, any> = {
-      id: targetUid,
-      uid: targetUid,
-      email: cleanEmail,
-      role: authoritativeRole,
-      name: safeName,
-      level: safeLevel,
-      ...(safeLevel !== undefined ? { englishLevel: safeLevel, userLevel: safeLevel } : {}),
-      learningGoal: safeGoal,
-      dailyGoalMinutes: safeDailyGoalMinutes,
-      weeklyNativeLessonsTarget: safeWeeklyNativeLessonsTarget,
-      avatar: safeAvatar,
-      picture: safePicture,
-      routineVideoTime: safeVideoTime,
-      routineAudioTime: safeAudioTime,
-      dailyPhraseTime: safePhraseTime,
-      ...(safeStudyDays ? { weeklyStudyDays: safeStudyDays, selectedStudyDays: safeStudyDays } : {}),
-      ...(safeStudyDaysTarget !== undefined ? { weeklyStudyDaysTarget: safeStudyDaysTarget } : {}),
-      ...(safeTimezone ? { timezone: safeTimezone } : {}),
-      ...(safePreferredLanguage ? { preferredLanguage: safePreferredLanguage } : {}),
-      ...(safeOnboardingCompleted !== undefined ? { onboardingCompleted: safeOnboardingCompleted } : {}),
-      updatedAt: nowIso,
-    };
-
-    if (!currentDocSnap || !currentDocSnap.exists) {
-      firestoreProfilePayload.contractedLessons = preservedContracted;
-      if (preservedAvailable !== undefined) {
-        firestoreProfilePayload.availableLessons = preservedAvailable;
+      const fsRole = String(fsUser?.role || fsUser?.userRole || '').toLowerCase().trim();
+      if (fsRole === 'teacher' || fsRole === 'native_friend' || fsRole === 'tutor') {
+        return {
+          status: 403 as const,
+          body: {
+            error: 'Forbidden',
+            message: 'Native Friends cannot modify student profile endpoints.',
+          },
+        };
       }
-      firestoreProfilePayload.completedLessonsCount = authoritativeCompletedLessonsCount;
-      firestoreProfilePayload.hasCompletedTrialLesson = authoritativeHasCompletedTrial;
-      firestoreProfilePayload.subscriptionType = authoritativeSubscriptionType;
-      firestoreProfilePayload.teacherUid = preservedTeacherUid;
-      firestoreProfilePayload.assignedNativeFriendUID = preservedTeacherUid;
-      firestoreProfilePayload.nativeFriendUID = preservedTeacherUid;
-      firestoreProfilePayload.teacherEmail = preservedTeacherEmail;
-      firestoreProfilePayload.teacherName = preservedTeacherName;
-      firestoreProfilePayload.enrollmentStatus = preservedEnrollmentStatus;
-      firestoreProfilePayload.status = preservedStatus;
-      firestoreProfilePayload.createdAt = nowIso;
-    }
 
-    const assignmentPayload: Record<string, any> = {
-      uid: targetUid,
-      studentUid: targetUid,
-      email: cleanEmail,
-      ...(safeLevel !== undefined ? { level: safeLevel } : {}),
-      ...(safeStudyDays ? { weeklyStudyDays: safeStudyDays } : {}),
-      ...(safeStudyDaysTarget !== undefined ? { weeklyStudyDaysTarget: safeStudyDaysTarget } : {}),
-      updatedAt: nowIso,
-    };
+      const resolvedCleanEmail = cleanEmail || (fsUser?.email ? String(fsUser.email).toLowerCase().trim() : '');
+      if (!resolvedCleanEmail) {
+        return {
+          status: 400 as const,
+          body: { error: 'Profile email is required' },
+        };
+      }
 
-    await userDocRef.set(removeUndefinedFields(firestoreProfilePayload), { merge: true });
-    await assignDocRef.set(removeUndefinedFields(assignmentPayload), { merge: true });
+      const existingProfile = db.userProfiles?.[resolvedCleanEmail] || {};
 
-    // Update RAM caches strictly AFTER canonical Firestore write confirmation
-    if (!db.userProfiles) db.userProfiles = {};
-    if (!db.weeklyNativeTargets) db.weeklyNativeTargets = {};
+      const safeName = profile.name || fsUser?.name || existingProfile.name;
+      const safeLevel = profile.level || profile.englishLevel || profile.userLevel || fsUser?.level || existingProfile.level;
+      const safeGoal = profile.learningGoal || profile.goal || fsUser?.learningGoal || existingProfile.learningGoal;
+      const safeDailyGoalMinutes = profile.dailyGoalMinutes ?? fsUser?.dailyGoalMinutes ?? existingProfile.dailyGoalMinutes ?? 30;
+      const parsedIncomingNativeTarget =
+        profile.weeklyNativeLessonsTarget !== undefined && profile.weeklyNativeLessonsTarget !== null && profile.weeklyNativeLessonsTarget !== ''
+          ? Number(profile.weeklyNativeLessonsTarget)
+          : NaN;
+      const safeWeeklyNativeLessonsTarget =
+        Number.isInteger(parsedIncomingNativeTarget) && parsedIncomingNativeTarget >= 1 && parsedIncomingNativeTarget <= 7
+          ? parsedIncomingNativeTarget
+          : (typeof fsUser?.weeklyNativeLessonsTarget === 'number' &&
+              Number.isInteger(fsUser.weeklyNativeLessonsTarget) &&
+              fsUser.weeklyNativeLessonsTarget >= 1 &&
+              fsUser.weeklyNativeLessonsTarget <= 7
+              ? fsUser.weeklyNativeLessonsTarget
+              : (typeof existingProfile.weeklyNativeLessonsTarget === 'number' &&
+                  Number.isInteger(existingProfile.weeklyNativeLessonsTarget) &&
+                  existingProfile.weeklyNativeLessonsTarget >= 1 &&
+                  existingProfile.weeklyNativeLessonsTarget <= 7
+                  ? existingProfile.weeklyNativeLessonsTarget
+                  : 1));
+      const safeAvatar = picture || profile.avatar || fsUser?.avatar || existingProfile.avatar;
+      const safePicture = picture || profile.picture || fsUser?.picture || existingProfile.picture;
+      const safeVideoTime = profile.routineVideoTime || fsUser?.routineVideoTime || existingProfile.routineVideoTime || '09:00';
+      const safeAudioTime = profile.routineAudioTime || fsUser?.routineAudioTime || existingProfile.routineAudioTime || '14:00';
+      const safePhraseTime = profile.dailyPhraseTime || fsUser?.dailyPhraseTime || existingProfile.dailyPhraseTime || '20:00';
 
-    const updatedProfileRecord: Record<string, any> = {
-      ...existingProfile,
-      id: targetUid,
-      uid: targetUid,
-      email: cleanEmail,
-      role: authoritativeRole,
-      name: safeName,
-      level: safeLevel,
-      learningGoal: safeGoal,
-      dailyGoalMinutes: safeDailyGoalMinutes,
-      weeklyNativeLessonsTarget: safeWeeklyNativeLessonsTarget,
-      avatar: safeAvatar,
-      picture: safePicture,
-      // Authoritative counters & flags
-      contractedLessons: preservedContracted,
-      ...(preservedAvailable !== undefined ? { availableLessons: preservedAvailable } : {}),
-      completedLessonsCount: authoritativeCompletedLessonsCount,
-      hasCompletedTrialLesson: authoritativeHasCompletedTrial,
-      subscriptionType: authoritativeSubscriptionType,
-      routineVideoTime: safeVideoTime,
-      routineAudioTime: safeAudioTime,
-      dailyPhraseTime: safePhraseTime,
-      teacherUid: preservedTeacherUid,
-      assignedNativeFriendUID: preservedTeacherUid,
-      nativeFriendUID: preservedTeacherUid,
-      teacherEmail: preservedTeacherEmail,
-      teacherName: preservedTeacherName,
-      enrollmentStatus: preservedEnrollmentStatus,
-      ...(safeStudyDays ? { weeklyStudyDays: safeStudyDays, selectedStudyDays: safeStudyDays } : {}),
-      ...(safeStudyDaysTarget !== undefined ? { weeklyStudyDaysTarget: safeStudyDaysTarget } : {}),
-      ...(safeTimezone ? { timezone: safeTimezone } : {}),
-      ...(safePreferredLanguage ? { preferredLanguage: safePreferredLanguage } : {}),
-      ...(safeOnboardingCompleted !== undefined ? { onboardingCompleted: safeOnboardingCompleted } : {}),
-      updatedAt: nowIso,
-    };
+      const safeStudyDays = Array.isArray(profile.weeklyStudyDays)
+        ? profile.weeklyStudyDays
+        : Array.isArray(profile.selectedStudyDays)
+        ? profile.selectedStudyDays
+        : (fsUser?.weeklyStudyDays || existingProfile.weeklyStudyDays);
+      const safeStudyDaysTarget =
+        profile.weeklyStudyDaysTarget !== undefined
+          ? Number(profile.weeklyStudyDaysTarget)
+          : (fsUser?.weeklyStudyDaysTarget ?? existingProfile.weeklyStudyDaysTarget);
+      const safeTimezone = profile.timezone || profile.studentTimezone || fsUser?.timezone || existingProfile.timezone;
+      const safePreferredLanguage = profile.preferredLanguage || profile.language || profile.uiLanguage || fsUser?.preferredLanguage || existingProfile.preferredLanguage;
+      const safeOnboardingCompleted =
+        profile.onboardingCompleted !== undefined
+          ? Boolean(profile.onboardingCompleted)
+          : (fsUser?.onboardingCompleted !== undefined ? Boolean(fsUser.onboardingCompleted) : existingProfile.onboardingCompleted);
 
-    db.userProfiles[cleanEmail] = updatedProfileRecord;
-    db.weeklyNativeTargets[cleanEmail] = safeWeeklyNativeLessonsTarget;
+      const preservedContracted =
+        typeof fsUser?.contractedLessons === 'number'
+          ? fsUser.contractedLessons
+          : typeof existingProfile.contractedLessons === 'number'
+          ? existingProfile.contractedLessons
+          : typeof db.contractedLessons?.[resolvedCleanEmail] === 'number'
+          ? db.contractedLessons[resolvedCleanEmail]
+          : 0;
+      const preservedAvailable =
+        typeof fsUser?.availableLessons === 'number'
+          ? fsUser.availableLessons
+          : existingProfile.availableLessons;
+      const authoritativeCompletedLessonsCount = Number(fsUser?.completedLessonsCount ?? existingProfile.completedLessonsCount ?? 0);
+      const authoritativeHasCompletedTrial = Boolean(fsUser?.hasCompletedTrialLesson ?? existingProfile.hasCompletedTrialLesson ?? false);
+      const authoritativeSubscriptionType = fsUser?.subscriptionType || existingProfile.subscriptionType || 'trial';
+      const authoritativeRole = fsUser?.role === 'admin' && verifiedCaller.role === 'admin' ? 'admin' : 'student';
 
-    const idx = db.students.findIndex((s) => s.uid === targetUid || (s.email || s.studentEmail || '').toLowerCase() === cleanEmail);
-    if (idx >= 0) {
-      db.students[idx] = {
-        ...db.students[idx],
-        name: safeName || db.students[idx].name,
-        studentName: safeName || db.students[idx].studentName,
-        level: safeLevel || db.students[idx].level,
-        studentLevel: safeLevel || db.students[idx].studentLevel,
-        goal: safeGoal || db.students[idx].goal,
-        learningGoal: safeGoal || db.students[idx].learningGoal,
-        picture: safePicture || db.students[idx].picture,
-        avatar: safeAvatar || db.students[idx].avatar,
+      const preservedTeacherUid =
+        [
+          fsUser?.teacherUid,
+          fsUser?.assignedNativeFriendUID,
+          fsUser?.nativeFriendUID,
+          existingProfile.teacherUid,
+          existingProfile.assignedNativeFriendUID,
+          existingProfile.nativeFriendUID,
+        ].find((v): v is string => typeof v === 'string' && isValidCanonicalUid(v.trim())) || null;
+      const preservedTeacherEmail = fsUser?.teacherEmail ?? existingProfile.teacherEmail ?? null;
+      const preservedTeacherName = fsUser?.teacherName ?? existingProfile.teacherName ?? null;
+      const preservedEnrollmentStatus =
+        fsUser?.enrollmentStatus ??
+        existingProfile.enrollmentStatus ??
+        (preservedTeacherUid || preservedTeacherEmail ? 'active' : 'not_enrolled');
+      const preservedStatus = fsUser?.status ?? existingProfile.status ?? preservedEnrollmentStatus;
+
+      const nowIso = new Date().toISOString();
+
+      const firestoreProfilePayload: Record<string, any> = {
+        id: targetUid,
+        uid: targetUid,
+        email: resolvedCleanEmail,
+        role: authoritativeRole,
+        name: safeName,
+        level: safeLevel,
+        ...(safeLevel !== undefined ? { englishLevel: safeLevel, userLevel: safeLevel } : {}),
+        learningGoal: safeGoal,
+        dailyGoalMinutes: safeDailyGoalMinutes,
         weeklyNativeLessonsTarget: safeWeeklyNativeLessonsTarget,
+        avatar: safeAvatar,
+        picture: safePicture,
         routineVideoTime: safeVideoTime,
         routineAudioTime: safeAudioTime,
         dailyPhraseTime: safePhraseTime,
+        ...(safeStudyDays ? { weeklyStudyDays: safeStudyDays, selectedStudyDays: safeStudyDays } : {}),
+        ...(safeStudyDaysTarget !== undefined ? { weeklyStudyDaysTarget: safeStudyDaysTarget } : {}),
+        ...(safeTimezone ? { timezone: safeTimezone } : {}),
+        ...(safePreferredLanguage ? { preferredLanguage: safePreferredLanguage } : {}),
+        ...(safeOnboardingCompleted !== undefined ? { onboardingCompleted: safeOnboardingCompleted } : {}),
+        updatedAt: nowIso,
+      };
+
+      if (!currentDocSnap || !currentDocSnap.exists) {
+        firestoreProfilePayload.contractedLessons = preservedContracted;
+        if (preservedAvailable !== undefined) {
+          firestoreProfilePayload.availableLessons = preservedAvailable;
+        }
+        firestoreProfilePayload.completedLessonsCount = authoritativeCompletedLessonsCount;
+        firestoreProfilePayload.hasCompletedTrialLesson = authoritativeHasCompletedTrial;
+        firestoreProfilePayload.subscriptionType = authoritativeSubscriptionType;
+        firestoreProfilePayload.teacherUid = preservedTeacherUid;
+        firestoreProfilePayload.assignedNativeFriendUID = preservedTeacherUid;
+        firestoreProfilePayload.nativeFriendUID = preservedTeacherUid;
+        firestoreProfilePayload.teacherEmail = preservedTeacherEmail;
+        firestoreProfilePayload.teacherName = preservedTeacherName;
+        firestoreProfilePayload.enrollmentStatus = preservedEnrollmentStatus;
+        firestoreProfilePayload.status = preservedStatus;
+        firestoreProfilePayload.createdAt = nowIso;
+      }
+
+      const assignmentPayload: Record<string, any> = {
+        uid: targetUid,
+        studentUid: targetUid,
+        email: resolvedCleanEmail,
+        ...(safeLevel !== undefined ? { level: safeLevel } : {}),
+        ...(safeStudyDays ? { weeklyStudyDays: safeStudyDays } : {}),
+        ...(safeStudyDaysTarget !== undefined ? { weeklyStudyDaysTarget: safeStudyDaysTarget } : {}),
+        updatedAt: nowIso,
+      };
+
+      tx.set(userDocRef, removeUndefinedFields(firestoreProfilePayload), { merge: true });
+      tx.set(assignDocRef, removeUndefinedFields(assignmentPayload), { merge: true });
+
+      const updatedProfileRecord: Record<string, any> = {
+        ...existingProfile,
+        id: targetUid,
+        uid: targetUid,
+        email: resolvedCleanEmail,
+        role: authoritativeRole,
+        name: safeName,
+        level: safeLevel,
+        learningGoal: safeGoal,
+        dailyGoalMinutes: safeDailyGoalMinutes,
+        weeklyNativeLessonsTarget: safeWeeklyNativeLessonsTarget,
+        avatar: safeAvatar,
+        picture: safePicture,
+        // Authoritative counters & flags
         contractedLessons: preservedContracted,
         ...(preservedAvailable !== undefined ? { availableLessons: preservedAvailable } : {}),
+        completedLessonsCount: authoritativeCompletedLessonsCount,
+        hasCompletedTrialLesson: authoritativeHasCompletedTrial,
+        subscriptionType: authoritativeSubscriptionType,
+        routineVideoTime: safeVideoTime,
+        routineAudioTime: safeAudioTime,
+        dailyPhraseTime: safePhraseTime,
+        teacherUid: preservedTeacherUid,
+        assignedNativeFriendUID: preservedTeacherUid,
+        nativeFriendUID: preservedTeacherUid,
+        teacherEmail: preservedTeacherEmail,
+        teacherName: preservedTeacherName,
+        enrollmentStatus: preservedEnrollmentStatus,
+        status: preservedStatus,
+        ...(safeStudyDays ? { weeklyStudyDays: safeStudyDays, selectedStudyDays: safeStudyDays } : {}),
+        ...(safeStudyDaysTarget !== undefined ? { weeklyStudyDaysTarget: safeStudyDaysTarget } : {}),
+        ...(safeTimezone ? { timezone: safeTimezone } : {}),
+        ...(safePreferredLanguage ? { preferredLanguage: safePreferredLanguage } : {}),
+        ...(safeOnboardingCompleted !== undefined ? { onboardingCompleted: safeOnboardingCompleted } : {}),
+        updatedAt: nowIso,
+      };
+
+      return {
+        status: 200 as const,
+        resolvedCleanEmail,
+        updatedProfileRecord,
+        safeName,
+        safeLevel,
+        safeGoal,
+        safePicture,
+        safeAvatar,
+        safeWeeklyNativeLessonsTarget,
+        safeVideoTime,
+        safeAudioTime,
+        safePhraseTime,
+        safeStudyDays,
+        safeStudyDaysTarget,
+        preservedContracted,
+        preservedAvailable,
+      };
+    });
+
+    if (txResult.status !== 200) {
+      return res.status(txResult.status).json(txResult.body);
+    }
+
+    const resolvedCleanEmail = txResult.resolvedCleanEmail;
+
+    // Update RAM caches strictly AFTER canonical atomic Firestore transaction confirmation
+    if (!db.userProfiles) db.userProfiles = {};
+    if (!db.weeklyNativeTargets) db.weeklyNativeTargets = {};
+
+    db.userProfiles[resolvedCleanEmail] = txResult.updatedProfileRecord;
+    db.weeklyNativeTargets[resolvedCleanEmail] = txResult.safeWeeklyNativeLessonsTarget;
+    if (txResult.safeStudyDays) {
+      if (!db.weeklyStudyDays) db.weeklyStudyDays = {};
+      db.weeklyStudyDays[resolvedCleanEmail] = txResult.safeStudyDays;
+    }
+    if (txResult.safeStudyDaysTarget !== undefined) {
+      if (!db.weeklyStudyDaysTargets) db.weeklyStudyDaysTargets = {};
+      db.weeklyStudyDaysTargets[resolvedCleanEmail] = txResult.safeStudyDaysTarget;
+    }
+
+    const idx = db.students.findIndex((s) => s.uid === targetUid || (s.email || s.studentEmail || '').toLowerCase() === resolvedCleanEmail);
+    if (idx >= 0) {
+      db.students[idx] = {
+        ...db.students[idx],
+        name: txResult.safeName || db.students[idx].name,
+        studentName: txResult.safeName || db.students[idx].studentName,
+        level: txResult.safeLevel || db.students[idx].level,
+        studentLevel: txResult.safeLevel || db.students[idx].studentLevel,
+        goal: txResult.safeGoal || db.students[idx].goal,
+        learningGoal: txResult.safeGoal || db.students[idx].learningGoal,
+        picture: txResult.safePicture || db.students[idx].picture,
+        avatar: txResult.safeAvatar || db.students[idx].avatar,
+        weeklyNativeLessonsTarget: txResult.safeWeeklyNativeLessonsTarget,
+        routineVideoTime: txResult.safeVideoTime,
+        routineAudioTime: txResult.safeAudioTime,
+        dailyPhraseTime: txResult.safePhraseTime,
+        contractedLessons: txResult.preservedContracted,
+        ...(txResult.preservedAvailable !== undefined ? { availableLessons: txResult.preservedAvailable } : {}),
       };
     }
 
     await writeDbSync(db);
-    return res.json({ success: true, profile: db.userProfiles[cleanEmail], persistedToFirestore: true });
+    return res.json({ success: true, profile: db.userProfiles[resolvedCleanEmail], persistedToFirestore: true });
   } catch (fsErr: any) {
     console.error(`[serverFirestore] Failed to persist student profile in users/${targetUid}:`, fsErr);
     return res.status(500).json({
