@@ -158,10 +158,13 @@ export function setIsCloudWriteDisabled(disabled: boolean): void {
   isCloudWriteDisabled = disabled;
 }
 
+let lastAppStateHydrationDiagnostic: FirestoreHydrationDiagnosticResult | null = null;
+
 export function resetFirebaseAdminFirestoreForTesting(): void {
   adminFirestoreInstance = null;
   adminFirestoreDisabledForTesting = false;
   isCloudWriteDisabled = false;
+  lastAppStateHydrationDiagnostic = null;
 }
 
 // Authoritative in-memory DB provider to prevent circular import problems
@@ -183,6 +186,19 @@ export function getAuthoritativeDb(): any | null {
   return null;
 }
 
+function isFirestoreTimeoutError(err: any): boolean {
+  if (!err) return false;
+  const code = err.code;
+  const msg = String(err.message || err || '').toLowerCase();
+  return (
+    code === 4 ||
+    code === 'deadline-exceeded' ||
+    msg.includes('deadline_exceeded') ||
+    msg.includes('deadline exceeded') ||
+    msg.includes('timed out') ||
+    msg.includes('timeout')
+  );
+}
 
 // Timeout helper so remote Firestore never blocks an Express API response indefinitely
 function withTimeout<T>(promise: Promise<T>, ms: number = 1500): Promise<T | null> {
@@ -191,10 +207,16 @@ function withTimeout<T>(promise: Promise<T>, ms: number = 1500): Promise<T | nul
     timer = setTimeout(() => resolve(null), ms);
   });
   return Promise.race([
-    promise.then((res) => {
-      clearTimeout(timer);
-      return res;
-    }),
+    promise.then(
+      (res) => {
+        clearTimeout(timer);
+        return res;
+      },
+      (err) => {
+        clearTimeout(timer);
+        throw err;
+      }
+    ),
     timeoutPromise,
   ]);
 }
@@ -1142,7 +1164,7 @@ export async function saveTutorToFirestore(tutor: any, _legacyDocId?: string): P
  * Executes strictly against canonical (default) Firestore database.
  * Does not silently swallow query errors.
  */
-export async function fetchTutorsFromFirestore(): Promise<any[]> {
+async function fetchTutorsInternal(timeoutMs: number = 10000): Promise<{ tutors: any[]; rawDocsCount: number }> {
   const db = getFirestoreDb();
   if (!db) {
     throw new Error('[serverFirestore] Canonical Firestore database (default) client is not initialized');
@@ -1150,6 +1172,7 @@ export async function fetchTutorsFromFirestore(): Promise<any[]> {
 
   const fetchPromise = async () => {
     const rawList: any[] = [];
+    let rawDocsCount = 0;
 
     const [usersSnap, legacySnap] = await Promise.all([
       db.collection('users').where('role', '==', 'teacher').get(),
@@ -1158,6 +1181,7 @@ export async function fetchTutorsFromFirestore(): Promise<any[]> {
 
     if (usersSnap) {
       usersSnap.forEach((d) => {
+        rawDocsCount++;
         const data = d.data();
         if (data && (data.email || data.name)) {
           rawList.push({ id: d.id, ...data, role: 'teacher' });
@@ -1167,6 +1191,7 @@ export async function fetchTutorsFromFirestore(): Promise<any[]> {
 
     if (legacySnap) {
       legacySnap.forEach((d) => {
+        rawDocsCount++;
         const data = d.data();
         if (data && (data.email || data.name)) {
           rawList.push({ id: d.id, ...data, role: 'teacher' });
@@ -1179,14 +1204,19 @@ export async function fetchTutorsFromFirestore(): Promise<any[]> {
       .filter((t) => t.approvalStatus === 'approved' && t.isApproved === true)
       .map((t) => t.publicTutorId || t.id || t.email);
     console.log('[NativeFriends Server] Retrieved consolidated Firestore tutor IDs:', approvedIds);
-    return results;
+    return { tutors: results, rawDocsCount };
   };
 
-  const result = await withTimeout(fetchPromise(), 10000);
+  const result = await withTimeout(fetchPromise(), timeoutMs);
   if (result === null) {
     throw new Error('[serverFirestore] Timed out querying Firestore database (default) for tutors');
   }
   return result;
+}
+
+export async function fetchTutorsFromFirestore(): Promise<any[]> {
+  const { tutors } = await fetchTutorsInternal(10000);
+  return tutors;
 }
 
 /**
@@ -1236,37 +1266,212 @@ export async function deleteUserByEmailFromFirestore(targetEmail: string): Promi
   }
 }
 
-export async function fetchAppStateFromFirestore(): Promise<any | null> {
+export type FirestoreHydrationSourceName =
+  | 'app_state/main_data'
+  | 'app_state/routines'
+  | 'app_state/tutors'
+  | 'app_state/assignments'
+  | 'app_state/lessons'
+  | 'app_state/youtube_playlists'
+  | 'tutors'
+  | 'users';
+
+export type FirestoreHydrationStatus =
+  | 'hydrated_with_data'
+  | 'confirmed_empty'
+  | 'failed_or_partial';
+
+export interface FirestoreHydrationSourceDiagnostic {
+  source: FirestoreHydrationSourceName;
+  required: true;
+  ok: boolean;
+  hasData: boolean;
+  empty: boolean;
+  timedOut: boolean;
+  error?: string;
+}
+
+export interface FirestoreHydrationDiagnosticResult {
+  status: FirestoreHydrationStatus;
+  state: any | null;
+  hasData: boolean;
+  isConfirmedEmpty: boolean;
+  isPartialOrFailed: boolean;
+  allRequiredReadsSucceeded: boolean;
+  timedOut: boolean;
+  failedSources: FirestoreHydrationSourceName[];
+  timedOutSources: FirestoreHydrationSourceName[];
+  sources: Record<FirestoreHydrationSourceName, FirestoreHydrationSourceDiagnostic>;
+  checkedAt: string;
+  error?: string;
+}
+
+const REQUIRED_HYDRATION_SOURCES: FirestoreHydrationSourceName[] = [
+  'app_state/main_data',
+  'app_state/routines',
+  'app_state/tutors',
+  'app_state/assignments',
+  'app_state/lessons',
+  'app_state/youtube_playlists',
+  'tutors',
+  'users',
+];
+
+function buildDefaultSourceDiagnostic(
+  source: FirestoreHydrationSourceName,
+  overrides: Partial<FirestoreHydrationSourceDiagnostic> = {}
+): FirestoreHydrationSourceDiagnostic {
+  return {
+    source,
+    required: true,
+    ok: false,
+    hasData: false,
+    empty: false,
+    timedOut: false,
+    ...overrides,
+  };
+}
+
+export function getLastAppStateHydrationDiagnostic(): FirestoreHydrationDiagnosticResult | null {
+  return lastAppStateHydrationDiagnostic;
+}
+
+export async function fetchAppStateWithDiagnosticFromFirestore(options?: {
+  timeoutMs?: number;
+}): Promise<FirestoreHydrationDiagnosticResult> {
+  const checkedAt = new Date().toISOString();
+  const timeoutMs =
+    typeof options?.timeoutMs === 'number' && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+      ? options.timeoutMs
+      : 15000;
+  const perSourceTimeoutMs = Math.min(10000, timeoutMs);
+
+  const createEmptySourcesRecord = (
+    initialOverrides: Partial<FirestoreHydrationSourceDiagnostic> = {}
+  ): Record<FirestoreHydrationSourceName, FirestoreHydrationSourceDiagnostic> => {
+    const rec = {} as Record<FirestoreHydrationSourceName, FirestoreHydrationSourceDiagnostic>;
+    for (const src of REQUIRED_HYDRATION_SOURCES) {
+      rec[src] = buildDefaultSourceDiagnostic(src, initialOverrides);
+    }
+    return rec;
+  };
+
   const db = getFirestoreDb();
-  if (!db) return null;
+  if (!db) {
+    const errMsg = '[serverFirestore] Canonical Firestore database (default) client is not initialized';
+    const sources = createEmptySourcesRecord({ ok: false, hasData: false, empty: false, timedOut: false, error: errMsg });
+    const diagnostic: FirestoreHydrationDiagnosticResult = {
+      status: 'failed_or_partial',
+      state: null,
+      hasData: false,
+      isConfirmedEmpty: false,
+      isPartialOrFailed: true,
+      allRequiredReadsSucceeded: false,
+      timedOut: false,
+      failedSources: [...REQUIRED_HYDRATION_SOURCES],
+      timedOutSources: [],
+      sources,
+      checkedAt,
+      error: errMsg,
+    };
+    lastAppStateHydrationDiagnostic = diagnostic;
+    return diagnostic;
+  }
+
+  const liveSources = createEmptySourcesRecord();
+  const completedSources = new Set<FirestoreHydrationSourceName>();
+
+  const recordSource = (
+    source: FirestoreHydrationSourceName,
+    diag: Omit<FirestoreHydrationSourceDiagnostic, 'source' | 'required'>
+  ) => {
+    completedSources.add(source);
+    liveSources[source] = buildDefaultSourceDiagnostic(source, diag);
+  };
+
   try {
-    const fetchDoc = async (docName: string) => {
+    const fetchDocWithDiagnostic = async (
+      docName: 'main_data' | 'routines' | 'tutors' | 'assignments' | 'lessons' | 'youtube_playlists'
+    ): Promise<any | null> => {
+      const sourceName = `app_state/${docName}` as FirestoreHydrationSourceName;
       try {
-        const snap = await db.collection('app_state').doc(docName).get().catch(() => null);
-        return snap && snap.exists ? snap.data() : null;
-      } catch {
+        const snap = await db.collection('app_state').doc(docName).get();
+        const exists = Boolean(snap && snap.exists);
+        const data = exists ? (snap.data() ?? null) : null;
+        recordSource(sourceName, {
+          ok: true,
+          hasData: Boolean(data),
+          empty: !exists,
+          timedOut: false,
+        });
+        return data;
+      } catch (err: any) {
+        const timedOut = isFirestoreTimeoutError(err);
+        recordSource(sourceName, {
+          ok: false,
+          hasData: false,
+          empty: false,
+          timedOut,
+          error: err?.message || String(err),
+        });
         return null;
       }
     };
 
-    const fetchTutorsStatus = async (): Promise<{ ok: boolean; tutors: any[] }> => {
+    const fetchTutorsStatus = async (): Promise<{ ok: boolean; tutors: any[]; rawDocsCount: number }> => {
       try {
-        const tutors = await fetchTutorsFromFirestore();
-        return { ok: true, tutors: Array.isArray(tutors) ? tutors : [] };
-      } catch {
-        return { ok: false, tutors: [] };
+        const res = await fetchTutorsInternal(perSourceTimeoutMs);
+        const tutorsList = Array.isArray(res.tutors) ? res.tutors : [];
+        recordSource('tutors', {
+          ok: true,
+          hasData: tutorsList.length > 0 || res.rawDocsCount > 0,
+          empty: res.rawDocsCount === 0 && tutorsList.length === 0,
+          timedOut: false,
+        });
+        return { ok: true, tutors: tutorsList, rawDocsCount: res.rawDocsCount };
+      } catch (err: any) {
+        const timedOut = isFirestoreTimeoutError(err);
+        recordSource('tutors', {
+          ok: false,
+          hasData: false,
+          empty: false,
+          timedOut,
+          error: err?.message || String(err),
+        });
+        return { ok: false, tutors: [], rawDocsCount: 0 };
       }
     };
 
+    const fetchUsersStatus = async (): Promise<{ ok: boolean; users: any[]; rawDocsCount: number }> => {
+      const res = await fetchUsersCanonicalInternal(perSourceTimeoutMs);
+      if (res.ok) {
+        recordSource('users', {
+          ok: true,
+          hasData: res.users.length > 0 || res.rawDocsCount > 0,
+          empty: res.rawDocsCount === 0 && res.users.length === 0,
+          timedOut: false,
+        });
+      } else {
+        recordSource('users', {
+          ok: false,
+          hasData: false,
+          empty: false,
+          timedOut: res.timedOut,
+          error: res.error || 'Failed reading users collection',
+        });
+      }
+      return { ok: res.ok, users: res.users, rawDocsCount: res.rawDocsCount };
+    };
+
     const fetchAllPromise = Promise.all([
-      fetchDoc('main_data'),
-      fetchDoc('routines'),
-      fetchDoc('tutors'),
-      fetchDoc('assignments'),
-      fetchDoc('lessons'),
-      fetchDoc('youtube_playlists'),
+      fetchDocWithDiagnostic('main_data'),
+      fetchDocWithDiagnostic('routines'),
+      fetchDocWithDiagnostic('tutors'),
+      fetchDocWithDiagnostic('assignments'),
+      fetchDocWithDiagnostic('lessons'),
+      fetchDocWithDiagnostic('youtube_playlists'),
       fetchTutorsStatus(),
-      fetchUsersFromFirestoreCanonical(),
+      fetchUsersStatus(),
     ]).then(([mainData, routines, tutors, assignments, lessons, ytPlaylists, directTutorsResult, directUsersResult]) => {
       const directTutors = directTutorsResult.tutors;
       const directUsers = directUsersResult.users;
@@ -1501,7 +1706,127 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
         ...(ytPlaylists && ytPlaylists.playlists ? { youtubePlaylists: ytPlaylists.playlists } : {}),
       };
     });
-    return await withTimeout(fetchAllPromise, 15000);
+
+    const raceResult = await new Promise<{ timedOut: boolean; state: any | null }>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          resolve({ timedOut: true, state: null });
+        }
+      }, timeoutMs);
+
+      fetchAllPromise.then(
+        (state) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            resolve({ timedOut: false, state });
+          }
+        },
+        (err) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            reject(err);
+          }
+        }
+      );
+    });
+
+    if (raceResult.timedOut) {
+      const snapshotSources = createEmptySourcesRecord();
+      for (const src of REQUIRED_HYDRATION_SOURCES) {
+        if (completedSources.has(src)) {
+          snapshotSources[src] = { ...liveSources[src] };
+        } else {
+          snapshotSources[src] = buildDefaultSourceDiagnostic(src, {
+            ok: false,
+            hasData: false,
+            empty: false,
+            timedOut: true,
+            error: `[serverFirestore] Timed out after ${timeoutMs}ms reading ${src}`,
+          });
+        }
+      }
+      const failedSources = REQUIRED_HYDRATION_SOURCES.filter((src) => !snapshotSources[src].ok);
+      const timedOutSources = REQUIRED_HYDRATION_SOURCES.filter((src) => snapshotSources[src].timedOut);
+      const diagnostic: FirestoreHydrationDiagnosticResult = {
+        status: 'failed_or_partial',
+        state: null,
+        hasData: false,
+        isConfirmedEmpty: false,
+        isPartialOrFailed: true,
+        allRequiredReadsSucceeded: false,
+        timedOut: true,
+        failedSources,
+        timedOutSources,
+        sources: snapshotSources,
+        checkedAt,
+        error: `[serverFirestore] fetchAppState timed out after ${timeoutMs}ms`,
+      };
+      lastAppStateHydrationDiagnostic = diagnostic;
+      return diagnostic;
+    }
+
+    const finalSources = createEmptySourcesRecord();
+    for (const src of REQUIRED_HYDRATION_SOURCES) {
+      finalSources[src] = { ...liveSources[src] };
+    }
+    const failedSources = REQUIRED_HYDRATION_SOURCES.filter((src) => !finalSources[src].ok);
+    const timedOutSources = REQUIRED_HYDRATION_SOURCES.filter((src) => finalSources[src].timedOut);
+    const allRequiredReadsSucceeded = failedSources.length === 0;
+    const anySourceTimedOut = timedOutSources.length > 0;
+    const allSourcesConfirmedEmpty =
+      allRequiredReadsSucceeded &&
+      !anySourceTimedOut &&
+      REQUIRED_HYDRATION_SOURCES.every((src) => finalSources[src].empty);
+    const hasData = raceResult.state !== null;
+
+    let status: FirestoreHydrationStatus;
+    let isConfirmedEmpty = false;
+    let isPartialOrFailed = false;
+
+    if (!allRequiredReadsSucceeded || anySourceTimedOut) {
+      status = 'failed_or_partial';
+      isConfirmedEmpty = false;
+      isPartialOrFailed = true;
+    } else if (hasData) {
+      status = 'hydrated_with_data';
+      isConfirmedEmpty = false;
+      isPartialOrFailed = false;
+    } else if (allSourcesConfirmedEmpty) {
+      status = 'confirmed_empty';
+      isConfirmedEmpty = true;
+      isPartialOrFailed = false;
+    } else {
+      status = 'failed_or_partial';
+      isConfirmedEmpty = false;
+      isPartialOrFailed = true;
+    }
+
+    const diagnostic: FirestoreHydrationDiagnosticResult = {
+      status,
+      state: raceResult.state,
+      hasData,
+      isConfirmedEmpty,
+      isPartialOrFailed,
+      allRequiredReadsSucceeded,
+      timedOut: anySourceTimedOut,
+      failedSources,
+      timedOutSources,
+      sources: finalSources,
+      checkedAt,
+      ...(failedSources.length > 0
+        ? {
+            error: failedSources
+              .map((src) => `${src}: ${finalSources[src].error || 'read failed'}`)
+              .join('; '),
+          }
+        : {}),
+    };
+    lastAppStateHydrationDiagnostic = diagnostic;
+    return diagnostic;
   } catch (err: any) {
     const isPerm =
       err?.code === 7 ||
@@ -1510,8 +1835,44 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
     if (!isPerm) {
       console.info('[serverFirestore] fetchAppState notice:', err?.message || String(err));
     }
+    const snapshotSources = createEmptySourcesRecord();
+    for (const src of REQUIRED_HYDRATION_SOURCES) {
+      if (completedSources.has(src)) {
+        snapshotSources[src] = { ...liveSources[src] };
+      } else {
+        snapshotSources[src] = buildDefaultSourceDiagnostic(src, {
+          ok: false,
+          hasData: false,
+          empty: false,
+          timedOut: isFirestoreTimeoutError(err),
+          error: err?.message || String(err),
+        });
+      }
+    }
+    const failedSources = REQUIRED_HYDRATION_SOURCES.filter((src) => !snapshotSources[src].ok);
+    const timedOutSources = REQUIRED_HYDRATION_SOURCES.filter((src) => snapshotSources[src].timedOut);
+    const diagnostic: FirestoreHydrationDiagnosticResult = {
+      status: 'failed_or_partial',
+      state: null,
+      hasData: false,
+      isConfirmedEmpty: false,
+      isPartialOrFailed: true,
+      allRequiredReadsSucceeded: false,
+      timedOut: isFirestoreTimeoutError(err) || timedOutSources.length > 0,
+      failedSources: failedSources.length > 0 ? failedSources : [...REQUIRED_HYDRATION_SOURCES],
+      timedOutSources,
+      sources: snapshotSources,
+      checkedAt,
+      error: err?.message || String(err),
+    };
+    lastAppStateHydrationDiagnostic = diagnostic;
+    return diagnostic;
   }
-  return null;
+}
+
+export async function fetchAppStateFromFirestore(): Promise<any | null> {
+  const diagnostic = await fetchAppStateWithDiagnosticFromFirestore();
+  return diagnostic.state;
 }
 
 export async function saveYouTubePlaylistsToFirestore(playlists: any[]): Promise<boolean> {
@@ -1637,10 +1998,12 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
     // Strip out external API caches that must not be stored in main Firestore documents
     delete sanitized.youtubePlaylists;
 
+    // SEC.FIX.6A.2: Protect canonical ADM global template (app_state/routines.routinesByDay)
+    // from being overwritten by default/unhydrated/stale RAM via saveAppStateToFirestore / writeDb.
+    // Global routinesByDay is persisted exclusively by POST /api/routines (ADM).
     const routinesData = {
       studentRoutinesMap: sanitized.studentRoutinesMap || {},
       studentCurrentRoutines: sanitized.studentCurrentRoutines || {},
-      routinesByDay: sanitized.routinesByDay || {},
       weeklyNativeTargets: sanitized.weeklyNativeTargets || {},
       updatedAt: new Date().toISOString(),
     };
@@ -1768,9 +2131,19 @@ export async function saveUserToFirestore(user: any): Promise<boolean> {
   }
 }
 
-export async function fetchUsersFromFirestoreCanonical(): Promise<{ ok: boolean; users: any[] }> {
+async function fetchUsersCanonicalInternal(
+  timeoutMs: number = 10000
+): Promise<{ ok: boolean; users: any[]; rawDocsCount: number; timedOut: boolean; error?: string }> {
   const db = getFirestoreDb();
-  if (!db) return { ok: false, users: [] };
+  if (!db) {
+    return {
+      ok: false,
+      users: [],
+      rawDocsCount: 0,
+      timedOut: false,
+      error: '[serverFirestore] Canonical Firestore database (default) client is not initialized',
+    };
+  }
   try {
     const fetchPromise = async () => {
       let queryError: any = null;
@@ -1788,9 +2161,19 @@ export async function fetchUsersFromFirestoreCanonical(): Promise<{ ok: boolean;
         }
         return null;
       });
-      if (!snap || queryError) return { ok: false, users: [] };
+      if (!snap || queryError) {
+        return {
+          ok: false,
+          users: [],
+          rawDocsCount: 0,
+          timedOut: isFirestoreTimeoutError(queryError),
+          error: queryError ? (queryError?.message || String(queryError)) : 'Users snapshot unavailable',
+        };
+      }
       const list: any[] = [];
+      let rawDocsCount = 0;
       snap.forEach((d: any) => {
+        rawDocsCount++;
         const data = d.data();
         if (data && (data.email || data.id)) {
           list.push({
@@ -1799,10 +2182,19 @@ export async function fetchUsersFromFirestoreCanonical(): Promise<{ ok: boolean;
           });
         }
       });
-      return { ok: true, users: list };
+      return { ok: true, users: list, rawDocsCount, timedOut: false };
     };
-    const result = await withTimeout(fetchPromise(), 10000);
-    return result || { ok: false, users: [] };
+    const result = await withTimeout(fetchPromise(), timeoutMs);
+    if (!result) {
+      return {
+        ok: false,
+        users: [],
+        rawDocsCount: 0,
+        timedOut: true,
+        error: '[serverFirestore] Timed out querying Firestore database (default) for users',
+      };
+    }
+    return result;
   } catch (err: any) {
     const isPerm =
       err?.code === 7 ||
@@ -1814,8 +2206,19 @@ export async function fetchUsersFromFirestoreCanonical(): Promise<{ ok: boolean;
     } else {
       console.info('[serverFirestore] Users collection query notice:', err?.message || String(err));
     }
-    return { ok: false, users: [] };
+    return {
+      ok: false,
+      users: [],
+      rawDocsCount: 0,
+      timedOut: isFirestoreTimeoutError(err),
+      error: err?.message || String(err),
+    };
   }
+}
+
+export async function fetchUsersFromFirestoreCanonical(): Promise<{ ok: boolean; users: any[] }> {
+  const res = await fetchUsersCanonicalInternal(10000);
+  return { ok: res.ok, users: res.users };
 }
 
 export async function fetchUsersFromFirestore(): Promise<any[]> {
