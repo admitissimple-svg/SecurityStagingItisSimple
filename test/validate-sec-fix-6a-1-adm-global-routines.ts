@@ -566,7 +566,7 @@ async function run() {
       );
       assert.strictEqual(admGlobal.status, 200);
 
-      // Admin updates specific student -> does NOT overwrite app_state/routines.routinesByDay
+      // Admin targeted POST returns HTTP 410 Gone and does NOT overwrite app_state/routines.routinesByDay or RAM
       const admTargetPost = await makeRequest(
         server,
         'POST',
@@ -577,13 +577,15 @@ async function run() {
         },
         { Authorization: 'Bearer tok-admin' }
       );
-      assert.strictEqual(admTargetPost.status, 200);
+      assert.strictEqual(admTargetPost.status, 410);
+      assert.strictEqual(admTargetPost.data?.code, 'LEGACY_TARGETED_ROUTINES_POST_DISABLED');
       assert.strictEqual(
         mockFs._getDoc('app_state', 'routines')?.routinesByDay?.monday?.[0]?.id,
         'adm-global-isolated'
       );
+      assert.strictEqual(Object.keys(readDb().studentRoutinesMap || {}).length, 0);
 
-      // Student POST updates only student routine, never global template
+      // Student POST returns HTTP 410 Gone without mutating global template or RAM
       const stuPost = await makeRequest(
         server,
         'POST',
@@ -591,11 +593,13 @@ async function run() {
         { monday: [{ id: 'stu-custom-isolated', time: '14:00', activityName: 'Student Custom' }] },
         { Authorization: 'Bearer tok-student' }
       );
-      assert.strictEqual(stuPost.status, 200);
+      assert.strictEqual(stuPost.status, 410);
+      assert.strictEqual(stuPost.data?.code, 'LEGACY_TARGETED_ROUTINES_POST_DISABLED');
       assert.strictEqual(
         mockFs._getDoc('app_state', 'routines')?.routinesByDay?.monday?.[0]?.id,
         'adm-global-isolated'
       );
+      assert.strictEqual(Object.keys(readDb().studentRoutinesMap || {}).length, 0);
 
       // Teacher bare GET returns clean defaultRoutinesByDay (never admin custom template or student routine)
       const teacherBareGet = await makeRequest(server, 'GET', '/api/routines', undefined, {

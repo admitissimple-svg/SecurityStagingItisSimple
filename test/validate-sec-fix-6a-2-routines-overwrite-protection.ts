@@ -518,7 +518,7 @@ async function run() {
       // Unhydrated RAM write attempt before initCloudPersistence
       await saveAppStateToFirestore(readDb());
 
-      // Student updates own routine via POST /api/routines (triggers writeDb(db))
+      // Student legacy POST /api/routines returns 410 Gone without mutating RAM/Firestore; subsequent writeDbSync preserves ADM template
       await initCloudPersistence();
       const stuPost = await makeRequest(
         server,
@@ -527,8 +527,10 @@ async function run() {
         { monday: [{ id: 'stu-after-restart', time: '11:00', activityName: 'Student Only' }] },
         { Authorization: 'Bearer tok-student' }
       );
-      assert.strictEqual(stuPost.status, 200);
-      await new Promise((r) => setTimeout(r, 350)); // allow debounced writeDb timer to fire
+      assert.strictEqual(stuPost.status, 410);
+      assert.strictEqual(stuPost.data?.code, 'LEGACY_TARGETED_ROUTINES_POST_DISABLED');
+      await writeDbSync(readDb());
+      await new Promise((r) => setTimeout(r, 100));
 
       // Admin GET after simulated restart must return exact ADM V3 template
       const admGet = await makeRequest(server, 'GET', '/api/routines', undefined, {

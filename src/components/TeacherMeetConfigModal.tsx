@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   X,
   Settings,
@@ -11,6 +11,8 @@ import {
   Copy,
   Trash2,
   CheckSquare,
+  AlertCircle,
+  Loader2,
 } from 'lucide-react';
 import { TeacherMeetSettings, DayOfWeek, Language, NativeFriendTutor } from '../types';
 import {
@@ -32,7 +34,7 @@ export interface TeacherMeetConfigModalProps {
   teacherUid?: string;
   currentSettings?: TeacherMeetSettings;
   tutorProfile?: NativeFriendTutor | null;
-  onSave: (settings: TeacherMeetSettings) => void;
+  onSave: (settings: TeacherMeetSettings) => Promise<any> | void;
   currentLanguage?: Language;
 }
 
@@ -173,22 +175,73 @@ export const TeacherMeetConfigModal: React.FC<TeacherMeetConfigModalProps> = ({
     getInitialAvailability(currentSettings)
   );
   const [savedSuccess, setSavedSuccess] = useState<boolean>(false);
+  const [isSaving, setIsSaving] = useState<boolean>(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
 
-  // Sync state whenever modal opens or settings/profile change
+  const prevIsOpenRef = useRef<boolean>(false);
+  const prevTeacherKeyRef = useRef<string>('');
+  const hasEditedRef = useRef<boolean>(false);
+  const closeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearPendingCloseTimeout = useCallback(() => {
+    if (closeTimeoutRef.current !== null) {
+      clearTimeout(closeTimeoutRef.current);
+      closeTimeoutRef.current = null;
+    }
+  }, []);
+
   useEffect(() => {
-    if (isOpen) {
+    return () => {
+      clearPendingCloseTimeout();
+    };
+  }, [clearPendingCloseTimeout]);
+
+  // Sync state whenever modal opens, target teacher changes, or confirmed settings arrive before user edits
+  useEffect(() => {
+    const teacherKey = `${(teacherEmail || '').toLowerCase().trim()}::${teacherUid || ''}`;
+    if (!isOpen) {
+      clearPendingCloseTimeout();
+      prevIsOpenRef.current = false;
+      return;
+    }
+
+    const justOpened = !prevIsOpenRef.current;
+    const teacherChanged = prevTeacherKeyRef.current !== teacherKey;
+    prevIsOpenRef.current = true;
+    prevTeacherKeyRef.current = teacherKey;
+
+    if (justOpened || teacherChanged) {
+      clearPendingCloseTimeout();
+      hasEditedRef.current = false;
       setMeetLink(currentSettings?.meetLink || tutorProfile?.meetUrl || '');
       setTimezone(resolveInitialTimezone());
       setAvailabilityByDay(getInitialAvailability(currentSettings));
       setSavedSuccess(false);
+      setIsSaving(false);
+      setSaveError(null);
       setActionNotice(null);
+    } else if (!hasEditedRef.current && !isSaving && !savedSuccess && !saveError) {
+      setMeetLink(currentSettings?.meetLink || tutorProfile?.meetUrl || '');
+      setTimezone(resolveInitialTimezone());
+      setAvailabilityByDay(getInitialAvailability(currentSettings));
     }
-  }, [isOpen, currentSettings, tutorProfile, resolveInitialTimezone]);
+  }, [
+    isOpen,
+    teacherEmail,
+    teacherUid,
+    currentSettings,
+    tutorProfile,
+    resolveInitialTimezone,
+    isSaving,
+    savedSuccess,
+    saveError,
+    clearPendingCloseTimeout,
+  ]);
 
-  // Support ESC key to dismiss
+  // Support ESC key to dismiss (blocked while save request is in flight)
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen || isSaving) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         onClose();
@@ -196,7 +249,7 @@ export const TeacherMeetConfigModal: React.FC<TeacherMeetConfigModalProps> = ({
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, onClose]);
+  }, [isOpen, isSaving, onClose]);
 
   if (!isOpen) return null;
 
@@ -214,6 +267,7 @@ export const TeacherMeetConfigModal: React.FC<TeacherMeetConfigModalProps> = ({
 
   // Toggle a single 30-min slot for active day
   const toggleSlotForActiveDay = (slot: string) => {
+    hasEditedRef.current = true;
     setAvailabilityByDay((prev) => {
       const currentSlots = prev[activeDay] || [];
       const updated = currentSlots.includes(slot)
@@ -228,6 +282,7 @@ export const TeacherMeetConfigModal: React.FC<TeacherMeetConfigModalProps> = ({
 
   // Select all 48 slots for the active day
   const handleSelectAllForActiveDay = () => {
+    hasEditedRef.current = true;
     setAvailabilityByDay((prev) => ({
       ...prev,
       [activeDay]: [...FIXED_30MIN_AVAILABILITY_SLOTS],
@@ -238,6 +293,7 @@ export const TeacherMeetConfigModal: React.FC<TeacherMeetConfigModalProps> = ({
 
   // Clear all slots for active day
   const handleClearActiveDay = () => {
+    hasEditedRef.current = true;
     setAvailabilityByDay((prev) => ({
       ...prev,
       [activeDay]: [],
@@ -248,6 +304,7 @@ export const TeacherMeetConfigModal: React.FC<TeacherMeetConfigModalProps> = ({
 
   // Copy schedule from active day to Mon-Fri or All 7 Days
   const copyActiveDaySchedule = (scope: 'weekdays' | 'all') => {
+    hasEditedRef.current = true;
     const slotsToCopy = [...(availabilityByDay[activeDay] || [])];
     setAvailabilityByDay((prev) => {
       const next = { ...prev };
@@ -271,9 +328,15 @@ export const TeacherMeetConfigModal: React.FC<TeacherMeetConfigModalProps> = ({
     setTimeout(() => setActionNotice(null), 2200);
   };
 
-  // Save to backend & Firestore
-  const handleSave = (e: React.FormEvent) => {
+  // Save to backend & Firestore — only show success after confirmed HTTP 2xx
+  const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSaving) return;
+
+    clearPendingCloseTimeout();
+    setIsSaving(true);
+    setSaveError(null);
+    setSavedSuccess(false);
 
     const activeDaysList = ALL_DAYS.map((d) => d.id).filter(
       (dayId) => (availabilityByDay[dayId] || []).length > 0
@@ -309,12 +372,28 @@ export const TeacherMeetConfigModal: React.FC<TeacherMeetConfigModalProps> = ({
       updatedAt: new Date().toISOString(),
     };
 
-    onSave(updatedSettings);
-    setSavedSuccess(true);
-    setTimeout(() => {
+    try {
+      const result = await onSave(updatedSettings);
+      if (result && typeof result === 'object' && result.success === false) {
+        throw new Error(result.message || result.error || 'Failed to save schedule and settings.');
+      }
+
+      hasEditedRef.current = false;
+      setSavedSuccess(true);
+      closeTimeoutRef.current = setTimeout(() => {
+        closeTimeoutRef.current = null;
+        setSavedSuccess(false);
+        onClose();
+      }, 1000);
+    } catch (err: any) {
       setSavedSuccess(false);
-      onClose();
-    }, 1000);
+      setSaveError(
+        err?.message ||
+          'Failed to save schedule and settings. Your previous settings were kept — please try again.'
+      );
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const isAllSelected = activeDaySlots.length === FIXED_30MIN_AVAILABILITY_SLOTS.length;
@@ -324,7 +403,7 @@ export const TeacherMeetConfigModal: React.FC<TeacherMeetConfigModalProps> = ({
       className="fixed inset-0 z-50 bg-[#000035]/80 backdrop-blur-sm flex items-center justify-center p-3 sm:p-6 overflow-y-auto"
       id="teacher-meet-config-modal-backdrop"
       onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        if (e.target === e.currentTarget && !isSaving) onClose();
       }}
     >
       <div
@@ -356,9 +435,10 @@ export const TeacherMeetConfigModal: React.FC<TeacherMeetConfigModalProps> = ({
 
           <button
             type="button"
+            disabled={isSaving}
             onClick={onClose}
             id="close-teacher-meet-config-button"
-            className="p-1.5 rounded-xl text-[#9AB4FF] hover:text-white hover:bg-white/10 transition cursor-pointer"
+            className="p-1.5 rounded-xl text-[#9AB4FF] hover:text-white hover:bg-white/10 transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
             aria-label="Close"
             title="Close (Esc)"
           >
@@ -379,6 +459,20 @@ export const TeacherMeetConfigModal: React.FC<TeacherMeetConfigModalProps> = ({
             >
               <Check className="w-4 h-4 text-emerald-600" />
               <span>Schedule and settings saved successfully!</span>
+            </div>
+          )}
+
+          {saveError && (
+            <div
+              className="p-3 bg-rose-50 border border-rose-300 rounded-xl text-xs font-bold text-rose-800 flex items-start gap-2.5 animate-in fade-in"
+              id="teacher-settings-save-error"
+              role="alert"
+            >
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <p className="font-black text-rose-900">Failed to save schedule and settings</p>
+                <p className="text-[11px] text-rose-700 mt-0.5 font-normal">{saveError}</p>
+              </div>
             </div>
           )}
 
@@ -404,7 +498,10 @@ export const TeacherMeetConfigModal: React.FC<TeacherMeetConfigModalProps> = ({
                 type="url"
                 required
                 value={meetLink}
-                onChange={(e) => setMeetLink(e.target.value)}
+                onChange={(e) => {
+                  hasEditedRef.current = true;
+                  setMeetLink(e.target.value);
+                }}
                 placeholder="https://meet.google.com/..."
                 id="teacher-meet-link-input"
                 className="w-full p-2 bg-white border border-slate-300 rounded-xl text-xs text-[#000035] focus:ring-2 focus:ring-[#1C4C96]"
@@ -420,7 +517,10 @@ export const TeacherMeetConfigModal: React.FC<TeacherMeetConfigModalProps> = ({
               <div className="relative">
                 <select
                   value={timezone}
-                  onChange={(e) => setTimezone(e.target.value)}
+                  onChange={(e) => {
+                    hasEditedRef.current = true;
+                    setTimezone(e.target.value);
+                  }}
                   id="teacher-timezone-select"
                   className="w-full p-2 bg-white border border-slate-300 rounded-xl text-xs text-[#000035] focus:ring-2 focus:ring-[#1C4C96]"
                 >
@@ -611,19 +711,25 @@ export const TeacherMeetConfigModal: React.FC<TeacherMeetConfigModalProps> = ({
             <div className="flex items-center gap-2 self-end sm:self-auto">
               <button
                 type="button"
+                disabled={isSaving}
                 onClick={onClose}
                 id="cancel-teacher-config-button"
-                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold cursor-pointer transition"
+                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold cursor-pointer transition disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 Cancel
               </button>
               <button
                 type="submit"
+                disabled={isSaving}
                 id="save-teacher-availability-button"
-                className="px-5 py-2 bg-[#000035] hover:bg-[#1C4C96] text-white rounded-xl text-xs font-black transition flex items-center gap-1.5 shadow-md cursor-pointer"
+                className="px-5 py-2 bg-[#000035] hover:bg-[#1C4C96] text-white rounded-xl text-xs font-black transition flex items-center gap-1.5 shadow-md cursor-pointer disabled:opacity-70 disabled:cursor-not-allowed"
               >
-                <Save className="w-4 h-4 text-[#F4CA54]" />
-                <span>Save Availability & Settings</span>
+                {isSaving ? (
+                  <Loader2 className="w-4 h-4 text-[#F4CA54] animate-spin" />
+                ) : (
+                  <Save className="w-4 h-4 text-[#F4CA54]" />
+                )}
+                <span>{isSaving ? 'Saving Settings...' : 'Save Availability & Settings'}</span>
               </button>
             </div>
           </div>

@@ -534,30 +534,37 @@ async function run() {
       assert.strictEqual(s1Get.data?.monday?.[0]?.teacherSpotify?.trackId, 'spot-s1-mon');
       assert.strictEqual(JSON.stringify(s1Get.data).includes('confidential-s2-word'), false);
 
-      // 3b. Student 1 POST updates ONLY Student 1 map entry without touching global db.routinesByDay
+      // 3b. Student 1 POST to legacy /api/routines -> HTTP 410 Gone, no RAM or Firestore mutation
+      const writeCountBeforeS1Post = mockFs._writeLog.length;
       const s1UpdatedPayload = {
         monday: [{ id: 'mon-s1-custom', time: '09:00', activityName: 'S1 Custom Routine', learnedWords: ['s1-custom-word'] }],
       };
       const s1Post = await makeRequest(server, 'POST', '/api/routines', s1UpdatedPayload, {
         Authorization: 'Bearer token-student-1',
       });
-      assert.strictEqual(s1Post.status, 200);
-      assert.strictEqual(s1Post.data?.monday?.[0]?.id, 'mon-s1-custom');
+      assert.strictEqual(s1Post.status, 410, 'POST legado de aluno deve retornar HTTP 410 Gone');
+      assert.strictEqual(s1Post.data?.code, 'LEGACY_TARGETED_ROUTINES_POST_DISABLED');
+      assert.ok(
+        String(s1Post.data?.message || '').includes('/api/routines/'),
+        'Mensagem 410 deve orientar uso dos endpoints granulares canônicos'
+      );
+      assert.strictEqual(mockFs._writeLog.length, writeCountBeforeS1Post, 'POST 410 de aluno não grava no Firestore');
+      assert.strictEqual(Object.keys(readDb().studentRoutinesMap || {}).length, 0, 'POST 410 de aluno não muta studentRoutinesMap em RAM');
       assert.strictEqual(JSON.stringify(readDb().routinesByDay), initialGlobalSnapshot, 'POST de aluno não altera db.routinesByDay global');
 
-      // 3c. Subsequent GET for Student 1 returns updated routine; Student 2 still sees Student 2 routine
+      // 3c. Subsequent GET for Student 1 still returns canonical Firestore routine; Student 2 still sees Student 2 routine
       const s1GetAfter = await makeRequest(server, 'GET', '/api/routines', undefined, {
         Authorization: 'Bearer token-student-1',
       });
       assert.strictEqual(s1GetAfter.status, 200);
-      assert.strictEqual(s1GetAfter.data?.monday?.[0]?.id, 'mon-s1-custom');
+      assert.strictEqual(s1GetAfter.data?.monday?.[0]?.learnedWords?.[0], 'secret-s1-word');
 
       const s2Get = await makeRequest(server, 'GET', '/api/routines', undefined, {
         Authorization: 'Bearer token-student-2',
       });
       assert.strictEqual(s2Get.status, 200);
       assert.strictEqual(s2Get.data?.monday?.[0]?.learnedWords?.[0], 'confidential-s2-word');
-      assert.strictEqual(JSON.stringify(s2Get.data).includes('s1-custom-word'), false);
+      assert.strictEqual(JSON.stringify(s2Get.data).includes('mon-s1-custom'), false);
 
       // 3d. Cross-student attempts by Student 1 -> 403
       const crossGetUid = await makeRequest(server, 'GET', `/api/routines?studentUid=${STUDENT_2_UID}`, undefined, {
@@ -620,13 +627,14 @@ async function run() {
       assert.strictEqual(taBarePost.status, 403);
       assert.strictEqual(JSON.stringify(readDb().routinesByDay), initialGlobalSnapshot);
 
-      // 4c. Teacher A reads and updates linked Student 1 -> 200 without modifying global
+      // 4c. Teacher A reads linked Student 1 -> 200; targeted legacy POST -> HTTP 410 without mutating RAM or Firestore
       const taGetS1 = await makeRequest(server, 'GET', `/api/routines?studentUid=${STUDENT_1_UID}`, undefined, {
         Authorization: 'Bearer token-teacher-a',
       });
       assert.strictEqual(taGetS1.status, 200);
       assert.strictEqual(taGetS1.data?.monday?.[0]?.learnedWords?.[0], 'secret-s1-word');
 
+      const writeCountBeforeTaPost = mockFs._writeLog.length;
       const taPostS1 = await makeRequest(
         server,
         'POST',
@@ -639,8 +647,11 @@ async function run() {
         },
         { Authorization: 'Bearer token-teacher-a' }
       );
-      assert.strictEqual(taPostS1.status, 200);
-      assert.strictEqual(taPostS1.data?.monday?.[0]?.id, 'mon-ta-updated-s1');
+      assert.strictEqual(taPostS1.status, 410, 'POST legado direcionado de professor deve retornar HTTP 410 Gone');
+      assert.strictEqual(taPostS1.data?.code, 'LEGACY_TARGETED_ROUTINES_POST_DISABLED');
+      assert.ok(String(taPostS1.data?.message || '').includes('/api/routines/'));
+      assert.strictEqual(mockFs._writeLog.length, writeCountBeforeTaPost, 'POST 410 de professor não grava no Firestore');
+      assert.strictEqual(Object.keys(readDb().studentRoutinesMap || {}).length, 0, 'POST 410 de professor não muta studentRoutinesMap em RAM');
       assert.strictEqual(JSON.stringify(readDb().routinesByDay), initialGlobalSnapshot, 'POST de professor não muta global');
 
       // 4d. Teacher A blocked on unlinked Student 2, self-UID, synthetic UID
@@ -764,7 +775,8 @@ async function run() {
       assert.strictEqual(adminPostGlobal.status, 200);
       assert.strictEqual(readDb().routinesByDay?.monday?.[0]?.id, 'mon-admin-global');
 
-      // Admin targeted update for Student 1 does NOT overwrite global template
+      // Admin targeted update for Student 1 returns HTTP 410 Gone and does NOT mutate global template, RAM, or Firestore
+      const writeCountBeforeAdmTarget = mockFs._writeLog.length;
       const adminPostStudent1 = await makeRequest(
         server,
         'POST',
@@ -777,14 +789,18 @@ async function run() {
         },
         { Authorization: 'Bearer token-admin' }
       );
-      assert.strictEqual(adminPostStudent1.status, 200);
-      assert.strictEqual(readDb().routinesByDay?.monday?.[0]?.id, 'mon-admin-global', 'Template global preservado após update direcionado do ADM');
+      assert.strictEqual(adminPostStudent1.status, 410, 'POST legado do ADM com aluno-alvo deve retornar HTTP 410 Gone');
+      assert.strictEqual(adminPostStudent1.data?.code, 'LEGACY_TARGETED_ROUTINES_POST_DISABLED');
+      assert.ok(String(adminPostStudent1.data?.message || '').includes('/api/routines/'));
+      assert.strictEqual(mockFs._writeLog.length, writeCountBeforeAdmTarget, 'POST 410 do ADM com aluno-alvo não grava no Firestore');
+      assert.strictEqual(Object.keys(readDb().studentRoutinesMap || {}).length, 0, 'POST 410 do ADM com aluno-alvo não muta studentRoutinesMap');
+      assert.strictEqual(readDb().routinesByDay?.monday?.[0]?.id, 'mon-admin-global', 'Template global preservado após POST 410 direcionado do ADM');
 
       const adminGetStudent1 = await makeRequest(server, 'GET', `/api/routines?studentUid=${STUDENT_1_UID}`, undefined, {
         Authorization: 'Bearer token-admin',
       });
       assert.strictEqual(adminGetStudent1.status, 200);
-      assert.strictEqual(adminGetStudent1.data?.monday?.[0]?.id, 'mon-admin-s1');
+      assert.strictEqual(adminGetStudent1.data?.monday?.[0]?.learnedWords?.[0], 'secret-s1-word');
 
       // Invalid payload -> 400
       const invalidPayload1 = await makeRequest(server, 'POST', '/api/routines', {}, { Authorization: 'Bearer token-admin' });

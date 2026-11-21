@@ -6422,37 +6422,19 @@ export default function App() {
     const uid =
       settings.uid ||
       (currentAccount?.email?.toLowerCase().trim() === cleanEmail ? currentAccount?.uid : undefined);
-    const merged = { ...settings, teacherEmail: cleanEmail, ...(uid ? { uid } : {}) };
+    const merged: TeacherMeetSettings = { ...settings, teacherEmail: cleanEmail, ...(uid ? { uid } : {}) };
 
-    setTeacherMeetSettings((prev) => ({
-      ...prev,
-      [cleanEmail]: merged,
-      ...(uid ? { [uid]: merged } : {}),
-    }));
+    let token =
+      (await getAccessToken().catch(() => null)) ||
+      (await auth.currentUser?.getIdToken().catch(() => null)) ||
+      null;
+    if (!token && currentAccount?.role === 'admin') {
+      token = await getAdminAccessToken().catch(() => null);
+    }
 
-    // Synchronize timezone, meetLink, availableDays, and availability to tutors list if updated
-    setTutors((prev) =>
-      prev.map((t) =>
-        (t.email || '').toLowerCase().trim() === cleanEmail || (uid && (t as any).uid === uid)
-          ? {
-              ...t,
-              timezone: settings.timezone || t.timezone,
-              meetUrl: settings.meetLink || t.meetUrl,
-              meetLink: settings.meetLink || (t as any).meetLink,
-              availableDays:
-                settings.availableDays && settings.availableDays.length > 0
-                  ? settings.availableDays
-                  : t.availableDays,
-              availability: settings.availability || settings.availableHoursByDay || t.availability,
-              availableHoursByDay: settings.availableHoursByDay || settings.availability || (t as any).availableHoursByDay,
-            }
-          : t
-      )
-    );
-
+    let response: Response;
     try {
-      const token = (await getAccessToken().catch(() => null)) || (await auth.currentUser?.getIdToken().catch(() => null)) || null;
-      await fetch('/api/teacher-settings', {
+      response = await fetch('/api/teacher-settings', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -6460,9 +6442,96 @@ export default function App() {
         },
         body: JSON.stringify(merged),
       });
-    } catch {
-      // local fallback
+    } catch (networkErr: any) {
+      throw new Error(
+        networkErr?.message
+          ? `Network error while saving settings: ${networkErr.message}. Please try again.`
+          : 'Network error while saving settings. Please check your connection and try again.'
+      );
     }
+
+    const data = await response.json().catch(() => null);
+
+    if (!response.ok || data?.success === false) {
+      const serverMsg = data?.message || data?.error;
+      if (response.status === 401) {
+        throw new Error(serverMsg || 'Session expired or unauthorized. Please sign in again.');
+      }
+      if (response.status === 403) {
+        throw new Error(serverMsg || 'Access denied: You are not authorized to update these settings.');
+      }
+      if (response.status === 503) {
+        throw new Error(
+          serverMsg ||
+            'Service or database temporarily unavailable (503). Your previous settings were kept — please try again.'
+        );
+      }
+      if (response.status >= 500) {
+        throw new Error(
+          serverMsg ||
+            `Server error (${response.status}). Your previous settings were kept — please try again.`
+        );
+      }
+      throw new Error(
+        serverMsg || `Failed to save teacher settings (HTTP ${response.status}). Please try again.`
+      );
+    }
+
+    const confirmedSettings: TeacherMeetSettings =
+      data?.settings && typeof data.settings === 'object'
+        ? { ...merged, ...data.settings }
+        : merged;
+
+    const confirmedEmail = (confirmedSettings.teacherEmail || cleanEmail).toLowerCase().trim();
+    const confirmedUid = confirmedSettings.uid || uid;
+
+    setTeacherMeetSettings((prev) => {
+      const next = { ...prev };
+      if (data?.meetSettings && typeof data.meetSettings === 'object') {
+        Object.entries(data.meetSettings).forEach(([k, v]) => {
+          if (v && typeof v === 'object') {
+            next[k] = v as TeacherMeetSettings;
+          }
+        });
+      }
+      if (data?.teacherSettings && typeof data.teacherSettings === 'object') {
+        Object.entries(data.teacherSettings).forEach(([k, v]) => {
+          if (v && typeof v === 'object') {
+            next[k] = v as TeacherMeetSettings;
+          }
+        });
+      }
+      if (confirmedEmail) {
+        next[confirmedEmail] = confirmedSettings;
+      }
+      if (confirmedUid) {
+        next[confirmedUid] = confirmedSettings;
+      }
+      return next;
+    });
+
+    // Synchronize timezone, meetLink, availableDays, and availability to tutors list strictly after backend 2xx confirmation
+    setTutors((prev) =>
+      prev.map((t) =>
+        (t.email || '').toLowerCase().trim() === confirmedEmail || (confirmedUid && (t as any).uid === confirmedUid)
+          ? {
+              ...t,
+              timezone: confirmedSettings.timezone || t.timezone,
+              meetUrl: confirmedSettings.meetLink || t.meetUrl,
+              meetLink: confirmedSettings.meetLink || (t as any).meetLink,
+              availableDays:
+                confirmedSettings.availableDays && confirmedSettings.availableDays.length > 0
+                  ? confirmedSettings.availableDays
+                  : t.availableDays,
+              availability: confirmedSettings.availability || confirmedSettings.availableHoursByDay || t.availability,
+              availableHoursByDay:
+                confirmedSettings.availableHoursByDay || confirmedSettings.availability || (t as any).availableHoursByDay,
+            }
+          : t
+      )
+    );
+
+    return confirmedSettings;
   };
 
   // Handler: Save Landing Content from Admin Editor

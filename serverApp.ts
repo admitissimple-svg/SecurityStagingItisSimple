@@ -6925,6 +6925,53 @@ app.post(['/api/meet-settings', '/api/teacher-settings'], async (req, res) => {
     updatedAt: new Date().toISOString(),
   };
 
+  // SEC.FIX.6A.4C.3: Verify Firestore availability BEFORE mutating RAM
+  const firestoreDb = getFirestoreDb();
+  if (!firestoreDb || getIsCloudWriteDisabled()) {
+    return res.status(503).json({
+      success: false,
+      error: 'FIRESTORE_UNAVAILABLE',
+      message: 'Canonical Firestore database is unavailable for teacher settings persistence.',
+    });
+  }
+
+  // Persist to Firestore linked to teacher UID / Email in teacher_availability collection
+  let savedToFirestore = false;
+  try {
+    savedToFirestore = await saveTeacherAvailabilityToFirestore(effectiveUid || cleanEmail, entry);
+  } catch (fsErr: any) {
+    console.error('[serverApp] Firestore teacher availability save threw error:', fsErr);
+    const errMsg = String(fsErr?.message || '').toLowerCase();
+    const isUnavailable =
+      !getFirestoreDb() ||
+      getIsCloudWriteDisabled() ||
+      fsErr?.code === 14 ||
+      fsErr?.code === 4 ||
+      fsErr?.code === 'unavailable' ||
+      fsErr?.code === 'deadline-exceeded' ||
+      errMsg.includes('unavailable') ||
+      errMsg.includes('timeout') ||
+      errMsg.includes('deadline') ||
+      errMsg.includes('cloud writes are disabled');
+    return res.status(isUnavailable ? 503 : 500).json({
+      success: false,
+      error: isUnavailable ? 'FIRESTORE_UNAVAILABLE' : 'FIRESTORE_WRITE_FAILED',
+      message: fsErr?.message || 'Failed to persist teacher settings to Firestore.',
+    });
+  }
+
+  if (!savedToFirestore) {
+    const isUnavailable = !getFirestoreDb() || getIsCloudWriteDisabled();
+    return res.status(isUnavailable ? 503 : 500).json({
+      success: false,
+      error: isUnavailable ? 'FIRESTORE_UNAVAILABLE' : 'FIRESTORE_WRITE_FAILED',
+      message: isUnavailable
+        ? 'Canonical Firestore database is unavailable for teacher settings persistence.'
+        : 'Could not confirm persistence of teacher settings in Firestore.',
+    });
+  }
+
+  // Update RAM caches strictly AFTER confirmed Firestore persistence
   if (!db.meetSettings) db.meetSettings = {};
   if (!db.teacherSettings) db.teacherSettings = {};
   db.meetSettings[cleanEmail] = entry;
@@ -6959,13 +7006,6 @@ app.post(['/api/meet-settings', '/api/teacher-settings'], async (req, res) => {
   }
 
   await writeDbSync(db);
-
-  // Persist to Firestore linked to teacher UID / Email in teacher_availability collection
-  if (effectiveUid || cleanEmail) {
-    await saveTeacherAvailabilityToFirestore(effectiveUid || cleanEmail, entry).catch((err) => {
-      console.warn('Firestore teacher availability save failed:', err);
-    });
-  }
 
   if (isCallerAdmin) {
     return res.json({
@@ -22598,6 +22638,23 @@ app.get('/api/routines', firebaseAuthMiddleware, async (req, res) => {
   return res.json(routines);
 });
 
+const LEGACY_TARGETED_ROUTINES_POST_GONE_PAYLOAD = {
+  error: 'Gone',
+  code: 'LEGACY_TARGETED_ROUTINES_POST_DISABLED',
+  message:
+    'Targeted POST /api/routines is permanently disabled. Use canonical granular routine endpoints instead (/api/routines/daily-video, /api/routines/teacher-video, /api/routines/teacher-spotify, /api/routines/words, /api/routines/toggle, /api/routines/update-time, /api/routines/weekly-checks, /api/routines/current-routine).',
+  canonicalEndpoints: [
+    '/api/routines/daily-video',
+    '/api/routines/teacher-video',
+    '/api/routines/teacher-spotify',
+    '/api/routines/words',
+    '/api/routines/toggle',
+    '/api/routines/update-time',
+    '/api/routines/weekly-checks',
+    '/api/routines/current-routine',
+  ],
+};
+
 app.post('/api/routines', firebaseAuthMiddleware, async (req, res) => {
   const authCtx = await authorizeRoutinesCaller(req, res);
   if (!authCtx) return;
@@ -22608,15 +22665,15 @@ app.post('/api/routines', firebaseAuthMiddleware, async (req, res) => {
   const hasExplicitTarget = Boolean(rawTargetUid || rawTargetEmail);
 
   if (isAdmin) {
-    const sanitizedRoutines = extractSanitizedRoutinesPayload(req.body);
-    if (!sanitizedRoutines) {
-      return res.status(400).json({
-        error: 'Bad Request',
-        message: 'Valid routinesByDay object with at least one valid day array is required.',
-      });
-    }
-
     if (!hasExplicitTarget) {
+      const sanitizedRoutines = extractSanitizedRoutinesPayload(req.body);
+      if (!sanitizedRoutines) {
+        return res.status(400).json({
+          error: 'Bad Request',
+          message: 'Valid routinesByDay object with at least one valid day array is required.',
+        });
+      }
+
       const firestoreDb = getFirestoreDb();
       if (!firestoreDb || getIsCloudWriteDisabled()) {
         return res.status(503).json({
@@ -22658,6 +22715,7 @@ app.post('/api/routines', firebaseAuthMiddleware, async (req, res) => {
       return res.json(db.routinesByDay);
     }
 
+    // SEC.FIX.6A.4C.2: Targeted ADM branch disabled (Option B) after target validation, no RAM/Firestore mutation
     const targetRes = await resolveRoutineTargetStudent({
       rawUid: rawTargetUid,
       rawEmail: rawTargetEmail,
@@ -22670,14 +22728,7 @@ app.post('/api/routines', firebaseAuthMiddleware, async (req, res) => {
       });
     }
 
-    if (!db.studentRoutinesMap) db.studentRoutinesMap = {};
-    db.studentRoutinesMap[targetRes.studentUid] = sanitizedRoutines;
-    if (targetRes.studentEmail) {
-      db.studentRoutinesMap[targetRes.studentEmail] = sanitizedRoutines;
-    }
-    routinePostUpdatedAtMap.set(targetRes.studentUid, Date.now());
-    writeDb(db);
-    return res.json(sanitizedRoutines);
+    return res.status(410).json(LEGACY_TARGETED_ROUTINES_POST_GONE_PAYLOAD);
   }
 
   if (isApprovedTeacher) {
@@ -22719,25 +22770,11 @@ app.post('/api/routines', firebaseAuthMiddleware, async (req, res) => {
       });
     }
 
-    const sanitizedRoutines = extractSanitizedRoutinesPayload(req.body);
-    if (!sanitizedRoutines) {
-      return res.status(400).json({
-        error: 'Bad Request',
-        message: 'Valid routinesByDay object with at least one valid day array is required.',
-      });
-    }
-
-    if (!db.studentRoutinesMap) db.studentRoutinesMap = {};
-    db.studentRoutinesMap[targetRes.studentUid] = sanitizedRoutines;
-    if (targetRes.studentEmail) {
-      db.studentRoutinesMap[targetRes.studentEmail] = sanitizedRoutines;
-    }
-    routinePostUpdatedAtMap.set(targetRes.studentUid, Date.now());
-    writeDb(db);
-    return res.json(sanitizedRoutines);
+    // SEC.FIX.6A.4C.2: Targeted teacher branch disabled (Option B), no RAM/Firestore mutation
+    return res.status(410).json(LEGACY_TARGETED_ROUTINES_POST_GONE_PAYLOAD);
   }
 
-  // Student role: strict self-access only (never mutates global db.routinesByDay)
+  // Student role: strict self-access check preserved, legacy POST disabled (Option B), no RAM/Firestore mutation
   if (rawTargetUid && rawTargetUid !== callerUid) {
     return res.status(403).json({
       error: 'Forbidden',
@@ -22751,22 +22788,7 @@ app.post('/api/routines', firebaseAuthMiddleware, async (req, res) => {
     });
   }
 
-  const sanitizedRoutines = extractSanitizedRoutinesPayload(req.body);
-  if (!sanitizedRoutines) {
-    return res.status(400).json({
-      error: 'Bad Request',
-      message: 'Valid routinesByDay object with at least one valid day array is required.',
-    });
-  }
-
-  if (!db.studentRoutinesMap) db.studentRoutinesMap = {};
-  db.studentRoutinesMap[callerUid] = sanitizedRoutines;
-  if (callerEmail) {
-    db.studentRoutinesMap[callerEmail] = sanitizedRoutines;
-  }
-  routinePostUpdatedAtMap.set(callerUid, Date.now());
-  writeDb(db);
-  return res.json(sanitizedRoutines);
+  return res.status(410).json(LEGACY_TARGETED_ROUTINES_POST_GONE_PAYLOAD);
 });
 
 app.post('/api/routines/words', firebaseAuthMiddleware, async (req, res) => {
